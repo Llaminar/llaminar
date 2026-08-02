@@ -851,46 +851,6 @@ namespace llaminar2
         {
             *error = "failed to enqueue ROCm KV device sequence-state publication";
         }
-        if (enqueued && mtpKVPublicationDiagnosticsEnabled())
-        {
-            const int seq_idx = request.first_seq_idx;
-            const int idx = seq_idx;
-            int device_head = -1;
-            int device_count = -1;
-            hipError_t diag_err = hipMemcpyAsync(
-                &device_head,
-                &d_head_params_[idx],
-                sizeof(int),
-                hipMemcpyDeviceToHost,
-                static_cast<hipStream_t>(request.stream));
-            if (diag_err == hipSuccess)
-            {
-                diag_err = hipMemcpyAsync(
-                    &device_count,
-                    &d_count_params_[idx],
-                    sizeof(int),
-                    hipMemcpyDeviceToHost,
-                    static_cast<hipStream_t>(request.stream));
-            }
-            if (diag_err == hipSuccess)
-                diag_err = hipStreamSynchronize(static_cast<hipStream_t>(request.stream));
-            if (diag_err == hipSuccess)
-            {
-                LOG_INFO("[MTPPublicationDiagnostics] phase=rocm_kv_sequence_state_publish"
-                         << " first_seq_idx=" << request.first_seq_idx
-                         << " request_count=" << request.request_count
-                         << " layer0_seq0_head_after=" << device_head
-                         << " layer0_seq0_count_after=" << device_count
-                         << " stream=" << request.stream);
-            }
-            else
-            {
-                LOG_ERROR("[MTPPublicationDiagnostics] phase=rocm_kv_sequence_state_publish"
-                          << " diagnostic_copy_failed=" << hipGetErrorString(diag_err)
-                          << " first_seq_idx=" << request.first_seq_idx
-                          << " request_count=" << request.request_count);
-            }
-        }
         return enqueued;
     }
 

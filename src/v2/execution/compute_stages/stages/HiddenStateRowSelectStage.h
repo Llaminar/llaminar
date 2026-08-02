@@ -139,11 +139,13 @@ namespace llaminar2
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
             return params_.device_id.is_gpu() &&
-                   params_.selection_policy ==
-                       SelectionPolicy::DynamicDeviceScalar;
+                           params_.selection_policy ==
+                               SelectionPolicy::DynamicDeviceScalar
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                       : GraphLaunchPreparationPolicy::None;
         }
 
         /**

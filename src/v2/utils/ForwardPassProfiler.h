@@ -51,7 +51,7 @@ namespace llaminar2
          *
          * Sub-phases within graph replay (executeReplayPhase):
          *   [graph_launch]: hipGraphLaunch() / cudaGraphLaunch()
-         *   [post_launch]:  markOutputsDirty + onGraphReplayed callbacks
+         *   [post_launch]:  output-coherence publication
          *   [stream_sync]:  synchronizeStream() calls at end of replay
          */
         struct PhaseTimings
@@ -69,7 +69,7 @@ namespace llaminar2
 
             // Sub-phases of execute (graph replay path only)
             uint64_t graph_launch_ns = 0; ///< hipGraphLaunch / cudaGraphLaunch
-            uint64_t post_launch_ns = 0;  ///< markOutputsDirty + onGraphReplayed callbacks
+            uint64_t post_launch_ns = 0;  ///< Output-coherence publication.
             uint64_t stream_sync_ns = 0;  ///< synchronizeStream() at end of replay phase
         };
 

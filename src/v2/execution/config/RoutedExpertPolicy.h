@@ -108,6 +108,30 @@ namespace llaminar2
     };
 
     /**
+     * @enum RoutedExpertRowExecutionPolicy
+     * @brief Graph-lowered execution contract for one router-selected row.
+     *
+     * This is not another user-facing placement axis. Graph construction
+     * derives it from the physical routed-expert tier, its phase policy, and
+     * the graph phase being built. Keeping the result typed prevents a stage
+     * from receiving a fully replicated runtime bank while still applying the
+     * participant-assignment policy intended for apportioned prefill.
+     *
+     * The distinction also owns the collective boundary. Participant-assigned
+     * rows publish one partial contribution across the domain, whereas a fully
+     * replicated local row is already complete on every participant and must
+     * never be reduced with another identical result.
+     */
+    enum class RoutedExpertRowExecutionPolicy : uint8_t
+    {
+        /** Exactly one eligible participant executes each selected row. */
+        ParticipantAssigned = 0,
+
+        /** Every participant executes every selected row from its full replica. */
+        FullyReplicatedLocal,
+    };
+
+    /**
      * @brief Return the canonical configuration spelling for a compute policy.
      * @param policy Typed compute-distribution value to render.
      * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
@@ -165,6 +189,24 @@ namespace llaminar2
             return "static-owner";
         case RoutedExpertAssignmentPolicy::LeastLoadedResident:
             return "least-loaded-resident";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the canonical diagnostic spelling for a lowered row policy.
+     * @param policy Graph-resolved routed-row execution contract.
+     * @return Stable lowercase spelling used by graph and stage diagnostics.
+     */
+    inline const char *routedExpertRowExecutionPolicyToString(
+        RoutedExpertRowExecutionPolicy policy)
+    {
+        switch (policy)
+        {
+        case RoutedExpertRowExecutionPolicy::ParticipantAssigned:
+            return "participant-assigned";
+        case RoutedExpertRowExecutionPolicy::FullyReplicatedLocal:
+            return "fully-replicated-local";
         }
         return "unknown";
     }

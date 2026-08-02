@@ -14,7 +14,9 @@
 #include "app/Splash.h"
 #include "app/modes/BenchmarkMode.h"
 #include "config/OrchestrationConfigParser.h"
+#include "utils/BenchmarkRunner.h"
 #include "utils/Logger.h"
+#include "utils/MPIBootstrap.h"
 #include <iostream>
 #include <vector>
 
@@ -51,6 +53,26 @@ namespace llaminar2
         if (!command_validation::printConfigErrors(config))
         {
             return 1;
+        }
+
+        /*
+         * The original launcher can reject an unreadable or empty prompt file
+         * before paying model-load and MPI startup costs. Once already under an
+         * explicit MPI launcher, only BenchmarkRunner rank 0 reads the file and
+         * broadcasts the resulting token IDs; this avoids requiring a shared
+         * prompt-file path on every host.
+         */
+        if (!MPIBootstrap::detectMPIEnvironment().is_mpi_process)
+        {
+            try
+            {
+                (void)resolveBenchmarkPrompt(config);
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "Error: " << error.what() << "\n";
+                return 1;
+            }
         }
 
         if (config.validate_only)
@@ -90,11 +112,6 @@ namespace llaminar2
         if (!ctx_opt)
             return config.dry_run ? 0 : 1;
         auto ctx = std::move(*ctx_opt);
-        // RuntimeInitPhase reparses argv after MPI_Init. The benchmark
-        // subcommand is represented by command dispatch rather than a required
-        // --benchmark flag, so re-apply the mode bit to the runtime config that
-        // benchmark summaries and JSON artifacts report.
-        ctx.config.benchmark_mode = true;
 
         // Run benchmark directly — no mode chain needed
         BenchmarkMode mode;

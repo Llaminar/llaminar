@@ -1061,6 +1061,23 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.routed_row_execution_policy ==
+            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
+        {
+            if (!hasFullLocalExpertOwnership() || !expertMaskAllEnabled())
+            {
+                throw std::invalid_argument(
+                    "[MoEExpertComputeStage] fully replicated local row execution "
+                    "requires every logical expert to be locally executable");
+            }
+            if (params_.canonical_route_contributions)
+            {
+                throw std::invalid_argument(
+                    "[MoEExpertComputeStage] fully replicated local row execution "
+                    "forbids canonical route contribution publication");
+            }
+        }
+
         if (params_.device_id.is_gpu() &&
             params_.routed_assignment_policy ==
                 RoutedExpertAssignmentPolicy::LeastLoadedResident &&
@@ -1690,6 +1707,33 @@ namespace llaminar2
         int rows_per_request,
         void *producer_stream)
     {
+        if (!enqueueCommittedGroupedVerifierHistograms(
+                accepted_state_counts_device,
+                publication_ok_flags_device,
+                request_count,
+                rows_per_request,
+                producer_stream))
+        {
+            return false;
+        }
+
+        /*
+         * This wrapper is retained for explicit diagnostic owners outside a
+         * captured graph body. Production capture stages call the enqueue-only
+         * method so cloning cannot preserve a stale host stream alias.
+         */
+        params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+            producer_stream);
+        return true;
+    }
+
+    bool MoEExpertComputeStage::enqueueCommittedGroupedVerifierHistograms(
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        void *producer_stream)
+    {
         if (!requiresCommittedGroupedVerifierHistogramPublication())
         {
             LOG_ERROR(
@@ -1754,13 +1798,6 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Host-side diagnostic drains are not part of inference, but they
-         * still need to know which stream owns the newest device histogram.
-         * Recording the pointer does not wait on or inspect the stream.
-         */
-        params_.moe_runtime_table->recordDecodeHistogramProducerStream(
-            producer_stream);
         return true;
     }
 
@@ -4555,11 +4592,20 @@ namespace llaminar2
     bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedPrefill()
     {
         moe_prefill_runtime_grouping_available_ = false;
+        const bool fully_replicated_local_runtime_grouping =
+            params_.routed_row_execution_policy ==
+                RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
+            hasFullLocalExpertOwnership() &&
+            expertMaskAllEnabled();
         const bool static_owner_runtime_grouping =
+            params_.routed_row_execution_policy ==
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
             ((hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
              hasFixedTopologyPrefillExpertMask());
         const bool least_loaded_runtime_grouping =
+            params_.routed_row_execution_policy ==
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
             hasFixedTopologyPrefillExpertMask();
         if (!params_.use_runtime_prefill_grouping ||
@@ -4569,7 +4615,9 @@ namespace llaminar2
             params_.num_experts <= 0 ||
             params_.top_k <= 0 ||
             !supportsGroupedPrefillExecutionBackend(params_.device_id) ||
-            (!static_owner_runtime_grouping && !least_loaded_runtime_grouping))
+            (!fully_replicated_local_runtime_grouping &&
+             !static_owner_runtime_grouping &&
+             !least_loaded_runtime_grouping))
         {
             return false;
         }
@@ -4795,6 +4843,12 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::supportsRequestedRoutedAssignmentPolicy() const
     {
+        if (params_.routed_row_execution_policy ==
+            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
+        {
+            return hasFullLocalExpertOwnership() && expertMaskAllEnabled();
+        }
+
         if (params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
             return true;
 
@@ -4845,6 +4899,11 @@ namespace llaminar2
                 params_.seq_len))
         {
             return false;
+        }
+        if (params_.routed_row_execution_policy ==
+            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
+        {
+            return hasFullLocalExpertOwnership() && expertMaskAllEnabled();
         }
         if (params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
             return (hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
@@ -5647,6 +5706,9 @@ namespace llaminar2
                      << " top_k=" << top_k
                      << " assignment_policy="
                      << routedExpertAssignmentPolicyToString(params_.routed_assignment_policy)
+                     << " row_execution_policy="
+                     << routedExpertRowExecutionPolicyToString(
+                            params_.routed_row_execution_policy)
                      << " runtime_grouping=" << perfBool(runtime_grouping)
                      << " masked_grouping=" << perfBool(masked_grouping)
                      << " requested_runtime_grouping=" << perfBool(params_.use_runtime_prefill_grouping)
@@ -5726,12 +5788,17 @@ namespace llaminar2
         bool groups_prepared = false;
         if (runtime_grouping)
         {
+            const bool fully_replicated_local_rows =
+                params_.routed_row_execution_policy ==
+                RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
             const bool filter_runtime_grouping_to_local_experts =
+                fully_replicated_local_rows ||
                 params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
             const bool retain_routes_during_initial_grouping =
                 retain_routes_for_deferred_commit &&
-                params_.routed_assignment_policy ==
-                    RoutedExpertAssignmentPolicy::StaticOwner;
+                (fully_replicated_local_rows ||
+                 params_.routed_assignment_policy ==
+                     RoutedExpertAssignmentPolicy::StaticOwner);
             groups_prepared = kernel->groupPrefillRoutes(
                 moe_runtime_layer_,
                 params_.routing_indices,
@@ -5748,6 +5815,7 @@ namespace llaminar2
                 return false;
             }
             if (groups_prepared &&
+                !fully_replicated_local_rows &&
                 params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
             {
                 const auto &runtime_state =

@@ -637,14 +637,6 @@ namespace llaminar2
         clearKernelVerifierStateWorkspace();
     }
 
-    void ShortConv1dStage::onGraphReplayed()
-    {
-        // GDN hybrid kernels are shared by verifier, correction, and normal decode
-        // graphs. Replay bypasses execute(), so refresh the host-side kernel
-        // workspace binding before MTP publication restores a captured row.
-        bindKernelWorkspace();
-    }
-
     bool ShortConv1dStage::execute(IDeviceContext *ctx)
     {
         if (!ensureContext(ctx, "ShortConv1dStage"))

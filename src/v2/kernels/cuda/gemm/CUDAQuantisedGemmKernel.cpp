@@ -1689,19 +1689,26 @@ namespace llaminar2
             }
             if (impl_->gemv_ctx)
             {
-                float *kpar_partials = nullptr;
-                size_t kpar_partials_bytes = 0;
-                const char *kpar_buffer_name =
-                    explicitSmallMVerifierScopeActive()
-                        ? GemmWorkspaceBuffers::
-                              GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
-                        : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
-                if (workspace_->hasBuffer(kpar_buffer_name))
+                if (!workspace_->hasBuffer(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
                 {
-                    kpar_partials = static_cast<float *>(
-                        workspace_->getBuffer(kpar_buffer_name));
-                    kpar_partials_bytes =
-                        workspace_->getBufferSize(kpar_buffer_name);
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] Workspace is missing the "
+                        "required persistent serial/grouped KPAR arena: " +
+                        std::string(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                }
+
+                auto *kpar_partials = static_cast<float *>(
+                    workspace_->getBuffer(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                const size_t kpar_partials_bytes =
+                    workspace_->getBufferSize(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                if (!kpar_partials || kpar_partials_bytes == 0)
+                {
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] Persistent serial/grouped "
+                        "KPAR arena has no device storage");
                 }
 
                 cudaGemvContext_bindWorkspace(
@@ -4215,13 +4222,8 @@ namespace llaminar2
                 const int k_groups = (k + 31) / 32;
                 const size_t kpar_bytes =
                     static_cast<size_t>(k_groups) * static_cast<size_t>(gemv_workspace_m) * n * sizeof(float);
-                const char *buffer_name =
-                    m > 1
-                        ? GemmWorkspaceBuffers::
-                              GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
-                        : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
                 reqs.buffers.push_back({
-                    buffer_name,
+                    GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
                     kpar_bytes,
                     256,
                     true,

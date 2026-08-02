@@ -267,9 +267,11 @@ TEST_F(Test__TPAllreduceStage, SidebandsExecuteOnSameExplicitStreamAfterPrimaryA
 
     const size_t execute_fn = source.find("bool TPAllreduceStage::execute(");
     ASSERT_NE(execute_fn, std::string::npos);
-    const size_t replay_fn = source.find("void TPAllreduceStage::onGraphReplayed()", execute_fn);
-    ASSERT_NE(replay_fn, std::string::npos);
-    const std::string body = source.substr(execute_fn, replay_fn - execute_fn);
+    const size_t workspace_fn = source.find(
+        "WorkspaceRequirements TPAllreduceStage::getWorkspaceRequirements(",
+        execute_fn);
+    ASSERT_NE(workspace_fn, std::string::npos);
+    const std::string body = source.substr(execute_fn, workspace_fn - execute_fn);
 
     EXPECT_NE(body.find("params_.sidebands"), std::string::npos);
     EXPECT_NE(body.find("params_.sideband_workspace_bindings"), std::string::npos);
@@ -823,9 +825,9 @@ TEST_F(Test__TPAllreduceStage,
 }
 
 /**
- * @test Captured graph replay records the same allreduce BOM without re-entering execute()
+ * @test Graph construction records a static allreduce BOM descriptor
  */
-TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)
+TEST_F(Test__TPAllreduceStage, GraphConstructionRecordsBillOfMaterials)
 {
     ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -841,8 +843,7 @@ TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)
 
     TPAllreduceStage stage(params);
 
-    ASSERT_TRUE(stage.needsOnGraphReplayed());
-    stage.onGraphReplayed();
+    ASSERT_TRUE(stage.execute(nullptr));
 
     const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
     const PerfStatRecord *bytes = nullptr;
@@ -866,6 +867,10 @@ TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)
     EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
     EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
     EXPECT_EQ(bytes->tags.at("no_op"), "true");
+    EXPECT_EQ(bytes->tags.at("accounting"), "graph_template_or_eager_launch");
+    EXPECT_EQ(
+        bytes->tags.at("device_loop_multiplier"),
+        "mtp.device_generation_terminal_transactions");
 
     ASSERT_NE(stages, nullptr);
     EXPECT_DOUBLE_EQ(stages->value, 1.0);

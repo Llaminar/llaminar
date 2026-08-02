@@ -255,6 +255,38 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 f"Qwen3.6 MoE matrix row inherits an ambiguous CLI mode: {row}",
             )
 
+    def test_llep_cells_declare_phase_split_routed_policy_explicitly(self) -> None:
+        """LLEP mode must not rely on runner-factory policy mutation."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        for backend in ("CUDA", "ROCM"):
+            definition = next(
+                line
+                for line in harness.splitlines()
+                if line.startswith(f"    S9_LLEP_OVERLAY_{backend}2_FLAGS=")
+            )
+            self.assertIn("routed_compute=replicated", definition)
+            self.assertIn(
+                "routed_phase=prefill-apportioned-decode-replicated",
+                definition,
+            )
+            self.assertIn(
+                "routed_assignment=least-loaded-resident",
+                definition,
+            )
+
+        llep_rows = [
+            line
+            for line in harness.splitlines()
+            if "SUITES+=" in line and "--moe-rebalance llep" in line
+        ]
+        self.assertGreater(len(llep_rows), 0)
+        for row in llep_rows:
+            self.assertRegex(row, r"\$\{S9_LLEP_OVERLAY_(?:CUDA|ROCM)2_FLAGS\}")
+            self.assertNotRegex(row, r"\$\{S9_OVERLAY_(?:CUDA|ROCM)2_FLAGS\}")
+
     def test_prefill_graph_probe_defeats_full_prefix_hits_at_fixed_geometry(
         self,
     ) -> None:

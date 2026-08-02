@@ -136,9 +136,12 @@ namespace llaminar2
         bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return hasPrefillReplayParams(); }
-        void onGraphReplayed() override;
-        bool needsOnGraphReplayed() const override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return hasPrefillReplayParams()
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                       : GraphLaunchPreparationPolicy::None;
+        }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

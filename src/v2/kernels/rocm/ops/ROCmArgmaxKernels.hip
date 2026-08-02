@@ -24,14 +24,17 @@
 #include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 
 // ── Argmax multi-block reduction tuning ─────────────────────────────────────
-// Threads per block for both reduction passes. Must be a power of two because
-// the in-block tree reduction halves the active range each step.
+// Threads per block for both reduction passes. Every production geometry is a
+// power-of-two multiple of the target wave size, allowing the deterministic
+// shuffle reduction below to avoid repeated workgroup-wide barriers.
 constexpr int ARGMAX_REDUCE_THREADS = 256;
 constexpr int ARGMAX_FINALIZE_THREADS = 256;
-// Target elements processed per thread in pass 1. Chosen so each thread reads a
-// handful of elements (good memory coalescing) while still spreading the vocab
-// across enough blocks to occupy most CUs. 8 → ~74 blocks for a 152K vocab.
-constexpr int ARGMAX_ELEMS_PER_THREAD = 8;
+// Target elements processed per thread in pass 1.  The production Qwen 3.6
+// vocabulary has 248,320 columns, so four elements per thread launches 243
+// blocks at the 256-thread geometry.  Repeated full-matrix Perf__ sweeps on an
+// MI50 selected this geometry while preserving the serial lower-token tie
+// break exactly.
+constexpr int ARGMAX_ELEMS_PER_THREAD = 4;
 
 __device__ __forceinline__ bool rocm_argmax_better(float candidate_value,
                                                    int candidate_index,
@@ -40,6 +43,70 @@ __device__ __forceinline__ bool rocm_argmax_better(float candidate_value,
 {
     return candidate_value > current_value ||
            (candidate_value == current_value && candidate_index < current_index);
+}
+
+/**
+ * @brief Value/index pair carrying serial argmax tie-breaking semantics.
+ */
+struct ROCmArgmaxPair
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Reduce one complete AMD wave with deterministic token-id ties.
+ */
+__device__ __forceinline__ ROCmArgmaxPair rocm_argmax_wave_reduce(
+    ROCmArgmaxPair pair)
+{
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        const ROCmArgmaxPair candidate{
+            __shfl_down(pair.value, offset),
+            __shfl_down(pair.index, offset)};
+        if (rocm_argmax_better(
+                candidate.value,
+                candidate.index,
+                pair.value,
+                pair.index))
+        {
+            pair = candidate;
+        }
+    }
+    return pair;
+}
+
+/**
+ * @brief Reduce one workgroup with one barrier and one final wave.
+ */
+__device__ __forceinline__ ROCmArgmaxPair rocm_argmax_block_reduce(
+    ROCmArgmaxPair pair,
+    float *wave_values,
+    int *wave_indices)
+{
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int wave = static_cast<int>(threadIdx.x) / warpSize;
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+
+    pair = rocm_argmax_wave_reduce(pair);
+    if (lane == 0)
+    {
+        wave_values[wave] = pair.value;
+        wave_indices[wave] = pair.index;
+    }
+    __syncthreads();
+
+    if (wave == 0)
+    {
+        pair = lane < wave_count
+                   ? ROCmArgmaxPair{
+                         wave_values[lane],
+                         wave_indices[lane]}
+                   : ROCmArgmaxPair{-FLT_MAX, INT_MAX};
+        pair = rocm_argmax_wave_reduce(pair);
+    }
+    return pair;
 }
 
 // ============================================================================
@@ -175,8 +242,10 @@ __global__ void rocm_argmax_partial_f32_batched_rows_kernel(
     int row_partial_capacity)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+    float *wave_values = reinterpret_cast<float *>(shared_mem);
+    int *wave_indices = reinterpret_cast<int *>(
+        shared_mem + wave_count * sizeof(float));
 
     const int row = blockIdx.y;
     if (row >= rows)
@@ -199,29 +268,16 @@ __global__ void rocm_argmax_partial_f32_batched_rows_kernel(
         }
     }
 
-    smax[tid] = local_max;
-    sidx[tid] = local_idx;
-    __syncthreads();
-
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
-    {
-        if (tid < stride)
-        {
-            if (rocm_argmax_better(smax[tid + stride], sidx[tid + stride],
-                                   smax[tid], sidx[tid]))
-            {
-                smax[tid] = smax[tid + stride];
-                sidx[tid] = sidx[tid + stride];
-            }
-        }
-        __syncthreads();
-    }
+    const ROCmArgmaxPair block_max = rocm_argmax_block_reduce(
+        ROCmArgmaxPair{local_max, local_idx},
+        wave_values,
+        wave_indices);
 
     if (tid == 0)
     {
         const int offset = row * row_partial_capacity + blockIdx.x;
-        partial_vals[offset] = smax[0];
-        partial_idxs[offset] = sidx[0];
+        partial_vals[offset] = block_max.value;
+        partial_idxs[offset] = block_max.index;
     }
 }
 
@@ -680,8 +736,10 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     int output_stride)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+    float *wave_values = reinterpret_cast<float *>(shared_mem);
+    int *wave_indices = reinterpret_cast<int *>(
+        shared_mem + wave_count * sizeof(float));
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -700,30 +758,125 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
         }
     }
 
-    smax[tid] = local_max;
-    sidx[tid] = local_idx;
-    __syncthreads();
-
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
-    {
-        if (tid < stride)
-        {
-            if (rocm_argmax_better(smax[tid + stride], sidx[tid + stride],
-                                   smax[tid], sidx[tid]))
-            {
-                smax[tid] = smax[tid + stride];
-                sidx[tid] = sidx[tid + stride];
-            }
-        }
-        __syncthreads();
-    }
+    const ROCmArgmaxPair block_max = rocm_argmax_block_reduce(
+        ROCmArgmaxPair{local_max, local_idx},
+        wave_values,
+        wave_indices);
 
     if (tid == 0)
     {
         const int out_row = row * output_stride;
-        out_values[out_row] = smax[0];
-        out_indices[out_row] = sidx[0];
+        out_values[out_row] = block_max.value;
+        out_indices[out_row] = block_max.index;
     }
+}
+
+/**
+ * @brief Validate a workgroup width accepted by the wave reducer.
+ *
+ * Production gfx906 devices execute wave64.  Requiring a multiple of 64 also
+ * remains valid on a future wave32 target, while shared-memory sizing below is
+ * conservatively based on 32-lane waves.
+ */
+static bool validROCmArgmaxThreadCount(int threads)
+{
+    return threads >= 64 && threads <= 1024 &&
+           (threads & (threads - 1)) == 0 &&
+           threads % 64 == 0;
+}
+
+/**
+ * @brief Launch one explicit HIP two-pass argmax geometry.
+ *
+ * The production entry point and Perf__ sweep share this exact launcher.  The
+ * benchmark can therefore select a stable winner without creating a separate
+ * implementation or a runtime autotuning branch in inference.
+ */
+static bool launchROCmArgmaxF32BatchedRowsGeometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads)
+{
+    if (rows <= 0 || cols <= 0 || row_stride < cols ||
+        !data || !out_values || !out_indices ||
+        !partial_vals || !partial_idxs || partial_capacity < rows ||
+        !stream || output_stride <= 0 || elements_per_thread <= 0 ||
+        !validROCmArgmaxThreadCount(reduce_threads) ||
+        !validROCmArgmaxThreadCount(finalize_threads))
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int row_partial_capacity = partial_capacity / rows;
+    if (row_partial_capacity < 1)
+        return false;
+
+    const long per_block =
+        static_cast<long>(reduce_threads) * elements_per_thread;
+    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > row_partial_capacity)
+        blocks = row_partial_capacity;
+    const int num_blocks = static_cast<int>(blocks);
+
+    const size_t partial_shared_bytes =
+        static_cast<size_t>(reduce_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    hipLaunchKernelGGL(
+        rocm_argmax_partial_f32_batched_rows_kernel,
+        dim3(num_blocks, rows),
+        dim3(reduce_threads),
+        partial_shared_bytes,
+        s,
+        data,
+        rows,
+        cols,
+        row_stride,
+        partial_vals,
+        partial_idxs,
+        row_partial_capacity);
+
+    const size_t finalize_shared_bytes =
+        static_cast<size_t>(finalize_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    hipLaunchKernelGGL(
+        rocm_argmax_finalize_f32_batched_rows_kernel,
+        dim3(rows),
+        dim3(finalize_threads),
+        finalize_shared_bytes,
+        s,
+        partial_vals,
+        partial_idxs,
+        num_blocks,
+        row_partial_capacity,
+        out_values,
+        out_indices,
+        output_stride);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm Argmax FP32 batched rows launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -832,53 +985,60 @@ bool rocmOps_argmax_f32_batched_rows(
     void *stream,
     int output_stride)
 {
-    if (rows <= 0 || cols <= 0 || row_stride < cols ||
-        !data || !out_values || !out_indices ||
-        !partial_vals || !partial_idxs || partial_capacity < rows ||
-        output_stride <= 0)
-    {
-        return false;
-    }
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        ARGMAX_REDUCE_THREADS,
+        ARGMAX_ELEMS_PER_THREAD,
+        ARGMAX_FINALIZE_THREADS);
+}
 
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipStream_t s = static_cast<hipStream_t>(stream);
-
-    const int row_partial_capacity = partial_capacity / rows;
-    if (row_partial_capacity < 1)
-        return false;
-
-    const int threads = ARGMAX_REDUCE_THREADS;
-    const long per_block = static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
-    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
-    if (blocks < 1)
-        blocks = 1;
-    if (blocks > row_partial_capacity)
-        blocks = row_partial_capacity;
-    const int num_blocks = static_cast<int>(blocks);
-
-    const size_t smem1 = threads * (sizeof(float) + sizeof(int));
-    hipLaunchKernelGGL(
-        rocm_argmax_partial_f32_batched_rows_kernel,
-        dim3(num_blocks, rows), dim3(threads), smem1, s,
-        data, rows, cols, row_stride, partial_vals, partial_idxs,
-        row_partial_capacity);
-
-    const int fthreads = ARGMAX_FINALIZE_THREADS;
-    const size_t smem2 = fthreads * (sizeof(float) + sizeof(int));
-    hipLaunchKernelGGL(
-        rocm_argmax_finalize_f32_batched_rows_kernel,
-        dim3(rows), dim3(fthreads), smem2, s,
-        partial_vals, partial_idxs, num_blocks, row_partial_capacity,
-        out_values, out_indices, output_stride);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "ROCm Argmax FP32 batched rows launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
-    }
-    return true;
+/**
+ * @brief Perf__ entry point for explicit HIP argmax launch geometry.
+ */
+bool rocmOps_argmax_f32_batched_rows_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        reduce_threads,
+        elements_per_thread,
+        finalize_threads);
 }
 
 bool rocmOps_configure_mtp_greedy_penalty_policy(

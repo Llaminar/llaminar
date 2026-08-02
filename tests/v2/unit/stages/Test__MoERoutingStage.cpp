@@ -483,10 +483,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
     MoERoutingStage stage(params);
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable());
-    EXPECT_TRUE(stage.needsOnGraphReplayed());
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
-    EXPECT_FALSE(stage.needsOnGraphReplayed());
 #endif
 }
 

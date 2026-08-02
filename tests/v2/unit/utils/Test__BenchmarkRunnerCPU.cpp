@@ -10,7 +10,12 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -631,11 +636,99 @@ namespace
         bool previous_ = false;
     };
 
+    std::filesystem::path uniqueBenchmarkPromptPath()
+    {
+        static std::atomic<uint64_t> sequence{0};
+        return std::filesystem::temp_directory_path() /
+               ("llaminar_benchmark_prompt_" +
+                std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) +
+                ".txt");
+    }
+
+    /**
+     * @brief RAII owner for one exact-byte benchmark prompt fixture.
+     */
+    class ScopedBenchmarkPromptFile
+    {
+    public:
+        explicit ScopedBenchmarkPromptFile(const std::string &bytes)
+            : path_(uniqueBenchmarkPromptPath())
+        {
+            std::ofstream output(path_, std::ios::binary | std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("unable to create benchmark prompt fixture");
+            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            if (!output)
+                throw std::runtime_error("unable to write benchmark prompt fixture");
+        }
+
+        ~ScopedBenchmarkPromptFile()
+        {
+            std::error_code error;
+            std::filesystem::remove(path_, error);
+        }
+
+        const std::filesystem::path &path() const noexcept { return path_; }
+
+    private:
+        std::filesystem::path path_;
+    };
+
 } // namespace
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+TEST(Test__BenchmarkRunnerCPU, ResolvesInlinePromptWithoutLegacySentinelSubstitution)
+{
+    OrchestrationConfig config;
+    config.prompt = "Hello, my name is";
+
+    const auto resolved = resolveBenchmarkPrompt(config);
+
+    EXPECT_EQ(resolved.source, BenchmarkPromptSource::Inline);
+    EXPECT_EQ(resolved.text, "Hello, my name is");
+    EXPECT_TRUE(resolved.file_path.empty());
+    EXPECT_EQ(resolved.sha256.size(), 64u);
+}
+
+TEST(Test__BenchmarkRunnerCPU, ResolvesPromptFileAsExactBytes)
+{
+    const std::string exact_prompt = "First line\nSecond line\n";
+    ScopedBenchmarkPromptFile prompt_file(exact_prompt);
+
+    OrchestrationConfig file_config;
+    file_config.benchmark_prompt_file_path = prompt_file.path().string();
+    const auto from_file = resolveBenchmarkPrompt(file_config);
+
+    OrchestrationConfig inline_config;
+    inline_config.prompt = exact_prompt;
+    const auto from_inline = resolveBenchmarkPrompt(inline_config);
+
+    EXPECT_EQ(from_file.source, BenchmarkPromptSource::File);
+    EXPECT_EQ(from_file.text, exact_prompt);
+    EXPECT_EQ(from_file.file_path, prompt_file.path().string());
+    EXPECT_EQ(from_file.sha256, from_inline.sha256)
+        << "Equal prompt bytes must have one source-independent benchmark identity";
+}
+
+TEST(Test__BenchmarkRunnerCPU, RejectsAmbiguousOrInvalidPromptFiles)
+{
+    OrchestrationConfig ambiguous;
+    ambiguous.prompt = "inline";
+    ambiguous.benchmark_prompt_file_path = "/tmp/prompt.txt";
+    EXPECT_THROW((void)resolveBenchmarkPrompt(ambiguous), std::invalid_argument);
+
+    ScopedBenchmarkPromptFile empty_file("");
+    OrchestrationConfig empty;
+    empty.benchmark_prompt_file_path = empty_file.path().string();
+    EXPECT_THROW((void)resolveBenchmarkPrompt(empty), std::invalid_argument);
+
+    OrchestrationConfig missing;
+    missing.benchmark_prompt_file_path = uniqueBenchmarkPromptPath().string();
+    EXPECT_THROW((void)resolveBenchmarkPrompt(missing), std::runtime_error);
+}
 
 /**
  * @brief Verify that CPU benchmark does NOT enable skip-logits-gather.
@@ -1597,6 +1690,11 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     result.success = true;
     result.generated_text = "xy";
     result.generated_token_ids = {77, 88};
+    result.prompt_source = BenchmarkPromptSource::File;
+    result.prompt_file_path = "/tmp/fixed-prompt.txt";
+    result.prompt_bytes = 22;
+    result.prompt_sha256 =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     auto &snapshot = result.prefix_state;
     snapshot.initialized = true;
@@ -1706,6 +1804,12 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_TRUE(doc.at("success").get<bool>());
     EXPECT_EQ(doc.at("measurement_iterations"), 3);
     EXPECT_EQ(doc.at("warmup_iterations"), 1);
+    EXPECT_EQ(doc.at("prompt").at("source"), "file");
+    EXPECT_EQ(doc.at("prompt").at("file_path"), "/tmp/fixed-prompt.txt");
+    EXPECT_EQ(doc.at("prompt").at("bytes"), 22);
+    EXPECT_EQ(
+        doc.at("prompt").at("sha256"),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     EXPECT_EQ(doc.at("tokens").at("prefill"), 10);
     EXPECT_EQ(doc.at("tokens").at("decode"), 2);
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);

@@ -99,12 +99,11 @@ namespace llaminar2
      * CUDA NativeVNNI M=1 decode can launch several projections from one fused
      * stage on separate streams. Slot 0 uses the normal
      * `GEMV_KPAR_PARTIALS` buffer; the remaining projections need one disjoint
-     * side-stream slot each. Grouped verifier projections instead execute
-     * in-order on their graph stream and expose only
-     * `GROUPED_VERIFIER_GEMV_KPAR_PARTIALS`, so this helper deliberately
-     * ignores them. Single-output GEMV stages such as LM head cannot consume
-     * these slots either; the declaration belongs at the fused-stage layer
-     * where M=1 projection fan-out is known.
+     * side-stream slot each. Grouped verifier projections reuse the same
+     * primary arena in-order on their graph stream and never allocate side
+     * slots. Single-output GEMV stages such as LM head cannot consume these
+     * slots either; the declaration belongs at the fused-stage layer where
+     * M=1 projection fan-out is known.
      *
      * @param reqs Merged per-projection workspace requirements to augment.
      * @param device Stage device; only CUDA receives this CUDA-specific buffer.
@@ -120,8 +119,7 @@ namespace llaminar2
         size_t projection_count,
         size_t max_concurrent_streams = 8)
     {
-        if (!device.is_cuda() || m < 1 ||
-            m > kDefaultNativeVNNIVerifierRowCapacity ||
+        if (!device.is_cuda() || m != 1 ||
             projection_count <= 1 || max_concurrent_streams <= 1)
             return;
 

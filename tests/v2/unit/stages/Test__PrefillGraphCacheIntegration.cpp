@@ -3,7 +3,7 @@
  * @brief Unit tests for PrefillGraphCache integration into ForwardExecutionEngine
  *
  * Tests the warmup → capture → replay lifecycle, preflight rejection paths,
- * failure propagation, replay callbacks, and snapshot bypass.
+ * failure propagation, device replay parameters, and snapshot bypass.
  */
 
 #include <gtest/gtest.h>
@@ -30,7 +30,6 @@ public:
 
     bool isGraphCapturable() const override { return true; }
     bool hasDynamicParams() const override { return has_dynamic_params_; }
-    bool needsOnGraphReplayed() const override { return needs_replay_callback_; }
 
     void updateDynamicParams(int position_offset, int seq_len) override
     {
@@ -39,24 +38,15 @@ public:
         last_seq_len_ = seq_len;
     }
 
-    void onGraphReplayed() override
-    {
-        replay_callback_calls_++;
-    }
-
     void setHasDynamicParams(bool v) { has_dynamic_params_ = v; }
-    void setNeedsReplayCallback(bool v) { needs_replay_callback_ = v; }
 
     int dynamicParamsCalls() const { return dynamic_params_calls_; }
-    int replayCallbackCalls() const { return replay_callback_calls_; }
     int lastPositionOffset() const { return last_position_offset_; }
     int lastSeqLen() const { return last_seq_len_; }
 
 private:
     bool has_dynamic_params_ = false;
-    bool needs_replay_callback_ = false;
     int dynamic_params_calls_ = 0;
-    int replay_callback_calls_ = 0;
     int last_position_offset_ = -1;
     int last_seq_len_ = -1;
 };
@@ -394,47 +384,6 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
     EXPECT_EQ(reject_stage_name, "bad_stage");
     EXPECT_EQ(reject_stage_type, "GEMM");
-}
-
-// =============================================================================
-// Test: Replay callbacks are called with correct stage list
-// =============================================================================
-
-TEST(Test__PrefillGraphCacheIntegration, ReplayCallbackStagesCached)
-{
-    ForwardGraphCache fwd_cache;
-    auto dev = testGPUDevice();
-
-    std::vector<IntegCapturableMockStage *> stage_ptrs;
-    auto graph = buildIntegCapturableGraph(dev, 4, &stage_ptrs);
-
-    // Mark stage 1 and 3 as needing replay callbacks
-    stage_ptrs[1]->setNeedsReplayCallback(true);
-    stage_ptrs[3]->setNeedsReplayCallback(true);
-
-    fwd_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
-
-    // Cache replay callback stages (mimics executeCacheHit logic)
-    EXPECT_FALSE(fwd_cache.replay_callback_stages_cached);
-    const auto &order = fwd_cache.graph->getExecutionOrder();
-    for (const auto &node_name : order)
-    {
-        ComputeNode *node = fwd_cache.graph->getNode(node_name);
-        if (node && node->stage && node->stage->needsOnGraphReplayed())
-            fwd_cache.replay_callback_stages.push_back(node->stage.get());
-    }
-    fwd_cache.replay_callback_stages_cached = true;
-
-    EXPECT_EQ(fwd_cache.replay_callback_stages.size(), 2u);
-
-    // Simulate replay callbacks
-    for (auto *stage : fwd_cache.replay_callback_stages)
-        stage->onGraphReplayed();
-
-    EXPECT_EQ(stage_ptrs[1]->replayCallbackCalls(), 1);
-    EXPECT_EQ(stage_ptrs[3]->replayCallbackCalls(), 1);
-    EXPECT_EQ(stage_ptrs[0]->replayCallbackCalls(), 0);
-    EXPECT_EQ(stage_ptrs[2]->replayCallbackCalls(), 0);
 }
 
 // =============================================================================

@@ -67,9 +67,19 @@ namespace llaminar2
         int provided;
         MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
-        // Re-parse arguments (MPI_Init may modify argc/argv)
+        /*
+         * Re-parse arguments because MPI_Init may modify argc/argv. Subcommand
+         * mode is not represented by a required legacy flag, so preserve the
+         * mode selected by the command object across this parser boundary.
+         * Runtime factories and validators must see the same mode that the
+         * command validated before MPI startup.
+         */
+        const bool command_selected_benchmark = config.benchmark_mode;
+        const bool command_selected_server = config.serve_mode;
         OrchestrationConfigParser parser;
         config = parser.parseArgs(argc, argv);
+        config.benchmark_mode = config.benchmark_mode || command_selected_benchmark;
+        config.serve_mode = config.serve_mode || command_selected_server;
 
         auto mpi_ctx = MPIContextFactory::global();
 

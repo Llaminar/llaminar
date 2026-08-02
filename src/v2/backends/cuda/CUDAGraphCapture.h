@@ -28,6 +28,18 @@ namespace llaminar2
         bool endCapture() override;
         bool instantiate() override;
         bool launch() override;
+        [[nodiscard]] bool supportsDeviceControlledWhileLoop() const noexcept override
+        {
+#if CUDART_VERSION >= 12030
+            return true;
+#else
+            return false;
+#endif
+        }
+        using IGPUGraphCapture::buildDeviceControlledWhileLoop;
+        bool buildDeviceControlledWhileLoop(
+            std::span<const IGPUGraphCapture *const> ordered_body_fragments,
+            const DeviceControlledLoopPredicate &predicate) override;
         [[nodiscard]] void *executionStream() const noexcept override
         {
             return static_cast<void *>(stream_);

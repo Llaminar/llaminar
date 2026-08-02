@@ -13,6 +13,7 @@
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
 #include "PerfStatsCollector.h"
+#include "Sha256.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
 
@@ -20,9 +21,12 @@
 #include "../backends/IBackend.h"
 #include "fort.hpp"
 #include <algorithm>
+#include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <print>
 #include <sstream>
+#include <stdexcept>
 #include <mpi.h>
 #include <numeric>
 #include <nlohmann/json.hpp>
@@ -503,6 +507,9 @@ namespace llaminar2
             {"decode_success", result.decode_success},
             {"measurement_iterations", result.measurement_iterations},
             {"warmup_iterations", result.warmup_iterations},
+            {"prompt", {{"source", benchmarkPromptSourceToString(result.prompt_source)},
+                        {"bytes", result.prompt_bytes},
+                        {"sha256", result.prompt_sha256}}},
             {"tokens", {{"prefill", result.prefill_tokens},
                          {"decode", result.decode_tokens},
                          {"total", result.prefill_tokens + result.decode_tokens}}},
@@ -601,6 +608,9 @@ namespace llaminar2
             {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
+        if (!result.prompt_file_path.empty())
+            doc["prompt"]["file_path"] = result.prompt_file_path;
+
         if (config)
         {
             nlohmann::json config_json{
@@ -662,69 +672,157 @@ namespace llaminar2
         return oss.str();
     }
 
+    namespace
+    {
+        /**
+         * @brief Return the stable built-in benchmark corpus.
+         *
+         * This text is intentionally centralized beside prompt resolution so an
+         * omitted prompt has exactly one byte representation and one SHA-256.
+         */
+        std::string builtInBenchmarkPrompt()
+        {
+            return "The following is a comprehensive analysis of machine learning systems "
+                   "and their applications in modern computing environments. "
+                   "We will explore the fundamental concepts, examine practical implementations, "
+                   "and discuss the future directions of this rapidly evolving field. "
+                   "Machine learning has transformed how we approach problem-solving across "
+                   "numerous domains, from natural language processing to computer vision, "
+                   "from autonomous vehicles to medical diagnosis. "
+                   "The key to understanding these systems lies in grasping the underlying "
+                   "mathematical foundations while also appreciating the engineering challenges "
+                   "involved in deploying them at scale. "
+                   "Let us begin our exploration with an overview of the main paradigms: "
+                   "supervised learning, unsupervised learning, and reinforcement learning. "
+                   "Each of these approaches has its own strengths and is suited to different "
+                   "types of problems. In supervised learning, we train models using labeled data, "
+                   "where the correct output is known for each input example. "
+                   "This approach is particularly effective for classification and regression tasks. "
+                   "Unsupervised learning, on the other hand, deals with finding patterns in data "
+                   "without explicit labels. Clustering, dimensionality reduction, and anomaly detection "
+                   "are common applications. Reinforcement learning takes a different approach, "
+                   "where agents learn optimal behaviors through interaction with an environment, "
+                   "receiving rewards or penalties based on their actions. "
+                   "Deep learning, a subset of machine learning, has revolutionized the field "
+                   "by enabling the training of neural networks with many layers. "
+                   "These deep neural networks can learn hierarchical representations of data, "
+                   "automatically extracting features at multiple levels of abstraction. "
+                   "Convolutional neural networks have become the standard for image processing, "
+                   "while recurrent neural networks and transformers excel at sequential data. "
+                   "The transformer architecture, introduced in 2017, has become particularly influential, "
+                   "forming the basis for large language models like GPT, BERT, and LLaMA. "
+                   "These models are trained on vast amounts of text data and can perform "
+                   "a wide range of natural language tasks with impressive accuracy. "
+                   "The training process involves optimizing millions or billions of parameters "
+                   "using gradient descent and backpropagation algorithms. "
+                   "Modern training infrastructure relies on specialized hardware like GPUs and TPUs, "
+                   "distributed computing frameworks, and sophisticated optimization techniques. "
+                   "Transfer learning has emerged as a powerful paradigm, allowing models "
+                   "pre-trained on large datasets to be fine-tuned for specific tasks "
+                   "with relatively little additional data. This approach has democratized "
+                   "access to state-of-the-art AI capabilities for researchers and practitioners "
+                   "who may not have the resources to train large models from scratch. "
+                   "As we look to the future, several exciting developments are on the horizon. "
+                   "Multimodal models that can process text, images, audio, and video together "
+                   "are becoming increasingly sophisticated. Federated learning enables "
+                   "training on distributed data while preserving privacy. "
+                   "Neural architecture search automates the design of optimal network structures. "
+                   "And new hardware accelerators promise to make AI more efficient and accessible. "
+                   "The ethical implications of these technologies cannot be overlooked. "
+                   "Issues of bias, fairness, transparency, and accountability must be addressed "
+                   "as AI systems become more prevalent in society. Responsible AI development "
+                   "requires collaboration between technologists, policymakers, and the public "
+                   "to ensure these powerful tools benefit humanity as a whole.";
+        }
+    } // namespace
+
+    const char *benchmarkPromptSourceToString(BenchmarkPromptSource source) noexcept
+    {
+        switch (source)
+        {
+        case BenchmarkPromptSource::BuiltIn:
+            return "built_in";
+        case BenchmarkPromptSource::Inline:
+            return "inline";
+        case BenchmarkPromptSource::File:
+            return "file";
+        }
+        return "unknown";
+    }
+
+    ResolvedBenchmarkPrompt resolveBenchmarkPrompt(const OrchestrationConfig &config)
+    {
+        const bool has_inline_prompt =
+            config.prompt_was_explicitly_provided || !config.prompt.empty();
+        const bool has_prompt_file =
+            config.benchmark_prompt_file_was_provided ||
+            !config.benchmark_prompt_file_path.empty();
+
+        if (has_inline_prompt && has_prompt_file)
+        {
+            throw std::invalid_argument(
+                "--prompt and --prompt-file are mutually exclusive benchmark prompt sources");
+        }
+
+        ResolvedBenchmarkPrompt resolved;
+        if (has_inline_prompt)
+        {
+            if (config.prompt.empty())
+                throw std::invalid_argument("--prompt must not be empty");
+            resolved.source = BenchmarkPromptSource::Inline;
+            resolved.text = config.prompt;
+        }
+        else if (has_prompt_file)
+        {
+            if (config.benchmark_prompt_file_path.empty())
+                throw std::invalid_argument("--prompt-file path must not be empty");
+
+            resolved.source = BenchmarkPromptSource::File;
+            resolved.file_path = config.benchmark_prompt_file_path;
+            std::ifstream input(resolved.file_path, std::ios::binary);
+            if (!input)
+            {
+                throw std::runtime_error(
+                    "unable to open benchmark prompt file: " + resolved.file_path);
+            }
+
+            resolved.text.assign(
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>());
+            if (input.bad())
+            {
+                throw std::runtime_error(
+                    "failed while reading benchmark prompt file: " + resolved.file_path);
+            }
+            if (resolved.text.empty())
+            {
+                throw std::invalid_argument(
+                    "benchmark prompt file is empty: " + resolved.file_path);
+            }
+        }
+        else
+        {
+            resolved.source = BenchmarkPromptSource::BuiltIn;
+            resolved.text = builtInBenchmarkPrompt();
+        }
+
+        std::string digest_error;
+        const auto digest = sha256BytesHex(resolved.text, &digest_error);
+        if (!digest)
+        {
+            throw std::runtime_error(
+                "failed to authenticate benchmark prompt bytes: " + digest_error);
+        }
+        resolved.sha256 = *digest;
+        return resolved;
+    }
+
     BenchmarkRunner::BenchmarkRunner(
         std::shared_ptr<IInferenceRunner> runner,
         std::shared_ptr<ITokenizer> tokenizer,
         std::shared_ptr<IMPIContext> mpi_ctx)
         : runner_(std::move(runner)), tokenizer_(std::move(tokenizer)), mpi_ctx_(std::move(mpi_ctx))
     {
-    }
-
-    std::string BenchmarkRunner::generateDefaultPrompt() const
-    {
-        // A standardized prompt that tokenizes to ~512 tokens
-        // This is a comprehensive text covering various topics to exercise the model
-        return "The following is a comprehensive analysis of machine learning systems "
-               "and their applications in modern computing environments. "
-               "We will explore the fundamental concepts, examine practical implementations, "
-               "and discuss the future directions of this rapidly evolving field. "
-               "Machine learning has transformed how we approach problem-solving across "
-               "numerous domains, from natural language processing to computer vision, "
-               "from autonomous vehicles to medical diagnosis. "
-               "The key to understanding these systems lies in grasping the underlying "
-               "mathematical foundations while also appreciating the engineering challenges "
-               "involved in deploying them at scale. "
-               "Let us begin our exploration with an overview of the main paradigms: "
-               "supervised learning, unsupervised learning, and reinforcement learning. "
-               "Each of these approaches has its own strengths and is suited to different "
-               "types of problems. In supervised learning, we train models using labeled data, "
-               "where the correct output is known for each input example. "
-               "This approach is particularly effective for classification and regression tasks. "
-               "Unsupervised learning, on the other hand, deals with finding patterns in data "
-               "without explicit labels. Clustering, dimensionality reduction, and anomaly detection "
-               "are common applications. Reinforcement learning takes a different approach, "
-               "where agents learn optimal behaviors through interaction with an environment, "
-               "receiving rewards or penalties based on their actions. "
-               "Deep learning, a subset of machine learning, has revolutionized the field "
-               "by enabling the training of neural networks with many layers. "
-               "These deep neural networks can learn hierarchical representations of data, "
-               "automatically extracting features at multiple levels of abstraction. "
-               "Convolutional neural networks have become the standard for image processing, "
-               "while recurrent neural networks and transformers excel at sequential data. "
-               "The transformer architecture, introduced in 2017, has become particularly influential, "
-               "forming the basis for large language models like GPT, BERT, and LLaMA. "
-               "These models are trained on vast amounts of text data and can perform "
-               "a wide range of natural language tasks with impressive accuracy. "
-               "The training process involves optimizing millions or billions of parameters "
-               "using gradient descent and backpropagation algorithms. "
-               "Modern training infrastructure relies on specialized hardware like GPUs and TPUs, "
-               "distributed computing frameworks, and sophisticated optimization techniques. "
-               "Transfer learning has emerged as a powerful paradigm, allowing models "
-               "pre-trained on large datasets to be fine-tuned for specific tasks "
-               "with relatively little additional data. This approach has democratized "
-               "access to state-of-the-art AI capabilities for researchers and practitioners "
-               "who may not have the resources to train large models from scratch. "
-               "As we look to the future, several exciting developments are on the horizon. "
-               "Multimodal models that can process text, images, audio, and video together "
-               "are becoming increasingly sophisticated. Federated learning enables "
-               "training on distributed data while preserving privacy. "
-               "Neural architecture search automates the design of optimal network structures. "
-               "And new hardware accelerators promise to make AI more efficient and accessible. "
-               "The ethical implications of these technologies cannot be overlooked. "
-               "Issues of bias, fairness, transparency, and accountability must be addressed "
-               "as AI systems become more prevalent in society. Responsible AI development "
-               "requires collaboration between technologists, policymakers, and the public "
-               "to ensure these powerful tools benefit humanity as a whole.";
     }
 
     std::pair<bool, double> BenchmarkRunner::runPrefill(const std::vector<int> &tokens)
@@ -1372,29 +1470,42 @@ namespace llaminar2
             return result;
         };
 
-        // Determine prompt (use default if not provided or empty)
-        std::string prompt = config.prompt;
-        if (prompt.empty() || prompt == "Hello, my name is")
-        {
-            prompt = generateDefaultPrompt();
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("Using default benchmark prompt (~512 tokens)");
-            }
-        }
-
-        // Tokenize prompt (rank 0 only, then broadcast)
+        // Resolve and tokenize on rank 0. Other ranks receive token IDs only,
+        // so a prompt file never needs to exist on every distributed host.
+        std::string prompt;
         std::vector<int> tokens;
         int token_count = 0;
 
         if (mpi_ctx_->rank() == 0)
         {
-            tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
-            token_count = static_cast<int>(tokens.size());
-
-            if (tokens.empty())
+            try
             {
-                LOG_ERROR("Failed to tokenize benchmark prompt");
+                const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
+                prompt = resolved.text;
+                result.prompt_source = resolved.source;
+                result.prompt_file_path = resolved.file_path;
+                result.prompt_bytes = resolved.text.size();
+                result.prompt_sha256 = resolved.sha256;
+
+                LOG_DEBUG("Benchmark prompt source="
+                          << benchmarkPromptSourceToString(resolved.source)
+                          << " bytes=" << resolved.text.size()
+                          << " sha256=" << resolved.sha256);
+
+                tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
+                token_count = static_cast<int>(tokens.size());
+                if (tokens.empty())
+                {
+                    last_failure_reason_ = "benchmark prompt tokenization failed";
+                    LOG_ERROR(last_failure_reason_);
+                    token_count = -1;
+                }
+            }
+            catch (const std::exception &error)
+            {
+                last_failure_reason_ =
+                    std::string("benchmark prompt resolution failed: ") + error.what();
+                LOG_ERROR(last_failure_reason_);
                 token_count = -1;
             }
         }
@@ -1405,17 +1516,35 @@ namespace llaminar2
 
         if (token_count <= 0)
         {
-            last_failure_reason_ = "benchmark prompt tokenization failed";
+            if (last_failure_reason_.empty())
+                last_failure_reason_ = "benchmark prompt resolution or tokenization failed on rank 0";
             return capture_and_return(); // Return empty result on error
         }
         result.prefill_tokens = token_count;
+
+        const bool has_gpu = runner_->primaryDeviceId().is_gpu();
+        const auto &execution_env = debugEnv().execution;
+        if (has_gpu &&
+            execution_env.gpu_graphs &&
+            execution_env.prefill_graph_required &&
+            token_count < execution_env.prefill_graph_min_seq)
+        {
+            last_failure_reason_ =
+                "benchmark prompt has " + std::to_string(token_count) +
+                " tokens, below the required prefill graph admission minimum of " +
+                std::to_string(execution_env.prefill_graph_min_seq) +
+                "; provide a prompt with at least that many tokens";
+            if (mpi_ctx_->rank() == 0)
+                LOG_ERROR(last_failure_reason_);
+            return capture_and_return();
+        }
 
         if (config.max_seq_len > 0 && token_count > config.max_seq_len)
         {
             last_failure_reason_ =
                 "benchmark prompt has " + std::to_string(token_count) +
                 " tokens but context length is " + std::to_string(config.max_seq_len) +
-                "; pass a shorter -p/--prompt or increase -c/--context-length";
+                "; pass a shorter -p/--prompt or --prompt-file, or increase -c/--context-length";
             if (mpi_ctx_->rank() == 0)
             {
                 LOG_ERROR(last_failure_reason_);
@@ -1452,7 +1581,8 @@ namespace llaminar2
                     " total tokens (" + std::to_string(token_count) +
                     " prompt + " + std::to_string(n_decode) +
                     " decode) but context length is " + std::to_string(config.max_seq_len) +
-                    "; reduce -n/--n-predict, pass a shorter -p/--prompt, or increase -c/--context-length";
+                    "; reduce -n/--n-predict, pass a shorter -p/--prompt or --prompt-file, "
+                    "or increase -c/--context-length";
                 if (mpi_ctx_->rank() == 0)
                 {
                     LOG_ERROR(last_failure_reason_);
@@ -1474,7 +1604,6 @@ namespace llaminar2
         // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
         // Only enabled on GPU — CPU has no device-side argmax, so logits must be
         // gathered to host for CPU-side sampling.
-        const bool has_gpu = runner_->primaryDeviceId().is_gpu();
         runner_->setSkipLogitsGatherDecode(has_gpu);
 
         decode_sampling_params_ = SamplingParams{};
@@ -1882,6 +2011,15 @@ namespace llaminar2
         table.column(0).set_cell_text_align(fort::text_align::left);
         table.column(1).set_cell_text_align(fort::text_align::left);
         table.column(2).set_cell_text_align(fort::text_align::right);
+
+        // Input identity is deliberately shown without echoing prompt text.
+        table << "INPUT" << "Prompt source"
+              << benchmarkPromptSourceToString(result.prompt_source) << fort::endr;
+        table << "" << "Prompt bytes" << std::to_string(result.prompt_bytes) << fort::endr;
+        if (!result.prompt_file_path.empty())
+            table << "" << "Prompt file" << result.prompt_file_path << fort::endr;
+        if (!result.prompt_sha256.empty())
+            table << "" << "Prompt SHA-256" << result.prompt_sha256 << fort::endr;
 
         // Prefill results
         if (result.prefill_tokens > 0)

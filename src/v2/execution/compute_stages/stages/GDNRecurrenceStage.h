@@ -210,9 +210,10 @@ namespace llaminar2
          *
          * Prefill graphs capture recurrent-state snapshot buffers by address
          * and read each request's real length from the stable device request
-         * metadata allocation. onGraphReplayed() rebinds the kernel for
-         * publication. Do not clear the verifier workspace binding while a
-         * Ready prefill executable is being preserved.
+         * metadata allocation. Every explicit publication entry point establishes
+         * this stage's verifier-workspace binding before enqueueing its restore
+         * kernel; graph replay itself has no host callback. Do not clear the
+         * verifier workspace binding while a Ready prefill executable is preserved.
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
@@ -285,8 +286,6 @@ namespace llaminar2
             int request_count,
             int request_row_width) const override;
         void clearVerifierStateCaptureBindingAfterPublication() override;
-        void onGraphReplayed() override;
-        bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         /// @brief Allows cold GPU prefill graph preflight before warmup allocates recurrence state.
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.

@@ -276,10 +276,7 @@ namespace
 
             WorkspaceRequirements reqs;
             reqs.buffers.push_back({
-                m > 1
-                    ? GemmWorkspaceBuffers::
-                          GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
-                    : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
+                GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
                 static_cast<size_t>(k_groups) * static_cast<size_t>(rows) *
                     static_cast<size_t>(out_cols) * sizeof(float),
                 256,
@@ -2428,9 +2425,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_CudaSmallMDeclaresGateUpSideStrea
         stage.getWorkspaceRequirements(rows, d_model, intermediate);
 
     const auto *grouped =
-        reqs.find(
-            GemmWorkspaceBuffers::
-                GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     const auto *side_stream =
         reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
 

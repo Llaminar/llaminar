@@ -1232,9 +1232,15 @@ namespace llaminar2::test
             << "Layers may reuse a bounded workspace/stream lane only after the "
                "graph gives each layer a distinct persistent event pair. Event "
                "identity cannot alias across multiple records in one capture.";
-        EXPECT_TRUE(stage0->needsGraphLaunchPreparation());
-        EXPECT_TRUE(stage1->needsGraphLaunchPreparation());
-        EXPECT_TRUE(stage2->needsGraphLaunchPreparation())
+        EXPECT_EQ(
+            stage0->graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly);
+        EXPECT_EQ(
+            stage1->graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly);
+        EXPECT_EQ(
+            stage2->graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly)
             << "Every transfer-backed prefill stage must preflight lane resources "
                "before CUDA/HIP capture begins.";
     }

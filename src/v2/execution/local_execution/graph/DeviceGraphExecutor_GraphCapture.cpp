@@ -28,6 +28,76 @@
 
 namespace llaminar2
 {
+    std::optional<
+        DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+    DeviceGraphExecutor::GraphSegmentCache::deviceLoopGraphTemplate(
+        const ComputeGraph &graph,
+        std::string *error) const
+    {
+        auto reject = [&](const std::string &reason)
+            -> std::optional<DeviceLoopGraphTemplateView>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+        const auto &execution_order = graph.getExecutionOrder();
+        if (execution_order.empty())
+            return reject("source graph has no stages");
+        if (!initialized || needs_capture)
+            return reject("graph cache is not replay-ready");
+        if (segments.size() != 1)
+        {
+            return reject(
+                "graph is segmented: replay_units=" +
+                std::to_string(segments.size()));
+        }
+
+        const GraphSegment &segment = segments.front();
+        if (!segment.capturable || !segment.capture ||
+            !segment.capture->hasExecutable() ||
+            segment.capture->nodeCount() == 0)
+        {
+            return reject("monolithic replay unit has no executable capture");
+        }
+        if (!capture_stream ||
+            segment.capture->executionStream() != capture_stream)
+        {
+            return reject(
+                "captured replay unit has ambiguous producer-stream ownership");
+        }
+        if (segment.stage_names != execution_order)
+        {
+            return reject(
+                "captured replay unit does not cover the complete source graph");
+        }
+        for (const auto &stage_name : execution_order)
+        {
+            const ComputeNode *node = graph.getNode(stage_name);
+            if (!node || !node->stage)
+            {
+                return reject(
+                    "source graph contains an unresolved stage: " + stage_name);
+            }
+            if (node->stage->graphLaunchPreparationPolicy() ==
+                GraphLaunchPreparationPolicy::CaptureAndReplay)
+            {
+                return reject(
+                    "stage requires external preparation before every replay: " +
+                    stage_name);
+            }
+        }
+
+        return DeviceLoopGraphTemplateView{
+            .capture = segment.capture.get(),
+            .stream = capture_stream,
+            .stage_count = segment.stage_names.size(),
+            .captured_node_count = segment.capture->nodeCount(),
+        };
+    }
+
     namespace
     {
         /**
@@ -334,6 +404,38 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphExecutor::GraphSegmentCache::orderStreamAfterCapture(
+        IWorkerGPUContext *ctx,
+        void *consumer_stream)
+    {
+        if (!ctx || !consumer_stream || !capture_stream)
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Capture-stream publication requires one "
+                "context and two explicit streams");
+            return false;
+        }
+        if (consumer_stream == capture_stream)
+            return true;
+        if (!ensureSyncEvent(ctx))
+            return false;
+        if (!ctx->recordEventChecked(sync_event, capture_stream))
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to record capture-stream output "
+                "handoff event");
+            return false;
+        }
+        if (!ctx->waitEventChecked(sync_event, consumer_stream))
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to queue captured-output wait on "
+                "the consumer stream");
+            return false;
+        }
+        return true;
+    }
+
     void DeviceGraphExecutor::GraphSegmentCache::destroySyncEvent()
     {
         if (!sync_event)
@@ -501,7 +603,10 @@ namespace llaminar2
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
-            if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+            if (!node || !node->stage ||
+                !requiresGraphLaunchPreparation(
+                    node->stage->graphLaunchPreparationPolicy(),
+                    GraphLaunchPreparationPhase::Capture))
                 continue;
             if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
             {
@@ -1063,10 +1168,8 @@ namespace llaminar2
             },
             capture_boundary};
 
-        // Capture-phase hooks: same as replay hooks except post_launch skips
-        // onGraphReplayed() callbacks. During capture, execute() already ran
-        // host-side bookkeeping; calling onGraphReplayed() would double-advance
-        // KV cache head positions and corrupt subsequent decode steps.
+        // Capture and replay share the same post-launch lifecycle. All mutable
+        // GPU state is published by captured kernels and explicit event edges.
         const StageRunPolicy capture_phase_policy = StageRunPolicy::capturePhase();
         DeviceGraphCaptureController::ReplayHooks capture_hooks{
             replay_hooks.cohere_inputs,
@@ -1091,8 +1194,7 @@ namespace llaminar2
                     [&](BufferId id, DeviceId device)
                     {
                         mark_arena_write_dirty(id, device);
-                    },
-                    /*skip_replay_callbacks=*/true);
+                    });
             },
             capture_boundary};
 

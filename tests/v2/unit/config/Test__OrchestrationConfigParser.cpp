@@ -1317,6 +1317,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Prompt)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_EQ(config.prompt, "Hello, world!");
+    EXPECT_TRUE(config.prompt_was_explicitly_provided);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_Prompt_LongForm)
@@ -1327,6 +1328,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Prompt_LongForm)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_EQ(config.prompt, "Test prompt");
+    EXPECT_TRUE(config.prompt_was_explicitly_provided);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_NPredict)
@@ -1510,6 +1512,18 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkJsonOutput)
 
     EXPECT_TRUE(config.benchmark_mode);
     EXPECT_EQ(config.benchmark_json_output_path, "/tmp/llaminar-benchmark.json");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkPromptFile)
+{
+    ArgvHelper args{"llaminar2", "--benchmark", "--prompt-file", "/tmp/fixed-prompt.txt"};
+    OrchestrationConfigParser parser;
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.benchmark_mode);
+    EXPECT_TRUE(config.benchmark_prompt_file_was_provided);
+    EXPECT_EQ(config.benchmark_prompt_file_path, "/tmp/fixed-prompt.txt");
 }
 
 // ============================================================================

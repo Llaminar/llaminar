@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -31,5 +32,21 @@ namespace llaminar2
      */
     std::optional<std::string> sha256FileHex(
         const std::filesystem::path &path,
+        std::string *error = nullptr);
+
+    /**
+     * @brief Compute the lowercase hexadecimal SHA-256 digest of in-memory bytes.
+     *
+     * This overload is intended for small runtime identities such as an exact
+     * benchmark prompt. It hashes every byte, including embedded NULs and final
+     * newlines, so diagnostics can prove that two benchmark invocations used
+     * precisely the same input rather than merely the same pathname.
+     *
+     * @param bytes Exact byte range to hash.
+     * @param error Optional diagnostic populated when OpenSSL rejects the hash.
+     * @return Sixty-four lowercase hexadecimal characters on success.
+     */
+    std::optional<std::string> sha256BytesHex(
+        std::string_view bytes,
         std::string *error = nullptr);
 } // namespace llaminar2

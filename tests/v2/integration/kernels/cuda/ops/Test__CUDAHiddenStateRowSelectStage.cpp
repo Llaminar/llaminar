@@ -376,7 +376,9 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedCheckpointReadsResidentPrefill
                  d_model,
                  0)
             .buffers.empty());
-    ASSERT_FALSE(stage.needsGraphLaunchPreparation());
+    ASSERT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
 
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;

@@ -356,10 +356,35 @@ namespace llaminar2
         MTP_CONCAT, ///< Concatenate normalized draft embedding and terminal hidden rows
 
         /**
+         * Captured proposal transaction: optional serial-equivalent branch
+         * penalties followed by deterministic device-slot argmax publication.
+         */
+        MTP_DRAFT_TOKEN_PUBLICATION,
+
+        /**
+         * Captured target-verifier transaction: optional device-history
+         * penalties followed by compact top-k/top-p row construction.
+         */
+        MTP_STOCHASTIC_TARGET_DISTRIBUTION,
+
+        /**
          * Terminal grouped-verifier transaction: device argmax/distribution
          * reduction plus optional mirrored LocalTP outcome publication.
          */
         MTP_VERIFIER_OUTCOME,
+
+        /**
+         * Captured seeded stochastic transaction: sample compact target rows
+         * and reduce them against the materialized verifier input sequence.
+         */
+        MTP_STOCHASTIC_SERIAL_OUTCOME,
+
+        /**
+         * Captured accepted-state transaction: response/controller commit,
+         * main and shifted KV publication, MoE history, penalty history, and
+         * recurrent verifier-row restoration.
+         */
+        MTP_SPEC_STATE_PUBLICATION,
     };
 
     /**
@@ -519,6 +544,45 @@ namespace llaminar2
      * Derived classes implement device-specific kernels while maintaining
      * a common interface for orchestration.
      */
+    /**
+     * @brief Declares when a stage needs work outside its captured graph body.
+     *
+     * Graph launch preparation is deliberately a typed lifecycle contract. A
+     * capture-only stage may initialize persistent streams, import an existing
+     * producer event, or bind a stable device pointer before native capture.
+     * Once captured, that work is represented by the graph and does not have to
+     * be repeated by its launcher. A capture-and-replay stage, by contrast,
+     * publishes mutable metadata from outside the graph before every replay and
+     * therefore cannot be cloned into a fully device-controlled parent loop.
+     */
+    enum class GraphLaunchPreparationPolicy : uint8_t
+    {
+        None,
+        CaptureOnly,
+        CaptureAndReplay,
+    };
+
+    /**
+     * @brief Identifies the lifecycle boundary requesting graph preparation.
+     */
+    enum class GraphLaunchPreparationPhase : uint8_t
+    {
+        Capture,
+        Replay,
+    };
+
+    /**
+     * @brief Return whether @p policy requires work at @p phase.
+     */
+    [[nodiscard]] constexpr bool requiresGraphLaunchPreparation(
+        GraphLaunchPreparationPolicy policy,
+        GraphLaunchPreparationPhase phase) noexcept
+    {
+        return policy == GraphLaunchPreparationPolicy::CaptureAndReplay ||
+               (policy == GraphLaunchPreparationPolicy::CaptureOnly &&
+                phase == GraphLaunchPreparationPhase::Capture);
+    }
+
     class IComputeStage
     {
     public:
@@ -736,7 +800,7 @@ namespace llaminar2
          *   - Weights use direct ITensor* (external, read-only)
          *   - KV caches are out of scope (managed by IKVCache)
          *   - Effective dimensions (M in GEMM) are stage-internal
-         *   - updateDynamicParams/onGraphReplayed remain orthogonal
+         *   - updateDynamicParams remains orthogonal
          *
          * @return StageBufferContract (empty if not migrated)
          */
@@ -1393,10 +1457,9 @@ namespace llaminar2
          * @brief Update prefill replay bookkeeping before a captured graph launch.
          *
          * The executor calls this on cached prefill graph hits before normal
-         * dynamic params are refreshed and before capture/replay callbacks can
-         * run. Decode graph replay continues to use updateDynamicParams() only.
-         * Stages should ignore this unless their dynamic device metadata or
-         * host-side replay callback must distinguish real tokens from padded
+         * dynamic params are refreshed. Decode graph replay continues to use
+         * updateDynamicParams() only. Stages should ignore this unless their
+         * dynamic device metadata must distinguish real tokens from padded
          * bucket rows.
          *
          * @param params Real-token and bucket metadata for the upcoming prefill replay.
@@ -1455,16 +1518,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Prepare mutable device metadata before a captured graph launch.
+         * @brief Prepare stage state outside a captured graph launch.
          *
-         * Device graphs may read tiny metadata buffers whose contents change
-         * between launches while the graph topology stays fixed, such as
-         * row-select indices for bucketed prefill or compact verifier rows.
-         * The executor calls this after it has rebound workspace ownership and
-         * assigned an explicit stream, but before starting capture or replaying
-         * an already captured segment. Implementations may enqueue small
-         * workspace uploads on @p stream, but must not allocate ad-hoc device
-         * memory or synchronize the device.
+         * The executor calls this only at the lifecycle boundaries selected by
+         * graphLaunchPreparationPolicy(), after rebinding workspace ownership
+         * and assigning an explicit stream. Implementations may publish into
+         * persistent workspace or establish event ordering on @p stream, but
+         * must not allocate ad-hoc device memory or synchronize the device.
          *
          * @param ctx Device context for the launch.
          * @param stream Explicit backend stream used for the upcoming launch.
@@ -1479,35 +1539,16 @@ namespace llaminar2
         }
 
         /**
-         * @brief Whether this stage needs prepareGraphLaunch() callbacks.
+         * @brief Declare exactly when prepareGraphLaunch() is required.
          *
-         * Used by graph replay/capture code to avoid calling the hook on every
-         * stage in hot paths.
+         * The default is fully self-contained. Stages that return
+         * CaptureAndReplay are ineligible for device-controlled parent graph
+         * composition until their mutable launch state becomes device-owned.
          */
-        virtual bool needsGraphLaunchPreparation() const { return false; }
-
-        /**
-         * @brief Called after a captured GPU graph segment is replayed.
-         *
-         * This method is invoked by DeviceGraphExecutor after launching a graph segment
-         * containing this stage (Phase 3 replay). It allows stages to perform
-         * host-side bookkeeping that would normally happen inside execute().
-         *
-         * Primary use case: KVCacheAppendStage advances the ring buffer head
-         * position and count after the replayed graph performs the actual GPU append.
-         * This MUST happen AFTER the graph replay (not before in updateDynamicParams)
-         * to preserve the invariant that get_cached_tokens() returns the PREVIOUS
-         * step's count during updateDynamicParams.
-         */
-        virtual void onGraphReplayed() {}
-
-        /**
-         * @brief Returns true if this stage overrides onGraphReplayed().
-         *
-         * Used by DeviceGraphExecutor to precompute a list of stages needing
-         * post-replay callbacks, avoiding per-step hash map lookups.
-         */
-        virtual bool needsOnGraphReplayed() const { return false; }
+        virtual GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const
+        {
+            return GraphLaunchPreparationPolicy::None;
+        }
 
     protected:
         /**

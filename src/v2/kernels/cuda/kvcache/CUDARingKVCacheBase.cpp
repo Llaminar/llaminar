@@ -862,46 +862,6 @@ namespace llaminar2
         {
             *error = "failed to enqueue CUDA KV device sequence-state publication";
         }
-        if (enqueued && mtpKVPublicationDiagnosticsEnabled())
-        {
-            const int seq_idx = request.first_seq_idx;
-            const int idx = seq_idx;
-            int device_head = -1;
-            int device_count = -1;
-            cudaError_t diag_err = cudaMemcpyAsync(
-                &device_head,
-                &d_head_params_[idx],
-                sizeof(int),
-                cudaMemcpyDeviceToHost,
-                static_cast<cudaStream_t>(request.stream));
-            if (diag_err == cudaSuccess)
-            {
-                diag_err = cudaMemcpyAsync(
-                    &device_count,
-                    &d_count_params_[idx],
-                    sizeof(int),
-                    cudaMemcpyDeviceToHost,
-                    static_cast<cudaStream_t>(request.stream));
-            }
-            if (diag_err == cudaSuccess)
-                diag_err = cudaStreamSynchronize(static_cast<cudaStream_t>(request.stream));
-            if (diag_err == cudaSuccess)
-            {
-                LOG_INFO("[MTPPublicationDiagnostics] phase=cuda_kv_sequence_state_publish"
-                         << " first_seq_idx=" << request.first_seq_idx
-                         << " request_count=" << request.request_count
-                         << " layer0_seq0_head_after=" << device_head
-                         << " layer0_seq0_count_after=" << device_count
-                         << " stream=" << request.stream);
-            }
-            else
-            {
-                LOG_ERROR("[MTPPublicationDiagnostics] phase=cuda_kv_sequence_state_publish"
-                          << " diagnostic_copy_failed=" << cudaGetErrorString(diag_err)
-                          << " first_seq_idx=" << request.first_seq_idx
-                          << " request_count=" << request.request_count);
-            }
-        }
         return enqueued;
     }
 

@@ -1015,6 +1015,41 @@ namespace llaminar2
         int leading_committed_output_count,
         int device_idx,
         void *stream);
+    extern "C" bool
+    rocmOps_summarize_speculative_verify_batch_device_generation_controls(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        const int *greedy_draft_tokens,
+        int row_count,
+        const int *first_token,
+        const int *stop_tokens,
+        const int *bonus_token,
+        int has_bonus_token,
+        const int *generation_control,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool
+    rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generation_controls(
+        const int *target_token_ids,
+        const float *target_probs,
+        int target_row_stride,
+        int top_k,
+        int row_count,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
+        const int *verifier_input_tokens,
+        const int *stop_tokens,
+        const int *generation_control,
+        int *sampled_target_tokens,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_summarize_greedy_speculative_verify_batch(
         const int *verify_tokens,
         const int *draft_tokens,
@@ -1053,6 +1088,44 @@ namespace llaminar2
         uint32_t *decode_boundary_advanced,
         int device_idx,
         void *stream);
+    extern "C" bool rocmOps_initialize_device_generation(
+        int request_count,
+        int max_new_tokens,
+        int response_token_stride,
+        int control_stride,
+        int *control,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_prepare_device_generation_transaction_budget(
+        int *control,
+        int control_stride,
+        int request_count,
+        int verifier_row_capacity,
+        const uint32_t *maintenance_rows_remaining,
+        int device_idx,
+        void *stream);
+    extern "C" bool
+    rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
+        const int32_t *compact_tokens,
+        int output_token_stride,
+        int *compact_meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int32_t *response_tokens,
+        int response_token_stride,
+        int *control,
+        int control_stride,
+        int *out_restore_rows,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int *out_next_condition_tokens,
+        int *out_all_drafts_accepted_flags,
+        int *out_stopped_flags,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_derive_speculative_publication_metadata(
         const int *meta,
         int meta_stride,
@@ -1071,13 +1144,12 @@ namespace llaminar2
         int *out_stopped_flags,
         int device_idx,
         void *stream);
-    extern "C" bool rocmOps_derive_shifted_speculative_publication_metadata(
-        const int *meta,
-        int meta_stride,
+    extern "C" bool
+    rocmOps_derive_shifted_speculative_publication_metadata_from_primary(
         const int *base_cached_tokens,
+        const int *main_target_cached_tokens,
+        const int *main_publication_ok,
         int request_count,
-        int padded_state_rows_per_request,
-        int max_state_commit_rows,
         int mtp_depth,
         int *out_target_cached_tokens,
         int *out_accepted_state_counts,
@@ -2277,6 +2349,98 @@ namespace llaminar2
             stream);
     }
 
+    bool ROCmBackend::
+        enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            const void *greedy_draft_tokens_device,
+            int row_count,
+            const void *first_token_device,
+            const void *stop_tokens_device,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device)
+    {
+        const bool has_acceptance_rows = verify_accepted_device != nullptr;
+        const bool has_greedy_rows = greedy_draft_tokens_device != nullptr;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || has_acceptance_rows == has_greedy_rows ||
+            row_count < 0 || !first_token_device || !stop_tokens_device ||
+            (has_bonus_token && !bonus_token_device) ||
+            !generation_control_device ||
+            out_token_capacity < row_count + 1 || !stream ||
+            !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_speculative_verify_batch_device_generation_controls(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            static_cast<const int *>(greedy_draft_tokens_device),
+            row_count,
+            static_cast<const int *>(first_token_device),
+            static_cast<const int *>(stop_tokens_device),
+            static_cast<const int *>(bonus_token_device),
+            has_bonus_token ? 1 : 0,
+            static_cast<const int *>(generation_control_device),
+            static_cast<int *>(out_tokens_device),
+            out_token_capacity,
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::
+        enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            int target_row_stride,
+            int top_k,
+            int row_count,
+            uint64_t threshold_seed,
+            const void *threshold_position_device,
+            int threshold_position_offset,
+            const void *verifier_input_tokens_device,
+            const void *stop_tokens_device,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *sampled_target_tokens_device,
+            void *out_tokens_device,
+            void *out_meta_device)
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return false;
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generation_controls(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            target_row_stride,
+            top_k,
+            row_count,
+            static_cast<unsigned long long>(threshold_seed),
+            static_cast<const int *>(threshold_position_device),
+            threshold_position_offset,
+            static_cast<const int *>(verifier_input_tokens_device),
+            static_cast<const int *>(stop_tokens_device),
+            static_cast<const int *>(generation_control_device),
+            static_cast<int *>(sampled_target_tokens_device),
+            static_cast<int *>(out_tokens_device),
+            out_token_capacity,
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
     bool ROCmBackend::enqueueSummarizeGreedySpeculativeVerifyBatch(
         const void *verify_tokens_device,
         const void *draft_tokens_device,
@@ -2373,7 +2537,7 @@ namespace llaminar2
     }
 
     bool ROCmBackend::enqueueAdvanceSpeculativeCommitBoundary(
-        const void *meta_device,
+        void *meta_device,
         int request_count,
         int meta_stride,
         void *decode_rounds_committed_device,
@@ -2396,13 +2560,133 @@ namespace llaminar2
 
         HipDeviceGuard::setDevice(device_id);
         return rocmOps_advance_speculative_commit_boundary(
-            static_cast<const int *>(meta_device),
+            static_cast<int *>(meta_device),
             request_count,
             meta_stride,
             static_cast<uint32_t *>(decode_rounds_committed_device),
             static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
             static_cast<uint32_t *>(maintenance_due_device),
             static_cast<uint32_t *>(decode_boundary_advanced_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueInitializeDeviceGeneration(
+        int request_count,
+        int max_new_tokens,
+        int response_token_stride,
+        void *response_tokens_device,
+        int control_stride,
+        void *control_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            request_count <= 0 || max_new_tokens <= 0 ||
+            response_token_stride < max_new_tokens ||
+            !response_tokens_device ||
+            control_stride < sampling_math::kDeviceGenerationControlCount ||
+            !control_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_initialize_device_generation(
+            request_count,
+            max_new_tokens,
+            response_token_stride,
+            control_stride,
+            static_cast<int *>(control_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueuePrepareDeviceGenerationTransactionBudget(
+        void *control_device,
+        int control_stride,
+        int request_count,
+        int verifier_row_capacity,
+        const void *maintenance_rows_remaining_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ || !control_device ||
+            control_stride < sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || verifier_row_capacity <= 0 || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_prepare_device_generation_transaction_budget(
+            static_cast<int *>(control_device),
+            control_stride,
+            request_count,
+            verifier_row_capacity,
+            static_cast<const uint32_t *>(maintenance_rows_remaining_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::
+        enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+        const void *output_tokens_device,
+        int output_token_stride,
+        void *meta_device,
+        int meta_stride,
+        const void *base_cached_tokens_device,
+        int request_count,
+        int padded_state_rows_per_request,
+        void *response_tokens_device,
+        int response_token_stride,
+        void *control_device,
+        int control_stride,
+        int device_id,
+        void *stream,
+        void *out_restore_rows_device,
+        void *out_target_cached_tokens_device,
+        void *out_accepted_state_counts_device,
+        void *out_ok_device,
+        void *out_next_condition_tokens_device,
+        void *out_all_drafts_accepted_flags_device,
+        void *out_stopped_flags_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !output_tokens_device || output_token_stride <= 0 ||
+            !meta_device || !base_cached_tokens_device ||
+            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            request_count <= 0 || padded_state_rows_per_request <= 0 ||
+            !response_tokens_device ||
+            response_token_stride <= 0 || !control_device ||
+            control_stride < sampling_math::kDeviceGenerationControlCount ||
+            !out_restore_rows_device || !out_target_cached_tokens_device ||
+            !out_accepted_state_counts_device || !out_ok_device ||
+            !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
+            static_cast<const int32_t *>(output_tokens_device),
+            output_token_stride,
+            static_cast<int *>(meta_device),
+            meta_stride,
+            static_cast<const int *>(base_cached_tokens_device),
+            request_count,
+            padded_state_rows_per_request,
+            static_cast<int32_t *>(response_tokens_device),
+            response_token_stride,
+            static_cast<int *>(control_device),
+            control_stride,
+            static_cast<int *>(out_restore_rows_device),
+            static_cast<int *>(out_target_cached_tokens_device),
+            static_cast<int *>(out_accepted_state_counts_device),
+            static_cast<int *>(out_ok_device),
+            static_cast<int *>(out_next_condition_tokens_device),
+            static_cast<int *>(out_all_drafts_accepted_flags_device),
+            static_cast<int *>(out_stopped_flags_device),
             device_id,
             stream);
     }
@@ -2468,13 +2752,12 @@ namespace llaminar2
             stream);
     }
 
-    bool ROCmBackend::enqueueDeriveShiftedSpeculativePublicationMetadata(
-        const void *meta_device,
-        int meta_stride,
+    bool ROCmBackend::
+        enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
         const void *base_cached_tokens_device,
+        const void *main_target_cached_tokens_device,
+        const void *main_publication_ok_device,
         int request_count,
-        int padded_state_rows_per_request,
-        int max_state_commit_rows,
         int mtp_depth,
         int device_id,
         void *stream,
@@ -2483,12 +2766,10 @@ namespace llaminar2
         void *out_ok_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
-            !meta_device || !base_cached_tokens_device ||
-            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            !base_cached_tokens_device ||
+            !main_target_cached_tokens_device ||
+            !main_publication_ok_device ||
             request_count <= 0 ||
-            padded_state_rows_per_request <= 0 ||
-            max_state_commit_rows < 0 ||
-            max_state_commit_rows > padded_state_rows_per_request ||
             mtp_depth < 0 ||
             !stream ||
             !out_target_cached_tokens_device ||
@@ -2499,13 +2780,11 @@ namespace llaminar2
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        return rocmOps_derive_shifted_speculative_publication_metadata(
-            static_cast<const int *>(meta_device),
-            meta_stride,
+        return rocmOps_derive_shifted_speculative_publication_metadata_from_primary(
             static_cast<const int *>(base_cached_tokens_device),
+            static_cast<const int *>(main_target_cached_tokens_device),
+            static_cast<const int *>(main_publication_ok_device),
             request_count,
-            padded_state_rows_per_request,
-            max_state_commit_rows,
             mtp_depth,
             static_cast<int *>(out_target_cached_tokens_device),
             static_cast<int *>(out_accepted_state_counts_device),

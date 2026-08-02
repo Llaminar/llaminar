@@ -23,6 +23,8 @@
 #include "Sampler.h"
 #include "../execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "../config/OrchestrationConfig.h"
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +33,57 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Origin of the exact text tokenized by a benchmark run.
+     *
+     * The source is part of the benchmark result contract. In particular, an
+     * inline prompt that happens to match an old default sentinel remains an
+     * inline prompt; no prompt value is interpreted as an implicit mode switch.
+     */
+    enum class BenchmarkPromptSource : uint8_t
+    {
+        BuiltIn, ///< No prompt option was supplied; use the stable built-in corpus.
+        Inline,  ///< Prompt bytes came directly from `-p` / `--prompt`.
+        File     ///< Prompt bytes came from `--prompt-file`.
+    };
+
+    /**
+     * @brief Fully resolved, content-addressed benchmark prompt.
+     *
+     * Resolution happens before benchmark timing begins. File input is read in
+     * binary mode so trailing newlines and every other byte remain significant.
+     * The digest lets benchmark artifacts prove that their prompt inputs match
+     * without embedding potentially sensitive prompt text in logs or JSON.
+     */
+    struct ResolvedBenchmarkPrompt
+    {
+        BenchmarkPromptSource source = BenchmarkPromptSource::BuiltIn; ///< Selected source kind.
+        std::string text;      ///< Exact bytes passed to the tokenizer.
+        std::string file_path; ///< User-supplied path for file-backed input.
+        std::string sha256;    ///< SHA-256 of `text`, lowercase hexadecimal.
+    };
+
+    /**
+     * @brief Return the stable diagnostic name for a prompt source.
+     * @param source Source kind to describe.
+     * @return `built_in`, `inline`, or `file`.
+     */
+    const char *benchmarkPromptSourceToString(BenchmarkPromptSource source) noexcept;
+
+    /**
+     * @brief Resolve and authenticate the exact prompt for a benchmark run.
+     *
+     * `--prompt` and `--prompt-file` are mutually exclusive. Empty explicit
+     * input, unreadable files, and failed content authentication throw instead
+     * of silently selecting the built-in corpus.
+     *
+     * @param config Parsed benchmark configuration.
+     * @return Exact prompt bytes together with source and SHA-256 identity.
+     * @throws std::invalid_argument for ambiguous or empty prompt options.
+     * @throws std::runtime_error for file I/O or SHA-256 failures.
+     */
+    ResolvedBenchmarkPrompt resolveBenchmarkPrompt(const OrchestrationConfig &config);
 
     /**
      * @brief Inter-step overhead profiling data from the decode loop.
@@ -55,6 +108,12 @@ namespace llaminar2
     {
         int measurement_iterations = 3; ///< Number of measured benchmark iterations averaged.
         int warmup_iterations = 1;      ///< Number of pre-measurement warmup iterations.
+
+        // Exact benchmark input identity (the prompt text itself is deliberately omitted).
+        BenchmarkPromptSource prompt_source = BenchmarkPromptSource::BuiltIn;
+        std::string prompt_file_path; ///< Source path when `prompt_source == File`.
+        size_t prompt_bytes = 0;      ///< Exact byte count before tokenization.
+        std::string prompt_sha256;    ///< SHA-256 of the exact pre-tokenization bytes.
 
         // Prefill phase
         int prefill_tokens = 0;              ///< Number of tokens in prefill
@@ -169,12 +228,6 @@ namespace llaminar2
         SamplingParams decode_sampling_params_; ///< Sampling params used by orchestrated decodeStep()
         int decode_request_batch_ = 1;          ///< Active logical request batch for MTP benchmark decode.
         std::string last_failure_reason_;
-
-        /**
-         * @brief Generate a default benchmark prompt if none provided
-         * @return A standardized prompt for consistent benchmarking
-         */
-        std::string generateDefaultPrompt() const;
 
         /**
          * @brief Synchronize rank-local success across all benchmark ranks

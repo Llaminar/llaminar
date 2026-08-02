@@ -587,6 +587,70 @@ TEST(Test__ConfigValidator, Consistency_SimpleTP_WithTopology)
 }
 
 // ============================================================================
+// Benchmark Input Tests
+// ============================================================================
+
+TEST(Test__ConfigValidator, BenchmarkPromptSourcesAreMutuallyExclusive)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.prompt = "inline";
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_TRUE(ruleFiresFor(validator, "benchmark-prompt-source-mutex", config));
+}
+
+TEST(Test__ConfigValidator, BenchmarkPromptFileRequiresBenchmarkMode)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_TRUE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-requires-benchmark",
+        config));
+}
+
+TEST(Test__ConfigValidator, ExplicitEmptyBenchmarkPromptFails)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.prompt_was_explicitly_provided = true;
+
+    EXPECT_TRUE(ruleFiresFor(validator, "benchmark-inline-prompt-nonempty", config));
+}
+
+TEST(Test__ConfigValidator, ExplicitEmptyBenchmarkPromptFilePathFails)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.benchmark_prompt_file_was_provided = true;
+
+    EXPECT_TRUE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-path-nonempty",
+        config));
+}
+
+TEST(Test__ConfigValidator, OneNonEmptyBenchmarkPromptSourceIsValid)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_FALSE(ruleFiresFor(validator, "benchmark-prompt-source-mutex", config));
+    EXPECT_FALSE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-requires-benchmark",
+        config));
+}
+
+// ============================================================================
 // Multiple Errors Test (validator collects ALL violations, not just first)
 // ============================================================================
 

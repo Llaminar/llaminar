@@ -2,7 +2,191 @@
 
 This document provides practical guidelines for working with the **Llaminar V2** LLM inference engine, including build processes, testing, debugging, and kernel / MPI / attention development best practices.
 
-**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **RankOrchestrator** (multi-device TP/PP) as execution paths.
+## Non-Negotiable Engineering Maxims
+
+These rules summarize the architecture that Llaminar is converging on. They
+take precedence over stale examples or older compatibility patterns elsewhere
+in the repository. **Fallbacks are forbidden.** Every supported,
+user-selectable mode is a first-class implementation with its own correctness
+and economy gates; no mode may be entered automatically to hide a missing,
+broken, or uneconomical implementation.
+
+### Architecture and Ownership
+
+1. **Implement the target state directly.** Do not add serial replay, host
+   mirrors, eager execution, recapture, oversized timeouts, or capability
+   advertisements to postpone a required production implementation. Finish the
+   implementation or fail hard with a precise diagnostic.
+2. **Give every live value one authority.** GPU execution state is device-owned;
+   CPU execution state is host-owned. Do not maintain an informal host shadow
+   of device state or repair coherence by downloading and re-uploading values.
+3. **Make invalid states unrepresentable.** Put lifecycle, ownership, ordering,
+   and policy in typed interfaces, enums, builders, and RAII scopes. Do not rely
+   on comments, caller discipline, raw state transitions, or source scans when
+   an API can reject the invalid operation.
+4. **Keep model graphs declarative.** Model graph files declare typed placement,
+   sharding, replication, collective, and execution policies. Reusable graph
+   builders and base machinery perform the wiring; model files must not become
+   imperative orchestration scripts.
+5. **Keep graphs per-device and symmetric.** Compute stages are
+   participant-local and cross-device movement is an explicit graph collective.
+   Never create nested multi-device subgraphs or hide rank coordination inside
+   an ordinary compute stage.
+6. **Use one public transfer/coherence authority.** Production callers use
+   `TransferEngine`, arena contracts, and event-aware publication APIs. Direct
+   `transitionTo()`, ad hoc `ensureOnDevice()`, and manual dirty-state mutation
+   are test-only unless an explicitly documented infrastructure boundary owns
+   them.
+7. **Retire replaced machinery completely.** Remove obsolete launchers,
+   entrypoints, generic suites, CLI names, capability checks, and dead code when
+   the replacement is installed. Do not preserve a second path "just in case."
+
+### GPU Execution and Memory
+
+8. **GPU inference is device-resident end to end.** After request admission,
+   planning, sampling, MTP verification, state publication, and loop control
+   stay on device. The ordinary host boundary is one small terminal result.
+   Explicit RAM/SSD KV-cache tiers and initial/final I/O are intentional
+   exceptions, not permission for host-owned execution state.
+9. **Homogeneous GPU execution uses one complete captured graph.** Segmented or
+   eager execution is a hard error for CUDA-only or ROCm-only production cells.
+   Segmentation is permitted only at an explicitly declared heterogeneous
+   device/collective boundary that cannot be represented by one native graph.
+10. **Every GPU operation has an exact non-null stream.** Kernel launches,
+    libraries, copies, memset, events, and publication APIs must reject null or
+    default streams. The producer publishes its exact stream/event and the
+    consumer waits on that event; never guess or substitute an unrelated stream.
+11. **Use events for ordering, never blocking synchronization in the hot path.**
+    No per-stage, per-leaf, per-token, or per-transaction stream/device syncs.
+    Keep the producer/consumer DAG visible in one timeline or fluent graph API.
+12. **No hot-path allocation or transfer.** CUDA/HIP allocation, free, H2D, D2H,
+    host callbacks, temporary workspace construction, and buffer rebinding are
+    forbidden during captured execution. Bind arena- or instance-owned
+    persistent buffers before capture and reuse them.
+13. **Capture identity is complete.** Every embedded pointer, device, workspace
+    generation, geometry, policy scalar, and launch mode belongs in graph-cache
+    identity. Stale or partial identity is a fatal error, never a reason to
+    replay a vaguely compatible graph.
+14. **Request reset resets data, not topology.** Reuse proven captured graphs
+    across requests and publish new device state through explicit ordered
+    lifecycle operations. Do not recapture to avoid proving reset/replay
+    equivalence.
+15. **Share memory according to concurrency.** Graphs that cannot execute
+    concurrently may share arena regions sized for the largest participant;
+    concurrently runnable graphs require exclusive ownership. Validate every
+    arena plan with a buffer/weight capacity BOM.
+16. **Deterministic reductions have a fixed arithmetic order.** Atomics and
+    partition-dependent reductions are forbidden in batch-invariant paths
+    unless byte determinism is concretely proven. Prefer fixed partitions and
+    fixed reduction trees that retain performance without changing arithmetic.
+
+### Correctness and Completeness
+
+17. **Grouped decode means serial-row byte equivalence.** MTP verifier outputs
+    must be bitwise/byte identical to serial decode, not merely close. Row replay
+    may be a diagnostic oracle but must never execute in production.
+18. **Prove the real optimized path.** Correctness tests must exercise production
+    graph capture, collectives, stochastic sampling, dynamic depth, prefix
+    cache, TurboQuant, and optimized kernels. Test-only deterministic modes or
+    disabled optimizations do not certify production.
+19. **Coverage is total, not anecdotal.** Sweep every supported tensor
+    format/codebook and backend, all grouped operations, dense and MoE models,
+    MTP and non-MTP lanes, and representative geometries. Cover M from 1 through
+    the supported range and dispatch totality beyond measured points; likewise
+    cover N/K geometry, codebook, CPU ISA, and every positive thread count.
+20. **Backend symmetry is the default.** CPU, CUDA, and ROCm receive equivalent
+    features, tests, diagnostics, and economical kernels unless hardware makes
+    a difference explicit. A working implementation on one backend exposes a
+    gap on the others; close it rather than silently advertising less support.
+21. **Correctness and economy are simultaneous invariants.** A slow serial-style
+    grouped kernel is not a finished implementation. First establish exact
+    arithmetic, then retain that exactness while making the grouped path
+    genuinely economical.
+22. **Every discovered defect gets a focused regression.** Reproduce flaky
+    failures in a loop (up to 20 iterations when appropriate), reduce them to a
+    focused test, then fold the invariant into the all-format/backend sweep and
+    canonical integration gate.
+
+### Performance and Observability
+
+23. **Measure production binaries and production workloads.** Canonical server
+    E2E and benchmarks use `Release`; `Integration` remains `-O3` with symbols
+    and snapshots. Compare end-to-end behavior with relevant external baselines,
+    not isolated kernel wins alone.
+24. **Profile every new CUDA/HIP kernel.** Use `ncu`/`nsys` or
+    `rocprof`/ISA inspection to report occupancy, registers/VGPRs, spills,
+    throughput, memory efficiency, and launch geometry. Tune until occupancy
+    and throughput are economical; zero spills is the default expectation.
+25. **Profile CPU kernels with the same rigor.** Use `perf`, IPC/cache evidence,
+    physical-core scaling, AVX2/AVX-512 runtime dispatch, and NUMA-aware tests.
+    Work must scale sensibly from one thread through the physical cores per
+    socket; hyperthreads are not the default worker budget.
+26. **PerfStats is the production truth.** Add counters that prove the intended
+    path actually ran, including full graph capture, MTP depth, routing mode,
+    prefix-cache tier, collectives, transfers, and segmentation. E2E tests assert
+    those counters, including no GPU D2H except the terminal result.
+27. **Keep profiling evidence isolated.** Profile one exact kernel/ISA/shape/M
+    candidate per profiler launch and attach that evidence to its timing record.
+    Never contaminate candidate features with unrelated kernels or perturb the
+    canonical timing run with profiler overhead.
+28. **Optimize the feedback loop too.** Long preprocessing, CV, parsing,
+    certification, and corpus adaptation work must use physical-core parallelism
+    or efficient accelerator execution. Persistent buffers, graph capture, and
+    resumable/additive corpora apply to tooling as well as inference.
+
+### Failure, Testing, and Hygiene
+
+29. **Fail fast and fatally.** Missing events, stale generations, null streams,
+    unsupported topology, failed publication, segmented homogeneous replay, or
+    incomplete state are fatal. Do not log a warning and limp onward, retry a
+    different path, or disguise a deadlock with a huge timeout; collectives use
+    the standard 30-second timeout unless a documented protocol requires less.
+30. **Unit tests stay fast and device-free.** GPU work belongs in explicit CUDA
+    and ROCm integration suites. Unit tests should finish in seconds, use shared
+    tensor/arena fixtures, and test interfaces/state machines without loading
+    models or occupying accelerators.
+31. **Test state machines adversarially.** Transfer, KV-cache, prefix-cache,
+    graph-reset, MTP advancement, promotion/demotion, eviction, and multi-stream
+    publication suites should stress interleavings and lifecycle boundaries to
+    destruction, not only verify a happy path.
+32. **Use source sanitizers as architecture tests.** Forbid default streams,
+    blocking syncs, direct coherence transitions, dynamic GPU allocation,
+    host callbacks, row-replay production calls, and other structurally banned
+    patterns. Keep allowlists narrow, named, and limited to true infrastructure.
+33. **Logs are proportional to rarity.** Fatal state is `ERROR`, actionable
+    anomalies are `WARN`, lifecycle summaries are `INFO`, diagnostics are
+    `DEBUG`, and per-token/per-buffer/coherence traffic is `TRACE`. Never let
+    logging create hot-path transfers or synchronization.
+34. **Build and test with the repository's concurrency.** Use Ninja, ccache, and
+    unrestricted `--parallel`; split very large generated kernel families into
+    persistent translation-unit shards when that improves compile throughput.
+    Do not cap ordinary builds/tests to an arbitrary small worker count.
+
+### Code and Documentation
+
+35. **Prefer typed, explicit C++ interfaces.** Use scoped enums, designated
+    initializers, concepts, structured parsers, and fluent builders where they
+    clarify policy. Avoid boolean soups, stringly typed wiring, duplicated mode
+    names, and ad hoc pointer conventions.
+36. **Document ownership and why.** Every touched source file needs a substantive
+    Doxygen file header; public/protected and non-trivial private methods need
+    complete Doxygen; inline comments explain lifecycle, arithmetic order,
+    event edges, invariants, and performance reasoning so a junior developer can
+    follow the implementation.
+37. **Keep workflow docs timeless.** Skills describe stable procedures,
+    commands, gates, and architecture; dashboards/project plans record current
+    progress, measurements, failures, and next steps. Do not turn `SKILL.md` or
+    `AGENTS.md` into a task diary.
+38. **Keep names and docs synchronized.** When modes or CLI options change,
+    update code, tests, help, `README.md`, `AGENTS.md`, project docs, and source
+    sanitizers together. Fully disambiguate execution modes rather than carrying
+    historical aliases indefinitely.
+39. **Keep changes scoped and the tree clean.** Preserve unrelated user edits,
+    avoid incidental rewrites, remove generated debris, and never commit local
+    result directories. Checkpoint meaningful green slices; publish large
+    certified corpora through Git LFS, not ordinary Git blobs.
+
+**Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, a kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **RankOrchestrator** (multi-device TP/PP) as execution paths.
 
 - For a **high-level architecture map** of tensors, kernels, attention, MPI orchestration, and graph execution, see:
     - `.github/instructions/llaminar-architecture-v2.instructions.md`
@@ -31,6 +215,7 @@ Do not copy these skill bodies into framework-specific folders. Add or update
 symlinks instead so Codex, Claude, and GitHub Copilot all read the same content.
 
 ## Table of Contents
+- [Non-Negotiable Engineering Maxims](#non-negotiable-engineering-maxims)
 - [Architecture Overview](#architecture-overview)
 - [Build System](#build-system)
 - [Canonical Runtime Configuration](#canonical-runtime-configuration)
@@ -299,6 +484,14 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
 # Benchmark on a specific CPU socket only
 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cpu:0
 
+# Deterministic inline prompt (the exact text is never replaced by a default)
+./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0 \
+  --prompt "A fixed prompt used for every comparison."
+
+# Deterministic prompt from a text file (preserves every byte and final newline)
+./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0 \
+  --prompt-file benchmarks/prompts/qwen36_mtp_fixed.txt
+
 # With graph-safe PerfStats summary and GPU replay timing
 LLAMINAR_PERF_STATS_SUMMARY=1 LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
   ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
@@ -323,6 +516,8 @@ LLAMINAR_PERF_STATS_SUMMARY=1 LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
 - Separate prefill/decode timing
 - Greedy sampling for reproducibility
 - KV cache cleared between runs
+- Mutually exclusive `--prompt` and `--prompt-file` inputs
+- Prompt source, byte count, and SHA-256 recorded in benchmark JSON
 
 **Example Output**:
 ```
@@ -1227,7 +1422,7 @@ print(worst_routing[["step", "layer", "routing_overlap", "routing_top1_match"]])
 3. **Strategy Pattern**: Generic kernels + format-specific decode via `ITensorGemmTileDataProvider`
 4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
 5. **Performance-conscious allocation/buffer management**: No allocations in the hot path, ever. This is a common mistake! Don't make it. Write into / read from arena buffers or one-time-allocated kernel-owned instance members. Hot path scratch allocations kill performance!!
-6. **Fatal Errors stop execution**: Unrecoverable errors should result in a LOG_ERROR and a hard throw, or a return:false that is verified to propagate up the chain into a hard throw. We never continue blindly with warnings or "fallbacks" in such cases. We fail loud and fail fast!
+6. **Fatal Errors stop execution**: Unrecoverable errors should result in a LOG_ERROR and a hard throw, or a return:false that is verified to propagate up the chain into a hard throw. We never continue blindly with warnings or select an alternate execution path in such cases. We fail loud and fail fast!
 
 ### CRITICAL: Never Use GPU Default/nullptr Streams
 
@@ -2305,7 +2500,7 @@ Before considering a file complete, verify:
 | `LLAMINAR_STAGE_OUTPUT_PRINT_ROWS` | Rows to print (first and last) | 2 |
 | `LLAMINAR_STAGE_OUTPUT_PRINT_STAGES` | Stage names to print (substring match) | `all` |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
-| `LLAMINAR_CPU_PREFILL_PARTICIPATE` | Enable CPU participation in PREFILL phase (Option C fallback for memory-constrained systems) | Disabled |
+| `LLAMINAR_CPU_PREFILL_PARTICIPATE` | Enable the explicit CPU-participating PREFILL mode for memory-constrained systems | Disabled |
 | `LLAMINAR_WEIGHT_STREAMING` | Enable weight streaming for VRAM-constrained systems (Option B) | Disabled |
 | `LLAMINAR_STREAM_MEMORY_MB` | GPU memory budget for weight streaming cache (0 = auto) | 0 |
 | `LLAMINAR_STREAM_PREFETCH_DEPTH` | Layers to prefetch ahead during streaming | 1 |
@@ -2402,12 +2597,14 @@ Include: summary, code changes with paths, test results, performance metrics, ne
 
 ## Conclusion
 
-This project emphasizes production reliability over peak theoretical performance:
+This project treats correctness, explicit ownership, and economy as one
+production contract:
 
-1. **Empirical testing beats theoretical assumptions** - Always measure real performance
-2. **MPI barriers are critical** - Prevent hangs with proper synchronization
-3. **Adaptive approaches work** - Different backends for different problem sizes
-4. **Graceful degradation** - Always have reliable fallback paths
-5. **Threading is complex** - Start simple, optimize incrementally
+1. **Measure rather than assume** - Validate real hardware and real workloads.
+2. **Order rather than synchronize** - Express dependencies with events and graph edges.
+3. **Implement rather than fall back** - Missing production functionality is work to finish.
+4. **Prove rather than advertise** - PerfStats and regression gates certify the actual path.
+5. **Fail rather than limp** - Broken invariants stop execution with a precise error.
 
-When in doubt, prioritize correctness and reliability over raw performance.
+When in doubt, choose the design that makes stale state, hidden host work, and
+arithmetic drift structurally impossible.

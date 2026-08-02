@@ -140,13 +140,6 @@ namespace llaminar2
         bool requiresAllreduce() const override { return true; }
 
         /**
-         * Captured graph replay does not re-enter execute(), so emit the same
-         * allreduce BOM from the replay callback path when perfstats are active.
-         */
-        void onGraphReplayed() override;
-        bool needsOnGraphReplayed() const override;
-
-        /**
          * @brief TP allreduce sidebands reuse buffers declared by producer stages.
          */
         WorkspaceRequirements getWorkspaceRequirements(
@@ -326,9 +319,6 @@ namespace llaminar2
         {
             return CoherencePolicy::OUTPUT;
         }
-        void onGraphReplayed() override;
-        bool needsOnGraphReplayed() const override;
-
         /** @return Immutable operation parameters for graph regressions. */
         [[nodiscard]] const Params &params() const { return params_; }
 

@@ -12,6 +12,8 @@ reps="${LLAMINAR_GPU_MOE_REBALANCE_REPS:-5}"
 context_length="${LLAMINAR_GPU_MOE_REBALANCE_CONTEXT:-1024}"
 n_predict_csv="${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT_LIST:-${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT:-128}}"
 seeds_csv="${LLAMINAR_GPU_MOE_REBALANCE_SEEDS:-}"
+prompt="${LLAMINAR_GPU_MOE_REBALANCE_PROMPT:-}"
+prompt_file="${LLAMINAR_GPU_MOE_REBALANCE_PROMPT_FILE:-}"
 cases_csv="${LLAMINAR_GPU_MOE_REBALANCE_CASES:-static,observe,dynamic,llep,dynamic_hot10}"
 rebalance_window="${LLAMINAR_GPU_MOE_REBALANCE_WINDOW:-64}"
 dry_run=0
@@ -30,7 +32,7 @@ require_prefill_graph="${LLAMINAR_GPU_MOE_REBALANCE_REQUIRE_PREFILL_GRAPH:-1}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--routed-assignment-policy static-owner|least-loaded-resident] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
+Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--prompt TEXT|--prompt-file PATH] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--routed-assignment-policy static-owner|least-loaded-resident] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
 
 Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
@@ -39,9 +41,11 @@ Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   LLEP least-loaded routed assignment
   dynamic ownership + 10% hot expert replicas
 
-Each run uses one homogeneous 2-card LocalTP routed expert domain owned by MPI rank 0:
-  CUDA: cuda:0,cuda:1; backend=nccl; routed_compute=apportioned
-  ROCm: rocm:0,rocm:1; backend=rccl; routed_compute=apportioned
+Each run uses one homogeneous 2-card LocalTP routed expert domain owned by MPI rank 0.
+The emitted domain declaration always states routed compute, phase, and row
+assignment separately. Static/dynamic use apportioned + uniform + static-owner;
+LLEP uses replicated + prefill-apportioned-decode-replicated +
+least-loaded-resident. CUDA uses NCCL and ROCm uses RCCL.
 
 Single-card placement is included for 1x CUDA/ROCm baselines:
   CUDA: -d cuda:0
@@ -52,6 +56,10 @@ LIST is comma-separated, e.g. --cases static,llep,dynamic_hot10.
 Use --n-predict-list 512,1024,2048 and --seeds 101,202,303 to gather a
 decode-length/seed matrix for rebalance policy training. When --seeds is
 omitted, the benchmark's default seed path is used.
+
+Use --prompt for an exact inline benchmark prompt or --prompt-file to read the
+exact prompt bytes from a file. The options are mutually exclusive. Stable
+prompt identity is recorded by the benchmark JSON alongside its SHA-256 digest.
 
 By default rows are clean throughput measurements. Use --perfstats for
 diagnostic JSON/CSV counters including tp_allreduce_bom; use --stage-gpu-stats
@@ -90,10 +98,11 @@ Use --dense-policy to pass an explicit --moe-continuation-dense-policy value,
 for example tensor-parallel-decode-mirrored-embedding. This overrides
 --dense-tp/--dense-decode-replicated for two-card runs.
 
-Use case 'llep' to request LLEP as the first-class rebalance strategy. The
+Use case 'llep' to request LLEP as the first-class maintenance strategy. The
+wrapper also declares the required phase-split row policy explicitly; the
+runtime never infers or rewrites it from --moe-rebalance. The
 --routed-assignment-policy least-loaded-resident option remains available for
-diagnostic runs that need least-loaded row assignment independent of the
-rebalance mode.
+diagnostic non-LLEP runs that need least-loaded row assignment independently.
 
 Use --allreduce-precision fp16|fp32|bf16 to force the collective transport
 precision for diagnostic/performance A/B runs. Omit it to use the model schema's
@@ -157,6 +166,14 @@ while [[ $# -gt 0 ]]; do
     --no-seeds)
       seeds_csv=""
       shift
+      ;;
+    --prompt)
+      prompt="${2:?missing --prompt value}"
+      shift 2
+      ;;
+    --prompt-file)
+      prompt_file="${2:?missing --prompt-file value}"
+      shift 2
       ;;
     --rebalance-window)
       rebalance_window="${2:?missing --rebalance-window value}"
@@ -311,6 +328,11 @@ if [[ "${rebalance_window}" -lt 1 ]]; then
   exit 2
 fi
 
+if [[ -n "${prompt}" && -n "${prompt_file}" ]]; then
+  echo "error: --prompt and --prompt-file are mutually exclusive" >&2
+  exit 2
+fi
+
 case "${allreduce_precision}" in
   ""|default|off) allreduce_precision="" ;;
   fp16|fp32|bf16) ;;
@@ -358,6 +380,15 @@ IFS=',' read -r -a case_names <<< "${cases_csv}"
 for i in "${!case_names[@]}"; do
   case_names[$i]="$(printf '%s' "${case_names[$i]}" | xargs)"
 done
+
+if [[ "${routed_assignment_policy}" == "static-owner" ]]; then
+  for case_name in "${case_names[@]}"; do
+    if [[ "${case_name}" == llep || "${case_name}" == llep_hot10 ]]; then
+      echo "error: LLEP requires routed assignment policy least-loaded-resident" >&2
+      exit 2
+    fi
+  done
+fi
 
 IFS=',' read -r -a n_predict_values <<< "${n_predict_csv}"
 for i in "${!n_predict_values[@]}"; do
@@ -425,7 +456,11 @@ single_device_args() {
 
 twocard_overlay_args() {
   local be="$1"
-  local domain devices collective assignment_suffix
+  local case_name="$2"
+  local domain devices collective
+  local routed_compute="apportioned"
+  local routed_phase="uniform"
+  local routed_assignment="${routed_assignment_policy:-static-owner}"
   case "${be}" in
     cuda)
       domain="qwen36_moe_cuda_hot"
@@ -438,9 +473,11 @@ twocard_overlay_args() {
       collective="rccl"
       ;;
   esac
-  assignment_suffix=""
-  if [[ -n "${routed_assignment_policy}" && "${routed_assignment_policy}" != "static-owner" ]]; then
-    assignment_suffix=";routed_assignment=${routed_assignment_policy}"
+
+  if [[ "${case_name}" == llep || "${case_name}" == llep_hot10 ]]; then
+    routed_compute="replicated"
+    routed_phase="prefill-apportioned-decode-replicated"
+    routed_assignment="least-loaded-resident"
   fi
 
   printf '%s\n' \
@@ -449,7 +486,7 @@ twocard_overlay_args() {
     --moe-routed-expert-base-model-domain "${domain}" \
     --moe-routed-expert-shared-domain "${domain}" \
     --moe-routed-expert-residency static-by-id \
-    --moe-routed-expert-domain "${domain}=${devices};scope=local;backend=${collective};routed_compute=apportioned${assignment_suffix};owner=0" \
+    --moe-routed-expert-domain "${domain}=${devices};scope=local;backend=${collective};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_assignment=${routed_assignment};owner=0" \
     --moe-routed-expert-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
 }
 
@@ -478,7 +515,7 @@ run_one() {
       mapfile -t placement_args < <(single_device_args "${be}")
       ;;
     twocard)
-      mapfile -t placement_args < <(twocard_overlay_args "${be}")
+      mapfile -t placement_args < <(twocard_overlay_args "${be}" "${case_name}")
       ;;
   esac
   mapfile -t rebalance < <(case_args "${case_name}")
@@ -495,6 +532,11 @@ run_one() {
   )
   if [[ -n "${seed_value}" ]]; then
     cmd+=(--seed "${seed_value}")
+  fi
+  if [[ -n "${prompt}" ]]; then
+    cmd+=(--prompt "${prompt}")
+  elif [[ -n "${prompt_file}" ]]; then
+    cmd+=(--prompt-file "${prompt_file}")
   fi
   local dense_tp_enabled=0
   local dense_decode_replicated_enabled=0

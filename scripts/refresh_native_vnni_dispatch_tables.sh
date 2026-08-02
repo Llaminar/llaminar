@@ -1599,6 +1599,59 @@ sha256_file_set() {
   sha256sum "$@" | sha256sum | awk '{print "sha256:" $1}'
 }
 
+validate_cuda_native_vnni_gemv_physical_shards() {
+  local gemm_dir="${repo_root}/src/v2/kernels/cuda/gemm"
+  local cmake_path="${repo_root}/src/v2/CMakeLists.txt"
+  local source_name source_count shard
+  local -a compiled_sources=("CUDANativeVNNIGemvDispatch.cu")
+
+  for shard in {0..7}; do
+    compiled_sources+=("CUDANativeVNNIGemvShard${shard}.cu")
+  done
+
+  for source_name in \
+    "CUDANativeVNNIGemvShard.h" \
+    "CUDANativeVNNIGemvShardImpl.cu.inc" \
+    "${compiled_sources[@]}"; do
+    if [[ ! -f "${gemm_dir}/${source_name}" ]]; then
+      echo "error: CUDA NativeVNNI GEMV physical shard artifact is missing: ${source_name}" >&2
+      exit 2
+    fi
+  done
+
+  for source_name in "${compiled_sources[@]}"; do
+    source_count="$(grep -F -c \
+      "kernels/cuda/gemm/${source_name}" "${cmake_path}" || true)"
+    if [[ "${source_count}" != "1" ]]; then
+      echo "error: CUDA NativeVNNI GEMV source ${source_name} must appear exactly once in CMake (found ${source_count})" >&2
+      exit 2
+    fi
+  done
+
+  if grep -F -q "CUDANativeVNNIGemvTuned.cu" "${cmake_path}"; then
+    echo "error: retired monolithic CUDA NativeVNNI GEMV source returned to CMake" >&2
+    exit 2
+  fi
+}
+
+cuda_native_vnni_serial_policy_hash() {
+  local gemm_dir="${repo_root}/src/v2/kernels/cuda/gemm"
+  sha256_file_set \
+    "${gemm_dir}/CUDANativeVNNIGemvDispatch.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard.h" \
+    "${gemm_dir}/CUDANativeVNNIGemvShardImpl.cu.inc" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard0.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard1.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard2.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard3.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard4.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard5.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard6.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvShard7.cu" \
+    "${gemm_dir}/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc" \
+    "${gemm_dir}/CUDANativeVNNIDecodeCommon.cuh"
+}
+
 cpu_serial_arithmetic_contract_hash() {
   python3 - "${cpu_serial_arithmetic_contract_path}" <<'PY'
 import json
@@ -4625,6 +4678,7 @@ write_cuda_measurement_context() {
 }
 
 refresh_cuda() {
+  validate_cuda_native_vnni_gemv_physical_shards
   begin_backend_collection_target "CUDA"
   require_executable "${cuda_sweep_bin}"
   validate_cuda_measurement_devices
@@ -4647,10 +4701,7 @@ refresh_cuda() {
     cuda_arch_class="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 | first_output_line | tr -d '.')"
     cuda_device_name="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | first_output_line)"
     cuda_driver_runtime="driver-$(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i 0 | first_output_line)-cuda-$(/usr/local/cuda/bin/nvcc --version | awk '/release/ && !printed {gsub(",", "", $5); print $5; printed=1}')"
-    cuda_serial_policy_hash="$(sha256_file_set \
-      "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu" \
-      "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc" \
-      "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh")"
+    cuda_serial_policy_hash="$(cuda_native_vnni_serial_policy_hash)"
   fi
 
   # A fresh seal belongs to the currently built trainer even when an audited
@@ -5159,10 +5210,7 @@ PY
       cmake --build "${repo_root}/build_v2_release" --parallel \
         --target v2_perf_cuda_native_vnni_decode_trainer
       staged_build_id="$(sha256_file_set "${cuda_sweep_bin}")"
-      staged_serial_policy_hash="$(sha256_file_set \
-        "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu" \
-        "${cuda_source_include}" \
-        "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh")"
+      staged_serial_policy_hash="$(cuda_native_vnni_serial_policy_hash)"
     fi
 
     if (( ! skip_sweep )); then

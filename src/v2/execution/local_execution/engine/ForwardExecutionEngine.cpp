@@ -1510,6 +1510,22 @@ namespace llaminar2
         return viewForLastExecutedForwardGraphState(last_all_position_verifier_graph_);
     }
 
+    std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>
+    ForwardExecutionEngine::lastExecutedDeviceLoopGraphTemplate(
+        std::string *error) const
+    {
+        return deviceLoopGraphTemplateForState(
+            last_executed_forward_graph_, error);
+    }
+
+    std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>
+    ForwardExecutionEngine::lastAllPositionVerifierDeviceLoopGraphTemplate(
+        std::string *error) const
+    {
+        return deviceLoopGraphTemplateForState(
+            last_all_position_verifier_graph_, error);
+    }
+
     void ForwardExecutionEngine::clearLastAllPositionVerifierForwardGraph()
     {
         last_all_position_verifier_graph_ = {};
@@ -1536,6 +1552,59 @@ namespace llaminar2
         view.cache_hit = state.cache_hit;
         view.is_decode = view.signature.decode;
         view.all_position_logits = view.signature.all_position_logits;
+        return view;
+    }
+
+    std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>
+    ForwardExecutionEngine::deviceLoopGraphTemplateForState(
+        const LastExecutedForwardGraphState &state,
+        std::string *error) const
+    {
+        auto reject = [&](const std::string &reason)
+            -> std::optional<DeviceLoopGraphTemplateView>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+        if (!state.valid)
+            return reject("no successful forward graph is retained");
+
+        const auto cache_it = cache_.find(state.signature);
+        if (cache_it == cache_.end() || !cache_it->second.valid ||
+            !cache_it->second.graph)
+        {
+            return reject("retained forward graph no longer owns a valid cache entry");
+        }
+
+        const ForwardGraphCache &cache = cache_it->second;
+        if (!state.signature.device.is_gpu() || !state.signature.decode)
+            return reject("device-loop composition requires a GPU decode graph");
+        if (!state.signature.uses_device_token_ids ||
+            !state.signature.uses_device_position_ids)
+        {
+            return reject(
+                "device-loop composition requires device-owned token and position rows");
+        }
+        if (!cache.phase3_active)
+        {
+            return reject("forward graph is not replay-ready");
+        }
+        std::string template_error;
+        const auto template_view = cache.segment_cache.deviceLoopGraphTemplate(
+            *cache.graph,
+            &template_error);
+        if (!template_view)
+            return reject(template_error);
+        DeviceLoopGraphTemplateView view;
+        view.capture = template_view->capture;
+        view.signature = state.signature;
+        view.device = state.signature.device;
+        view.stream = template_view->stream;
+        view.stage_count = template_view->stage_count;
+        view.captured_node_count = template_view->captured_node_count;
         return view;
     }
 
@@ -2007,20 +2076,6 @@ namespace llaminar2
             forward_cache.dynamic_param_stages_cached = true;
         }
 
-        // Cache replay callback stages (KVCacheAppend, MoERouting, etc.)
-        // Called after monolithic graph replay to advance host-side metadata.
-        if (!forward_cache.replay_callback_stages_cached)
-        {
-            forward_cache.replay_callback_stages.clear();
-            const auto &order = forward_cache.graph->getExecutionOrder();
-            for (const auto &node_name : order)
-            {
-                ComputeNode *node = forward_cache.graph->getNode(node_name);
-                if (node && node->stage && node->stage->needsOnGraphReplayed())
-                    forward_cache.replay_callback_stages.push_back(node->stage.get());
-            }
-            forward_cache.replay_callback_stages_cached = true;
-        }
         if (!forward_cache.prefill_replay_param_stages_cached)
         {
             forward_cache.prefill_replay_param_stages.clear();
@@ -2805,13 +2860,16 @@ namespace llaminar2
         };
 
         auto preparePrefillGraphLaunchMetadata = [&](void *stream,
+                                                     GraphLaunchPreparationPhase phase,
                                                      const char *phase_name) -> bool
         {
             const auto &order = forward_cache.graph->getExecutionOrder();
             for (const auto &node_name : order)
             {
                 ComputeNode *node = forward_cache.graph->getNode(node_name);
-                if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+                if (!node || !node->stage ||
+                    !requiresGraphLaunchPreparation(
+                        node->stage->graphLaunchPreparationPolicy(), phase))
                     continue;
 
                 /*
@@ -2880,7 +2938,10 @@ namespace llaminar2
             }
             bindPrefillStreamToStages(stream);
 
-            if (!preparePrefillGraphLaunchMetadata(stream, "replay"))
+            if (!preparePrefillGraphLaunchMetadata(
+                    stream,
+                    GraphLaunchPreparationPhase::Replay,
+                    "replay"))
                 return false;
 
             if (!launchPrefillGraph(gpu_ctx, stream, "replay", PrefillGraphPhase::Ready, "replay", "none"))
@@ -2888,10 +2949,6 @@ namespace llaminar2
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
                 return false;
             }
-
-            // Post-replay callbacks (KV cache head advance, histogram boundaries)
-            for (auto *stage : forward_cache.replay_callback_stages)
-                stage->onGraphReplayed();
 
             if (!publishPrefillCapturedTerminalState(
                     stream,
@@ -2965,7 +3022,10 @@ namespace llaminar2
              * Warmup -> Capture transition.
              */
             bindPrefillStreamToStages(stream);
-            if (!preparePrefillGraphLaunchMetadata(stream, "capture"))
+            if (!preparePrefillGraphLaunchMetadata(
+                    stream,
+                    GraphLaunchPreparationPhase::Capture,
+                    "capture"))
                 return false;
             if (!executor_.prepareSnapshotsForGraphCapture(
                     *forward_cache.graph,
@@ -3065,16 +3125,6 @@ namespace llaminar2
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph launch-after-capture failed for seq_len=" << input.seq_len);
                 return false;
-            }
-
-            // KV append stages advanced host metadata while recording so later
-            // captured stages could read the just-appended cache view. The
-            // immediate launch-after-capture must not advance those entries
-            // again; normal Ready-phase replay still runs every callback.
-            for (auto *stage : forward_cache.replay_callback_stages)
-            {
-                if (stage && stage->type() != ComputeStageType::KV_CACHE_APPEND)
-                    stage->onGraphReplayed();
             }
 
             if (!publishPrefillCapturedTerminalState(

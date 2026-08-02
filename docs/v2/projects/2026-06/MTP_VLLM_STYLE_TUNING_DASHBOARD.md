@@ -49,8 +49,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Release CUDA2 and ROCm2 each pass all eight Dynamic/LLEP cells and `166/166`
   checks through 2048 tokens. PerfStats prove full capture, device verification,
   movement, clean shutdown, and VRAM release.
-- GPU logits ownership is request-persistent. Fatal host-access guards prevent
-  stale mirrors; only the final 4-byte sampled token crosses to the host.
+- Captured stochastic target preparation and draft publication are byte-exact
+  across every fixed depth/policy on CUDA and ROCm. Both are strict device
+  graphs with exact producer streams and no eager production route.
 - Canonical Release CUDA2 LLEP stochastic d4..15 plus RAM-prefix E2E is
   `23/23` green at 4096 context/1024 output tokens. PerfStats proves complete
   capture, no segmentation, device verification, real movement, prefix reuse,
@@ -71,16 +72,17 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Deterministic MoE route planner: CUDA `3.392 us` versus `22.212 us`
   (`6.55x`), 31 registers and zero spills; ROCm `11.2 us`, 16 VGPR, 33 SGPR,
   1.25 KiB LDS, zero scratch/spills.
-- Removing the invalid shared-expert allreduce improved the production CUDA2
-  LLEP stochastic lane from `15.368` to `27.790 tok/s` decode (`+80.8%`), with
-  `4030.44 tok/s` prefill. It remains only 16.2% of llama.cpp d3 decode.
+- Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
+  40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
+  32 SGPR, zero scratch, and 90.6% VALU utilization.
+- Current CUDA2 LLEP d3 stochastic baseline is `80.34 tok/s` decode and
+  `90.84 tok/s` prefill at 65.87% acceptance. Per-transaction host outcome
+  observation is 62% of decode wall and is the active removal target.
 - Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
   `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
   communication baseline; the dynamic depth controller is a later tuning lane.
-- Participant-local overlay preparation removed duplicate cross-GPU repacking:
-  graph build fell `61.3 -> 36.5 s`, per-GPU jobs `32129 -> 16385`, and source
-  bytes `15.74 -> 9.14 GB`. Missing frozen bindings now fail instead of reading
-  another participant's mutable cache.
+- Participant-local overlay preparation cut graph build `61.3 -> 36.5 s`, jobs
+  `32129 -> 16385`, and source bytes `15.74 -> 9.14 GB`; bindings fail closed.
 - On this non-P2P RTX 3090 topology, graph-captured NCCL rooted
   reduce+broadcast at verifier `M=5` costs about `941 us/layer`; collective
   count, payload, and overlap are the immediate Nsight economy targets.

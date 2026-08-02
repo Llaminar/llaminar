@@ -272,7 +272,9 @@ TEST(Test__HiddenStateRowSelectStage, FixedDeviceRowHasNoReplayOrScalarWorkspace
 
     HiddenStateRowSelectStage gpu_stage(gpu_params);
     EXPECT_FALSE(gpu_stage.hasPrefillReplayParams());
-    EXPECT_FALSE(gpu_stage.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        gpu_stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
     EXPECT_TRUE(
         gpu_stage.getWorkspaceRequirements(seq_len, d_model, 0)
             .buffers.empty());
@@ -311,7 +313,9 @@ TEST(Test__HiddenStateRowSelectStage, DeviceResidentRequestLengthHasNoHostReplay
         stage.requestSequenceLengthDeviceForTesting(),
         request_length_device);
     EXPECT_FALSE(stage.hasPrefillReplayParams());
-    EXPECT_FALSE(stage.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
     EXPECT_TRUE(
         stage.getWorkspaceRequirements(
                  params.seq_len,
@@ -385,14 +389,16 @@ TEST(Test__HiddenStateRowSelectStage, UsesExplicitStableWorkspaceBufferName)
     EXPECT_EQ(after.buffers[0].name, "mtp_terminal_hidden_selected_row");
 }
 
-TEST(Test__HiddenStateRowSelectStage, GPUStagesOptIntoGraphLaunchPreparation)
+TEST(Test__HiddenStateRowSelectStage, GraphLaunchPreparationPolicyIsExplicit)
 {
     HiddenStateRowSelectStage::Params single_gpu_params;
     single_gpu_params.device_id = DeviceId::cuda(0);
     single_gpu_params.seq_len = 8;
     single_gpu_params.d_model = 32;
     HiddenStateRowSelectStage single_gpu(single_gpu_params);
-    EXPECT_TRUE(single_gpu.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        single_gpu.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
 
     HiddenStateRowsSelectStage::Params multi_gpu_params;
     multi_gpu_params.device_id = DeviceId::rocm(0);
@@ -400,14 +406,18 @@ TEST(Test__HiddenStateRowSelectStage, GPUStagesOptIntoGraphLaunchPreparation)
     multi_gpu_params.d_model = 32;
     multi_gpu_params.selected_row_count = 3;
     HiddenStateRowsSelectStage multi_gpu(multi_gpu_params);
-    EXPECT_TRUE(multi_gpu.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        multi_gpu.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
 
     HiddenStateRowSelectStage::Params cpu_params;
     cpu_params.device_id = DeviceId::cpu();
     cpu_params.seq_len = 8;
     cpu_params.d_model = 32;
     HiddenStateRowSelectStage cpu_stage(cpu_params);
-    EXPECT_FALSE(cpu_stage.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        cpu_stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
 }
 
 TEST(Test__HiddenStateRowSelectStage, LMHeadUsesScratchOffsetZeroWhenSelectedRowChanges)

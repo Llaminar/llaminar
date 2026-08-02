@@ -1,6 +1,6 @@
 /**
- * @file CUDANativeVNNIGemvTuned.cu
- * @brief Tuned CUDA native-vnni GEMV kernels for decode (M=1).
+ * @file CUDANativeVNNIGemvShardImpl.cu.inc
+ * @brief Physical CUDA NativeVNNI GEMV shard implementation.
  *
  * Three shape-specific kernel families:
  *   - **Wide**:     N >> K  (LM_Head only, N/K >= 44) — TILE_N columns per CTA, shared-memory A broadcast
@@ -41,6 +41,78 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+
+#ifndef LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD
+#error "CUDANativeVNNIGemvShardImpl.cu.inc requires a physical shard index"
+#endif
+
+#if LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD < 0 || \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD > 7
+#error "CUDA NativeVNNI GEMV shard index must be in [0, 7]"
+#endif
+
+#ifndef LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL
+#error "CUDA NativeVNNI GEMV shard must define its external symbol mapper"
+#endif
+
+#ifndef LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK
+#error "CUDA NativeVNNI GEMV shard must declare its two owned codebooks"
+#endif
+
+/*
+ * Every physical shard compiles the same implementation surface but exports a
+ * disjoint internal ABI. The thin dispatcher is the sole owner of the public
+ * names. Keeping this mapping here means a policy include refresh can change
+ * decisions without changing, regenerating, or collapsing the build topology.
+ */
+#define cudaNativeVNNIGemvTuned_supportsCodebook \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_supportsCodebook)
+#define cudaNativeVNNIGemvTuned_queryGeneratedDispatch \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryGeneratedDispatch)
+#define cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule)
+#define cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs)
+#define cudaNativeVNNIGemvTuned_fp32 \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fp32)
+#define cudaNativeVNNIGemvTuned_small_m_fp32 \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_small_m_fp32)
+#define cudaNativeVNNIInitIQGridTables_tuned \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIInitIQGridTables_tuned)
+#define cudaNativeVNNIGemvSweep_setConfig \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvSweep_setConfig)
+#define cudaNativeVNNIGemvSweep_clearConfig \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvSweep_clearConfig)
+#define cudaNativeVNNIGemvSweep_setGroupedRows \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvSweep_setGroupedRows)
+#define cudaNativeVNNIGroupedVerifier_setTensorCoreOverride \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGroupedVerifier_setTensorCoreOverride)
+#define cudaNativeVNNIGemvSweep_isActive \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvSweep_isActive)
+#define cudaNativeVNNIGemvTuned_clearStaticState \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_clearStaticState)
+#define cudaGemvContext_create \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaGemvContext_create)
+#define cudaGemvContext_destroy \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaGemvContext_destroy)
+#define cudaGemvContext_bindWorkspace \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaGemvContext_bindWorkspace)
+#define cudaRowMajorWeights_create \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaRowMajorWeights_create)
+#define cudaRowMajorWeights_createForCodebook \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaRowMajorWeights_createForCodebook)
+#define cudaNativeVNNIGemvTuned_policyRequiresRowMajor \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_policyRequiresRowMajor)
+#define cudaRowMajorWeights_destroy \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaRowMajorWeights_destroy)
+#define cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config)
+#define cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config)
+#define cudaNativeVNNIGemvTuned_setSerialPartitionN \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_setSerialPartitionN)
+#define cudaNativeVNNIGemvTuned_getSerialPartitionN \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_getSerialPartitionN)
 
 static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
 static thread_local int g_cuda_native_vnni_serial_partition_n = 0;
@@ -312,22 +384,8 @@ namespace
                 graph_captured, m, n, k, shape, tuning)
         switch (codebook_id)
         {
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(0);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(4);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(5);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(6);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(7);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(8);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(9);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(10);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(11);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(12);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(13);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(14);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(15);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(16);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(17);
-            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(19);
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK);
         default:
             return false;
         }
@@ -3057,6 +3115,26 @@ namespace
         return false;
     }
 
+    /** Return the secondary-scale/minimum plane only for formats that own it. */
+    template <uint8_t CB>
+    const uint16_t *secondaryPlaneForCodebook(const uint16_t *d_mins)
+    {
+        using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CB>;
+        if constexpr (Traits::is_asymmetric || Traits::is_dual_scale)
+            return d_mins;
+        return nullptr;
+    }
+
+    /** Return the packed asymmetric-minimum plane only for Q2_K. */
+    template <uint8_t CB>
+    const uint32_t *extendedMinimumPlaneForCodebook(const uint32_t *d_emins)
+    {
+        using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CB>;
+        if constexpr (Traits::is_dual_scale_asym)
+            return d_emins;
+        return nullptr;
+    }
+
     bool dispatchSmallMByCodebook(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
@@ -3077,38 +3155,18 @@ namespace
     {
         switch (codebook_id)
         {
-        case 0:
-            return dispatchCodebookSmallMRowPar<0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 4:
-            return dispatchCodebookSmallMRowPar<4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 5:
-            return dispatchCodebookSmallMRowPar<5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 6:
-            return dispatchCodebookSmallMRowPar<6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 7:
-            return dispatchCodebookSmallMRowPar<7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 8:
-            return dispatchCodebookSmallMRowPar<8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 9:
-            return dispatchCodebookSmallMRowPar<9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 10:
-            return dispatchCodebookSmallMRowPar<10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 11:
-            return dispatchCodebookSmallMRowPar<11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 12:
-            return dispatchCodebookSmallMRowPar<12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 13:
-            return dispatchCodebookSmallMRowPar<13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 14:
-            return dispatchCodebookSmallMRowPar<14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 15:
-            return dispatchCodebookSmallMRowPar<15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 16:
-            return dispatchCodebookSmallMRowPar<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 17:
-            return dispatchCodebookSmallMRowPar<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 19:
-            return dispatchCodebookSmallMRowPar<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+#define LLAMINAR_DISPATCH_CUDA_NVNNI_SMALL_M(CODEBOOK)                  \
+        case CODEBOOK:                                                  \
+            return dispatchCodebookSmallMRowPar<CODEBOOK>(              \
+                d_A_int8, d_payload, d_scales,                           \
+                secondaryPlaneForCodebook<CODEBOOK>(d_mins),            \
+                extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
+                d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,       \
+                d_C_existing, d_bias, gemv_ctx, rm_slot,                \
+                cuda_device_id, cuda_stream)
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_DISPATCH_CUDA_NVNNI_SMALL_M);
+#undef LLAMINAR_DISPATCH_CUDA_NVNNI_SMALL_M
         default:
             return false;
         }
@@ -3279,22 +3337,10 @@ extern "C"
     {
         switch (codebook_id)
         {
-        case 0:
-        case 4:
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
-        case 12:
-        case 13:
-        case 14:
-        case 15:
-        case 16:
-        case 17:
-        case 19:
+#define LLAMINAR_SUPPORT_CUDA_NVNNI_CODEBOOK(CODEBOOK) case CODEBOOK:
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_SUPPORT_CUDA_NVNNI_CODEBOOK)
+#undef LLAMINAR_SUPPORT_CUDA_NVNNI_CODEBOOK
             return true;
         default:
             return false;
@@ -3449,22 +3495,8 @@ extern "C"
                 out_checksum)
         switch (codebook_id)
         {
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(0);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(4);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(5);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(6);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(7);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(8);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(9);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(10);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(11);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(12);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(13);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(14);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(15);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(16);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(17);
-            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(19);
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK);
         default:
             return -1.0;
         }
@@ -3506,38 +3538,18 @@ extern "C"
 
         switch (codebook_id)
         {
-        case 0:
-            return dispatchCodebook<0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 4:
-            return dispatchCodebook<4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 5:
-            return dispatchCodebook<5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 6:
-            return dispatchCodebook<6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 7:
-            return dispatchCodebook<7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 8:
-            return dispatchCodebook<8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 9:
-            return dispatchCodebook<9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 10:
-            return dispatchCodebook<10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 11:
-            return dispatchCodebook<11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 12:
-            return dispatchCodebook<12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 13:
-            return dispatchCodebook<13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 14:
-            return dispatchCodebook<14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 15:
-            return dispatchCodebook<15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 16:
-            return dispatchCodebook<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 17:
-            return dispatchCodebook<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
-        case 19:
-            return dispatchCodebook<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+#define LLAMINAR_DISPATCH_CUDA_NVNNI_M1(CODEBOOK)                       \
+        case CODEBOOK:                                                  \
+            return dispatchCodebook<CODEBOOK>(                           \
+                d_A_int8, d_payload, d_scales,                           \
+                secondaryPlaneForCodebook<CODEBOOK>(d_mins),            \
+                extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
+                d_C_fp32, d_scales_A_block, N, K, alpha, beta,          \
+                d_C_existing, d_bias, gemv_ctx, rm_slot,                \
+                cuda_device_id, cuda_stream)
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_DISPATCH_CUDA_NVNNI_M1);
+#undef LLAMINAR_DISPATCH_CUDA_NVNNI_M1
         default:
             return false;
         }
@@ -3839,22 +3851,8 @@ extern "C"
                 device_id, stream)
         switch (codebook_id)
         {
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(0);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(4);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(5);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(6);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(7);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(8);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(9);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(10);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(11);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(12);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(13);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(14);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(15);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(16);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(17);
-            LLAMINAR_CREATE_CUDA_ROW_MAJOR(19);
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_CREATE_CUDA_ROW_MAJOR);
         default:
             return nullptr;
         }
@@ -3933,3 +3931,28 @@ extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN()
 {
     return g_cuda_native_vnni_serial_partition_n;
 }
+
+#undef cudaNativeVNNIGemvTuned_supportsCodebook
+#undef cudaNativeVNNIGemvTuned_queryGeneratedDispatch
+#undef cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule
+#undef cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs
+#undef cudaNativeVNNIGemvTuned_fp32
+#undef cudaNativeVNNIGemvTuned_small_m_fp32
+#undef cudaNativeVNNIInitIQGridTables_tuned
+#undef cudaNativeVNNIGemvSweep_setConfig
+#undef cudaNativeVNNIGemvSweep_clearConfig
+#undef cudaNativeVNNIGemvSweep_setGroupedRows
+#undef cudaNativeVNNIGroupedVerifier_setTensorCoreOverride
+#undef cudaNativeVNNIGemvSweep_isActive
+#undef cudaNativeVNNIGemvTuned_clearStaticState
+#undef cudaGemvContext_create
+#undef cudaGemvContext_destroy
+#undef cudaGemvContext_bindWorkspace
+#undef cudaRowMajorWeights_create
+#undef cudaRowMajorWeights_createForCodebook
+#undef cudaNativeVNNIGemvTuned_policyRequiresRowMajor
+#undef cudaRowMajorWeights_destroy
+#undef cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config
+#undef cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config
+#undef cudaNativeVNNIGemvTuned_setSerialPartitionN
+#undef cudaNativeVNNIGemvTuned_getSerialPartitionN

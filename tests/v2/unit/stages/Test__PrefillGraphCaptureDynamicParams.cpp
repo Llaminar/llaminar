@@ -8,7 +8,7 @@
  * 3. Prelaunch token upload succeeds under graph capture (ROCm)
  * 4. Missing preload fails under graph capture (ROCm)
  * 5. KVCacheAppendStage canonical device-state binding contract
- * 6. ForwardGraphCache replay_callback_stages caching
+ * 6. ForwardGraphCache device replay-parameter caching
  */
 
 #include <gtest/gtest.h>
@@ -46,6 +46,16 @@ using namespace llaminar2::testing;
 
 namespace
 {
+    template <typename T>
+    concept HasHostGraphReplayCallback = requires(T &stage) {
+        stage.onGraphReplayed();
+        stage.needsOnGraphReplayed();
+    };
+
+    static_assert(
+        !HasHostGraphReplayCallback<IComputeStage>,
+        "GPU graph state publication must remain device-owned; do not restore host replay callbacks");
+
 #ifdef HAVE_ROCM
     /**
      * @brief Own one explicit HIP stream for GPU integration cases.
@@ -205,28 +215,6 @@ namespace
         const int32_t *last_dynamic_append_source_ = nullptr;
         int last_captured_max_tokens_ = 0;
         void *last_dynamic_stream_ = nullptr;
-    };
-
-    // =========================================================================
-    // Mock stage with configurable needsOnGraphReplayed()
-    // =========================================================================
-
-    class MockReplayCallbackStage : public MockComputeStage
-    {
-    public:
-        explicit MockReplayCallbackStage(bool needs_replay, std::string name = "MockReplay")
-            : MockComputeStage(ComputeStageType::GEMM, std::move(name), DeviceId::cpu()),
-              needs_replay_(needs_replay) {}
-
-        bool needsOnGraphReplayed() const override { return needs_replay_; }
-
-        void onGraphReplayed() override { replay_count_++; }
-
-        int replayCount() const { return replay_count_; }
-
-    private:
-        bool needs_replay_ = false;
-        int replay_count_ = 0;
     };
 
     /**
@@ -656,18 +644,6 @@ namespace
     // Test 6: KVCacheAppendStage binds canonical device append geometry
     // =========================================================================
 
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_DoesNotAdoptStateAfterReplay)
-    {
-        KVCacheAppendStage::Params kv_params{};
-        kv_params.device_id = DeviceId::cpu();
-        kv_params.layer_idx = 0;
-        kv_params.num_tokens = 1;
-
-        KVCacheAppendStage stage(kv_params);
-        EXPECT_FALSE(stage.needsOnGraphReplayed())
-            << "Captured KV kernels own sequence-state publication; replay must have no host callback";
-    }
-
     TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_DynamicParamsRequireCanonicalDeviceState)
     {
         RecordingKVCache host_only_cache;
@@ -763,9 +739,7 @@ namespace
         }
 
         EXPECT_EQ(kv_cache.get_cached_tokens(0), 0)
-            << "Neither capture nor replay may establish a host sequence-state owner";
-        stage.onGraphReplayed();
-        EXPECT_EQ(kv_cache.get_cached_tokens(0), 0);
+            << "Graph recording must not establish a host sequence-state owner";
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, IKVCacheBaseDefaultsFailClosed)
@@ -1079,75 +1053,14 @@ namespace
         }
     }
 
-    // =========================================================================
-    // Test 7: ForwardGraphCache caches replay callback stages
-    // =========================================================================
-
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, ForwardGraphCache_CachesReplayCallbacks)
-    {
-        // Build a compute graph with a mix of stages:
-        // - 2 stages that need replay callbacks
-        // - 2 stages that don't
-        ComputeGraph graph;
-
-        auto replay_stage_1 = std::make_unique<MockReplayCallbackStage>(true, "kv_append_0");
-        auto replay_stage_2 = std::make_unique<MockReplayCallbackStage>(true, "kv_append_1");
-        auto normal_stage_1 = std::make_unique<MockReplayCallbackStage>(false, "gemm_0");
-        auto normal_stage_2 = std::make_unique<MockReplayCallbackStage>(false, "norm_0");
-
-        graph.addNode("kv_append_0", std::move(replay_stage_1));
-        graph.addNode("gemm_0", std::move(normal_stage_1));
-        graph.addNode("kv_append_1", std::move(replay_stage_2));
-        graph.addNode("norm_0", std::move(normal_stage_2));
-
-        // Create ForwardGraphCache and populate replay_callback_stages
-        ForwardGraphCache cache;
-        cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
-        cache.valid = true;
-
-        ASSERT_FALSE(cache.replay_callback_stages_cached);
-
-        // Simulate caching logic (same as ForwardExecutionEngine)
-        {
-            cache.replay_callback_stages.clear();
-            const auto &order = cache.graph->getExecutionOrder();
-            for (const auto &node_name : order)
-            {
-                ComputeNode *node = cache.graph->getNode(node_name);
-                if (node && node->stage && node->stage->needsOnGraphReplayed())
-                    cache.replay_callback_stages.push_back(node->stage.get());
-            }
-            cache.replay_callback_stages_cached = true;
-        }
-
-        EXPECT_TRUE(cache.replay_callback_stages_cached);
-        EXPECT_EQ(cache.replay_callback_stages.size(), 2u);
-
-        // Verify the correct stages were collected
-        for (auto *stage : cache.replay_callback_stages)
-        {
-            EXPECT_TRUE(stage->needsOnGraphReplayed());
-        }
-
-        // Verify onGraphReplayed() can be called
-        for (auto *stage : cache.replay_callback_stages)
-        {
-            stage->onGraphReplayed();
-        }
-
-        // Verify invalidation clears the cache
-        cache.invalidate();
-        EXPECT_FALSE(cache.replay_callback_stages_cached);
-        EXPECT_TRUE(cache.replay_callback_stages.empty());
-    }
-
     TEST_F(Test__PrefillGraphCaptureDynamicParams, ForwardGraphCache_CachesPrefillReplayParamStages)
     {
         ComputeGraph graph;
 
         auto param_stage_1 = std::make_unique<MockPrefillReplayParamStage>("kv_append_0");
         auto param_stage_2 = std::make_unique<MockPrefillReplayParamStage>("kv_append_1");
-        auto normal_stage = std::make_unique<MockReplayCallbackStage>(false, "norm_0");
+        auto normal_stage = std::make_unique<MockComputeStage>(
+            ComputeStageType::GEMM, "norm_0", DeviceId::cpu());
         auto *raw_param_stage_1 = param_stage_1.get();
         auto *raw_param_stage_2 = param_stage_2.get();
 

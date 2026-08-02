@@ -114,6 +114,8 @@ namespace llaminar2
         STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
         STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [request, 5]
         STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [request, 10]
+        MTP_GENERATION_RESPONSE_TOKENS, ///< Persistent device-owned response ledger [request, max_seq_len]
+        MTP_GENERATION_CONTROL,         ///< Persistent device-owned generation controller [request, control_words]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,
@@ -292,6 +294,10 @@ namespace llaminar2
             return "STOCHASTIC_BATCH_OUTPUT_TOKENS";
         case BufferId::STOCHASTIC_BATCH_OUTPUT_META:
             return "STOCHASTIC_BATCH_OUTPUT_META";
+        case BufferId::MTP_GENERATION_RESPONSE_TOKENS:
+            return "MTP_GENERATION_RESPONSE_TOKENS";
+        case BufferId::MTP_GENERATION_CONTROL:
+            return "MTP_GENERATION_CONTROL";
         case BufferId::PREFIX_K_STAGING:
             return "PREFIX_K_STAGING";
         case BufferId::PREFIX_V_STAGING:

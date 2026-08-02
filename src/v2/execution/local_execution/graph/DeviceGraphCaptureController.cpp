@@ -1163,28 +1163,6 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphCaptureController::initializeReplayCallbacks(
-        ComputeGraph &graph,
-        DeviceGraphExecutor::GraphSegmentCache &segment_cache)
-    {
-        for (auto &seg : segment_cache.segments)
-        {
-            seg.replay_callbacks.clear();
-            if (!seg.capturable)
-            {
-                continue;
-            }
-            for (const auto &stage_name : seg.stage_names)
-            {
-                auto *node = graph.getNode(stage_name);
-                if (node && node->stage && node->stage->needsOnGraphReplayed())
-                {
-                    seg.replay_callbacks.push_back(node->stage.get());
-                }
-            }
-        }
-    }
-
     bool DeviceGraphCaptureController::executeStreamOnlyReplay(
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegmentCache &segment_cache,
@@ -1524,7 +1502,7 @@ namespace llaminar2
                 replaySegmentTags(segment, perf_context));
         }
 
-        // Time post-launch callbacks (markOutputsDirty + onGraphReplayed)
+        // Time post-launch output-coherence publication.
         auto post_t0 = std::chrono::high_resolution_clock::now();
         post_launch_cb(segment, capture_stream);
         if (profiling)
@@ -1592,7 +1570,12 @@ namespace llaminar2
             }
         }
 
-        if (!prepareGraphLaunchMetadata(graph, segment, ctx, capture_stream))
+        if (!prepareGraphLaunchMetadata(
+                graph,
+                segment,
+                ctx,
+                capture_stream,
+                GraphLaunchPreparationPhase::Capture))
         {
             LOG_ERROR("[DeviceGraphCaptureController] Re-capture metadata preparation failed, seg "
                       << segment_index);
@@ -2141,9 +2124,8 @@ namespace llaminar2
                 return false;
             }
 
-            // NOTE: Do NOT call onGraphReplayed() here. During capture phase,
-            // execute() already ran host-side bookkeeping (e.g., KV cache head
-            // advancement). Calling onGraphReplayed() would double-advance.
+            // Capture records device-side state publication directly into the
+            // graph. The host owns no corresponding replay bookkeeping.
             segment.last_executed_step = current_step;
             LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+executed (Phase-2 semantics): "
                       << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
@@ -2155,11 +2137,8 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphCaptureController] Segment initial launch failed");
             return false;
         }
-        // Capture phase: pass skip_replay_callbacks=true because segmented
-        // capture runs logical host-side bookkeeping while recording. This keeps
-        // later stages in the same capture (e.g. attention after KV append)
-        // seeing normal-execution cache metadata. onGraphReplayed() must only
-        // run during replay (Phase 3) or host state would double-advance.
+        // Capture and replay use the same post-launch coherence lifecycle;
+        // mutable execution state remains device-owned in both phases.
         post_launch_cb(segment, capture_stream);
         LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+launched: "
                   << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
@@ -2281,12 +2260,15 @@ namespace llaminar2
         ComputeGraph &graph,
         const DeviceGraphExecutor::GraphSegment &segment,
         IDeviceContext *ctx,
-        void *stream)
+        void *stream,
+        GraphLaunchPreparationPhase phase)
     {
         for (const auto &stage_name : segment.stage_names)
         {
             auto *node = graph.getNode(stage_name);
-            if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+            if (!node || !node->stage ||
+                !requiresGraphLaunchPreparation(
+                    node->stage->graphLaunchPreparationPolicy(), phase))
                 continue;
 
             if (stream)
@@ -2346,7 +2328,13 @@ namespace llaminar2
             return result;
         }
 
-        if (!prepareGraphLaunchMetadata(graph, segment, ctx, capture_stream))
+        if (!recapture_mode &&
+            !prepareGraphLaunchMetadata(
+                graph,
+                segment,
+                ctx,
+                capture_stream,
+                GraphLaunchPreparationPhase::Replay))
         {
             return result;
         }
@@ -2486,7 +2474,6 @@ namespace llaminar2
         }
         void *capture_stream = segment_cache.capture_stream;
 
-        initializeReplayCallbacks(graph, segment_cache);
         const bool full_graph_capture =
             captureModeForCache(segment_cache) == GraphReplayCaptureMode::FullGraph;
 
@@ -2570,7 +2557,12 @@ namespace llaminar2
                     }
                 }
 
-                if (!prepareGraphLaunchMetadata(graph, seg, ctx, capture_stream))
+                if (!prepareGraphLaunchMetadata(
+                        graph,
+                        seg,
+                        ctx,
+                        capture_stream,
+                        GraphLaunchPreparationPhase::Capture))
                 {
                     result.reset_cache = true;
                     return result;
@@ -3133,8 +3125,7 @@ namespace llaminar2
         DeviceGraphExecutor::GraphSegment &segment,
         uint64_t current_step,
         void * /*stream*/,
-        const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb,
-        bool skip_replay_callbacks)
+        const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb)
     {
         if (!segment.arena_writes_cached)
         {
@@ -3190,25 +3181,6 @@ namespace llaminar2
         for (const auto &write : segment.cached_arena_writes)
         {
             mark_arena_write_dirty_cb(write.id, write.device);
-        }
-
-        // Skip replay callbacks during the capture phase: execute() already ran
-        // all host-side bookkeeping (e.g., KV cache head/count advancement).
-        // Calling onGraphReplayed() here would double-advance host state, causing
-        // decode steps to write to wrong KV cache positions and produce garbage.
-        if (!skip_replay_callbacks)
-        {
-            for (auto *stage : segment.replay_callbacks)
-            {
-                stage->onGraphReplayed();
-            }
-            LOG_TRACE("[DeviceGraphCaptureController] Ran " << segment.replay_callbacks.size()
-                                                            << " onGraphReplayed() callbacks");
-        }
-        else
-        {
-            LOG_TRACE("[DeviceGraphCaptureController] SKIPPED " << segment.replay_callbacks.size()
-                                                                << " onGraphReplayed() callbacks (capture phase)");
         }
 
         segment.last_executed_step = current_step;

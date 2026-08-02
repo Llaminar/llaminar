@@ -3312,6 +3312,142 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
 }
 
 /**
+ * @brief Reduce a generation transaction using only resident mutable controls.
+ *
+ * This is the HIP twin of the CUDA production reducer.  The request-admitted
+ * stop row and the generation-controller words are read directly on the exact
+ * verifier stream, so graph replay cannot observe a stale host carry bit or
+ * commit budget.  Exactly one of the explicit acceptance row and the
+ * serial-equivalent draft row is supplied by the launcher.
+ */
+__global__ void
+rocm_summarize_speculative_verify_batch_device_generation_controls_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ verify_accepted,
+    const int *__restrict__ greedy_draft_tokens,
+    int row_count,
+    const int *__restrict__ first_token,
+    const int *__restrict__ stop_tokens,
+    const int *__restrict__ bonus_token,
+    int has_bonus_token,
+    const int *__restrict__ generation_control,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const int ready_token =
+        has_bonus_token && bonus_token ? *bonus_token : -1;
+    const int commit_budget =
+        generation_control
+            ? generation_control[llaminar2::sampling_math::
+                                     kDeviceGenerationControlTransactionCommitBudget]
+            : 0;
+    const int leading_committed_output_count =
+        generation_control
+            ? generation_control[llaminar2::sampling_math::
+                                     kDeviceGenerationControlNextLeadingCommittedOutputCount]
+            : -1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
+        first_token ? *first_token : -1,
+        verify_tokens,
+        verify_accepted,
+        row_count,
+        stop_tokens,
+        llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+        ready_token,
+        has_bonus_token,
+        commit_budget,
+        out_tokens,
+        out_token_capacity,
+        out_meta,
+        greedy_draft_tokens,
+        leading_committed_output_count);
+}
+
+/**
+ * @brief Fused seeded sampling and serial-equivalent speculative reduction.
+ *
+ * One wavefront owns the complete MTP transaction. Each active lane executes
+ * the canonical scalar probability scan for one compact target row, preserving
+ * serial decode's floating-point order. Lane zero reduces the sampled rows
+ * after a workgroup barrier. The single-workgroup topology avoids atomics,
+ * temporary storage, and a second launch while covering depths one through
+ * fifteen plus the terminal bonus row.
+ */
+__global__ __launch_bounds__(64, 1) void
+rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
+    const int *__restrict__ target_token_ids,
+    const float *__restrict__ target_probs,
+    int target_row_stride,
+    int top_k,
+    int row_count,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ stop_tokens,
+    const int *__restrict__ generation_control,
+    int *__restrict__ sampled_target_tokens,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta)
+{
+    constexpr int kMaxSampleRows = 16;
+    __shared__ int sampled_rows[kMaxSampleRows];
+
+    const int sample_row = static_cast<int>(threadIdx.x);
+    const int sample_row_count = row_count + 1;
+    if (sample_row < sample_row_count)
+    {
+        const float threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                threshold_seed,
+                *threshold_position + threshold_position_offset + sample_row,
+                0 /* MTPSpecStochasticDrawPurpose::Sample */);
+        const int sampled =
+            llaminar2::sampling_math::sample_distribution_with_threshold(
+                target_token_ids + sample_row * target_row_stride,
+                target_probs + sample_row * target_row_stride,
+                top_k,
+                threshold);
+        sampled_rows[sample_row] = sampled;
+        sampled_target_tokens[sample_row] = sampled;
+    }
+    __syncthreads();
+
+    if (sample_row != 0)
+        return;
+
+    const int commit_budget =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlTransactionCommitBudget];
+    const int leading_committed_output_count =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlNextLeadingCommittedOutputCount];
+    llaminar2::sampling_math::
+        summarize_speculative_verify_batch_at_commit_boundary(
+            verifier_input_tokens[0],
+            sampled_rows,
+            /*row_accepted=*/nullptr,
+            row_count,
+            stop_tokens,
+            llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+            sampled_rows[row_count],
+            /*has_bonus_ready_token=*/1,
+            commit_budget,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            verifier_input_tokens,
+            leading_committed_output_count);
+}
+
+/**
  * @brief Reduce greedy verifier argmax rows into one speculative commit plan.
  *
  * ROCm uses the same tiny graph-capturable reducer as CUDA: compare
@@ -3473,6 +3609,128 @@ __global__ void rocm_advance_speculative_commit_boundary_kernel(
 }
 
 /**
+ * @brief Initialize one persistent device-generation controller per request.
+ *
+ * The response payload is intentionally not cleared.  Its authoritative count
+ * starts at zero, so clearing a context-sized row would spend admission
+ * bandwidth on bytes that cannot be observed.
+ */
+__global__ void rocm_initialize_device_generation_kernel(
+    int request_count,
+    int max_new_tokens,
+    int response_token_stride,
+    int control_stride,
+    int *__restrict__ control)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::initialize_device_generation_control(
+        max_new_tokens,
+        response_token_stride,
+        request_control);
+}
+
+/**
+ * @brief Publish each request's next serial-visible verifier-row budget.
+ */
+__global__ void rocm_prepare_device_generation_transaction_budget_kernel(
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    int verifier_row_capacity,
+    const uint32_t *__restrict__ maintenance_rows_remaining)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    const int maintenance_budget = maintenance_rows_remaining
+                                       ? static_cast<int>(*maintenance_rows_remaining)
+                                       : verifier_row_capacity;
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::prepare_device_generation_transaction_budget(
+        verifier_row_capacity,
+        maintenance_budget,
+        request_control);
+}
+
+/**
+ * @brief Commit one compact outcome and derive its accepted publication row.
+ *
+ * One lane owns one request transaction.  Combining response-ledger commit
+ * with publication derivation removes a dispatch from every MTP transaction
+ * and makes the serial-visible response/state boundary indivisible.
+ */
+__global__ void
+rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel(
+    const int32_t *__restrict__ compact_tokens,
+    int output_token_stride,
+    int *__restrict__ compact_meta,
+    int meta_stride,
+    const int *__restrict__ base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int32_t *__restrict__ response_tokens,
+    int response_token_stride,
+    int *__restrict__ control,
+    int control_stride,
+    int *__restrict__ out_restore_rows,
+    int *__restrict__ out_target_cached_tokens,
+    int *__restrict__ out_accepted_state_counts,
+    int *__restrict__ out_ok,
+    int32_t *__restrict__ out_next_condition_tokens,
+    int *__restrict__ out_all_drafts_accepted_flags,
+    int *__restrict__ out_stopped_flags)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int32_t *request_response_tokens =
+        response_tokens + static_cast<size_t>(request_index) *
+                              static_cast<size_t>(response_token_stride);
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    const int base_cached_tokens_for_request =
+        base_cached_tokens ? base_cached_tokens[request_index] : -1;
+    llaminar2::sampling_math::
+        commit_device_generation_and_derive_speculative_publication_metadata(
+        compact_tokens,
+        output_token_stride,
+        compact_meta,
+        meta_stride,
+        request_index,
+        padded_state_rows_per_request,
+        base_cached_tokens_for_request,
+        request_response_tokens,
+        response_token_stride,
+        request_control,
+        out_restore_rows ? out_restore_rows + request_index : nullptr,
+        out_target_cached_tokens
+            ? out_target_cached_tokens + request_index
+            : nullptr,
+        out_accepted_state_counts
+            ? out_accepted_state_counts + request_index
+            : nullptr,
+        out_ok ? out_ok + request_index : nullptr,
+        out_next_condition_tokens
+            ? out_next_condition_tokens + request_index
+            : nullptr,
+        out_all_drafts_accepted_flags
+            ? out_all_drafts_accepted_flags + request_index
+            : nullptr,
+        out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+}
+
+/**
  * @brief Derive publication rows/counts from compact speculative metadata.
  *
  * This ROCm companion to the CUDA helper keeps the state-publication math in
@@ -3521,19 +3779,18 @@ __global__ void rocm_derive_speculative_publication_metadata_kernel(
 }
 
 /**
- * @brief Derive shifted MTP KV publication counts from compact metadata.
+ * @brief Derive shifted MTP KV counts from canonical primary publication.
  *
  * One HIP thread handles one request. The shared SamplingMath helper owns the
  * depth-dependent off-by-one rule so CUDA and ROCm update shifted sidecar
- * caches identically.
+ * caches identically from the same already-budgeted primary rows.
  */
-__global__ void rocm_derive_shifted_speculative_publication_metadata_kernel(
-    const int *__restrict__ meta,
-    int meta_stride,
+__global__ void
+rocm_derive_shifted_speculative_publication_metadata_from_primary_kernel(
     const int *__restrict__ base_cached_tokens,
+    const int *__restrict__ main_target_cached_tokens,
+    const int *__restrict__ main_publication_ok,
     int request_count,
-    int padded_state_rows_per_request,
-    int max_state_commit_rows,
     int mtp_depth,
     int *__restrict__ out_target_cached_tokens,
     int *__restrict__ out_accepted_state_counts,
@@ -3543,15 +3800,11 @@ __global__ void rocm_derive_shifted_speculative_publication_metadata_kernel(
     if (request_index >= request_count)
         return;
 
-    const int base_cached_tokens_for_request =
-        base_cached_tokens ? base_cached_tokens[request_index] : -1;
-    llaminar2::sampling_math::derive_shifted_speculative_publication_metadata(
-        meta,
-        meta_stride,
-        request_index,
-        padded_state_rows_per_request,
-        base_cached_tokens_for_request,
-        max_state_commit_rows,
+    llaminar2::sampling_math::
+        derive_shifted_speculative_publication_metadata_from_primary(
+        base_cached_tokens[request_index],
+        main_target_cached_tokens[request_index],
+        main_publication_ok[request_index],
         mtp_depth,
         out_target_cached_tokens ? out_target_cached_tokens + request_index : nullptr,
         out_accepted_state_counts ? out_accepted_state_counts + request_index : nullptr,
@@ -5389,6 +5642,126 @@ bool rocmOps_summarize_speculative_verify_batch_device_first_token(
     return true;
 }
 
+bool rocmOps_summarize_speculative_verify_batch_device_generation_controls(
+    const int *verify_tokens,
+    const int *verify_accepted,
+    const int *greedy_draft_tokens,
+    int row_count,
+    const int *first_token,
+    const int *stop_tokens,
+    const int *bonus_token,
+    int has_bonus_token,
+    const int *generation_control,
+    int *out_tokens,
+    int out_token_capacity,
+    int *out_meta,
+    int device_idx,
+    void *stream)
+{
+    const bool has_acceptance_rows = verify_accepted != nullptr;
+    const bool has_greedy_rows = greedy_draft_tokens != nullptr;
+    if (!verify_tokens || has_acceptance_rows == has_greedy_rows ||
+        row_count < 0 || !first_token || !stop_tokens ||
+        (has_bonus_token && !bonus_token) || !generation_control ||
+        out_token_capacity < row_count + 1 || !out_tokens || !out_meta ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_summarize_speculative_verify_batch_device_generation_controls_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        verify_tokens,
+        verify_accepted,
+        greedy_draft_tokens,
+        row_count,
+        first_token,
+        stop_tokens,
+        bonus_token,
+        has_bonus_token,
+        generation_control,
+        out_tokens,
+        out_token_capacity,
+        out_meta);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm device-generation speculative summary launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool
+rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generation_controls(
+    const int *target_token_ids,
+    const float *target_probs,
+    int target_row_stride,
+    int top_k,
+    int row_count,
+    unsigned long long threshold_seed,
+    const int *threshold_position,
+    int threshold_position_offset,
+    const int *verifier_input_tokens,
+    const int *stop_tokens,
+    const int *generation_control,
+    int *sampled_target_tokens,
+    int *out_tokens,
+    int out_token_capacity,
+    int *out_meta,
+    int device_idx,
+    void *stream)
+{
+    constexpr int kMaxComparisonRows = 15;
+    if (!target_token_ids || !target_probs ||
+        target_row_stride <= 0 || top_k <= 0 ||
+        top_k > target_row_stride || row_count <= 0 ||
+        row_count > kMaxComparisonRows || threshold_seed == 0 ||
+        !threshold_position || !verifier_input_tokens || !stop_tokens ||
+        !generation_control || !sampled_target_tokens || !out_tokens ||
+        out_token_capacity < row_count + 1 || !out_meta || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel,
+        dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream),
+        target_token_ids,
+        target_probs,
+        target_row_stride,
+        top_k,
+        row_count,
+        threshold_seed,
+        threshold_position,
+        threshold_position_offset,
+        verifier_input_tokens,
+        stop_tokens,
+        generation_control,
+        sampled_target_tokens,
+        out_tokens,
+        out_token_capacity,
+        out_meta);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm fused serial-equivalent speculative outcome launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool rocmOps_summarize_greedy_speculative_verify_batch(
     const int *verify_tokens,
     const int *draft_tokens,
@@ -5552,6 +5925,172 @@ bool rocmOps_advance_speculative_commit_boundary(
     return true;
 }
 
+bool rocmOps_initialize_device_generation(
+    int request_count,
+    int max_new_tokens,
+    int response_token_stride,
+    int control_stride,
+    int *control,
+    int device_idx,
+    void *stream)
+{
+    if (request_count <= 0 || max_new_tokens <= 0 ||
+        response_token_stride < max_new_tokens ||
+        control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        !control || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    // One request owns one scalar controller row. A single gfx906 wave avoids
+    // scheduling an empty second wave for the common batch-one request.
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_initialize_device_generation_kernel,
+        dim3(blocks),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        request_count,
+        max_new_tokens,
+        response_token_stride,
+        control_stride,
+        control);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm device-generation initialization launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_prepare_device_generation_transaction_budget(
+    int *control,
+    int control_stride,
+    int request_count,
+    int verifier_row_capacity,
+    const uint32_t *maintenance_rows_remaining,
+    int device_idx,
+    void *stream)
+{
+    if (!control ||
+        control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        request_count <= 0 || verifier_row_capacity <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    // Keep the tiny row transition to one physical ROCm wave per workgroup.
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_prepare_device_generation_transaction_budget_kernel,
+        dim3(blocks),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        control,
+        control_stride,
+        request_count,
+        verifier_row_capacity,
+        maintenance_rows_remaining);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm device-generation budget launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool
+rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
+    const int32_t *compact_tokens,
+    int output_token_stride,
+    int *compact_meta,
+    int meta_stride,
+    const int *base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int32_t *response_tokens,
+    int response_token_stride,
+    int *control,
+    int control_stride,
+    int *out_restore_rows,
+    int *out_target_cached_tokens,
+    int *out_accepted_state_counts,
+    int *out_ok,
+    int *out_next_condition_tokens,
+    int *out_all_drafts_accepted_flags,
+    int *out_stopped_flags,
+    int device_idx,
+    void *stream)
+{
+    if (!compact_tokens || output_token_stride <= 0 || !compact_meta ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        !base_cached_tokens || request_count <= 0 ||
+        padded_state_rows_per_request <= 0 ||
+        !response_tokens || response_token_stride <= 0 ||
+        !control ||
+        control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        !out_restore_rows || !out_target_cached_tokens ||
+        !out_accepted_state_counts || !out_ok ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    // One physical wave is the minimum economical gfx906 workgroup for the
+    // production batch-one transaction; grid scaling preserves batch totality.
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel,
+        dim3(blocks),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        compact_tokens,
+        output_token_stride,
+        compact_meta,
+        meta_stride,
+        base_cached_tokens,
+        request_count,
+        padded_state_rows_per_request,
+        response_tokens,
+        response_token_stride,
+        control,
+        control_stride,
+        out_restore_rows,
+        out_target_cached_tokens,
+        out_accepted_state_counts,
+        out_ok,
+        reinterpret_cast<int32_t *>(out_next_condition_tokens),
+        out_all_drafts_accepted_flags,
+        out_stopped_flags);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm fused device-generation publication launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool rocmOps_derive_speculative_publication_metadata(
     const int *meta,
     int meta_stride,
@@ -5619,13 +6158,11 @@ bool rocmOps_derive_speculative_publication_metadata(
     return true;
 }
 
-bool rocmOps_derive_shifted_speculative_publication_metadata(
-    const int *meta,
-    int meta_stride,
+bool rocmOps_derive_shifted_speculative_publication_metadata_from_primary(
     const int *base_cached_tokens,
+    const int *main_target_cached_tokens,
+    const int *main_publication_ok,
     int request_count,
-    int padded_state_rows_per_request,
-    int max_state_commit_rows,
     int mtp_depth,
     int *out_target_cached_tokens,
     int *out_accepted_state_counts,
@@ -5633,35 +6170,31 @@ bool rocmOps_derive_shifted_speculative_publication_metadata(
     int device_idx,
     void *stream)
 {
-    if (!meta || !base_cached_tokens ||
+    if (!base_cached_tokens ||
+        !main_target_cached_tokens ||
+        !main_publication_ok ||
         !out_target_cached_tokens ||
         !out_accepted_state_counts ||
         !out_ok ||
         !stream ||
-        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
         request_count <= 0 ||
-        padded_state_rows_per_request <= 0 ||
-        max_state_commit_rows < 0 ||
-        max_state_commit_rows > padded_state_rows_per_request ||
         mtp_depth < 0)
     {
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    constexpr int threads_per_block = 128;
+    constexpr int threads_per_block = 64;
     const int blocks =
         (request_count + threads_per_block - 1) / threads_per_block;
     hipLaunchKernelGGL(
-        rocm_derive_shifted_speculative_publication_metadata_kernel,
+        rocm_derive_shifted_speculative_publication_metadata_from_primary_kernel,
         dim3(blocks), dim3(threads_per_block), 0,
         static_cast<hipStream_t>(stream),
-        meta,
-        meta_stride,
         base_cached_tokens,
+        main_target_cached_tokens,
+        main_publication_ok,
         request_count,
-        padded_state_rows_per_request,
-        max_state_commit_rows,
         mtp_depth,
         out_target_cached_tokens,
         out_accepted_state_counts,

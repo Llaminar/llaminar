@@ -36,6 +36,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         no_require_prefill_graph: bool = False,
         n_predict_list: str | None = None,
         seeds: str | None = None,
+        prompt: str | None = None,
+        prompt_file: str | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -46,6 +48,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             env.pop("LLAMINAR_PREFILL_GRAPH_REQUIRED", None)
             env.pop("LLAMINAR_MOE_REBALANCE_TRACE_JSONL", None)
             env.pop("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS", None)
+            env.pop("LLAMINAR_GPU_MOE_REBALANCE_PROMPT", None)
+            env.pop("LLAMINAR_GPU_MOE_REBALANCE_PROMPT_FILE", None)
             if extra_env:
                 env.update(extra_env)
 
@@ -75,6 +79,10 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 args[-2] = "--n-predict-list"
             if seeds is not None:
                 args.extend(["--seeds", seeds])
+            if prompt is not None:
+                args.extend(["--prompt", prompt])
+            if prompt_file is not None:
+                args.extend(["--prompt-file", prompt_file])
             if rebalance_window is not None:
                 args.extend(["--rebalance-window", str(rebalance_window)])
             if perfstats:
@@ -128,6 +136,9 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertNotIn("tp_allreduce_bom", result.stdout)
         self.assertIn("--moe-routed-expert-placement", result.stdout)
         self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
+        self.assertIn("routed_compute=apportioned", result.stdout)
+        self.assertIn("routed_phase=uniform", result.stdout)
+        self.assertIn("routed_assignment=static-owner", result.stdout)
         self.assertNotIn("routed_assignment=least-loaded-resident", result.stdout)
 
     def test_twocard_dry_run_can_request_llep_assignment_policy(self) -> None:
@@ -135,8 +146,30 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("routed_compute=apportioned", result.stdout)
+        self.assertIn("routed_phase=uniform", result.stdout)
         self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
         self.assertIn("owner=0", result.stdout)
+
+    def test_llep_declares_phase_split_policy_without_factory_inference(self) -> None:
+        result = self.run_script(cases="llep")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--moe-rebalance llep", result.stdout)
+        self.assertIn("routed_compute=replicated", result.stdout)
+        self.assertIn(
+            "routed_phase=prefill-apportioned-decode-replicated",
+            result.stdout,
+        )
+        self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
+
+    def test_llep_rejects_conflicting_static_owner_assignment(self) -> None:
+        result = self.run_script(cases="llep", assignment_policy="static-owner")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "LLEP requires routed assignment policy least-loaded-resident",
+            result.stderr,
+        )
 
     def test_no_capture_collectives_is_rejected_for_homogeneous_twocard(self) -> None:
         result = self.run_script(no_capture_collectives=True)
@@ -197,6 +230,36 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertEqual(result.stdout.count("--seed 202"), 2)
         self.assertIn("/n_512/seed_101/", result.stdout)
         self.assertIn("/n_1024/seed_202/", result.stdout)
+
+    def test_inline_prompt_is_forwarded_as_one_argument(self) -> None:
+        result = self.run_script(prompt="Explain why fixed prompts aid comparison.")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--prompt Explain\\ why\\ fixed\\ prompts\\ aid\\ comparison.",
+            result.stdout,
+        )
+
+    def test_prompt_file_is_forwarded_as_one_argument(self) -> None:
+        result = self.run_script(prompt_file="/tmp/llep benchmark prompt.txt")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--prompt-file /tmp/llep\\ benchmark\\ prompt.txt",
+            result.stdout,
+        )
+
+    def test_inline_and_file_prompts_are_mutually_exclusive(self) -> None:
+        result = self.run_script(
+            prompt="inline",
+            prompt_file="/tmp/prompt.txt",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--prompt and --prompt-file are mutually exclusive",
+            result.stderr,
+        )
 
     def test_reusing_output_dir_appends_summary_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

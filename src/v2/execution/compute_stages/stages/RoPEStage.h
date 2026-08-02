@@ -106,7 +106,14 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            if (!params_.device_id.is_gpu())
+                return GraphLaunchPreparationPolicy::None;
+            return params_.position_ids_device
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::CaptureAndReplay;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

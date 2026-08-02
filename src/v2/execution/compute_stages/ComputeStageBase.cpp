@@ -215,6 +215,16 @@ namespace llaminar2
             return "Q_GATE_SPLIT";
         case ComputeStageType::MTP_CONCAT:
             return "MTP_CONCAT";
+        case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
+            return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:
+            return "MTP_STOCHASTIC_TARGET_DISTRIBUTION";
+        case ComputeStageType::MTP_VERIFIER_OUTCOME:
+            return "MTP_VERIFIER_OUTCOME";
+        case ComputeStageType::MTP_STOCHASTIC_SERIAL_OUTCOME:
+            return "MTP_STOCHASTIC_SERIAL_OUTCOME";
+        case ComputeStageType::MTP_SPEC_STATE_PUBLICATION:
+            return "MTP_SPEC_STATE_PUBLICATION";
         default:
             return "UNKNOWN";
         }

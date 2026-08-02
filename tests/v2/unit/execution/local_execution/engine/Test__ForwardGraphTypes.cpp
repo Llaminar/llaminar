@@ -78,8 +78,11 @@ namespace
     class FakeGraphLaunchPrepStage final : public IComputeStage
     {
     public:
-        explicit FakeGraphLaunchPrepStage(DeviceId device)
-            : IComputeStage(device)
+        explicit FakeGraphLaunchPrepStage(
+            DeviceId device,
+            GraphLaunchPreparationPolicy policy =
+                GraphLaunchPreparationPolicy::CaptureAndReplay)
+            : IComputeStage(device), policy_(policy)
         {
         }
 
@@ -94,7 +97,10 @@ namespace
         std::string name() const override { return "fake_graph_launch_prep_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
         bool isGraphCapturable() const override { return true; }
-        bool needsGraphLaunchPreparation() const override { return true; }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return policy_;
+        }
 
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
         {
@@ -115,6 +121,9 @@ namespace
         IDeviceContext *last_ctx_ = nullptr;
         void *last_stream_ = nullptr;
         void *stream_seen_by_stage_ = nullptr;
+
+    private:
+        GraphLaunchPreparationPolicy policy_;
     };
 
     /**
@@ -412,9 +421,11 @@ namespace
     FakeGraphLaunchPrepStage *addFakeGraphLaunchPrepStage(
         ComputeGraph &graph,
         const std::string &name,
-        DeviceId device)
+        DeviceId device,
+        GraphLaunchPreparationPolicy policy =
+            GraphLaunchPreparationPolicy::CaptureAndReplay)
     {
-        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(device);
+        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(device, policy);
         auto *raw_stage = stage.get();
         graph.addNode(name, std::move(stage), device);
         return raw_stage;
@@ -1983,6 +1994,97 @@ TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
     EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1);
 }
 
+TEST(Test__GraphSegmentCache, DeviceLoopTemplateRequiresOneCompleteReplayUnit)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "first", true);
+    addFakeSegmentStage(graph, "second", true);
+    graph.addDependency("second", "first");
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.stage_names = {"first", "second"};
+    segment.capturable = true;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.segments.push_back(std::move(segment));
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    const auto view = cache.deviceLoopGraphTemplate(graph, &error);
+    ASSERT_TRUE(view.has_value()) << error;
+    EXPECT_EQ(view->capture, cache.segments.front().capture.get());
+    EXPECT_EQ(view->stream, cache.capture_stream);
+    EXPECT_EQ(view->stage_count, 2u);
+
+    cache.needs_capture = true;
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(error, "graph cache is not replay-ready");
+    cache.needs_capture = false;
+
+    cache.segments.front().stage_names.pop_back();
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(
+        error,
+        "captured replay unit does not cover the complete source graph");
+
+    cache.segments.front().stage_names = {"first", "second"};
+    cache.segments.emplace_back();
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(error, "graph is segmented: replay_units=2");
+}
+
+TEST(Test__GraphSegmentCache, BidirectionalCaptureHandoffUsesEventsWithoutStreamSync)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    void *const external_stream = gpu_ctx.defaultStream();
+    ASSERT_NE(external_stream, cache.capture_stream);
+
+    ASSERT_TRUE(cache.orderCaptureStreamAfter(&gpu_ctx, external_stream));
+    ASSERT_TRUE(cache.orderStreamAfterCapture(&gpu_ctx, external_stream));
+
+    EXPECT_EQ(gpu_ctx.events_created_, 1)
+        << "Both directions should reuse one cache-owned ordering event.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 2);
+    EXPECT_EQ(gpu_ctx.events_waited_, 2);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+TEST(Test__GraphSegmentCache, DeviceLoopTemplateRejectsExternalReplayPreparation)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(
+        graph,
+        "host_metadata",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.front().stage_names = {"host_metadata"};
+    cache.segments.front().capturable = true;
+    cache.segments.front().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(
+        error,
+        "stage requires external preparation before every replay: host_metadata");
+}
+
 TEST(Test__GraphSegmentCache, HeterogeneousCollectivePolicyAdmitsNamedSparseBoundary)
 {
     ComputeGraph graph;
@@ -2519,6 +2621,49 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     EXPECT_EQ(prep_stage->last_stream_, cache.capture_stream);
     EXPECT_NE(prep_stage->last_stream_, nullptr);
     EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
+}
+
+TEST(Test__GraphSegmentCache, ReplaySkipsCaptureOnlyPreparation)
+{
+    ComputeGraph graph;
+    auto *prep_stage = addFakeGraphLaunchPrepStage(
+        graph,
+        "capture_only",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureOnly);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"capture_only"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(prep_stage->prepare_calls_, 0)
+        << "Capture-only setup must already be embodied by the executable graph.";
+    EXPECT_EQ(prep_stage->execute_calls_, 0);
 }
 
 TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)

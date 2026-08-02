@@ -197,6 +197,8 @@ namespace llaminar2
                 {"root_device_index", std::to_string(root_device_index)},
                 {"source", source},
                 {"attachment", "tp_allreduce_stage_sideband"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"},
                 {"launch_relation", grouped_with_anchor ? "same_group_as_anchor" : "same_stream_after_anchor"},
                 {"fused_with_anchor", grouped_with_anchor ? "true" : "false"},
                 {"physical_fusion", grouped_with_anchor ? "grouped_with_anchor_collective" : "separate_backend_collective"}};
@@ -298,7 +300,9 @@ namespace llaminar2
                 {"backend", params.tp_ctx ? collectiveBackendTypeToString(params.tp_ctx->backend()) : "none"},
                 {"scope", allreduceScopeString(params.tp_ctx)},
                 {"degree", params.tp_ctx ? std::to_string(params.tp_ctx->degree()) : "0"},
-                {"no_op", no_op ? "true" : "false"}};
+                {"no_op", no_op ? "true" : "false"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
             common_tags.emplace("elements", std::to_string(effective_count));
             const size_t logical_row_elements = params.tensor->cols();
             common_tags.emplace(
@@ -588,25 +592,6 @@ namespace llaminar2
     void TPAllreduceStage::unbindWorkspace()
     {
         bound_workspace_ = nullptr;
-    }
-
-    void TPAllreduceStage::onGraphReplayed()
-    {
-        if (!PerfStatsCollector::isEnabled() || !params_.tensor)
-            return;
-
-        const size_t effective_count =
-            (params_.count > 0) ? params_.count : params_.tensor->numel();
-        const bool no_op_allreduce =
-            !params_.tp_ctx || params_.tp_ctx->degree() == 1 || debugEnv().skip_allreduce;
-        recordAllreduceBillOfMaterials(params_, effective_count, no_op_allreduce);
-        recordAllreduceSidebandBillOfMaterials(params_, params_.sidebands, true);
-        recordAllreduceWorkspaceSidebandBillOfMaterials(params_, true);
-    }
-
-    bool TPAllreduceStage::needsOnGraphReplayed() const
-    {
-        return PerfStatsCollector::isEnabled();
     }
 
     bool TPAllreduceStage::supportsBackend(ComputeBackendType backend) const
@@ -997,7 +982,9 @@ namespace llaminar2
             {"elements", std::to_string(params_.count)},
             {"element_bytes", std::to_string(element_bytes)},
             {"host_rendezvous", "false"},
-            {"graph_capturable", "true"}};
+            {"graph_capturable", "true"},
+            {"accounting", "graph_template_or_eager_launch"},
+            {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
         PerfStatsCollector::addCounter(
             "tp_rooted_collective_bom",
             "calls",
@@ -1024,7 +1011,9 @@ namespace llaminar2
                  std::to_string(sideband_element_bytes)},
                 {"launch_relation", "same_stream_after_rooted_collective"},
                 {"host_rendezvous", "false"},
-                {"graph_capturable", "true"}};
+                {"graph_capturable", "true"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
             PerfStatsCollector::addCounter(
                 "tp_rooted_collective_bom",
                 "sideband_calls",
@@ -1048,16 +1037,6 @@ namespace llaminar2
             {},
             params_.device_id.toString(),
             tags);
-    }
-
-    void TPLocalRootedCollectiveStage::onGraphReplayed()
-    {
-        recordBillOfMaterials();
-    }
-
-    bool TPLocalRootedCollectiveStage::needsOnGraphReplayed() const
-    {
-        return PerfStatsCollector::isEnabled();
     }
 
 } // namespace llaminar2

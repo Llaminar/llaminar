@@ -248,13 +248,6 @@ namespace llaminar2
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
 
         /**
-         * @brief Precompute `onGraphReplayed()` callback lists for capturable segments.
-         */
-        static void initializeReplayCallbacks(
-            ComputeGraph &graph,
-            DeviceGraphExecutor::GraphSegmentCache &segment_cache);
-
-        /**
          * @brief Execute replay in stream-only diagnostic mode (no graph launch).
          */
         static bool executeStreamOnlyReplay(
@@ -373,13 +366,14 @@ namespace llaminar2
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb);
 
         /**
-         * @brief Run stage-owned dynamic metadata uploads before capture/replay.
+         * @brief Run stage-owned preparation required at one graph lifecycle boundary.
          */
         static bool prepareGraphLaunchMetadata(
             ComputeGraph &graph,
             const DeviceGraphExecutor::GraphSegment &segment,
             IDeviceContext *ctx,
-            void *stream);
+            void *stream,
+            GraphLaunchPreparationPhase phase);
 
         /**
          * @brief Execute one capturable replay segment under selected diagnostics mode.
@@ -463,20 +457,16 @@ namespace llaminar2
         /**
          * @brief Post-launch lifecycle for one captured segment.
          *
-         * Applies output-dirty marking, replay callbacks, and step bookkeeping.
-         *
-         * @param skip_replay_callbacks When true, skips onGraphReplayed() callbacks.
-         *        Used during the capture phase where execute() already ran host-side
-         *        bookkeeping (e.g., KV cache head advancement). Calling onGraphReplayed()
-         *        during capture would double-advance host state.
+         * Applies output-dirty marking and step bookkeeping. Device state
+         * publication is part of the captured graph; host replay callbacks are
+         * deliberately not an execution primitive.
          */
         static void postCapturedSegmentLaunch(
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegment &segment,
             uint64_t current_step,
             void *stream,
-            const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb,
-            bool skip_replay_callbacks = false);
+            const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb);
     };
 
 } // namespace llaminar2

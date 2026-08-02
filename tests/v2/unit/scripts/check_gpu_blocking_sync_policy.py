@@ -26,7 +26,7 @@ from collections import Counter
 from collections.abc import Iterable
 
 
-SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hip", ".hpp"}
+SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hip", ".hpp", ".inc"}
 
 SYNC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -320,6 +320,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "host_result",
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentStochasticGeneration", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),
@@ -346,7 +347,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/runner/OrchestrationRunner.cpp", "synchronizeRunnerDevicesBeforeRelease", "backend_device", 1),
         ("src/v2/execution/runner/OrchestrationRunner.cpp", "synchronizeRunnerDevicesBeforeRelease", "rank_device", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_uploadRawBytes", "backend_sync_copy", 1),
-        ("src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu", "cudaRowMajorWeights_create", "raw_stream", 1),
+        ("src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc", "cudaRowMajorWeights_create", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu", "CUDARingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 2),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 2),

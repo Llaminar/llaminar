@@ -69,6 +69,18 @@ namespace llaminar2
                     }),
                 },
                 {
+                    .point = DeviceTimelinePoint::DeviceGenerationStateReady,
+                    .name = "device_generation_state_ready",
+                    .producer = DeviceTimelineRole::DeviceGenerationController,
+                    .consumers = roles({
+                        DeviceTimelineRole::DeviceGenerationController,
+                        DeviceTimelineRole::VerifierSummary,
+                        DeviceTimelineRole::HostResultBridge,
+                        DeviceTimelineRole::RequestStateReset,
+                        DeviceTimelineRole::Diagnostics,
+                    }),
+                },
+                {
                     .point = DeviceTimelinePoint::StochasticDraftSampleReady,
                     .name = "stochastic_draft_sample_ready",
                     .producer = DeviceTimelineRole::DraftSampler,
@@ -281,6 +293,8 @@ namespace llaminar2
             return "graph_build_device_state_publication";
         case DeviceTimelineRole::RequestAdmissionTransfer:
             return "request_admission_transfer";
+        case DeviceTimelineRole::DeviceGenerationController:
+            return "device_generation_controller";
         case DeviceTimelineRole::MainForwardGraph:
             return "main_forward_graph";
         case DeviceTimelineRole::MTPSidecarGraph:

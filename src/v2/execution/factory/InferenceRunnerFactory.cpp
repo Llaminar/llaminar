@@ -486,7 +486,7 @@ namespace llaminar2
                              RoutedExpertPhasePolicy::Uniform);
         }
 
-        bool routedOverlayDomainsSupportLeastLoadedResidentAssignment(
+        bool validateLLEPRoutedOverlayPolicy(
             const MoERoutedExpertPlacementPlan &plan,
             std::string *error)
         {
@@ -506,6 +506,22 @@ namespace llaminar2
                         *error = "routed tier '" + tier.name + "' references missing domain '" + tier.domain + "'";
                     return false;
                 }
+
+                if (domain->routed_assignment_policy !=
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "domain '" + domain->name +
+                            "' must explicitly declare "
+                            "routed_assignment=least-loaded-resident for LLEP; "
+                            "--moe-rebalance selects the maintenance strategy "
+                            "and never rewrites graph scheduling policy";
+                    }
+                    return false;
+                }
+
                 if (!domain->supportsLeastLoadedResidentAssignment())
                 {
                     if (error)
@@ -518,23 +534,6 @@ namespace llaminar2
             }
 
             return true;
-        }
-
-        void setRoutedOverlayLeastLoadedResidentAssignment(MoERoutedExpertPlacementPlan &plan)
-        {
-            for (const auto &tier : plan.routed_tiers)
-            {
-                auto it = std::find_if(
-                    plan.domains.begin(),
-                    plan.domains.end(),
-                    [&](const auto &domain)
-                    {
-                        return domain.name == tier.domain;
-                    });
-                if (it != plan.domains.end())
-                    it->routed_assignment_policy =
-                        RoutedExpertAssignmentPolicy::LeastLoadedResident;
-            }
         }
 
         bool overlayPlanDisablesDenseTP(const MoERoutedExpertPlacementPlan &plan)
@@ -669,13 +668,11 @@ namespace llaminar2
             if (graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
             {
                 std::string llep_error;
-                if (!routedOverlayDomainsSupportLeastLoadedResidentAssignment(*plan, &llep_error))
+                if (!validateLLEPRoutedOverlayPolicy(*plan, &llep_error))
                 {
                     LOG_ERROR(log_prefix << " invalid LLEP overlay: " << llep_error);
                     return false;
                 }
-                plan = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
-                setRoutedOverlayLeastLoadedResidentAssignment(*plan);
             }
 
             graph_config.moe.routed_expert_plan = plan;

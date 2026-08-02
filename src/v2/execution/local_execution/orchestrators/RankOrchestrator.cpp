@@ -4720,7 +4720,7 @@ namespace llaminar2
             static_cast<int64_t>(first_condition_slot) +
             static_cast<int64_t>(request_batch - 1) *
                 static_cast<int64_t>(condition_slot_stride);
-        if (request_batch <= 1 ||
+        if (request_batch <= 0 ||
             first_condition_slot < 0 ||
             condition_slot_stride <= 0 ||
             last_condition_slot < 0 ||
@@ -4941,7 +4941,7 @@ namespace llaminar2
             static_cast<int64_t>(first_draft_slot) +
             static_cast<int64_t>(request_batch - 1) *
                 static_cast<int64_t>(draft_slot_stride);
-        if (request_batch <= 1 ||
+        if (request_batch <= 0 ||
             first_draft_slot < 0 ||
             draft_slot_stride <= 0 ||
             last_draft_slot < 0 ||
@@ -9360,6 +9360,69 @@ namespace llaminar2
             vocab_size);
     }
 
+    bool RankOrchestrator::
+        buildCapturedStochasticVerifierTargetDistributions(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar
+                ->buildCapturedStochasticVerifierTargetDistributions(
+                    row_count,
+                    params,
+                    penalty_policy,
+                    vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->buildCapturedStochasticVerifierTargetDistributions(
+                    row_count,
+                    params,
+                    penalty_policy,
+                    vocab_size);
+        }
+        if (!primaryDeviceId().is_gpu() ||
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            LOG_ERROR("[RankOrchestrator] Captured stochastic verifier target distributions require mirrored GPU verifier heads");
+            return false;
+        }
+
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            if (!child ||
+                !child->buildCapturedStochasticVerifierTargetDistributions(
+                    row_count,
+                    params,
+                    penalty_policy,
+                    vocab_size))
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored participant "
+                          << participant
+                          << " failed captured stochastic verifier target preparation");
+                return false;
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_captured_stochastic_verifier_target_rows",
+            static_cast<double>(row_count),
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"top_k", std::to_string(params.top_k)},
+             {"implementation", "mirrored_monolithic_graph"}});
+        return true;
+    }
+
     bool RankOrchestrator::buildStochasticProcessedLogitRowsOnDevice(
         DeviceLogitsSource source,
         int first_row,
@@ -9392,6 +9455,62 @@ namespace llaminar2
                 vocab_size);
         }
         return false;
+    }
+
+    bool RankOrchestrator::publishCapturedMTPDraftToken(
+        int row,
+        int slot,
+        const MTPGreedyPenaltyPolicy &penalty_policy)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->publishCapturedMTPDraftToken(
+                row,
+                slot,
+                penalty_policy);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->publishCapturedMTPDraftToken(
+                row,
+                slot,
+                penalty_policy);
+        }
+        if (!primaryDeviceId().is_gpu() ||
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            LOG_ERROR("[RankOrchestrator] Captured MTP draft publication requires mirrored full-vocabulary GPU MTP heads");
+            return false;
+        }
+
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            if (!child ||
+                !child->publishCapturedMTPDraftToken(
+                    row,
+                    slot,
+                    penalty_policy))
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored participant "
+                          << participant
+                          << " failed captured MTP draft publication");
+                return false;
+            }
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_captured_mtp_draft_publications",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"row", std::to_string(row)},
+             {"slot", std::to_string(slot)},
+             {"implementation", "mirrored_monolithic_graph"}});
+        return true;
     }
 
     int RankOrchestrator::sampleStochasticDraftProposalOnDevice(
@@ -10501,6 +10620,120 @@ namespace llaminar2
         return copyDeviceSpeculativeOutcomesToHost(handle, out);
     }
 
+    bool RankOrchestrator::beginDeviceResidentStochasticGeneration(
+        int request_count,
+        int max_new_tokens)
+    {
+        if (request_count <= 0 || max_new_tokens <= 0)
+        {
+            LOG_ERROR("[RankOrchestrator] Invalid device-resident stochastic generation admission: requests="
+                      << request_count << " max_new_tokens=" << max_new_tokens);
+            return false;
+        }
+
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-resident stochastic generation admission has no participants");
+            return false;
+        }
+
+        /*
+         * Every participant that may publish mirrored KV, recurrent, or
+         * response state owns an independent resident ledger.  Admitting only
+         * the final sampler would leave earlier pipeline/TP participants with
+         * an unbounded publication authority and make cross-device equality an
+         * accident of host scheduling.
+         */
+        for (size_t participant = 0; participant < participants.size(); ++participant)
+        {
+            if (!participants[participant] ||
+                !participants[participant]
+                     ->beginDeviceResidentStochasticGeneration(
+                         request_count,
+                         max_new_tokens))
+            {
+                LOG_ERROR("[RankOrchestrator] Device-resident stochastic generation admission failed on participant "
+                          << participant);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool RankOrchestrator::finishDeviceResidentStochasticGeneration(
+        DeviceGenerationTerminalResult *out_result)
+    {
+        if (out_result)
+            *out_result = DeviceGenerationTerminalResult{};
+        if (!out_result)
+        {
+            LOG_ERROR("[RankOrchestrator] Terminal device-generation result requires a destination");
+            return false;
+        }
+
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Terminal device-generation result has no participants");
+            return false;
+        }
+
+        std::vector<DeviceGenerationTerminalResult> participant_results;
+        participant_results.reserve(participants.size());
+        for (size_t participant_index = 0;
+             participant_index < participants.size();
+             ++participant_index)
+        {
+            DeviceGenerationTerminalResult participant_result;
+            if (!participants[participant_index] ||
+                !participants[participant_index]
+                     ->finishDeviceResidentStochasticGeneration(
+                         &participant_result) ||
+                !participant_result.valid())
+            {
+                LOG_ERROR("[RankOrchestrator] Terminal device-generation materialization failed on participant "
+                          << participant_index);
+                return false;
+            }
+            participant_results.push_back(
+                std::move(participant_result));
+        }
+
+        const auto &authoritative_requests =
+            participant_results.front().requests;
+        for (size_t participant_index = 1;
+             participant_index < participant_results.size();
+             ++participant_index)
+        {
+            if (participant_results[participant_index].requests !=
+                authoritative_requests)
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored terminal device-generation ledgers disagree"
+                          << " primary="
+                          << participant_results.front().device.toString()
+                          << " participant="
+                          << participant_results[participant_index]
+                                 .device.toString()
+                          << " participant_index=" << participant_index);
+                return false;
+            }
+        }
+
+        *out_result = std::move(participant_results.front());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_device_generation_terminal_response_bridges",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(participants.size())},
+             {"validation", "byte_identical_host_terminal_results"}});
+        return true;
+    }
+
     bool RankOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
         const DeviceStochasticBatchOutcomeRequest *requests,
         int request_count,
@@ -10982,6 +11215,9 @@ namespace llaminar2
                 rank_mirrored_primary_outcome_.response_ready_event.get() &&
             outcome.mtp_transaction.state.get() ==
                 rank_mirrored_primary_outcome_.mtp_transaction.state.get() &&
+            outcome.device_generation_controller_owned ==
+                rank_mirrored_primary_outcome_
+                    .device_generation_controller_owned &&
             outcome.mirrored_local_tp_locally_complete ==
                 rank_mirrored_primary_outcome_.mirrored_local_tp_locally_complete;
 

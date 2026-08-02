@@ -219,6 +219,20 @@ namespace llaminar2
             RoutedExpertAssignmentPolicy routed_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
 
+            /**
+             * @brief Immutable graph-lowered contract for routed row ownership.
+             *
+             * ParticipantAssigned applies the configured resident scheduling
+             * policy and publishes a participant-local contribution. In
+             * FullyReplicatedLocal mode every participant owns every complete
+             * expert and executes every selected row locally; resident
+             * assignment and canonical route contribution buffers are then
+             * forbidden because either would reintroduce a tiny decode
+             * collective or sum duplicate complete outputs.
+             */
+            RoutedExpertRowExecutionPolicy routed_row_execution_policy =
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned;
+
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
             // into the corresponding 3D packed tensor.
@@ -463,6 +477,10 @@ namespace llaminar2
         {
             return params_.routed_assignment_policy;
         }
+        RoutedExpertRowExecutionPolicy routedExpertRowExecutionPolicyForTesting() const
+        {
+            return params_.routed_row_execution_policy;
+        }
         bool usesRuntimePrefillGroupingForTesting() const
         {
             return params_.use_runtime_prefill_grouping;
@@ -664,10 +682,12 @@ namespace llaminar2
          * occurring inside stage execution while CUDA/HIP capture is active.
          */
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
             return requestsTransferBackedCurrentBatchPrefillLLEP() ||
-                   params_.prefix_runtime_device_rehydration;
+                           params_.prefix_runtime_device_rehydration
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
         }
         /**
          * @brief Drop per-request fused decode warmup state.
@@ -816,6 +836,24 @@ namespace llaminar2
          * @return true after the backend commit has been enqueued.
          */
         bool publishCommittedGroupedVerifierHistograms(
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            void *producer_stream);
+
+        /**
+         * @brief Enqueue the committed grouped-verifier histogram kernel only.
+         *
+         * Captured publication graphs must not mutate a host diagnostic stream
+         * alias while their graph body is being warmed or captured: once the
+         * native graph is cloned into a parent loop, that alias would still name
+         * the old capture stream rather than the parent execution stream.  This
+         * entry point performs the production mutation and nothing else.  A
+         * terminal diagnostic owner may publish observation provenance after
+         * the enclosing graph launch through a separate lifecycle API.
+         */
+        bool enqueueCommittedGroupedVerifierHistograms(
             const int32_t *accepted_state_counts_device,
             const int32_t *publication_ok_flags_device,
             int request_count,
@@ -1477,7 +1515,12 @@ namespace llaminar2
         bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return hasPrefillReplayParams(); }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return hasPrefillReplayParams()
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                       : GraphLaunchPreparationPolicy::None;
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

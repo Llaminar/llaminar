@@ -8077,6 +8077,19 @@ add_v2_test(V2_Unit_MTPSpecDecodeMetadata
     MPI_PROCS 1
 )
 
+# Test: device-owned generation response and transaction controller
+add_executable(v2_test_device_generation_controller
+    unit/mtp/Test__DeviceGenerationController.cpp)
+target_link_libraries(v2_test_device_generation_controller
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_device_generation_controller PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_DeviceGenerationController
+    COMMAND $<TARGET_FILE:v2_test_device_generation_controller>
+    LABELS "V2;Unit;MTP;SpecDecode;DeviceResident;Lifecycle;ByteExact"
+    MPI_PROCS 1
+)
+
 # Test: vLLM-style MTP verifier graph-forward execution routing
 add_executable(v2_test_mtp_verifier_forward_executor unit/mtp/Test__MTPVerifierForwardExecutor.cpp)
 target_link_libraries(v2_test_mtp_verifier_forward_executor llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
@@ -13374,7 +13387,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*CUDA
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*CUDA:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
@@ -13382,6 +13395,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_DeviceGenerationController_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA
+            LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
     endif()
@@ -13394,7 +13413,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*ROCm
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*ROCm:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
@@ -13402,6 +13421,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_DeviceGenerationController_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm
+            LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
     endif()

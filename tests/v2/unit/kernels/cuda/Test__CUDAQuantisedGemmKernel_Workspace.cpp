@@ -244,18 +244,11 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     constexpr int kK = 5120;
     auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
 
-    EXPECT_EQ(
-        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS),
-        nullptr)
-        << "M>1 must not use the serial M=1 decode participant.";
-
     const WorkspaceDescriptor *grouped =
-        reqs.find(
-            GemmWorkspaceBuffers::
-                GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     ASSERT_NE(grouped, nullptr)
         << "Grouped verifier M is total and may exceed the default captured "
-           "depth by tiling through one bounded persistent arena.";
+           "depth by tiling through the unified persistent KPAR arena.";
     EXPECT_EQ(
         grouped->regime,
         WorkspaceExecutionRegime::CompactDecodeOnly)
@@ -330,7 +323,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       GroupedVerifierGemvPartials_M4UsesDedicatedSerialParticipant)
+       GroupedVerifierGemvPartials_M4UsesUnifiedPersistentArena)
 {
     auto weights_small = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/155);
     auto weights_large = TestTensorFactory::createQ8_0Random({8192, 2048}, /*seed=*/156);
@@ -343,16 +336,11 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     auto reqs_large = kernel_large.getWorkspaceRequirements(kM, /*n=*/8192, /*k=*/2048);
 
     const auto *small_grouped = reqs_small.find(
-        GemmWorkspaceBuffers::
-            GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     const auto *large_grouped = reqs_large.find(
-        GemmWorkspaceBuffers::
-            GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     ASSERT_NE(small_grouped, nullptr);
     ASSERT_NE(large_grouped, nullptr);
-    EXPECT_EQ(
-        reqs_small.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS),
-        nullptr);
     ASSERT_GT(large_grouped->size_bytes, small_grouped->size_bytes);
     EXPECT_EQ(
         large_grouped->regime,

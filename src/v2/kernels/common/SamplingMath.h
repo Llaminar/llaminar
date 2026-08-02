@@ -92,6 +92,332 @@ namespace llaminar2::sampling_math
     };
 
     /**
+     * @brief Stable control-word layout for a device-owned generation request.
+     *
+     * A speculative verifier transaction produces a compact token row and a
+     * metadata row.  Production GPU generation must be able to consume many of
+     * those transactions without asking the host how many response tokens have
+     * already been emitted, whether a rejected correction row is being carried
+     * into the next verifier, or whether the request has reached its terminal
+     * budget.  These words are the single device-resident authority for those
+     * facts.
+     *
+     * The layout intentionally contains only fixed-width INT32 values.  CUDA and
+     * ROCm kernels can therefore share the exact transition helper below, while
+     * CPU unit tests can exhaustively prove the same state machine without a GPU.
+     * The response-token payload lives in a separate persistent arena row.
+     */
+    enum DeviceGenerationControlIndex : int
+    {
+        kDeviceGenerationControlOk = 0,
+        kDeviceGenerationControlResponseTokenCount = 1,
+        kDeviceGenerationControlRemainingTokenCount = 2,
+        kDeviceGenerationControlModelStopped = 3,
+        kDeviceGenerationControlRequestComplete = 4,
+        kDeviceGenerationControlTransactionCount = 5,
+        kDeviceGenerationControlNextLeadingCommittedOutputCount = 6,
+        kDeviceGenerationControlTransactionCommitBudget = 7,
+        kDeviceGenerationControlAcceptedSpeculativeTokenCount = 8,
+        kDeviceGenerationControlRejectedTransactionCount = 9,
+        kDeviceGenerationControlConsumedVerifierRowCount = 10,
+        kDeviceGenerationControlErrorCode = 11,
+        kDeviceGenerationControlCount = 12,
+    };
+
+    /**
+     * @brief Fatal validation failures reported by the generation controller.
+     *
+     * The controller never repairs or truncates malformed production output.
+     * A non-zero value invalidates the request and is surfaced by the single
+     * terminal materialization.  This prevents a GPU request from limping on
+     * after a stale mailbox, response-budget overrun, or compact-ABI drift.
+     */
+    enum class DeviceGenerationError : int
+    {
+        None = 0,
+        InvalidInitialization = 1,
+        InvalidController = 2,
+        InvalidCompactOutcome = 3,
+        LeadingCommittedRowMismatch = 4,
+        EmptyTransaction = 5,
+        ResponseBudgetExceeded = 6,
+        ResponseCapacityExceeded = 7,
+        InvalidVerifierCounts = 8,
+        InvalidPublicationMetadata = 9,
+    };
+
+    /**
+     * @brief Invalidate a resident generation request after a fatal transition.
+     *
+     * Keeping failure publication in a named host/device helper avoids
+     * compiler-specific device lambdas and gives CUDA, ROCm, and CPU tests one
+     * exact fail-hard state.  A failed request is terminal: later graph replays
+     * observe `Ok == 0`, publish no commit budget, and preserve the first error
+     * code for terminal materialization.
+     *
+     * @param control Mutable controller row, or nullptr when pointer validation
+     *        itself failed.
+     * @param error Stable error code to surface at the request boundary.
+     * @return Always false, allowing callers to return the transition result.
+     */
+    LLAMINAR_SAMPLING_HD bool fail_device_generation_control(
+        int *control,
+        DeviceGenerationError error)
+    {
+        if (control)
+        {
+            control[kDeviceGenerationControlOk] = 0;
+            control[kDeviceGenerationControlRequestComplete] = 1;
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(error);
+        }
+        return false;
+    }
+
+    /**
+     * @brief Initialize one persistent device generation controller row.
+     *
+     * This helper is called by a tiny explicit-stream backend kernel at request
+     * admission.  The host supplies immutable request policy exactly once; all
+     * later transaction counts and boundaries are device-owned.
+     *
+     * @param max_new_tokens Number of response tokens requested by the caller.
+     * @param response_capacity Number of token slots in the persistent response
+     *        row.  It must cover the complete request budget.
+     * @param control Writable row with @ref kDeviceGenerationControlCount words.
+     * @return true when the initialized controller is valid.
+     */
+    LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
+        int max_new_tokens,
+        int response_capacity,
+        int *control)
+    {
+        if (!control)
+            return false;
+
+        for (int i = 0; i < kDeviceGenerationControlCount; ++i)
+            control[i] = 0;
+
+        if (max_new_tokens <= 0 ||
+            response_capacity <= 0 ||
+            max_new_tokens > response_capacity)
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidInitialization);
+            return false;
+        }
+
+        control[kDeviceGenerationControlOk] = 1;
+        control[kDeviceGenerationControlRemainingTokenCount] = max_new_tokens;
+        return true;
+    }
+
+    /**
+     * @brief Publish the maximum serial-visible row count for the next verifier.
+     *
+     * The verifier reducer already accepts a device pointer for its commit
+     * boundary.  This transition combines the response budget with the current
+     * device-owned maintenance boundary before any verifier output is reduced.
+     * A completed request publishes zero, allowing a graph-owned conditional or
+     * no-op admission kernel to suppress later work without a host poll.
+     *
+     * @param verifier_row_capacity Static verifier graph row capacity.
+     * @param maintenance_rows_remaining Device MoE maintenance boundary.  Values
+     *        <= 0 are invalid because maintenance must run before another
+     *        serial-visible transaction is admitted.
+     * @param control Mutable generation controller row.
+     * @return Published commit budget, or zero when the request is complete or
+     *         invalid.
+     */
+    LLAMINAR_SAMPLING_HD int prepare_device_generation_transaction_budget(
+        int verifier_row_capacity,
+        int maintenance_rows_remaining,
+        int *control)
+    {
+        if (!control || verifier_row_capacity <= 0 ||
+            maintenance_rows_remaining <= 0)
+        {
+            if (control)
+            {
+                control[kDeviceGenerationControlOk] = 0;
+                control[kDeviceGenerationControlErrorCode] =
+                    static_cast<int>(DeviceGenerationError::InvalidController);
+                control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            }
+            return 0;
+        }
+        if (control[kDeviceGenerationControlOk] == 0 ||
+            control[kDeviceGenerationControlRequestComplete] != 0)
+        {
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            return 0;
+        }
+
+        const int remaining =
+            control[kDeviceGenerationControlRemainingTokenCount];
+        if (remaining <= 0)
+        {
+            control[kDeviceGenerationControlRequestComplete] = 1;
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            return 0;
+        }
+
+        int budget = remaining < verifier_row_capacity
+                         ? remaining
+                         : verifier_row_capacity;
+        budget = budget < maintenance_rows_remaining
+                     ? budget
+                     : maintenance_rows_remaining;
+        control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+        return budget;
+    }
+
+    /**
+     * @brief Append one compact verifier outcome to a device response ledger.
+     *
+     * The function enforces serial decode response semantics.  A rejected token
+     * may be emitted at the end of transaction N and carried as verifier input
+     * row zero in transaction N+1; the compact ABI marks that row with
+     * `kSpecBatchMetaLeadingCommittedOutputCount`, and this controller refuses to
+     * count it twice.  No malformed or over-budget output is silently clipped.
+     *
+     * @param compact_tokens Compact output-token row for one request.
+     * @param output_token_stride Capacity of @p compact_tokens.
+     * @param compact_meta Compact metadata row for the same request.
+     * @param meta_stride Capacity of @p compact_meta.
+     * @param response_tokens Persistent device response row.
+     * @param response_capacity Capacity of @p response_tokens.
+     * @param control Mutable controller row.
+     * @return true when the transaction was appended, or when the request was
+     *         already complete and therefore required no mutation.
+     */
+    LLAMINAR_SAMPLING_HD bool append_speculative_outcome_to_device_generation(
+        const int32_t *compact_tokens,
+        int output_token_stride,
+        const int *compact_meta,
+        int meta_stride,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control)
+    {
+        if (!control || !compact_tokens || !compact_meta || !response_tokens ||
+            output_token_stride <= 0 ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            response_capacity <= 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidController);
+        }
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+        if (compact_meta[kSpecBatchMetaOk] == 0)
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidCompactOutcome);
+
+        const int output_count = compact_meta[kSpecBatchMetaOutputCount];
+        const int leading_count =
+            compact_meta[kSpecBatchMetaLeadingCommittedOutputCount];
+        const int expected_leading_count =
+            control[kDeviceGenerationControlNextLeadingCommittedOutputCount];
+        const int verifier_state_count =
+            compact_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+        const int accepted_prefix =
+            compact_meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+        const int consumed_rows =
+            compact_meta[kSpecBatchMetaConsumedVerifierRows];
+
+        if (output_count <= 0 || output_count > output_token_stride ||
+            leading_count < 0 || leading_count > 1 ||
+            leading_count > output_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidCompactOutcome);
+        }
+        if (leading_count != expected_leading_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::LeadingCommittedRowMismatch);
+        }
+        if (verifier_state_count < 0 || verifier_state_count > output_count ||
+            accepted_prefix < 0 || consumed_rows < 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidVerifierCounts);
+        }
+
+        const int newly_emitted_count = output_count - leading_count;
+        if (newly_emitted_count <= 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::EmptyTransaction);
+        }
+
+        const int response_count =
+            control[kDeviceGenerationControlResponseTokenCount];
+        const int remaining_count =
+            control[kDeviceGenerationControlRemainingTokenCount];
+        if (response_count < 0 || remaining_count < newly_emitted_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::ResponseBudgetExceeded);
+        }
+        if (response_count + newly_emitted_count > response_capacity)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::ResponseCapacityExceeded);
+        }
+
+        for (int i = 0; i < newly_emitted_count; ++i)
+        {
+            response_tokens[response_count + i] =
+                compact_tokens[leading_count + i];
+        }
+
+        const int next_response_count = response_count + newly_emitted_count;
+        const int next_remaining_count = remaining_count - newly_emitted_count;
+        const bool model_stopped =
+            compact_meta[kSpecBatchMetaStoppedOnOutput] != 0;
+        const bool has_emitted_pending_condition =
+            !model_stopped && output_count > verifier_state_count;
+        const bool rejected_transaction =
+            !model_stopped &&
+            compact_meta[kSpecBatchMetaAllSpeculativeAccepted] == 0 &&
+            compact_meta[kSpecBatchMetaCommitBoundaryClipped] == 0;
+
+        control[kDeviceGenerationControlResponseTokenCount] =
+            next_response_count;
+        control[kDeviceGenerationControlRemainingTokenCount] =
+            next_remaining_count;
+        control[kDeviceGenerationControlModelStopped] = model_stopped ? 1 : 0;
+        control[kDeviceGenerationControlRequestComplete] =
+            model_stopped || next_remaining_count == 0 ? 1 : 0;
+        control[kDeviceGenerationControlTransactionCount] += 1;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
+            has_emitted_pending_condition ? 1 : 0;
+        control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+        control[kDeviceGenerationControlAcceptedSpeculativeTokenCount] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlRejectedTransactionCount] +=
+            rejected_transaction ? 1 : 0;
+        control[kDeviceGenerationControlConsumedVerifierRowCount] +=
+            consumed_rows;
+        control[kDeviceGenerationControlErrorCode] =
+            static_cast<int>(DeviceGenerationError::None);
+        return true;
+    }
+
+    /**
      * @brief Convert compact output rows into newly emitted serial decode rounds.
      *
      * The compact ABI permits exactly one leading row from an earlier transaction:
@@ -1064,22 +1390,185 @@ namespace llaminar2::sampling_math
     }
 
     /**
-     * @brief Derive shifted MTP-KV publication counts from compact metadata.
+     * @brief Commit one compact outcome and derive its live-state publication.
      *
-     * The main verifier publication advances the target model cache to
-     * `base + accepted_state_count`.  Depth `d` of the shifted sidecar cache is
-     * one-or-more rows behind the main model and must instead expose
-     * `max(0, target - d - 1)` rows.  The accepted count passed to a ring cache
-     * is the delta from its prior shifted length so wrapped heads advance by the
-     * same number of newly valid shifted rows as the old host publisher used.
+     * GPU generation used to launch one scalar kernel to append response tokens
+     * and a second scalar kernel to derive the accepted KV/recurrent-state row.
+     * Both operations consume the same compact token/metadata row, run on the
+     * same producer stream, and form one indivisible serial-decode transaction.
+     * Keeping them in separate launches added latency and allowed later callers
+     * to accidentally publish state without first committing the response
+     * ledger.  This shared helper makes that illegal by construction.
+     *
+     * Publication is validated before response bytes are mutated.  Response
+     * append is then all-or-nothing: its helper validates every count and
+     * capacity before copying tokens.  If either half fails, @p out_ok is zero
+     * and the resident controller becomes terminal, so downstream publication
+     * kernels cannot expose a partially committed transaction.
+     *
+     * @param output_tokens Compact output rows for every request.
+     * @param output_token_stride Compact token capacity per request.
+     * @param meta Compact metadata rows for every request.
+     * @param meta_stride Compact metadata capacity per request.
+     * @param request_index Request row owned by this invocation.
+     * @param padded_state_rows_per_request Static verifier graph row capacity.
+     * @param base_cached_tokens Device-owned cache count before verifier replay.
+     * @param response_tokens Persistent response row for this request.
+     * @param response_capacity Persistent response-row capacity.
+     * @param control Persistent generation-controller row.  Its current
+     *        transaction budget is the sole publication limit.
+     * @return true only when response and publication state were both committed.
      */
-    LLAMINAR_SAMPLING_HD void derive_shifted_speculative_publication_metadata(
-        const int *meta,
+    LLAMINAR_SAMPLING_HD bool
+    commit_device_generation_and_derive_speculative_publication_metadata(
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int *meta,
         int meta_stride,
         int request_index,
         int padded_state_rows_per_request,
         int base_cached_tokens,
-        int max_state_commit_rows,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control,
+        int *out_restore_row,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_count,
+        int *out_ok,
+        int32_t *out_next_condition_token = nullptr,
+        int *out_all_drafts_accepted = nullptr,
+        int *out_stopped = nullptr)
+    {
+        /*
+         * Validate every required address and geometry before either helper can
+         * derive a request-row address.  Backend launchers enforce the same
+         * contract on the host, but this device-side guard is still essential:
+         * graph node parameters are mutable, and a malformed replay must become
+         * a terminal request error instead of performing undefined pointer
+         * arithmetic or publishing stale metadata.
+         */
+        if (!output_tokens ||
+            output_token_stride <= 0 ||
+            !meta ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            request_index < 0 ||
+            padded_state_rows_per_request <= 0 ||
+            base_cached_tokens < 0 ||
+            !response_tokens ||
+            response_capacity <= 0 ||
+            !control ||
+            !out_restore_row ||
+            !out_target_cached_tokens ||
+            !out_accepted_state_count ||
+            !out_ok)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidPublicationMetadata);
+        }
+
+        /*
+         * A successfully completed request is an absorbing state.  A static
+         * graph may reach this node again before its device-side loop observes
+         * the terminal predicate, but stale verifier scratch must never turn a
+         * successful terminal controller into an error or republish an old
+         * accepted row.  Publish an explicitly inert state transaction while
+         * preserving the last valid condition-token value: speculative readers
+         * can safely drain already-enqueued work, while every live-state
+         * publisher sees `out_ok == 0` and a negative restore row.
+         *
+         * This check deliberately precedes every compact-metadata read.  Once
+         * terminal, those bytes are outside the request state machine and are
+         * neither trusted nor repaired.
+         */
+        if (control[kDeviceGenerationControlOk] != 0 &&
+            control[kDeviceGenerationControlRequestComplete] != 0)
+        {
+            *out_restore_row = -1;
+            *out_target_cached_tokens = base_cached_tokens;
+            *out_accepted_state_count = 0;
+            *out_ok = 0;
+            if (out_all_drafts_accepted)
+                *out_all_drafts_accepted = 0;
+            if (out_stopped)
+                *out_stopped = 1;
+            return true;
+        }
+
+        *out_ok = 0;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+
+        int *request_meta =
+            meta + static_cast<size_t>(request_index) *
+                       static_cast<size_t>(meta_stride);
+        const int transaction_commit_budget =
+            control[kDeviceGenerationControlTransactionCommitBudget];
+
+        derive_speculative_publication_metadata(
+            meta,
+            meta_stride,
+            request_index,
+            padded_state_rows_per_request,
+            base_cached_tokens,
+            transaction_commit_budget,
+            out_restore_row,
+            out_target_cached_tokens,
+            out_accepted_state_count,
+            out_ok,
+            output_tokens,
+            output_token_stride,
+            out_next_condition_token,
+            out_all_drafts_accepted,
+            out_stopped);
+
+        if (!out_ok || *out_ok == 0)
+        {
+            request_meta[kSpecBatchMetaOk] = 0;
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidPublicationMetadata);
+        }
+
+        const int32_t *request_output_tokens =
+            output_tokens + static_cast<size_t>(request_index) *
+                                static_cast<size_t>(output_token_stride);
+        if (!append_speculative_outcome_to_device_generation(
+                request_output_tokens,
+                output_token_stride,
+                request_meta,
+                meta_stride,
+                response_tokens,
+                response_capacity,
+                control))
+        {
+            *out_ok = 0;
+            request_meta[kSpecBatchMetaOk] = 0;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Derive shifted MTP-KV counts from canonical primary publication.
+     *
+     * The primary publication transaction has already validated compact
+     * verifier metadata and applied the resident response/maintenance budget.
+     * Re-reading compact metadata here would repeat that policy with another
+     * scalar input and could let main and shifted caches publish different
+     * prefixes.  This helper therefore accepts only the canonical primary
+     * output: base count, committed target count, and publication validity.
+     *
+     * Depth `d` is `d + 1` rows behind the main model.  The shifted target is
+     * `max(0, main_target - d - 1)`, while its accepted count is the delta from
+     * the correspondingly shifted pre-transaction base.  This preserves ring
+     * head movement at short prefixes without inventing a second commit limit.
+     */
+    LLAMINAR_SAMPLING_HD void
+    derive_shifted_speculative_publication_metadata_from_primary(
+        int base_cached_tokens,
+        int main_target_cached_tokens,
+        int main_publication_ok,
         int mtp_depth,
         int *out_target_cached_tokens,
         int *out_accepted_state_count,
@@ -1092,26 +1581,10 @@ namespace llaminar2::sampling_math
         if (out_ok)
             *out_ok = 0;
 
-        if (mtp_depth < 0)
-            return;
-
-        int restore_row = -1;
-        int main_target_cached_tokens = base_cached_tokens;
-        int main_accepted_state_count = 0;
-        int ok = 0;
-        derive_speculative_publication_metadata(
-            meta,
-            meta_stride,
-            request_index,
-            padded_state_rows_per_request,
-            base_cached_tokens,
-            max_state_commit_rows,
-            &restore_row,
-            &main_target_cached_tokens,
-            &main_accepted_state_count,
-            &ok);
-
-        if (!ok)
+        if (mtp_depth < 0 ||
+            base_cached_tokens < 0 ||
+            main_target_cached_tokens < base_cached_tokens ||
+            main_publication_ok == 0)
             return;
 
         const int shift = mtp_depth + 1;

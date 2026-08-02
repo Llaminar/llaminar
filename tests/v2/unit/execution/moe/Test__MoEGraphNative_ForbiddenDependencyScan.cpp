@@ -437,18 +437,34 @@ namespace llaminar2::test
         const std::string contents = readFile(path);
         ASSERT_FALSE(contents.empty()) << path;
 
-        const size_t candidate = contents.find("local_tp_apportioned_fast_candidate");
+        const size_t candidate = contents.find("const bool ordinary_prefill_graph");
         ASSERT_NE(candidate, std::string::npos);
         const std::string gate = contents.substr(candidate, 1600);
 
+        EXPECT_NE(gate.find("total_tokens > 1"), std::string::npos);
         EXPECT_NE(gate.find("phase_split_local_tp_apportioned_gpu_prefill"), std::string::npos)
             << "Phase-split LocalTP GPU prefill must be allowed to use the grouped expert fast path; "
                "otherwise prefill falls back to the CPU sparse dispatch stage and rejects graph capture.";
-        EXPECT_NE(gate.find("DenseParallelPolicy::PrefillTensorParallelDecodeReplicated"), std::string::npos);
-        EXPECT_NE(gate.find("total_tokens > 1"), std::string::npos);
-        EXPECT_NE(gate.find("phase_split_local_tp_apportioned_gpu_prefill"), std::string::npos);
+        EXPECT_NE(gate.find("isPrefillApportionedDecodeReplicatedTier"), std::string::npos);
         EXPECT_EQ(gate.find("(!device.is_gpu() || total_tokens == 1) &&"), std::string::npos)
             << "Do not regress to decode-only GPU LocalTP apportioned overlay fast path gating.";
+
+        const size_t phase_policy_helper =
+            contents.find("bool isPrefillApportionedDecodeReplicatedTier");
+        ASSERT_NE(phase_policy_helper, std::string::npos);
+        const std::string phase_policy =
+            contents.substr(phase_policy_helper, 700);
+        EXPECT_NE(
+            phase_policy.find("RoutedExpertComputePolicy::Replicated"),
+            std::string::npos);
+        EXPECT_NE(
+            phase_policy.find("RoutedExpertPhasePolicy::"),
+            std::string::npos);
+        EXPECT_NE(
+            phase_policy.find("PrefillApportionedDecodeReplicated"),
+            std::string::npos)
+            << "The declarative routed-expert phase policy must remain the "
+               "single owner of phase-split prefill admission.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DeviceRebalanceKernelsFilterResidentOnlyCandidatesBeforeRanking)
@@ -2671,8 +2687,10 @@ namespace llaminar2::test
         EXPECT_NE(stage_source.find("wave_state"), std::string::npos);
         EXPECT_NE(stage_header.find("prepareGraphLaunch"), std::string::npos)
             << "Transfer stream/event resources should be prepared before graph capture begins.";
-        EXPECT_NE(stage_header.find("needsGraphLaunchPreparation() const override { return usesTransferSlotApply(); }"),
-                  std::string::npos);
+        EXPECT_NE(stage_header.find("GraphLaunchPreparationPolicy::CaptureOnly"),
+                  std::string::npos)
+            << "Transfer-backed graph setup must be capture-only so cached and "
+               "device-controlled replays require no external host preparation.";
         EXPECT_NE(stage_header.find("prepareForCapture("), std::string::npos)
             << "Every multi-stream MoE stage must share one typed pre-capture lane contract.";
         const size_t prepare_lane =

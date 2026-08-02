@@ -871,10 +871,19 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
 
     GraphConfig prefill_config = makeMoEConfig(tp_ctx.get());
     prefill_config.dense_tp_enabled = false;
+    /*
+     * Preserve the production distinction deliberately: the request-level
+     * policy still describes the apportioned prefill lane, while the resolved
+     * overlay domain owns complete replicated weights and phase-splits only
+     * ordinary prefill. Graph lowering must consult the resolved tier instead
+     * of leaking this outer value into decode collective decisions.
+     */
     prefill_config.moe.routed_compute_policy =
-        RoutedExpertComputePolicy::Replicated;
+        RoutedExpertComputePolicy::Apportioned;
     prefill_config.moe.routed_phase_policy =
         RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+    prefill_config.moe.routed_assignment_policy =
+        RoutedExpertAssignmentPolicy::LeastLoadedResident;
     prefill_config.moe.local_expert_count = -1;
     prefill_config.moe.routed_expert_plan =
         makeLocalTPApportionedOverlayPlan("phase_split_localtp");
@@ -914,6 +923,15 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
     ASSERT_NE(
         prefill_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
         nullptr);
+    const auto *prefill_expert_stage =
+        dynamic_cast<const MoEExpertComputeStage *>(
+            prefill_graph
+                .getNode("layer0_moe_expert_ffn_overlay_fast")
+                ->stage.get());
+    ASSERT_NE(prefill_expert_stage, nullptr);
+    EXPECT_EQ(
+        prefill_expert_stage->routedExpertRowExecutionPolicyForTesting(),
+        RoutedExpertRowExecutionPolicy::ParticipantAssigned);
     ASSERT_NE(
         prefill_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
         nullptr)
@@ -942,6 +960,24 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
     ASSERT_NE(
         verifier_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
         nullptr);
+    const auto *verifier_expert_stage =
+        dynamic_cast<const MoEExpertComputeStage *>(
+            verifier_graph
+                .getNode("layer0_moe_expert_ffn_overlay_fast")
+                ->stage.get());
+    ASSERT_NE(verifier_expert_stage, nullptr);
+    EXPECT_EQ(
+        verifier_expert_stage->routedExpertRowExecutionPolicyForTesting(),
+        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal);
+    EXPECT_EQ(
+        verifier_expert_stage->routedExpertAssignmentPolicyForTesting(),
+        RoutedExpertAssignmentPolicy::LeastLoadedResident)
+        << "The declared resident scheduler may remain visible for diagnostics, "
+           "but fully replicated local execution must not invoke it.";
+    EXPECT_FALSE(
+        verifier_expert_stage->hasPrefillLLEPTPContextForTesting())
+        << "Replicated verifier rows require neither resident assignment nor "
+           "current-batch transport wiring.";
     EXPECT_EQ(
         verifier_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
         nullptr)

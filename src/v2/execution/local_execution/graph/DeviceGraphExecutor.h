@@ -44,6 +44,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <optional>
 #include <span>
 
 namespace llaminar2
@@ -608,7 +609,6 @@ namespace llaminar2
             std::vector<std::string> stage_names;          ///< Ordered stage names in this segment
             bool capturable = true;                        ///< Whether this segment can be graph-captured
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
-            std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
 
             // Output coherence is marked through stable BufferArena ids after
@@ -632,6 +632,21 @@ namespace llaminar2
          */
         struct GraphSegmentCache
         {
+            /**
+             * @brief Immutable view of one complete replay-ready graph template.
+             *
+             * The cache retains ownership. A parent graph may clone the native
+             * executable through @ref capture, but must not launch, reset, or
+             * mutate it through this borrowed view.
+             */
+            struct DeviceLoopGraphTemplateView
+            {
+                const IGPUGraphCapture *capture = nullptr;
+                void *stream = nullptr;
+                size_t stage_count = 0;
+                size_t captured_node_count = 0;
+            };
+
             /**
              * @brief Stable execution geometry represented by this graph cache.
              *
@@ -811,6 +826,23 @@ namespace llaminar2
             GraphSegmentCache(const GraphSegmentCache &) = delete;
             GraphSegmentCache &operator=(const GraphSegmentCache &) = delete;
 
+            /**
+             * @brief Export a strict monolithic template for device-loop composition.
+             *
+             * Segmentation, incomplete capture, ambiguous stream ownership, or
+             * incomplete stage coverage are hard failures. This method never
+             * launches eagerly and never recaptures as a substitute.
+             *
+             * @param graph Complete source graph whose stage lifecycle
+             *        contracts must be self-contained at replay time.
+             * @param error Optional first violated contract.
+             * @return Borrowed replay template when every invariant holds.
+             */
+            [[nodiscard]] std::optional<DeviceLoopGraphTemplateView>
+            deviceLoopGraphTemplate(
+                const ComputeGraph &graph,
+                std::string *error = nullptr) const;
+
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
                 waitForCaptureStreamFence();
@@ -868,6 +900,23 @@ namespace llaminar2
             bool orderCaptureStreamAfter(
                 IWorkerGPUContext *ctx,
                 void *producer_stream);
+
+            /**
+             * @brief Order an external consumer after the capture stream.
+             *
+             * This is the reverse half of @ref orderCaptureStreamAfter. It
+             * records the cache-owned handoff event on the exact stream that
+             * launched the captured graph, then queues a wait on the caller's
+             * explicit consumer stream. The operation is entirely device-side;
+             * it never synchronizes the host or changes graph ownership.
+             *
+             * @param ctx GPU context that owns both streams and the handoff event.
+             * @param consumer_stream Explicit stream that will consume graph output.
+             * @return true after the stream wait has been enqueued.
+             */
+            bool orderStreamAfterCapture(
+                IWorkerGPUContext *ctx,
+                void *consumer_stream);
 
             /// Destroy the cached sync event if it exists
             void destroySyncEvent();

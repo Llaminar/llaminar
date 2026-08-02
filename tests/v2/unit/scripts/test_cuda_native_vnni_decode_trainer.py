@@ -65,7 +65,7 @@ RUNTIME_SOURCE = (
     / "kernels"
     / "cuda"
     / "gemm"
-    / "CUDANativeVNNIGemvTuned.cu"
+    / "CUDANativeVNNIGemvShardImpl.cu.inc"
 )
 DEBUG_ENV_SOURCE = REPO_ROOT / "src" / "v2" / "utils" / "DebugEnv.h"
 

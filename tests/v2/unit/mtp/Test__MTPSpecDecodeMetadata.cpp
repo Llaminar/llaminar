@@ -1573,13 +1573,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
     int accepted_state_count = -1;
     int ok = 0;
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/10,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/13,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/0,
         &target_cached_tokens,
         &accepted_state_count,
@@ -1590,13 +1587,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         << "At normal context lengths depth-0 shifted KV advances by every "
            "committed verifier row.";
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/10,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/13,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/2,
         &target_cached_tokens,
         &accepted_state_count,
@@ -1607,13 +1601,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         << "Deeper shifted caches use the same accepted delta once the base "
            "context is longer than the shift.";
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/0,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/3,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/0,
         &target_cached_tokens,
         &accepted_state_count,

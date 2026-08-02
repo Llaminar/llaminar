@@ -443,6 +443,39 @@ namespace llaminar2
             void *out_meta_device,
             const void *max_state_commit_rows_device = nullptr,
             int leading_committed_output_count = 0) override;
+        bool enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            const void *greedy_draft_tokens_device,
+            int row_count,
+            const void *first_token_device,
+            const void *stop_tokens_device,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device) override;
+        bool enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            int target_row_stride,
+            int top_k,
+            int row_count,
+            uint64_t threshold_seed,
+            const void *threshold_position_device,
+            int threshold_position_offset,
+            const void *verifier_input_tokens_device,
+            const void *stop_tokens_device,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *sampled_target_tokens_device,
+            void *out_tokens_device,
+            void *out_meta_device) override;
         bool enqueueSummarizeGreedySpeculativeVerifyBatch(
             const void *verify_tokens_device,
             const void *draft_tokens_device,
@@ -470,7 +503,7 @@ namespace llaminar2
             const void *max_state_commit_rows_device = nullptr,
             const void *penalty_policy_device = nullptr) override;
         bool enqueueAdvanceSpeculativeCommitBoundary(
-            const void *meta_device,
+            void *meta_device,
             int request_count,
             int meta_stride,
             void *decode_rounds_committed_device,
@@ -479,6 +512,44 @@ namespace llaminar2
             void *decode_boundary_advanced_device,
             int device_id,
             void *stream) override;
+        bool enqueueInitializeDeviceGeneration(
+            int request_count,
+            int max_new_tokens,
+            int response_token_stride,
+            void *response_tokens_device,
+            int control_stride,
+            void *control_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePrepareDeviceGenerationTransactionBudget(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            int verifier_row_capacity,
+            const void *maintenance_rows_remaining_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+            const void *output_tokens_device,
+            int output_token_stride,
+            void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            void *response_tokens_device,
+            int response_token_stride,
+            void *control_device,
+            int control_stride,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,
@@ -497,13 +568,11 @@ namespace llaminar2
             int output_token_stride = 0,
             void *out_all_drafts_accepted_flags_device = nullptr,
             void *out_stopped_flags_device = nullptr) override;
-        bool enqueueDeriveShiftedSpeculativePublicationMetadata(
-            const void *meta_device,
-            int meta_stride,
+        bool enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
             const void *base_cached_tokens_device,
+            const void *main_target_cached_tokens_device,
+            const void *main_publication_ok_device,
             int request_count,
-            int padded_state_rows_per_request,
-            int max_state_commit_rows,
             int mtp_depth,
             int device_id,
             void *stream,

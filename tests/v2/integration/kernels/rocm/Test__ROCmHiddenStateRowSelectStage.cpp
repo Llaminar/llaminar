@@ -374,7 +374,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedCheckpointReadsResidentPrefill
                  d_model,
                  0)
             .buffers.empty());
-    ASSERT_FALSE(stage.needsGraphLaunchPreparation());
+    ASSERT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;

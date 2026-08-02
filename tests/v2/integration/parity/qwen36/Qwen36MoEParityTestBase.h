@@ -9392,8 +9392,6 @@ namespace llaminar2::test::parity::qwen36
                 outcome_request.draw_position_source =
                     DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
                 outcome_request.serial_sample_equivalent = true;
-                outcome_request.leading_committed_output_count =
-                    stochastic_first_token_is_pending ? 1 : 0;
                 outcome_request.use_device_draft_tokens = true;
                 ASSERT_TRUE(
                     runner->verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
@@ -9622,8 +9620,6 @@ namespace llaminar2::test::parity::qwen36
             chained_outcome_request.draw_position_source =
                 DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
             chained_outcome_request.serial_sample_equivalent = true;
-            chained_outcome_request.leading_committed_output_count =
-                stochastic_first_token_is_pending ? 1 : 0;
             chained_outcome_request.use_device_draft_tokens = true;
 
             DeviceSpeculativeOutcomeHandle chained_outcome_handle;
@@ -9928,8 +9924,6 @@ namespace llaminar2::test::parity::qwen36
             request.draw_position_source =
                 DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
             request.serial_sample_equivalent = true;
-            request.leading_committed_output_count =
-                stochastic_first_token_is_pending ? 1 : 0;
             request.use_device_draft_tokens = true;
 
             DeviceSpeculativeOutcomeHandle outcome_handle;

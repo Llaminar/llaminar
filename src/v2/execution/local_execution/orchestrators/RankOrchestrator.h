@@ -878,6 +878,11 @@ namespace llaminar2
             int row_count,
             const SamplingParams &params,
             int vocab_size) override;
+        bool buildCapturedStochasticVerifierTargetDistributions(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size) override;
         bool buildStochasticProcessedLogitRowsOnDevice(
             DeviceLogitsSource source,
             int first_row,
@@ -893,6 +898,10 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold) override;
+        bool publishCapturedMTPDraftToken(
+            int row,
+            int slot,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
         bool sampleStochasticDraftProposalOnDeviceDeferred(
             DeviceLogitsSource source,
             int row,
@@ -988,6 +997,11 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool beginDeviceResidentStochasticGeneration(
+            int request_count,
+            int max_new_tokens) override;
+        bool finishDeviceResidentStochasticGeneration(
+            DeviceGenerationTerminalResult *out_result) override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
 

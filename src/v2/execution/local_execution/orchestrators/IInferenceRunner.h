@@ -200,7 +200,15 @@ namespace llaminar2
     struct DeviceSpeculativeOutcomeHandle
     {
         const int32_t *output_tokens_device = nullptr;
-        const int *meta_device = nullptr;
+        /**
+         * Compact transaction metadata owned by the producer graph.
+         *
+         * Publication may terminally invalidate this row when response-ledger
+         * commit fails.  Keeping the pointer mutable makes that single-device
+         * authority explicit and prevents a later host bridge from observing a
+         * stale successful transaction after publication has failed.
+         */
+        int *meta_device = nullptr;
         int request_count = 0;
         int output_token_stride = sampling_math::kSpeculativeBatchMaxOutputTokens;
         int meta_stride = sampling_math::kSpeculativeBatchMetaCount;
@@ -236,6 +244,17 @@ namespace llaminar2
          */
         DeviceResidentMTPTransactionLease mtp_transaction;
         /**
+         * @brief Whether the compact row participates in the resident response ledger.
+         *
+         * Stochastic production reduction sets this bit only after it has
+         * consumed the request-admission controller event and published a
+         * device-owned transaction budget.  Accepted-state publication then
+         * must use the fused response-commit/publication kernel.  Greedy
+         * graph-terminal outcomes have a separate captured reducer and leave
+         * this false until that graph is migrated to the same controller ABI.
+         */
+        bool device_generation_controller_owned = false;
+        /**
          * @brief True when this child produced a complete mirrored LocalTP outcome.
          *
          * Every child in a mirrored domain must report this value. It proves
@@ -253,6 +272,47 @@ namespace llaminar2
                    meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
                    stream != nullptr &&
                    response_ready_event != nullptr;
+        }
+    };
+
+    /**
+     * @brief Host-visible terminal record for one device-owned generation row.
+     *
+     * This record is created only after the request's final controller
+     * publication has been consumed through an explicit GPU event edge.  It is
+     * deliberately a terminal result rather than a live-state mirror: none of
+     * these fields may feed a later graph replay or accepted-state publication.
+     */
+    struct DeviceGenerationTerminalRequestResult
+    {
+        std::vector<int32_t> tokens; ///< Exact response tokens emitted by the device ledger.
+        int remaining_token_count = 0; ///< Unused response budget when a stop token ended generation.
+        bool model_stopped = false; ///< True when generation ended on the request stop policy.
+        int transaction_count = 0; ///< Number of committed speculative transactions.
+        int accepted_speculative_token_count = 0; ///< Accepted draft-token total.
+        int rejected_transaction_count = 0; ///< Transactions that emitted a rejection correction.
+        int consumed_verifier_row_count = 0; ///< Total verifier rows consumed by committed transactions.
+
+        bool operator==(
+            const DeviceGenerationTerminalRequestResult &) const = default;
+    };
+
+    /**
+     * @brief Complete terminal response surfaced from a resident GPU generation.
+     *
+     * A successful result proves that every request controller was healthy,
+     * complete, and internally consistent.  The response/control D2H copies are
+     * queued together and observed through one terminal stream synchronization;
+     * no per-transaction bridge is part of this contract.
+     */
+    struct DeviceGenerationTerminalResult
+    {
+        DeviceId device = DeviceId::invalid(); ///< Device that owned the authoritative ledger.
+        std::vector<DeviceGenerationTerminalRequestResult> requests;
+
+        bool valid() const
+        {
+            return device.is_gpu() && !requests.empty();
         }
     };
 
@@ -574,15 +634,6 @@ namespace llaminar2
         DeviceStochasticDrawPositionSource draw_position_source =
             DeviceStochasticDrawPositionSource::ExplicitThresholds;
         bool serial_sample_equivalent = false;
-        /**
-         * @brief Leading compact output rows emitted by the prior transaction.
-         *
-         * This is one only when row zero is a pending rejection correction that
-         * has already been returned to the caller.  The verifier still consumes
-         * and publishes that row, while maintenance cadence advances only for
-         * later, newly emitted rows.
-         */
-        int leading_committed_output_count = 0;
         bool use_device_draft_tokens = true; ///< Null host draft pointer when true.
         std::vector<int32_t> draft_tokens;
         std::vector<float> accept_thresholds;
@@ -1615,6 +1666,10 @@ namespace llaminar2
          * shadow is accepted by this contract, so a caller cannot accidentally
          * turn device publication into a D2H/H2D planning loop.
          *
+         * @p request_batch must be positive. A value of one is the canonical
+         * SingleDevice and scalar LocalTP transaction; larger values exercise
+         * the identical kernel and mailbox contract for continuous batching.
+         *
          * The default hard-fails. CPU request batching uses the separate
          * forwardMTPBatchAndSampleGreedy() host contract.
          */
@@ -1664,7 +1719,8 @@ namespace llaminar2
          * is stream ordered on device; there is deliberately no host-token output.
          *
          * @param logical_state Live resident mailbox that owns base positions.
-         * @param request_batch Number of request rows in the grouped sidecar.
+         * @param request_batch Positive request-row count. One is the canonical
+         *        scalar transaction and must not select a separate implementation.
          * @param first_condition_slot Previous depth's first request slot.
          * @param condition_slot_stride Element stride between request inputs.
          * @param position_offset Offset from the mailbox base position for this depth.
@@ -3020,6 +3076,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief Build every stochastic verifier target row as one captured transaction.
+         *
+         * The operation consumes the current all-position verifier logits and
+         * produces compact target distributions in slots `[0, row_count)`.
+         * Device-owned history penalties, when enabled by @p penalty_policy,
+         * are part of the same monolithic graph as top-k/top-p construction.
+         * Implementations must reject missing graph capture, segmented replay,
+         * null producer streams, stale arena bindings, and non-GPU execution;
+         * eager execution is not a permitted substitute.
+         *
+         * @param row_count Number of contiguous verifier rows, including bonus.
+         * @param params Immutable stochastic sampling policy captured by graph.
+         * @param penalty_policy Device-history penalty policy for these rows.
+         * @param vocab_size Expected full vocabulary width of each logits row.
+         * @return true only after strict graph replay has been queued and its
+         *         completion handed back to the verifier producer stream.
+         */
+        virtual bool buildCapturedStochasticVerifierTargetDistributions(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size)
+        {
+            (void)row_count;
+            (void)params;
+            (void)penalty_policy;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
          * @brief Legacy full-vocab stochastic probability row builder.
          *
          * Production vLLM-style greedy-draft MTP now prefers compact
@@ -3099,6 +3186,25 @@ namespace llaminar2
             (void)vocab_size;
             (void)threshold;
             return -1;
+        }
+
+        /**
+         * @brief Publish one MTP proposal through a mandatory captured graph.
+         *
+         * The method consumes the exact sidecar-logit producer, applies the
+         * supplied serial branch-penalty policy when enabled, and records a
+         * device-resident draft-slot readiness edge.  GPU implementations may
+         * not substitute eager execution or return a host token.
+         */
+        virtual bool publishCapturedMTPDraftToken(
+            int row,
+            int slot,
+            const MTPGreedyPenaltyPolicy &penalty_policy)
+        {
+            (void)row;
+            (void)slot;
+            (void)penalty_policy;
+            return false;
         }
 
         /**
@@ -3496,8 +3602,7 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle,
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
-            bool use_vllm_probability_rejection = false,
-            int leading_committed_output_count = 0)
+            bool use_vllm_probability_rejection = false)
         {
             using namespace sampling_math;
             const bool derive_thresholds_from_seed =
@@ -3532,8 +3637,6 @@ namespace llaminar2
                 inverse_sample_first_logical_position;
             request.use_vllm_probability_rejection =
                 use_vllm_probability_rejection;
-            request.leading_committed_output_count =
-                leading_committed_output_count;
             request.derive_thresholds_from_seed = derive_thresholds_from_seed;
             request.draw_position_source =
                 derive_thresholds_from_seed
@@ -3592,8 +3695,7 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle,
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
-            bool use_vllm_probability_rejection = false,
-            int leading_committed_output_count = 0)
+            bool use_vllm_probability_rejection = false)
         {
             using namespace sampling_math;
             const bool derive_thresholds_from_seed =
@@ -3630,8 +3732,6 @@ namespace llaminar2
                 inverse_sample_first_logical_position;
             request.use_vllm_probability_rejection =
                 use_vllm_probability_rejection;
-            request.leading_committed_output_count =
-                leading_committed_output_count;
             request.derive_thresholds_from_seed = derive_thresholds_from_seed;
             request.draw_position_source =
                 derive_thresholds_from_seed
@@ -3832,6 +3932,45 @@ namespace llaminar2
             (void)requests;
             (void)request_count;
             (void)out_handle;
+            return false;
+        }
+
+        /**
+         * @brief Admit one stochastic generation response ledger on the device.
+         *
+         * GPU implementations initialize persistent response-token and control
+         * rows exactly once after prefill.  Every later verifier transaction
+         * consumes and republishes that controller through explicit event
+         * edges; no host counter becomes an alternate commit-boundary owner.
+         * CPU and runners without a resident stochastic path may retain the
+         * default no-op implementation.
+         *
+         * @param request_count Number of independently generated request rows.
+         * @param max_new_tokens Exact terminal response budget per request.
+         * @return true when generation may begin.
+         */
+        virtual bool beginDeviceResidentStochasticGeneration(
+            int request_count,
+            int max_new_tokens)
+        {
+            (void)request_count;
+            (void)max_new_tokens;
+            return true;
+        }
+
+        /**
+         * @brief Surface and close one completed device-owned generation.
+         *
+         * GPU implementations consume the final controller-ready event on a
+         * dedicated result stream, enqueue the response and controller copies,
+         * synchronize that stream exactly once, and validate the complete
+         * controller ABI before releasing the request lifecycle.  Calling this
+         * method before every request is terminal is an error, not a polling API.
+         */
+        virtual bool finishDeviceResidentStochasticGeneration(
+            DeviceGenerationTerminalResult *out_result)
+        {
+            (void)out_result;
             return false;
         }
 

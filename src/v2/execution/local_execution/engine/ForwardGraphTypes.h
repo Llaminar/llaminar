@@ -527,15 +527,9 @@ namespace llaminar2
         std::vector<IComputeStage *> dynamic_param_stages;
         bool dynamic_param_stages_cached = false;
 
-        // Pre-cached pointers to stages that override onGraphReplayed().
-        // For prefill monolithic graph replay, these must be called after launch
-        // to advance KV cache heads and other host-side bookkeeping.
-        std::vector<IComputeStage *> replay_callback_stages;
-        bool replay_callback_stages_cached = false;
-
         // Pre-cached pointers to stages that consume fixed-bucket prefill replay
-        // metadata. These are updated before prefill capture/replay so callback
-        // stages can advance host state by real tokens instead of padded rows.
+        // metadata. These are updated before prefill capture/replay so device
+        // kernels consume real token counts instead of padded rows.
         std::vector<IComputeStage *> prefill_replay_param_stages;
         bool prefill_replay_param_stages_cached = false;
 
@@ -846,8 +840,6 @@ namespace llaminar2
             collective_nodes.clear();
             dynamic_param_stages.clear();
             dynamic_param_stages_cached = false;
-            replay_callback_stages.clear();
-            replay_callback_stages_cached = false;
             prefill_replay_param_stages.clear();
             prefill_replay_param_stages_cached = false;
             gpu_stream_applied = false;

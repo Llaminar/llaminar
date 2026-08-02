@@ -1856,6 +1856,151 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reduce one resident generation transaction from device controls.
+         *
+         * This is the production stochastic-MTP reducer contract.  Every value
+         * that may change after request admission is read from a stable device
+         * address on @p stream:
+         *
+         * - @p first_token_device owns the verifier condition token;
+         * - @p stop_tokens_device owns the fixed-width, `-1`-padded stop policy;
+         * - @p generation_control_device owns both the current commit budget and
+         *   whether row zero was already emitted by the preceding transaction.
+         *
+         * Exactly one of @p verify_accepted_device and @p greedy_draft_tokens_device
+         * must be non-null.  The former reduces ordinary probability-rejection
+         * decisions.  The latter compares already-sampled target tokens with the
+         * verifier input row, preserving serial-sampling byte equivalence.  A
+         * backend implementation must only enqueue work: no allocation, transfer,
+         * device synchronization, or host inspection is permitted.
+         *
+         * @param verify_tokens_device Device token selected for every verifier row.
+         * @param verify_accepted_device Device acceptance flag for every row, or
+         *        nullptr for serial-equivalent token comparison.
+         * @param greedy_draft_tokens_device Device verifier input row used for
+         *        serial-equivalent comparison, or nullptr for probability rejection.
+         * @param row_count Number of speculative rows in the transaction.
+         * @param first_token_device Device pointer to the transaction condition token.
+         * @param stop_tokens_device Fixed-width device stop-token row.
+         * @param bonus_token_device Optional device terminal sample.
+         * @param has_bonus_token Whether @p bonus_token_device is present.
+         * @param generation_control_device DeviceGenerationControlIndex row for the
+         *        same logical request.
+         * @param device_id GPU ordinal.
+         * @param stream Exact non-null producer stream.
+         * @param out_token_capacity Capacity of the compact output token row.
+         * @param out_tokens_device Compact output token destination.
+         * @param out_meta_device Compact metadata destination.
+         * @return true only when the graph-capturable reducer launch was enqueued.
+         */
+        virtual bool
+        enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            const void *greedy_draft_tokens_device,
+            int row_count,
+            const void *first_token_device,
+            const void *stop_tokens_device,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)greedy_draft_tokens_device;
+            (void)row_count;
+            (void)first_token_device;
+            (void)stop_tokens_device;
+            (void)bonus_token_device;
+            (void)has_bonus_token;
+            (void)generation_control_device;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_capacity;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Sample every seeded serial-equivalent verifier row and reduce it.
+         *
+         * The compact target matrix contains @p row_count comparison rows followed
+         * by one bonus row.  Each row is sampled with the same scalar accumulation
+         * order as enqueueSampleDistributionF32Device(), using the draw at
+         * `*threshold_position_device + threshold_position_offset + row`.  The
+         * sampled comparison rows are then compared byte-for-byte with verifier
+         * input entries `[1, row_count]`, while entry zero supplies the already
+         * materialized first token.
+         *
+         * This fused operation removes a fan-out of up to sixteen tiny sampler
+         * launches plus a separate summary launch from the captured MTP loop.  It
+         * must enqueue exactly one graph-capturable kernel on @p stream.  Dynamic
+         * allocation, host/device transfer, atomics, callbacks, and device or
+         * stream synchronization are forbidden.
+         *
+         * @param target_token_ids_device Compact target token rows.
+         * @param target_probs_device Compact target probability rows.
+         * @param target_row_stride Entries between compact target rows.
+         * @param top_k Number of entries inspected in each compact row.
+         * @param row_count Number of speculative comparison rows; one additional
+         *        bonus row must be present in the target matrix.
+         * @param threshold_seed Immutable request sampling seed.
+         * @param threshold_position_device Resident pre-verifier base position.
+         * @param threshold_position_offset Logical offset of comparison row zero.
+         * @param verifier_input_tokens_device Materialized `[first, drafts...]` row.
+         * @param stop_tokens_device Fixed-width, `-1`-padded stop-token row.
+         * @param generation_control_device Resident transaction budget/control row.
+         * @param sampled_target_tokens_device Persistent sampled-row destination.
+         * @param out_tokens_device Compact committed-token destination.
+         * @param out_meta_device Compact speculative metadata destination.
+         */
+        virtual bool
+        enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            int target_row_stride,
+            int top_k,
+            int row_count,
+            uint64_t threshold_seed,
+            const void *threshold_position_device,
+            int threshold_position_offset,
+            const void *verifier_input_tokens_device,
+            const void *stop_tokens_device,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *sampled_target_tokens_device,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)target_row_stride;
+            (void)top_k;
+            (void)row_count;
+            (void)threshold_seed;
+            (void)threshold_position_device;
+            (void)threshold_position_offset;
+            (void)verifier_input_tokens_device;
+            (void)stop_tokens_device;
+            (void)generation_control_device;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_capacity;
+            (void)sampled_target_tokens_device;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
          * @brief Enqueue device-side reduction of greedy verifier rows.
          *
          * Greedy MTP uses the same vLLM-style compact batch contract as the
@@ -1969,7 +2114,7 @@ namespace llaminar2
          * one-round serial boundary advance.
          */
         virtual bool enqueueAdvanceSpeculativeCommitBoundary(
-            const void *meta_device,
+            void *meta_device,
             int request_count,
             int meta_stride,
             void *decode_rounds_committed_device,
@@ -1988,6 +2133,120 @@ namespace llaminar2
             (void)decode_boundary_advanced_device;
             (void)device_id;
             (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Initialize persistent response and control rows for GPU generation.
+         *
+         * Request admission supplies the immutable response budget once.  Every
+         * later speculative transaction mutates @p control_device and appends to
+         * @p response_tokens_device on explicit streams; no per-transaction host
+         * mirror participates in the lifecycle.
+         */
+        virtual bool enqueueInitializeDeviceGeneration(
+            int request_count,
+            int max_new_tokens,
+            int response_token_stride,
+            void *response_tokens_device,
+            int control_stride,
+            void *control_device,
+            int device_id,
+            void *stream)
+        {
+            (void)request_count;
+            (void)max_new_tokens;
+            (void)response_token_stride;
+            (void)response_tokens_device;
+            (void)control_stride;
+            (void)control_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Derive the next verifier commit budget from resident request state.
+         *
+         * The generated scalar is consumed directly by the compact verifier
+         * reducer.  It is the minimum of response tokens remaining, verifier
+         * graph capacity, and the device MoE maintenance boundary.
+         */
+        virtual bool enqueuePrepareDeviceGenerationTransactionBudget(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            int verifier_row_capacity,
+            const void *maintenance_rows_remaining_device,
+            int device_id,
+            void *stream)
+        {
+            (void)control_device;
+            (void)control_stride;
+            (void)request_count;
+            (void)verifier_row_capacity;
+            (void)maintenance_rows_remaining_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Atomically commit response bytes and derive publication metadata.
+         *
+         * One backend thread owns each request row and executes the shared
+         * SamplingMath transaction.  Response-ledger append and accepted-state
+         * publication are deliberately one launch: callers cannot publish KV,
+         * recurrent, or logical state without committing the corresponding
+         * serial-visible response bytes first.  The current transaction budget
+         * is read from @p control_device; no host scalar is accepted.
+         *
+         * The call is allocation-free, graph-capturable, and requires the exact
+         * non-null producer stream.  A validation failure publishes `out_ok=0`
+         * and terminally invalidates the controller row.
+         */
+        virtual bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+            const void *output_tokens_device,
+            int output_token_stride,
+            void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            void *response_tokens_device,
+            int response_token_stride,
+            void *control_device,
+            int control_stride,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr)
+        {
+            (void)output_tokens_device;
+            (void)output_token_stride;
+            (void)meta_device;
+            (void)meta_stride;
+            (void)base_cached_tokens_device;
+            (void)request_count;
+            (void)padded_state_rows_per_request;
+            (void)response_tokens_device;
+            (void)response_token_stride;
+            (void)control_device;
+            (void)control_stride;
+            (void)device_id;
+            (void)stream;
+            (void)out_restore_rows_device;
+            (void)out_target_cached_tokens_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_ok_device;
+            (void)out_next_condition_tokens_device;
+            (void)out_all_drafts_accepted_flags_device;
+            (void)out_stopped_flags_device;
             return false;
         }
 
@@ -2053,22 +2312,20 @@ namespace llaminar2
         }
 
         /**
-         * @brief Derive shifted MTP KV cache publication counts on device.
+         * @brief Derive shifted MTP KV counts from canonical primary publication.
          *
-         * Direct all-position MTP publication updates both the main target KV
-         * cache and each shifted sidecar KV cache.  This helper derives the
-         * sidecar depth's target cached-token count and wrapped-head advance
-         * count from the same compact verifier metadata as
-         * enqueueDeriveSpeculativePublicationMetadata(), using
-         * `max(0, target_cached_tokens - mtp_depth - 1)`.
+         * The primary target count and validity row already include response,
+         * maintenance, and accepted-prefix policy.  Shifted caches must consume
+         * those exact outputs rather than re-evaluating compact metadata with a
+         * second scalar commit limit.  This call is allocation-free,
+         * graph-capturable, and requires the exact non-null producer stream.
          */
-        virtual bool enqueueDeriveShiftedSpeculativePublicationMetadata(
-            const void *meta_device,
-            int meta_stride,
+        virtual bool
+        enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
             const void *base_cached_tokens_device,
+            const void *main_target_cached_tokens_device,
+            const void *main_publication_ok_device,
             int request_count,
-            int padded_state_rows_per_request,
-            int max_state_commit_rows,
             int mtp_depth,
             int device_id,
             void *stream,
@@ -2076,12 +2333,10 @@ namespace llaminar2
             void *out_accepted_state_counts_device,
             void *out_ok_device)
         {
-            (void)meta_device;
-            (void)meta_stride;
             (void)base_cached_tokens_device;
+            (void)main_target_cached_tokens_device;
+            (void)main_publication_ok_device;
             (void)request_count;
-            (void)padded_state_rows_per_request;
-            (void)max_state_commit_rows;
             (void)mtp_depth;
             (void)device_id;
             (void)stream;

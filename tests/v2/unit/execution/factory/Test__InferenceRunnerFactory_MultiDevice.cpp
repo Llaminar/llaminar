@@ -588,6 +588,42 @@ namespace
             << "single, nested TP-in-PP, and LocalTP primary plans must share the same residency contract";
     }
 
+    /**
+     * @brief LLEP selection must validate, never synthesize, graph policy.
+     *
+     * The routed domain declaration is the authoritative description of
+     * compute residency, phase scheduling, and row assignment. Treating the
+     * maintenance-mode selector as an implicit assignment override makes the
+     * graph depend on factory control flow and previously hid a decode
+     * collective behind an apportioned outer policy.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         LLEPModeDoesNotRewriteRoutedAssignmentPolicy)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_EQ(
+            source.find("setRoutedOverlayLeastLoadedResidentAssignment"),
+            std::string::npos)
+            << "the runner factory must not mutate declarative routed policy";
+        EXPECT_NE(
+            source.find("validateLLEPRoutedOverlayPolicy"),
+            std::string::npos)
+            << "LLEP must validate its declared graph policy before lowering";
+        EXPECT_NE(
+            source.find(
+                "routed_assignment=least-loaded-resident for LLEP"),
+            std::string::npos)
+            << "a missing explicit LLEP assignment must fail with actionable diagnostics";
+        EXPECT_NE(
+            source.find("never rewrites graph scheduling policy"),
+            std::string::npos)
+            << "the diagnostic must make the declarative ownership boundary explicit";
+    }
+
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlansMissingPlacementsFromModelMetadata)
     {
         auto model_ctx = makeMoEModelContext();

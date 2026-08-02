@@ -683,6 +683,32 @@ namespace llaminar2
             explicit operator bool() const { return graph != nullptr; }
         };
 
+        /**
+         * @brief Immutable capture template admitted for device-controlled composition.
+         *
+         * This view is deliberately stricter than LastExecutedForwardGraphView.
+         * It is returned only for a replay-ready, monolithic GPU graph whose
+         * token and position geometry are device-owned and whose replay has no
+         * host callback obligations. The capture remains owned by this engine;
+         * callers may clone it into a parent graph but must never mutate or launch
+         * it through this view.
+         */
+        struct DeviceLoopGraphTemplateView
+        {
+            const IGPUGraphCapture *capture = nullptr;
+            ForwardGraphSignature signature;
+            DeviceId device = DeviceId::invalid();
+            void *stream = nullptr;
+            size_t stage_count = 0;
+            size_t captured_node_count = 0;
+
+            explicit operator bool() const noexcept
+            {
+                return capture != nullptr && device.is_gpu() && stream != nullptr &&
+                       stage_count > 0 && captured_node_count > 0;
+            }
+        };
+
         struct ReplayCacheObservation
         {
             ForwardGraphSignature signature;
@@ -736,6 +762,25 @@ namespace llaminar2
          * separate from lastExecutedForwardGraph().
          */
         std::optional<LastExecutedForwardGraphView> lastAllPositionVerifierForwardGraph();
+
+        /**
+         * @brief Export the last successful forward as a device-loop graph template.
+         *
+         * @param error Optional diagnostic describing the first violated hard
+         *        contract. Failure never selects eager execution or host replay.
+         */
+        std::optional<DeviceLoopGraphTemplateView>
+        lastExecutedDeviceLoopGraphTemplate(std::string *error = nullptr) const;
+
+        /**
+         * @brief Export the retained all-position verifier capture for composition.
+         *
+         * The same monolithic/device-owned/callback-free requirements apply as
+         * lastExecutedDeviceLoopGraphTemplate().
+         */
+        std::optional<DeviceLoopGraphTemplateView>
+        lastAllPositionVerifierDeviceLoopGraphTemplate(
+            std::string *error = nullptr) const;
 
         /**
          * @brief Drop the retained verifier graph publication handle.
@@ -998,6 +1043,10 @@ namespace llaminar2
             bool cache_hit);
         std::optional<LastExecutedForwardGraphView> viewForLastExecutedForwardGraphState(
             const LastExecutedForwardGraphState &state);
+        std::optional<DeviceLoopGraphTemplateView>
+        deviceLoopGraphTemplateForState(
+            const LastExecutedForwardGraphState &state,
+            std::string *error) const;
 
         // ----- Cache HIT execution path -----
         bool executeCacheHit(

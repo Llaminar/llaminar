@@ -638,7 +638,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
     }
 }
 
-TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
+TEST_F(MoERoutingPrefillGraphCapture, DeviceRuntimeHistogramNeedsNoHostReplayCallback)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
 
@@ -656,7 +656,6 @@ TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable());
-    EXPECT_TRUE(stage.needsOnGraphReplayed());
 #else
     (void)stage;
 #endif
@@ -754,6 +753,49 @@ protected:
         return p;
     }
 };
+
+TEST_F(MoEExpertPrefillGraphCapture,
+       FullyReplicatedLocalRowsBypassParticipantAssignment)
+{
+    auto params = makeValidPrefillParams();
+    params.routed_assignment_policy =
+        RoutedExpertAssignmentPolicy::LeastLoadedResident;
+    params.routed_row_execution_policy =
+        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
+
+    MoEExpertComputeStage stage(params);
+    EXPECT_EQ(
+        stage.routedExpertRowExecutionPolicyForTesting(),
+        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal);
+    EXPECT_TRUE(stage.supportsRequestedRoutedAssignmentPolicyForTesting())
+        << "A complete local replica does not need a LocalTP assignment context.";
+}
+
+TEST_F(MoEExpertPrefillGraphCapture,
+       FullyReplicatedLocalRowsRejectPartialExpertOwnership)
+{
+    auto params = makeValidPrefillParams();
+    params.routed_row_execution_policy =
+        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
+    params.expert_mask = {true, true, true, false};
+
+    EXPECT_THROW(
+        MoEExpertComputeStage stage(params),
+        std::invalid_argument);
+}
+
+TEST_F(MoEExpertPrefillGraphCapture,
+       FullyReplicatedLocalRowsRejectCanonicalRoutePublication)
+{
+    auto params = makeValidPrefillParams();
+    params.routed_row_execution_policy =
+        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
+    params.canonical_route_contributions = output_.get();
+
+    EXPECT_THROW(
+        MoEExpertComputeStage stage(params),
+        std::invalid_argument);
+}
 
 TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
 {

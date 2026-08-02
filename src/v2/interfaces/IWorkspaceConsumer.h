@@ -185,8 +185,7 @@ namespace llaminar2
         constexpr const char *CUDA_FP32_MAPPED_REDIRECT = "cuda_fp32_mapped_redirect"; ///< [batch × M × N] HBM redirect for mapped FP32 outputs
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
-        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
-        constexpr const char *GROUPED_VERIFIER_GEMV_KPAR_PARTIALS = "grouped_verifier_gemv_kpar_partials"; ///< [kpar × verifier-M × N] FP32 grouped-verifier partials
+        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × bounded verifier rows × N] FP32 serial/grouped reduction arena
         constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< per-side-stream [kpar × M × max_N] FP32 GEMV partials
 
         // CUDA NativeVNNI prefill scratch. These buffers are intentionally

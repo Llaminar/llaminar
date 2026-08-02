@@ -1104,7 +1104,11 @@ namespace llaminar2
             .category = "Inference Configuration",
             .value_label = "<text>",
             .description = "Input prompt text",
-            .setter = setters::assignString(&OrchestrationConfig::prompt),
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.prompt = value;
+                config.prompt_was_explicitly_provided = true;
+            },
         });
         spec.add({
             .short_name = "-n",
@@ -1217,6 +1221,17 @@ namespace llaminar2
             .value_label = "<path>",
             .description = "Write machine-readable benchmark JSON to a file",
             .setter = setters::assignString(&OrchestrationConfig::benchmark_json_output_path),
+        });
+        spec.add({
+            .long_name = "--prompt-file",
+            .category = "Benchmark Configuration",
+            .value_label = "<path>",
+            .description = "Read the exact benchmark prompt bytes from a text file",
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.benchmark_prompt_file_path = value;
+                config.benchmark_prompt_file_was_provided = true;
+            },
         });
 
         // --- Server Configuration --------------------------------------------

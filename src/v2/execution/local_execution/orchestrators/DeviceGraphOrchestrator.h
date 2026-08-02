@@ -2586,6 +2586,11 @@ namespace llaminar2
             int row_count,
             const SamplingParams &params,
             int vocab_size) override;
+        bool buildCapturedStochasticVerifierTargetDistributions(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size) override;
         bool buildStochasticProcessedLogitRowsOnDevice(
             DeviceLogitsSource source,
             int first_row,
@@ -2601,6 +2606,10 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold) override;
+        bool publishCapturedMTPDraftToken(
+            int row,
+            int slot,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
         bool sampleStochasticDraftProposalOnDeviceDeferred(
             DeviceLogitsSource source,
             int row,
@@ -2711,6 +2720,121 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool beginDeviceResidentStochasticGeneration(
+            int request_count,
+            int max_new_tokens) override;
+        bool finishDeviceResidentStochasticGeneration(
+            DeviceGenerationTerminalResult *out_result) override;
+
+        /**
+         * @brief Borrow one replay-ready MTP sidecar for device-loop composition.
+         *
+         * Only sidecars whose condition tokens and positions are both owned by
+         * persistent device storage are addressable through this API. The
+         * returned capture remains owned by the sidecar cache and may only be
+         * cloned into a parent graph. Missing warmup/capture, segmentation,
+         * host-authored launch metadata, and stale graph bindings are hard
+         * failures reported through @p error; this method never selects a host
+         * token cache or eager execution path.
+         *
+         * @param role Semantic sidecar role in the fixed-depth transaction.
+         * @param row_count Immutable flattened row geometry of the sidecar.
+         * @param error Optional diagnostic describing the first violated contract.
+         * @return Borrowed monolithic graph template when every invariant holds.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpSidecarDeviceLoopGraphTemplate(
+            MTPSidecarCaptureRole role,
+            int row_count,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow one captured proposal publication for parent-loop composition.
+         *
+         * Slot identity also fixes branch depth: slot zero sees no prior draft,
+         * slot one sees draft zero, and so on.  The returned graph consumes the
+         * fresh sidecar logit row and writes the same persistent token slot used
+         * by verifier input preparation.  Eager and segmented representations
+         * are rejected.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpDraftTokenPublicationDeviceLoopGraphTemplate(
+            int slot,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow the accepted-row terminal-hidden publication graph.
+         *
+         * The request count selects one immutable launch geometry from the
+         * pre-materialized device-indexed graph family. The graph reads row
+         * indices derived by the compact stochastic reducer directly from the
+         * MTP metadata workspace. Host-authored row vectors, stale workspace
+         * generations, eager execution, and segmented capture are rejected.
+         *
+         * @param request_count Number of accepted terminal rows to publish.
+         * @param error Optional first violated composition contract.
+         * @return Borrowed monolithic capture suitable for parent-loop cloning.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpAcceptedTerminalHiddenDeviceLoopGraphTemplate(
+            int request_count,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow the seeded stochastic sample-and-summary transaction.
+         *
+         * This fragment consumes compact target distributions and resident
+         * verifier/control rows.  It contains one fused sampler/reducer launch
+         * per request plus the optional device MoE maintenance-clock advance.
+         * The active graph must match request count and comparison depth exactly;
+         * no eager or segmented substitute is returned.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
+            int request_count,
+            int comparison_rows_per_request,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow captured penalty-plus-distribution verifier preparation.
+         *
+         * Only the canonical zero-based all-position row and target-slot
+         * geometry is exportable. The graph owns optional device-history
+         * penalties and compact target distribution construction together, so
+         * parent-loop composition cannot accidentally omit or reorder either
+         * half of serial-equivalent stochastic sampling.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpStochasticTargetDistributionDeviceLoopGraphTemplate(
+            int row_count,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow the complete accepted-state publication transaction.
+         *
+         * The exported graph contains the fused response/controller commit,
+         * primary and shifted KV publication, committed MoE routing history,
+         * stochastic penalty-history commit, and recurrent verifier-row
+         * restoration.  It contains no host lifecycle callback or replay-time
+         * launch preparation and is therefore suitable for cloning immediately
+         * before the accepted terminal-hidden selector in a parent device loop.
+         *
+         * @param request_count Immutable request geometry represented by capture.
+         * @param verifier_rows_per_request Immutable grouped-verifier row width.
+         * @param error Optional first violated composition invariant.
+         * @return Borrowed monolithic capture when the active cache is exact.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
+            int request_count,
+            int verifier_rows_per_request,
+            std::string *error = nullptr) const;
         /**
          * @brief Republish this runner's compact outcome after rank collection.
          *
@@ -3263,6 +3387,14 @@ namespace llaminar2
                 if (cache)
                     cache->resetSessionState();
             }
+            for (auto &cache : mtp_draft_token_publication_graphs_)
+            {
+                if (cache)
+                    cache->resetSessionState();
+            }
+            mtp_speculative_state_publication_graph_.resetSessionState();
+            mtp_stochastic_serial_outcome_graph_.resetSessionState();
+            mtp_stochastic_target_distribution_graph_.resetSessionState();
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
@@ -3293,6 +3425,18 @@ namespace llaminar2
             clearPendingAllPositionVerifierStateReady();
             clearDeviceResidentLogicalSequenceStateMailbox();
             retireDeviceResidentMTPTransaction();
+            if (device_generation_storage_.active_request_count != 0 ||
+                device_generation_state_ready_.valid)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Request reset reached mutation after an unjoined device-generation transaction"
+                          << " active_requests="
+                          << device_generation_storage_.active_request_count
+                          << " ready="
+                          << device_generation_state_ready_.valid);
+                std::terminate();
+            }
+            device_generation_state_ready_.producer_stream = nullptr;
+            device_generation_state_ready_.request_count = 0;
             cache_stats_ = CacheStats{};
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
@@ -4611,8 +4755,7 @@ namespace llaminar2
             int threshold_position_offset,
             bool use_vllm_probability_rejection,
             bool serial_sample_equivalent,
-            int leading_committed_output_count,
-            const uint32_t *max_state_commit_rows_device,
+            const int *generation_control_device,
             int output_request_slot,
             void *stream_override,
             bool copy_summary_to_host);
@@ -5204,10 +5347,21 @@ namespace llaminar2
             void *stream,
             const DeviceResidentMTPTransactionLease *transaction,
             const char *operation);
+        /**
+         * @brief Apply the graph-lifetime policy for a live inference-state mutation.
+         *
+         * The mutation reason is the complete policy input. Callers cannot
+         * request blanket preservation or invalidation: the forward engine
+         * classifies each cached graph by its device-state ownership contract,
+         * preserves byte-proven stable-address captures through an explicit
+         * stream rebind, and resets only live-state-versioned captures.
+         *
+         * @param reason Typed mutation boundary that selected the lifetime rule.
+         * @param operation Stable diagnostic name for PerfStats attribution.
+         */
         void handleLivePrefixReplayStateAfterMutation(
             LivePrefixMutationReason reason,
-            const char *operation,
-            bool preserve_gpu_replay_state = false);
+            const char *operation);
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
             const PrefixCacheRuntimeConfig &prefix_config) const;
         PrefixCacheKey makePrefixKeyForBlock(
@@ -5866,6 +6020,7 @@ namespace llaminar2
         struct MTPTerminalHiddenRowsSelectGraphCache
         {
             std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
             HiddenStateRowsSelectStage *stage = nullptr;
             TensorBase *input = nullptr;
             TensorBase *output = nullptr;
@@ -5913,6 +6068,9 @@ namespace llaminar2
 
             void invalidate()
             {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
                 graph.reset();
                 stage = nullptr;
                 input = nullptr;
@@ -5936,6 +6094,183 @@ namespace llaminar2
                 row_index_source =
                     HiddenStateRowsSelectStage::DeviceRowIndexSource::
                         StageOwnedIndices;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Capture owner for one complete accepted-state mutation graph.
+         *
+         * Dynamic outcome/state values live at persistent device addresses and
+         * are intentionally absent from this host cache.  The stage compares
+         * every captured pointer and scalar before reuse; workspace generation
+         * adds allocator lifetime to that identity.  Any mismatch destroys the
+         * native executable before a replacement is built.
+         */
+        struct MTPSpeculativeStatePublicationGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MTPSpeculativeStatePublicationStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage
+                            ->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Capture owner for one fixed-depth MTP proposal publication.
+         *
+         * The cache is indexed by destination draft slot.  That slot is also
+         * the number of prior proposals visible to branch penalties, making
+         * depth and destination one structural identity rather than two
+         * independently mutable integers.
+         */
+        struct MTPDraftTokenPublicationGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MTPDraftTokenPublicationStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage
+                            ->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Capture owner for seeded stochastic row sampling and reduction.
+         *
+         * The cache owns one active fixed-depth/request-count geometry. Dynamic
+         * depth materialization replaces this owner during setup; parent-loop
+         * composition may borrow it only while the exact stage identity remains
+         * current. Request seeds are capture identity and therefore can never be
+         * changed underneath a native executable.
+         */
+        struct MTPStochasticSerialOutcomeGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MTPStochasticSerialOutcomeStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage
+                            ->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Capture owner for verifier penalties and compact target rows.
+         *
+         * One cache identity represents one immutable row geometry and sampler
+         * policy. All dynamic logits, verifier tokens, and generated-history
+         * counts remain in persistent device storage across parent-loop replay.
+         */
+        struct MTPStochasticTargetDistributionGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MTPStochasticTargetDistributionStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage
+                            ->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
                 valid = false;
             }
         };
@@ -5979,6 +6314,22 @@ namespace llaminar2
          */
         std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
             mtp_shifted_prefill_hidden_rows_select_caches_;
+
+        /// Active geometry/policy publication fragment used by resident MTP.
+        MTPSpeculativeStatePublicationGraphCache
+            mtp_speculative_state_publication_graph_;
+
+        /// One immutable proposal publication graph for every legal draft slot.
+        std::vector<std::unique_ptr<MTPDraftTokenPublicationGraphCache>>
+            mtp_draft_token_publication_graphs_;
+
+        /// Active seeded stochastic outcome fragment used by fixed-depth tuning.
+        MTPStochasticSerialOutcomeGraphCache
+            mtp_stochastic_serial_outcome_graph_;
+
+        /// Active verifier penalty/distribution fragment for resident MTP.
+        MTPStochasticTargetDistributionGraphCache
+            mtp_stochastic_target_distribution_graph_;
 
         /**
          * @brief Device-checkpoint bank written by the last successful hidden producer.
@@ -6227,6 +6578,96 @@ namespace llaminar2
         int mtp_max_draft_depth_ = 1; ///< Largest configured fixed/dynamic draft depth owned by this runner.
         int mtp_max_verifier_rows_ = 2; ///< Per-request draft rows plus the terminal bonus row.
         int stochastic_batch_output_token_stride_ = 2; ///< Per-request compact output capacity.
+
+        /**
+         * @brief Typed view over persistent device-owned generation rows.
+         *
+         * Response tokens and scalar controller words intentionally live in
+         * separate arena buffers: response capacity scales with the configured
+         * sequence limit, while the controller has a fixed ABI.  This view
+         * binds them into one lifecycle and is the only code allowed to derive
+         * per-request control-field addresses.
+         */
+        struct DeviceGenerationStorage
+        {
+            int request_capacity = 0;
+            int response_token_stride = 0;
+            int control_stride = 0;
+            int32_t *response_tokens_device = nullptr;
+            int *control_device = nullptr;
+            int active_request_count = 0;
+
+            bool bind(
+                void *response_base,
+                int response_rows,
+                int response_stride,
+                void *control_base,
+                int control_rows,
+                int controller_stride)
+            {
+                clear();
+                if (!response_base || !control_base ||
+                    response_rows <= 0 || response_rows != control_rows ||
+                    response_stride <= 0 ||
+                    controller_stride <
+                        sampling_math::kDeviceGenerationControlCount)
+                {
+                    return false;
+                }
+                request_capacity = response_rows;
+                response_token_stride = response_stride;
+                control_stride = controller_stride;
+                response_tokens_device =
+                    static_cast<int32_t *>(response_base);
+                control_device = static_cast<int *>(control_base);
+                return true;
+            }
+
+            bool validFor(int request_count) const
+            {
+                return request_count > 0 &&
+                       request_count <= request_capacity &&
+                       response_tokens_device != nullptr &&
+                       response_token_stride > 0 &&
+                       control_device != nullptr &&
+                       control_stride >=
+                           sampling_math::kDeviceGenerationControlCount;
+            }
+
+            int *controlForRequest(int request_index) const
+            {
+                return request_index >= 0 &&
+                               request_index < request_capacity &&
+                               control_device
+                           ? control_device +
+                                 static_cast<size_t>(request_index) *
+                                     static_cast<size_t>(control_stride)
+                           : nullptr;
+            }
+
+            const uint32_t *transactionBudgetForRequest(
+                int request_index) const
+            {
+                int *row = controlForRequest(request_index);
+                return row
+                           ? reinterpret_cast<const uint32_t *>(
+                                 row + sampling_math::
+                                           kDeviceGenerationControlTransactionCommitBudget)
+                           : nullptr;
+            }
+
+            void clear()
+            {
+                request_capacity = 0;
+                response_token_stride = 0;
+                control_stride = 0;
+                response_tokens_device = nullptr;
+                control_device = nullptr;
+                active_request_count = 0;
+            }
+        };
+
+        DeviceGenerationStorage device_generation_storage_;
         void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]
@@ -6293,6 +6734,7 @@ namespace llaminar2
         void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, stochastic_batch_output_token_stride_]
         void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
         std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
+        std::unique_ptr<PinnedHostScratch> device_generation_terminal_host_scratch_;
 
         /**
          * @brief Device representation stored in a stochastic verifier row slot.
@@ -6516,6 +6958,22 @@ namespace llaminar2
         };
 
         /**
+         * @brief Exact event handoff for the reusable generation controller.
+         *
+         * Admission publishes initialized rows, verifier summary consumes them
+         * before deriving its transaction budget, and fused accepted-state
+         * publication republishes the mutated controller.  Reusing either
+         * arena row without consuming this event is a fatal lifecycle error.
+         */
+        struct PendingDeviceGenerationStateReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            int request_count = 0;
+        };
+
+        /**
          * @brief Device event that protects the reusable request-input arena bank.
          *
          * Admission readiness proves that H2D publication completed before the
@@ -6603,6 +7061,8 @@ namespace llaminar2
             mtp_graph_build_device_state_ready_;
         PendingRequestInputAdmissionReadyState
             request_input_admission_ready_;
+        PendingDeviceGenerationStateReadyState
+            device_generation_state_ready_;
         PendingRequestInputReuseReadyState
             request_input_reuse_ready_;
         ForwardGraphOutputReadyState forward_graph_output_ready_;
@@ -7836,6 +8296,21 @@ namespace llaminar2
             void *stream = nullptr);
 
         /**
+         * @brief Execute one pre-materialized rows graph through full capture.
+         *
+         * The caller's stream is the producer before this graph and the
+         * consumer after it. Two cache-owned event edges bridge that stream to
+         * the graph's persistent capture stream without a host wait. Warmup,
+         * capture, and replay all use the same strict monolithic policy, so a
+         * successful cache can later be cloned into a device-controlled parent
+         * graph without changing its computation.
+         */
+        bool executeMTPTerminalHiddenRowsCaptured(
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            void *producer_consumer_stream,
+            const char *perf_context);
+
+        /**
          * @brief Materialize all GPU terminal-hidden publication graph objects.
          *
          * This runs after the largest-participant workspace family has fixed
@@ -7947,26 +8422,116 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Commit accepted MoE verifier routes into maintenance history.
+         * @brief Build or validate one fixed-depth proposal publication graph.
          *
-         * The all-position verifier graph owns per-layer route ids and final
-         * participant assignments for every physical row. The speculative
-         * outcome owns device-resident accepted prefix counts. This helper
-         * joins those records on the accepted-publication stream and invokes
-         * every grouped MoE stage exactly once before the publication-ready
-         * event is recorded.
-         *
-         * Dense graphs contain no MoE stages and succeed without launching
-         * work. A GPU MoE verifier graph whose MoE stages do not advertise the
-         * committed-publication contract is rejected rather than silently
-         * dropping routing evidence.
+         * Setup resolves the fresh sidecar logit row, branch-history pointers,
+         * deterministic argmax workspace, and destination slot.  It does not
+         * enqueue sampling work.
          */
-        bool publishCommittedMoEVerifierHistograms(
-            ComputeGraph &verifier_graph,
-            const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
-            int request_count,
-            int rows_per_request,
+        bool materializeMTPDraftTokenPublicationGraph(
+            int row,
+            int slot,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Replay one proposal publication after its exact sidecar producer.
+         *
+         * The private capture stream consumes the sidecar event and publishes
+         * completion back to that same producer stream.  No synchronization or
+         * host token bridge is permitted.
+         */
+        bool executeMTPDraftTokenPublicationCaptured(
             void *producer_stream,
+            int row,
+            int slot,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Build or validate the fixed-geometry seeded stochastic fragment.
+         *
+         * Descriptor inspection is setup-only. The resulting stage captures no
+         * host arrays: it retains immutable seeds/geometry and persistent device
+         * addresses exclusively.
+         */
+        bool materializeMTPStochasticSerialOutcomeGraph(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Execute the seeded stochastic fragment under mandatory capture.
+         *
+         * The producer stream owns completed target distributions on entry. The
+         * same stream consumes compact output after an event-ordered graph replay.
+         */
+        bool executeMTPStochasticSerialOutcomeCaptured(
+            void *producer_stream,
+            int request_count,
+            int comparison_rows_per_request,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Build or validate captured stochastic verifier row preparation.
+         *
+         * Setup resolves persistent arena addresses and freezes row geometry,
+         * top-k/top-p policy, temperature, and optional penalty policy. It does
+         * not launch work; execution is owned by the strict captured helper
+         * below and exported parent-loop composition.
+         */
+        bool materializeMTPStochasticTargetDistributionGraph(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Replay captured verifier target preparation after its producer.
+         *
+         * The verifier stream remains the externally visible transaction
+         * owner. Device events order the private capture stream after and then
+         * back before that producer; no host or device synchronization occurs.
+         */
+        bool executeMTPStochasticTargetDistributionCaptured(
+            void *producer_stream,
+            int row_count,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Build or validate the immutable accepted-state publication graph.
+         *
+         * This is graph-setup work only. It resolves persistent device pointers
+         * and verifier-stage identities but enqueues no publication kernel.
+         */
+        bool materializeMTPSpeculativeStatePublicationGraph(
+            const DeviceSpeculativePublicationRequest &request,
+            const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
+            ComputeGraph &verifier_graph,
+            int verifier_rows_per_request,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Replay the publication graph between two explicit event edges.
+         *
+         * The caller stream owns compact verifier output on entry and consumes
+         * all accepted state on return. Warmup/capture/replay occur on the
+         * cache-owned stream; both crossings are device event waits.
+         */
+        bool executeMTPSpeculativeStatePublicationCaptured(
+            const DeviceSpeculativePublicationRequest &request,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Publish host lifecycle metadata after one captured transaction.
+         *
+         * This method records readiness events and coherence ownership only. It
+         * must not launch publication kernels or inspect device values. Parent
+         * loop composition will call the equivalent lifecycle once after the
+         * terminal loop launch rather than once per transaction.
+         */
+        bool finalizeMTPSpeculativeStatePublicationLaunch(
+            const DeviceSpeculativePublicationRequest &request,
             std::string *error = nullptr);
 
         /// Drop any stale device logical-state mailbox after request/session mutation.
@@ -8195,6 +8760,19 @@ namespace llaminar2
         bool waitForPendingRequestStateReset(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
+            const char *consumer_name);
+
+        /** Publish the newest complete generation-controller transaction. */
+        bool publishDeviceGenerationStateReady(
+            void *producer_stream,
+            int request_count,
+            const char *producer_name);
+
+        /** Consume the current generation-controller transaction exactly once. */
+        bool consumeDeviceGenerationStateReady(
+            void *consumer_stream,
+            DeviceTimelineRole consumer_role,
+            int expected_request_count,
             const char *consumer_name);
 
         /**

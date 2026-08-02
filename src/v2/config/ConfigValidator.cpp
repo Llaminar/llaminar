@@ -96,6 +96,17 @@ namespace llaminar2
             return !c.pp_stage_definitions.empty();
         }
 
+        bool hasExplicitPrompt(const OrchestrationConfig &c)
+        {
+            return c.prompt_was_explicitly_provided || !c.prompt.empty();
+        }
+
+        bool hasBenchmarkPromptFile(const OrchestrationConfig &c)
+        {
+            return c.benchmark_prompt_file_was_provided ||
+                   !c.benchmark_prompt_file_path.empty();
+        }
+
     } // anonymous namespace
 
     DeviceSelectionMode detectDeviceSelectionMode(const OrchestrationConfig &config)
@@ -377,6 +388,66 @@ namespace llaminar2
                 return "Conflicting options: --device " +
                        c.device_for_this_rank->toShortString() +
                        " and --device-map both specified.";
+            },
+        });
+
+        // =====================================================================
+        // BENCHMARK INPUT RULES
+        //
+        // A benchmark must have one unambiguous prompt source. Keeping these
+        // rules in the declarative validator means every CLI entry point sees
+        // the same contract before model loading or MPI work begins.
+        // =====================================================================
+
+        v.addRule({
+            .id = "benchmark-prompt-source-mutex",
+            .description = "--prompt and --prompt-file are mutually exclusive for benchmarks",
+            .fix_hint = "Provide the prompt inline with --prompt or from a file with --prompt-file, not both",
+            .applies = [](const OrchestrationConfig &c)
+            { return hasExplicitPrompt(c) && hasBenchmarkPromptFile(c); },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "Conflicting benchmark prompt sources: --prompt and --prompt-file were both specified.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-prompt-file-requires-benchmark",
+            .description = "--prompt-file is only valid in benchmark mode",
+            .fix_hint = "Use the benchmark subcommand, or use --prompt for a non-benchmark request",
+            .applies = [](const OrchestrationConfig &c)
+            { return hasBenchmarkPromptFile(c) && !c.benchmark_mode; },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt-file was specified outside benchmark mode.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-inline-prompt-nonempty",
+            .description = "An explicitly supplied benchmark prompt must not be empty",
+            .fix_hint = "Provide non-empty text to --prompt, or omit it to use the built-in benchmark prompt",
+            .applies = [](const OrchestrationConfig &c)
+            { return c.benchmark_mode && c.prompt_was_explicitly_provided && c.prompt.empty(); },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt was explicitly supplied with an empty value.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-prompt-file-path-nonempty",
+            .description = "An explicitly supplied benchmark prompt file path must not be empty",
+            .fix_hint = "Provide a readable text-file path to --prompt-file",
+            .applies = [](const OrchestrationConfig &c)
+            {
+                return c.benchmark_mode &&
+                       c.benchmark_prompt_file_was_provided &&
+                       c.benchmark_prompt_file_path.empty();
+            },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt-file was explicitly supplied with an empty path.";
             },
         });
 

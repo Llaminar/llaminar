@@ -2948,6 +2948,34 @@ namespace llaminar2
             config_.compute_all_position_logits &&
             layer_idx >= config_.pp_layer_offset &&
             layer_idx < config_.pp_layer_offset + config_.n_layers;
+        const RoutedExpertTier *resolved_local_tp_replicated_tier = nullptr;
+        const bool resolved_local_tp_replicated_fast_candidate =
+            use_expert_overlay &&
+            canUseLocalTPReplicatedFastPath(
+                *overlay_plan,
+                device,
+                &resolved_local_tp_replicated_tier);
+        const bool ordinary_prefill_graph =
+            total_tokens > 1 &&
+            !mtp_sidecar_context &&
+            !config_.compute_all_position_logits;
+        const bool phase_split_local_tp_apportioned_gpu_prefill =
+            resolved_local_tp_replicated_fast_candidate &&
+            resolved_local_tp_replicated_tier &&
+            ordinary_prefill_graph &&
+            isPrefillApportionedDecodeReplicatedTier(
+                *overlay_plan,
+                *resolved_local_tp_replicated_tier);
+        const bool resolved_fully_replicated_local_rows =
+            (resolved_local_tp_replicated_fast_candidate &&
+             !phase_split_local_tp_apportioned_gpu_prefill) ||
+            (!use_expert_overlay &&
+             config_.moe.routed_compute_policy ==
+                 RoutedExpertComputePolicy::Replicated);
+        const RoutedExpertRowExecutionPolicy routed_row_execution_policy =
+            resolved_fully_replicated_local_rows
+                ? RoutedExpertRowExecutionPolicy::FullyReplicatedLocal
+                : RoutedExpertRowExecutionPolicy::ParticipantAssigned;
         const bool device_rebalance_decode_layer =
             local_decode_layer || grouped_main_verifier_layer;
         const bool first_device_rebalance_decode_layer =
@@ -2981,6 +3009,8 @@ namespace llaminar2
         const bool llep_prefill_requested =
             !mtp_sidecar_context &&
             total_tokens > 1 &&
+            routed_row_execution_policy ==
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
         const uint64_t llep_prefill_routed_rows =
             llep_prefill_requested
@@ -3030,7 +3060,10 @@ namespace llaminar2
                 device.to_string());
         }
         const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
-            (total_tokens > 1 && !llep_prefill_enabled)
+            (routed_row_execution_policy ==
+                 RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+             total_tokens > 1 &&
+             !llep_prefill_enabled)
                 ? RoutedExpertAssignmentPolicy::StaticOwner
                 : config_.moe.routed_assignment_policy;
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
@@ -4738,31 +4771,16 @@ namespace llaminar2
                 *overlay_plan,
                 device,
                 &local_tp_apportioned_tier);
-        const RoutedExpertTier *local_tp_replicated_tier = nullptr;
+        const RoutedExpertTier *local_tp_replicated_tier =
+            resolved_local_tp_replicated_tier;
         const bool local_tp_replicated_fast_candidate =
-            use_expert_overlay &&
-            canUseLocalTPReplicatedFastPath(
-                *overlay_plan,
-                device,
-                &local_tp_replicated_tier);
-        const bool ordinary_prefill_graph =
-            total_tokens > 1 &&
-            !mtp_sidecar_context &&
-            !config_.compute_all_position_logits;
-        const bool phase_split_local_tp_apportioned_gpu_prefill =
-            local_tp_replicated_fast_candidate &&
-            local_tp_replicated_tier &&
-            ordinary_prefill_graph &&
-            isPrefillApportionedDecodeReplicatedTier(
-                *overlay_plan,
-                *local_tp_replicated_tier);
+            resolved_local_tp_replicated_fast_candidate;
 
         auto needsMoEParticipantAllreduce = [&]() -> bool
         {
             return config_.tp_ctx && config_.tp_ctx->degree() > 1 &&
-                   (config_.moe.routed_compute_policy !=
-                        RoutedExpertComputePolicy::Replicated ||
-                    phase_split_local_tp_apportioned_gpu_prefill);
+                   routed_row_execution_policy ==
+                       RoutedExpertRowExecutionPolicy::ParticipantAssigned;
         };
         /*
          * LocalTP expert ownership must never shape the FP32 route addition
@@ -4829,8 +4847,12 @@ namespace llaminar2
                         : std::max(1, expert_params.my_socket_id + 1);
                 expert_params.routed_assignment_policy =
                     prefill_routed_expert_assignment_policy;
+                expert_params.routed_row_execution_policy =
+                    routed_row_execution_policy;
                 if (local_tp_ctx &&
                     total_tokens > 1 &&
+                    routed_row_execution_policy ==
+                        RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
                     prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
@@ -5080,6 +5102,8 @@ namespace llaminar2
                         continuationRootParticipant(*overlay_plan));
                 if (local_tp_ctx &&
                     total_tokens > 1 &&
+                    routed_row_execution_policy ==
+                        RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
                     prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
@@ -5227,6 +5251,13 @@ namespace llaminar2
                     needsMoEParticipantAllreduce() &&
                     needsTPAllreduce() &&
                     device.is_gpu();
+                if (routed_row_execution_policy ==
+                        RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
+                    canonical_local_tp_route_publication)
+                {
+                    throw std::logic_error(
+                        "Qwen35 MoE fully replicated local row execution cannot publish canonical route contributions");
+                }
                 if (canonical_local_tp_route_publication)
                 {
                     if (!canonical_route_contributions)
@@ -5451,6 +5482,9 @@ namespace llaminar2
                                                     << " compute="
                                                     << routedExpertComputePolicyToString(
                                                            config_.moe.routed_compute_policy)
+                                                    << " row_execution="
+                                                    << routedExpertRowExecutionPolicyToString(
+                                                           routed_row_execution_policy)
                                                     << " phase="
                                                     << (local_tp_fast_tier
                                                             ? routedExpertPhasePolicyToString(

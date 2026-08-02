@@ -1182,7 +1182,7 @@ TEST(Test__GDNKernels, RecurrenceStageResetClearsStaleSpeculativeStateBinding)
     EXPECT_EQ(kernel.speculative_state_size, 32);
 }
 
-TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+TEST(Test__GDNKernels, ShortConvGraphReplayRequiresNoHostWorkspaceRebind)
 {
     ensureCPUBackendForWorkspace();
     RecordingShortConvolution kernel;
@@ -1208,8 +1208,6 @@ TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKe
     ASSERT_NE(verifier_capture, nullptr);
     EXPECT_EQ(kernel.capture_rows, 2);
     EXPECT_EQ(kernel.capture_state_size, 48);
-    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
-
     ShortConv1dStage::Params normal_p = verifier_p;
     normal_p.verifier_state_capture_rows = 0;
     ShortConv1dStage normal_stage(normal_p);
@@ -1217,11 +1215,9 @@ TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKe
     ASSERT_EQ(kernel.capture_workspace, nullptr);
     ASSERT_EQ(kernel.capture_rows, 0);
 
-    verifier_stage.onGraphReplayed();
-    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
-        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
-    EXPECT_EQ(kernel.capture_rows, 2);
-    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.capture_workspace, nullptr)
+        << "Captured replay must not mutate shared host kernel bindings; the "
+           "explicit publication entry point owns any required rebind.";
 }
 
 TEST(Test__GDNKernels, ShortConvPublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
@@ -1339,7 +1335,7 @@ TEST(Test__GDNKernels, ShortConvGpuScalarPublicationDoesNotPassHostMirrorToBacke
     EXPECT_EQ(kernel.restore_stream, fake_stream);
 }
 
-TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+TEST(Test__GDNKernels, RecurrenceGraphReplayRequiresNoHostWorkspaceRebind)
 {
     ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet kernel;
@@ -1367,8 +1363,6 @@ TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedK
     ASSERT_NE(verifier_capture, nullptr);
     EXPECT_EQ(kernel.capture_rows, 2);
     EXPECT_EQ(kernel.capture_state_size, 32);
-    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
-
     GDNRecurrenceStage::Params normal_p = verifier_p;
     normal_p.verifier_state_capture_rows = 0;
     GDNRecurrenceStage normal_stage(normal_p);
@@ -1376,11 +1370,9 @@ TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedK
     ASSERT_EQ(kernel.capture_workspace, nullptr);
     ASSERT_EQ(kernel.capture_rows, 0);
 
-    verifier_stage.onGraphReplayed();
-    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
-        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
-    EXPECT_EQ(kernel.capture_rows, 2);
-    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.capture_workspace, nullptr)
+        << "Captured replay must not mutate shared host kernel bindings; the "
+           "explicit publication entry point owns any required rebind.";
 }
 
 TEST(Test__GDNKernels, RecurrencePublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)

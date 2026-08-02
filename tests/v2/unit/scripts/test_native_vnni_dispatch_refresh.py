@@ -3662,6 +3662,81 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
         self.assertNotIn("ROCmNativeVNNIGemmShard", refresh_source)
 
+    def test_turnkey_install_preserves_cuda_native_vnni_physical_shards(
+        self,
+    ) -> None:
+        """A CUDA policy refresh authenticates, but never rewrites, topology."""
+
+        cmake_source = (
+            REPO_ROOT / "src" / "v2" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+        refresh_source = SCRIPT.read_text(encoding="utf-8")
+        gemm_directory = (
+            REPO_ROOT / "src" / "v2" / "kernels" / "cuda" / "gemm"
+        )
+
+        retired_source = "CUDANativeVNNIGemvTuned.cu"
+        self.assertFalse((gemm_directory / retired_source).exists())
+        self.assertNotIn(retired_source, cmake_source)
+
+        structural_sources = (
+            "CUDANativeVNNIGemvDispatch.cu",
+            "CUDANativeVNNIGemvShard.h",
+            "CUDANativeVNNIGemvShardImpl.cu.inc",
+        )
+        for source_name in structural_sources:
+            self.assertTrue((gemm_directory / source_name).is_file())
+
+        expected_codebooks = (
+            (0, 4),
+            (5, 6),
+            (7, 8),
+            (9, 10),
+            (11, 12),
+            (13, 14),
+            (15, 16),
+            (17, 19),
+        )
+        for shard, (first_codebook, second_codebook) in enumerate(
+            expected_codebooks
+        ):
+            source_name = f"CUDANativeVNNIGemvShard{shard}.cu"
+            source_path = gemm_directory / source_name
+            self.assertTrue(source_path.is_file())
+            self.assertEqual(cmake_source.count(source_name), 1)
+            source = source_path.read_text(encoding="utf-8")
+            self.assertIn(
+                f"MACRO({first_codebook}); MACRO({second_codebook})",
+                source,
+            )
+            self.assertIn(
+                '#include "CUDANativeVNNIGemvShardImpl.cu.inc"',
+                source,
+            )
+
+        self.assertEqual(
+            cmake_source.count("CUDANativeVNNIGemvDispatch.cu"),
+            1,
+        )
+        self.assertIn(
+            "validate_cuda_native_vnni_gemv_physical_shards",
+            refresh_source,
+        )
+        self.assertIn(
+            "cuda_native_vnni_serial_policy_hash",
+            refresh_source,
+        )
+        self.assertIn(
+            'local cuda_source_include="${repo_root}/src/v2/kernels/cuda/gemm/'
+            'CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"',
+            refresh_source,
+        )
+        self.assertEqual(refresh_source.count(retired_source), 1)
+        self.assertIn(
+            f'grep -F -q "{retired_source}" "${{cmake_path}}"',
+            refresh_source,
+        )
+
     def test_strong_gpu_trainers_own_the_complete_runtime_m_envelope(self) -> None:
         cuda_trainer = (
             REPO_ROOT

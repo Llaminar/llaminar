@@ -6625,13 +6625,9 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
     CUDAGemvContext *gemv_ctx = cudaGemvContext_create(gpu_device_.ordinal);
     ASSERT_NE(gemv_ctx, nullptr);
     auto *kpar_partials = static_cast<float *>(
-        workspace_->getBuffer(
-            GemmWorkspaceBuffers::
-                GROUPED_VERIFIER_GEMV_KPAR_PARTIALS));
+        workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
     const size_t kpar_partials_bytes =
-        workspace_->getBufferSize(
-            GemmWorkspaceBuffers::
-                GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     cudaGemvContext_bindWorkspace(gemv_ctx, kpar_partials, kpar_partials_bytes);
 
     auto input = std::make_unique<FP32Tensor>(
@@ -6883,13 +6879,9 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
         CUDAGemvContext *gemv_ctx = cudaGemvContext_create(gpu_device_.ordinal);
         ASSERT_NE(gemv_ctx, nullptr) << fmt.name << " GEMV context";
         auto *kpar_partials = static_cast<float *>(
-            workspace_->getBuffer(
-                GemmWorkspaceBuffers::
-                    GROUPED_VERIFIER_GEMV_KPAR_PARTIALS));
+            workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
         const size_t kpar_partials_bytes =
-            workspace_->getBufferSize(
-                GemmWorkspaceBuffers::
-                    GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
+            workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
         cudaGemvContext_bindWorkspace(gemv_ctx, kpar_partials, kpar_partials_bytes);
 
         CUDARowMajorWeights *rowmajor = nullptr;

@@ -2790,61 +2790,10 @@ namespace
             const MTPGreedyPenaltyPolicy &penalty_policy) override
         {
             ++apply_device_owned_mtp_penalty_rows_count_;
-            if (row_count <= 0 || penalty_policy.enabled == 0)
-                return penalty_policy.enabled == 0;
-
-            std::vector<float> *logits = nullptr;
-            const bool verifier_rows =
-                source == DeviceLogitsSource::AllPosition;
-            if (source == DeviceLogitsSource::Main)
-                logits = &logits_;
-            else if (verifier_rows)
-                logits = &all_position_logits_;
-            else
-                return false;
-            if (!logits || logits->size() <
-                               static_cast<size_t>(row_count * VOCAB_SIZE))
-            {
-                return false;
-            }
-
-            const int prefix_begin =
-                penalty_policy.first_token_already_in_history != 0 ? 1 : 0;
-            for (int row = 0; row < row_count; ++row)
-            {
-                for (int token = 0; token < VOCAB_SIZE; ++token)
-                {
-                    int count = mock_device_generated_token_counts_[
-                        static_cast<size_t>(token)];
-                    if (verifier_rows)
-                    {
-                        for (int history_index = prefix_begin;
-                             history_index <= row;
-                             ++history_index)
-                        {
-                            count +=
-                                device_verifier_input_tokens_[
-                                    static_cast<size_t>(history_index)] == token
-                                    ? 1
-                                    : 0;
-                        }
-                    }
-                    if (count <= 0)
-                        continue;
-
-                    float penalty = 0.0f;
-                    if (penalty_policy.presence_penalty != 0.0f)
-                        penalty += penalty_policy.presence_penalty;
-                    if (penalty_policy.frequency_penalty != 0.0f)
-                    {
-                        penalty += penalty_policy.frequency_penalty *
-                                   static_cast<float>(count);
-                    }
-                    (*logits)[static_cast<size_t>(row * VOCAB_SIZE + token)] -=
-                        penalty;
-                }
-            }
-            return true;
+            return applyDeviceOwnedMTPPenaltyRowsMath(
+                source,
+                row_count,
+                penalty_policy);
         }
 
         bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
@@ -2993,6 +2942,36 @@ namespace
                 }
             }
             return true;
+        }
+
+        bool buildCapturedStochasticVerifierTargetDistributions(
+            int row_count,
+            const SamplingParams &params,
+            const MTPGreedyPenaltyPolicy &penalty_policy,
+            int vocab_size) override
+        {
+            ++captured_stochastic_verifier_target_distribution_count_;
+            if (!supports_stochastic_device_sampling_ || row_count <= 0 ||
+                vocab_size != VOCAB_SIZE || params.top_k <= 0)
+            {
+                return false;
+            }
+            if (penalty_policy.enabled != 0 &&
+                !applyDeviceOwnedMTPPenaltyRowsMath(
+                    DeviceLogitsSource::AllPosition,
+                    row_count,
+                    penalty_policy))
+            {
+                return false;
+            }
+            return buildStochasticDistributionsOnDevice(
+                DeviceLogitsSource::AllPosition,
+                /*first_row=*/0,
+                DeviceDistributionBuffer::Target,
+                /*first_slot=*/0,
+                row_count,
+                params,
+                vocab_size);
         }
 
         bool buildStochasticProbabilityRowsOnDevice(
@@ -5068,6 +5047,10 @@ namespace
         {
             return apply_device_owned_mtp_penalty_rows_count_;
         }
+        int capturedStochasticVerifierTargetDistributionCount() const
+        {
+            return captured_stochastic_verifier_target_distribution_count_;
+        }
         int applyDeviceOwnedMTPBranchPenaltiesCount() const
         {
             return apply_device_owned_mtp_branch_penalties_count_;
@@ -5560,6 +5543,68 @@ namespace
         }
 
     private:
+        bool applyDeviceOwnedMTPPenaltyRowsMath(
+            DeviceLogitsSource source,
+            int row_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy)
+        {
+            if (row_count <= 0 || penalty_policy.enabled == 0)
+                return penalty_policy.enabled == 0;
+
+            std::vector<float> *logits = nullptr;
+            const bool verifier_rows =
+                source == DeviceLogitsSource::AllPosition;
+            if (source == DeviceLogitsSource::Main)
+                logits = &logits_;
+            else if (verifier_rows)
+                logits = &all_position_logits_;
+            else
+                return false;
+            if (logits->size() <
+                static_cast<size_t>(row_count * VOCAB_SIZE))
+            {
+                return false;
+            }
+
+            const int prefix_begin =
+                penalty_policy.first_token_already_in_history != 0 ? 1 : 0;
+            for (int row = 0; row < row_count; ++row)
+            {
+                for (int token = 0; token < VOCAB_SIZE; ++token)
+                {
+                    int count = mock_device_generated_token_counts_[
+                        static_cast<size_t>(token)];
+                    if (verifier_rows)
+                    {
+                        for (int history_index = prefix_begin;
+                             history_index <= row;
+                             ++history_index)
+                        {
+                            count +=
+                                device_verifier_input_tokens_[
+                                    static_cast<size_t>(history_index)] == token
+                                    ? 1
+                                    : 0;
+                        }
+                    }
+                    if (count <= 0)
+                        continue;
+
+                    float penalty = 0.0f;
+                    if (penalty_policy.presence_penalty != 0.0f)
+                        penalty += penalty_policy.presence_penalty;
+                    if (penalty_policy.frequency_penalty != 0.0f)
+                    {
+                        penalty += penalty_policy.frequency_penalty *
+                                   static_cast<float>(count);
+                    }
+                    (*logits)[static_cast<size_t>(row * VOCAB_SIZE + token)] -=
+                        penalty;
+                }
+            }
+            return true;
+        }
+
         std::optional<int> forcedRequestBatchRejectionToken(int request_id) const
         {
             for (const auto &entry : forced_request_batch_rejections_)
@@ -6139,6 +6184,7 @@ namespace
         int apply_mtp_penalties_count_{0};
         int apply_all_position_penalties_count_{0};
         int apply_device_owned_mtp_penalty_rows_count_{0};
+        int captured_stochastic_verifier_target_distribution_count_{0};
         int apply_device_owned_mtp_branch_penalties_count_{0};
         int last_device_owned_mtp_branch_prior_draft_count_{-1};
         int device_distribution_build_count_{0};
@@ -10933,8 +10979,12 @@ namespace
                    "target-side rejection correction owns the final policy";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
                 << "GPU verifier penalties must never use host-authored sparse rows";
-            EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 2)
-                << "main and grouped logits consume device-owned history";
+            EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1)
+                << "the first target row consumes device-owned history before the verifier";
+            EXPECT_EQ(
+                mock->capturedStochasticVerifierTargetDistributionCount(),
+                1)
+                << "grouped verifier penalties and distributions are one captured transaction";
 
             const DeviceSpeculativePublicationRequest &publication_request =
                 mock->lastDeviceResidentPublicationRequest();
@@ -12539,9 +12589,12 @@ namespace
                    "target-side rejection correction owns the final policy";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
                 << "host-authored sparse row penalties are forbidden on GPU";
-            EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 2)
-                << "main and grouped target logits must both consume the "
-                   "device-owned generated-token histogram";
+            EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1)
+                << "the first target row consumes the generated-token histogram";
+            EXPECT_EQ(
+                mock->capturedStochasticVerifierTargetDistributionCount(),
+                1)
+                << "grouped target rows consume history inside one captured transaction";
 
             const DeviceSpeculativePublicationRequest &publication_request =
                 mock->lastDeviceResidentPublicationRequest();
@@ -13491,7 +13544,10 @@ namespace
             << "vLLM-style draft proposal ignores draft-side penalties; "
                "target-side rejection correction owns the final policy";
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
-        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 2);
+        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1);
+        EXPECT_EQ(
+            mock->capturedStochasticVerifierTargetDistributionCount(),
+            1);
         EXPECT_EQ(mock->forwardMTPCount(), 1);
 
         const auto probe = runner->prefixStateProbe();
@@ -13552,7 +13608,10 @@ namespace
         EXPECT_EQ(mock->setAllPositionCount(), 2)
             << "stateful stochastic verification uses one grouped verifier forward";
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
-        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 2);
+        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1);
+        EXPECT_EQ(
+            mock->capturedStochasticVerifierTargetDistributionCount(),
+            1);
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 3)
             << "first target token, sequential target row, and ready token "
                "use compact distributions; MTP draft uses the proposal path";
@@ -13764,7 +13823,10 @@ namespace
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0)
             << "the first rejected row should use the batched residual-capable verifier";
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
-        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 2);
+        EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1);
+        EXPECT_EQ(
+            mock->capturedStochasticVerifierTargetDistributionCount(),
+            1);
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
@@ -14182,6 +14244,86 @@ namespace
                     ElementsAre("device_outcome_publish"));
         EXPECT_EQ(harness.child0->setAllPositionCount(), 2);
         EXPECT_EQ(harness.child1->setAllPositionCount(), 2);
+    }
+
+    /**
+     * @brief Prove the scalar CUDA lane uses the positive-M grouped sidecar ABI.
+     *
+     * A scalar speculative request still has one request row. It must consume
+     * the same device-owned mailbox and request-major draft matrix as continuous
+     * batching rather than selecting legacy scalar token/position entry points.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           LocalTPCUDAScalarResidentMailboxExecutesGroupedSidecarDepths)
+    {
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+            /*mtp_draft_tokens=*/2,
+            {},
+            /*spec_state_publication=*/false,
+            /*max_request_batch=*/1);
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            child->enableMTPDeviceDraftTokenInput();
+            child->enableMTPSidecarPreservesMainState();
+            child->enableMTPShiftedRowReuseFromSidecar();
+            child->requireMTPDecodeEquivalentReplay();
+            child->enableMirroredLocalTPMTPHeadForVerifier();
+            child->setVerifierAcceptedPrefixScript({2});
+        }
+
+        ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = harness.runner->decodeStep();
+        ASSERT_TRUE(first.success()) << first.error;
+
+        ASSERT_NE(harness.rank, nullptr);
+        const DeviceResidentLogicalSequenceStateHandle scalar_mailbox =
+            harness.rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(scalar_mailbox.valid());
+        ASSERT_EQ(scalar_mailbox.request_count, 1);
+
+        const int child0_first_depth_before =
+            harness.child0->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount();
+        const int child1_first_depth_before =
+            harness.child1->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount();
+        const int child0_chained_before =
+            harness.child0->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount();
+        const int child1_chained_before =
+            harness.child1->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount();
+
+        ASSERT_TRUE(
+            harness.rank
+                ->forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+                    scalar_mailbox,
+                    /*request_batch=*/1,
+                    /*first_draft_slot=*/0,
+                    /*slot_stride=*/1));
+        ASSERT_TRUE(
+            harness.rank
+                ->forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+                    scalar_mailbox,
+                    /*request_batch=*/1,
+                    /*first_condition_slot=*/0,
+                    /*condition_slot_stride=*/1,
+                    /*position_offset=*/1,
+                    /*first_draft_slot=*/1,
+                    /*draft_slot_stride=*/1));
+
+        EXPECT_EQ(
+            harness.child0->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(),
+            child0_first_depth_before + 1);
+        EXPECT_EQ(
+            harness.child1->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(),
+            child1_first_depth_before + 1);
+        EXPECT_EQ(
+            harness.child0->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(),
+            child0_chained_before + 1);
+        EXPECT_EQ(
+            harness.child1->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(),
+            child1_chained_before + 1);
     }
 
     /**

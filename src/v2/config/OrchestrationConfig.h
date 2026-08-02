@@ -356,7 +356,8 @@ namespace llaminar2
         // Inference Configuration
         // =========================================================================
 
-        std::string prompt; ///< Input prompt
+        std::string prompt; ///< Input prompt.
+        bool prompt_was_explicitly_provided = false; ///< Distinguishes an omitted prompt from `--prompt ""`.
         int n_predict = -1; ///< Tokens to generate (-1 = until EOS)
         int batch_size = 1; ///< Batch size
         int n_threads = -1; ///< Thread count (-1 = auto)
@@ -384,8 +385,10 @@ namespace llaminar2
         // Benchmark Configuration
         // =========================================================================
 
-        bool benchmark_mode = false;              ///< Run benchmark
-        std::string benchmark_json_output_path;   ///< Optional machine-readable benchmark JSON output path
+        bool benchmark_mode = false;            ///< Run benchmark.
+        std::string benchmark_json_output_path; ///< Optional machine-readable benchmark JSON output path.
+        std::string benchmark_prompt_file_path; ///< Exact benchmark prompt bytes loaded from this text file.
+        bool benchmark_prompt_file_was_provided = false; ///< Distinguishes omission from `--prompt-file ""`.
 
         // =========================================================================
         // Server Configuration

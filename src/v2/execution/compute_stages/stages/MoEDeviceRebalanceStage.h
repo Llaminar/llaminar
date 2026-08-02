@@ -269,7 +269,12 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return usesTransferSlotApply(); }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return usesTransferSlotApply()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
 
         /**
          * @brief Report whether this stage owns the persistent request transaction.

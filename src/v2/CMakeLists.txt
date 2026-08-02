@@ -350,7 +350,18 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
         kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
-        kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
+        # NativeVNNI decode/grouped GEMV is physically sharded by codebook pair.
+        # Eight independent objects expose real Ninja parallelism; the dispatch
+        # TU preserves the single public ABI and contains no device templates.
+        kernels/cuda/gemm/CUDANativeVNNIGemvDispatch.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard0.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard1.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard2.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard3.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard4.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard5.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard6.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -380,15 +391,12 @@ if(HAVE_CUDA)
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
 
-    # These two NativeVNNI files own hundreds of independent device-template
-    # instantiations. CUDA's split compiler partitions their optimization work
-    # internally while preserving one public ABI and one copy of mutable
-    # trainer/context state. Restrict the option to these compilation hot spots
-    # so an ordinary parallel Ninja build does not multiply worker counts for
-    # every small CUDA source.
+    # Prefill still owns hundreds of independent device-template instantiations
+    # in one TU, so ask nvcc to split its internal optimization work. Decode is
+    # physically sharded above: keeping compiler-internal split work there would
+    # oversubscribe eight already independent Ninja jobs.
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
         set_source_files_properties(
-            kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu
             kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
             PROPERTIES COMPILE_OPTIONS "--split-compile=8"
         )
@@ -1403,7 +1411,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
+    execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
+    execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp
+    execution/compute_stages/stages/MTPStochasticTargetDistributionStage.cpp
+    execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp

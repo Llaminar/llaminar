@@ -111,6 +111,36 @@ namespace llaminar2
                 hex << std::setw(2) << static_cast<unsigned int>(digest[index]);
             return {hex.str(), {}};
         }
+
+        DigestResult computeBytesDigest(std::string_view bytes)
+        {
+            using ContextOwner = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+            ContextOwner context(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+            if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
+            {
+                return {std::nullopt, "failed to initialize OpenSSL SHA-256 context"};
+            }
+
+            if (!bytes.empty() &&
+                EVP_DigestUpdate(context.get(), bytes.data(), bytes.size()) != 1)
+            {
+                return {std::nullopt, "OpenSSL rejected SHA-256 input bytes"};
+            }
+
+            std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+            unsigned int digest_bytes = 0;
+            if (EVP_DigestFinal_ex(context.get(), digest.data(), &digest_bytes) != 1 ||
+                digest_bytes != 32)
+            {
+                return {std::nullopt, "failed to finalize SHA-256 digest"};
+            }
+
+            std::ostringstream hex;
+            hex << std::hex << std::setfill('0');
+            for (unsigned int index = 0; index < digest_bytes; ++index)
+                hex << std::setw(2) << static_cast<unsigned int>(digest[index]);
+            return {hex.str(), {}};
+        }
     } // namespace
 
     std::optional<std::string> sha256FileHex(
@@ -170,5 +200,15 @@ namespace llaminar2
                 *error = std::string("SHA-256 calculation failed: ") + exception.what();
             return std::nullopt;
         }
+    }
+
+    std::optional<std::string> sha256BytesHex(
+        std::string_view bytes,
+        std::string *error)
+    {
+        const DigestResult result = computeBytesDigest(bytes);
+        if (error)
+            *error = result.error;
+        return result.digest;
     }
 } // namespace llaminar2

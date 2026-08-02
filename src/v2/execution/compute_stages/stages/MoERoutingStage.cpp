@@ -1024,17 +1024,6 @@ namespace llaminar2
         return isDeviceRoutedPrefillGraphCaptureSupported();
     }
 
-    void MoERoutingStage::onGraphReplayed()
-    {
-        recordRuntimeHistogramTokenBoundary();
-    }
-
-    bool MoERoutingStage::needsOnGraphReplayed() const
-    {
-        return params_.decode_histogram != nullptr &&
-               (isDeviceRoutedDecodeGraphCapturable() || isDeviceRoutedPrefillGraphCapturable());
-    }
-
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)

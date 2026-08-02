@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace llaminar2
@@ -13,6 +14,41 @@ namespace llaminar2
         Success,            ///< Graph executable updated in-place
         NeedsReinstantiate, ///< Topology changed, needs full re-instantiation
         Failed              ///< Update failed; the owning execution path must fail
+    };
+
+    /**
+     * @brief Device-resident predicate for a graph-owned request loop.
+     *
+     * The predicate addresses a row-major controller table that remains on the
+     * accelerator for the complete graph launch.  A loop iteration is admitted
+     * only while every request is healthy and at least one request remains
+     * incomplete.  A controller failure therefore stops device execution and is
+     * surfaced by the caller's terminal validation; it cannot spin forever or
+     * silently switch to host scheduling.
+     *
+     * The field indices deliberately remain explicit.  The graph abstraction
+     * does not own the generation-controller ABI, while its caller can bind the
+     * exact health and completion fields from that ABI without manufacturing a
+     * second device flag or a host-visible mirror.
+     */
+    struct DeviceControlledLoopPredicate
+    {
+        const int *control_rows_device = nullptr; ///< First word of row zero on device.
+        int control_stride = 0;                   ///< Controller words between request rows.
+        int request_count = 0;                    ///< Number of active request rows.
+        int healthy_index = -1;                   ///< Non-zero means the row remains valid.
+        int complete_index = -1;                  ///< Non-zero means the row is terminal.
+
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return control_rows_device != nullptr &&
+                   control_stride > 0 &&
+                   request_count > 0 &&
+                   healthy_index >= 0 &&
+                   healthy_index < control_stride &&
+                   complete_index >= 0 &&
+                   complete_index < control_stride;
+        }
     };
 
     /// Abstract interface for GPU graph capture and replay.
@@ -60,6 +96,66 @@ namespace llaminar2
         /// Launch (replay) the instantiated graph executable on the associated stream.
         /// @return true on success
         virtual bool launch() = 0;
+
+        /**
+         * @brief Report whether this graph owner supports a device-controlled WHILE node.
+         *
+         * This is a static backend/runtime property.  A caller selecting a
+         * fully device-resident generation architecture must require it (or a
+         * backend-native equivalent) before admitting the request; this method
+         * is not permission to retry through a host loop.
+         */
+        [[nodiscard]] virtual bool supportsDeviceControlledWhileLoop() const noexcept
+        {
+            return false;
+        }
+
+        /**
+         * @brief Replace this graph with a device-controlled repetition of captured fragments.
+         *
+         * The implementation clones every element of @p ordered_body_fragments
+         * into one conditional WHILE body, adds an explicit dependency from each
+         * fragment to its successor, and appends the device predicate update
+         * after the final fragment. The first iteration is admitted by request
+         * admission; subsequent iterations are controlled exclusively by
+         * @p predicate. No D2H copy, host callback, allocation, or stream
+         * synchronization is permitted in the generated graph.
+         *
+         * On success the graph is built but not instantiated.  The caller must
+         * call instantiate() exactly as it would after endCapture().
+         *
+         * @param ordered_body_fragments Captured, non-empty transaction fragments
+         *        in producer-to-consumer order. Every pointer must remain valid
+         *        through this call and must identify the same backend/device
+         *        context as this graph owner. Source captures may own different
+         *        streams: child-graph cloning discards launch-stream identity,
+         *        and the parent dependencies establish transaction ordering.
+         * @param predicate Persistent device controller binding.
+         * @return true when this object owns a complete loop graph.
+         */
+        virtual bool buildDeviceControlledWhileLoop(
+            std::span<const IGPUGraphCapture *const> ordered_body_fragments,
+            const DeviceControlledLoopPredicate &predicate)
+        {
+            (void)ordered_body_fragments;
+            (void)predicate;
+            return false;
+        }
+
+        /**
+         * @brief Convenience overload for a transaction captured as one graph.
+         *
+         * This overload deliberately delegates to the ordered-fragment contract,
+         * so backends have exactly one composition implementation and monolithic
+         * transactions cannot acquire subtly different loop semantics.
+         */
+        bool buildDeviceControlledWhileLoop(
+            const IGPUGraphCapture &body,
+            const DeviceControlledLoopPredicate &predicate)
+        {
+            const IGPUGraphCapture *fragments[] = {&body};
+            return buildDeviceControlledWhileLoop(fragments, predicate);
+        }
 
         /**
          * @brief Return the exact stream owned by this capture lifecycle.

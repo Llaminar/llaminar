@@ -21,6 +21,44 @@
 
 using namespace llaminar2;
 
+#ifdef HAVE_CUDA
+extern "C" bool cudaOps_argmax_f32_batched_rows_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads);
+#endif
+
+#ifdef HAVE_ROCM
+extern "C" bool rocmOps_argmax_f32_batched_rows_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads);
+#endif
+
 namespace
 {
     constexpr int kQwen36Vocab = 248320;
@@ -77,6 +115,234 @@ namespace
     int stochasticHotToken(int row, int rank, int cols)
     {
         return (151936 + row * 911 + rank * 577 + (rank * rank * 17)) % cols;
+    }
+
+    /**
+     * @brief Sweep the exact production two-pass argmax over launch geometry.
+     *
+     * Timing events surround only repeated kernel pairs. Allocation, fixture
+     * upload, candidate validation, and result observation happen outside the
+     * measured interval. Every candidate must reproduce the lower-token tie
+     * winner and exact FP32 maximum before its latency is admitted as evidence.
+     */
+    void runArgmaxGeometrySweep(
+        const std::string &backend_name,
+        IBackend *backend,
+        DeviceId device)
+    {
+        if (!backend)
+            GTEST_SKIP() << backend_name << " backend unavailable";
+        ASSERT_TRUE(device.is_gpu());
+
+        const int device_id = device.gpu_ordinal();
+        auto &ctx = GPUDeviceContextPool::instance().getContext(device);
+        void *const stream = ctx.defaultStream();
+        ASSERT_NE(stream, nullptr);
+
+        std::vector<float> logits(static_cast<size_t>(kQwen36Vocab));
+        for (int token = 0; token < kQwen36Vocab; ++token)
+        {
+            logits[static_cast<size_t>(token)] =
+                -13.0F +
+                static_cast<float>((token * 37) % 4093) * 0.0001F;
+        }
+        constexpr int kExpectedToken = 17;
+        constexpr int kEqualLaterToken = 200003;
+        constexpr float kExpectedValue = 42.0F;
+        logits[static_cast<size_t>(kExpectedToken)] = kExpectedValue;
+        logits[static_cast<size_t>(kEqualLaterToken)] = kExpectedValue;
+
+        DeviceAllocation d_logits(
+            backend,
+            device_id,
+            logits.size() * sizeof(float));
+        DeviceAllocation d_value(backend, device_id, sizeof(float));
+        DeviceAllocation d_index(backend, device_id, sizeof(int));
+        DeviceAllocation d_partial_values(
+            backend,
+            device_id,
+            static_cast<size_t>(kPartialCapacity) * sizeof(float));
+        DeviceAllocation d_partial_indices(
+            backend,
+            device_id,
+            static_cast<size_t>(kPartialCapacity) * sizeof(int));
+        ASSERT_TRUE(d_logits);
+        ASSERT_TRUE(d_value);
+        ASSERT_TRUE(d_index);
+        ASSERT_TRUE(d_partial_values);
+        ASSERT_TRUE(d_partial_indices);
+        ASSERT_TRUE(backend->hostToDeviceOnStream(
+            d_logits.get(),
+            logits.data(),
+            logits.size() * sizeof(float),
+            device_id,
+            stream));
+        ASSERT_TRUE(backend->synchronizeStream(stream, device_id));
+
+        void *const start_event = backend->createTimingEvent(device_id);
+        void *const stop_event = backend->createTimingEvent(device_id);
+        ASSERT_NE(start_event, nullptr);
+        ASSERT_NE(stop_event, nullptr);
+        struct EventCleanup
+        {
+            IBackend *backend = nullptr;
+            int device_id = 0;
+            void *start = nullptr;
+            void *stop = nullptr;
+            ~EventCleanup()
+            {
+                if (backend && start)
+                    backend->destroyEvent(start, device_id);
+                if (backend && stop)
+                    backend->destroyEvent(stop, device_id);
+            }
+        } event_cleanup{backend, device_id, start_event, stop_event};
+
+        const std::vector<int> reduce_threads =
+            backend_name == "CUDA"
+                ? std::vector<int>{32, 64, 128, 256, 512}
+                : std::vector<int>{64, 128, 256, 512};
+        const std::array<int, 4> elements_per_thread = {2, 4, 8, 16};
+        const std::vector<int> finalize_threads =
+            backend_name == "CUDA"
+                ? std::vector<int>{32, 64, 128, 256}
+                : std::vector<int>{64, 128, 256};
+        const int warmup = envInt(
+            "LLAMINAR_PERF_GPU_ARGMAX_GEOMETRY_WARMUP", 10);
+        const int iterations = envInt(
+            "LLAMINAR_PERF_GPU_ARGMAX_GEOMETRY_ITERS", 500);
+
+        auto launch = [&](int reduce, int elements, int finalize) -> bool
+        {
+#ifdef HAVE_CUDA
+            if (backend_name == "CUDA")
+            {
+                return cudaOps_argmax_f32_batched_rows_geometry(
+                    static_cast<const float *>(d_logits.get()),
+                    /*rows=*/1,
+                    kQwen36Vocab,
+                    kQwen36Vocab,
+                    static_cast<float *>(d_value.get()),
+                    static_cast<int *>(d_index.get()),
+                    static_cast<float *>(d_partial_values.get()),
+                    static_cast<int *>(d_partial_indices.get()),
+                    kPartialCapacity,
+                    device_id,
+                    stream,
+                    /*output_stride=*/1,
+                    reduce,
+                    elements,
+                    finalize);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (backend_name == "ROCm")
+            {
+                return rocmOps_argmax_f32_batched_rows_geometry(
+                    static_cast<const float *>(d_logits.get()),
+                    /*rows=*/1,
+                    kQwen36Vocab,
+                    kQwen36Vocab,
+                    static_cast<float *>(d_value.get()),
+                    static_cast<int *>(d_index.get()),
+                    static_cast<float *>(d_partial_values.get()),
+                    static_cast<int *>(d_partial_indices.get()),
+                    kPartialCapacity,
+                    device_id,
+                    stream,
+                    /*output_stride=*/1,
+                    reduce,
+                    elements,
+                    finalize);
+            }
+#endif
+            return false;
+        };
+
+        double best_us = std::numeric_limits<double>::infinity();
+        int best_reduce = 0;
+        int best_elements = 0;
+        int best_finalize = 0;
+        std::cout
+            << "backend,case,cols,reduce_threads,elements_per_thread,"
+               "finalize_threads,iterations,avg_us\n";
+        for (const int reduce : reduce_threads)
+        {
+            for (const int elements : elements_per_thread)
+            {
+                for (const int finalize : finalize_threads)
+                {
+                    for (int i = 0; i < warmup; ++i)
+                        ASSERT_TRUE(launch(reduce, elements, finalize));
+                    ASSERT_TRUE(backend->synchronizeStream(stream, device_id));
+
+                    ASSERT_TRUE(backend->recordEvent(
+                        start_event, device_id, stream));
+                    for (int i = 0; i < iterations; ++i)
+                        ASSERT_TRUE(launch(reduce, elements, finalize));
+                    ASSERT_TRUE(backend->recordEvent(
+                        stop_event, device_id, stream));
+                    ASSERT_TRUE(backend->waitForEvent(stop_event, device_id));
+
+                    float elapsed_ms = 0.0F;
+                    ASSERT_TRUE(backend->eventElapsedTimeMs(
+                        start_event,
+                        stop_event,
+                        device_id,
+                        &elapsed_ms));
+                    const double avg_us =
+                        static_cast<double>(elapsed_ms) * 1000.0 /
+                        static_cast<double>(iterations);
+
+                    float actual_value = 0.0F;
+                    int actual_index = -1;
+                    ASSERT_TRUE(backend->deviceToHostFast(
+                        &actual_value,
+                        d_value.get(),
+                        sizeof(actual_value),
+                        device_id,
+                        stream));
+                    ASSERT_TRUE(backend->deviceToHostFast(
+                        &actual_index,
+                        d_index.get(),
+                        sizeof(actual_index),
+                        device_id,
+                        stream));
+                    ASSERT_EQ(actual_value, kExpectedValue)
+                        << "geometry=" << reduce << 'x' << elements
+                        << '/' << finalize;
+                    ASSERT_EQ(actual_index, kExpectedToken)
+                        << "geometry=" << reduce << 'x' << elements
+                        << '/' << finalize;
+
+                    std::cout << backend_name
+                              << ",argmax_geometry," << kQwen36Vocab
+                              << ',' << reduce
+                              << ',' << elements
+                              << ',' << finalize
+                              << ',' << iterations
+                              << ',' << std::fixed << std::setprecision(4)
+                              << avg_us << '\n';
+                    if (avg_us < best_us)
+                    {
+                        best_us = avg_us;
+                        best_reduce = reduce;
+                        best_elements = elements;
+                        best_finalize = finalize;
+                    }
+                }
+            }
+        }
+
+        ASSERT_GT(best_reduce, 0);
+        std::cout << backend_name
+                  << ",argmax_geometry_winner," << kQwen36Vocab
+                  << ',' << best_reduce
+                  << ',' << best_elements
+                  << ',' << best_finalize
+                  << ',' << iterations
+                  << ',' << std::fixed << std::setprecision(4)
+                  << best_us << '\n';
     }
 
     std::vector<float> makeVerifierLogits(int rows, int cols, const std::vector<int> &expected_tokens)
@@ -1855,6 +2121,21 @@ namespace
                   << std::fixed << std::setprecision(3) << total_ms << ','
                   << std::fixed << std::setprecision(3) << avg_us << '\n';
     }
+}
+
+TEST(Perf__GPUSpeculativeSummary, ArgmaxGeometryQwen36SingleRow)
+{
+#ifdef HAVE_CUDA
+    runArgmaxGeometrySweep(
+        "CUDA", getCUDABackend(), DeviceId::cuda(0));
+#endif
+#ifdef HAVE_ROCM
+    runArgmaxGeometrySweep(
+        "ROCm", getROCmBackend(), DeviceId::rocm(0));
+#endif
+#if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+    GTEST_SKIP() << "No GPU backend enabled";
+#endif
 }
 
 TEST(Perf__GPUSpeculativeSummary, GreedyQwen36Rows)

@@ -9881,34 +9881,26 @@ namespace llaminar2
                     batched_residual_thresholds.reserve(static_cast<size_t>(compare_rows));
 
                     const int bonus_row = compare_rows;
-                    if (active_sampling_params_.has_penalties() &&
-                        !runner_->applyDeviceOwnedMTPPenaltiesToLogitRows(
-                            DeviceLogitsSource::AllPosition,
-                            compare_rows + 1,
-                            MTPGreedyPenaltyPolicy{
-                                .presence_penalty =
-                                    active_sampling_params_.presence_penalty,
-                                .frequency_penalty =
-                                    active_sampling_params_.frequency_penalty,
-                                .first_token_already_in_history =
-                                    first_token_is_pending_condition ? 1 : 0,
-                                .enabled = 1,
-                            }))
+                    const MTPGreedyPenaltyPolicy verifier_penalty_policy{
+                        .presence_penalty =
+                            active_sampling_params_.presence_penalty,
+                        .frequency_penalty =
+                            active_sampling_params_.frequency_penalty,
+                        .first_token_already_in_history =
+                            first_token_is_pending_condition ? 1 : 0,
+                        .enabled = active_sampling_params_.has_penalties()
+                                       ? 1
+                                       : 0,
+                    };
+                    if (!runner_
+                             ->buildCapturedStochasticVerifierTargetDistributions(
+                                 compare_rows + 1,
+                                 active_sampling_params_,
+                                 verifier_penalty_policy,
+                                 vocab))
                     {
                         return fail_after_checkpoint(
-                            "All-position stochastic MTP device-history row penalty application failed");
-                    }
-                    if (!runner_->buildStochasticDistributionsOnDevice(
-                            DeviceLogitsSource::AllPosition,
-                            /*first_row=*/0,
-                            DeviceDistributionBuffer::Target,
-                            /*first_slot=*/0,
-                            /*row_count=*/compare_rows + 1,
-                            active_sampling_params_,
-                            vocab))
-                    {
-                        return fail_after_checkpoint(
-                            "All-position stochastic MTP batched compact target-row build failed");
+                            "All-position stochastic MTP captured penalty/distribution transaction failed");
                     }
 
                     for (int row = 0; row < compare_rows; ++row)
@@ -9974,8 +9966,7 @@ namespace llaminar2
                                       &device_outcome_handle,
                                       inverse_sample_seed,
                                       inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true,
-                                      first_token_is_pending_condition ? 1 : 0)
+                                      /*use_vllm_probability_rejection=*/true)
                                 : runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
                                       /*first_target_slot=*/0,
                                       /*first_draft_slot=*/0,
@@ -9991,8 +9982,7 @@ namespace llaminar2
                                       &device_outcome_handle,
                                       inverse_sample_seed,
                                       inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true,
-                                      first_token_is_pending_condition ? 1 : 0);
+                                      /*use_vllm_probability_rejection=*/true);
                     }
                     if (!resident_outcome_ok)
                     {
@@ -11688,34 +11678,26 @@ namespace llaminar2
                 };
 
                 const int bonus_row = compare_rows;
-                if (active_sampling_params_.has_penalties() &&
-                    !runner_->applyDeviceOwnedMTPPenaltiesToLogitRows(
-                        DeviceLogitsSource::AllPosition,
-                        compare_rows + 1,
-                        MTPGreedyPenaltyPolicy{
-                            .presence_penalty =
-                                active_sampling_params_.presence_penalty,
-                            .frequency_penalty =
-                                active_sampling_params_.frequency_penalty,
-                            .first_token_already_in_history =
-                                first_token_is_pending_condition ? 1 : 0,
-                            .enabled = 1,
-                        }))
+                const MTPGreedyPenaltyPolicy verifier_penalty_policy{
+                    .presence_penalty =
+                        active_sampling_params_.presence_penalty,
+                    .frequency_penalty =
+                        active_sampling_params_.frequency_penalty,
+                    .first_token_already_in_history =
+                        first_token_is_pending_condition ? 1 : 0,
+                    .enabled = active_sampling_params_.has_penalties()
+                                   ? 1
+                                   : 0,
+                };
+                if (!runner_
+                         ->buildCapturedStochasticVerifierTargetDistributions(
+                             compare_rows + 1,
+                             active_sampling_params_,
+                             verifier_penalty_policy,
+                             vocab))
                 {
                     return fail_after_checkpoint(
-                        "Grouped-outcome stochastic MTP device-history row penalty application failed");
-                }
-                if (!runner_->buildStochasticDistributionsOnDevice(
-                        DeviceLogitsSource::AllPosition,
-                        /*first_row=*/0,
-                        DeviceDistributionBuffer::Target,
-                        /*first_slot=*/0,
-                        /*row_count=*/compare_rows + 1,
-                        active_sampling_params_,
-                        vocab))
-                {
-                    return fail_after_checkpoint(
-                        "Grouped-outcome stochastic MTP compact target-row build failed");
+                        "Grouped-outcome stochastic MTP captured penalty/distribution transaction failed");
                 }
 
                 std::vector<float> accept_thresholds;
@@ -11797,8 +11779,6 @@ namespace llaminar2
                         request.draw_position_source =
                             DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
                         request.serial_sample_equivalent = true;
-                        request.leading_committed_output_count =
-                            first_token_is_pending_condition ? 1 : 0;
                         request.use_device_draft_tokens = true;
                         request.stop_token_count =
                             static_cast<int>(stop_tokens_.size());
@@ -11831,8 +11811,7 @@ namespace llaminar2
                                       &outcome_handle,
                                       inverse_sample_seed,
                                       inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true,
-                                      first_token_is_pending_condition ? 1 : 0)
+                                      /*use_vllm_probability_rejection=*/true)
                                 : runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
                                       /*first_target_slot=*/0,
                                       /*first_draft_slot=*/0,
@@ -11848,8 +11827,7 @@ namespace llaminar2
                                       &outcome_handle,
                                       inverse_sample_seed,
                                       inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true,
-                                      first_token_is_pending_condition ? 1 : 0);
+                                      /*use_vllm_probability_rejection=*/true);
                     }
                 }
                 std::string verifier_cleanup_error;
@@ -14417,6 +14395,16 @@ namespace llaminar2
         // Store sampling params for decodeStep() and configure GPU-side decode
         active_sampling_params_ = sampling;
         sampler_ = Sampler(sampling.seed);
+
+        if (!sampling.is_greedy() && max_new_tokens > 0 &&
+            !runner_->beginDeviceResidentStochasticGeneration(
+                /*request_count=*/1,
+                max_new_tokens))
+        {
+            result.error =
+                "Failed to admit the device-resident stochastic generation response ledger";
+            return result;
+        }
 
         while (static_cast<int>(result.tokens.size()) < max_new_tokens)
         {
