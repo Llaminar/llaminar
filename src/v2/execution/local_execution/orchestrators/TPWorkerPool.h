@@ -81,6 +81,9 @@ namespace llaminar2
                 workers_.emplace_back([this, i]()
                                       { workerLoop(i); });
             }
+            failure_callback_worker_ = std::thread(
+                [this]()
+                { failureCallbackLoop(); });
             // Note: construction logging handled by caller (RankOrchestrator)
         }
 
@@ -91,12 +94,15 @@ namespace llaminar2
                 shutdown_ = true;
             }
             dispatch_cv_.notify_all();
+            failure_callback_cv_.notify_all();
 
             for (auto &t : workers_)
             {
                 if (t.joinable())
                     t.join();
             }
+            if (failure_callback_worker_.joinable())
+                failure_callback_worker_.join();
         }
 
         // Non-copyable, non-movable
@@ -210,11 +216,15 @@ namespace llaminar2
          * @brief Set a callback invoked on first worker failure.
          *
          * When a worker completes with an exception or returns false, this
-         * callback fires immediately on the failing worker's thread. Use it
-         * to abort collective operations (e.g., NCCL/RCCL) so that workers
-         * stuck in collectives can unblock and complete.
+         * callback is scheduled immediately on the pool's persistent control
+         * thread. The failing participant publishes its terminal WorkerResult
+         * before scheduling the callback. This ordering is mandatory because
+         * NCCL/RCCL abort may block while another participant leaves a collective;
+         * executing it on the failing participant would prevent that participant
+         * from ever contributing to the completion fence.
          *
-         * The callback must be thread-safe and non-blocking.
+         * The callback must be thread-safe. It may block inside the collective
+         * backend without occupying any participant worker.
          */
         void setFailureCallback(std::function<void()> cb)
         {
@@ -247,6 +257,7 @@ namespace llaminar2
                 // Execute the work
                 WorkerResult result;
                 result.worker_index = index;
+                bool schedule_failure_callback = false;
                 try
                 {
                     result.success = fn(index);
@@ -257,14 +268,7 @@ namespace llaminar2
                         if (first_failure_index_.compare_exchange_strong(
                                 expected, index, std::memory_order_acq_rel))
                         {
-                            // First failure — invoke abort callback to unblock stuck workers
-                            std::function<void()> cb;
-                            {
-                                std::lock_guard<std::mutex> lock(mutex_);
-                                cb = failure_callback_;
-                            }
-                            if (cb)
-                                cb();
+                            schedule_failure_callback = true;
                         }
                     }
                 }
@@ -280,14 +284,7 @@ namespace llaminar2
                     if (first_failure_index_.compare_exchange_strong(
                             expected, index, std::memory_order_acq_rel))
                     {
-                        // First failure — invoke abort callback to unblock stuck workers
-                        std::function<void()> cb;
-                        {
-                            std::lock_guard<std::mutex> lock(mutex_);
-                            cb = failure_callback_;
-                        }
-                        if (cb)
-                            cb();
+                        schedule_failure_callback = true;
                     }
                 }
                 catch (...)
@@ -301,14 +298,7 @@ namespace llaminar2
                     if (first_failure_index_.compare_exchange_strong(
                             expected, index, std::memory_order_acq_rel))
                     {
-                        // First failure — invoke abort callback to unblock stuck workers
-                        std::function<void()> cb;
-                        {
-                            std::lock_guard<std::mutex> lock(mutex_);
-                            cb = failure_callback_;
-                        }
-                        if (cb)
-                            cb();
+                        schedule_failure_callback = true;
                     }
                 }
                 result.completed = true;
@@ -349,18 +339,87 @@ namespace llaminar2
                      */
                     collect_cv_.notify_all();
                 }
+                if (schedule_failure_callback)
+                {
+                    /*
+                     * Publish completion first, then wake the independent abort
+                     * coordinator. A collective abort is allowed to block, but a
+                     * participant completion can never again be held behind it.
+                     */
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        failure_callback_generation_ = std::max(
+                            failure_callback_generation_,
+                            work_generation);
+                    }
+                    failure_callback_cv_.notify_one();
+                }
+            }
+        }
+
+        /**
+         * @brief Execute fatal collective teardown away from participant workers.
+         *
+         * One persistent thread avoids both a per-failure allocation and the lock
+         * inversion that can occur when a thread currently associated with one
+         * NCCL/RCCL participant calls communicator abort. Exceptions are fatal:
+         * after the first participant failure the collective context is explicitly
+         * unusable, so continuing would only conceal asymmetric device state.
+         */
+        void failureCallbackLoop()
+        {
+            uint64_t handled_generation = 0;
+            while (true)
+            {
+                std::function<void()> callback;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    failure_callback_cv_.wait(
+                        lock,
+                        [this, handled_generation]()
+                        {
+                            return shutdown_ ||
+                                   failure_callback_generation_ >
+                                       handled_generation;
+                        });
+                    if (shutdown_)
+                        return;
+                    handled_generation = failure_callback_generation_;
+                    callback = failure_callback_;
+                }
+
+                if (!callback)
+                    continue;
+                try
+                {
+                    callback();
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR("[TPWorkerPool] Fatal collective-abort callback exception: "
+                              << error.what());
+                    std::terminate();
+                }
+                catch (...)
+                {
+                    LOG_ERROR("[TPWorkerPool] Fatal non-standard collective-abort callback exception");
+                    std::terminate();
+                }
             }
         }
 
         size_t num_workers_;
         std::vector<std::thread> workers_;
+        std::thread failure_callback_worker_;
         std::vector<WorkerResult> results_;
 
         // Dispatch synchronization
         std::mutex mutex_;
         std::condition_variable dispatch_cv_;
+        std::condition_variable failure_callback_cv_;
         std::function<bool(size_t)> work_fn_;
         std::function<void()> failure_callback_;
+        uint64_t failure_callback_generation_ = 0;
         uint64_t generation_ = 0;
         uint64_t completed_generation_ = 0;
         uint64_t collected_generation_ = 0;

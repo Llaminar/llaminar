@@ -31,7 +31,7 @@ namespace llaminar2
         ALL_POSITION_LOGITS_LOCAL, ///< Column-parallel verifier logits [seq_len, local_vocab]
         REQUEST_TOKEN_IDS,         ///< Device-owned request token rows admitted once at the API boundary
         REQUEST_POSITION_IDS,      ///< Device-owned absolute request positions paired with REQUEST_TOKEN_IDS
-        REQUEST_SEQUENCE_LENGTHS,  ///< Device-owned valid row count for each request in a padded batch
+        REQUEST_BATCH_GEOMETRY,    ///< Device-owned real lengths followed by the padded physical row stride
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -154,6 +154,7 @@ namespace llaminar2
         MTP_GREEDY_PENALTY_POLICY, ///< Arena-owned request policy read by captured grouped greedy sampling
         MTP_GENERATED_TOKEN_COUNTS, ///< Arena-owned generated-token histogram for presence/frequency penalties
         MTP_VERIFIER_POSITION_IDS, ///< Arena-owned INT32 absolute positions expanded from device-owned live KV counts
+        MTP_VERIFIER_REQUEST_LENGTHS, ///< Arena-owned INT32 valid grouped-verifier width for each request row
         MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
         MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS, ///< Opt-in device-only phase history for fatal MTP publication diagnostics
 
@@ -181,8 +182,8 @@ namespace llaminar2
             return "REQUEST_TOKEN_IDS";
         case BufferId::REQUEST_POSITION_IDS:
             return "REQUEST_POSITION_IDS";
-        case BufferId::REQUEST_SEQUENCE_LENGTHS:
-            return "REQUEST_SEQUENCE_LENGTHS";
+        case BufferId::REQUEST_BATCH_GEOMETRY:
+            return "REQUEST_BATCH_GEOMETRY";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:
@@ -363,6 +364,8 @@ namespace llaminar2
             return "MTP_GENERATED_TOKEN_COUNTS";
         case BufferId::MTP_VERIFIER_POSITION_IDS:
             return "MTP_VERIFIER_POSITION_IDS";
+        case BufferId::MTP_VERIFIER_REQUEST_LENGTHS:
+            return "MTP_VERIFIER_REQUEST_LENGTHS";
         case BufferId::MTP_LOGICAL_SEQUENCE_STATE:
             return "MTP_LOGICAL_SEQUENCE_STATE";
         case BufferId::MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS:

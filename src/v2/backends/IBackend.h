@@ -2241,6 +2241,60 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize all dynamic geometry consumed by a grouped verifier.
+         *
+         * The grouped verifier owns two related but distinct device inputs:
+         * absolute position rows and the number of valid tokens in each padded
+         * request row. Position rows derive from the canonical device KV counts.
+         * Request lengths derive from the physical valid-row list already
+         * published for compact verifier logits. Keeping both outputs in one
+         * bounded launch gives RoPE, short-conv, and GDN recurrence one ordered
+         * geometry publication without introducing another H2D transfer.
+         *
+         * When @p valid_graph_rows_device is null, the input is rectangular and
+         * every request length is @p padded_seq_len. Otherwise the array contains
+         * @p valid_graph_row_count flattened request-major physical indices. An
+         * implementation must count those indices per request exactly; gaps are
+         * padding and must not mutate recurrent state.
+         *
+         * Implementations must be graph-capturable, allocation-free, transfer-free,
+         * and asynchronous on the explicit non-null @p stream.
+         *
+         * @param base_positions_device Device INT32 next-position row.
+         * @param valid_graph_rows_device Optional device INT32 physical valid rows.
+         * @param valid_graph_row_count Number of entries in the valid-row array.
+         * @param request_count Number of independent request rows.
+         * @param padded_seq_len Physical verifier columns per request.
+         * @param device_id GPU ordinal owning all inputs and outputs.
+         * @param stream Exact CUDA/HIP producer stream.
+         * @param out_position_ids_device Device INT32 request-major positions.
+         * @param out_request_lengths_device Device INT32 valid width per request.
+         * @return true when the geometry publication was enqueued.
+         */
+        virtual bool enqueuePrepareMTPVerifierGeometry(
+            const void *base_positions_device,
+            const void *valid_graph_rows_device,
+            int valid_graph_row_count,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device,
+            void *out_request_lengths_device)
+        {
+            (void)base_positions_device;
+            (void)valid_graph_rows_device;
+            (void)valid_graph_row_count;
+            (void)request_count;
+            (void)padded_seq_len;
+            (void)device_id;
+            (void)stream;
+            (void)out_position_ids_device;
+            (void)out_request_lengths_device;
+            return false;
+        }
+
+        /**
          * @brief Seed the request-batched GPU logical-state mailbox after prefill.
          *
          * The terminal prefill sampler already owns one sampled token per request

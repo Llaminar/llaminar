@@ -3962,13 +3962,17 @@ namespace llaminar2
 
     bool WeightManager::prepareMoEExpertOverlayWeights(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
+        DeviceId target_device,
         const FrozenModelWeightSet *frozen_weights,
         const MoEExpertOverlayExecutionPlan *execution_plan)
     {
-        (void)frozen_weights;
-
         if (!runtime_plan.sourcePlan().isTieredOverlay())
             return true;
+        if (!target_device.is_valid())
+        {
+            LOG_ERROR("[WeightManager] MoE overlay preparation requires an explicit participant device");
+            return false;
+        }
 
         size_t routed_expert_bytes_per_expert = 0;
         {
@@ -3981,9 +3985,29 @@ namespace llaminar2
             routed_expert_bytes_per_expert);
         if (execution_plan)
             preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
-        moe_overlay_preparation_diagnostics_ = preparation_plan.diagnostics();
+        preparation_plan = preparation_plan.filteredForDevice(target_device);
 
-        LOG_DEBUG("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
+        /**
+         * Accelerator expert preparation must consume the same immutable bindings
+         * that the graph will later resolve. Falling back to WeightManager's mutable
+         * legacy caches here is incorrect for LocalTP replication: those caches may
+         * contain a participant slice while the graph owns a complete replicated
+         * expert tensor. That mismatch previously let preparation report success and
+         * left the graph without any engines under its binding/device identity.
+         *
+         * CPU fallback tiers remain loader-backed because they do not materialize a
+         * per-device frozen accelerator binding. Every CUDA/ROCm caller, however,
+         * must provide its runner-owned FrozenModelWeightSet.
+         */
+        if (preparation_plan.hasAcceleratorRequests() && !frozen_weights)
+        {
+            LOG_ERROR("[WeightManager] MoE overlay accelerator preparation requires "
+                      "the graph-frozen weight bindings; cache-backed preparation is forbidden");
+            return false;
+        }
+
+        LOG_DEBUG("[WeightManager] participant-local overlay preparation device="
+                  << target_device.to_string() << " " << preparation_plan.diagnostics().render());
 
         {
             std::unordered_set<std::string> cpu_owned_parent_names;
@@ -4009,26 +4033,31 @@ namespace llaminar2
         // before CPU fallback packing advises those pages DONTNEED.
         if (!preparation_plan.empty() && preparation_plan.hasAcceleratorRequests())
         {
-            for (const auto &device : preparation_plan.acceleratorDevices())
+            if (!target_device.is_gpu())
             {
-                auto layer_role_filter = [&preparation_plan, device](const std::string &name) -> bool
-                {
-                    int layer_idx = -1;
-                    ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
-                    if (!parseMoEExpertParentName(name, layer_idx, role))
-                        return false;
-                    return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
-                };
-
-                LOG_DEBUG("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
-                const bool device_ok = packGemmWeightsViaPipeline(
-                    device,
-                    layer_role_filter,
-                    nullptr,
-                    true,
-                    &preparation_plan);
-                ok = ok && device_ok;
+                LOG_ERROR("[WeightManager] participant-local overlay plan retained accelerator requests for non-GPU target "
+                          << target_device.to_string());
+                return false;
             }
+
+            auto layer_role_filter = [&preparation_plan, target_device](const std::string &name) -> bool
+            {
+                int layer_idx = -1;
+                ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+                if (!parseMoEExpertParentName(name, layer_idx, role))
+                    return false;
+                return preparation_plan.hasAnyRequestForDeviceLayerRole(
+                    target_device, layer_idx, role);
+            };
+
+            LOG_DEBUG("[WeightManager] Preparing participant-local MoE overlay experts for "
+                      << target_device.to_string());
+            ok = packGemmWeightsViaPipeline(
+                target_device,
+                layer_role_filter,
+                frozen_weights,
+                true,
+                &preparation_plan);
         }
 
         if (preparation_plan.hasCpuRoutedAssignments())
@@ -4536,7 +4565,7 @@ namespace llaminar2
                 }
             }
 
-            if (!collected_from_frozen)
+            if (!collected_from_frozen && !frozen_weights)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 for (const auto &[name, tensor] : cache_)
@@ -4544,6 +4573,14 @@ namespace llaminar2
                     WeightSliceSpec full_slice;
                     add_moe_parent(name, tensor, tensor.get(), full_slice);
                 }
+            }
+            else if (!collected_from_frozen && overlay_preparation_plan &&
+                     overlay_preparation_plan->hasRequestsForDevice(target_device))
+            {
+                LOG_ERROR("[WeightManager] GPU overlay preparation for "
+                          << target_device.to_string()
+                          << " has routed-expert requests but its graph-frozen set owns no matching expert parents; mutable-cache substitution is forbidden");
+                return false;
             }
 
             // Create 2D expert views for each complete layer

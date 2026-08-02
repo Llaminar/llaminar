@@ -878,7 +878,8 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
 #endif
 }
 
-TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalRequestLengths)
+TEST(Test__CUDAHiddenStateRowSelectStage,
+     CapturedGraphReplaysAcrossResidentRequestWidths)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -891,28 +892,35 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalReque
 
     const DeviceId device = DeviceId::cuda(0);
     constexpr int request_count = 2;
-    constexpr int request_row_stride = 8;
-    constexpr int total_rows = request_count * request_row_stride;
+    constexpr int seq_capacity = 16;
+    const int32_t initial_row_stride = 8;
+    const int32_t replay_row_stride = 6;
     constexpr int d_model = 32;
     const std::vector<int32_t> initial_lengths{8, 3};
-    const std::vector<int32_t> replay_lengths{4, 8};
+    const std::vector<int32_t> replay_lengths{4, 6};
     const std::vector<int> initial_terminal_rows{7, 10};
-    const std::vector<int> replay_terminal_rows{3, 15};
+    const std::vector<int> replay_terminal_rows{3, 11};
 
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
-    auto hidden = makeHiddenStates(total_rows, d_model, device, stream);
+    auto hidden = makeHiddenStates(seq_capacity, d_model, device, stream);
     auto scratch = std::make_unique<FP32Tensor>(
         std::vector<size_t>{request_count, static_cast<size_t>(d_model)},
         DeviceId::cpu());
     ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
 
     int32_t *lengths_device = nullptr;
+    int32_t *row_stride_device = nullptr;
     ASSERT_EQ(
         cudaMalloc(
             reinterpret_cast<void **>(&lengths_device),
             initial_lengths.size() * sizeof(int32_t)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&row_stride_device),
+            sizeof(int32_t)),
         cudaSuccess);
     ASSERT_EQ(
         cudaMemcpyAsync(
@@ -922,23 +930,34 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalReque
             cudaMemcpyHostToDevice,
             stream),
         cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            row_stride_device,
+            &initial_row_stride,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream),
+        cudaSuccess);
 
     HiddenStateRowsSelectStage::Params params;
     params.device_id = device;
     params.input = hidden.get();
     params.output = scratch.get();
-    params.seq_len = total_rows;
+    params.seq_len = seq_capacity;
     params.d_model = d_model;
     params.selected_row_count = request_count;
     params.selected_row_indices = initial_terminal_rows;
     params.device_row_index_source =
         HiddenStateRowsSelectStage::DeviceRowIndexSource::RequestTerminalLengths;
     params.request_sequence_lengths_device = lengths_device;
-    params.request_row_stride = request_row_stride;
+    params.request_row_stride_source =
+        HiddenStateRowsSelectStage::RequestRowStrideSource::
+            ExternalDeviceScalar;
+    params.request_row_stride_device = row_stride_device;
     HiddenStateRowsSelectStage stage(params);
     stage.setGPUStream(stream);
 
-    ASSERT_TRUE(stage.getWorkspaceRequirements(total_rows, d_model, 0).buffers.empty())
+    ASSERT_TRUE(stage.getWorkspaceRequirements(seq_capacity, d_model, 0).buffers.empty())
         << "Resident request lengths must not allocate or alias verifier-row metadata";
     ASSERT_TRUE(stage.execute(nullptr));
     expectRows(
@@ -970,14 +989,23 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalReque
         d_model);
 
     /*
-     * Only the device length array changes. The captured kernel must derive a
-     * new terminal row for each request without a host row-plan update.
+     * Both values change inside the same logical device geometry record. The
+     * captured kernel must derive new terminal rows without a prompt-width
+     * graph identity or host row-plan update.
      */
     ASSERT_EQ(
         cudaMemcpyAsync(
             lengths_device,
             replay_lengths.data(),
             replay_lengths.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            row_stride_device,
+            &replay_row_stride,
+            sizeof(int32_t),
             cudaMemcpyHostToDevice,
             stream),
         cudaSuccess);
@@ -991,6 +1019,192 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalReque
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
     cudaFree(lengths_device);
+    cudaFree(row_stride_device);
+    cudaStreamDestroy(stream);
+#endif
+}
+
+TEST(Test__CUDAHiddenStateRowSelectStage,
+     CapturedGraphReplaysAcrossShiftedPrefillKVProgress)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    constexpr int seq_capacity = 24;
+    constexpr int d_model = 32;
+    constexpr int request_index = 1;
+    constexpr int selected_row_count = 3;
+    const int32_t initial_stride = 10;
+    const std::vector<int32_t> initial_lengths{7, 8};
+    const int32_t initial_main_count = 20;
+    const int32_t initial_shifted_count = 14;
+    const std::vector<int> initial_rows{12, 13, 14};
+    const int32_t replay_stride = 8;
+    const std::vector<int32_t> replay_lengths{5, 6};
+    const int32_t replay_main_count = 31;
+    const int32_t replay_shifted_count = 28;
+    const std::vector<int> replay_rows{11, 12, 13};
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto hidden = makeHiddenStates(seq_capacity, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{selected_row_count, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    int32_t *lengths_device = nullptr;
+    int32_t *stride_device = nullptr;
+    int32_t *main_count_device = nullptr;
+    int32_t *shifted_count_device = nullptr;
+    ASSERT_EQ(cudaMalloc(
+                  reinterpret_cast<void **>(&lengths_device),
+                  initial_lengths.size() * sizeof(int32_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(
+                  reinterpret_cast<void **>(&stride_device),
+                  sizeof(int32_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(
+                  reinterpret_cast<void **>(&main_count_device),
+                  sizeof(int32_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(
+                  reinterpret_cast<void **>(&shifted_count_device),
+                  sizeof(int32_t)),
+              cudaSuccess);
+
+    const auto publish_progress =
+        [&](const std::vector<int32_t> &lengths,
+            const int32_t stride,
+            const int32_t main_count,
+            const int32_t shifted_count)
+    {
+        ASSERT_EQ(cudaMemcpyAsync(
+                      lengths_device,
+                      lengths.data(),
+                      lengths.size() * sizeof(int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(
+                      stride_device,
+                      &stride,
+                      sizeof(int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(
+                      main_count_device,
+                      &main_count,
+                      sizeof(int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(
+                      shifted_count_device,
+                      &shifted_count,
+                      sizeof(int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream),
+                  cudaSuccess);
+    };
+    publish_progress(
+        initial_lengths,
+        initial_stride,
+        initial_main_count,
+        initial_shifted_count);
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = seq_capacity;
+    params.d_model = d_model;
+    params.selected_row_count = selected_row_count;
+    params.selected_row_indices = initial_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            ShiftedPrefillKVProgress;
+    params.request_sequence_lengths_device = lengths_device;
+    params.request_row_stride_source =
+        HiddenStateRowsSelectStage::RequestRowStrideSource::
+            ExternalDeviceScalar;
+    params.request_row_stride_device = stride_device;
+    params.main_cached_tokens_device = main_count_device;
+    params.shifted_cached_tokens_device = shifted_count_device;
+    params.request_index = request_index;
+    HiddenStateRowsSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(seq_capacity, d_model, 0).buffers.empty())
+        << "Canonical KV progress must not allocate or upload a host row cursor";
+    ASSERT_TRUE(stage.execute(nullptr));
+    expectRows(
+        downloadScratchRows(
+            *scratch,
+            selected_row_count,
+            d_model,
+            stream),
+        *hidden,
+        initial_rows,
+        d_model);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+            cudaSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    expectRows(
+        downloadScratchRows(
+            *scratch,
+            selected_row_count,
+            d_model,
+            stream),
+        *hidden,
+        initial_rows,
+        d_model);
+
+    publish_progress(
+        replay_lengths,
+        replay_stride,
+        replay_main_count,
+        replay_shifted_count);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    expectRows(
+        downloadScratchRows(
+            *scratch,
+            selected_row_count,
+            d_model,
+            stream),
+        *hidden,
+        replay_rows,
+        d_model);
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaFree(lengths_device);
+    cudaFree(stride_device);
+    cudaFree(main_count_device);
+    cudaFree(shifted_count_device);
     cudaStreamDestroy(stream);
 #endif
 }

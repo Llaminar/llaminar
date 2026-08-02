@@ -129,7 +129,7 @@ namespace llaminar2
         if (eq_pos == std::string::npos)
         {
             throw std::invalid_argument("Invalid " + options.context + " spec: '" + spec +
-                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_assignment=...])");
+                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_phase=...][;routed_assignment=...])");
         }
 
         ExecutionDomainDefinition domain;
@@ -226,6 +226,13 @@ namespace llaminar2
                 if (!assignment)
                     throw std::invalid_argument("Invalid " + options.context + " routed assignment policy: '" + value + "'");
                 domain.routed_assignment_policy = *assignment;
+            }
+            else if (key == "routed_phase")
+            {
+                auto phase = parseRoutedExpertPhasePolicy(value);
+                if (!phase)
+                    throw std::invalid_argument("Invalid " + options.context + " routed phase policy: '" + value + "'");
+                domain.routed_phase_policy = *phase;
             }
             else
             {
@@ -340,8 +347,34 @@ namespace llaminar2
             errors.push_back("Domain '" + name + "' uses routed_compute=apportioned but has no participants");
         }
 
+        const bool apportioned_prefill_over_replicated_weights =
+            routed_compute_policy == RoutedExpertComputePolicy::Replicated &&
+            routed_phase_policy ==
+                RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+
+        if (routed_phase_policy ==
+                RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated &&
+            routed_compute_policy != RoutedExpertComputePolicy::Replicated)
+        {
+            errors.push_back(
+                "Domain '" + name +
+                "' uses routed_phase=prefill-apportioned-decode-replicated "
+                "but routed_compute is not replicated");
+        }
+
+        if (routed_phase_policy ==
+                RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated &&
+            !supportsLeastLoadedResidentAssignment())
+        {
+            errors.push_back(
+                "Domain '" + name +
+                "' uses routed_phase=prefill-apportioned-decode-replicated "
+                "but is not a multi-participant domain-scoped TP domain");
+        }
+
         if (routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
-            routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
+            routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+            !apportioned_prefill_over_replicated_weights)
         {
             errors.push_back("Domain '" + name + "' uses routed_assignment=least-loaded-resident but does not use routed_compute=apportioned");
         }
@@ -405,6 +438,9 @@ namespace llaminar2
         if (routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
             oss << " routed_compute="
                 << routedExpertComputePolicyToString(routed_compute_policy);
+        if (routed_phase_policy != RoutedExpertPhasePolicy::Unspecified)
+            oss << " routed_phase="
+                << routedExpertPhasePolicyToString(routed_phase_policy);
         if (routed_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
             oss << " routed_assignment="
                 << routedExpertAssignmentPolicyToString(routed_assignment_policy);

@@ -1535,38 +1535,31 @@ namespace llaminar2
                 "persistent device bindings");
         }
 
-        ILocalTPContext *local_tp = nullptr;
-        if (config_.tp_ctx && config_.tp_ctx->isLocal())
+        if (config_.mtp_verifier_outcome_ownership !=
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal)
         {
-            local_tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
-            if (!local_tp)
-            {
-                throw std::runtime_error(
-                    "Local MTP verifier topology did not expose ILocalTPContext");
-            }
+            throw std::runtime_error(
+                "Graph-owned MTP verifier outcomes require an explicit "
+                "participant-local ownership policy");
         }
-        const bool publish_mirrored_local_tp =
-            local_tp && local_tp->degree() > 1;
-        if (publish_mirrored_local_tp &&
+
+        const bool mirrored_local_tp =
+            config_.tp_ctx &&
+            config_.tp_ctx->isLocal() &&
+            config_.tp_ctx->degree() > 1;
+        if (mirrored_local_tp &&
             !config_.mtp.mirror_full_head_for_local_tp)
         {
             throw std::runtime_error(
-                "Graph-owned LocalTP MTP outcomes require a mirrored full "
-                "verifier head on every participant");
-        }
-        if (publish_mirrored_local_tp &&
-            !local_tp->supportsCollectiveSidebandOnStreamGraphCapture())
-        {
-            throw std::runtime_error(
-                "Graph-owned LocalTP MTP outcome publication requires "
-                "graph-capturable NCCL/RCCL sidebands");
+                "Participant-local LocalTP MTP outcomes require a mirrored "
+                "full verifier head on every participant");
         }
         if (config_.tp_ctx && !config_.tp_ctx->isLocal() &&
             config_.tp_ctx->degree() > 1)
         {
             throw std::runtime_error(
-                "Graph-owned compact MTP outcome publication is not yet "
-                "implemented for multi-rank GlobalTP");
+                "Participant-local compact MTP outcomes require a complete "
+                "local verifier head and cannot be lowered onto sharded GlobalTP");
         }
 
         MTPVerifierOutcomeStage::Params params{
@@ -1576,10 +1569,8 @@ namespace llaminar2
             .binding = config_.mtp_verifier_outcome_graph_binding,
             .verifier_row_count = verifier_row_count,
             .vocab_size = config_.vocab_size,
-            .local_tp_ctx = local_tp,
-            .local_tp_device_index = config_.tp_device_idx,
-            .local_tp_root_device_index = 0,
-            .publish_mirrored_local_tp = publish_mirrored_local_tp,
+            .ownership_policy = config_.mtp_verifier_outcome_ownership,
+            .mirrored_local_tp = mirrored_local_tp,
             .stage_name = "mtp_verifier_outcome",
         };
         graph.addNode(

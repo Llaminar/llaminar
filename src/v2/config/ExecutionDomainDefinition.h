@@ -81,6 +81,8 @@ namespace llaminar2
         std::vector<int> ranks;
         RoutedExpertComputePolicy routed_compute_policy =
             RoutedExpertComputePolicy::Unspecified;
+        RoutedExpertPhasePolicy routed_phase_policy =
+            RoutedExpertPhasePolicy::Unspecified;
         RoutedExpertAssignmentPolicy routed_assignment_policy =
             RoutedExpertAssignmentPolicy::Unspecified;
 
@@ -111,6 +113,11 @@ namespace llaminar2
         bool hasRoutedExpertComputePolicy() const
         {
             return routed_compute_policy != RoutedExpertComputePolicy::Unspecified;
+        }
+        /** @brief Return true when phase-specific routed execution was stated explicitly. */
+        bool hasRoutedExpertPhasePolicy() const
+        {
+            return routed_phase_policy != RoutedExpertPhasePolicy::Unspecified;
         }
         /** @brief Return true when routed-row assignment was stated explicitly. */
         bool hasRoutedExpertAssignmentPolicy() const

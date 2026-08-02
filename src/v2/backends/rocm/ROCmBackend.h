@@ -542,6 +542,16 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_position_ids_device) override;
+        bool enqueuePrepareMTPVerifierGeometry(
+            const void *base_positions_device,
+            const void *valid_graph_rows_device,
+            int valid_graph_row_count,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device,
+            void *out_request_lengths_device) override;
         bool enqueueInitializeMTPDeviceLogicalState(
             const void *sampled_tokens_device,
             const void *target_positions_device,

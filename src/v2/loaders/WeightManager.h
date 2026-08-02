@@ -151,18 +151,28 @@ namespace llaminar2
             DeviceId device,
             bool include_expert_jobs = true);
 
-        /// Prepare routed experts assigned to overlay tiers. Accelerator tiers use
-        /// the GPU load pipeline; CPU fallback tiers are eagerly packed into CPU
-        /// expert GEMM engines and inserted into ExpertGemmRegistry.
+        /**
+         * @brief Prepare the overlay experts owned by one graph participant.
+         *
+         * Accelerator preparation consumes only the exact frozen bindings owned
+         * by @p target_device.  It never scans another participant's requests and
+         * never substitutes mutable process-wide cache tensors for a missing
+         * frozen binding.  CPU participants likewise prepare only their explicit
+         * device-scoped requests.  This keeps LocalTP graph construction
+         * participant-local and prevents duplicate cross-device repack work.
+         *
+         * @param runtime_plan Declarative rank/domain overlay policy.
+         * @param target_device Device owned by the calling graph participant.
+         * @param frozen_weights Immutable graph bindings for that participant;
+         *        mandatory when the scoped plan contains accelerator requests.
+         * @param execution_plan Optional rank filter applied before device scope.
+         * @return true after all scoped requests have been prepared.
+         */
         bool prepareMoEExpertOverlayWeights(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
+            DeviceId target_device,
             const FrozenModelWeightSet *frozen_weights = nullptr,
             const MoEExpertOverlayExecutionPlan *execution_plan = nullptr);
-
-        const MoEExpertOverlayPreparationDiagnostics &moeExpertOverlayPreparationDiagnostics() const
-        {
-            return moe_overlay_preparation_diagnostics_;
-        }
 
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
@@ -1273,7 +1283,6 @@ namespace llaminar2
 
         ExpertGemmRegistry expert_gemm_registry_;
         std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
-        MoEExpertOverlayPreparationDiagnostics moe_overlay_preparation_diagnostics_;
         uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
 
         // =========================================================================

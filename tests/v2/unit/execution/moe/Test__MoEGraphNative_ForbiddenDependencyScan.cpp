@@ -5723,6 +5723,42 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Require CUDA MoE integration captures to use production ownership.
+     *
+     * The kernel integration suite calls tensor-aware facades directly. A raw
+     * cudaStreamBeginCapture/cudaStreamEndCapture pair does not establish the
+     * thread-local graph lifecycle consumed by TensorBase, so an output facade
+     * can incorrectly try to record an externally visible completion event
+     * inside the graph. The shared test fixture must compose the same
+     * CUDAGraphCapture and ScopedBackendGraphCapture owners as production.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         CUDAMoEIntegrationCaptureUsesProductionTransaction)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path test_path =
+            root / "tests/v2/integration/kernels/cuda/Test__CUDAMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(test_path)) << test_path;
+
+        const std::string test_source = readFile(test_path);
+        ASSERT_FALSE(test_source.empty());
+        EXPECT_NE(test_source.find("class ScopedCudaTestGraph final"),
+                  std::string::npos);
+        EXPECT_NE(test_source.find("llaminar2::CUDAGraphCapture graph_"),
+                  std::string::npos);
+        EXPECT_NE(test_source.find(
+                      "llaminar2::ScopedBackendGraphCapture transaction_"),
+                  std::string::npos);
+        EXPECT_EQ(test_source.find("cudaStreamBeginCapture("),
+                  std::string::npos)
+            << "Tensor-aware CUDA MoE tests must not bypass the production "
+               "capture owner";
+        EXPECT_EQ(test_source.find("cudaStreamEndCapture("),
+                  std::string::npos)
+            << "Capture closure must remain structurally paired by RAII";
+    }
+
+    /**
      * @brief Keep monolithic prefill capture inside the same structural owner.
      *
      * Prefill historically exposed separate begin, abort, and end methods. Any

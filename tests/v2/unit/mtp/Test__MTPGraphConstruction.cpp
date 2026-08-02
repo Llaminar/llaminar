@@ -1432,10 +1432,9 @@ TEST(Test__MTPGraphConstruction,
         .binding = binding,
         .verifier_row_count = 4,
         .vocab_size = 32,
-        .local_tp_ctx = nullptr,
-        .local_tp_device_index = 0,
-        .local_tp_root_device_index = 0,
-        .publish_mirrored_local_tp = false,
+        .ownership_policy =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal,
+        .mirrored_local_tp = false,
         .stage_name = "mtp_verifier_outcome",
     });
 
@@ -1484,45 +1483,57 @@ TEST(Test__MTPGraphConstruction,
                    BufferId::MTP_GENERATED_TOKEN_COUNTS;
         }));
 
-    MTPVerifierOutcomeStage non_root_stage({
+    MTPVerifierOutcomeStage mirrored_participant_stage({
         .device_id = DeviceId::cuda(1),
         .logits = logits.get(),
         .mode = MTPVerifierOutcomeGraphMode::Greedy,
         .binding = binding,
         .verifier_row_count = 4,
         .vocab_size = 32,
-        .local_tp_ctx = nullptr,
-        .local_tp_device_index = 1,
-        .local_tp_root_device_index = 0,
-        .publish_mirrored_local_tp = true,
+        .ownership_policy =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal,
+        .mirrored_local_tp = true,
         .stage_name = "mtp_verifier_outcome",
     });
-    const StageBufferContract non_root_contract =
-        non_root_stage.bufferContract();
-    const auto non_root_has_output = [&](BufferId id)
+    const StageBufferContract mirrored_participant_contract =
+        mirrored_participant_stage.bufferContract();
+    const auto mirrored_participant_has_input = [&](BufferId id)
     {
         return std::any_of(
-            non_root_contract.outputs.begin(),
-            non_root_contract.outputs.end(),
+            mirrored_participant_contract.inputs.begin(),
+            mirrored_participant_contract.inputs.end(),
+            [id](const BufferBinding &input_binding)
+            {
+                return input_binding.id == id;
+            });
+    };
+    const auto mirrored_participant_has_output = [&](BufferId id)
+    {
+        return std::any_of(
+            mirrored_participant_contract.outputs.begin(),
+            mirrored_participant_contract.outputs.end(),
             [id](const BufferBinding &output_binding)
             {
                 return output_binding.id == id;
             });
     };
 
-    EXPECT_EQ(non_root_contract.inputs.size(), 1u)
-        << "A compact-outcome receiver reads only its device-local penalty "
-           "policy before committing the broadcast outcome.";
-    EXPECT_EQ(
-        non_root_contract.inputs.front().id,
-        BufferId::MTP_GREEDY_PENALTY_POLICY);
-    EXPECT_FALSE(non_root_has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
-    EXPECT_FALSE(
-        non_root_has_output(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS));
+    EXPECT_TRUE(mirrored_participant_has_input(BufferId::ALL_POSITION_LOGITS));
     EXPECT_TRUE(
-        non_root_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
+        mirrored_participant_has_input(BufferId::MTP_VERIFIER_INPUT_TOKENS));
     EXPECT_TRUE(
-        non_root_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
+        mirrored_participant_has_input(BufferId::MTP_VERIFIER_STOP_TOKENS));
+    EXPECT_TRUE(
+        mirrored_participant_has_input(BufferId::MTP_GREEDY_PENALTY_POLICY));
+    EXPECT_TRUE(
+        mirrored_participant_has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
+    EXPECT_TRUE(
+        mirrored_participant_has_output(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS));
+    EXPECT_TRUE(
+        mirrored_participant_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
+    EXPECT_TRUE(
+        mirrored_participant_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
+    EXPECT_FALSE(mirrored_participant_stage.isCollectiveStage());
 }
 
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
@@ -6069,4 +6080,33 @@ TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchC
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
     ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
     EXPECT_FALSE(orchestrator.setComputeRowIndexedAllPositionLogits(true, selected_rows + 1));
+}
+
+/**
+ * @brief Lock the request geometry ABI used by captured publication graphs.
+ *
+ * A future edit must not split lengths and stride into independently published
+ * allocations: doing so would reintroduce the mixed-epoch lifecycle race this
+ * layout was created to make impossible.
+ */
+TEST(Test__MTPGraphConstruction,
+     DeviceRequestBatchGeometryKeepsLengthsAndStrideInOneRecord)
+{
+    constexpr int request_capacity = 4;
+    constexpr DeviceRequestBatchGeometryLayout layout(request_capacity);
+    static_assert(layout.valid());
+    static_assert(layout.requestCapacity() == request_capacity);
+    static_assert(layout.scalarCount() == 5);
+    static_assert(layout.rowStrideIndex() == 4);
+
+    std::array<int32_t, layout.scalarCount()> geometry{11, 7, 3, 1, 16};
+    EXPECT_EQ(layout.sequenceLengths(geometry.data()), geometry.data());
+    EXPECT_EQ(layout.rowStride(geometry.data()), geometry.data() + 4);
+    EXPECT_EQ(*layout.rowStride(geometry.data()), 16);
+
+    constexpr DeviceRequestBatchGeometryLayout invalid;
+    static_assert(!invalid.valid());
+    static_assert(invalid.scalarCount() == 0);
+    EXPECT_EQ(invalid.sequenceLengths(geometry.data()), nullptr);
+    EXPECT_EQ(invalid.rowStride(geometry.data()), nullptr);
 }

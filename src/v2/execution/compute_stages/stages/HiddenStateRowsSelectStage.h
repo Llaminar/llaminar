@@ -52,8 +52,10 @@ namespace llaminar2
          * suffix directly in a captured D2D node. `ExternalDeviceIndices` lets a
          * preceding device metadata kernel publish arbitrary verifier rows.
          * `RequestTerminalLengths` computes one terminal row per padded request
-         * directly in the copy kernel, preserving full device ownership of
-         * request-batched prefill.
+         * directly in the copy kernel. `ShiftedPrefillKVProgress` computes the
+         * next contiguous shifted-prefill range from canonical device KV counts
+         * and the same resident request geometry. Both policies preserve full
+         * device ownership and remain stable across captured graph replay.
          */
         enum class DeviceRowIndexSource
         {
@@ -61,6 +63,23 @@ namespace llaminar2
             FixedContiguousRange,
             ExternalDeviceIndices,
             RequestTerminalLengths,
+            ShiftedPrefillKVProgress,
+        };
+
+        /**
+         * @brief Selects the authoritative padded-row-stride owner.
+         *
+         * Main forward graphs have one immutable shape and therefore encode
+         * their stride in graph topology. Reusable MTP publication graphs are
+         * total over prompt widths and read the stride from the same
+         * event-published device record as the request lengths. The two modes
+         * are explicit policies; execution never probes one and falls back to
+         * the other.
+         */
+        enum class RequestRowStrideSource
+        {
+            StaticGraphGeometry,
+            ExternalDeviceScalar,
         };
 
         struct Params
@@ -82,6 +101,12 @@ namespace llaminar2
             std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or external-device plans.
             const int32_t *request_sequence_lengths_device = nullptr; ///< Resident request lengths for RequestTerminalLengths.
             int request_row_stride = 0; ///< Padded source-row stride between requests.
+            RequestRowStrideSource request_row_stride_source =
+                RequestRowStrideSource::StaticGraphGeometry; ///< Typed owner of request_row_stride.
+            const int32_t *request_row_stride_device = nullptr; ///< Stable device scalar for ExternalDeviceScalar.
+            const int32_t *main_cached_tokens_device = nullptr; ///< Canonical main-KV count for ShiftedPrefillKVProgress.
+            const int32_t *shifted_cached_tokens_device = nullptr; ///< Canonical shifted-MTP KV count for ShiftedPrefillKVProgress.
+            int request_index = -1; ///< Immutable request row selected by ShiftedPrefillKVProgress.
         };
 
         explicit HiddenStateRowsSelectStage(Params params);

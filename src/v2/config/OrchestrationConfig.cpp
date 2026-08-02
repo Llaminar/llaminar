@@ -251,6 +251,7 @@ namespace llaminar2
                    lhs.owner_rank == rhs.owner_rank &&
                    lhs.ranks == rhs.ranks &&
                    lhs.routed_compute_policy == rhs.routed_compute_policy &&
+                   lhs.routed_phase_policy == rhs.routed_phase_policy &&
                    lhs.routed_assignment_policy == rhs.routed_assignment_policy;
         }
 
@@ -320,6 +321,7 @@ namespace llaminar2
         domain.owner_rank = owner_rank;
         domain.ranks = explicit_ranks;
         domain.routed_compute_policy = routed_compute_policy;
+        domain.routed_phase_policy = routed_phase_policy;
         domain.routed_assignment_policy = routed_assignment_policy;
         return domain;
     }
@@ -332,6 +334,7 @@ namespace llaminar2
         def.weights = domain.weights;
         def.backend = domain.backend;
         def.routed_compute_policy = domain.routed_compute_policy;
+        def.routed_phase_policy = domain.routed_phase_policy;
         def.routed_assignment_policy = domain.routed_assignment_policy;
         def.scope = toTPScope(domain.scope);
         def.owner_rank = domain.owner_rank;

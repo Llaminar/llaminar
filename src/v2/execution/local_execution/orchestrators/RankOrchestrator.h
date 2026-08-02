@@ -495,8 +495,9 @@ namespace llaminar2
          * @brief True when every LocalTP participant can consume a previous
          *        MTP sidecar hidden row as the next draft input.
          *
-         * Depth-2/3 MTP is only valid for a rank when all child runners can
-         * keep their shifted MTP KV and sidecar hidden state in lockstep.
+         * Multi-depth MTP is valid only when all child runners can keep their
+         * shifted MTP KV and sidecar hidden state in lockstep through the
+         * graph-planned draft capacity.
          */
         bool supportsChainedMTPDrafts() const override;
 
@@ -542,9 +543,9 @@ namespace llaminar2
          * A LocalTP rank owns only an aggregate identity handle; the actual
          * condition-token and position rows remain in one device mailbox per
          * participant. This method dispatches one true request-batched sidecar
-         * to every child with that child's matching mailbox, then broadcasts
-         * the primary mirrored-head proposal slot to the corresponding slot on
-         * every participant through NCCL/RCCL. It never reads a condition,
+         * to every child with that child's matching mailbox. Each mirrored head
+         * samples and event-publishes its own destination slot; rank code neither
+         * transports nor compares the proposal bytes. It never reads a condition,
          * position, logit row, or proposal token through host memory.
          *
          * @param logical_state Rank-owned aggregate mailbox identity returned by
@@ -552,8 +553,8 @@ namespace llaminar2
          * @param request_batch Exact number of resident request rows to execute.
          * @param first_draft_slot Destination slot for request zero.
          * @param slot_stride Element stride between request destinations.
-         * @return true only when every child grouped sidecar and every compact
-         *         draft-token collective completed successfully.
+         * @return true only when every child grouped sidecar and participant-local
+         *         draft publication completed successfully.
          */
         bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -566,10 +567,10 @@ namespace llaminar2
          *
          * Each child consumes the previous request-major draft column from its
          * own device arena and adds @p position_offset to its resident position
-         * row. After one grouped sidecar per participant, the rank collectively
-         * publishes the primary mirrored-head result into every destination
-         * slot. The source and destination matrices remain device-owned for the
-         * complete chain.
+         * row. After one grouped sidecar per participant, every mirrored head
+         * publishes its own destination slot on its exact producer stream. The
+         * source and destination matrices remain device-owned for the complete
+         * chain.
          *
          * @param logical_state Current rank-owned aggregate mailbox identity.
          * @param request_batch Exact number of request rows in the grouped call.
@@ -578,7 +579,7 @@ namespace llaminar2
          * @param position_offset Sidecar depth added to resident base positions.
          * @param first_draft_slot New-depth slot for request zero.
          * @param draft_slot_stride Stride between new-depth requests.
-         * @return true only when all grouped child calls and slot broadcasts pass.
+         * @return true only when all grouped child calls and local slot publications pass.
          */
         bool forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -796,17 +797,17 @@ namespace llaminar2
          * Mirrored LocalTP MTP heads produce one full-vocabulary terminal row
          * per logical request on every GPU participant. Each child samples its
          * own row batch and initializes its child-local resident logical-state
-         * mailbox. The rank compares only the small response-token shadows;
+         * mailbox. Child zero alone surfaces the explicit host response token;
          * verifier planning and accepted-state publication continue to consume
-         * the child-resident mailboxes.
+         * the child-resident mailboxes without host comparison or adoption.
          *
          * @param request_count Number of compact terminal rows per child.
          * @param params Shared sampling policy for the request batch.
          * @param out_tokens Host response-token shadow written from child zero.
          * @param stochastic_position_seeds Immutable per-request seeds. Draws
          *        remain device-generated from each child's resident positions.
-         * @return true when every child sampled matching tokens and published
-         *         its resident logical-state mailbox.
+         * @return true when every child sampled and published its resident
+         *         logical-state mailbox and child zero surfaced the response row.
          */
         bool sampleMainLogitsBatchRowsOnDevice(
             int request_count,
@@ -1875,21 +1876,17 @@ namespace llaminar2
             int first_slot);
 
         /**
-         * @brief Broadcast one primary mirrored sample slot to every child.
+         * @brief Broadcast one primary main-target slot to every child.
          *
-         * Child zero samples either a main-model target or an MTP draft from its
-         * mirrored full-vocabulary head. The rank broadcasts that one `INT32`
-         * mailbox slot through NCCL/RCCL, then records the collective stream as
-         * the new producer on every child. The operation is allocation-free and
-         * never materializes the token on the host unless the caller separately
-         * requests a response shadow.
+         * This remains only for a main LM head that is not independently mirrored
+         * on every participant. MTP draft heads use participant-local sampling
+         * and never enter this collective. The rank broadcasts child zero's one
+         * `INT32` target slot through NCCL/RCCL, then records the collective
+         * stream as the exact producer on every child.
          *
-         * @param buffer Selects the target or draft runner mailbox namespace.
          * @param slot Slot index within that namespace.
          */
-        bool broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-            DeviceDistributionBuffer buffer,
-            int slot);
+        bool broadcastPrimaryLocalTPMainTargetSlotToChildren(int slot);
 
         /**
          * @brief Dispatch one grouped resident MTP operation to every LocalTP child.
@@ -1898,9 +1895,9 @@ namespace llaminar2
          * and chained request batching. It validates that @p logical_state names
          * the current rank aggregate and that every retained child mailbox has
          * the exact same request shape and device owner. The supplied operation
-         * is invoked once per participant, never once per request row. Only after
-         * every child succeeds does the helper broadcast each strided primary
-         * proposal slot through the configured NCCL/RCCL context.
+         * is invoked once per participant, never once per request row. Once
+         * every child succeeds, its exact local producer event remains the
+         * publication edge for each strided proposal slot.
          *
          * @param logical_state Current rank aggregate mailbox identity.
          * @param request_batch Exact grouped request count.
@@ -1909,7 +1906,7 @@ namespace llaminar2
          * @param operation_name Stable diagnostic name for failures/timeouts.
          * @param source_name Perfstats label describing the device input source.
          * @param child_operation One true grouped child operation.
-         * @return true when child execution and collective publication succeed.
+         * @return true when every child publishes its local grouped outputs.
          */
         bool dispatchMirroredLocalTPResidentMTPRequestBatch(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -1984,12 +1981,10 @@ namespace llaminar2
          * @brief Run greedy verifier reduction on mirrored LocalTP children.
          *
          * Every child owns a replicated MTP verifier head and therefore has the
-         * local state needed to publish accepted rows.  The compact accept/reject
-         * decision, however, is a single rank-level fact: all children must publish
-         * the same accepted prefix and next-condition token.  After child-local
-         * reducers produce resident mailboxes, the rank broadcasts the primary
-         * child's compact outcome into every peer mailbox on device before any
-         * live-state publication occurs.
+         * local state needed to publish accepted rows. Every child runs the same
+         * deterministic terminal reducer against mirrored inputs and publishes a
+         * complete local mailbox. Child zero is retained only as the host-response
+         * owner; live-state publication consumes each child-local mailbox.
          */
         bool verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
             const int32_t *draft_tokens,
@@ -2001,12 +1996,11 @@ namespace llaminar2
         /**
          * @brief Run stochastic verifier reduction on mirrored children.
          *
-         * Stochastic MTP must be batch-invariant across the LocalTP group.  The
-         * primary child computes the authoritative compact stochastic outcome,
-         * then a device-side LocalTP broadcast copies that compact token/meta row
-         * into every child-owned resident outcome buffer.  Publication can then
-         * remain child-local for KV/GDN/terminal-hidden state while consuming one
-         * common accept/reject decision.
+         * Stochastic MTP must be batch-invariant across the LocalTP group. Every
+         * participant consumes mirrored logits, sample slots, and RNG controls,
+         * then publishes a complete local mailbox. Publication consumes those
+         * child-local outcomes directly; no tiny rank control collective is
+         * permitted.
          */
         bool verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
             const DeviceStochasticBatchOutcomeRequest *requests,
@@ -2014,22 +2008,19 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle);
 
         /**
-         * @brief Broadcast the primary mirrored outcome into all child mailboxes.
+         * @brief Validate complete participant-local mirrored outcomes.
          *
-         * The child handles in @p child_outcomes own device-resident compact
-         * output-token and metadata buffers.  This helper validates that every
-         * handle is current, then enqueues two INT32 LocalTP broadcast sidebands
-         * on each participant stream: one for output tokens and one for metadata.
-         * No host copy or row replay is involved; NCCL/RCCL provide the device
-         * transport for homogeneous GPU LocalTP domains.
+         * This checks shape, device ownership, readiness, and the declarative
+         * participant-local completion bit for every child. It never inspects or
+         * transports mailbox bytes. Byte identity is proved by grouped verifier
+         * integration sweeps; production has no corrective fallback collective.
          *
          * @param child_outcomes Per-child resident compact outcome handles.
          * @param context_name Short diagnostic name attached to perfstats/errors.
-         * @return true when every child mailbox now contains the primary compact
-         *         outcome and remains ordered on its own stream.
+         * @return true when every child owns a complete local compact outcome.
          */
-        bool broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
-            std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
+        bool validateMirroredLocalTPChildOutcomesComplete(
+            const std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
             const char *context_name);
 
         /**
@@ -2103,10 +2094,10 @@ namespace llaminar2
          * @brief Publish child-resident outcomes from mirrored LocalTP verification.
          *
          * The request outcome must be the primary child handle returned by the
-         * most recent mirrored greedy or stochastic verifier reduction. Each
-         * participant receives its own stored handle after the rank has broadcast
-         * the primary compact outcome into all child mailboxes, preserving stream
-         * ownership while guaranteeing one common accepted count.
+         * most recent mirrored greedy or stochastic verifier reduction. Rank
+         * orchestration retains the complete handle set and passes each participant
+         * its own locally produced handle. No outcome transport or corrective
+         * collective exists in this publication path.
          */
         bool publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
             const DeviceSpeculativePublicationRequest &request,

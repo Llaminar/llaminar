@@ -24,12 +24,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -44,9 +47,10 @@
  * @brief Focused MoE verifier-prefill parity and timing harness.
  *
  * This target isolates the Qwen3.6 MoE MTP verifier hot path: small verifier
- * batches with M=2,3,4, routed top-k experts, and the always-on shared expert.
- * Each case compares grouped verifier prefill against row-wise decode-equivalent
- * execution and then reports eager and graph-replay timing in a compact CSV row.
+ * batches across the complete production MTP depth range, routed top-k
+ * experts, and the always-on shared expert. Each case compares grouped
+ * verifier prefill against row-wise decode-equivalent execution byte for byte,
+ * then reports eager and graph-replay timing in a compact CSV row.
  *
  * The harness is deliberately narrower than full-model benchmark mode. It gives
  * us a stable speedometer for kernel and grouping changes before we spend time
@@ -70,6 +74,10 @@ namespace
         size_t nonfinite_actual_count = 0;
         size_t nonfinite_expected_count = 0;
         size_t first_nonfinite_index = 0;
+        size_t bit_mismatch_count = 0;
+        size_t first_bit_mismatch_index = 0;
+        uint32_t first_actual_bits = 0;
+        uint32_t first_expected_bits = 0;
         size_t worst_row = 0;
     };
 
@@ -235,6 +243,75 @@ namespace
             start = comma + 1;
         }
         return false;
+    }
+
+    /**
+     * @brief Resolve an optional exact runtime-M inventory for CUDA profiling.
+     *
+     * Full correctness suites own contiguous M-totality. This focused speedometer
+     * also needs to isolate one production depth, such as M=5, so Nsight can
+     * attribute one launch geometry without measuring every default cell first.
+     * An explicitly supplied malformed or non-positive value is a configuration
+     * error: silently reverting to defaults would produce convincing timing for
+     * the wrong verifier shape.
+     *
+     * @param defaults Test-specific row inventory used when the environment is
+     *        absent.
+     * @return Requested positive row counts in caller order, with duplicates
+     *         removed.
+     * @throws std::runtime_error when the selector contains an invalid token.
+     */
+    std::vector<int> selectedVerifierRows(
+        std::initializer_list<int> defaults)
+    {
+        constexpr const char *kEnvironment =
+            "LLAMINAR_MOE_VERIFIER_PREFILL_ROWS";
+        const char *value = std::getenv(kEnvironment);
+        if (!value || !*value)
+            return std::vector<int>(defaults);
+
+        std::vector<int> rows;
+        std::string csv(value);
+        size_t start = 0;
+        while (start <= csv.size())
+        {
+            const size_t comma = csv.find(',', start);
+            std::string item = csv.substr(
+                start,
+                comma == std::string::npos
+                    ? std::string::npos
+                    : comma - start);
+            item.erase(item.begin(), std::find_if(
+                item.begin(), item.end(), [](unsigned char ch)
+                {
+                    return !std::isspace(ch);
+                }));
+            item.erase(std::find_if(
+                item.rbegin(), item.rend(), [](unsigned char ch)
+                {
+                    return !std::isspace(ch);
+                }).base(), item.end());
+
+            char *end = nullptr;
+            const long parsed = std::strtol(item.c_str(), &end, 10);
+            if (item.empty() || end == item.c_str() || *end != '\0' ||
+                parsed <= 0 ||
+                parsed > std::numeric_limits<int>::max())
+            {
+                throw std::runtime_error(
+                    std::string(kEnvironment) +
+                    " requires a comma-separated list of positive integers; got '" +
+                    item + "'");
+            }
+            const int row_count = static_cast<int>(parsed);
+            if (std::find(rows.begin(), rows.end(), row_count) == rows.end())
+                rows.push_back(row_count);
+
+            if (comma == std::string::npos)
+                break;
+            start = comma + 1;
+        }
+        return rows;
     }
 
     std::shared_ptr<llaminar2::FP32Tensor> makeTensor(
@@ -455,6 +532,19 @@ namespace
         double diff2 = 0.0;
         for (size_t i = 0; i < actual.size(); ++i)
         {
+            const uint32_t actual_bits = std::bit_cast<uint32_t>(actual[i]);
+            const uint32_t expected_bits = std::bit_cast<uint32_t>(expected[i]);
+            if (actual_bits != expected_bits)
+            {
+                if (metrics.bit_mismatch_count == 0)
+                {
+                    metrics.first_bit_mismatch_index = i;
+                    metrics.first_actual_bits = actual_bits;
+                    metrics.first_expected_bits = expected_bits;
+                }
+                ++metrics.bit_mismatch_count;
+            }
+
             const bool actual_finite = std::isfinite(actual[i]);
             const bool expected_finite = std::isfinite(expected[i]);
             if (!actual_finite || !expected_finite)
@@ -541,8 +631,22 @@ namespace
         return metrics;
     }
 
-    void expectClose(const CloseMetrics &metrics)
+    /**
+     * @brief Require exact grouped-versus-serial FP32 output identity.
+     *
+     * Similarity metrics remain in the diagnostic payload because they make a
+     * failure's magnitude immediately visible. They are not acceptance
+     * thresholds: one differing output bit is a verifier correctness failure.
+     */
+    void expectBitwiseEqual(const CloseMetrics &metrics)
     {
+        EXPECT_EQ(metrics.bit_mismatch_count, 0u)
+            << "first_bit_mismatch_index=" << metrics.first_bit_mismatch_index
+            << " actual_bits=0x" << std::hex << metrics.first_actual_bits
+            << " expected_bits=0x" << metrics.first_expected_bits << std::dec
+            << " cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " max_abs=" << metrics.max_abs;
         EXPECT_EQ(metrics.nonfinite_count, 0u)
             << "first_nonfinite_index=" << metrics.first_nonfinite_index
             << " nonfinite_actual=" << metrics.nonfinite_actual_count
@@ -595,7 +699,9 @@ namespace
                    "cosine,relative_l2,max_abs,"
                    "min_row_cosine,max_row_relative_l2,max_row_kl,"
                    "nonfinite_count,nonfinite_actual_count,nonfinite_expected_count,"
-                   "first_nonfinite_index,worst_row\n";
+                   "first_nonfinite_index,bit_mismatch_count,"
+                   "first_bit_mismatch_index,first_actual_bits,first_expected_bits,"
+                   "worst_row\n";
             printed_header = true;
         }
 
@@ -625,6 +731,10 @@ namespace
                   << result.metrics.nonfinite_actual_count << ','
                   << result.metrics.nonfinite_expected_count << ','
                   << result.metrics.first_nonfinite_index << ','
+                  << result.metrics.bit_mismatch_count << ','
+                  << result.metrics.first_bit_mismatch_index << ','
+                  << result.metrics.first_actual_bits << ','
+                  << result.metrics.first_expected_bits << ','
                   << result.metrics.worst_row << '\n';
     }
 
@@ -1237,8 +1347,23 @@ namespace
         const auto hidden_values = makeHiddenValues(rows, d_model);
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        /*
+         * Reproduce the production graph resolver's stable scratch contract.
+         * SharedExpertFFNStage deliberately refuses to manufacture GPU scratch
+         * during execute(): both projection destinations must already own fixed
+         * device addresses before warmup and graph capture begin. Keeping these
+         * tensors alive for the complete benchmark also ensures that replay
+         * measures the production grouped kernels rather than an allocation or
+         * pointer-rebinding setup path.
+         */
+        auto graph_gate_scratch = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(intermediate)});
+        auto graph_up_scratch = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(intermediate)});
         EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
         EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(graph_gate_scratch->ensureOnDevice(device, stream));
+        EXPECT_TRUE(graph_up_scratch->ensureOnDevice(device, stream));
 
         auto make_params = [&](llaminar2::TensorBase *output,
                                bool grouped_verifier)
@@ -1250,6 +1375,8 @@ namespace
             params.up_w = up_w.get();
             params.down_w = down_w.get();
             params.output = output;
+            params.gate_scratch = graph_gate_scratch.get();
+            params.up_scratch = graph_up_scratch.get();
             params.seq_len = rows;
             params.d_model = d_model;
             params.intermediate = intermediate;
@@ -1444,10 +1571,10 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedExpertFFNDecodeEquivalent)
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
-    for (int rows : {1, 2, 3, 4})
+    for (int rows : selectedVerifierRows({1, 2, 3, 4}))
     {
         auto routed = runCudaCase(/*shared=*/false, rows);
-        expectClose(routed.metrics);
+        expectBitwiseEqual(routed.metrics);
         if (rows >= 2)
             expectGraphReplayFasterThanReference(routed);
         printResult(routed);
@@ -1464,10 +1591,10 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M1234_SharedExpertFFNDecodeEquivalent)
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
-    for (int rows : {1, 2, 3, 4})
+    for (int rows : selectedVerifierRows({1, 2, 3, 4}))
     {
         auto shared = runCudaCase(/*shared=*/true, rows);
-        expectClose(shared.metrics);
+        expectBitwiseEqual(shared.metrics);
         if (rows >= 2)
             expectSharedExpertFfnEconomical(shared);
         printResult(shared);
@@ -1485,10 +1612,10 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M234_SharedExpertFFNStageDecodeEquivalent)
 
     ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     const QuantFormatCase &format = sharedExpertPreparedFormatCase("IQ3_S");
-    for (int rows : {2, 3, 4})
+    for (int rows : selectedVerifierRows({2, 3, 4}))
     {
         auto shared = runCudaSharedExpertStageCase(rows, format);
-        expectClose(shared.metrics);
+        expectBitwiseEqual(shared.metrics);
         expectSharedExpertFfnEconomical(shared);
         printResult(shared);
     }
@@ -1511,11 +1638,11 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M234_SharedExpertFFNStageAllCodebooksDecodeE
         if (!envCsvContainsOrUnset("LLAMINAR_MOE_VERIFIER_PREFILL_FORMATS", format.name))
             continue;
         SCOPED_TRACE(format.name);
-        for (int rows : {2, 3, 4})
+        for (int rows : selectedVerifierRows({2, 3, 4}))
         {
             SCOPED_TRACE(rows);
             auto shared = runCudaSharedExpertStageCase(rows, format);
-            expectClose(shared.metrics);
+            expectBitwiseEqual(shared.metrics);
             printResult(shared);
         }
     }
@@ -1546,7 +1673,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4_CombinedRoutedSharedUpperBound)
         /*case_name_override=*/"combined_top9_upper_bound",
         /*unique_routes=*/true,
         /*include_terminal_expert=*/true);
-    expectClose(combined.metrics);
+    expectBitwiseEqual(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
 #endif
@@ -1575,7 +1702,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4M9M31_CombinedTop9AllFormatsDecodeEquivale
     for (const auto &format : llaminar2::test::quantizedVerifierFormats())
     {
         SCOPED_TRACE(format.label);
-        for (const int rows : {4, 9, 31})
+        for (const int rows : selectedVerifierRows({4, 9, 31}))
         {
             SCOPED_TRACE(rows);
             auto combined = runCudaCase(
@@ -1588,7 +1715,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4M9M31_CombinedTop9AllFormatsDecodeEquivale
                 /*include_terminal_expert=*/true,
                 &format,
                 &format);
-            expectClose(combined.metrics);
+            expectBitwiseEqual(combined.metrics);
             expectGraphReplayFasterThanReference(combined);
         }
     }

@@ -62,6 +62,32 @@ namespace llaminar2
     };
 
     /**
+     * @enum RoutedExpertPhasePolicy
+     * @brief Phase-specific execution over physically resident routed experts.
+     *
+     * This axis is deliberately separate from RoutedExpertComputePolicy. A
+     * phase policy may choose which complete resident computes a row, but it
+     * cannot change the physical weight representation promised by the compute
+     * policy. In particular, apportioned prefill plus replicated decode requires
+     * every participant to own every complete expert.
+     */
+    enum class RoutedExpertPhasePolicy : uint8_t
+    {
+        Unspecified = 0, ///< Domain declaration did not state a phase policy.
+
+        /** Use the routed compute policy uniformly in prefill and decode. */
+        Uniform,
+
+        /**
+         * Apportion complete experts across participants for ordinary prefill,
+         * then execute serial decode and grouped verifier rows from each
+         * participant's complete local replica. This preserves LLEP's large-M
+         * work sharing while removing tiny routed collectives from decode.
+         */
+        PrefillApportionedDecodeReplicated,
+    };
+
+    /**
      * @enum RoutedExpertAssignmentPolicy
      * @brief Scheduling policy among residents that hold a complete expert.
      *
@@ -99,6 +125,26 @@ namespace llaminar2
             return "apportioned";
         case RoutedExpertComputePolicy::TensorSharded:
             return "tensor-sharded";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the canonical configuration spelling for a phase policy.
+     * @param policy Typed phase-specific execution policy.
+     * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
+     */
+    inline const char *routedExpertPhasePolicyToString(
+        RoutedExpertPhasePolicy policy)
+    {
+        switch (policy)
+        {
+        case RoutedExpertPhasePolicy::Unspecified:
+            return "unspecified";
+        case RoutedExpertPhasePolicy::Uniform:
+            return "uniform";
+        case RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated:
+            return "prefill-apportioned-decode-replicated";
         }
         return "unknown";
     }
@@ -162,6 +208,22 @@ namespace llaminar2
             return RoutedExpertComputePolicy::Apportioned;
         if (normalized == "tensor-sharded")
             return RoutedExpertComputePolicy::TensorSharded;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Parse a canonical routed-expert phase policy.
+     * @param value CLI or YAML token naming phase-specific execution.
+     * @return Typed policy, or `std::nullopt` for an unknown spelling.
+     */
+    inline std::optional<RoutedExpertPhasePolicy> parseRoutedExpertPhasePolicy(
+        const std::string &value)
+    {
+        const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "uniform")
+            return RoutedExpertPhasePolicy::Uniform;
+        if (normalized == "prefill-apportioned-decode-replicated")
+            return RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
         return std::nullopt;
     }
 

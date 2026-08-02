@@ -99,11 +99,42 @@ namespace llaminar2
                                });
         }
 
+        /**
+         * @brief Return whether every LocalTP participant owns every routed expert.
+         *
+         * Replicated routed compute needs no routed-output collective: each
+         * participant independently produces the complete expert result. The
+         * runtime plan still has to preserve all participants so the graph
+         * builder can bind the correct device-local prepared-weight registry
+         * on every symmetric graph.
+         */
+        bool isLocalTPReplicatedDomain(
+            const MoEOverlayRuntimeDomain &domain)
+        {
+            if (domain.scope != ExecutionDomainScope::LOCAL ||
+                domain.routed_compute_policy !=
+                    RoutedExpertComputePolicy::Replicated ||
+                domain.participants.size() < 2)
+            {
+                return false;
+            }
+
+            return std::all_of(
+                domain.participants.begin(),
+                domain.participants.end(),
+                [](const auto &participant)
+                {
+                    return participant.locally_addressable &&
+                           participant.local_device.is_valid();
+                });
+        }
+
         bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
                    isAcceleratorLocalTPTensorShardedDomain(domain) ||
-                   isLocalTPExpertIdApportionedDomain(domain);
+                   isLocalTPExpertIdApportionedDomain(domain) ||
+                   isLocalTPReplicatedDomain(domain);
         }
 
         std::string sanitizeDomainToken(std::string value)
@@ -150,6 +181,7 @@ namespace llaminar2
             resolved.scope = domain.scope;
             resolved.backend = canonical.backend;
             resolved.routed_compute_policy = domain.routed_compute_policy;
+            resolved.routed_phase_policy = domain.routed_phase_policy;
             resolved.routed_assignment_policy = domain.routed_assignment_policy;
             resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
@@ -325,6 +357,8 @@ namespace llaminar2
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
                 << " routed_compute="
                 << routedExpertComputePolicyToString(domain.routed_compute_policy)
+                << " routed_phase="
+                << routedExpertPhasePolicyToString(domain.routed_phase_policy)
                 << " routed_assignment="
                 << routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)
                 << " participants=" << domain.participants.size()

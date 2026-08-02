@@ -141,6 +141,67 @@ namespace llaminar2::rocm
         int request_count,
         void *stream);
 
+    /**
+     * @brief Pack request-terminal rows using a device-owned padded stride.
+     *
+     * Real lengths and stride are consumed from one event-published geometry
+     * record. A captured HIP launch can therefore replay at any prompt width
+     * within @p seq_capacity without host-authored row metadata or recapture.
+     *
+     * @param input Device pointer to maximum-capacity flattened hidden rows.
+     * @param output Device pointer to compact [request_count, d_model] rows.
+     * @param request_sequence_lengths Device INT32 real-length array.
+     * @param request_row_stride Device INT32 scalar containing current padded width.
+     * @param seq_capacity Maximum flattened source rows available at input.
+     * @param d_model Number of FP32 columns in each hidden row.
+     * @param request_count Fixed captured request count.
+     * @param stream Explicit non-null HIP stream.
+     * @return true when the graph-capturable kernel launch succeeds.
+     */
+    bool launchDeviceGeometryRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int seq_capacity,
+        int d_model,
+        int request_count,
+        void *stream);
+
+    /**
+     * @brief Pack the next shifted-prefill hidden range from canonical KV progress.
+     *
+     * The captured kernel derives the current segment-relative row as
+     * `shifted_count - (main_count - admitted_length)`. Request index and row
+     * count are immutable graph geometry; all progress values remain resident
+     * at stable device addresses across replay.
+     *
+     * @param input Maximum-capacity flattened hidden-state rows.
+     * @param output Compact contiguous hidden rows consumed by the MTP sidecar.
+     * @param main_cached_tokens Canonical main-cache count for @p request_index.
+     * @param shifted_cached_tokens Canonical shifted-MTP count for the request.
+     * @param request_sequence_lengths Resident current-segment lengths.
+     * @param request_row_stride Resident padded request stride.
+     * @param request_index Immutable request row owned by this graph.
+     * @param seq_capacity Flattened hidden-state capacity.
+     * @param d_model FP32 columns per hidden row.
+     * @param selected_row_count Number of consecutive rows to pack.
+     * @param stream Explicit non-null HIP stream.
+     * @return true when the graph-capturable launch succeeds.
+     */
+    bool launchDeviceKVProgressRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int request_index,
+        int seq_capacity,
+        int d_model,
+        int selected_row_count,
+        void *stream);
+
     /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */
     bool launchMTPConcatFP32(
         const float *hidden,

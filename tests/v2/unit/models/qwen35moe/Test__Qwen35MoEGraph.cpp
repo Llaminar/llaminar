@@ -803,6 +803,155 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_ffn"));
 }
 
+TEST(Test__Qwen35MoEGraph, ReplicatedLocalTPOverlayUsesFullLocalExpertGraphWithoutCollective)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    tp_ctx->setBackend(CollectiveBackendType::HOST);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.dense_tp_enabled = false;
+    config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+    config.moe.local_expert_count = -1;
+    config.moe.routed_expert_plan =
+        makeLocalTPApportionedOverlayPlan("replicated_localtp");
+    config.moe.routed_expert_plan->domains[0].routed_compute_policy =
+        RoutedExpertComputePolicy::Replicated;
+    config.moe.expert_overlay_runtime_plan =
+        resolveMoEExpertOverlayRuntimePlan(
+            config.moe.routed_expert_plan,
+            MoEExpertOverlayRuntimeResolverOptions{
+                .current_world_rank = 0,
+                .validate_mvp_root_reachability = false,
+            });
+    config.refreshMoEExecutionPolicy();
+
+    Qwen35MoEGraph graph_builder(config, nullptr);
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/2,
+        config.d_model,
+        config.moe.num_experts,
+        config.moe.top_k);
+
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
+
+    ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
+    EXPECT_EQ(
+        graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
+        nullptr)
+        << "replicated participants already publish complete routed output";
+    EXPECT_EQ(
+        graph.getNode("layer0_moe_canonical_routes_reduce_to_root"),
+        nullptr)
+        << "replicated routed compute must not materialize route collectives";
+    ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_combine",
+        "layer0_moe_expert_ffn_overlay_fast"));
+}
+
+TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifier)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    tp_ctx->setBackend(CollectiveBackendType::HOST);
+
+    GraphConfig prefill_config = makeMoEConfig(tp_ctx.get());
+    prefill_config.dense_tp_enabled = false;
+    prefill_config.moe.routed_compute_policy =
+        RoutedExpertComputePolicy::Replicated;
+    prefill_config.moe.routed_phase_policy =
+        RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+    prefill_config.moe.local_expert_count = -1;
+    prefill_config.moe.routed_expert_plan =
+        makeLocalTPApportionedOverlayPlan("phase_split_localtp");
+    prefill_config.moe.routed_expert_plan->domains[0]
+        .routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+    prefill_config.moe.routed_expert_plan->domains[0]
+        .routed_phase_policy =
+        RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+    prefill_config.moe.expert_overlay_runtime_plan =
+        resolveMoEExpertOverlayRuntimePlan(
+            prefill_config.moe.routed_expert_plan,
+            MoEExpertOverlayRuntimeResolverOptions{
+                .current_world_rank = 0,
+                .validate_mvp_root_reachability = false,
+            });
+    prefill_config.refreshMoEExecutionPolicy();
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto prefill_buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/4,
+        prefill_config.d_model,
+        prefill_config.moe.num_experts,
+        prefill_config.moe.top_k);
+
+    Qwen35MoEGraph prefill_builder(prefill_config, nullptr);
+    ComputeGraph prefill_graph = prefill_builder.buildFFNGraph(
+        layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/4,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
+
+    ASSERT_NE(
+        prefill_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
+        nullptr);
+    ASSERT_NE(
+        prefill_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
+        nullptr)
+        << "ordinary prefill must publish apportioned routed outputs";
+
+    GraphConfig verifier_config = prefill_config;
+    verifier_config.compute_all_position_logits = true;
+    verifier_config.grouped_mtp_verifier = true;
+    auto verifier_buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/4,
+        verifier_config.d_model,
+        verifier_config.moe.num_experts,
+        verifier_config.moe.top_k);
+
+    Qwen35MoEGraph verifier_builder(verifier_config, nullptr);
+    ComputeGraph verifier_graph = verifier_builder.buildFFNGraph(
+        layer,
+        verifier_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/4,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
+
+    ASSERT_NE(
+        verifier_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
+        nullptr);
+    EXPECT_EQ(
+        verifier_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
+        nullptr)
+        << "grouped verifier rows are decode and must use complete local replicas";
+    EXPECT_EQ(
+        verifier_graph.getNode("layer0_moe_canonical_routes_reduce_to_root"),
+        nullptr)
+        << "replicated verifier execution must not emit routed collectives";
+}
+
 TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
 {
     GraphConfig config = makeMoEConfig();

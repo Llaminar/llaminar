@@ -22,6 +22,7 @@
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
 #include "../execution/config/RuntimeConfig.h"
+#include "../execution/mtp/MTPRequestTerminalPublicationGraph.h"
 #include "../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
@@ -227,6 +228,39 @@ namespace llaminar2
          */
         MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
             MTPVerifierOutcomeGraphMode::Disabled;
+
+        /**
+         * @brief Declarative ownership of terminal verifier outcome reduction.
+         *
+         * Architecture config builders set this independently of runtime MTP
+         * enablement.  Runtime graph construction may select a sampling mode,
+         * but it may not invent an ownership topology or silently add a rank
+         * collective.
+         */
+        MTPVerifierOutcomeOwnershipPolicy mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::Unspecified;
+
+        /**
+         * @brief Declarative ownership of request-terminal hidden publication.
+         *
+         * Architecture builders choose this independently of prompt geometry.
+         * The graph/runtime system lowers it into a complete prebuilt graph
+         * family and may not add a prompt-specific runtime graph as a repair.
+         */
+        MTPRequestTerminalHiddenPublicationPolicy
+            mtp_request_terminal_hidden_publication =
+                MTPRequestTerminalHiddenPublicationPolicy::Unspecified;
+
+        /**
+         * @brief Declarative ownership of shifted-prefill hidden-row progress.
+         *
+         * Model graph definitions choose the semantic owner. Reusable graph
+         * machinery lowers that policy into backend stages and event edges;
+         * orchestrator call sites must not manufacture host row cursors.
+         */
+        MTPShiftedPrefillHiddenPublicationPolicy
+            mtp_shifted_prefill_hidden_publication =
+                MTPShiftedPrefillHiddenPublicationPolicy::Unspecified;
 
         /**
          * @brief Stable arena addresses used by the terminal outcome stage.
@@ -546,6 +580,10 @@ namespace llaminar2
             RoutedExpertComputePolicy routed_compute_policy =
                 RoutedExpertComputePolicy::Apportioned;
 
+            /// Phase-specific scheduling over complete routed-expert residents.
+            RoutedExpertPhasePolicy routed_phase_policy =
+                RoutedExpertPhasePolicy::Uniform;
+
             /// Explicit semantic policy for assigning router-selected rows to
             /// participants that can execute the selected routed expert.
             RoutedExpertAssignmentPolicy routed_assignment_policy =
@@ -619,7 +657,8 @@ namespace llaminar2
             moe.execution_policy = makeMoEExecutionPolicy(
                 dense_parallel_policy,
                 moe.routed_compute_policy,
-                moe.routed_assignment_policy);
+                moe.routed_assignment_policy,
+                moe.routed_phase_policy);
             moe.expert_replica_policy =
                 expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);
         }

@@ -175,7 +175,9 @@ namespace llaminar2
         if (params_.device_row_index_source ==
                 DeviceRowIndexSource::RequestTerminalLengths ||
             params_.device_row_index_source ==
-                DeviceRowIndexSource::FixedContiguousRange)
+                DeviceRowIndexSource::FixedContiguousRange ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillKVProgress)
         {
             /*
              * Request-terminal mode reads current resident lengths. Fixed-range
@@ -209,19 +211,34 @@ namespace llaminar2
             params_.device_row_index_source ==
                 DeviceRowIndexSource::RequestTerminalLengths)
         {
+            const bool static_geometry =
+                params_.request_row_stride_source ==
+                RequestRowStrideSource::StaticGraphGeometry;
+            const bool device_geometry =
+                params_.request_row_stride_source ==
+                RequestRowStrideSource::ExternalDeviceScalar;
             const bool valid_request_geometry =
                 params_.request_sequence_lengths_device != nullptr &&
-                params_.request_row_stride > 0 &&
-                selected_row_count_ * params_.request_row_stride ==
-                    params_.seq_len;
+                ((static_geometry &&
+                  params_.request_row_stride > 0 &&
+                  selected_row_count_ * params_.request_row_stride ==
+                      params_.seq_len &&
+                  params_.request_row_stride_device == nullptr) ||
+                 (device_geometry &&
+                  params_.request_row_stride == 0 &&
+                  params_.request_row_stride_device != nullptr &&
+                  selected_row_count_ <= params_.seq_len));
             if (!valid_request_geometry)
             {
                 LOG_ERROR("[HiddenStateRowsSelectStage] Request-terminal row selection requires "
-                          << "resident lengths and exact flattened geometry: seq_len="
+                          << "one unambiguous resident geometry owner: seq_len="
                           << params_.seq_len
                           << " request_count=" << selected_row_count_
                           << " request_row_stride=" << params_.request_row_stride
-                          << " lengths=" << params_.request_sequence_lengths_device);
+                          << " lengths=" << params_.request_sequence_lengths_device
+                          << " stride_device=" << params_.request_row_stride_device
+                          << " stride_source="
+                          << (static_geometry ? "static_graph" : "external_device"));
                 return false;
             }
         }
@@ -239,6 +256,33 @@ namespace llaminar2
                           << params_.fixed_contiguous_row_start
                           << " count=" << selected_row_count_
                           << " seq_len=" << params_.seq_len);
+                return false;
+            }
+        }
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillKVProgress)
+        {
+            const bool valid_progress_binding =
+                params_.request_sequence_lengths_device != nullptr &&
+                params_.request_row_stride_source ==
+                    RequestRowStrideSource::ExternalDeviceScalar &&
+                params_.request_row_stride == 0 &&
+                params_.request_row_stride_device != nullptr &&
+                params_.main_cached_tokens_device != nullptr &&
+                params_.shifted_cached_tokens_device != nullptr &&
+                params_.request_index >= 0 &&
+                selected_row_count_ <= params_.seq_len;
+            if (!valid_progress_binding)
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill row selection requires canonical device KV progress and resident request geometry: request="
+                          << params_.request_index
+                          << " rows=" << selected_row_count_
+                          << " seq_capacity=" << params_.seq_len
+                          << " main_count=" << params_.main_cached_tokens_device
+                          << " shifted_count=" << params_.shifted_cached_tokens_device
+                          << " lengths=" << params_.request_sequence_lengths_device
+                          << " stride=" << params_.request_row_stride_device);
                 return false;
             }
         }
@@ -327,7 +371,9 @@ namespace llaminar2
     bool HiddenStateRowsSelectStage::ensureGpuParamStateInitialized()
     {
         if (params_.device_row_index_source ==
-            DeviceRowIndexSource::RequestTerminalLengths)
+                DeviceRowIndexSource::RequestTerminalLengths ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillKVProgress)
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Request-terminal row selection must not bind a row-index workspace");
             return false;
@@ -416,7 +462,9 @@ namespace llaminar2
     bool HiddenStateRowsSelectStage::uploadGpuSelectedRows()
     {
         if (params_.device_row_index_source ==
-            DeviceRowIndexSource::RequestTerminalLengths)
+                DeviceRowIndexSource::RequestTerminalLengths ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillKVProgress)
         {
             return true;
         }
@@ -481,10 +529,18 @@ namespace llaminar2
         const bool request_terminal_rows =
             params_.device_row_index_source ==
             DeviceRowIndexSource::RequestTerminalLengths;
+        const bool device_request_geometry =
+            request_terminal_rows &&
+            params_.request_row_stride_source ==
+                RequestRowStrideSource::ExternalDeviceScalar;
         const bool fixed_contiguous_rows =
             params_.device_row_index_source ==
             DeviceRowIndexSource::FixedContiguousRange;
+        const bool shifted_prefill_progress =
+            params_.device_row_index_source ==
+            DeviceRowIndexSource::ShiftedPrefillKVProgress;
         if (!request_terminal_rows && !fixed_contiguous_rows &&
+            !shifted_prefill_progress &&
             !ensureGpuParamStateInitialized())
             return false;
 
@@ -514,6 +570,7 @@ namespace llaminar2
         }
 
         if (!request_terminal_rows && !fixed_contiguous_rows &&
+            !shifted_prefill_progress &&
             !uploadGpuSelectedRows())
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Failed to update GPU selected-row array");
@@ -524,17 +581,42 @@ namespace llaminar2
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            if (request_terminal_rows)
+            if (shifted_prefill_progress)
             {
-                launched = cuda::launchRequestTerminalRowsSelectFP32(
+                launched = cuda::launchDeviceKVProgressRowsSelectFP32(
                     input_device,
                     output_device,
+                    params_.main_cached_tokens_device,
+                    params_.shifted_cached_tokens_device,
                     params_.request_sequence_lengths_device,
+                    params_.request_row_stride_device,
+                    params_.request_index,
                     params_.seq_len,
-                    params_.request_row_stride,
                     params_.d_model,
                     selected_row_count_,
                     gpuStream());
+            }
+            else if (request_terminal_rows)
+            {
+                launched = device_request_geometry
+                               ? cuda::launchDeviceGeometryRequestTerminalRowsSelectFP32(
+                                     input_device,
+                                     output_device,
+                                     params_.request_sequence_lengths_device,
+                                     params_.request_row_stride_device,
+                                     params_.seq_len,
+                                     params_.d_model,
+                                     selected_row_count_,
+                                     gpuStream())
+                               : cuda::launchRequestTerminalRowsSelectFP32(
+                                     input_device,
+                                     output_device,
+                                     params_.request_sequence_lengths_device,
+                                     params_.seq_len,
+                                     params_.request_row_stride,
+                                     params_.d_model,
+                                     selected_row_count_,
+                                     gpuStream());
             }
             else if (fixed_contiguous_rows)
             {
@@ -563,17 +645,42 @@ namespace llaminar2
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            if (request_terminal_rows)
+            if (shifted_prefill_progress)
             {
-                launched = rocm::launchRequestTerminalRowsSelectFP32(
+                launched = rocm::launchDeviceKVProgressRowsSelectFP32(
                     input_device,
                     output_device,
+                    params_.main_cached_tokens_device,
+                    params_.shifted_cached_tokens_device,
                     params_.request_sequence_lengths_device,
+                    params_.request_row_stride_device,
+                    params_.request_index,
                     params_.seq_len,
-                    params_.request_row_stride,
                     params_.d_model,
                     selected_row_count_,
                     gpuStream());
+            }
+            else if (request_terminal_rows)
+            {
+                launched = device_request_geometry
+                               ? rocm::launchDeviceGeometryRequestTerminalRowsSelectFP32(
+                                     input_device,
+                                     output_device,
+                                     params_.request_sequence_lengths_device,
+                                     params_.request_row_stride_device,
+                                     params_.seq_len,
+                                     params_.d_model,
+                                     selected_row_count_,
+                                     gpuStream())
+                               : rocm::launchRequestTerminalRowsSelectFP32(
+                                     input_device,
+                                     output_device,
+                                     params_.request_sequence_lengths_device,
+                                     params_.seq_len,
+                                     params_.request_row_stride,
+                                     params_.d_model,
+                                     selected_row_count_,
+                                     gpuStream());
             }
             else if (fixed_contiguous_rows)
             {

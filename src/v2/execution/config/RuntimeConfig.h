@@ -811,7 +811,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Explicit composite of the three independent MoE execution axes.
+     * @brief Explicit composite of the four independent MoE execution axes.
      *
      * This is a value object rather than a combinatorial enum.  Callers can
      * inspect each policy directly, so adding a dense policy cannot accidentally
@@ -826,6 +826,10 @@ namespace llaminar2
         RoutedExpertComputePolicy routed_compute =
             RoutedExpertComputePolicy::Apportioned;
 
+        ///< Phase-specific scheduling over physically resident routed experts.
+        RoutedExpertPhasePolicy routed_phase =
+            RoutedExpertPhasePolicy::Uniform;
+
         ///< Scheduling among eligible complete routed-expert residents.
         RoutedExpertAssignmentPolicy routed_assignment =
             RoutedExpertAssignmentPolicy::StaticOwner;
@@ -835,6 +839,7 @@ namespace llaminar2
         {
             return dense == other.dense &&
                    routed_compute == other.routed_compute &&
+                   routed_phase == other.routed_phase &&
                    routed_assignment == other.routed_assignment;
         }
 
@@ -947,11 +952,14 @@ namespace llaminar2
         DenseParallelPolicy dense_policy,
         RoutedExpertComputePolicy routed_compute,
         RoutedExpertAssignmentPolicy routed_assignment =
-            RoutedExpertAssignmentPolicy::StaticOwner)
+            RoutedExpertAssignmentPolicy::StaticOwner,
+        RoutedExpertPhasePolicy routed_phase =
+            RoutedExpertPhasePolicy::Uniform)
     {
         return MoEExecutionPolicy{
             .dense = dense_policy,
             .routed_compute = routed_compute,
+            .routed_phase = routed_phase,
             .routed_assignment = routed_assignment,
         };
     }
@@ -959,7 +967,7 @@ namespace llaminar2
     /**
      * @brief Render every MoE execution axis for logs and diagnostics.
      * @param policy Explicit policy value object to describe.
-     * @return Comma-separated canonical key/value pairs for all three axes.
+     * @return Comma-separated canonical key/value pairs for all four axes.
      */
     inline std::string describeMoEExecutionPolicy(const MoEExecutionPolicy &policy)
     {
@@ -967,6 +975,8 @@ namespace llaminar2
         out << "dense=" << denseParallelPolicyToString(policy.dense)
             << ",routed_compute="
             << routedExpertComputePolicyToString(policy.routed_compute)
+            << ",routed_phase="
+            << routedExpertPhasePolicyToString(policy.routed_phase)
             << ",routed_assignment="
             << routedExpertAssignmentPolicyToString(policy.routed_assignment);
         return out.str();

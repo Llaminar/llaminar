@@ -389,8 +389,8 @@ namespace llaminar2
         int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
         int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
         int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
-        int cuda_moe_gateup_kparts = 16;          ///< K partitions for the mandatory decode-equivalent grouped MoE gate/up CUDA path (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
-        int cuda_moe_down_kparts = 16;            ///< K partitions for the mandatory decode-equivalent grouped MoE SwiGLU down CUDA path (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
+        int cuda_moe_gateup_kparts = 16;          ///< K partitions for the mandatory decode-equivalent grouped MoE gate/up CUDA path (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, proven default 16)
+        int cuda_moe_down_kparts = 16;            ///< K partitions for the mandatory decode-equivalent grouped MoE SwiGLU down CUDA path (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, proven default 16)
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -530,7 +530,11 @@ namespace llaminar2
 
             // CUDA grouped MoE gate/up split-K partition count. The ordered
             // K-part path is mandatory because verifier batches must execute
-            // the same reduction tree as serial decode.
+            // the same reduction tree as serial decode. The production-model
+            // stochastic A/B gate is part of this proof: changing partition
+            // geometry must not change even one generated token. Keep the
+            // proven geometry until a candidate passes that gate in addition
+            // to the all-format grouped-kernel sweep.
             cuda_moe_gateup_kparts = 16;
             const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPARTS");
             if (moe_gateup_kparts_env)
@@ -544,7 +548,9 @@ namespace llaminar2
             }
             // CUDA grouped MoE SwiGLU down split-K partition count. The
             // ordered reduction is deterministic and remains enabled in
-            // LLAMINAR_DETERMINISTIC mode.
+            // LLAMINAR_DETERMINISTIC mode. As with gate/up, partition-count
+            // promotion requires byte equality at production model geometry;
+            // relaxed kernel similarity is not a sufficient MTP contract.
             cuda_moe_down_kparts = 16;
             const char *moe_down_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPARTS");
             if (moe_down_kparts_env)

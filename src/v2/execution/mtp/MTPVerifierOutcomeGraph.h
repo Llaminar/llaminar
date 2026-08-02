@@ -3,10 +3,11 @@
  * @brief Typed policy and stable device bindings for graph-owned MTP outcomes.
  *
  * A grouped verifier forward does not end when the LM head writes logits.  The
- * complete GPU transaction also selects verifier tokens, reduces the accepted
- * prefix into a compact outcome, and, for mirrored LocalTP execution, publishes
- * that one canonical outcome to every participant.  This header describes that
- * transaction without depending on a particular model graph.
+ * complete GPU transaction also selects verifier tokens and reduces the
+ * accepted prefix into a compact outcome.  In mirrored LocalTP execution every
+ * participant performs that same terminal transaction against its own
+ * byte-identical full-vocabulary logits.  This header describes both the
+ * operation and its ownership without depending on a particular model graph.
  *
  * All pointers in MTPVerifierOutcomeGraphBinding refer to persistent arena
  * storage.  They are installed before any graph is built and remain stable for
@@ -56,6 +57,31 @@ namespace llaminar2
         Greedy = 1,
         StochasticSerialEquivalent = 2,
         StochasticRejection = 3,
+    };
+
+    /**
+     * @brief Declarative owner of graph-captured verifier outcome reduction.
+     *
+     * The policy is deliberately independent of the sampling mode.  A model
+     * graph declares where terminal reduction lives, while reusable graph
+     * machinery wires the corresponding kernels and event publication.  This
+     * prevents topology-sensitive collectives from being inferred deep inside
+     * a compute stage.
+     */
+    enum class MTPVerifierOutcomeOwnershipPolicy : uint8_t
+    {
+        /** No ownership contract was declared; graph construction must fail. */
+        Unspecified = 0,
+
+        /**
+         * Every graph participant owns and publishes its local compact result.
+         *
+         * SingleDevice naturally has one owner.  Mirrored LocalTP requires a
+         * full-vocabulary, byte-identical head on every participant; each child
+         * runs identical reduction math and publishes readiness on its exact
+         * graph stream.  No rank outcome broadcast is part of this policy.
+         */
+        ParticipantLocal = 1,
     };
 
     /**

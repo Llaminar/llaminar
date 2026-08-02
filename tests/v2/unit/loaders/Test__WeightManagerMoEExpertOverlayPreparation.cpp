@@ -295,6 +295,32 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsByOverlayRan
     EXPECT_EQ(worker_filtered.diagnostics().render().find("AcceleratorRoutedExpert"), std::string::npos);
 }
 
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsToOneGraphParticipantDevice)
+{
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(threeTierPlan({
+        RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2, 0, 1, 2}},
+    }));
+    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    const auto rank_wide = MoEExpertOverlayPreparationPlan::build(*runtime_plan, 2048);
+
+    const auto rocm0 = rank_wide.filteredForDevice(DeviceId::rocm(0));
+    EXPECT_TRUE(rocm0.hasAcceleratorRequests());
+    EXPECT_EQ(rocm0.acceleratorDevices(),
+              (std::vector<DeviceId>{DeviceId::rocm(0)}));
+    EXPECT_TRUE(rocm0.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::GATE));
+    EXPECT_FALSE(rocm0.shouldPrepare(DeviceId::rocm(1), 0, 4, Role::GATE));
+    EXPECT_FALSE(rocm0.shouldPrepare(DeviceId::cuda(0), 0, 0, Role::GATE));
+    EXPECT_FALSE(rocm0.hasCpuRoutedAssignments());
+    ASSERT_EQ(rocm0.diagnostics().domains.size(), 1u);
+    EXPECT_EQ(rocm0.diagnostics().domains.front().device, DeviceId::rocm(0));
+
+    const auto cpu = rank_wide.filteredForDevice(DeviceId::cpu());
+    EXPECT_FALSE(cpu.hasAcceleratorRequests());
+    EXPECT_TRUE(cpu.hasCpuRoutedAssignments());
+    EXPECT_TRUE(cpu.shouldPrepare(DeviceId::cpu(), 0, 2, Role::DOWN));
+    EXPECT_FALSE(cpu.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::DOWN));
+}
+
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, SmallModelBudgetKeepsCudaPartialUnlessUncapped)
 {
     MoERoutedExpertPlacementPlan capped;
@@ -399,6 +425,29 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, KeepsSameDeviceDomainsSepar
               (std::vector<std::string>{"cuda_fast", "cuda_warm"}));
 }
 
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, AcceleratorPreparationRejectsMutableCacheSource)
+{
+    /**
+     * A LocalTP runner freezes the exact weight slice or replica that its graph
+     * owns. Accelerator overlay preparation must use that immutable identity;
+     * accepting a null frozen set would silently return to WeightManager's
+     * process-wide cache, where a different participant's expert slice may live.
+     * This regression stops before touching CUDA, so it remains a true unit test.
+     */
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(threeTierPlan({
+        RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2}},
+    }));
+    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    ASSERT_TRUE(MoEExpertOverlayPreparationPlan::build(*runtime_plan, 128)
+                    .hasAcceleratorRequests());
+
+    auto loader = MockModelLoader::createMinimal();
+    WeightManager manager(*loader);
+
+    EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cuda(0)));
+}
+
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuFallbackExpertsIntoRegistry)
 {
     auto loader = MockModelLoader::createMinimal();
@@ -415,7 +464,8 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuFallbackExpertsI
     auto plan = singleLayerCpuColdReplicatedPlan(num_experts);
 
     auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
-    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime_plan));
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
 
     std::vector<ITensorGemm *> gate;
     std::vector<ITensorGemm *> up;
@@ -453,7 +503,8 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsW
 
     auto plan = singleLayerCpuColdReplicatedPlan(num_experts);
     auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
-    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime_plan));
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
 
     std::vector<ITensorGemm *> gate;
     std::vector<ITensorGemm *> up;

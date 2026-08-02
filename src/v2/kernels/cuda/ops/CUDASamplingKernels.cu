@@ -4296,7 +4296,7 @@ __global__ void cuda_prepare_mtp_batched_sidecar_inputs_kernel(
 }
 
 /**
- * @brief Expand canonical request positions into a grouped verifier matrix.
+ * @brief Publish all dynamic grouped-verifier geometry from device-owned rows.
  *
  * Each request owns one device-resident next-position scalar in its KV cache.
  * Grouped verification needs one absolute position per physical graph row. A
@@ -4305,24 +4305,45 @@ __global__ void cuda_prepare_mtp_batched_sidecar_inputs_kernel(
  *
  * `position[request, token] = live_kv_count[request] + token`.
  *
- * Padded columns are populated as well. Attention and stateful stages mask those
- * columns with the request's real sequence length, while keeping the position
- * buffer's physical geometry identical to the captured verifier graph.
+ * Padded columns are populated as well. The first @p request_count threads also
+ * publish each request's valid width. Rectangular graphs need no row-index
+ * input; ragged graphs count their already-published physical verifier rows.
+ * Thus position and recurrent-state masks become visible in one ordered launch,
+ * with no host length mirror or second metadata transfer.
  */
-__global__ void cuda_prepare_mtp_verifier_position_ids_kernel(
+__global__ void cuda_prepare_mtp_verifier_geometry_kernel(
     const int32_t *__restrict__ base_positions,
+    const int32_t *__restrict__ valid_graph_rows,
+    int valid_graph_row_count,
     int request_count,
     int padded_seq_len,
-    int32_t *__restrict__ out_position_ids)
+    int32_t *__restrict__ out_position_ids,
+    int32_t *__restrict__ out_request_lengths)
 {
     const int flat_row = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_rows = request_count * padded_seq_len;
-    if (flat_row >= total_rows)
-        return;
+    if (flat_row < total_rows)
+    {
+        const int request = flat_row / padded_seq_len;
+        const int token = flat_row - request * padded_seq_len;
+        out_position_ids[flat_row] = base_positions[request] + token;
+    }
 
-    const int request = flat_row / padded_seq_len;
-    const int token = flat_row - request * padded_seq_len;
-    out_position_ids[flat_row] = base_positions[request] + token;
+    if (out_request_lengths && flat_row < request_count)
+    {
+        int valid_tokens = padded_seq_len;
+        if (valid_graph_rows)
+        {
+            valid_tokens = 0;
+            for (int row = 0; row < valid_graph_row_count; ++row)
+            {
+                const int physical_row = valid_graph_rows[row];
+                valid_tokens +=
+                    physical_row / padded_seq_len == flat_row ? 1 : 0;
+            }
+        }
+        out_request_lengths[flat_row] = valid_tokens;
+    }
 }
 
 /**
@@ -6800,9 +6821,7 @@ extern "C"
         return true;
     }
 
-    /**
-     * @brief Enqueue device-resident grouped-verifier position expansion.
-     */
+    /** @brief Enqueue the position-only scalar/rectangular compatibility form. */
     bool cudaOps_prepare_mtp_verifier_position_ids(
         const int32_t *base_positions,
         int request_count,
@@ -6825,21 +6844,77 @@ extern "C"
         const int total_rows = request_count * padded_seq_len;
         const int blocks =
             (total_rows + threads_per_block - 1) / threads_per_block;
-        cuda_prepare_mtp_verifier_position_ids_kernel<<<
+        cuda_prepare_mtp_verifier_geometry_kernel<<<
             blocks,
             threads_per_block,
             0,
             static_cast<cudaStream_t>(stream)>>>(
             base_positions,
+            /*valid_graph_rows=*/nullptr,
+            /*valid_graph_row_count=*/0,
             request_count,
             padded_seq_len,
-            out_position_ids);
+            out_position_ids,
+            /*out_request_lengths=*/nullptr);
 
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr,
                     "CUDA grouped MTP verifier position preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue one device-resident grouped-verifier geometry publication.
+     */
+    bool cudaOps_prepare_mtp_verifier_geometry(
+        const int32_t *base_positions,
+        const int32_t *valid_graph_rows,
+        int valid_graph_row_count,
+        int request_count,
+        int padded_seq_len,
+        int32_t *out_position_ids,
+        int32_t *out_request_lengths,
+        int device_idx,
+        void *stream)
+    {
+        const int total_rows = request_count * padded_seq_len;
+        const bool rectangular = valid_graph_rows == nullptr;
+        if (!base_positions || request_count <= 0 || padded_seq_len <= 0 ||
+            !out_position_ids || !out_request_lengths || !stream ||
+            (rectangular && valid_graph_row_count != total_rows) ||
+            (!rectangular &&
+             (valid_graph_row_count <= 0 || valid_graph_row_count > total_rows)))
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 128;
+        const int blocks =
+            (total_rows + threads_per_block - 1) / threads_per_block;
+        cuda_prepare_mtp_verifier_geometry_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            base_positions,
+            valid_graph_rows,
+            valid_graph_row_count,
+            request_count,
+            padded_seq_len,
+            out_position_ids,
+            out_request_lengths);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA grouped MTP verifier geometry preparation failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

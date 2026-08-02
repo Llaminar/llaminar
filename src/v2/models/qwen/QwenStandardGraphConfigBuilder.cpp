@@ -120,6 +120,23 @@ namespace llaminar2
         config.d_ff = model_config.intermediate_size;
         config.vocab_size = model_config.vocab_size;
 
+        // Qwen verifier heads are complete local sampling surfaces.  LocalTP
+        // mirrors the full head, so every participant owns the same terminal
+        // reduction and publishes it without a tiny rank collective.
+        config.mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+
+        // Qwen prefill publishes one terminal hidden row per request from a
+        // single device-owned geometry record. The graph system builds the
+        // legal request-count family; prompt width remains replay data rather
+        // than graph topology.
+        config.mtp_request_terminal_hidden_publication =
+            MTPRequestTerminalHiddenPublicationPolicy::
+                GraphCapturedDeviceGeometry;
+        config.mtp_shifted_prefill_hidden_publication =
+            MTPShiftedPrefillHiddenPublicationPolicy::
+                GraphCapturedDeviceKVProgress;
+
         // Precision settings: use defaults from GraphConfig
         // (ModelConfig doesn't carry rms_norm_eps/rope_theta)
         // config.rms_norm_eps = 1e-6f;  // default
@@ -365,6 +382,18 @@ namespace llaminar2
         config.n_heads = ctx.headCount();
         config.n_kv_heads = ctx.headCountKV();
         config.vocab_size = ctx.vocabSize();
+
+        // Keep terminal MTP ownership architecture-declarative. Runtime code
+        // chooses the sampling mode only; Qwen graph machinery always lowers
+        // verifier outcomes as participant-local complete transactions.
+        config.mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+        config.mtp_request_terminal_hidden_publication =
+            MTPRequestTerminalHiddenPublicationPolicy::
+                GraphCapturedDeviceGeometry;
+        config.mtp_shifted_prefill_hidden_publication =
+            MTPShiftedPrefillHiddenPublicationPolicy::
+                GraphCapturedDeviceKVProgress;
 
         // head_dim: prefer explicit key_length, fall back to d_model / n_heads
         config.head_dim = ctx.keyLength() > 0

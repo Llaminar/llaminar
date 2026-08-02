@@ -287,6 +287,91 @@ TEST(Test__WeightManagerMaterialize, TiedAliasTPSliceHintPreservesMaterializedSl
     EXPECT_TRUE(binding.slice.inner_is_presliced);
 }
 
+/**
+ * @brief Replicated routed experts must bypass only the expert-axis TP slice.
+ *
+ * LocalTP normally apportions a three-dimensional routed-expert tensor along
+ * its expert axis. A graph whose routed compute policy is Replicated instead
+ * needs the complete source tensor on every participant. This regression
+ * exercises both materialization contracts against the same loader geometry
+ * so a future weight-plan or cache change cannot quietly turn a replicated
+ * participant back into a half-expert owner.
+ */
+TEST(Test__WeightManagerMaterialize,
+     ReplicatedExpertRequirementKeepsCompleteExpertAxis)
+{
+    constexpr const char *kExpertWeight =
+        "blk.0.ffn_gate_exps.weight";
+    constexpr size_t kExpertCount = 8;
+
+    auto make_manager = [&]()
+    {
+        auto loader = MockModelLoaderBuilder()
+                          .addFP32RandomTensor(
+                              kExpertWeight,
+                              {4, 3, kExpertCount})
+                          .build();
+        auto manager = std::make_unique<WeightManager>(
+            *loader,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::SHARDED,
+            WeightPrecision::NATIVE);
+
+        WeightShardingConfig sharding;
+        sharding.exact_matches[kExpertWeight] =
+            WeightShardingMode::ExpertIdApportioned;
+        manager->setWeightShardingConfig(sharding);
+        manager->setTensorParallelConfig(
+            std::make_shared<TensorParallelConfig>(
+                TensorParallelConfig::equalSplit(
+                    2,
+                    4,
+                    4,
+                    64,
+                    128,
+                    std::vector<DeviceId>{
+                        DeviceId::cuda(0),
+                        DeviceId::cuda(1)})));
+        return std::pair{std::move(loader), std::move(manager)};
+    };
+
+    auto materialize = [&](bool bypass_tensor_parallel)
+    {
+        auto [loader, manager] = make_manager();
+
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::LocalTP;
+        strategy.model_id = ModelContextId{
+            bypass_tensor_parallel ? uint64_t{202} : uint64_t{201}};
+        strategy.tp_degree = 2;
+        strategy.devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+
+        WeightPlan plan(strategy);
+        WeightRequirement requirement;
+        requirement.canonical_name = kExpertWeight;
+        requirement.target_device = DeviceId::cuda(1);
+        requirement.lookup_device = DeviceId::cuda(1);
+        requirement.tp_domain = 0;
+        requirement.tp_rank_or_device_index = 1;
+        requirement.bypass_tensor_parallel = bypass_tensor_parallel;
+        plan.add(requirement);
+
+        auto frozen = manager->materialize(plan);
+        const auto &binding = frozen.layer(0, "ffn_gate_exps.weight");
+        EXPECT_NE(binding.tensor, nullptr);
+        return binding.tensor ? binding.tensor->shape() : std::vector<size_t>{};
+    };
+
+    const auto apportioned_shape = materialize(false);
+    ASSERT_EQ(apportioned_shape.size(), 3u);
+    EXPECT_EQ(apportioned_shape[2], kExpertCount / 2);
+
+    const auto replicated_shape = materialize(true);
+    ASSERT_EQ(replicated_shape.size(), 3u);
+    EXPECT_EQ(replicated_shape[2], kExpertCount);
+}
+
 TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
 {
     auto loader = MockModelLoaderBuilder()

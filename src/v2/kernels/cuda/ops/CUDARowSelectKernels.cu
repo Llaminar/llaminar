@@ -120,6 +120,138 @@ namespace llaminar2::cuda
             }
         }
 
+        /**
+         * @brief Device-geometry variant used by prompt-width-total graphs.
+         *
+         * The stride scalar shares the request-admission publication with the
+         * length row. One cooperative load per block avoids redundant global
+         * traffic while preserving a fixed launch geometry for graph replay.
+         */
+        __global__ void deviceGeometryRequestTerminalRowsSelectFP32Kernel(
+            const float *__restrict__ input,
+            float *__restrict__ output,
+            const int32_t *__restrict__ request_sequence_lengths,
+            const int32_t *__restrict__ request_row_stride_device,
+            int seq_capacity,
+            int d_model,
+            int request_count)
+        {
+            __shared__ int request_row_stride;
+            if (threadIdx.x == 0)
+                request_row_stride = *request_row_stride_device;
+            __syncthreads();
+
+            const int total = request_count * d_model;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int grid_stride = blockDim.x * gridDim.x;
+            for (int idx = thread_index; idx < total; idx += grid_stride)
+            {
+                const int request = idx / d_model;
+                const int column = idx - request * d_model;
+                const int maximum_row_stride =
+                    seq_capacity / request_count;
+                const int bounded_row_stride =
+                    request_row_stride < 1
+                        ? 1
+                        : (request_row_stride > maximum_row_stride
+                               ? maximum_row_stride
+                               : request_row_stride);
+                const int raw_length = request_sequence_lengths[request];
+                const int request_length = raw_length < 1
+                                               ? 1
+                                               : (raw_length > bounded_row_stride
+                                                      ? bounded_row_stride
+                                                      : raw_length);
+                const int raw_source_row =
+                    request * bounded_row_stride + request_length - 1;
+                const int source_row = raw_source_row < seq_capacity
+                                           ? raw_source_row
+                                           : seq_capacity - 1;
+                const size_t source_offset =
+                    static_cast<size_t>(source_row) *
+                        static_cast<size_t>(d_model) +
+                    static_cast<size_t>(column);
+                output[static_cast<size_t>(idx)] = input[source_offset];
+            }
+        }
+
+        /**
+         * @brief Copy the next shifted-prefill range named by live KV progress.
+         *
+         * Main KV has already consumed the complete current request segment.
+         * Subtracting its admitted segment length recovers that segment's
+         * absolute base. Shifted KV advances after each sidecar replay, so its
+         * canonical count identifies the next unconsumed hidden row. This
+         * arithmetic is deliberately inside the captured kernel: the host never
+         * owns or uploads a replay cursor.
+         */
+        __global__ void deviceKVProgressRowsSelectFP32Kernel(
+            const float *__restrict__ input,
+            float *__restrict__ output,
+            const int32_t *__restrict__ main_cached_tokens,
+            const int32_t *__restrict__ shifted_cached_tokens,
+            const int32_t *__restrict__ request_sequence_lengths,
+            const int32_t *__restrict__ request_row_stride_device,
+            int request_index,
+            int seq_capacity,
+            int d_model,
+            int selected_row_count)
+        {
+            __shared__ int source_row_start;
+            __shared__ int progress_valid;
+            if (threadIdx.x == 0)
+            {
+                const int request_row_stride = *request_row_stride_device;
+                const int request_length =
+                    request_sequence_lengths[request_index];
+                const int main_count = *main_cached_tokens;
+                const int shifted_count = *shifted_cached_tokens;
+                const int segment_base = main_count - request_length;
+                const int segment_row = shifted_count - segment_base;
+                const int request_base = request_index * request_row_stride;
+
+                progress_valid =
+                    request_row_stride > 0 &&
+                    request_length > 0 &&
+                    request_length <= request_row_stride &&
+                    segment_base >= 0 &&
+                    segment_row >= 0 &&
+                    selected_row_count <= request_length - segment_row &&
+                    request_base >= 0 &&
+                    request_base <= seq_capacity - selected_row_count &&
+                    segment_row <=
+                        seq_capacity - request_base - selected_row_count;
+                source_row_start = request_base + segment_row;
+            }
+            __syncthreads();
+
+            const int total = selected_row_count * d_model;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int grid_stride = blockDim.x * gridDim.x;
+            for (int idx = thread_index; idx < total; idx += grid_stride)
+            {
+                if (!progress_valid)
+                {
+                    /*
+                     * Invalid canonical state is poisoned, never clamped into
+                     * a plausible row. The downstream exactness gate therefore
+                     * fails loudly without granting malformed metadata an OOB
+                     * access or silently turning it into a fallback selection.
+                     */
+                    output[static_cast<size_t>(idx)] =
+                        __int_as_float(0x7fc00000);
+                    continue;
+                }
+                const int output_row = idx / d_model;
+                const int column = idx - output_row * d_model;
+                const size_t source_offset =
+                    static_cast<size_t>(source_row_start + output_row) *
+                        static_cast<size_t>(d_model) +
+                    static_cast<size_t>(column);
+                output[static_cast<size_t>(idx)] = input[source_offset];
+            }
+        }
+
         /// @brief Concatenate two [rows, hidden_dim] matrices row-wise as [embedding, hidden].
         __global__ void mtpConcatFP32Kernel(
             const float *__restrict__ hidden,
@@ -406,6 +538,138 @@ namespace llaminar2::cuda
                 << " request_row_stride=" << request_row_stride
                 << " d_model=" << d_model
                 << " request_count=" << request_count);
+            return false;
+        }
+        return true;
+    }
+
+    bool launchDeviceGeometryRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int seq_capacity,
+        int d_model,
+        int request_count,
+        void *stream)
+    {
+        if (!input || !output || !request_sequence_lengths ||
+            !request_row_stride || !stream || seq_capacity <= 0 ||
+            d_model <= 0 || request_count <= 0 ||
+            request_count > seq_capacity)
+        {
+            LOG_ERROR(
+                "[CUDARowSelectKernels] Device-geometry request-terminal "
+                "selection rejected an incomplete launch contract"
+                << " input=" << static_cast<const void *>(input)
+                << " output=" << static_cast<void *>(output)
+                << " lengths="
+                << static_cast<const void *>(request_sequence_lengths)
+                << " row_stride="
+                << static_cast<const void *>(request_row_stride)
+                << " stream=" << stream
+                << " seq_capacity=" << seq_capacity
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
+            return false;
+        }
+
+        constexpr int threads_per_block = 256;
+        const int total = request_count * d_model;
+        const int blocks = std::max(
+            1,
+            std::min(
+                1024,
+                (total + threads_per_block - 1) / threads_per_block));
+        deviceGeometryRequestTerminalRowsSelectFP32Kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            reinterpret_cast<cudaStream_t>(stream)>>>(
+            input,
+            output,
+            request_sequence_lengths,
+            request_row_stride,
+            seq_capacity,
+            d_model,
+            request_count);
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess)
+        {
+            LOG_ERROR(
+                "[CUDARowSelectKernels] Device-geometry request-terminal "
+                "row-selection launch failed: "
+                << cudaGetErrorString(launch_status)
+                << " stream=" << stream
+                << " seq_capacity=" << seq_capacity
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
+            return false;
+        }
+        return true;
+    }
+
+    bool launchDeviceKVProgressRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int request_index,
+        int seq_capacity,
+        int d_model,
+        int selected_row_count,
+        void *stream)
+    {
+        if (!input || !output || !main_cached_tokens ||
+            !shifted_cached_tokens || !request_sequence_lengths ||
+            !request_row_stride || !stream || request_index < 0 ||
+            seq_capacity <= 0 || d_model <= 0 || selected_row_count <= 0 ||
+            selected_row_count > seq_capacity)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Device-KV-progress row selection rejected an incomplete launch contract"
+                      << " request=" << request_index
+                      << " rows=" << selected_row_count
+                      << " seq_capacity=" << seq_capacity
+                      << " main_count=" << main_cached_tokens
+                      << " shifted_count=" << shifted_cached_tokens
+                      << " lengths=" << request_sequence_lengths
+                      << " stride=" << request_row_stride
+                      << " stream=" << stream);
+            return false;
+        }
+
+        constexpr int threads_per_block = 256;
+        const int total = selected_row_count * d_model;
+        const int blocks = std::max(
+            1,
+            std::min(
+                1024,
+                (total + threads_per_block - 1) / threads_per_block));
+        deviceKVProgressRowsSelectFP32Kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            reinterpret_cast<cudaStream_t>(stream)>>>(
+            input,
+            output,
+            main_cached_tokens,
+            shifted_cached_tokens,
+            request_sequence_lengths,
+            request_row_stride,
+            request_index,
+            seq_capacity,
+            d_model,
+            selected_row_count);
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Device-KV-progress row-selection launch failed: "
+                      << cudaGetErrorString(launch_status)
+                      << " request=" << request_index
+                      << " rows=" << selected_row_count
+                      << " stream=" << stream);
             return false;
         }
         return true;

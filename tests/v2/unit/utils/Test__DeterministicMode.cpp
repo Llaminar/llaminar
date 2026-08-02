@@ -59,6 +59,26 @@ namespace
     };
 }
 
+/**
+ * @brief Lock in the production-model-proven CUDA MoE partition geometry.
+ *
+ * Empty environment values exercise the same invalid-override branch as an
+ * unset variable while keeping the process-global test environment reversible.
+ * The normal runtime must retain the geometry whose stochastic production
+ * token stream is byte-stable; a faster candidate is promoted only after that
+ * stronger gate passes.
+ */
+TEST(Test__DeterministicMode, CudaMoEOrderedKPartDefaultsUseProductionProvenGeometry)
+{
+    ScopedEnv env({
+        {"LLAMINAR_CUDA_MOE_GATEUP_KPARTS", ""},
+        {"LLAMINAR_CUDA_MOE_DOWN_KPARTS", ""},
+    });
+
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_kparts, 16);
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_down_kparts, 16);
+}
+
 TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreservesOrderedCudaKPart)
 {
     ScopedEnv env({

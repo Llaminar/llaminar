@@ -2608,14 +2608,6 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold) override;
-        DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleProducerSlot(int slot) override;
-        DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleBroadcastDestinationSlot(int slot) override;
-        bool recordStochasticDraftSampleSlotReadyFromDevice(
-            int slot,
-            void *producer_stream,
-            bool verifier_consumer_pending = true) override;
         DeviceStochasticTargetSampleSlotHandle
         deviceStochasticTargetSampleProducerSlot(int slot) override;
         DeviceStochasticTargetSampleSlotHandle
@@ -2725,8 +2717,6 @@ namespace llaminar2
          * This is deliberately runner-owned because only the per-device runner
          * owns the backend event and exact stream stored in the handle.
          */
-        bool publishRankCompactSpeculativeResponseReady(
-            DeviceSpeculativeOutcomeHandle *handle) override;
         /**
          * @brief Legacy host bridge for a device-resident stochastic outcome.
          */
@@ -3267,8 +3257,12 @@ namespace llaminar2
                 if (cache)
                     cache->resetSessionState();
             }
-            mtp_terminal_hidden_request_rows_select_cache_
-                .resetSessionState();
+            for (auto &cache :
+                 mtp_terminal_hidden_request_rows_select_caches_)
+            {
+                if (cache)
+                    cache->resetSessionState();
+            }
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
@@ -5883,6 +5877,14 @@ namespace llaminar2
             int fixed_contiguous_row_start = 0;
             int request_row_stride = 0;
             const int32_t *request_sequence_lengths_device = nullptr;
+            HiddenStateRowsSelectStage::RequestRowStrideSource
+                request_row_stride_source =
+                    HiddenStateRowsSelectStage::RequestRowStrideSource::
+                        StaticGraphGeometry;
+            const int32_t *request_row_stride_device = nullptr;
+            const int32_t *main_cached_tokens_device = nullptr;
+            const int32_t *shifted_cached_tokens_device = nullptr;
+            int request_index = -1;
             std::string row_buffer_name;
             HiddenStateRowsSelectStage::DeviceRowIndexSource row_index_source =
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
@@ -5923,6 +5925,13 @@ namespace llaminar2
                 fixed_contiguous_row_start = 0;
                 request_row_stride = 0;
                 request_sequence_lengths_device = nullptr;
+                request_row_stride_source =
+                    HiddenStateRowsSelectStage::RequestRowStrideSource::
+                        StaticGraphGeometry;
+                request_row_stride_device = nullptr;
+                main_cached_tokens_device = nullptr;
+                shifted_cached_tokens_device = nullptr;
+                request_index = -1;
                 row_buffer_name.clear();
                 row_index_source =
                     HiddenStateRowsSelectStage::DeviceRowIndexSource::
@@ -5949,9 +5958,27 @@ namespace llaminar2
          */
         std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
             mtp_terminal_hidden_device_accepted_rows_select_caches_;
-        /// Device-length-indexed request-terminal graph for padded request batches.
-        MTPTerminalHiddenRowsSelectGraphCache
-            mtp_terminal_hidden_request_rows_select_cache_;
+        /**
+         * @brief Device-geometry request-terminal graph for every legal count.
+         *
+         * Request count fixes launch/output geometry and therefore owns one
+         * captured graph identity. Prompt width does not: every graph reads the
+         * current padded stride from REQUEST_BATCH_GEOMETRY. Runtime execution
+         * can consequently select by count without rebuilding for a new prompt.
+         */
+        std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
+            mtp_terminal_hidden_request_rows_select_caches_;
+        /**
+         * @brief Shifted-prefill selectors indexed by request then row count.
+         *
+         * Every graph reads canonical main/shifted KV progress and resident
+         * request geometry. Prompt width and current row are therefore replay
+         * data, while request identity and bounded grouped width remain graph
+         * topology. The vector is flattened as
+         * `request * mtp_sidecar_condition_token_slot_width_ + rows - 1`.
+         */
+        std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
+            mtp_shifted_prefill_hidden_rows_select_caches_;
 
         /**
          * @brief Device-checkpoint bank written by the last successful hidden producer.
@@ -6214,6 +6241,7 @@ namespace llaminar2
         int mtp_sidecar_condition_token_slot_width_ = 2; ///< Flattened runtime row capacity reserved for each captured sidecar role.
         void *mtp_sidecar_position_ids_dev_ = nullptr; ///< INT32 [mtp_sidecar_condition_token_slot_width_], stable positions for chained device sidecars.
         void *mtp_verifier_position_ids_dev_ = nullptr; ///< INT32 [stochastic_target_row_capacity_], absolute grouped verifier rows derived from live device KV counts.
+        void *mtp_verifier_request_lengths_dev_ = nullptr; ///< INT32 [stochastic_batch_output_request_capacity_], valid grouped-verifier width per request.
         void *request_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], immutable external request tokens after admission.
         void *request_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], absolute positions paired with request_token_ids_dev_.
         int request_input_row_capacity_ = 0; ///< Number of flattened token/position elements reserved in the arena.
@@ -6228,21 +6256,25 @@ namespace llaminar2
          * source for the unused tail of REQUEST_TOKEN_IDS.  Its stable lifetime
          * makes the asynchronous H2D legal without a host wait or hot-path
          * allocation.
-         */
+        */
         std::vector<int32_t> request_padding_token_ids_host_;
-        void *request_sequence_lengths_dev_ = nullptr; ///< INT32 [batch], immutable real rows admitted before GPU prefill.
+        DeviceRequestBatchGeometryLayout request_batch_geometry_layout_; ///< Typed model-lifetime layout of REQUEST_BATCH_GEOMETRY.
+        void *request_batch_geometry_dev_ = nullptr; ///< Base of the arena-owned lengths-plus-stride record.
+        void *request_sequence_lengths_dev_ = nullptr; ///< First INT32 request length in REQUEST_BATCH_GEOMETRY.
+        const int32_t *request_row_stride_dev_ = nullptr; ///< Final INT32 scalar in REQUEST_BATCH_GEOMETRY.
         int request_sequence_lengths_capacity_ = 0; ///< Number of request rows reserved in the arena allocation.
         int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
         /**
-         * @brief Stable host source for one asynchronous request-length admission.
+         * @brief Stable host source for one asynchronous geometry admission.
          *
          * `state_.sequence_lengths` advances as soon as graph execution is
          * submitted, so lending its storage to an asynchronous H2D copy races the
-         * DMA reader. This fixed-capacity row is populated from the explicit
-         * forward transaction and remains unchanged until the next admission,
-         * whose device writer is ordered after the prior graph's reuse event.
+         * DMA reader. This fixed-capacity record contains every real length and
+         * the padded row stride. It remains unchanged until the next admission,
+         * whose single device writer is ordered after the prior graph's reuse
+         * event. Lengths and stride therefore cannot acquire different epochs.
          */
-        std::vector<int32_t> request_sequence_lengths_host_;
+        std::vector<int32_t> request_batch_geometry_host_;
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
         void *mtp_greedy_penalty_policy_dev_ = nullptr; ///< Graph-stable MTPGreedyPenaltyPolicy written on the exact verifier stream.
@@ -7807,14 +7839,13 @@ namespace llaminar2
          * @brief Materialize all GPU terminal-hidden publication graph objects.
          *
          * This runs after the largest-participant workspace family has fixed
-         * arena and workspace addresses. It builds one immutable contiguous
-         * catchup graph for every supported row count plus one fixed-capacity
-         * device-accepted graph. Decode execution treats a missing or stale
-         * cache as fatal instead of allocating or rebuilding in the hot path.
+         * arena and workspace addresses. It builds immutable contiguous and
+         * accepted-state families plus one device-geometry graph for every
+         * legal request count. Prompt width is resident data, not graph
+         * identity. Decode execution treats a missing or stale cache as fatal
+         * instead of allocating or rebuilding in the hot path.
          */
-        bool materializeMTPTerminalHiddenPublicationGraphs(
-            int request_count,
-            int request_row_stride);
+        bool materializeMTPTerminalHiddenPublicationGraphs();
 
         /**
          * @brief Build one typed GPU rows-select graph against current bindings.
@@ -7833,18 +7864,35 @@ namespace llaminar2
             int selected_row_count,
             int fixed_contiguous_row_start = 0,
             const char *row_buffer_name = nullptr,
-            int request_row_stride = 0);
+            int request_index = -1);
 
         /**
          * @brief Publish one terminal row per padded GPU request from resident lengths.
          *
-         * The graph reads `REQUEST_SEQUENCE_LENGTHS` directly and is materialized
-         * with the matching request-batch geometry before execution. No host
-         * request-length vector or row-index upload participates in refresh.
+         * The graph reads `REQUEST_BATCH_GEOMETRY` directly. Setup materializes
+         * one graph per request count; current prompt width remains device data.
+         * No host request-length vector, row-index upload, or runtime graph
+         * construction participates in refresh.
          */
         bool selectMTPTerminalHiddenRowsFromDeviceRequestLengths(
             int request_count,
             int request_row_stride,
+            int total_rows,
+            void *stream);
+
+        /**
+         * @brief Publish the next shifted-prefill hidden range from device KV progress.
+         *
+         * The caller names only immutable graph geometry: request identity and
+         * grouped row count. The captured stage derives its source range from
+         * canonical main/shifted KV counters after consuming the prior shifted
+         * mutation event. No host row cursor or runtime graph construction is
+         * permitted by this contract.
+         */
+        bool selectMTPTerminalHiddenRowsFromShiftedPrefillProgress(
+            int request_index,
+            int request_count,
+            int row_count,
             int total_rows,
             void *stream);
 

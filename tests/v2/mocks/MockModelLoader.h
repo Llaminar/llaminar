@@ -138,6 +138,12 @@ namespace llaminar2::test
             DeviceId device = DeviceId::cpu(),
             WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(
+            const std::string &name,
+            size_t expert_start, size_t expert_end,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
         bool hasTensor(const std::string &name) const override;
         std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const override;
         std::vector<std::string> tensorNames() const override;
@@ -810,6 +816,49 @@ namespace llaminar2::test
             return nullptr;
 
         return createColumnSlice(it->second, shape_it->second, col_start, col_end);
+    }
+
+    /**
+     * @brief Return a contiguous expert-axis slice of a mock FP32 MoE tensor.
+     *
+     * GGUF expert tensors use shape `[ne0, ne1, num_experts]` with each
+     * expert occupying one contiguous `ne0 * ne1` slab. Mirroring that layout
+     * here lets CPU-only unit tests exercise the same expert-ID apportionment
+     * contract as the production bounded GGUF loader.
+     */
+    inline std::shared_ptr<TensorBase> MockModelLoader::loadTensorExpertSlice(
+        const std::string &name,
+        size_t expert_start, size_t expert_end,
+        DeviceId /*device*/,
+        WeightPrecision /*weight_precision*/)
+    {
+        ++load_tensor_calls_;
+
+        auto tensor_it = tensors_.find(name);
+        auto shape_it = tensor_shapes_.find(name);
+        if (tensor_it == tensors_.end() || shape_it == tensor_shapes_.end())
+        {
+            missing_requests_.push_back(name);
+            return nullptr;
+        }
+
+        const auto &shape = shape_it->second;
+        auto *source = dynamic_cast<FP32Tensor *>(tensor_it->second.get());
+        if (!source || shape.size() != 3 || expert_start >= expert_end ||
+            expert_end > shape[2])
+        {
+            return nullptr;
+        }
+
+        const size_t values_per_expert = shape[0] * shape[1];
+        const size_t selected_experts = expert_end - expert_start;
+        auto slice = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{shape[0], shape[1], selected_experts});
+        std::memcpy(
+            slice->mutable_data(),
+            source->data() + expert_start * values_per_expert,
+            selected_experts * values_per_expert * sizeof(float));
+        return slice;
     }
 
     inline std::shared_ptr<TensorBase> MockModelLoader::createRowSlice(

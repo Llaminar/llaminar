@@ -217,17 +217,6 @@ namespace llaminar2
          */
         std::shared_ptr<void> response_ready_event;
         /**
-         * @brief Whether @ref response_ready_event was republished after a rank collective.
-         *
-         * Single-device outcomes are ready at the verifier-summary edge.
-         * Mirrored LocalTP outcomes become rank-authoritative only after the
-         * NCCL/RCCL compact-outcome collective queued on every child stream.
-         * Consumers use this flag to select the corresponding declarative
-         * timeline edge; they never guess ownership from topology or pointer
-         * identity.
-         */
-        bool response_ready_after_rank_collective = false;
-        /**
          * @brief Optional timing event recorded before compact outcome reduction.
          *
          * These events exist only when structured perfstats are enabled.  They
@@ -241,20 +230,19 @@ namespace llaminar2
         /**
          * @brief Child-local ownership lease for shifted MTP KV state.
          *
-         * Rank-level mirrored outcome broadcast replaces compact token/meta
-         * contents on every participant, but it must preserve this lease from
-         * each child.  Initial/suffix shifted-row commits therefore consume the
-         * same cache owner that produced the child verifier outcome.
+         * Every participant retains the lease produced beside its own compact
+         * token/meta buffers. Initial/suffix shifted-row commits therefore
+         * consume the same cache owner that produced the child verifier outcome.
          */
         DeviceResidentMTPTransactionLease mtp_transaction;
         /**
-         * @brief True when mirrored LocalTP publication is already in the graph.
+         * @brief True when this child produced a complete mirrored LocalTP outcome.
          *
-         * Rank orchestration must never enqueue a second compact-outcome
-         * broadcast when this flag is set.  Every child handle in the domain
-         * must agree on the value.
+         * Every child in a mirrored domain must report this value. It proves
+         * that the child ran the participant-local terminal reducer and owns a
+         * ready compact outcome; no rank outcome collective is permitted.
          */
-        bool mirrored_local_tp_published_in_graph = false;
+        bool mirrored_local_tp_locally_complete = false;
 
         bool valid() const
         {
@@ -480,12 +468,13 @@ namespace llaminar2
      * @brief Device-owned sampled-token mailbox slot.
      *
      * LocalTP MTP keeps target and draft samples in runner-owned device
-     * mailboxes so the next sidecar and verifier can consume the exact same
-     * token without a host round trip. Rank-level coordination needs a narrow
-     * way to name one child slot while broadcasting the primary mirrored-head
-     * sample to the rest of the TP participants. This handle exposes only the
-     * token pointer, the explicit ordering stream, and ownership metadata that
-     * catches stale or cross-device use.
+     * mailboxes so the next graph can consume the token without a host round
+     * trip. The generic handle is retained for main-target coordination when
+     * the declarative final-head policy remains column parallel. Mirrored MTP
+     * draft heads deliberately expose no rank-broadcast handle: every graph
+     * participant samples and publishes its own local slot. This handle exposes
+     * only the token pointer, exact producer stream, and ownership metadata
+     * needed to reject stale or cross-device use.
      */
     struct DeviceStochasticSampleSlotHandle
     {
@@ -503,9 +492,7 @@ namespace llaminar2
         }
     };
 
-    /// Buffer-specific spellings keep target and draft publication APIs explicit.
-    using DeviceStochasticDraftSampleSlotHandle =
-        DeviceStochasticSampleSlotHandle;
+    /// Main-target slots may still require coordination under a sharded head policy.
     using DeviceStochasticTargetSampleSlotHandle =
         DeviceStochasticSampleSlotHandle;
 
@@ -3138,61 +3125,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Acquire a ready draft-sample mailbox as a collective source.
-         *
-         * The returned stream must be the exact stream that produced the sampled
-         * token.  Implementations fail closed when the slot has no published
-         * sample-ready event; callers cannot accidentally broadcast stale bytes.
-         */
-        virtual DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleProducerSlot(int slot)
-        {
-            (void)slot;
-            return {};
-        }
-
-        /**
-         * @brief Acquire a peer draft mailbox after its preceding MTP sidecar.
-         *
-         * A mirrored LocalTP peer does not sample its duplicate logits, but its
-         * next chained sidecar still consumes the hidden row produced by that
-         * duplicate sidecar.  Implementations must therefore consume the exact
-         * pending MTP-sidecar stream and return it as the collective destination
-         * stream.  Enqueuing NCCL/RCCL on this stream makes the token broadcast
-         * the explicit join between the previous sidecar and the next one.
-         *
-         * Missing predecessor publication, null streams, and default streams are
-         * fatal contract violations.  Returning an arbitrary operation stream is
-         * never valid.
-         */
-        virtual DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleBroadcastDestinationSlot(int slot)
-        {
-            (void)slot;
-            return {};
-        }
-
-        /**
-         * @brief Record that a device operation has produced a draft sample slot.
-         *
-         * LocalTP broadcasts can overwrite a child draft slot without going through
-         * that child's sampler.  After the broadcast is enqueued on an explicit
-         * stream, the rank calls this hook so later sidecars and verifier reducers
-         * wait on the broadcast event exactly as they would wait on a native sample
-         * kernel event.
-         */
-        virtual bool recordStochasticDraftSampleSlotReadyFromDevice(
-            int slot,
-            void *producer_stream,
-            bool verifier_consumer_pending = true)
-        {
-            (void)slot;
-            (void)producer_stream;
-            (void)verifier_consumer_pending;
-            return false;
-        }
-
-        /**
          * @brief Acquire a ready target-sample mailbox as a collective source.
          *
          * The source stream is the exact target sampler stream and the slot must
@@ -3900,27 +3832,6 @@ namespace llaminar2
             (void)requests;
             (void)request_count;
             (void)out_handle;
-            return false;
-        }
-
-        /**
-         * @brief Strengthen compact-outcome readiness after a rank collective.
-         *
-         * The runner owns the backend event, producer stream, and device
-         * context carried by @p handle. Rank orchestration must therefore ask
-         * the owning runner to republish the event after NCCL/RCCL submission;
-         * it may not recover a backend independently and manipulate the
-         * runner's event resource from the outside.
-         *
-         * Implementations must fail unless the handle belongs to this runner,
-         * publish `RankCompactSpeculativeResponseReady` on the exact producer
-         * stream, and set `response_ready_after_rank_collective` only after the
-         * publication succeeds.
-         */
-        virtual bool publishRankCompactSpeculativeResponseReady(
-            DeviceSpeculativeOutcomeHandle *handle)
-        {
-            (void)handle;
             return false;
         }
 

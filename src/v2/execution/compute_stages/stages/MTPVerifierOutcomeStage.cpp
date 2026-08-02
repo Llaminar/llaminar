@@ -7,14 +7,12 @@
 
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/IBackend.h"
-#include "../../../collective/ILocalTPContext.h"
 #include "../../../kernels/common/SamplingMath.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <cstddef>
-#include <span>
 #include <utility>
 
 namespace llaminar2
@@ -23,35 +21,6 @@ namespace llaminar2
         : IComputeStage(params.device_id),
           params_(std::move(params))
     {
-        const bool is_root = isRootParticipant();
-        auto &tokens = mirrored_outcome_sidebands_[0];
-        tokens.kind = LocalTPCollectiveSidebandKind::Broadcast;
-        tokens.send_buffer =
-            is_root ? params_.binding.output_tokens_device : nullptr;
-        tokens.recv_buffer = params_.binding.output_tokens_device;
-        tokens.element_count =
-            static_cast<size_t>(params_.binding.output_token_capacity);
-        tokens.dtype = CollectiveDataType::INT32;
-        tokens.root_device_index = params_.local_tp_root_device_index;
-        tokens.name = "mtp_graph_outcome_tokens";
-
-        auto &meta = mirrored_outcome_sidebands_[1];
-        meta.kind = LocalTPCollectiveSidebandKind::Broadcast;
-        meta.send_buffer =
-            is_root ? params_.binding.output_meta_device : nullptr;
-        meta.recv_buffer = params_.binding.output_meta_device;
-        meta.element_count =
-            static_cast<size_t>(params_.binding.output_meta_capacity);
-        meta.dtype = CollectiveDataType::INT32;
-        meta.root_device_index = params_.local_tp_root_device_index;
-        meta.name = "mtp_graph_outcome_meta";
-    }
-
-    bool MTPVerifierOutcomeStage::isRootParticipant() const noexcept
-    {
-        return !params_.publish_mirrored_local_tp ||
-               params_.local_tp_device_index ==
-                   params_.local_tp_root_device_index;
     }
 
     bool MTPVerifierOutcomeStage::validate() const
@@ -72,6 +41,15 @@ namespace llaminar2
                       << static_cast<int>(params_.mode));
             return false;
         }
+
+        if (params_.ownership_policy !=
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal)
+        {
+            LOG_ERROR(
+                "[MTPVerifierOutcomeStage] Terminal verifier reduction has no "
+                "supported declarative ownership policy");
+            return false;
+        }
         if (params_.verifier_row_count <= 0 ||
             params_.vocab_size <= 0 ||
             params_.binding.output_token_capacity <
@@ -89,24 +67,6 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.publish_mirrored_local_tp)
-            return true;
-        if (!params_.local_tp_ctx ||
-            params_.local_tp_ctx->degree() <= 1 ||
-            params_.local_tp_device_index < 0 ||
-            params_.local_tp_device_index >= params_.local_tp_ctx->degree() ||
-            params_.local_tp_root_device_index < 0 ||
-            params_.local_tp_root_device_index >= params_.local_tp_ctx->degree())
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] Invalid mirrored LocalTP publication contract");
-            return false;
-        }
-        if (!params_.local_tp_ctx
-                 ->supportsCollectiveSidebandOnStreamGraphCapture())
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] LocalTP backend cannot capture compact outcome broadcasts");
-            return false;
-        }
         return true;
     }
 
@@ -123,120 +83,91 @@ namespace llaminar2
         }
 
         /*
-         * Only the root performs the expensive vocabulary reduction.  Every
-         * participant still enters the same two collectives below, so CUDA/HIP
-         * graph replay retains a symmetric collective order.
+         * ParticipantLocal ownership makes this terminal transaction complete
+         * on every graph participant. Mirrored LocalTP guarantees that logits,
+         * verifier inputs, stop controls, and penalty history are byte-identical
+         * at this point, so identical deterministic kernels produce identical
+         * compact mailboxes without a rank authority transfer.
          */
-        if (isRootParticipant())
+        const auto logits_device = params_.logits->current_device();
+        const auto &shape = params_.logits->shape();
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols =
+            shape.size() >= 2 ? shape[1]
+                              : (shape.empty() ? 0 : shape[0]);
+        if (!params_.logits->deviceValid() ||
+            !logits_device.has_value() ||
+            *logits_device != params_.device_id ||
+            rows < static_cast<size_t>(params_.verifier_row_count) ||
+            cols != static_cast<size_t>(params_.vocab_size))
         {
-            /*
-             * Non-root participants never read their duplicate verifier logits:
-             * their only semantic outputs are the persistent token/meta receive
-             * buffers written by the collective below. Keeping tensor coherence
-             * access inside this branch makes receiver-side logits ownership
-             * irrelevant and prevents a host-authoritative duplicate row from
-             * creating a false H2D requirement.
-             */
-            const auto logits_device = params_.logits->current_device();
-            const auto &shape = params_.logits->shape();
-            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
-            const size_t cols =
-                shape.size() >= 2 ? shape[1]
-                                  : (shape.empty() ? 0 : shape[0]);
-            if (!params_.logits->deviceValid() ||
-                !logits_device.has_value() ||
-                *logits_device != params_.device_id ||
-                rows < static_cast<size_t>(params_.verifier_row_count) ||
-                cols != static_cast<size_t>(params_.vocab_size))
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] Root verifier logits do not "
-                          "match the captured full-vocabulary contract"
-                          << " rows=" << rows
-                          << " cols=" << cols
-                          << " expected_rows=" << params_.verifier_row_count
-                          << " expected_cols=" << params_.vocab_size);
-                return false;
-            }
-            auto *logits = static_cast<const float *>(
-                params_.logits->gpu_data_ptr());
-            if (!logits)
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] Root verifier logits have "
-                          "no prepared device storage");
-                return false;
-            }
-
-            IBackend *backend = getBackendFor(params_.device_id);
-            if (!backend)
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] No backend for "
-                          << params_.device_id.toString());
-                return false;
-            }
-
-            if (!backend
-                     ->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
-                    logits,
-                    params_.verifier_row_count,
-                    params_.vocab_size,
-                    params_.binding.verifier_input_tokens_device,
-                    params_.binding.generated_token_counts_device,
-                    params_.binding.penalty_policy_device,
-                    params_.device_id.gpu_ordinal(),
-                    stream,
-                    params_.binding.argmax_values_device,
-                    params_.binding.verifier_tokens_device,
-                    params_.binding.argmax_partial_values_device,
-                    params_.binding.argmax_partial_indices_device,
-                    params_.binding.argmax_partial_capacity))
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] Batched verifier argmax launch failed");
-                return false;
-            }
-
-            if (!backend
-                     ->enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
-                         params_.binding.verifier_tokens_device,
-                         params_.binding.verifier_input_tokens_device,
-                         params_.verifier_row_count - 1,
-                         params_.binding.stop_tokens_device,
-                         params_.device_id.gpu_ordinal(),
-                         stream,
-                         params_.binding.output_token_capacity,
-                         params_.binding.output_tokens_device,
-                         params_.binding.output_meta_device,
-                         /*max_state_commit_rows_device=*/nullptr,
-                         params_.binding.penalty_policy_device))
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] Greedy compact outcome reduction failed");
-                return false;
-            }
+            LOG_ERROR("[MTPVerifierOutcomeStage] Participant-local verifier logits do not "
+                      "match the captured full-vocabulary contract"
+                      << " rows=" << rows
+                      << " cols=" << cols
+                      << " expected_rows=" << params_.verifier_row_count
+                      << " expected_cols=" << params_.vocab_size);
+            return false;
+        }
+        auto *logits = static_cast<const float *>(
+            params_.logits->gpu_data_ptr());
+        if (!logits)
+        {
+            LOG_ERROR("[MTPVerifierOutcomeStage] Participant-local verifier logits have "
+                      "no prepared device storage");
+            return false;
         }
 
-        if (params_.publish_mirrored_local_tp)
+        IBackend *backend = getBackendFor(params_.device_id);
+        if (!backend)
         {
-            if (!params_.local_tp_ctx->collectiveSidebandSpanOnStream(
-                    std::span<const LocalTPCollectiveSidebandBuffer>(
-                        mirrored_outcome_sidebands_),
-                    params_.local_tp_device_index,
-                    stream,
-                    params_.stage_name))
-            {
-                LOG_ERROR("[MTPVerifierOutcomeStage] Captured LocalTP compact outcome publication failed");
-                return false;
-            }
+            LOG_ERROR("[MTPVerifierOutcomeStage] No backend for "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        if (!backend->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+                logits,
+                params_.verifier_row_count,
+                params_.vocab_size,
+                params_.binding.verifier_input_tokens_device,
+                params_.binding.generated_token_counts_device,
+                params_.binding.penalty_policy_device,
+                params_.device_id.gpu_ordinal(),
+                stream,
+                params_.binding.argmax_values_device,
+                params_.binding.verifier_tokens_device,
+                params_.binding.argmax_partial_values_device,
+                params_.binding.argmax_partial_indices_device,
+                params_.binding.argmax_partial_capacity))
+        {
+            LOG_ERROR("[MTPVerifierOutcomeStage] Batched verifier argmax launch failed");
+            return false;
+        }
+
+        if (!backend->enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
+                params_.binding.verifier_tokens_device,
+                params_.binding.verifier_input_tokens_device,
+                params_.verifier_row_count - 1,
+                params_.binding.stop_tokens_device,
+                params_.device_id.gpu_ordinal(),
+                stream,
+                params_.binding.output_token_capacity,
+                params_.binding.output_tokens_device,
+                params_.binding.output_meta_device,
+                /*max_state_commit_rows_device=*/nullptr,
+                params_.binding.penalty_policy_device))
+        {
+            LOG_ERROR("[MTPVerifierOutcomeStage] Greedy compact outcome reduction failed");
+            return false;
         }
 
         /*
-         * The compact buffers are canonical only after the LocalTP broadcast.
-         * Advancing each participant's mirrored count table here gives the next
-         * captured verifier one transitive stream dependency from both root
-         * sampling and collective publication. A single thread owns this short
-         * update, so repeated output tokens require no atomics.
+         * Each participant advances its own mirrored history immediately after
+         * producing the compact outcome. A single thread owns this short update,
+         * so repeated output tokens require no atomics or inter-device handoff.
          */
-        IBackend *history_backend = getBackendFor(params_.device_id);
-        if (!history_backend ||
-            !history_backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
+        if (!backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
                 params_.binding.output_tokens_device,
                 params_.binding.output_meta_device,
                 params_.binding.penalty_policy_device,
@@ -257,9 +188,10 @@ namespace llaminar2
             "decode",
             params_.device_id.toString(),
             {{"rows", std::to_string(params_.verifier_row_count)},
-             {"root", isRootParticipant() ? "true" : "false"},
              {"mirrored_local_tp",
-              params_.publish_mirrored_local_tp ? "true" : "false"}});
+              params_.mirrored_local_tp ? "true" : "false"},
+             {"ownership", "participant_local"},
+             {"collective", "none"}});
         return true;
     }
 
@@ -292,7 +224,7 @@ namespace llaminar2
         info.addScalarInt("vocab_size", params_.vocab_size);
         info.addScalarBool(
             "mirrored_local_tp",
-            params_.publish_mirrored_local_tp);
+            params_.mirrored_local_tp);
         return info;
     }
 
@@ -300,21 +232,11 @@ namespace llaminar2
     {
         StageBufferContract contract;
 
-        /*
-         * The contract must describe what this participant actually touches,
-         * not the union of the root and receiver algorithms. DeviceGraphExecutor
-         * establishes coherence from this declaration before execute() runs.
-         * Advertising root-only logits on a receiver would therefore demand a
-         * needless H2D transfer before the receiver enters the collective.
-         */
-        if (isRootParticipant())
-        {
-            contract.addInput(BufferId::ALL_POSITION_LOGITS);
-            contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
-            contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
-            contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
-            contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
-        }
+        contract.addInput(BufferId::ALL_POSITION_LOGITS);
+        contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
+        contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
+        contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
+        contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
         contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
         contract.addInOut(
             BufferId::MTP_GENERATED_TOKEN_COUNTS,

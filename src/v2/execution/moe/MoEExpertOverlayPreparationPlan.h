@@ -89,6 +89,21 @@ namespace llaminar2
         std::vector<DeviceId> acceleratorDevices() const;
         MoEExpertOverlayPreparationPlan filteredForRank(const OverlayRankPlan &rank_plan) const;
 
+        /**
+         * @brief Restrict preparation ownership to one graph participant device.
+         *
+         * A per-device graph runner may prepare only the routed experts assigned
+         * to its own device.  Keeping this restriction in the immutable plan
+         * makes it impossible for one LocalTP runner to repack another runner's
+         * experts through WeightManager's process-wide caches.  The returned
+         * diagnostics are rebuilt from the retained requests, so logs describe
+         * the exact work owned by the caller rather than the rank-wide plan.
+         *
+         * @param device Device owned by the graph runner performing preparation.
+         * @return A plan containing only requests whose device equals @p device.
+         */
+        MoEExpertOverlayPreparationPlan filteredForDevice(DeviceId device) const;
+
         bool shouldPrepare(
             DeviceId device,
             int layer,

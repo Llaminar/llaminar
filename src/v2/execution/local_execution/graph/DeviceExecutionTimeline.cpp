@@ -227,19 +227,8 @@ namespace llaminar2
                     .name = "compact_speculative_response_ready",
                     .producer = DeviceTimelineRole::VerifierSummary,
                     .consumers = roles({
-                        DeviceTimelineRole::RankCollective,
-                        DeviceTimelineRole::HostResultBridge,
-                        DeviceTimelineRole::Diagnostics,
-                    }),
-                },
-                {
-                    .point =
-                        DeviceTimelinePoint::RankCompactSpeculativeResponseReady,
-                    .name = "rank_compact_speculative_response_ready",
-                    .producer = DeviceTimelineRole::RankCollective,
-                    .consumers = roles({
-                        DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::AcceptedStatePublication,
+                        DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },

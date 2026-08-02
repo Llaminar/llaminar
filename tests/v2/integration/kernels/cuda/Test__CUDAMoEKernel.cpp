@@ -10,6 +10,7 @@
 #include "tensors/Tensors.h"
 
 #include "backends/BackendManager.h"
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "collective/LocalTPContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -511,6 +512,87 @@ namespace
     }
 
 #ifdef HAVE_CUDA
+    /**
+     * @brief Own one production-shaped CUDA graph capture used by this suite.
+     *
+     * These integration tests call kernel facade methods directly, but those
+     * methods normally execute beneath DeviceGraphExecutor's capture owner.
+     * Calling cudaStreamBeginCapture directly omits the software capture state
+     * used by TensorBase: a facade then attempts to publish an external tensor
+     * completion event while CUDA is recording the graph.  Besides being the
+     * wrong lifetime boundary, that event cannot describe a future replay.
+     *
+     * This fixture deliberately composes the same CUDAGraphCapture and
+     * ScopedBackendGraphCapture types as production.  The transaction member
+     * is destroyed before the graph member, so an ASSERT_* early return or C++
+     * exception still closes the native stream-capture interval before graph
+     * resources are released.  Tests publish results only after launch, just
+     * as the production graph owner does.
+     */
+    class ScopedCudaTestGraph final
+    {
+    public:
+        /**
+         * @brief Begin capture immediately on an explicit test stream.
+         *
+         * @param stream Exact CUDA stream that will record and replay the DAG.
+         * @param operation Stable diagnostic name for lifecycle failures.
+         * @throws std::runtime_error when CUDA refuses to begin capture.
+         */
+        ScopedCudaTestGraph(cudaStream_t stream, std::string operation)
+            : graph_(stream),
+              transaction_(graph_, std::move(operation))
+        {
+            if (!transaction_.begin())
+            {
+                throw std::runtime_error(
+                    "ScopedCudaTestGraph failed to begin CUDA graph capture");
+            }
+        }
+
+        ~ScopedCudaTestGraph() = default;
+
+        ScopedCudaTestGraph(const ScopedCudaTestGraph &) = delete;
+        ScopedCudaTestGraph &operator=(const ScopedCudaTestGraph &) = delete;
+
+        /**
+         * @brief Close capture and build the reusable executable graph.
+         *
+         * ScopedBackendGraphCapture treats an end-capture failure as fatal,
+         * because CUDA leaves the stream lifetime unknowable in that case.
+         * Instantiation remains a normal boolean test assertion.
+         *
+         * @return true when CUDA instantiated the captured graph.
+         */
+        [[nodiscard]] bool finishAndInstantiate()
+        {
+            transaction_.finish();
+            return graph_.instantiate();
+        }
+
+        /**
+         * @brief Close a capturability-only test without instantiating it.
+         */
+        void finish()
+        {
+            transaction_.finish();
+        }
+
+        /**
+         * @brief Enqueue one replay on the exact stream captured at creation.
+         *
+         * @return true when CUDA accepted the graph launch.
+         */
+        [[nodiscard]] bool launch()
+        {
+            return graph_.launch();
+        }
+
+    private:
+        llaminar2::CUDAGraphCapture graph_;
+        llaminar2::ScopedBackendGraphCapture transaction_;
+    };
+
     /**
      * @brief Copy a CUDA-resident FP32 tensor into host memory for strict parity checks.
      *
@@ -2048,6 +2130,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
     runtime_config.top_k = top_k;
     runtime_config.mirror_to_device = true;
     runtime_config.prefill_token_capacity = seq_len;
+    runtime_config.deferred_verifier_token_capacity = seq_len;
     llaminar2::MoERuntimeTable runtime_table(runtime_config);
 
     auto runtime_state = runtime_table.hostLayerState(0);
@@ -2095,6 +2178,22 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
         num_experts,
         top_k,
         /*filter_to_local_runtime_experts=*/true));
+
+    /*
+     * Grouping is speculative: it must not mutate serial-visible decode
+     * history before the verifier accepts rows.  Production therefore copies
+     * the selected expert and participant identities into the deferred ledger
+     * while rebuilding the local grouped spans.  The later commit kernel reads
+     * only that ledger, so another layer may safely reuse the transient route
+     * arena before acceptance publication.
+     */
+    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+        runtime_table.deviceLayerState(0),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k,
+        /*retain_routes_for_deferred_commit=*/true));
     CudaAllocation accepted_count_device(sizeof(int32_t));
     CudaAllocation publication_ok_device(sizeof(int32_t));
     const int32_t accepted_count = seq_len;
@@ -2555,12 +2654,9 @@ TEST_F(Test__CUDAMoEKernel,
                 stream_),
             cudaSuccess);
 
-        cudaGraph_t graph = nullptr;
-        ASSERT_EQ(
-            cudaStreamBeginCapture(
-                stream_,
-                cudaStreamCaptureModeGlobal),
-            cudaSuccess);
+        ScopedCudaTestGraph graph(
+            stream_,
+            "resident verifier assignment lifecycle");
         ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
             runtime_table.deviceLayerState(0),
             routing_indices.get(),
@@ -2599,23 +2695,8 @@ TEST_F(Test__CUDAMoEKernel,
                 /*total_rows=*/m,
                 num_experts,
                 top_k));
-        ASSERT_EQ(
-            cudaStreamEndCapture(stream_, &graph),
-            cudaSuccess);
-        ASSERT_NE(graph, nullptr);
-
-        cudaGraphExec_t graph_exec = nullptr;
-        ASSERT_EQ(
-            cudaGraphInstantiate(
-                &graph_exec,
-                graph,
-                nullptr,
-                nullptr,
-                0),
-            cudaSuccess);
-        ASSERT_EQ(
-            cudaGraphLaunch(graph_exec, stream_),
-            cudaSuccess);
+        ASSERT_TRUE(graph.finishAndInstantiate());
+        ASSERT_TRUE(graph.launch());
         ASSERT_EQ(
             cudaStreamSynchronize(stream_),
             cudaSuccess);
@@ -2697,7 +2778,7 @@ TEST_F(Test__CUDAMoEKernel,
                 cudaMemcpyHostToDevice,
                 stream_),
             cudaSuccess);
-        ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+        ASSERT_TRUE(graph.launch());
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         std::vector<int32_t> participants_after_history_change(
             participants.size());
@@ -2711,8 +2792,6 @@ TEST_F(Test__CUDAMoEKernel,
         EXPECT_EQ(participants_after_history_change, participants)
             << "resident assignment consumed mutable workload history";
 
-        ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     }
     ASSERT_EQ(cudaFree(device_positions), cudaSuccess);
 #endif
@@ -13882,23 +13961,20 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillCapturesAfterWarmup)
     EXPECT_TRUE(warmup_host_result.router_logits.empty());
 
     llaminar2::MoERoutingResult captured_host_result;
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "tiled prefill router capture");
     const bool captured_route = cuda_kernel_->routeWithTensors(
         hidden.get(), gate.get(), seq_len, d_model,
         num_experts, top_k, true,
         cuda_indices.get(), cuda_weights.get(), captured_host_result);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
     EXPECT_TRUE(captured_host_result.expert_indices.empty());
     EXPECT_TRUE(captured_host_result.expert_weights.empty());
     EXPECT_TRUE(captured_host_result.router_logits.empty());
 
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
@@ -13921,8 +13997,6 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillCapturesAfterWarmup)
     expectNearArray(captured_indices.data(), cpu_indices->data(), captured_indices.size(), 0.0f);
     expectNearArray(captured_weights.data(), cpu_weights->data(), captured_weights.size(), 2.0e-5f);
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -13983,23 +14057,20 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult captured_result;
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "effective-sequence router capture");
     const bool captured_route = cuda_kernel_->routeWithTensorsEffectiveSeqLen(
         hidden.get(), gate.get(), bucket_seq_len, d_model,
         num_experts, top_k, true,
         cuda_indices.get(), cuda_weights.get(),
         captured_result, device_effective_seq_len);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
     EXPECT_TRUE(captured_result.expert_indices.empty());
     EXPECT_TRUE(captured_result.expert_weights.empty());
     EXPECT_TRUE(captured_result.router_logits.empty());
 
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
 
     ASSERT_EQ(cudaMemcpyAsync(device_effective_seq_len,
                               &replay_real_seq_len,
@@ -14007,7 +14078,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_result;
@@ -14049,8 +14120,6 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
         }
     }
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -14368,9 +14437,9 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
         << "public padded warmup changed active route weights";
 
     llaminar2::MoERoutingResult captured_result;
-    ASSERT_EQ(
-        cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal),
-        cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "Qwen3.6 padded-bucket router capture");
     const bool captured_route =
         cuda_kernel_->routeWithTensorsEffectiveSeqLen(
             bucket_hidden.get(), gate.get(),
@@ -14378,19 +14447,9 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
             /*normalize_weights=*/true,
             bucket_indices.get(), bucket_weights.get(),
             captured_result, device_effective_seq_len);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status =
-        cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
-    ASSERT_EQ(capture_status, cudaSuccess)
-        << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(
-        cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
-        cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
 
     std::vector<float> bucket_indices_host(bucket_indices->numel());
     std::vector<float> bucket_weights_host(bucket_weights->numel());
@@ -14427,8 +14486,6 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
         << "active normalized route weights changed when exact rows were "
            "replayed through the production prefill bucket";
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -14519,23 +14576,20 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
     EXPECT_TRUE(warmup_host_result.router_logits.empty());
 
     llaminar2::MoERoutingResult captured_host_result;
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "verifier-sized public router capture");
     const bool captured_route = cuda_kernel_->routeWithTensors(
         hidden.get(), gate.get(), seq_len, d_model,
         num_experts, top_k, true,
         cuda_indices.get(), cuda_weights.get(), captured_host_result);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
     EXPECT_TRUE(captured_host_result.expert_indices.empty());
     EXPECT_TRUE(captured_host_result.expert_weights.empty());
     EXPECT_TRUE(captured_host_result.router_logits.empty());
 
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
@@ -14558,8 +14612,6 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
     expectNearArray(captured_indices.data(), cpu_indices->data(), captured_indices.size(), 0.0f);
     expectNearArray(captured_weights.data(), cpu_weights->data(), captured_weights.size(), 1.0e-5f);
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -14603,20 +14655,16 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
         cuda_indices.get(), cuda_weights.get()));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "decode-equivalent verifier router capture");
     const bool captured_route = cuda_kernel_->routeVerifierRowsDecodeEquivalent(
         hidden.get(), gate.get(), seq_len, d_model,
         num_experts, top_k, true,
         cuda_indices.get(), cuda_weights.get());
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
@@ -14659,8 +14707,6 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     EXPECT_GE(match->value, 2.0);
     llaminar2::PerfStatsCollector::reset();
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -16047,46 +16093,40 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                  * the same router -> routed experts -> shared expert publication
                  * chain used by the production verifier graph.
                  */
-                cudaGraph_t graph = nullptr;
-                ASSERT_EQ(
-                    cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal),
-                    cudaSuccess);
+                ScopedCudaTestGraph graph(
+                    stream_,
+                    "all-format routed plus shared verifier capture");
                 bool captured_router = false;
                 bool captured_routed_grouping = false;
                 bool captured_routed_experts = false;
                 bool captured_shared = false;
-                {
-                    llaminar2::GraphCaptureGuard capture_guard;
-                    captured_router = moe_kernel.routeVerifierRowsDecodeEquivalent(
-                        grouped_input.get(),
-                        router_gate.get(),
-                        seq_len,
-                        d_model,
-                        routed_experts,
-                        routed_top_k,
-                        /*normalize_weights=*/true,
-                        grouped_routing_indices.get(),
-                        grouped_routing_weights.get());
-                    captured_routed_grouping = moe_kernel.prepareExpertGroupsAsync(
-                        grouped_routing_indices.get(),
-                        grouped_routing_weights.get(),
-                        seq_len,
-                        routed_experts,
-                        routed_top_k);
-                    captured_routed_experts = moe_kernel.executeGroupedPrefillPipeline(
-                        grouped_input.get(),
-                        routed_output.get(),
-                        routed_gateup_table,
-                        routed_down_table,
-                        seq_len,
-                        d_model,
-                        intermediate,
-                        routed_experts,
-                        routed_top_k);
-                    captured_shared = grouped_stage->execute(&ctx);
-                }
-                const cudaError_t capture_status =
-                    cudaStreamEndCapture(stream_, &graph);
+                captured_router = moe_kernel.routeVerifierRowsDecodeEquivalent(
+                    grouped_input.get(),
+                    router_gate.get(),
+                    seq_len,
+                    d_model,
+                    routed_experts,
+                    routed_top_k,
+                    /*normalize_weights=*/true,
+                    grouped_routing_indices.get(),
+                    grouped_routing_weights.get());
+                captured_routed_grouping = moe_kernel.prepareExpertGroupsAsync(
+                    grouped_routing_indices.get(),
+                    grouped_routing_weights.get(),
+                    seq_len,
+                    routed_experts,
+                    routed_top_k);
+                captured_routed_experts = moe_kernel.executeGroupedPrefillPipeline(
+                    grouped_input.get(),
+                    routed_output.get(),
+                    routed_gateup_table,
+                    routed_down_table,
+                    seq_len,
+                    d_model,
+                    intermediate,
+                    routed_experts,
+                    routed_top_k);
+                captured_shared = grouped_stage->execute(&ctx);
                 ASSERT_TRUE(captured_router) << "captured grouped router failed";
                 ASSERT_TRUE(captured_routed_grouping)
                     << "captured routed grouping failed";
@@ -16094,15 +16134,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                     << "captured routed expert pipeline failed";
                 ASSERT_TRUE(captured_shared)
                     << "captured shared verifier stage failed";
-                ASSERT_EQ(capture_status, cudaSuccess)
-                    << cudaGetErrorString(capture_status);
-                ASSERT_NE(graph, nullptr);
-
-                cudaGraphExec_t graph_exec = nullptr;
-                ASSERT_EQ(
-                    cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
-                    cudaSuccess);
-                ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+                ASSERT_TRUE(graph.finishAndInstantiate());
+                ASSERT_TRUE(graph.launch());
                 ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
                 const auto replay_host =
                     copyCudaFP32TensorToHost(grouped_output, stream_);
@@ -16116,8 +16149,6 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                     replay_host.size(),
                     static_cast<size_t>(d_model));
 
-                EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-                EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
                 grouped_stage->unbindWorkspace();
             }
 
@@ -16304,18 +16335,15 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAc
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "shared-expert gate effective-sequence capture");
     const bool captured_gate = cuda_kernel_->sharedExpertGateAddFromTensorsEffectiveSeqLen(
         input_cuda.get(), gate_cuda.get(), shared_cuda.get(),
         residual_cuda.get(), combined_cuda.get(),
         bucket_seq_len, d_model, device_effective_seq_len);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_gate);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
 
     effective_seq_len = replay_real_seq_len;
     ASSERT_EQ(cudaMemcpyAsync(device_effective_seq_len,
@@ -16344,7 +16372,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAc
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const float *shared_actual = shared_cuda->data();
@@ -16371,8 +16399,6 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAc
         }
     }
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     ASSERT_EQ(cudaFree(device_effective_seq_len), cudaSuccess);
 #endif
 }
@@ -17652,22 +17678,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
                        /*max_row_relative_l2=*/0.008,
                        /*max_row_kl=*/1.0e-4);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "fused runtime expert decode capture");
     const bool captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
         runtime_layer, hidden.get(), gateup_table, down_table, top_k,
         fused_output.get(), d_model, intermediate);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_fused);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
     std::vector<float> replay_values(
         fused_output->data(),
@@ -17812,35 +17832,29 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
         << "eager route+fused decode should still reuse router Q8 hidden scratch";
 
     llaminar2::PerfStatsCollector::reset();
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "router-Q8 fused runtime decode capture");
     bool captured_route = false;
     bool captured_fused = false;
-    {
-        llaminar2::GraphCaptureGuard capture_guard;
-        captured_route = cuda_kernel_->decodeRouteSelect(
-            runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
-            true, route_indices.get(), route_weights.get(),
-            /*write_legacy_outputs=*/true, /*update_runtime_histogram=*/true);
-        captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
-            runtime_layer, hidden.get(), gateup_table, down_table, top_k,
-            output.get(), d_model, intermediate);
-    }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+    captured_route = cuda_kernel_->decodeRouteSelect(
+        runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
+        true, route_indices.get(), route_weights.get(),
+        /*write_legacy_outputs=*/true, /*update_runtime_histogram=*/true);
+    captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
+        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+        output.get(), d_model, intermediate);
     EXPECT_TRUE(captured_route);
     EXPECT_TRUE(captured_fused);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
+    ASSERT_TRUE(graph.finishAndInstantiate());
     EXPECT_FALSE(llaminar2::PerfStatsCollector::snapshot(
                      {"kernel.cuda_moe_gateup_reused_router_q8_hidden_calls"})
                      .empty())
         << "the graph-ordered gate/up consumer must reuse Q8 rows published by "
            "the router producer recorded earlier in the same capture";
 
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
     for (int replay = 0; replay < 3; ++replay)
-        ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+        ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoELayerRuntime host_runtime{};
@@ -17857,8 +17871,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
     for (size_t i = 0; i < output->numel(); ++i)
         ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -18034,23 +18046,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
         llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "runtime descriptor-table replay capture");
     const bool captured = cuda_kernel_->groupedExpertDecodeFromRuntime(
         device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
         runtime_output.get(), d_model, intermediate,
         llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
     ASSERT_EQ(cudaMemcpyAsync(device_runtime, &runtime_fresh, sizeof(runtime_fresh),
                               cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::vector<float> runtime_values(
@@ -18064,8 +18072,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
     EXPECT_GT(relativeL2Error(runtime_values.data(), stale_values.data(), runtime_values.size()), 0.01)
         << "graph replay followed the stale descriptor table instead of device runtime descriptors";
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     ASSERT_EQ(cudaFree(device_runtime), cudaSuccess);
 #endif
 }
@@ -18364,25 +18370,19 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             prefill_values.size(),
             static_cast<size_t>(d_model));
 
-        ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+        ScopedCudaTestGraph graph(
+            stream_,
+            "runtime-M routed verifier prefill capture");
         const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
             routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k);
         const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k);
-        cudaGraph_t graph = nullptr;
-        const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
         EXPECT_TRUE(captured_grouping);
         EXPECT_TRUE(captured_prefill);
-        ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-        ASSERT_NE(graph, nullptr);
-
-        cudaGraphExec_t executable = nullptr;
-        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-        ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+        ASSERT_TRUE(graph.finishAndInstantiate());
+        ASSERT_TRUE(graph.launch());
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
         const float *captured_output = prefill_output->data();
         for (size_t i = 0; i < prefill_output->numel(); ++i)
@@ -19000,24 +19000,18 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
             prefill_values.size(),
             static_cast<size_t>(d_model));
 
-        ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+        ScopedCudaTestGraph graph(
+            stream_,
+            "runtime-M shared verifier prefill capture");
         const bool captured_grouping = cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len);
         const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k);
-        cudaGraph_t graph = nullptr;
-        const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
         EXPECT_TRUE(captured_grouping);
         EXPECT_TRUE(captured_prefill);
-        ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-        ASSERT_NE(graph, nullptr);
-
-        cudaGraphExec_t executable = nullptr;
-        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-        ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+        ASSERT_TRUE(graph.finishAndInstantiate());
+        ASSERT_TRUE(graph.launch());
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
         expect_shared_group_record(seq_len);
         expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
@@ -20438,32 +20432,26 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "large all-expert fixed-topology prefill capture");
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
     const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
         hidden.get(), output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_grouping);
     EXPECT_TRUE(captured_prefill);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const float *output_data = output->data();
     for (size_t i = 0; i < output->numel(); ++i)
         ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -20575,22 +20563,18 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
         seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "padded-route fixed-topology prefill capture");
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
     const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
         hidden.get(), output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_grouping);
     EXPECT_TRUE(captured_prefill);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     fill_routes(/*mask_tail=*/true);
@@ -20601,7 +20585,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
     ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
     ASSERT_TRUE(output->ensureOnDevice(device, stream_));
 
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     std::vector<float> replayed_output(output->numel());
     ASSERT_EQ(cudaMemcpyAsync(
                   replayed_output.data(),
@@ -20639,8 +20623,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
         }
     }
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 
@@ -20767,24 +20749,20 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
         seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "Q8 fused fixed-topology prefill capture");
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
     const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
         hidden.get(), fused_output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_grouping);
     EXPECT_TRUE(captured_prefill);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::vector<float> fused_values(
@@ -20806,8 +20784,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
@@ -20981,21 +20957,17 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
         seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "IQ3_S fused fixed-topology prefill capture");
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
     const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
         hidden.get(), fused_output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_grouping);
     EXPECT_TRUE(captured_prefill);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
 
     /*
      * Bucketed prefill graph cache captures once and then replays against new
@@ -21025,7 +20997,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
         split_output->data() + split_output->numel());
 
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::vector<float> fused_values(
@@ -21044,8 +21016,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
@@ -21219,21 +21189,17 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
         seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "Q6_K fused fixed-topology prefill capture");
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
     const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
         hidden.get(), fused_output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_grouping);
     EXPECT_TRUE(captured_prefill);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    cudaGraphExec_t executable = nullptr;
-    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
 
     /*
      * Replay against a new request payload. If the graph captured stale host
@@ -21262,7 +21228,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
         split_output->data() + split_output->numel());
 
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::vector<float> fused_values(
@@ -21281,8 +21247,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
 
-    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
@@ -21424,20 +21388,18 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     for (int i = 0; i < d_model; ++i)
         ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "runtime grouped decode descriptor capture");
     const bool captured_gateup = cuda_kernel_->groupedExpertGateUpDecodeFromRuntime(
         runtime_layer, hidden.get(), gateup_table, top_k,
         gate_outputs.data(), up_outputs.data(), d_model, intermediate);
     const bool captured_down = cuda_kernel_->groupedExpertDownDecodeFromRuntime(
         gate_outputs.data(), up_outputs.data(), runtime_layer, down_table, top_k,
         output.get(), d_model, intermediate);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_gateup);
     EXPECT_TRUE(captured_down);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    if (graph)
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    graph.finish();
 
     expectGroupedDecodeCounter(
         "cuda_moe_grouped_decode_gateup_calls", "runtime", top_k, d_model, intermediate);
@@ -21528,20 +21490,18 @@ TEST_F(Test__CUDAMoEKernel, StaticGroupedDecodeDescriptorPathCapturesAfterWarmup
     for (int i = 0; i < d_model; ++i)
         ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
 
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ScopedCudaTestGraph graph(
+        stream_,
+        "static grouped decode descriptor capture");
     const bool captured_gateup = cuda_kernel_->groupedExpertGateUpDecodeFromTable(
         hidden.get(), expert_ids, gateup_table, num_active,
         gate_outputs.data(), up_outputs.data(), d_model, intermediate);
     const bool captured_down = cuda_kernel_->groupedExpertDownDecodeFromTable(
         gate_outputs.data(), up_outputs.data(), expert_ids, expert_weights,
         down_table, num_active, output.get(), d_model, intermediate);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_gateup);
     EXPECT_TRUE(captured_down);
-    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
-    if (graph)
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    graph.finish();
 
     auto *workspace_consumer =
         dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);

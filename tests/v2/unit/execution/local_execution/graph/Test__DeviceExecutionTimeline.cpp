@@ -58,10 +58,16 @@ namespace llaminar2::test
 
         const auto host_result =
             publication.to(DeviceTimelineRole::HostResultBridge);
-        const auto rank_collective =
-            publication.to(DeviceTimelineRole::RankCollective);
+        const auto accepted_state =
+            publication.to(DeviceTimelineRole::AcceptedStatePublication);
         EXPECT_TRUE(host_result.validForConsumption());
-        EXPECT_TRUE(rank_collective.validForConsumption());
+        EXPECT_TRUE(accepted_state.validForConsumption());
+
+        EXPECT_FALSE(
+            publication.to(DeviceTimelineRole::RankCollective)
+                .validForConsumption())
+            << "A mirrored verifier outcome is already participant-local and "
+               "must not acquire a second rank-owned publication phase.";
 
         EXPECT_FALSE(
             publication.to(DeviceTimelineRole::MainForwardGraph)
@@ -73,31 +79,6 @@ namespace llaminar2::test
                 .from(DeviceTimelineRole::MainForwardGraph)
                 .validForPublication())
             << "The forward graph cannot impersonate the verifier summary.";
-    }
-
-    TEST(Test__DeviceExecutionTimeline, RankCompactResponseOwnsPostCollectiveFlow)
-    {
-        const auto publication =
-            DeviceEventEdge::at(
-                DeviceTimelinePoint::RankCompactSpeculativeResponseReady)
-                .from(DeviceTimelineRole::RankCollective);
-        EXPECT_TRUE(publication.validForPublication());
-        EXPECT_TRUE(
-            publication.to(DeviceTimelineRole::HostResultBridge)
-                .validForConsumption());
-        EXPECT_TRUE(
-            publication.to(DeviceTimelineRole::AcceptedStatePublication)
-                .validForConsumption());
-        EXPECT_FALSE(
-            publication.to(DeviceTimelineRole::MainForwardGraph)
-                .validForConsumption());
-        EXPECT_FALSE(
-            DeviceEventEdge::at(
-                DeviceTimelinePoint::RankCompactSpeculativeResponseReady)
-                .from(DeviceTimelineRole::VerifierSummary)
-                .validForPublication())
-            << "A child-local verifier summary cannot impersonate completed "
-               "rank publication.";
     }
 
     TEST(Test__DeviceExecutionTimeline, RequestInputBankDeclaresBidirectionalLifetime)

@@ -59,7 +59,6 @@ namespace llaminar2
         MoERebalanceMaintenanceReady,
         ForwardGraphOutputReady,
         CompactSpeculativeResponseReady,
-        RankCompactSpeculativeResponseReady,
         Count,
     };
 

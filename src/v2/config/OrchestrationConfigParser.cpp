@@ -1946,7 +1946,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
+            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

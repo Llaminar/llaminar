@@ -231,6 +231,39 @@ TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_AllLayers)
     EXPECT_TRUE(result.execution_info.has_lm_head);
 }
 
+/**
+ * @brief Prove terminal MTP ownership originates in the model graph definition.
+ *
+ * Runtime graph-family selection may choose greedy or stochastic reduction, but
+ * it must not infer whether rank orchestration or each graph participant owns
+ * the result. Qwen declares participant-local ownership here; QwenGraphBase is
+ * then responsible for lowering that immutable policy into concrete stages.
+ */
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice,
+       BuildGraphConfig_DeclaresParticipantLocalMTPVerifierOutcomeOwnership)
+{
+    GraphConfig config;
+    ASSERT_TRUE(builder->buildGraphConfig(
+        plan,
+        model_config,
+        g_stub_weight_manager,
+        config));
+
+    EXPECT_EQ(
+        config.mtp_verifier_outcome_ownership,
+        MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal);
+    EXPECT_EQ(
+        config.mtp_request_terminal_hidden_publication,
+        MTPRequestTerminalHiddenPublicationPolicy::
+            GraphCapturedDeviceGeometry)
+        << "Qwen must declare prompt-width-total device geometry in the graph definition; runtime code may not invent selector topology.";
+    EXPECT_EQ(
+        config.mtp_shifted_prefill_hidden_publication,
+        MTPShiftedPrefillHiddenPublicationPolicy::
+            GraphCapturedDeviceKVProgress)
+        << "Qwen must declare that shifted-prefill hidden rows are selected from graph-captured, device-owned KV progress.";
+}
+
 // ============================================================================
 // Pipeline Parallelism Tests
 // ============================================================================

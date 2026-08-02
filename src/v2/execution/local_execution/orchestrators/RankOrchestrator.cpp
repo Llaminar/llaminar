@@ -1077,7 +1077,6 @@ namespace llaminar2
         //
         // The WeightManager now handles all device-aware weight management centrally.
         // =====================================================================
-        bool overlay_weights_prepared_by_parent = false;
         {
             // Collect device IDs for preloading
             std::vector<DeviceId> device_ids;
@@ -1133,29 +1132,13 @@ namespace llaminar2
                         LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
                     }
 
-                    if (config_.moe_routed_expert_plan &&
-                        config_.moe_routed_expert_plan->isTieredOverlay())
-                    {
-                        if (auto concrete_weight_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr))
-                        {
-                            const int overlay_rank = config_.moe_expert_overlay_mpi_ctx
-                                                         ? config_.moe_expert_overlay_mpi_ctx->rank()
-                                                         : 0;
-                            auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-                                config_.moe_routed_expert_plan,
-                                MoEExpertOverlayRuntimeResolverOptions{
-                                    .current_world_rank = overlay_rank,
-                                });
-                            LOG_DEBUG("RankOrchestrator: Preparing LocalTP MoE overlay expert weights once for "
-                                      << device_ids.size() << " device(s)");
-                            if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(*runtime_plan))
-                            {
-                                throw std::runtime_error(
-                                    "RankOrchestrator: failed to prepare LocalTP MoE overlay expert weights");
-                            }
-                            overlay_weights_prepared_by_parent = true;
-                        }
-                    }
+                    /**
+                     * Routed-overlay engines are deliberately not prepared here.
+                     * This parent owns only mutable preload caches; it does not own
+                     * the per-runner frozen TP/replication bindings that define the
+                     * graph's actual weight identity. Each device runner prepares
+                     * its overlay from that immutable set during materialization.
+                     */
                 }
             }
         }
@@ -1187,7 +1170,7 @@ namespace llaminar2
             DeviceId device_id = device_addr.toLocalDeviceId();
 
             futures.push_back(std::async(std::launch::async,
-                                         [this, device_idx, device_id, overlay_weights_prepared_by_parent]() -> RunnerResult
+                                         [this, device_idx, device_id]() -> RunnerResult
                                          {
                                              RunnerResult result;
                                              result.device_idx = device_idx;
@@ -1215,8 +1198,6 @@ namespace llaminar2
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
                                                  runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
-                                                 runner_config.moe_expert_overlay_weights_prepared_by_parent =
-                                                     overlay_weights_prepared_by_parent;
                                                  runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
                                                  runner_config.cancellation_requested = [this]()
                                                  {
@@ -5139,25 +5120,6 @@ namespace llaminar2
         if (!all_success)
             return false;
 
-        /*
-         * Every mirrored child has produced a full-vocabulary proposal, but the
-         * rank publishes child zero as the one authoritative value. Broadcasting
-         * the compact INT32 slots keeps later chained sidecars and the verifier
-         * bitwise aligned without an MTP-logit allreduce or any host comparison.
-         */
-        for (int request = 0; request < request_batch; ++request)
-        {
-            const int slot = first_draft_slot + request * draft_slot_stride;
-            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-                    DeviceDistributionBuffer::Draft,
-                    slot))
-            {
-                return fail(
-                    "could not collectively publish primary proposal slot " +
-                    std::to_string(slot));
-            }
-        }
-
         PerfStatsCollector::addCounter(
             "mtp",
             "rank_mirrored_localtp_resident_request_batch_sidecars",
@@ -5179,7 +5141,8 @@ namespace llaminar2
              {"source", source},
              {"first_slot", std::to_string(first_draft_slot)},
              {"slot_stride", std::to_string(draft_slot_stride)},
-             {"collective", "nccl_rccl_int32_broadcast"}});
+             {"implementation", "participant_local_device_slots"},
+             {"collective", "none"}});
         return true;
     }
 
@@ -7059,8 +7022,7 @@ namespace llaminar2
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax failed on primary participant");
                 return false;
             }
-            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-                    DeviceDistributionBuffer::Target,
+            if (!broadcastPrimaryLocalTPMainTargetSlotToChildren(
                     target_sample_slot))
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax could not broadcast the primary device slot");
@@ -7743,15 +7705,15 @@ namespace llaminar2
                 [](const DeviceSpeculativeOutcomeHandle &outcome)
                 {
                     return outcome
-                        .mirrored_local_tp_published_in_graph;
+                        .mirrored_local_tp_locally_complete;
                 });
         if (!every_child_published_in_graph)
         {
             if (tp_ctx_)
                 tp_ctx_->requestAbort();
             throw std::runtime_error(
-                "Mirrored LocalTP greedy outcomes were not published by the "
-                "captured verifier graph on every participant");
+                "Mirrored LocalTP greedy outcomes were not produced locally "
+                "by every participant");
         }
 
         rank_mirrored_child_outcomes_ = std::move(child_outcomes);
@@ -7773,7 +7735,8 @@ namespace llaminar2
                 {{"participants", std::to_string(device_runners_.size())},
                  {"compare_rows", std::to_string(compare_rows)},
                  {"implementation",
-                  "graph_captured_primary_outcome_broadcast"}});
+                  "graph_captured_participant_local_outcomes"},
+                 {"collective", "none"}});
         }
         return rank_compact_outcome_valid_;
     }
@@ -7847,9 +7810,9 @@ namespace llaminar2
                 return false;
             }
         }
-        if (!broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
+        if (!validateMirroredLocalTPChildOutcomesComplete(
                 child_outcomes,
-                "rank_mirrored_localtp_greedy_request_batch_common_outcome"))
+                "rank_mirrored_localtp_greedy_request_batch_local_outcomes"))
         {
             return false;
         }
@@ -7871,7 +7834,8 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
-                 {"implementation", "primary_child_outcome_device_broadcast"}});
+                 {"implementation", "participant_local_device_outcomes"},
+                 {"collective", "none"}});
         }
         return rank_compact_outcome_valid_;
     }
@@ -7927,9 +7891,9 @@ namespace llaminar2
                 return false;
             }
         }
-        if (!broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
+        if (!validateMirroredLocalTPChildOutcomesComplete(
                 child_outcomes,
-                "rank_mirrored_localtp_stochastic_common_outcome"))
+                "rank_mirrored_localtp_stochastic_local_outcomes"))
         {
             return false;
         }
@@ -7951,56 +7915,43 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
-                 {"implementation", "primary_child_outcome_device_broadcast"}});
+                 {"implementation", "participant_local_device_outcomes"},
+                 {"collective", "none"}});
         }
         return rank_compact_outcome_valid_;
     }
 
-    bool RankOrchestrator::broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
-        std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
+    bool RankOrchestrator::validateMirroredLocalTPChildOutcomesComplete(
+        const std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
         const char *context_name)
     {
-        const std::string stage_name =
+        const std::string operation_name =
             context_name && context_name[0] != '\0'
                 ? std::string(context_name)
-                : std::string("rank_mirrored_localtp_common_outcome");
+                : std::string("rank_mirrored_localtp_local_outcomes");
         auto fail = [&](const std::string &reason) -> bool
         {
-            LOG_ERROR("[RankOrchestrator] " << stage_name << ": " << reason);
+            LOG_ERROR("[RankOrchestrator] " << operation_name << ": " << reason);
             return false;
         };
 
-        if (!tp_ctx_ ||
-            device_runners_.size() < 2 ||
-            child_outcomes.size() != device_runners_.size() ||
-            tp_ctx_->degree() != static_cast<int>(device_runners_.size()))
+        if (device_runners_.size() < 2 ||
+            child_outcomes.size() != device_runners_.size())
         {
             return fail(
-                "common outcome broadcast requires a complete LocalTP context and one child outcome per participant");
+                "participant-local outcome validation requires one child handle per LocalTP participant");
         }
 
         const DeviceSpeculativeOutcomeHandle &primary = child_outcomes.front();
         if (!primary.valid())
-        {
             return fail("primary mirrored child outcome is invalid");
-        }
-
-        const size_t token_elements =
-            static_cast<size_t>(primary.request_count) *
-            static_cast<size_t>(primary.output_token_stride);
-        const size_t meta_elements =
-            static_cast<size_t>(primary.request_count) *
-            static_cast<size_t>(primary.meta_stride);
-        if (token_elements == 0 || meta_elements == 0)
-        {
-            return fail("primary mirrored child outcome has empty compact buffers");
-        }
 
         /*
-         * Validate everything that can be checked without entering a collective
-         * before any participant records NCCL/RCCL work. If one participant
-         * were to fail a local precondition after another entered the broadcast,
-         * the peer could wait indefinitely inside the collective.
+         * Production never copies these compact rows to compare them. The
+         * grouped verifier parity suites prove byte identity across the same
+         * deterministic local kernels. Runtime validates only the complete
+         * ownership contract and fails hard if any participant did not execute
+         * the participant-local path.
          */
         for (size_t i = 0; i < child_outcomes.size(); ++i)
         {
@@ -8033,108 +7984,34 @@ namespace llaminar2
             if (!child.device.is_gpu())
             {
                 return fail(
-                    "mirrored common outcome broadcast is GPU-only; participant " +
+                    "mirrored participant-local outcomes are GPU-only; participant " +
                     std::to_string(i) + " is " + child.device.toString());
             }
-        }
-
-        /*
-         * Describe the whole rank publication before entering NCCL/RCCL. The
-         * LocalTP context lowers this participant-major matrix into one backend
-         * group over the exact streams that produced each compact mailbox.
-         * There is deliberately no host worker dispatch or completion fence:
-         * group submission is a non-blocking host call, while producer and
-         * consumer ordering remains encoded by the device streams themselves.
-         */
-        std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
-            participant_sidebands(device_runners_.size());
-        std::vector<void *> producer_streams(device_runners_.size(), nullptr);
-        for (size_t i = 0; i < child_outcomes.size(); ++i)
-        {
-            const DeviceSpeculativeOutcomeHandle &child = child_outcomes[i];
-            const bool is_root = i == 0;
-
-            LocalTPCollectiveSidebandBuffer output_tokens;
-            output_tokens.kind =
-                LocalTPCollectiveSidebandKind::Broadcast;
-            output_tokens.send_buffer =
-                is_root ? primary.output_tokens_device : nullptr;
-            output_tokens.recv_buffer =
-                const_cast<int32_t *>(child.output_tokens_device);
-            output_tokens.element_count = token_elements;
-            output_tokens.dtype = CollectiveDataType::INT32;
-            output_tokens.root_device_index = 0;
-            output_tokens.name = "mtp_common_outcome_tokens";
-
-            LocalTPCollectiveSidebandBuffer meta;
-            meta.kind = LocalTPCollectiveSidebandKind::Broadcast;
-            meta.send_buffer = is_root ? primary.meta_device : nullptr;
-            meta.recv_buffer = const_cast<int *>(child.meta_device);
-            meta.element_count = meta_elements;
-            meta.dtype = CollectiveDataType::INT32;
-            meta.root_device_index = 0;
-            meta.name = "mtp_common_outcome_meta";
-
-            auto &sidebands = participant_sidebands[i];
-            sidebands.reserve(2);
-            sidebands.push_back(std::move(output_tokens));
-            sidebands.push_back(std::move(meta));
-            producer_streams[i] = child.stream;
-        }
-        if (!tp_ctx_->collectiveSidebandsMultiOnStreams(
-                participant_sidebands,
-                producer_streams,
-                stage_name))
-        {
-            return fail(
-                "device-side common outcome grouped publication failed");
-        }
-
-        /*
-         * The child-local event initially names verifier-summary completion.
-         * Once NCCL/RCCL is queued, the compact bytes are rank-authoritative
-         * only after that collective on each exact participant stream. Re-record
-         * the preallocated event at this stronger named timeline point. The
-         * final host bridge waits on the primary participant's post-collective
-         * edge, which also guarantees that every non-root timing stop event
-         * ordered before collective entry can be reclaimed without a sync.
-         */
-        for (size_t i = 0; i < child_outcomes.size(); ++i)
-        {
-            DeviceSpeculativeOutcomeHandle &child = child_outcomes[i];
-            IInferenceRunner *runner = device_runners_[i].get();
-            if (!runner ||
-                !runner->publishRankCompactSpeculativeResponseReady(&child))
+            if (!child.mirrored_local_tp_locally_complete)
+                return fail(
+                    "participant " +
+                    std::to_string(i) +
+                    " did not publish a complete local mirrored outcome");
+            if (!child.stream || !child.response_ready_event)
             {
                 return fail(
-                    "could not publish post-collective compact outcome for "
                     "participant " +
-                    std::to_string(i));
+                    std::to_string(i) +
+                    " did not retain its exact outcome producer stream/event");
             }
         }
 
         PerfStatsCollector::addCounter(
             "mtp",
-            "rank_mirrored_localtp_common_outcome_broadcasts",
-            1.0,
+            "rank_mirrored_localtp_participant_local_outcomes",
+            static_cast<double>(child_outcomes.size()),
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
              {"request_count", std::to_string(primary.request_count)},
-             {"output_token_elements", std::to_string(token_elements)},
-             {"meta_elements", std::to_string(meta_elements)},
-             {"implementation", "localtp_grouped_multi_stream_broadcast"},
-             {"host_worker_rendezvous", "false"},
-             {"context", stage_name}});
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "rank_mirrored_localtp_post_collective_response_publications",
-            static_cast<double>(child_outcomes.size()),
-            "decode",
-            "rank",
-            {{"participants", std::to_string(child_outcomes.size())},
-             {"timeline_point",
-              "rank_compact_speculative_response_ready"}});
+             {"implementation", "independent_identical_device_outcomes"},
+             {"collective", "none"},
+             {"context", operation_name}});
         return true;
     }
 
@@ -8876,23 +8753,17 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-        DeviceDistributionBuffer buffer,
+    bool RankOrchestrator::broadcastPrimaryLocalTPMainTargetSlotToChildren(
         int slot)
     {
         if (device_runners_.size() < 2 ||
             !tp_ctx_ ||
             !usesMirroredLocalTPMTPHeadForVerifier() ||
-            (buffer != DeviceDistributionBuffer::Target &&
-             buffer != DeviceDistributionBuffer::Draft) ||
             slot < 0 ||
             slot >= rank_stochastic_slot_capacity_)
         {
             return false;
         }
-
-        const bool target_slot = buffer == DeviceDistributionBuffer::Target;
-        const char *slot_name = target_slot ? "target" : "draft";
 
         std::vector<DeviceStochasticSampleSlotHandle> child_slots(
             device_runners_.size());
@@ -8904,31 +8775,21 @@ namespace llaminar2
                 !runner->supportsDeviceStochasticMTPVerification())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
-                          << slot_name
-                          << " slot broadcast requires every child to expose mirrored device stochastic support; participant "
+                          "main-target slot broadcast requires every child to expose mirrored device stochastic support; participant "
                           << child << " is not ready");
                 return false;
             }
 
             child_slots[child] =
-                target_slot
-                    ? (child == 0
-                           ? runner->deviceStochasticTargetSampleProducerSlot(
-                                 slot)
-                           : runner
-                                 ->deviceStochasticTargetSampleBroadcastDestinationSlot(
-                                     slot))
-                    : (child == 0
-                           ? runner->deviceStochasticDraftSampleProducerSlot(
-                                 slot)
-                           : runner
-                                 ->deviceStochasticDraftSampleBroadcastDestinationSlot(
-                                     slot));
+                child == 0
+                    ? runner->deviceStochasticTargetSampleProducerSlot(slot)
+                    : runner
+                          ->deviceStochasticTargetSampleBroadcastDestinationSlot(
+                              slot);
             if (!child_slots[child].valid())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
-                          << slot_name
-                          << " slot broadcast could not acquire "
+                          "main-target slot broadcast could not acquire "
                           << (child == 0
                                   ? "ready primary producer"
                                   : "predecessor-ordered destination")
@@ -8959,7 +8820,6 @@ namespace llaminar2
         tp_worker_pool_->dispatch(
             [this,
              slot,
-             target_slot,
              &child_slots,
              kernel_phase,
              rocm_phase,
@@ -8985,17 +8845,13 @@ namespace llaminar2
                 sampled_token.element_count = 1;
                 sampled_token.dtype = CollectiveDataType::INT32;
                 sampled_token.root_device_index = 0;
-                sampled_token.name = target_slot
-                                         ? "mtp_mirrored_main_target_token"
-                                         : "mtp_mirrored_stochastic_draft_token";
+                sampled_token.name = "mtp_mirrored_main_target_token";
 
                 const bool broadcast_ok = tp_ctx_->collectiveSidebandOnStream(
                     {sampled_token},
                     static_cast<int>(child),
                     child_slots[child].stream,
-                    target_slot
-                        ? "mtp_rank_mirrored_main_target_token_broadcast"
-                        : "mtp_rank_mirrored_stochastic_draft_token_broadcast");
+                    "mtp_rank_mirrored_main_target_token_broadcast");
                 if (!broadcast_ok)
                     return false;
 
@@ -9006,17 +8862,11 @@ namespace llaminar2
                  * common rank-owned token rather than any pre-broadcast
                  * child-local sampler event.
                  */
-                return target_slot
-                           ? device_runners_[child]
-                                 ->recordStochasticTargetSampleSlotReadyFromDevice(
-                                     slot,
-                                     child_slots[child].stream,
-                                     /*verifier_consumer_pending=*/true)
-                           : device_runners_[child]
-                                 ->recordStochasticDraftSampleSlotReadyFromDevice(
-                                     slot,
-                                     child_slots[child].stream,
-                                     /*verifier_consumer_pending=*/true);
+                return device_runners_[child]
+                    ->recordStochasticTargetSampleSlotReadyFromDevice(
+                        slot,
+                        child_slots[child].stream,
+                        /*verifier_consumer_pending=*/true);
             });
 
         bool all_success = true;
@@ -9029,7 +8879,7 @@ namespace llaminar2
         {
             if (!r.completed)
             {
-                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: participant "
+                LOG_ERROR("RankOrchestrator::broadcastPrimaryLocalTPMainTargetSlotToChildren: participant "
                           << r.worker_index << " did not complete");
                 worker_timeout = true;
                 all_success = false;
@@ -9047,7 +8897,7 @@ namespace llaminar2
             }
             if (!r.success)
             {
-                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: participant "
+                LOG_ERROR("RankOrchestrator::broadcastPrimaryLocalTPMainTargetSlotToChildren: participant "
                           << r.worker_index << " failed");
                 all_success = false;
             }
@@ -9055,14 +8905,14 @@ namespace llaminar2
         if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
-                "broadcastPrimaryMirroredLocalTPSampleSlotToChildren",
+                "broadcastPrimaryLocalTPMainTargetSlotToChildren",
                 collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
         if (first_exception)
         {
-            LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: rethrowing primary exception from participant "
+            LOG_ERROR("RankOrchestrator::broadcastPrimaryLocalTPMainTargetSlotToChildren: rethrowing primary exception from participant "
                       << first_exception_child);
             std::rethrow_exception(first_exception);
         }
@@ -9070,15 +8920,13 @@ namespace llaminar2
         {
             PerfStatsCollector::addCounter(
                 "mtp",
-                target_slot
-                    ? "rank_mirrored_localtp_main_target_slot_broadcasts"
-                    : "rank_mirrored_localtp_stochastic_draft_slot_broadcasts",
+                "rank_mirrored_localtp_main_target_slot_broadcasts",
                 1.0,
                 "decode",
                 "rank",
-                {{"participants", std::to_string(device_runners_.size())},
-                 {"slot", std::to_string(slot)},
-                 {"buffer", slot_name},
+                 {{"participants", std::to_string(device_runners_.size())},
+                  {"slot", std::to_string(slot)},
+                 {"buffer", "target"},
                  {"implementation", "primary_child_device_slot_broadcast"}});
         }
         return all_success;
@@ -9587,16 +9435,11 @@ namespace llaminar2
         if (usesMirroredLocalTPMTPHeadForVerifier())
         {
             /*
-             * Mirrored LocalTP MTP heads bind a full-vocabulary verifier head
-             * on every participant, but stochastic proposal is rank-owned:
-             * every participant must consume the same draft token in the next
-             * sidecar/verifier row.  Sampling every child independently makes
-             * the transaction depend on tiny backend/order differences in a
-             * stateful sampler.  Instead, child 0 is the authoritative full
-             * head for the proposal, and the rank immediately stages that
-             * sampled token into the verifier draft slot on every child.  Later
-             * GPU work still consumes device-resident draft slots; the
-             * host-visible return value is only the caller's response shadow.
+             * This host-returning API is a response/diagnostic boundary, not
+             * the production deferred lane. Child zero materializes its local
+             * token for the caller while every peer performs the same sampling
+             * operation without a host read. Each slot remains produced by its
+             * own sampler stream; no H2D restaging or rank collective follows.
              */
             for (size_t child = 0; child < device_runners_.size(); ++child)
             {
@@ -9611,44 +9454,51 @@ namespace llaminar2
                 }
             }
 
-            IInferenceRunner *primary = device_runners_.front().get();
-            const int sampled_token =
-                primary->sampleStochasticDraftProposalOnDevice(
-                    source,
-                    row,
-                    slot,
-                    params,
-                    vocab_size,
-                    threshold);
-            if (sampled_token < 0)
+            int sampled_token = -1;
+            for (size_t child = 0; child < device_runners_.size(); ++child)
             {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic draft proposal primary child failed device proposal sampling");
-                return -1;
-            }
-
-            const int32_t rank_token = static_cast<int32_t>(sampled_token);
-            if (!stageStochasticDraftTokensForDeviceVerification(
-                    &rank_token,
-                    /*draft_token_count=*/1,
-                    slot))
-            {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic draft proposal could not stage rank-owned token "
-                          << rank_token << " to all child device draft slots");
-                return -1;
+                const bool ok =
+                    child == 0
+                        ? ((sampled_token = device_runners_[child]
+                                                ->sampleStochasticDraftProposalOnDevice(
+                                                    source,
+                                                    row,
+                                                    slot,
+                                                    params,
+                                                    vocab_size,
+                                                    threshold)) >= 0)
+                        : device_runners_[child]
+                              ->sampleStochasticDraftProposalOnDeviceDeferred(
+                                  source,
+                                  row,
+                                  slot,
+                                  params,
+                                  vocab_size,
+                                  threshold);
+                if (!ok)
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic draft proposal participant "
+                              << child
+                              << " failed local device sampling for slot="
+                              << slot);
+                    return -1;
+                }
             }
 
             rank_stochastic_draft_sample_tokens_[static_cast<size_t>(slot)] =
-                rank_token;
+                static_cast<int32_t>(sampled_token);
             PerfStatsCollector::addCounter(
                 "mtp",
                 "rank_mirrored_localtp_stochastic_draft_proposals",
                 1.0,
                 "decode",
-                "rank",
-                {{"participants", std::to_string(device_runners_.size())},
-                 {"slot", std::to_string(slot)},
-                 {"implementation", "primary_child_full_vocab_rank_staged"}});
-            return rank_token;
+                 "rank",
+                 {{"participants", std::to_string(device_runners_.size())},
+                  {"slot", std::to_string(slot)},
+                  {"implementation", "participant_local_identical_samples"},
+                  {"collective", "none"},
+                  {"host_reads", "primary_response_only"}});
+            return sampled_token;
         }
 
         (void)params;
@@ -9739,25 +9589,31 @@ namespace llaminar2
                 }
             }
 
-            IInferenceRunner *primary = device_runners_.front().get();
-            if (!primary->sampleStochasticDraftProposalOnDeviceDeferred(
-                    source,
-                    row,
-                    slot,
-                    params,
-                    vocab_size,
-                    threshold))
+            /*
+             * Each child consumes its exact pending MTP-sidecar stream and
+             * records its own sample-ready event. The argmax kernel is
+             * deterministic over byte-identical mirrored logits, so this
+             * locally complete publication is the production invariant. A
+             * host comparison or corrective token broadcast would merely hide
+             * a grouped-decode parity defect and is intentionally absent.
+             */
+            for (size_t child = 0; child < device_runners_.size(); ++child)
             {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal primary child failed device proposal sampling");
-                return false;
-            }
-            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-                    DeviceDistributionBuffer::Draft,
-                    slot))
-            {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal could not broadcast primary child device slot="
-                          << slot << " to all participants");
-                return false;
+                if (!device_runners_[child]
+                         ->sampleStochasticDraftProposalOnDeviceDeferred(
+                             source,
+                             row,
+                             slot,
+                             params,
+                             vocab_size,
+                             threshold))
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal participant "
+                              << child
+                              << " failed local device proposal sampling for slot="
+                              << slot);
+                    return false;
+                }
             }
 
             rank_stochastic_draft_sample_tokens_[static_cast<size_t>(slot)] = -1;
@@ -9766,10 +9622,11 @@ namespace llaminar2
                 "rank_mirrored_localtp_stochastic_deferred_draft_proposals",
                 1.0,
                 "decode",
-                "rank",
-                {{"participants", std::to_string(device_runners_.size())},
-                 {"slot", std::to_string(slot)},
-                 {"implementation", "primary_child_device_slot_broadcast"}});
+                 "rank",
+                 {{"participants", std::to_string(device_runners_.size())},
+                  {"slot", std::to_string(slot)},
+                  {"implementation", "participant_local_identical_samples"},
+                  {"collective", "none"}});
             return true;
         }
 
@@ -9821,9 +9678,7 @@ namespace llaminar2
                                       slot,
                                       threshold);
             if (token < 0 ||
-                !broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-                    DeviceDistributionBuffer::Target,
-                    slot))
+                !broadcastPrimaryLocalTPMainTargetSlotToChildren(slot))
             {
                 return -1;
             }
@@ -9886,9 +9741,7 @@ namespace llaminar2
                          buffer,
                          slot,
                          threshold) ||
-                !broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
-                    DeviceDistributionBuffer::Target,
-                    slot))
+                !broadcastPrimaryLocalTPMainTargetSlotToChildren(slot))
             {
                 return false;
             }
@@ -11127,12 +10980,10 @@ namespace llaminar2
             outcome.stream == rank_mirrored_primary_outcome_.stream &&
             outcome.response_ready_event.get() ==
                 rank_mirrored_primary_outcome_.response_ready_event.get() &&
-            outcome.response_ready_after_rank_collective ==
-                rank_mirrored_primary_outcome_.response_ready_after_rank_collective &&
             outcome.mtp_transaction.state.get() ==
                 rank_mirrored_primary_outcome_.mtp_transaction.state.get() &&
-            outcome.mirrored_local_tp_published_in_graph ==
-                rank_mirrored_primary_outcome_.mirrored_local_tp_published_in_graph;
+            outcome.mirrored_local_tp_locally_complete ==
+                rank_mirrored_primary_outcome_.mirrored_local_tp_locally_complete;
 
         if (mirrored_kind &&
             rank_compact_outcome_valid_ &&
@@ -11176,11 +11027,11 @@ namespace llaminar2
                     << " candidate_ready=" << outcome.response_ready_event.get()
                     << " primary_ready="
                     << rank_mirrored_primary_outcome_.response_ready_event.get()
-                    << " candidate_rank_ready="
-                    << outcome.response_ready_after_rank_collective
-                    << " primary_rank_ready="
+                    << " candidate_local_complete="
+                    << outcome.mirrored_local_tp_locally_complete
+                    << " primary_local_complete="
                     << rank_mirrored_primary_outcome_
-                           .response_ready_after_rank_collective;
+                           .mirrored_local_tp_locally_complete;
             *error = message.str();
         }
         return false;
@@ -11222,8 +11073,8 @@ namespace llaminar2
                           << " request_count=" << handle.request_count
                           << " output_stride=" << handle.output_token_stride
                           << " meta_stride=" << handle.meta_stride
-                          << " rank_ready="
-                          << handle.response_ready_after_rank_collective);
+                          << " local_complete="
+                          << handle.mirrored_local_tp_locally_complete);
                 return false;
             }
 
@@ -11429,11 +11280,10 @@ namespace llaminar2
         }
 
         /*
-         * Each child still owns its local verifier state and publication stream,
-         * but the compact accept/reject mailbox has already been overwritten by
-         * the rank-level device broadcast.  Passing child-local handles here
-         * preserves stream ownership while every participant consumes the same
-         * accepted count, next-condition token, and stop/bonus metadata.
+         * Each child owns the verifier state, compact outcome, and exact stream
+         * that produced both. Passing child-local handles preserves that
+         * ownership while byte-identical mirrored inputs and deterministic
+         * reducers provide the common accepted count and next-condition token.
          */
         for (size_t i = 0; i < device_runners_.size(); ++i)
         {

@@ -548,6 +548,46 @@ namespace
             << "the source contract should document the parity reason for keeping MTP sidecar weights";
     }
 
+    /**
+     * @brief Replicated routed compute must materialize complete expert tensors.
+     *
+     * Graph lowering cannot make an expert device-local when the preceding
+     * LocalTP weight plan has already sliced that expert away. Keep the
+     * resolved graph policy wired into every TP-aware primary weight-plan site,
+     * while the plan builder applies the bypass only to routed-expert roles.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         ReplicatedRoutedComputeBypassesExpertAxisSlicing)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_NE(
+            source.find(
+                "graph_config.moe.routed_compute_policy ==\n"
+                "                   RoutedExpertComputePolicy::Replicated"),
+            std::string::npos)
+            << "weight materialization must derive full expert residency from the typed graph policy";
+        EXPECT_NE(
+            source.find(
+                "isRoutedExpertRole(inferWeightRole(weight_name))"),
+            std::string::npos)
+            << "the TP bypass must be limited to routed-expert tensors";
+        EXPECT_NE(
+            source.find(
+                "options.bypass_tensor_parallel || replicate_routed_weight"),
+            std::string::npos)
+            << "replicated routed requirements must select the full source tensor";
+        EXPECT_GE(
+            countFactorySourceOccurrences(
+                source,
+                "needsReplicatedRoutedExpertWeights(graph_config)"),
+            3u)
+            << "single, nested TP-in-PP, and LocalTP primary plans must share the same residency contract";
+    }
+
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlansMissingPlacementsFromModelMetadata)
     {
         auto model_ctx = makeMoEModelContext();

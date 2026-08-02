@@ -893,5 +893,102 @@ namespace
         }
     }
 
+    /**
+     * @brief Compare root-reduce against a directed route-slot gather.
+     *
+     * Canonical route slots have exactly one producing participant. Therefore
+     * the collective does not mathematically need to add two useful values:
+     * it only has to make every non-root participant's slots visible to the
+     * fixed root. This candidate uses graph-captured NCCL send/recv for that
+     * directed handoff, after which the production reducer could read the
+     * root-local and received banks in deterministic participant and router
+     * order. The compact M*d_model broadcast remains unchanged.
+     *
+     * This transport benchmark deliberately omits the tiny deterministic merge
+     * kernel, just as GraphCapturedRootReduceBroadcast omits the canonical
+     * reducer. Every participant nevertheless records the exact production
+     * ordering on its explicit stream: send/recv, reducer position, then
+     * broadcast. No peer memcpy, host staging, allocation, synchronization, or
+     * default-stream operation is introduced by this candidate.
+     *
+     * The current fixture has two participants, so the root receives one full
+     * route-slot bank. General degree-N lowering would provide one persistent
+     * receive bank per non-root and issue all matching receives in the same
+     * NCCL group before running the deterministic merge.
+     */
+    TEST_F(Perf__NCCLCollectiveLatency, GraphCapturedRootGatherBroadcast)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        std::cout << "\nCUDA peer access: "
+                  << (bidirectionalPeerAccessAvailable()
+                          ? "bidirectional P2P"
+                          : "unavailable; NCCL will use a non-P2P transport")
+                  << "\n";
+        std::cout << std::left << std::setw(10) << "operation"
+                  << std::setw(24) << "shape"
+                  << std::right << std::setw(10) << "bytes"
+                  << std::setw(12) << "median_us"
+                  << std::setw(12) << "p95_us"
+                  << std::setw(12) << "min_us"
+                  << std::setw(12) << "max_us" << '\n';
+
+        constexpr int root = 0;
+        constexpr int non_root = 1;
+        for (const MessageShape &shape : kMessageShapes)
+        {
+            if (shape.canonical_output_bytes == 0)
+                continue;
+
+            const size_t route_count = shape.send_bytes / sizeof(float);
+            const size_t output_count =
+                shape.canonical_output_bytes / sizeof(float);
+            captureCollective(
+                [&](int participant, ParticipantResources &resources)
+                {
+                    CollectiveP2POp route_handoff;
+                    route_handoff.count = route_count;
+                    route_handoff.dtype = CollectiveDataType::FLOAT32;
+                    if (participant == root)
+                    {
+                        route_handoff.kind = CollectiveP2POpKind::Recv;
+                        route_handoff.recv_buffer = resources.send_buffer;
+                        route_handoff.peer = non_root;
+                    }
+                    else
+                    {
+                        route_handoff.kind = CollectiveP2POpKind::Send;
+                        route_handoff.send_buffer = resources.buffer;
+                        route_handoff.peer = root;
+                    }
+
+                    if (!coordinator_.groupedP2PSingleDeviceOnStream(
+                            {route_handoff},
+                            participant,
+                            resources.stream))
+                    {
+                        return false;
+                    }
+
+                    /*
+                     * The production graph inserts its deterministic
+                     * participant/router-order merge here. The root's first
+                     * output_count values are a stable-address stand-in for
+                     * the merged row bank in this transport-only comparison.
+                     */
+                    return coordinator_.broadcastSingleDeviceOnStream(
+                        resources.buffer,
+                        resources.send_buffer,
+                        output_count,
+                        CollectiveDataType::FLOAT32,
+                        root,
+                        participant,
+                        resources.stream);
+                });
+            printResult("gath+bcast", shape, benchmarkCaptured());
+        }
+    }
+
 } // namespace
 } // namespace llaminar2

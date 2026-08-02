@@ -134,6 +134,8 @@ namespace llaminar2
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         RoutedExpertComputePolicy routed_compute_policy =
             RoutedExpertComputePolicy::Unspecified;
+        RoutedExpertPhasePolicy routed_phase_policy =
+            RoutedExpertPhasePolicy::Unspecified;
         RoutedExpertAssignmentPolicy routed_assignment_policy =
             RoutedExpertAssignmentPolicy::Unspecified;
 

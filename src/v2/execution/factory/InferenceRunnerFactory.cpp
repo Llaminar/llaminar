@@ -365,18 +365,47 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &*it;
         }
 
-        bool allRoutedOverlayDomainsUseExpertIdApportionment(const MoERoutedExpertPlacementPlan &plan)
+        std::optional<RoutedExpertComputePolicy> routedOverlayComputePolicy(
+            const MoERoutedExpertPlacementPlan &plan,
+            std::string *error)
         {
-            if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
-                return false;
+            RoutedExpertComputePolicy policy =
+                RoutedExpertComputePolicy::Apportioned;
+            bool saw_policy = false;
 
             for (const auto &tier : plan.routed_tiers)
             {
                 const auto *domain = findMoEExpertDomain(plan, tier.domain);
-                if (!domain || domain->routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
-                    return false;
+                if (!domain)
+                    continue;
+
+                if (!saw_policy)
+                {
+                    policy = domain->routed_compute_policy;
+                    saw_policy = true;
+                    continue;
+                }
+
+                if (domain->routed_compute_policy != policy)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "mixed routed expert compute policies are not supported in one graph-native overlay: " +
+                            std::string(
+                                routedExpertComputePolicyToString(policy)) +
+                            " and " +
+                            routedExpertComputePolicyToString(
+                                domain->routed_compute_policy);
+                    }
+                    return std::nullopt;
+                }
             }
-            return true;
+
+            return saw_policy
+                       ? std::optional<RoutedExpertComputePolicy>(policy)
+                       : std::optional<RoutedExpertComputePolicy>(
+                             RoutedExpertComputePolicy::Apportioned);
         }
 
         std::optional<RoutedExpertAssignmentPolicy> routedOverlayAssignmentPolicy(
@@ -414,6 +443,47 @@ namespace llaminar2
 
             return saw_policy ? std::optional<RoutedExpertAssignmentPolicy>(policy)
                               : std::optional<RoutedExpertAssignmentPolicy>(RoutedExpertAssignmentPolicy::StaticOwner);
+        }
+
+        std::optional<RoutedExpertPhasePolicy> routedOverlayPhasePolicy(
+            const MoERoutedExpertPlacementPlan &plan,
+            std::string *error)
+        {
+            RoutedExpertPhasePolicy policy = RoutedExpertPhasePolicy::Uniform;
+            bool saw_policy = false;
+
+            for (const auto &tier : plan.routed_tiers)
+            {
+                const auto *domain = findMoEExpertDomain(plan, tier.domain);
+                if (!domain)
+                    continue;
+
+                if (!saw_policy)
+                {
+                    policy = domain->routed_phase_policy;
+                    saw_policy = true;
+                    continue;
+                }
+
+                if (domain->routed_phase_policy != policy)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "mixed routed expert phase policies are not supported in one graph-native overlay: " +
+                            std::string(routedExpertPhasePolicyToString(policy)) +
+                            " and " +
+                            routedExpertPhasePolicyToString(
+                                domain->routed_phase_policy);
+                    }
+                    return std::nullopt;
+                }
+            }
+
+            return saw_policy
+                       ? std::optional<RoutedExpertPhasePolicy>(policy)
+                       : std::optional<RoutedExpertPhasePolicy>(
+                             RoutedExpertPhasePolicy::Uniform);
         }
 
         bool routedOverlayDomainsSupportLeastLoadedResidentAssignment(
@@ -621,6 +691,17 @@ namespace llaminar2
                 plan->continuation_domain_spec.dense_decode_mirrored_embedding;
 
             std::string assignment_error;
+            std::string compute_error;
+            std::string phase_error;
+            auto compute_policy =
+                routedOverlayComputePolicy(*plan, &compute_error);
+            if (!compute_policy)
+            {
+                LOG_ERROR(log_prefix
+                          << " invalid MoE overlay routed compute policy: "
+                          << compute_error);
+                return false;
+            }
             auto assignment_policy = routedOverlayAssignmentPolicy(*plan, &assignment_error);
             if (!assignment_policy)
             {
@@ -628,23 +709,21 @@ namespace llaminar2
                                      << assignment_error);
                 return false;
             }
+            auto phase_policy = routedOverlayPhasePolicy(*plan, &phase_error);
+            if (!phase_policy)
+            {
+                LOG_ERROR(log_prefix << " invalid MoE overlay routed phase policy: "
+                                     << phase_error);
+                return false;
+            }
 
+            graph_config.moe.routed_compute_policy = *compute_policy;
+            graph_config.moe.routed_phase_policy = *phase_policy;
             graph_config.moe.routed_assignment_policy = *assignment_policy;
             graph_config.refreshMoEExecutionPolicy();
 
             if (plan->isTieredOverlay())
             {
-                if (allRoutedOverlayDomainsUseExpertIdApportionment(*plan))
-                {
-                    graph_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
-                    graph_config.refreshMoEExecutionPolicy();
-                    graph_config.moe.routed_compute_policy =
-                        RoutedExpertComputePolicy::Apportioned;
-                    graph_config.moe.execution_policy = makeMoEExecutionPolicy(
-                        graph_config.dense_parallel_policy,
-                        graph_config.moe.routed_compute_policy,
-                        graph_config.moe.routed_assignment_policy);
-                }
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
                 LOG_DEBUG(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
@@ -1179,11 +1258,39 @@ namespace llaminar2
         bool include_terminal_mtp_embedding = false;
         int tp_rank_override = -1;
         bool bypass_tensor_parallel = false;
+        /**
+         * Keep routed-expert tensors complete while ordinary dense weights
+         * continue to follow the enclosing tensor-parallel plan. This is the
+         * physical weight-residency counterpart of
+         * RoutedExpertComputePolicy::Replicated: every graph participant must
+         * be able to execute every selected expert without consulting another
+         * participant or reconstructing a full tensor from TP slices.
+         */
+        bool replicate_routed_experts = false;
         bool dense_decode_replicated_subset = false;
         bool dense_decode_mirrored_embedding_only = false;
         bool replicated_terminal_lm_head_only = false;
         bool replicated_terminal_bindings_only = false;
     };
+
+    /**
+     * @brief Return whether a graph needs complete routed-expert tensors on each TP participant.
+     *
+     * The graph compute policy and the weight materialization policy are one
+     * contract. A replicated graph with expert-ID-apportioned source tensors is
+     * invalid: it advertises full local execution but physically owns only a
+     * subset of experts. Keeping this predicate beside weight-plan creation
+     * makes that mismatch structurally difficult to introduce.
+     *
+     * @param graph_config Fully resolved per-participant graph configuration.
+     * @return true when routed-expert requirements must bypass TP slicing.
+     */
+    bool needsReplicatedRoutedExpertWeights(const GraphConfig &graph_config)
+    {
+        return graph_config.moe.enabled() &&
+               graph_config.moe.routed_compute_policy ==
+                   RoutedExpertComputePolicy::Replicated;
+    }
 
     /**
      * @brief Return true when LocalTP MTP needs a replicated terminal head.
@@ -1444,6 +1551,10 @@ namespace llaminar2
                 continue;
             }
 
+            const bool replicate_routed_weight =
+                options.replicate_routed_experts &&
+                isRoutedExpertRole(inferWeightRole(weight_name));
+
             plan.add(makeSingleDeviceRequirement(
                 weight_mgr,
                 weight_name,
@@ -1457,7 +1568,7 @@ namespace llaminar2
                 tp_domain,
                 pp_stage,
                 {},
-                options.bypass_tensor_parallel));
+                options.bypass_tensor_parallel || replicate_routed_weight));
         }
 
         return plan;
@@ -2993,6 +3104,8 @@ namespace llaminar2
             nullptr,
             SingleDeviceWeightPlanOptions{
                 .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                .replicate_routed_experts =
+                    needsReplicatedRoutedExpertWeights(graph_config),
             });
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
             return false;
@@ -3044,11 +3157,11 @@ namespace llaminar2
                      << device.to_string());
         }
 
-        if (overlay_runtime_plan_for_weight_prep &&
-            !config.moe_expert_overlay_weights_prepared_by_parent)
+        if (overlay_runtime_plan_for_weight_prep)
         {
             if (!weight_mgr->prepareMoEExpertOverlayWeights(
                     *overlay_runtime_plan_for_weight_prep,
+                    device,
                     &frozen_weights,
                     overlay_execution_plan_for_weight_prep))
             {
@@ -4059,6 +4172,8 @@ namespace llaminar2
                 SingleDeviceWeightPlanOptions{
                     .include_terminal_mtp_embedding = config.mtp.enabled && pp_cfg.has_lm_head,
                     .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                    .replicate_routed_experts =
+                        needsReplicatedRoutedExpertWeights(graph_config),
                 });
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
@@ -4219,6 +4334,8 @@ namespace llaminar2
                         nullptr,
                         SingleDeviceWeightPlanOptions{
                             .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                            .replicate_routed_experts =
+                                needsReplicatedRoutedExpertWeights(graph_config),
                         });
                     if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                         return nullptr;
@@ -4252,12 +4369,12 @@ namespace llaminar2
                         return nullptr;
                     }
 
-                    if (graph_config.moe.expert_overlay_runtime_plan &&
-                        !config.moe_expert_overlay_weights_prepared_by_parent)
+                    if (graph_config.moe.expert_overlay_runtime_plan)
                     {
                         const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
                         if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
                                 *graph_config.moe.expert_overlay_runtime_plan,
+                                device,
                                 &frozen_weights,
                                 execution_plan))
                         {
@@ -4379,14 +4496,14 @@ namespace llaminar2
                         return nullptr;
                     }
                 }
-                if (graph_config.moe.expert_overlay_runtime_plan &&
-                    !config.moe_expert_overlay_weights_prepared_by_parent)
+                if (graph_config.moe.expert_overlay_runtime_plan)
                 {
                     if (concrete_weight_mgr)
                     {
                         const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
                         if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
                                 *graph_config.moe.expert_overlay_runtime_plan,
+                                device,
                                 orchestrator->frozenWeightSet(),
                                 execution_plan))
                         {

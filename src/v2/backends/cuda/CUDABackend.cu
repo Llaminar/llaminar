@@ -1275,6 +1275,16 @@ namespace llaminar2
         int32_t *out_position_ids,
         int device_idx,
         void *stream);
+    extern "C" bool cudaOps_prepare_mtp_verifier_geometry(
+        const int32_t *base_positions,
+        const int32_t *valid_graph_rows,
+        int valid_graph_row_count,
+        int request_count,
+        int padded_seq_len,
+        int32_t *out_position_ids,
+        int32_t *out_request_lengths,
+        int device_idx,
+        void *stream);
     extern "C" bool cudaOps_initialize_mtp_device_logical_state(
         const int32_t *sampled_tokens,
         const int32_t *target_positions_device,
@@ -3144,6 +3154,38 @@ namespace llaminar2
             request_count,
             padded_seq_len,
             static_cast<int32_t *>(out_position_ids_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePrepareMTPVerifierGeometry(
+        const void *base_positions_device,
+        const void *valid_graph_rows_device,
+        int valid_graph_row_count,
+        int request_count,
+        int padded_seq_len,
+        int device_id,
+        void *stream,
+        void *out_position_ids_device,
+        void *out_request_lengths_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !base_positions_device || request_count <= 0 ||
+            padded_seq_len <= 0 || !stream || !out_position_ids_device ||
+            !out_request_lengths_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_prepare_mtp_verifier_geometry(
+            static_cast<const int32_t *>(base_positions_device),
+            static_cast<const int32_t *>(valid_graph_rows_device),
+            valid_graph_row_count,
+            request_count,
+            padded_seq_len,
+            static_cast<int32_t *>(out_position_ids_device),
+            static_cast<int32_t *>(out_request_lengths_device),
             device_id,
             stream);
     }

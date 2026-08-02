@@ -196,7 +196,6 @@ namespace llaminar2
         /// expert weights for the whole LocalTP domain. Child device runners
         /// still receive the overlay plan for graph routing, but skip the
         /// expensive per-runner weight preparation side effect.
-        bool moe_expert_overlay_weights_prepared_by_parent = false;
 
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;

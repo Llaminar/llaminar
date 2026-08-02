@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <thread>
 
 namespace llaminar2::test
@@ -124,6 +125,85 @@ namespace llaminar2::test
                     << "worker=" << worker;
             }
         }
+    }
+
+    /**
+     * @brief A blocking collective-abort callback cannot own participant completion.
+     *
+     * LocalTP installs a first-failure callback that can enter NCCL/RCCL
+     * communicator teardown. Teardown may wait while a neighboring participant
+     * leaves its collective. The callback therefore runs on the pool's dedicated
+     * control thread, after the failing worker has published its terminal result.
+     *
+     * This test models the former deadlock deliberately. Worker zero fails.
+     * Failure handling releases worker one and then remains blocked, just as a
+     * communicator abort can. Both participant results must nevertheless become
+     * collectible while failure handling is still blocked. Running the callback
+     * inline on worker zero would leave that worker incomplete and time out.
+     */
+    TEST(Test__TPWorkerPool,
+         BlockingFailureCallbackCannotDelayParticipantCompletion)
+    {
+        TPWorkerPool pool(/*num_workers=*/2);
+
+        std::promise<void> callback_entered_promise;
+        std::future<void> callback_entered =
+            callback_entered_promise.get_future();
+        std::promise<void> callback_finished_promise;
+        std::future<void> callback_finished =
+            callback_finished_promise.get_future();
+        std::promise<void> release_callback_promise;
+        const std::shared_future<void> release_callback =
+            release_callback_promise.get_future().share();
+
+        std::promise<void> release_peer_promise;
+        const std::shared_future<void> release_peer =
+            release_peer_promise.get_future().share();
+        std::once_flag release_peer_once;
+        const auto releasePeer = [&]()
+        {
+            std::call_once(
+                release_peer_once,
+                [&release_peer_promise]()
+                { release_peer_promise.set_value(); });
+        };
+
+        pool.setFailureCallback(
+            [&]()
+            {
+                callback_entered_promise.set_value();
+                releasePeer();
+                release_callback.wait();
+                callback_finished_promise.set_value();
+            });
+
+        pool.dispatch(
+            [release_peer](size_t worker)
+            {
+                if (worker == 0)
+                    return false;
+                release_peer.wait();
+                return true;
+            });
+
+        const auto callback_status = callback_entered.wait_for(500ms);
+        const auto results = pool.collectAll(/*timeout_ms=*/500);
+
+        // Always open both gates before assertions so a failed regression cannot
+        // strand either a participant or the pool's callback thread in teardown.
+        releasePeer();
+        release_callback_promise.set_value();
+        const auto callback_finished_status = callback_finished.wait_for(500ms);
+
+        EXPECT_EQ(callback_status, std::future_status::ready);
+        ASSERT_EQ(results.size(), 2u);
+        EXPECT_TRUE(results[0].completed);
+        EXPECT_FALSE(results[0].success);
+        EXPECT_TRUE(results[1].completed);
+        EXPECT_TRUE(results[1].success);
+        EXPECT_EQ(pool.completedCount(), 2u);
+        EXPECT_EQ(pool.firstFailureIndex(), 0u);
+        EXPECT_EQ(callback_finished_status, std::future_status::ready);
     }
 
 } // namespace llaminar2::test

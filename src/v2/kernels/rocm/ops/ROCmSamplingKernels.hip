@@ -3629,28 +3629,48 @@ __global__ void rocm_prepare_mtp_batched_sidecar_inputs_kernel(
 }
 
 /**
- * @brief Expand canonical request positions into a grouped verifier matrix.
+ * @brief Publish all dynamic grouped-verifier geometry from device-owned rows.
  *
  * The request's live KV count is the sole mutable position owner. One work item
  * maps a flattened request-major verifier row back to `(request, token)` and
  * writes `live_kv_count[request] + token`. Populating the complete padded matrix
- * gives captured RoPE kernels a stable pointer while request-length metadata
- * suppresses padded state updates.
+ * gives captured RoPE kernels a stable pointer. The first request-count work
+ * items also derive valid request widths from the compact physical-row list, so
+ * short-conv and GDN recurrence suppress padding from the same device evidence.
  */
-__global__ void rocm_prepare_mtp_verifier_position_ids_kernel(
+__global__ void rocm_prepare_mtp_verifier_geometry_kernel(
     const int32_t *__restrict__ base_positions,
+    const int32_t *__restrict__ valid_graph_rows,
+    int valid_graph_row_count,
     int request_count,
     int padded_seq_len,
-    int32_t *__restrict__ out_position_ids)
+    int32_t *__restrict__ out_position_ids,
+    int32_t *__restrict__ out_request_lengths)
 {
     const int flat_row = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_rows = request_count * padded_seq_len;
-    if (flat_row >= total_rows)
-        return;
+    if (flat_row < total_rows)
+    {
+        const int request = flat_row / padded_seq_len;
+        const int token = flat_row - request * padded_seq_len;
+        out_position_ids[flat_row] = base_positions[request] + token;
+    }
 
-    const int request = flat_row / padded_seq_len;
-    const int token = flat_row - request * padded_seq_len;
-    out_position_ids[flat_row] = base_positions[request] + token;
+    if (out_request_lengths && flat_row < request_count)
+    {
+        int valid_tokens = padded_seq_len;
+        if (valid_graph_rows)
+        {
+            valid_tokens = 0;
+            for (int row = 0; row < valid_graph_row_count; ++row)
+            {
+                const int physical_row = valid_graph_rows[row];
+                valid_tokens +=
+                    physical_row / padded_seq_len == flat_row ? 1 : 0;
+            }
+        }
+        out_request_lengths[flat_row] = valid_tokens;
+    }
 }
 
 /**
@@ -5792,19 +5812,74 @@ bool rocmOps_prepare_mtp_verifier_position_ids(
     const int blocks =
         (total_rows + threads_per_block - 1) / threads_per_block;
     hipLaunchKernelGGL(
-        rocm_prepare_mtp_verifier_position_ids_kernel,
+        rocm_prepare_mtp_verifier_geometry_kernel,
         dim3(blocks), dim3(threads_per_block), 0,
         static_cast<hipStream_t>(stream),
         base_positions,
+        /*valid_graph_rows=*/nullptr,
+        /*valid_graph_row_count=*/0,
         request_count,
         padded_seq_len,
-        out_position_ids);
+        out_position_ids,
+        /*out_request_lengths=*/nullptr);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr,
                 "ROCm grouped MTP verifier position preparation failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Enqueue one device-resident grouped-verifier geometry publication.
+ */
+bool rocmOps_prepare_mtp_verifier_geometry(
+    const int32_t *base_positions,
+    const int32_t *valid_graph_rows,
+    int valid_graph_row_count,
+    int request_count,
+    int padded_seq_len,
+    int32_t *out_position_ids,
+    int32_t *out_request_lengths,
+    int device_idx,
+    void *stream)
+{
+    const int total_rows = request_count * padded_seq_len;
+    const bool rectangular = valid_graph_rows == nullptr;
+    if (!base_positions || request_count <= 0 || padded_seq_len <= 0 ||
+        !out_position_ids || !out_request_lengths || !stream ||
+        (rectangular && valid_graph_row_count != total_rows) ||
+        (!rectangular &&
+         (valid_graph_row_count <= 0 || valid_graph_row_count > total_rows)))
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (total_rows + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_prepare_mtp_verifier_geometry_kernel,
+        dim3(blocks), dim3(threads_per_block), 0,
+        static_cast<hipStream_t>(stream),
+        base_positions,
+        valid_graph_rows,
+        valid_graph_row_count,
+        request_count,
+        padded_seq_len,
+        out_position_ids,
+        out_request_lengths);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm grouped MTP verifier geometry preparation failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

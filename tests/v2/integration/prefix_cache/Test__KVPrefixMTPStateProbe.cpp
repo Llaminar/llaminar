@@ -3441,7 +3441,7 @@ namespace
                     "rank_mirrored_localtp_resident_request_batch_draft_slot_publications"),
                 2.0)
                 << backend_name
-                << " LocalTP must collectively publish one resident draft slot per request";
+                << " LocalTP must publish one participant-local resident draft slot per request";
             EXPECT_EQ(
                 mtp_decode_counter(
                     "rank_mirrored_localtp_stochastic_resident_outcomes"),
@@ -3450,10 +3450,16 @@ namespace
                 << " LocalTP must reduce one child-resident stochastic outcome per request";
             EXPECT_EQ(
                 mtp_decode_counter(
-                    "rank_mirrored_localtp_common_outcome_broadcasts"),
-                1.0)
+                    "rank_mirrored_localtp_participant_local_outcomes"),
+                2.0)
                 << backend_name
-                << " LocalTP must publish one common compact outcome through NCCL/RCCL";
+                << " LocalTP must retain one complete local compact outcome per participant";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_common_outcome_broadcasts"),
+                0.0)
+                << backend_name
+                << " mirrored compact outcomes must never reintroduce a rank broadcast";
             EXPECT_EQ(
                 mtp_decode_counter(
                     "rank_mirrored_localtp_stochastic_device_outcome_publications"),

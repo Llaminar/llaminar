@@ -520,6 +520,151 @@ namespace
     }
 
     /**
+     * @brief Prove one captured geometry launch publishes exact ragged widths.
+     *
+     * The production grouped verifier already publishes its compact physical
+     * logit rows before replay. Short-conv and GDN must derive their recurrent
+     * state masks from those same device rows, rather than from a stale prompt
+     * length or a participant-external host vector. This test changes both live
+     * KV positions and ragged row geometry between graph replays while retaining
+     * every captured pointer and launch parameter.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        MTPGroupedVerifierGeometryDerivesRaggedLengthsAcrossGraphReplays)
+    {
+        constexpr int request_count = 4;
+        constexpr int padded_seq_len = 5;
+        constexpr int total_rows = request_count * padded_seq_len;
+        constexpr int valid_row_count = 12;
+        const std::array<std::array<int32_t, request_count>, 3> live_positions = {{
+            {{7, 11, 19, 23}},
+            {{4095, 8191, 12287, 16383}},
+            {{2383, 2387, 2391, 2395}},
+        }};
+        const std::array<std::array<int32_t, request_count>, 3> expected_lengths = {{
+            {{5, 2, 4, 1}},
+            {{1, 5, 3, 3}},
+            {{4, 4, 2, 2}},
+        }};
+
+        std::array<std::array<int32_t, valid_row_count>, 3> valid_rows{};
+        for (size_t replay = 0; replay < valid_rows.size(); ++replay)
+        {
+            int cursor = 0;
+            for (int request = 0; request < request_count; ++request)
+            {
+                for (int token = 0;
+                     token < expected_lengths[replay][static_cast<size_t>(request)];
+                     ++token)
+                {
+                    valid_rows[replay][static_cast<size_t>(cursor++)] =
+                        request * padded_seq_len + token;
+                }
+            }
+            ASSERT_EQ(cursor, valid_row_count);
+        }
+
+        void *d_live_positions = backend_->allocate(
+            request_count * sizeof(int32_t), device_id_);
+        void *d_valid_rows = backend_->allocate(
+            valid_row_count * sizeof(int32_t), device_id_);
+        void *d_verifier_positions = backend_->allocate(
+            total_rows * sizeof(int32_t), device_id_);
+        void *d_request_lengths = backend_->allocate(
+            request_count * sizeof(int32_t), device_id_);
+        ASSERT_NE(d_live_positions, nullptr);
+        ASSERT_NE(d_valid_rows, nullptr);
+        ASSERT_NE(d_verifier_positions, nullptr);
+        ASSERT_NE(d_request_lengths, nullptr);
+
+        std::array<std::array<int32_t, total_rows>, live_positions.size()>
+            observed_positions{};
+        std::array<std::array<int32_t, request_count>, live_positions.size()>
+            observed_lengths{};
+
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueuePrepareMTPVerifierGeometry(
+                    d_live_positions,
+                    d_valid_rows,
+                    valid_row_count,
+                    request_count,
+                    padded_seq_len,
+                    device_id_,
+                    stream,
+                    d_verifier_positions,
+                    d_request_lengths));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                for (size_t replay = 0; replay < live_positions.size(); ++replay)
+                {
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_live_positions,
+                        live_positions[replay].data(),
+                        request_count * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_valid_rows,
+                        valid_rows[replay].data(),
+                        valid_row_count * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(capture->launch());
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_positions[replay].data(),
+                        d_verifier_positions,
+                        total_rows * sizeof(int32_t),
+                        device_id_));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_lengths[replay].data(),
+                        d_request_lengths,
+                        request_count * sizeof(int32_t),
+                        device_id_));
+                }
+            });
+        };
+        if (GetParam() == "CUDA")
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+
+        for (size_t replay = 0; replay < live_positions.size(); ++replay)
+        {
+            EXPECT_EQ(observed_lengths[replay], expected_lengths[replay]);
+            for (int request = 0; request < request_count; ++request)
+            {
+                for (int token = 0; token < padded_seq_len; ++token)
+                {
+                    const int flat_row = request * padded_seq_len + token;
+                    EXPECT_EQ(
+                        observed_positions[replay][static_cast<size_t>(flat_row)],
+                        live_positions[replay][static_cast<size_t>(request)] + token)
+                        << "replay=" << replay
+                        << " request=" << request
+                        << " token=" << token;
+                }
+            }
+        }
+
+        backend_->free(d_request_lengths, device_id_);
+        backend_->free(d_verifier_positions, device_id_);
+        backend_->free(d_valid_rows, device_id_);
+        backend_->free(d_live_positions, device_id_);
+    }
+
+    /**
      * @brief Prove captured scalar MTP sidecars follow mutable device KV state.
      *
      * A scalar GPU MTP transaction has two production input shapes:

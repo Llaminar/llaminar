@@ -1972,87 +1972,6 @@ namespace
             return true;
         }
 
-        /**
-         * @brief Expose one mock device draft slot to rank collective publication.
-         *
-         * The token array models device storage and the per-slot integer models
-         * an explicit producer stream. Requiring readiness therefore catches a
-         * rank that attempts to broadcast before the grouped child sampler has
-         * published its output event.
-         */
-        DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleProducerSlot(int slot) override
-        {
-            if (!primary_device_.is_gpu() ||
-                !supports_mtp_device_draft_token_input_ ||
-                slot < 0 ||
-                slot >= static_cast<int>(device_draft_sample_tokens_.size()) ||
-                !device_draft_sample_ready_[static_cast<size_t>(slot)])
-            {
-                return {};
-            }
-
-            DeviceStochasticDraftSampleSlotHandle handle;
-            handle.token_device =
-                device_draft_sample_tokens_.data() + static_cast<size_t>(slot);
-            handle.slot = slot;
-            handle.device = primary_device_;
-            handle.stream =
-                device_draft_sample_stream_tokens_.data() +
-                static_cast<size_t>(slot);
-            return handle;
-        }
-
-        DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleBroadcastDestinationSlot(int slot) override
-        {
-            if (!primary_device_.is_gpu() ||
-                !supports_mtp_device_draft_token_input_ ||
-                slot < 0 ||
-                slot >= static_cast<int>(device_draft_sample_tokens_.size()))
-            {
-                return {};
-            }
-
-            DeviceStochasticDraftSampleSlotHandle handle;
-            handle.token_device =
-                device_draft_sample_tokens_.data() + static_cast<size_t>(slot);
-            handle.slot = slot;
-            handle.device = primary_device_;
-            handle.stream =
-                device_draft_sample_stream_tokens_.data() +
-                static_cast<size_t>(slot);
-            return handle;
-        }
-
-        /**
-         * @brief Record the mock NCCL/RCCL broadcast as the slot producer.
-         *
-         * Production records a GPU event on @p producer_stream. The unit mock
-         * keeps the same readiness state transition and counts it, allowing the
-         * regression to prove every participant crossed the collective boundary
-         * without initializing a GPU runtime.
-         */
-        bool recordStochasticDraftSampleSlotReadyFromDevice(
-            int slot,
-            void *producer_stream,
-            bool verifier_consumer_pending = true) override
-        {
-            (void)verifier_consumer_pending;
-            if (!primary_device_.is_gpu() ||
-                !supports_mtp_device_draft_token_input_ ||
-                slot < 0 ||
-                slot >= static_cast<int>(device_draft_sample_tokens_.size()) ||
-                !producer_stream)
-            {
-                return false;
-            }
-
-            ++record_draft_sample_slot_ready_from_device_count_;
-            device_draft_sample_ready_[static_cast<size_t>(slot)] = true;
-            return true;
-        }
-
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override
         {
             ++sample_all_position_logits_count_;
@@ -2417,7 +2336,7 @@ namespace
                     [](void *) {});
             out_handle->mtp_transaction =
                 makeMockMTPTransactionLease(/*request_count=*/1);
-            out_handle->mirrored_local_tp_published_in_graph =
+            out_handle->mirrored_local_tp_locally_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             const bool valid = out_handle->valid();
             if (valid)
@@ -4991,10 +4910,6 @@ namespace
         {
             return last_condition_advance_seeds_;
         }
-        int recordDraftSampleSlotReadyFromDeviceCount() const
-        {
-            return record_draft_sample_slot_ready_from_device_count_;
-        }
         int lastMTPBatchDeviceDraftFirstSlot() const
         {
             return last_mtp_batch_device_draft_first_slot_;
@@ -6186,7 +6101,6 @@ namespace
         int forward_mtp_batch_from_resident_state_to_device_draft_slots_count_{0};
         int forward_mtp_batch_from_last_draft_and_sample_count_{0};
         int forward_mtp_batch_from_device_draft_slots_to_device_draft_slots_count_{0};
-        int record_draft_sample_slot_ready_from_device_count_{0};
         int forward_mtp_from_last_draft_and_sample_count_{0};
         int flush_pending_mtp_work_count_{0};
         int clear_cache_count_{0};
@@ -6399,8 +6313,6 @@ namespace
             device_draft_sample_tokens_{};
         std::array<bool, kMockVerifierTokenCapacity>
             device_draft_sample_ready_{};
-        std::array<int, kMockVerifierTokenCapacity>
-            device_draft_sample_stream_tokens_{};
         std::array<int32_t, kMockVerifierTokenCapacity>
             device_verifier_input_tokens_{};
         std::array<int32_t, VOCAB_SIZE>
@@ -7052,8 +6964,6 @@ namespace
             EXPECT_THAT(
                 child->lastChainedMTPBatchDeviceDraftSlotStrides(),
                 ElementsAre(2));
-            EXPECT_EQ(child->recordDraftSampleSlotReadyFromDeviceCount(), 4)
-                << "Both depth columns must record both request slots after their NCCL/RCCL broadcasts.";
             EXPECT_EQ(child->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
             EXPECT_THAT(
                 child->lastMTPVerifierBatchFirstTokensFromDevice(),
@@ -7130,9 +7040,10 @@ namespace
                 PerfStatRecord::Kind::Counter,
                 "rank_mirrored_localtp_resident_request_batch_draft_slot_publications",
                 {{"source", source},
-                 {"collective", "nccl_rccl_int32_broadcast"}});
+                 {"implementation", "participant_local_device_slots"},
+                 {"collective", "none"}});
             ASSERT_NE(slot_publications, nullptr)
-                << "Every grouped depth must prove compact device-slot publication for source="
+                << "Every grouped depth must prove participant-local device-slot publication for source="
                 << source;
             EXPECT_EQ(slot_publications->value, 2.0);
         }
