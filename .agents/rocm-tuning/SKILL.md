@@ -79,6 +79,28 @@ requests. It must never disable graph capture or select eager execution.
 
 ---
 
+## Profiler attachment and evidence rules
+
+- Pass `--no-mpi-bootstrap` only when profiling or debugging `llaminar2`
+  directly so the profiler attaches to the compute process rather than the
+  `mpirun` wrapper. Never use it for production or canonical benchmark timing;
+  it disables the ordinary placement bootstrap.
+- Do not pass `--no-mpi-bootstrap` to standalone test/performance binaries;
+  they do not auto-bootstrap MPI.
+- Preserve `LLAMINAR_*`, `HSA_*`, and `ROCR_*` variables with `sudo -E` only on
+  hosts that require privilege escalation. Ordinary `sudo` strips them.
+- Write rocprof CSVs, traces, extracted code objects, and disassembly under an
+  explicit result directory outside the repository.
+- Use one exact kernel/ISA/shape/M candidate per profiler launch. Treat
+  rocprof timing and counters as diagnostic evidence beside the unprofiled
+  canonical timing corpus; never train dispatch on profiler overhead or replay
+  duration.
+- Keep the profiler generation and metric groups required by the repository's
+  evidence collector. Do not silently substitute `rocprofv3` output for a
+  `rocprof`/rocprofiler schema expected by the trainer.
+
+---
+
 ## Step 0: Architecture facts you must keep in mind (gfx906)
 
 | Parameter | Value | Why it matters |

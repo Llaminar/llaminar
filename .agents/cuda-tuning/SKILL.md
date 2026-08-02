@@ -1,7 +1,6 @@
 ---
 name: cuda-kernel-profiling
 description: Profile and tune Llaminar V2 CUDA kernels using graph-safe PerfStats replay timing, Nsight Systems (nsys), and Nsight Compute (ncu), then validate with the GEMM perf-test harness, the benchmark subcommand, and parity tests. Use when asked to find the slowest CUDA kernel, diagnose occupancy / register pressure / memory-bound stalls, A/B two kernel variants, or close a prefill/decode throughput gap while keeping PyTorch parity.
-applyTo: "src/v2/kernels/cuda/**,src/v2/backends/cuda/**,src/v2/execution/**,tests/v2/performance/kernels/cuda/**,tests/v2/integration/kernels/cuda/**"
 ---
 
 # CUDA Kernel Profiling & Tuning (Llaminar V2)
@@ -108,6 +107,23 @@ explicit target).
 
 ---
 
+## Profiler attachment and privilege rules
+
+- Use `/usr/local/cuda/bin/nsys` for launch order and timeline diagnosis, then
+  `/usr/local/cuda/bin/ncu` for one targeted launch. Do not start by replaying
+  every kernel through Nsight Compute.
+- Preserve `LLAMINAR_*` variables across privilege escalation with `sudo -E`,
+  or pass the exact variables after `sudo`. Ordinary `sudo` strips them.
+- Pass `--no-mpi-bootstrap` only when profiling or debugging `llaminar2`
+  directly; otherwise Nsight attaches to the `mpirun` wrapper. Never use the
+  flag for production or canonical benchmark measurements.
+- Do not pass `--no-mpi-bootstrap` to standalone test/performance binaries;
+  they do not auto-bootstrap MPI.
+- Write `.nsys-rep` and `.ncu-rep` artifacts under `/tmp` or another explicit
+  result directory, not in the repository.
+
+---
+
 ## Step 2: Timeline sanity check with `nsys`
 
 Use `nsys` to confirm the kernel of interest dominates and to see launch counts / sync stalls.
@@ -154,6 +170,9 @@ sudo -E /usr/local/cuda/bin/ncu \
 
 # Read it back
 sudo /usr/local/cuda/bin/ncu -i /tmp/k_ncu.ncu-rep --page details
+
+# Inspect the sections supported by the installed Nsight version
+/usr/local/cuda/bin/ncu --list-sections
 ```
 
 > 🧹 **MANDATORY CLEANUP after every ncu run** (ncu leaves zombie processes that hold
@@ -178,6 +197,20 @@ sudo /usr/local/cuda/bin/ncu -i /tmp/k_ncu.ncu-rep --page details
 | `Barrier` | uneven work across `__syncthreads()` | fewer sync points, warp-level sync |
 | `L1/TEX` + spilling | spilled regs reloaded from local mem | reduce live registers / relax `__launch_bounds__` MIN_BLOCKS |
 | `Long Scoreboard` (memory) | global-load latency | improve coalescing / prefetch / more warps |
+
+### Target standalone and A/B launches
+
+Run `nsys` first and count only launches matching the eventual `--kernel-name`
+filter. `--launch-skip` counts matching launches, not all launches in the
+process. Profile variant A and variant B in separate, otherwise-identical
+invocations with `--launch-count 1`; do not compare replay duration from the
+reports. Use the saved reports only for counters and resource diagnostics, and
+use the unprofiled harness for canonical latency.
+
+For standalone performance binaries, invoke `nsys`/`ncu` on the binary
+directly. Keep `--target-processes all` when the harness can fork, preserve its
+shape/format/M filters, and recalculate launch skip whenever the warmup or
+candidate order changes.
 
 ### Prove NativeVNNI IMMA and vectorized memory execution
 
