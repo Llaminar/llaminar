@@ -609,6 +609,90 @@ namespace llaminar2
 
     } // namespace
 
+    void declareFullyReplicatedPlacementTopology(
+        MoEPlacementUpdate &update,
+        int local_participant,
+        int participant_count,
+        const std::vector<int> &owner_participants)
+    {
+        if (participant_count <= 0 ||
+            participant_count > static_cast<int>(kDeviceMoEMaxParticipants))
+        {
+            throw std::invalid_argument(
+                "fully replicated MoE placement participant_count must be in [1, " +
+                std::to_string(kDeviceMoEMaxParticipants) + "]");
+        }
+        if (local_participant < 0 || local_participant >= participant_count)
+        {
+            throw std::invalid_argument(
+                "fully replicated MoE placement local participant is outside the domain");
+        }
+        if (update.expert_count == 0 ||
+            update.expert_count > kDeviceMoEMaxExperts ||
+            update.experts.size() != static_cast<size_t>(update.expert_count))
+        {
+            throw std::invalid_argument(
+                "fully replicated MoE placement requires one descriptor per logical expert");
+        }
+        if (owner_participants.size() != static_cast<size_t>(update.expert_count))
+        {
+            throw std::invalid_argument(
+                "fully replicated MoE placement requires one canonical owner per logical expert");
+        }
+
+        const uint32_t all_participants_mask =
+            (1u << static_cast<uint32_t>(participant_count)) - 1u;
+        const uint32_t replicated_flag =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+        const uint32_t preferred_owner_flag =
+            toMoEExpertFlags(DeviceMoEExpertFlags::PreferredOwner);
+
+        update.participant_id = static_cast<uint32_t>(local_participant);
+        update.participant_count = static_cast<uint32_t>(participant_count);
+        update.local_compute_mask.assign(
+            static_cast<size_t>(update.expert_count), 1u);
+        update.replica_role.resize(static_cast<size_t>(update.expert_count));
+        update.resident_participant_mask.assign(
+            static_cast<size_t>(update.expert_count),
+            all_participants_mask);
+
+        for (uint32_t expert = 0; expert < update.expert_count; ++expert)
+        {
+            const int owner = owner_participants[static_cast<size_t>(expert)];
+            if (owner < 0 || owner >= participant_count)
+            {
+                throw std::invalid_argument(
+                    "fully replicated MoE placement owner for expert " +
+                    std::to_string(expert) + " is outside the domain");
+            }
+
+            auto &descriptor = update.experts[static_cast<size_t>(expert)];
+            if (descriptor.logical_expert_id != static_cast<int32_t>(expert) ||
+                descriptor.local_slot < 0 ||
+                !descriptorReady(descriptor) ||
+                !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Valid) ||
+                !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Resident) ||
+                !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::LocalCompute))
+            {
+                throw std::invalid_argument(
+                    "fully replicated MoE placement descriptor for expert " +
+                    std::to_string(expert) + " is not compute-ready");
+            }
+
+            descriptor.owner_participant = owner;
+            descriptor.flags &= ~preferred_owner_flag;
+            descriptor.flags |= replicated_flag;
+            if (owner == local_participant)
+                descriptor.flags |= preferred_owner_flag;
+
+            update.replica_role[static_cast<size_t>(expert)] =
+                static_cast<uint8_t>(
+                    owner == local_participant
+                        ? DeviceMoEReplicaRole::Primary
+                        : DeviceMoEReplicaRole::Replica);
+        }
+    }
+
     DeviceMoESerialRouteScratchArena::DeviceMoESerialRouteScratchArena(
         Config config)
         : device_id_(config.device_id),

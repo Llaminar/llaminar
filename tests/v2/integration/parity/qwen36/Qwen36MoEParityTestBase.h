@@ -6027,7 +6027,6 @@ namespace llaminar2::test::parity::qwen36
             keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
             keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
             keys.push_back(prefix + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED");
-            keys.push_back(prefix + "_MOE_COMBINED_OUTPUT_ALLREDUCED");
             keys.push_back(prefix + "_FFN_RESIDUAL");
         }
         /*
@@ -6113,7 +6112,6 @@ namespace llaminar2::test::parity::qwen36
             keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
             keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
             keys.push_back(prefix + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED");
-            keys.push_back(prefix + "_MOE_COMBINED_OUTPUT_ALLREDUCED");
             keys.push_back(prefix + "_FFN_RESIDUAL");
         }
         keys.push_back("FINAL_NORM");

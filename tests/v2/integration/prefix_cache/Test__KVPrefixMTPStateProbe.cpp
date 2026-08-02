@@ -119,7 +119,6 @@ namespace
             "MOE_EXPERT_OUTPUT_ALLREDUCED",
             "MOE_SHARED_GATE_OUTPUT",
             "MOE_COMBINED_OUTPUT",
-            "MOE_COMBINED_OUTPUT_ALLREDUCED",
             "FFN_GATE",
             "FFN_UP",
             "FFN_SWIGLU",

@@ -307,6 +307,36 @@ namespace llaminar2
         bool transient_placement_observed = false;
     };
 
+    /**
+     * @brief Declare that every expert in a placement update is resident and
+     * compute-ready on every participant in one replicated domain.
+     *
+     * A replicated graph still has a real multi-device topology. Treating each
+     * participant as an independent one-device domain loses the owner map and
+     * makes the same runtime table incompatible with apportioned prefill,
+     * graph-side rebalance, and portable prefix restoration. This operation
+     * publishes the complete topology atomically: participant identity, domain
+     * width, canonical owner, all-participant residency, local-compute mask,
+     * replica role, and descriptor flags.
+     *
+     * Callers must populate @p update.experts with one complete descriptor per
+     * logical expert before invoking this function. Invalid participant IDs,
+     * incomplete owner maps, and malformed descriptors throw immediately; no
+     * partially declared replicated bank is permitted.
+     *
+     * @param update Placement update whose expert descriptors are finalized.
+     * @param local_participant Participant represented by this device-local
+     * runtime table.
+     * @param participant_count Number of participants in the replicated domain.
+     * @param owner_participants Canonical owner participant for every logical
+     * expert, indexed by expert ID.
+     */
+    void declareFullyReplicatedPlacementTopology(
+        MoEPlacementUpdate &update,
+        int local_participant,
+        int participant_count,
+        const std::vector<int> &owner_participants);
+
     struct DeviceMoEPortableExpertRuntimeState
     {
         int32_t logical_expert_id = -1;

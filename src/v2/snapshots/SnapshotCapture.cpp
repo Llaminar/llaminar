@@ -602,7 +602,6 @@ namespace llaminar2
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
             {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
-            {"_moe_combined_allreduce", "_MOE_COMBINED_OUTPUT_ALLREDUCED"},
             {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
@@ -716,10 +715,6 @@ namespace llaminar2
         if (stage_name.find("_down_allreduce") != std::string::npos)
         {
             return {prefixBefore("_down_allreduce") + "_FFN_DOWN_ALLREDUCED"};
-        }
-        if (stage_name.find("_moe_combined_allreduce") != std::string::npos)
-        {
-            return {prefixBefore("_moe_combined_allreduce") + "_MOE_COMBINED_OUTPUT_ALLREDUCED"};
         }
         if (stage_name.find("_shared_expert_allreduce") != std::string::npos)
         {

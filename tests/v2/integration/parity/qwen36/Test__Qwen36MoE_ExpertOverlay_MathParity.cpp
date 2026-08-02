@@ -75,10 +75,6 @@ namespace
         "MOE_SHARED_GATE_OUTPUT",
     };
 
-    const std::vector<std::string> kOverlayAllreduceStages = {
-        "MOE_COMBINED_OUTPUT",
-    };
-
     BackendThresholds qwen36MoEOverlayThresholds()
     {
         return {
@@ -88,7 +84,13 @@ namespace
             .min_early_layers_passed = 5,
             .kl_threshold = 0.05f,
             .excluded_stages = kOverlayExcludedStages,
-            .allreduce_stages = kOverlayAllreduceStages,
+            /*
+             * The graph reduces routed and shared branches independently,
+             * then publishes MOE_COMBINED_OUTPUT from their final local add.
+             * That boundary is already replicated; asking the harness to find
+             * a second combined-output collective would test the retired DAG.
+             */
+            .allreduce_stages = {},
             .min_top1_accuracy = 80.0f,
             .min_top5_accuracy = 60.0f,
             .pytorch_top1_in_topk = 4,
@@ -748,6 +750,29 @@ protected:
         ParityForwardPhase phase) const override
     {
         auto policy = Base::parityGraphSnapshotPolicy(phase);
+        if (phase == ParityForwardPhase::Prefill &&
+            !GetParam().decode_snapshots_only)
+        {
+            /*
+             * Final MoE publication is the only routed/shared arithmetic
+             * boundary this focused fixture compares.  Requiring every layer
+             * here prevents a graph rewrite from silently preserving layer 0
+             * while dropping later captured publications.
+             */
+            for (int layer = 0; layer < parityLayerCount(); ++layer)
+            {
+                const std::string key =
+                    "layer" + std::to_string(layer) +
+                    "_MOE_COMBINED_OUTPUT";
+                if (std::find(
+                        policy.required_prefill_snapshot_keys.begin(),
+                        policy.required_prefill_snapshot_keys.end(),
+                        key) == policy.required_prefill_snapshot_keys.end())
+                {
+                    policy.required_prefill_snapshot_keys.push_back(key);
+                }
+            }
+        }
         if (GetParam().decode_snapshots_only && phase == ParityForwardPhase::Prefill)
         {
             policy.required_prefill_snapshot_keys = {

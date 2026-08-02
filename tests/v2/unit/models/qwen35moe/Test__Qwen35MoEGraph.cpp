@@ -952,6 +952,31 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
         << "replicated verifier execution must not emit routed collectives";
 }
 
+TEST(Test__Qwen35MoEGraph, ReplicatedOverlayPublishesExplicitRuntimeOwnerMetadata)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t assignment = source.find(
+        "expert_params.runtime_decode_has_explicit_owner_metadata =");
+    ASSERT_NE(assignment, std::string::npos);
+    const size_t assignment_end = source.find(";", assignment);
+    ASSERT_NE(assignment_end, std::string::npos);
+    const std::string assignment_body =
+        source.substr(assignment, assignment_end - assignment);
+
+    EXPECT_NE(
+        assignment_body.find(
+            "full_local_tp_replicated_overlay_decode_runtime_table"),
+        std::string::npos)
+        << "Replicated LocalTP banks carry canonical owner and all-participant "
+           "residency metadata; the expert stage must consume that bank instead "
+           "of synthesizing a contradictory local-only epoch.";
+}
+
 TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
 {
     GraphConfig config = makeMoEConfig();
@@ -2500,7 +2525,7 @@ TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
     EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertIdApportioned);
 }
 
-TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresPostCollectiveMoEKeys)
+TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresFinalCombinedOutputReplicated)
 {
     Qwen35MoESchemaFactory factory;
     StageShardingConfig sharding = factory.getStageShardingConfig();
@@ -2508,10 +2533,14 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresPostCollectiveMoEKeys)
     EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
     EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
     EXPECT_EQ(sharding.at("MOE_SHARED_GATE_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
-    EXPECT_EQ(sharding.at("MOE_COMBINED_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("MOE_COMBINED_OUTPUT"), SnapshotShardingMode::REPLICATED)
+        << "The final combine consumes branch outputs after their production "
+           "collectives and must never be reconstructed from participant partials";
     EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
-    EXPECT_EQ(sharding.at("MOE_COMBINED_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.count("MOE_COMBINED_OUTPUT_ALLREDUCED"), 0u)
+        << "The combined-output allreduce was retired when branch-wise reduction "
+           "became the byte-stable production topology";
 }
 
 /**

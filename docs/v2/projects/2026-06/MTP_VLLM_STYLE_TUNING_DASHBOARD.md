@@ -58,6 +58,10 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Replicated shared-expert residuals no longer enter an invalid allreduce.
   Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
   contributions and is covered on NCCL and RCCL.
+- CUDA2 phase-split prefill and serial decode match the reference, and fixed-d3
+  stochastic grouped verification matches same-seed serial decode after cache
+  clear/reuse. Final MoE combined outputs are explicitly replicated snapshots;
+  the obsolete post-combine allreduce diagnostic contract has been removed.
 
 ## Kernel Economy
 
@@ -70,6 +74,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Removing the invalid shared-expert allreduce improved the production CUDA2
   LLEP stochastic lane from `15.368` to `27.790 tok/s` decode (`+80.8%`), with
   `4030.44 tok/s` prefill. It remains only 16.2% of llama.cpp d3 decode.
+- Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
+  `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
+  communication baseline; the dynamic depth controller is a later tuning lane.
 - Participant-local overlay preparation removed duplicate cross-GPU repacking:
   graph build fell `61.3 -> 36.5 s`, per-GPU jobs `32129 -> 16385`, and source
   bytes `15.74 -> 9.14 GB`. Missing frozen bindings now fail instead of reading
@@ -89,8 +96,9 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Profile the full CUDA LLEP lane; reduce/overlap rooted collectives and tune
-   every dominant kernel until decode exceeds llama.cpp `171.81 tok/s`.
+1. Profile fixed-d3 CUDA LLEP end to end; reduce/overlap rooted collectives and
+   tune every dominant kernel until decode exceeds llama.cpp `171.81 tok/s`.
+   Tune dynamic depth and hysteresis only after this fixed control is economical.
 2. Run the remaining full-context CPU matrix, then close remote-participant
    lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.

@@ -1257,6 +1257,70 @@ TEST_F(MoEExpertPrefillGraphCapture, StaticDescriptorMaskedDecodeAcceptsExplicit
 #endif
 }
 
+TEST_F(MoEExpertPrefillGraphCapture, FullyReplicatedDecodePreservesExplicitRuntimeOwners)
+{
+    auto expect_backend = [&](DeviceId device, bool backend_supported)
+    {
+        constexpr int kParticipantCount = 2;
+        const std::vector<int> owners{0, 1, 0, 1};
+
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        auto update = routingRuntimeUpdate(
+            /*epoch=*/1,
+            NUM_EXPERTS,
+            D_MODEL);
+        declareFullyReplicatedPlacementTopology(
+            update,
+            /*local_participant=*/0,
+            kParticipantCount,
+            owners);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, nullptr));
+
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+        params.my_socket_id = 0;
+        params.participant_count = kParticipantCount;
+        params.expert_mask.assign(NUM_EXPERTS, true);
+        params.runtime_decode_uses_mutable_descriptors = false;
+        params.runtime_decode_has_explicit_owner_metadata = true;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        stage.setRuntimeGroupedDecodeWarmedForTesting(true);
+
+        const auto &state = runtime_table.hostLayerState(0);
+        const auto &bank = state.banks[state.active_bank];
+        EXPECT_EQ(state.active_epoch, update.epoch)
+            << "A complete replicated graph bank must not be replaced by stage-local topology synthesis";
+        EXPECT_EQ(state.participant_count, kParticipantCount);
+        EXPECT_EQ(bank.resident_participant_mask[1], 0b11u);
+        EXPECT_EQ(bank.experts[1].owner_participant, 1);
+        EXPECT_EQ(
+            bank.replica_role[1],
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
+        EXPECT_EQ(stage.runtimeDecodeDescriptorSourceForTesting(),
+                  MoEDecodeDescriptorSource::StaticDescriptorTable);
+        EXPECT_EQ(stage.isGraphCapturable(), backend_supported)
+            << "A fully replicated LocalTP bank with explicit owner metadata should remain graph-capturable";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true);
+#else
+    expect_backend(DeviceId::cuda(0), false);
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true);
+#else
+    expect_backend(DeviceId::rocm(0), false);
+#endif
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
 {
 #if defined(HAVE_ROCM)

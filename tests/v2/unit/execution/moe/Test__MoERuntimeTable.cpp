@@ -158,6 +158,89 @@ namespace llaminar2::test
         EXPECT_EQ(layer0->participant_count, 1u);
     }
 
+    TEST(Test__MoERuntimeTable, FullyReplicatedTopologyPublishesEveryParticipantAndCanonicalOwner)
+    {
+        constexpr int kExperts = 4;
+        constexpr int kParticipants = 2;
+        const std::vector<int> owners{0, 1, 0, 1};
+
+        for (int local_participant = 0;
+             local_participant < kParticipants;
+             ++local_participant)
+        {
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = kExperts;
+            for (int expert = 0; expert < kExperts; ++expert)
+                update.experts.push_back(expertDesc(expert, -1, expert));
+
+            declareFullyReplicatedPlacementTopology(
+                update,
+                local_participant,
+                kParticipants,
+                owners);
+
+            EXPECT_EQ(update.participant_id,
+                      static_cast<uint32_t>(local_participant));
+            EXPECT_EQ(update.participant_count,
+                      static_cast<uint32_t>(kParticipants));
+            ASSERT_EQ(update.local_compute_mask.size(), kExperts);
+            ASSERT_EQ(update.replica_role.size(), kExperts);
+            ASSERT_EQ(update.resident_participant_mask.size(), kExperts);
+
+            for (int expert = 0; expert < kExperts; ++expert)
+            {
+                const bool is_primary = owners[expert] == local_participant;
+                const auto &descriptor = update.experts[expert];
+                EXPECT_EQ(update.local_compute_mask[expert], 1u);
+                EXPECT_EQ(update.resident_participant_mask[expert], 0b11u);
+                EXPECT_EQ(
+                    update.replica_role[expert],
+                    static_cast<uint8_t>(
+                        is_primary
+                            ? DeviceMoEReplicaRole::Primary
+                            : DeviceMoEReplicaRole::Replica));
+                EXPECT_EQ(descriptor.owner_participant, owners[expert]);
+                EXPECT_TRUE(hasMoEExpertFlag(
+                    descriptor.flags,
+                    DeviceMoEExpertFlags::Replicated));
+                EXPECT_EQ(
+                    hasMoEExpertFlag(
+                        descriptor.flags,
+                        DeviceMoEExpertFlags::PreferredOwner),
+                    is_primary);
+            }
+        }
+    }
+
+    TEST(Test__MoERuntimeTable, FullyReplicatedTopologyRejectsIncompleteDomainMetadata)
+    {
+        const std::vector<int> incomplete_owners{0};
+        const std::vector<int> out_of_domain_owners{0, 2};
+        MoEPlacementUpdate update;
+        update.epoch = 1;
+        update.expert_count = 2;
+        update.experts = {
+            expertDesc(0, -1, 0),
+            expertDesc(1, -1, 1),
+        };
+
+        EXPECT_THROW(
+            declareFullyReplicatedPlacementTopology(
+                update,
+                /*local_participant=*/0,
+                /*participant_count=*/2,
+                incomplete_owners),
+            std::invalid_argument);
+        EXPECT_THROW(
+            declareFullyReplicatedPlacementTopology(
+                update,
+                /*local_participant=*/0,
+                /*participant_count=*/2,
+                out_of_domain_owners),
+            std::invalid_argument);
+    }
+
     TEST(Test__MoERuntimeTable, DeviceRebalanceConfigValidatesExplicitRootParticipant)
     {
         auto config = rebalanceConfig(/*layers=*/2,

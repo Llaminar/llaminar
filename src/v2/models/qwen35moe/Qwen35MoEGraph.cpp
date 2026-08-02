@@ -378,6 +378,89 @@ namespace llaminar2
             return true;
         }
 
+        bool runtimeTableHasUsableFullyReplicatedDecodeBank(
+            IMoERuntimeTable *runtime_table,
+            int layer_idx,
+            int num_experts,
+            int top_k,
+            int local_participant,
+            int participant_count,
+            const std::vector<int> &owner_participants)
+        {
+            if (!runtime_table ||
+                layer_idx < 0 ||
+                local_participant < 0 ||
+                participant_count <= 0 ||
+                local_participant >= participant_count ||
+                participant_count > static_cast<int>(kDeviceMoEMaxParticipants) ||
+                owner_participants.size() != static_cast<size_t>(num_experts) ||
+                runtime_table->decodeRuntimePublicationRequired(layer_idx))
+            {
+                return false;
+            }
+
+            const auto &state = runtime_table->hostLayerState(layer_idx);
+            if (state.active_bank > 1 ||
+                state.active_epoch == 0 ||
+                state.expert_count != static_cast<uint32_t>(num_experts) ||
+                state.top_k != static_cast<uint32_t>(top_k) ||
+                state.participant_id != static_cast<uint32_t>(local_participant) ||
+                state.participant_count != static_cast<uint32_t>(participant_count))
+            {
+                return false;
+            }
+
+            const auto &bank = state.banks[state.active_bank];
+            if (bank.epoch != state.active_epoch ||
+                bank.expert_count != static_cast<uint32_t>(num_experts))
+            {
+                return false;
+            }
+
+            const uint32_t all_participants_mask =
+                (1u << static_cast<uint32_t>(participant_count)) - 1u;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const int owner = owner_participants[static_cast<size_t>(expert)];
+                if (owner < 0 || owner >= participant_count)
+                    return false;
+
+                const auto &descriptor = bank.experts[static_cast<size_t>(expert)];
+                const auto expected_role = static_cast<uint8_t>(
+                    owner == local_participant
+                        ? DeviceMoEReplicaRole::Primary
+                        : DeviceMoEReplicaRole::Replica);
+                if (bank.local_compute_mask[static_cast<size_t>(expert)] != 1u ||
+                    bank.replica_role[static_cast<size_t>(expert)] != expected_role ||
+                    bank.resident_participant_mask[static_cast<size_t>(expert)] !=
+                        all_participants_mask ||
+                    descriptor.logical_expert_id != expert ||
+                    descriptor.owner_participant != owner ||
+                    descriptor.local_slot < 0 ||
+                    !descriptor.gate.valid() ||
+                    !descriptor.up.valid() ||
+                    !descriptor.down.valid() ||
+                    !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Valid) ||
+                    !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Resident) ||
+                    !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Replicated) ||
+                    !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::LocalCompute) ||
+                    (hasMoEExpertFlag(
+                         descriptor.flags,
+                         DeviceMoEExpertFlags::PreferredOwner) !=
+                     (owner == local_participant)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        enum class FullLocalDecodeRuntimePolicy
+        {
+            SingleParticipant,
+            FullyReplicatedLocalTP,
+        };
+
         bool runtimeTableHasUsableMaskedDecodeBank(
             IMoERuntimeTable *runtime_table,
             int layer_idx,
@@ -832,6 +915,10 @@ namespace llaminar2
             int top_k,
             int d_model,
             int expert_intermediate,
+            FullLocalDecodeRuntimePolicy topology_policy,
+            int local_participant,
+            int participant_count,
+            const std::vector<int> &owner_participants,
             const std::vector<ITensorGemm *> &gate_gemms,
             const std::vector<ITensorGemm *> &up_gemms,
             const std::vector<ITensorGemm *> &down_gemms,
@@ -841,9 +928,26 @@ namespace llaminar2
             if (!runtime_table || layer_idx < 0)
                 return false;
 
-            if (runtimeTableHasUsableDecodeBank(
-                    runtime_table, layer_idx, num_experts, top_k,
-                    /*require_full_local_descriptors=*/true))
+            const bool fully_replicated_local_tp =
+                topology_policy ==
+                FullLocalDecodeRuntimePolicy::FullyReplicatedLocalTP;
+            const bool existing_bank_usable =
+                fully_replicated_local_tp
+                    ? runtimeTableHasUsableFullyReplicatedDecodeBank(
+                          runtime_table,
+                          layer_idx,
+                          num_experts,
+                          top_k,
+                          local_participant,
+                          participant_count,
+                          owner_participants)
+                    : runtimeTableHasUsableDecodeBank(
+                          runtime_table,
+                          layer_idx,
+                          num_experts,
+                          top_k,
+                          /*require_full_local_descriptors=*/true);
+            if (existing_bank_usable)
             {
                 return true;
             }
@@ -873,14 +977,22 @@ namespace llaminar2
             update.epoch = 1;
             update.expert_count = static_cast<uint32_t>(num_experts);
             update.experts.resize(static_cast<size_t>(num_experts));
-            update.local_compute_mask.assign(static_cast<size_t>(num_experts), 1u);
-            update.replica_role.assign(static_cast<size_t>(num_experts),
-                                       static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+            if (!fully_replicated_local_tp)
+            {
+                update.local_compute_mask.assign(
+                    static_cast<size_t>(num_experts), 1u);
+                update.replica_role.assign(
+                    static_cast<size_t>(num_experts),
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+            }
 
-            const uint32_t flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
-                                                    DeviceMoEExpertFlags::Resident |
-                                                    DeviceMoEExpertFlags::PreferredOwner |
-                                                    DeviceMoEExpertFlags::LocalCompute);
+            DeviceMoEExpertFlags descriptor_flags =
+                DeviceMoEExpertFlags::Valid |
+                DeviceMoEExpertFlags::Resident |
+                DeviceMoEExpertFlags::LocalCompute;
+            if (!fully_replicated_local_tp)
+                descriptor_flags |= DeviceMoEExpertFlags::PreferredOwner;
+            const uint32_t flags = toMoEExpertFlags(descriptor_flags);
 
             for (int expert = 0; expert < num_experts; ++expert)
             {
@@ -918,10 +1030,29 @@ namespace llaminar2
                 }
 
                 desc.logical_expert_id = expert;
-                desc.owner_participant = 0;
+                desc.owner_participant = fully_replicated_local_tp ? -1 : 0;
                 desc.local_slot = expert;
                 desc.flags = flags;
                 update.experts[static_cast<size_t>(expert)] = desc;
+            }
+
+            if (fully_replicated_local_tp)
+            {
+                try
+                {
+                    declareFullyReplicatedPlacementTopology(
+                        update,
+                        local_participant,
+                        participant_count,
+                        owner_participants);
+                }
+                catch (const std::exception &ex)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": invalid replicated runtime topology for layer "
+                                                  << layer_idx << ": " << ex.what());
+                    return false;
+                }
             }
 
             try
@@ -937,9 +1068,21 @@ namespace llaminar2
                 return false;
             }
 
-            return runtimeTableHasUsableDecodeBank(
-                runtime_table, layer_idx, num_experts, top_k,
-                /*require_full_local_descriptors=*/true);
+            return fully_replicated_local_tp
+                       ? runtimeTableHasUsableFullyReplicatedDecodeBank(
+                             runtime_table,
+                             layer_idx,
+                             num_experts,
+                             top_k,
+                             local_participant,
+                             participant_count,
+                             owner_participants)
+                       : runtimeTableHasUsableDecodeBank(
+                             runtime_table,
+                             layer_idx,
+                             num_experts,
+                             top_k,
+                             /*require_full_local_descriptors=*/true);
         }
 
         MoEOverlayCollectiveKey graphNativeMoEKey(
@@ -4667,6 +4810,7 @@ namespace llaminar2
                     activeRuntimeBankUsesTransientLocalPayload(layer_idx);
                 expert_params.runtime_decode_has_explicit_owner_metadata =
                     masked_local_tp_overlay_decode_runtime_table ||
+                    full_local_tp_replicated_overlay_decode_runtime_table ||
                     masked_local_tp_apportioned_decode_runtime_table;
                 expert_params.force_grouped_verifier_prefill_for_decode =
                     forceGroupedMoEVerifierPrefill(stage_device);
@@ -5044,6 +5188,12 @@ namespace llaminar2
                 else if (moe_runtime_table &&
                          full_local_tp_replicated_overlay_decode_runtime_table)
                 {
+                    const int participant_count = expert_params.participant_count;
+                    const auto owner_participants =
+                        ownerParticipantsFromMap(
+                            *owner_map_lifetime,
+                            layer_idx,
+                            config_.moe.num_experts);
                     if (!initializeFullLocalDecodeRuntimeTable(
                             moe_runtime_table,
                             layer_idx,
@@ -5051,6 +5201,10 @@ namespace llaminar2
                             config_.moe.top_k,
                             config_.d_model,
                             expert_intermediate,
+                            FullLocalDecodeRuntimePolicy::FullyReplicatedLocalTP,
+                            local_participant,
+                            participant_count,
+                            owner_participants,
                             expert_params.prepared_gate_gemm,
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
@@ -5790,6 +5944,10 @@ namespace llaminar2
                                 config_.moe.top_k,
                                 config_.d_model,
                                 expert_intermediate,
+                                FullLocalDecodeRuntimePolicy::SingleParticipant,
+                                /*local_participant=*/0,
+                                /*participant_count=*/1,
+                                /*owner_participants=*/{},
                                 expert_params.prepared_gate_gemm,
                                 expert_params.prepared_up_gemm,
                                 expert_params.prepared_down_gemm,

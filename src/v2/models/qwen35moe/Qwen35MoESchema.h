@@ -198,10 +198,18 @@ namespace llaminar2
             config["MOE_EXPERT_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["MOE_SHARED_EXPERT_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["MOE_SHARED_GATE_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
-            config["MOE_COMBINED_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
+            /*
+             * MOE_COMBINED_OUTPUT is emitted only after every sharded routed
+             * and shared-expert branch has completed its own collective.  The
+             * final add therefore consumes replicated branch results and is
+             * itself replicated.  Treating this boundary as row-parallel was
+             * a stale description of the retired combined-output allreduce
+             * graph and caused parity to request a snapshot from a node that
+             * no longer exists.
+             */
+            config["MOE_COMBINED_OUTPUT"] = SnapshotShardingMode::REPLICATED;
             config["MOE_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
             config["MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
-            config["MOE_COMBINED_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
 
             return config;
         }

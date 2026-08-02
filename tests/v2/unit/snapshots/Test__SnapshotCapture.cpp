@@ -124,8 +124,6 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combine"), "layer0_MOE_COMBINED_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combined_allreduce"),
-              "layer0_MOE_COMBINED_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_ffn"), "layer39_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_add"), "layer39_MOE_COMBINED_OUTPUT");
 }
@@ -163,13 +161,6 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutpu
                         down_keys.end(),
                         "layer14_FFN_DOWN_ALLREDUCED"),
               down_keys.end());
-
-    const auto combined_keys =
-        SnapshotCapture::possibleKeysForStageName("layer14_moe_combined_allreduce");
-    EXPECT_NE(std::find(combined_keys.begin(),
-                        combined_keys.end(),
-                        "layer14_MOE_COMBINED_OUTPUT_ALLREDUCED"),
-              combined_keys.end());
 
     const auto shared_keys =
         SnapshotCapture::possibleKeysForStageName("layer14_shared_expert_allreduce");
