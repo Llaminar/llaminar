@@ -4486,10 +4486,11 @@ namespace llaminar2
         /*
          * LocalTP expert ownership must never shape the FP32 route addition
          * tree. GPU apportioned paths therefore publish every original route
-         * into an independent slot, allreduce those slots in FP32, and reduce
-         * them in router order on device. The shared expert retains its normal
+         * into an independent slot, reduce those slots in FP32 to one fixed
+         * participant, fold them in router order on that device, and broadcast
+         * only the compact routed row. The shared expert retains its normal
          * allreduce-then-gate arithmetic and is combined only after the routed
-         * reducer completes.
+         * result has been published to every participant.
          */
         bool canonical_local_tp_route_publication = false;
 
@@ -4949,30 +4950,70 @@ namespace llaminar2
                              : size_t{1});
                     const std::string ar_name =
                         canonical_local_tp_route_publication
-                            ? prefix + "moe_canonical_routes_allreduce"
+                            ? prefix + "moe_canonical_routes_reduce_to_root"
                             : prefix + "moe_expert_overlay_fast_allreduce";
                     auto rebalance_sidebands =
                         takeGraphRebalanceSidebandsForAllreduce();
-                    auto allreduce_stage = createTPAllreduceStage(
-                        allreduce_buffer,
-                        allreduce_count,
-                        device,
-                        layer_idx,
-                        /*is_attention=*/false,
-                        ar_name,
-                        allreduce_buffer_id,
-                        std::move(rebalance_sidebands),
-                        canonical_local_tp_route_publication
-                            ? std::optional<std::string>{"fp32"}
-                            : std::nullopt);
-                    if (!allreduce_stage)
+                    std::unique_ptr<IComputeStage> collective_stage;
+                    int canonical_route_root_participant = -1;
+                    if (canonical_local_tp_route_publication)
+                    {
+                        canonical_route_root_participant =
+                            continuationRootParticipant(*overlay_plan);
+                        if (!local_tp_ctx ||
+                            config_.tp_device_idx < 0 ||
+                            config_.tp_device_idx >= local_tp_ctx->degree() ||
+                            canonical_route_root_participant < 0 ||
+                            canonical_route_root_participant >=
+                                local_tp_ctx->degree())
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE canonical rooted route publication "
+                                "requires a valid homogeneous LocalTP participant "
+                                "and root for layer " +
+                                std::to_string(layer_idx));
+                        }
+
+                        TPLocalRootedCollectiveStage::Params rooted_params;
+                        rooted_params.device_id = device;
+                        rooted_params.tp_ctx = local_tp_ctx;
+                        rooted_params.tensor = allreduce_buffer;
+                        rooted_params.count = allreduce_count;
+                        rooted_params.dtype = CollectiveDataType::FLOAT32;
+                        rooted_params.operation =
+                            TPLocalRootedCollectiveOperation::ReduceSum;
+                        rooted_params.root_device_index =
+                            canonical_route_root_participant;
+                        rooted_params.participant_device_index =
+                            config_.tp_device_idx;
+                        rooted_params.stage_name = ar_name;
+                        rooted_params.tensor_buffer_id = allreduce_buffer_id;
+                        rooted_params.sideband_workspace_bindings =
+                            std::move(rebalance_sidebands);
+                        collective_stage =
+                            ComputeStageFactory::createTPLocalRootedCollective(
+                                rooted_params);
+                    }
+                    else
+                    {
+                        collective_stage = createTPAllreduceStage(
+                            allreduce_buffer,
+                            allreduce_count,
+                            device,
+                            layer_idx,
+                            /*is_attention=*/false,
+                            ar_name,
+                            allreduce_buffer_id,
+                            std::move(rebalance_sidebands));
+                    }
+                    if (!collective_stage)
                     {
                         throw std::runtime_error(
                             "Qwen35 MoE graph could not create the required "
-                            "LocalTP routed-expert allreduce for layer " +
+                            "LocalTP routed-expert collective for layer " +
                             std::to_string(layer_idx));
                     }
-                    graph.addNode(ar_name, std::move(allreduce_stage), device);
+                    graph.addNode(ar_name, std::move(collective_stage), device);
                     /*
                      * The canonical route collective consumes the expert
                      * kernel's per-route publication directly.  Keep that
@@ -5026,6 +5067,10 @@ namespace llaminar2
                         reduce_params.seq_len = total_tokens;
                         reduce_params.top_k = config_.moe.top_k;
                         reduce_params.d_model = config_.d_model;
+                        reduce_params.participant_device_index =
+                            config_.tp_device_idx;
+                        reduce_params.root_device_index =
+                            canonical_route_root_participant;
                         reduce_params.canonical_route_contributions_buffer_id =
                             allreduce_buffer_id;
                         reduce_params.output_buffer_id =
@@ -5039,7 +5084,37 @@ namespace llaminar2
                                 reduce_params),
                             device);
                         graph.addDependency(reduce_name, ffn_terminal);
-                        ffn_terminal = reduce_name;
+
+                        TPLocalRootedCollectiveStage::Params broadcast_params;
+                        broadcast_params.device_id = device;
+                        broadcast_params.tp_ctx = local_tp_ctx;
+                        broadcast_params.tensor = moe_output;
+                        broadcast_params.count =
+                            static_cast<size_t>(total_tokens) *
+                            static_cast<size_t>(config_.d_model);
+                        broadcast_params.dtype =
+                            CollectiveDataType::FLOAT32;
+                        broadcast_params.operation =
+                            TPLocalRootedCollectiveOperation::Broadcast;
+                        broadcast_params.root_device_index =
+                            canonical_route_root_participant;
+                        broadcast_params.participant_device_index =
+                            config_.tp_device_idx;
+                        broadcast_params.stage_name =
+                            prefix + "moe_canonical_routes_broadcast";
+                        broadcast_params.tensor_buffer_id =
+                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+
+                        const std::string broadcast_name =
+                            broadcast_params.stage_name;
+                        graph.addNode(
+                            broadcast_name,
+                            ComputeStageFactory::
+                                createTPLocalRootedCollective(
+                                    broadcast_params),
+                            device);
+                        graph.addDependency(broadcast_name, reduce_name);
+                        ffn_terminal = broadcast_name;
                     }
                 }
 
@@ -5595,6 +5670,18 @@ namespace llaminar2
             layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
         {
             DeviceId shared_device = planned_shared_device;
+            /*
+             * Shared experts are always-on dense FFNs even though their GGUF
+             * names contain "expert". Phase-split decode therefore binds the
+             * complete replicated shared-expert weights on every participant,
+             * exactly like replicated attention and dense FFN weights. Only
+             * the tensor-parallel prefill view produces a partial down row that
+             * requires a collective. Keeping this policy in one named value
+             * prevents the gate/combine lowering and the collective lowering
+             * from disagreeing about whether the branch is already complete.
+             */
+            const bool shared_expert_requires_tp_allreduce =
+                needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph();
             if (overlay_runtime_plan)
             {
                 const auto &continuation_domain = overlay_runtime_plan->continuationDomain();
@@ -5726,10 +5813,13 @@ namespace llaminar2
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
 
-            // Input-parallel shared-expert down rows are reduced before the
-            // replicated sigmoid gate, preserving the serial LocalTP branch
-            // arithmetic independently of routed-expert placement.
-            if (needsTPAllreduce())
+            /*
+             * Input-parallel prefill shared-expert down rows are reduced before
+             * the replicated sigmoid gate, preserving the serial LocalTP branch
+             * arithmetic independently of routed-expert placement. Replicated
+             * decode rows are already complete and must never be summed again.
+             */
+            if (shared_expert_requires_tp_allreduce)
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                 std::string ar_name = prefix + "shared_expert_allreduce";
@@ -5758,7 +5848,8 @@ namespace llaminar2
             if (layer.shared_expert_gate_inp)
             {
                 const bool can_fuse_gate_and_combine =
-                    !needsTPAllreduce() && shared_device == device &&
+                    !shared_expert_requires_tp_allreduce &&
+                    shared_device == device &&
                     moe_output && buffers.attn_proj;
                 const bool gate_writes_combined_output =
                     can_fuse_gate_and_combine;

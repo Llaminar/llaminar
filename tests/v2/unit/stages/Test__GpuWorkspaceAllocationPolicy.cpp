@@ -5411,6 +5411,65 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
 }
 
 /**
+ * @brief Keep rooted collective execution free of workspace lookup and allocation.
+ *
+ * Rooted activation reduction and its rebalance sidebands are captured as one
+ * fixed-stream transaction. Symbolic workspace names therefore have to become
+ * stable device pointers during graph binding, before execute() can launch the
+ * first collective. Resolving names or constructing descriptor vectors after
+ * that launch would both allocate in a capture-sensitive path and permit a bad
+ * sideband binding to split collective order across participants.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     RootedCollectivePrebindsSidebandsOutsideExecution)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/compute_stages/stages/TPAllreduceStage.cpp");
+    const auto header = readFile(
+        repoRoot() /
+        "src/v2/execution/compute_stages/stages/TPAllreduceStage.h");
+
+    const auto execute_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool TPLocalRootedCollectiveStage::execute(IDeviceContext *ctx)",
+            "bool TPLocalRootedCollectiveStage::supportsBackend(")));
+    const auto bind_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "void TPLocalRootedCollectiveStage::bindWorkspace(",
+            "void TPLocalRootedCollectiveStage::unbindWorkspace()")));
+    const auto compact_header = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(header));
+
+    EXPECT_NE(
+        compact_header.find(
+            "std::vector<LocalTPCollectiveSidebandBuffer>bound_sidebands_;"),
+        std::string::npos)
+        << "The stage needs persistent prebound descriptors with graph-stable addresses.";
+    EXPECT_NE(bind_body.find("bound_workspace_->getBuffer(buffer_name)"),
+              std::string::npos)
+        << "Workspace names must be resolved during binding.";
+    EXPECT_NE(bind_body.find("bound_sidebands_.push_back("),
+              std::string::npos)
+        << "Binding must materialize the complete fixed sideband table.";
+
+    EXPECT_NE(execute_body.find(
+                  "collectiveSidebandSpanOnStream(bound_sidebands_,"),
+              std::string::npos)
+        << "Execution must submit the already-bound descriptor span.";
+    EXPECT_EQ(execute_body.find("getBuffer("), std::string::npos);
+    EXPECT_EQ(execute_body.find("std::vector<"), std::string::npos);
+    EXPECT_EQ(execute_body.find(".reserve("), std::string::npos);
+    EXPECT_EQ(execute_body.find(".push_back("), std::string::npos);
+    EXPECT_EQ(execute_body.find("malloc("), std::string::npos);
+    EXPECT_EQ(execute_body.find("cudaMalloc("), std::string::npos);
+    EXPECT_EQ(execute_body.find("hipMalloc("), std::string::npos);
+    EXPECT_EQ(execute_body.find("synchronize"), std::string::npos);
+}
+
+/**
  * @brief Locks in bounded, nonblocking profiler-event reuse for mirrored MTP.
  *
  * Non-root LocalTP participants do not own the final compact result D2H. Their

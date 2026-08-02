@@ -1372,6 +1372,8 @@ namespace llaminar2
             if (cache_it != cache_.end())
             {
                 active_forward_cache = &cache_it->second;
+                active_forward_cache->segment_cache.replay_workload =
+                    replayWorkloadGeometryForSignature(forward_signature);
             }
         }
 
@@ -1443,6 +1445,8 @@ namespace llaminar2
                 forwardCacheLookupTags(forward_signature, "miss"));
             auto [it, _inserted] = cache_.try_emplace(forward_signature);
             build_cache = &it->second;
+            build_cache->segment_cache.replay_workload =
+                replayWorkloadGeometryForSignature(forward_signature);
             should_cache_after_build = !build_cache->valid;
         }
 

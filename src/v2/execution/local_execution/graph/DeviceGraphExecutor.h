@@ -40,6 +40,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
@@ -632,6 +633,42 @@ namespace llaminar2
         struct GraphSegmentCache
         {
             /**
+             * @brief Stable execution geometry represented by this graph cache.
+             *
+             * Deferred GPU timing events can complete several host iterations
+             * after their graph launch.  Reading mutable runner state when an
+             * event is reclaimed would consequently attach the wrong M, batch,
+             * or verifier mode to an otherwise accurate GPU interval.  The
+             * descriptor instead travels with the cached executable whose event
+             * ring produced the sample.
+             *
+             * The fields are deliberately scalar and backend-neutral.  They add
+             * no allocation, transfer, synchronization, or graph node to replay;
+             * PerfStats converts them to strings only when structured metrics
+             * are already enabled.  `m` is the flattened physical row count and
+             * is therefore the exact grouped-verifier work size for the common
+             * batch-size-one MTP transaction.
+             */
+            struct ReplayWorkloadGeometry
+            {
+                int seq_len = 0;                 ///< Rows per logical request.
+                int batch_size = 0;              ///< Logical request count.
+                int m = 0;                       ///< Flattened physical graph rows.
+                int all_position_rows = 0;       ///< Compact verifier/logit rows, or zero.
+                uint8_t verifier_outcome_mode = 0; ///< Typed MTP outcome enum value.
+                uint8_t position_policy = 0;     ///< Typed ForwardPositionPolicy value.
+                uint64_t moe_placement_epoch = 0; ///< Expert-placement identity in the cache key.
+                bool decode = false;             ///< Decode-equivalent graph family.
+                bool all_position_logits = false; ///< Graph projects verifier rows.
+                bool live_mtp_request_batch_condition = false; ///< One live condition row per request.
+
+                [[nodiscard]] bool valid() const noexcept
+                {
+                    return seq_len > 0 && batch_size > 0 && m > 0;
+                }
+            };
+
+            /**
              * @brief One preallocated asynchronous GPU replay timing interval.
              *
              * Timing events are backend resources, so they are created during
@@ -685,6 +722,7 @@ namespace llaminar2
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
             uint64_t snapshot_configuration_epoch = 0; ///< Executor snapshot topology represented by this cache
             std::string perf_context;                 ///< Optional structured stats tag for the replay caller
+            ReplayWorkloadGeometry replay_workload;   ///< Exact cache-key geometry for deferred replay metrics
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
@@ -711,6 +749,7 @@ namespace llaminar2
                   variant_recapture_count(other.variant_recapture_count),
                   snapshot_configuration_epoch(other.snapshot_configuration_epoch),
                   perf_context(std::move(other.perf_context)),
+                  replay_workload(other.replay_workload),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
                   gpu_ctx_ref(other.gpu_ctx_ref),
@@ -746,6 +785,7 @@ namespace llaminar2
                     variant_recapture_count = other.variant_recapture_count;
                     snapshot_configuration_epoch = other.snapshot_configuration_epoch;
                     perf_context = std::move(other.perf_context);
+                    replay_workload = other.replay_workload;
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
                     gpu_ctx_ref = other.gpu_ctx_ref;

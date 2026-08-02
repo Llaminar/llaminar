@@ -303,6 +303,7 @@ namespace llaminar2
 
         // Collective
         ALLREDUCE,
+        ROOTED_COLLECTIVE, ///< LocalTP reduce-to-root or root broadcast
         ALLGATHER,
         ALLGATHER_V, ///< Variable-count allgather for heterogeneous TP
 
@@ -378,6 +379,7 @@ namespace llaminar2
         switch (type)
         {
         case ComputeStageType::ALLREDUCE:
+        case ComputeStageType::ROOTED_COLLECTIVE:
         case ComputeStageType::ALLGATHER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:

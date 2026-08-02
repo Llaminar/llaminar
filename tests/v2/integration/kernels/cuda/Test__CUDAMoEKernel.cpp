@@ -20316,6 +20316,8 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             reduce_params.seq_len = 1;
             reduce_params.top_k = top_k;
             reduce_params.d_model = d_model;
+            reduce_params.participant_device_index = 0;
+            reduce_params.root_device_index = 0;
             llaminar2::MoECanonicalRouteReduceStage reduce_stage(
                 std::move(reduce_params));
             reduce_stage.setGPUStream(stream_);

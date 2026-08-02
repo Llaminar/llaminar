@@ -1656,6 +1656,96 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid reduce root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!send_buf || !recv_buf || count == 0)
+        {
+            last_error_ = "Invalid reduce buffer/count for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null reduce stream for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        const auto comm =
+            static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        const auto caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_reduce = -1;
+        if (tl_last_hip_device_for_reduce != ordinal)
+        {
+            const hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") +
+                              hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_reduce = ordinal;
+        }
+
+        const rccl::ncclResult_t result = rccl::ncclReduce(
+            send_buf,
+            recv_buf,
+            count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            toRcclRedOpInt(toOpInt(op)),
+            root,
+            comm,
+            caller_stream);
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclReduce(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherSingleDeviceOnStream(const void *send_buf,
                                                         void *recv_buf,
                                                         size_t send_count,

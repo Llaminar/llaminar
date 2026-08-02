@@ -1603,6 +1603,64 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_)
+        {
+            last_error_ = initialized_
+                              ? "No RCCLCoordinator"
+                              : "RCCLBackend not initialized";
+            return false;
+        }
+        if (!coordinator_->reduceSingleDeviceOnStream(
+                send_buf,
+                recv_buf,
+                count,
+                dtype,
+                op,
+                root,
+                device_idx,
+                stream))
+        {
+            last_error_ =
+                "RCCLCoordinator reduceSingleDeviceOnStream failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsReduceSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allgatherSingleDeviceOnStream(
         const void *send_buf,
         void *recv_buf,

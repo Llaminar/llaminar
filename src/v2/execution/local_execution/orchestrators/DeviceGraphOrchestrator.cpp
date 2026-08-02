@@ -11356,6 +11356,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] forwardImpl cannot force both prefill and decode semantics");
             return nullptr;
         }
+        if (force_prefill_phase &&
+            execution_role != ForwardExecutionRole::MainInference)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Internal MTP forward roles are decode-equivalent and cannot force prefill semantics");
+            return nullptr;
+        }
         if (position_ids_device_override && !state_.device_id.is_gpu())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-resident position rows require a GPU forward");
@@ -11646,29 +11652,33 @@ namespace llaminar2
             return nullptr;
         }
 
-        // =====================================================================
-        // Gap 4: Automatic phase transition based on live request position.
-        // =====================================================================
-        // Short multi-token continuations are used by greedy MTP verification:
-        // they extend an existing KV/GDN history and must use decode semantics
-        // even though seq_len > 1. Treat only position-zero multi-token input as
-        // prompt prefill.
-        // =====================================================================
+        /*
+         * Select phase from the typed execution role before considering row
+         * geometry. Grouped verifiers are serial-decode-equivalent for every
+         * M, so the ordinary MainInference continuation heuristic must never
+         * switch M=5+ verifier graphs to tensor-parallel prefill. That old
+         * crossover added one dense allreduce per layer plus GDN/KV state
+         * allgathers and made dynamic MTP depth an accidental topology policy.
+         *
+         * MainInference still supports the compatibility heuristic for callers
+         * that have not supplied an explicit phase: scalar work is decode, and
+         * a bounded multi-row continuation with established history is decode.
+         */
         const int decode_max_seq_len = std::max(1, cache_config_.decode_seq_len);
-        const bool is_single_token_decode = (seq_len == 1 && batch_size <= 1);
-        const bool is_short_continuation_decode =
-            batch_size <= 1 &&
-            seq_len > 1 &&
-            seq_len <= decode_max_seq_len &&
-            state_.positions[0] > 0;
+        const ForwardExecutionPhase resolved_phase =
+            resolveForwardExecutionPhase({
+                .role = execution_role,
+                .force_prefill = force_prefill_phase,
+                .force_decode = force_decode_phase,
+                .seq_len = seq_len,
+                .batch_size = batch_size,
+                .decode_max_seq_len = decode_max_seq_len,
+                .logical_position = state_.positions[0],
+            });
         const InferencePhase new_phase =
-            force_prefill_phase
-                ? InferencePhase::PREFILL
-                : force_decode_phase
-                      ? InferencePhase::DECODE
-                      : (is_single_token_decode || is_short_continuation_decode)
-                            ? InferencePhase::DECODE
-                            : InferencePhase::PREFILL;
+            resolved_phase == ForwardExecutionPhase::Decode
+                ? InferencePhase::DECODE
+                : InferencePhase::PREFILL;
         transitionToPhase(new_phase);
 
         /*

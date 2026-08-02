@@ -37,6 +37,7 @@
 
 #include "backends/BackendManager.h"
 #include "utils/MPIContext.h"
+#include "../../../mocks/MockBackend.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -207,36 +208,19 @@ TEST_F(StageDumpInfoTest, DumpInfoCacheAllowsConcurrentSnapshotsAndInvalidation)
 
 TEST_F(StageDumpInfoTest, EnsureOutputsOnHostRejectsGpuOutputWithoutExplicitStream)
 {
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-    DeviceId device = DeviceId::invalid();
-#ifdef HAVE_CUDA
-    if (getCUDABackend() != nullptr)
-    {
-        device = DeviceId::cuda(0);
-    }
-#endif
-#ifdef HAVE_ROCM
-    if (!device.is_valid() && getROCmBackend() != nullptr)
-    {
-        device = DeviceId::rocm(0);
-    }
-#endif
-    if (!device.is_valid())
-    {
-        GTEST_SKIP() << "No GPU backend available";
-    }
-
+    MockBackend backend(DeviceType::CUDA);
     auto output = TestTensorFactory::createFP32({2, 2});
-    ASSERT_TRUE(output->ensureOnDevice(device));
+    output->setBackendForTesting(&backend);
+
+    const DeviceId device = DeviceId::cuda(0);
+    void *producer_stream = reinterpret_cast<void *>(0xD00F0001);
+    ASSERT_TRUE(output->allocateOnDevice(device, producer_stream));
     TransferEngine::publishGraphOwnedDeviceWrite(output, device);
 
     StageDumpInfo info;
     info.addOutput("gpu_output", output.get(), 2, 2);
 
     EXPECT_THROW(info.ensureOutputsOnHost(), std::runtime_error);
-#else
-    GTEST_SKIP() << "No GPU backend linked";
-#endif
 }
 
 // =============================================================================

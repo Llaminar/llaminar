@@ -267,6 +267,35 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op,
                                            int device_idx, void *stream);
 
+        /**
+         * @brief Reduce participant-local device input to one root on an
+         *        explicit HIP stream.
+         *
+         * This is the rooted counterpart to allreduceSingleDeviceOnStream().
+         * It enqueues RCCL directly on the caller's stream and performs no
+         * allocation, host transfer, or synchronization, so it is suitable for
+         * participant-local HIP graph capture.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root-owned device result buffer.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation.
+         * @param root Fixed communicator-local root participant.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null HIP stream.
+         * @return true when RCCL accepted the asynchronous operation.
+         */
+        bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream);
+
         bool allgatherSingleDeviceOnStream(const void *send_buf,
                                            void *recv_buf,
                                            size_t send_count,

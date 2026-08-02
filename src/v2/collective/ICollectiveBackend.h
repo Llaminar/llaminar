@@ -957,6 +957,49 @@ namespace llaminar2
         virtual bool supportsAllreduceSingleDeviceOnStream() const { return false; }
 
         /**
+         * @brief Per-device rooted reduction on a caller-provided stream.
+         *
+         * Every participant contributes @p count elements. Only @p root owns
+         * the reduced result in @p recv_buf. Implementations must enqueue the
+         * collective directly on @p stream so the operation remains compatible
+         * with participant-local GPU graph capture. No allocation, transfer,
+         * host rendezvous, or completion synchronization is permitted.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root result buffer; ignored by non-root transports.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation.
+         * @param root Communicator-local root participant index.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null CUDA/HIP stream.
+         * @return true when the backend accepted the asynchronous operation.
+         */
+        virtual bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)root;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /** @brief Whether graph-capturable participant-local reduce is implemented. */
+        virtual bool supportsReduceSingleDeviceOnStream() const { return false; }
+
+        /**
          * @brief Per-device all-gather on a caller-provided stream (graph-capturable)
          *
          * Like allreduceSingleDeviceOnStream(), this records the collective

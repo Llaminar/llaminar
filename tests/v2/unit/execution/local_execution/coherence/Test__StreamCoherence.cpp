@@ -48,6 +48,7 @@
 #include "utils/MPIContext.h"
 
 #include "../../../../mocks/MockBackend.h"
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 #include <memory>
 #include <vector>
@@ -149,6 +150,11 @@ public:
 class Test__StreamCoherence : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     void SetUp() override
     {
         mpi_ctx_ = std::make_shared<MPIContext>(0, 2, MPI_COMM_NULL);
@@ -809,10 +815,12 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_WithEvent_UsesEventSync)
 
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 64;
+    // The injected backend must outlive the tensor even when an assertion
+    // throws and GoogleTest unwinds this scope.
+    MockBackend mock_backend(DeviceType::ROCm);
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{ROWS, COLS}, DeviceId::cpu());
 
-    MockBackend mock_backend(DeviceType::ROCm);
     tensor->setBackendForTesting(&mock_backend);
 
     // Use ROCm device to avoid the cross-vendor CUDA event proxy path
@@ -887,10 +895,11 @@ TEST_F(Test__StreamCoherence, EnsureOnHost_InjectedEventUsesPublishedOrdering)
 
     constexpr size_t ROWS = 2;
     constexpr size_t COLS = 32;
+    // Keep backend ownership valid through every exceptional exit path.
+    MockBackend mock_backend(DeviceType::ROCm);
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{ROWS, COLS}, DeviceId::cpu());
 
-    MockBackend mock_backend(DeviceType::ROCm);
     tensor->setBackendForTesting(&mock_backend);
 
     tensor->injectGpuDevice(DeviceId::rocm(0));

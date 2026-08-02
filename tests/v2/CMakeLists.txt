@@ -5300,11 +5300,24 @@ target_link_libraries(v2_test_weight_preload_virtual_weights
     llaminar2_core
     GTest::gtest_main
 )
+set(V2_WEIGHT_PRELOAD_GPU_TESTS
+    "Test__WeightPreloadVirtualWeights.VirtualWeightIncludedInPreload:Test__WeightPreloadVirtualWeights.PreloadedVirtualWeightReturnsSameTensor:Test__WeightPreloadVirtualWeights.TiedEmbeddingProducesVocabParallelSlices")
 add_v2_test(V2_Unit_WeightPreloadVirtualWeights
     COMMAND $<TARGET_FILE:v2_test_weight_preload_virtual_weights>
+            --gtest_filter=-${V2_WEIGHT_PRELOAD_GPU_TESTS}
     LABELS "V2;Unit;WeightManager;TensorParallelism;TiedEmbeddings;Regression"
     MPI_PROCS 1
 )
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_WeightPreloadVirtualWeights_ROCm
+        COMMAND $<TARGET_FILE:v2_test_weight_preload_virtual_weights>
+                --gtest_filter=${V2_WEIGHT_PRELOAD_GPU_TESTS}
+        LABELS "V2;Integration;ROCm;WeightManager;TensorParallelism;TiedEmbeddings;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1"
+        TIMEOUT 120
+    )
+endif()
 
 # Test: NullWeightStreamer
 # No-op weight streamer for RESIDENT mode (Option B - weights fit in GPU VRAM)
@@ -12234,6 +12247,32 @@ if(HAVE_ROCM)
 endif()
 
 # =============================================================================
+# Performance Test: NCCL production-shape collective latency
+# =============================================================================
+# Isolates the CUDA2 transport floor for the small MoE expert-output allreduces
+# and larger GDN state allgathers observed in Qwen3.6 LocalTP/LLEP graphs. The
+# executable reports peer-access capability so SHM proxy results cannot be
+# mistaken for P2P performance.
+if(HAVE_CUDA)
+    add_executable(v2_perf_nccl_collective_latency
+        performance/Perf__NCCLCollectiveLatency.cu
+    )
+    target_link_libraries(v2_perf_nccl_collective_latency PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    add_v2_test(V2_Perf_NCCLCollectiveLatency
+        COMMAND $<TARGET_FILE:v2_perf_nccl_collective_latency>
+        LABELS "V2;Performance;CUDA;NCCL;AllReduce;AllGather;Latency;LocalTP;LLEP;Benchmark"
+        MPI_PROCS 1
+        TIMEOUT 300
+    )
+    message(STATUS "V2 Tests: Added NCCL production-shape collective latency benchmarks")
+endif()
+
+# =============================================================================
 # ROCm MoE Kernel Integration Tests
 # =============================================================================
 if(HAVE_ROCM)
@@ -14139,11 +14178,24 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
 add_executable(v2_test_moe_routing_stage unit/stages/Test__MoERoutingStage.cpp)
 target_include_directories(v2_test_moe_routing_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_moe_routing_stage llaminar2_core GTest::gtest GTest::gtest_main)
+set(V2_MOE_ROUTING_CUDA_TEST
+    "MoERoutingStageTest.CUDARoutingOutputsRemainDeviceCoherentWithWorkspace")
 add_v2_test(V2_Unit_MoERoutingStage
     COMMAND $<TARGET_FILE:v2_test_moe_routing_stage>
+            --gtest_filter=-${V2_MOE_ROUTING_CUDA_TEST}
     LABELS "V2;Unit;MoE;Router;Stages"
     MPI_PROCS 1
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_MoERoutingStage_CUDA
+        COMMAND $<TARGET_FILE:v2_test_moe_routing_stage>
+                --gtest_filter=${V2_MOE_ROUTING_CUDA_TEST}
+        LABELS "V2;Integration;CUDA;MoE;Router;Stages;Coherence;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK cuda_gpu_0
+        TIMEOUT 120
+    )
+endif()
 
 add_executable(v2_test_moe_local_expert_stage_prepared_weights
     unit/execution/compute_stages/Test__MoELocalExpertStage_PreparedWeights.cpp)

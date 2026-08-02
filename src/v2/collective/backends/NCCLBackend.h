@@ -280,6 +280,17 @@ namespace llaminar2
             int device_idx, void *stream) override;
         bool supportsAllreduceSingleDeviceOnStream() const override;
 
+        bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsReduceSingleDeviceOnStream() const override;
+
         bool allgatherSingleDeviceOnStream(
             const void *send_buf,
             void *recv_buf,

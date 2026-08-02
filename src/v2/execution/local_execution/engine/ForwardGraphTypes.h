@@ -16,6 +16,7 @@
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -69,6 +70,68 @@ namespace llaminar2
         bool cache_attention = true; ///< Cache attention graphs
         bool cache_ffn = true;       ///< Cache FFN graphs
     };
+
+    /**
+     * @brief Immutable inputs to forward-phase policy resolution.
+     *
+     * Execution role is the authoritative discriminator for internal MTP
+     * graphs. Shape-based continuation detection remains only for the legacy
+     * public MainInference API, whose caller does not yet carry a typed phase.
+     * Keeping those two policies in one value object prevents a future graph
+     * entry point from accidentally applying the ordinary-continuation M
+     * heuristic to grouped verification again.
+     */
+    struct ForwardExecutionPhaseRequest
+    {
+        ForwardExecutionRole role = ForwardExecutionRole::MainInference;
+        bool force_prefill = false;
+        bool force_decode = false;
+        int seq_len = 0;
+        int batch_size = 0;
+        int decode_max_seq_len = 1;
+        int logical_position = 0;
+    };
+
+    /**
+     * @brief Resolve the mathematical and topology phase for one forward.
+     *
+     * Grouped MTP verification and device-resident MTP condition graphs are
+     * decode-equivalent by contract for every positive row count. Their M may
+     * be 1, the current dynamic-depth range 2..16, or a larger future
+     * speculative batch; none may cross into prefill topology merely because
+     * it exceeds an ordinary-continuation cache heuristic.
+     *
+     * MainInference retains the existing compatibility rule: a scalar row is
+     * decode, and a small continuation with established history is decode.
+     * Explicit phase requests take precedence for that public role.
+     *
+     * @param request Complete typed role, explicit overrides, and legacy
+     *                MainInference shape/history inputs.
+     * @return Prefill or decode topology selected without consulting mutable
+     *         graph-builder state.
+     */
+    [[nodiscard]] inline ForwardExecutionPhase resolveForwardExecutionPhase(
+        const ForwardExecutionPhaseRequest &request) noexcept
+    {
+        if (request.role != ForwardExecutionRole::MainInference)
+            return ForwardExecutionPhase::Decode;
+
+        if (request.force_prefill)
+            return ForwardExecutionPhase::Prefill;
+        if (request.force_decode)
+            return ForwardExecutionPhase::Decode;
+
+        const bool scalar_decode =
+            request.seq_len == 1 && request.batch_size <= 1;
+        const bool short_continuation_decode =
+            request.batch_size <= 1 &&
+            request.seq_len > 1 &&
+            request.seq_len <= std::max(1, request.decode_max_seq_len) &&
+            request.logical_position > 0;
+        return scalar_decode || short_continuation_decode
+                   ? ForwardExecutionPhase::Decode
+                   : ForwardExecutionPhase::Prefill;
+    }
 
     /**
      * @brief Signature for caching full forward graphs.
@@ -168,6 +231,48 @@ namespace llaminar2
             return h;
         }
     };
+
+    /**
+     * @brief Convert a forward-cache identity into immutable replay telemetry.
+     *
+     * The graph signature is the authoritative source of execution geometry:
+     * cache lookup, graph construction, and replay all use that same value.
+     * Copying its scalar fields into the segment cache prevents asynchronous
+     * GPU-event reclamation from consulting whichever request happens to be
+     * current later.  Invalid or overflowing dimensions produce an invalid
+     * descriptor, causing PerfStats to omit geometry instead of publishing a
+     * plausible but false M value.
+     */
+    inline DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry
+    replayWorkloadGeometryForSignature(
+        const ForwardGraphSignature &signature) noexcept
+    {
+        using Geometry =
+            DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry;
+
+        Geometry geometry{
+            .seq_len = signature.seq_len,
+            .batch_size = signature.batch_size,
+            .m = 0,
+            .all_position_rows = signature.all_position_logit_rows,
+            .verifier_outcome_mode = static_cast<uint8_t>(
+                signature.mtp_verifier_outcome_graph_mode),
+            .position_policy = static_cast<uint8_t>(signature.position_policy),
+            .moe_placement_epoch = signature.moe_placement_epoch,
+            .decode = signature.decode,
+            .all_position_logits = signature.all_position_logits,
+            .live_mtp_request_batch_condition =
+                signature.live_mtp_request_batch_condition,
+        };
+
+        if (signature.seq_len > 0 && signature.batch_size > 0 &&
+            signature.batch_size <=
+                std::numeric_limits<int>::max() / signature.seq_len)
+        {
+            geometry.m = signature.seq_len * signature.batch_size;
+        }
+        return geometry;
+    }
 
     enum class ForwardReplayStateCacheClass
     {

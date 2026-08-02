@@ -153,6 +153,8 @@ namespace llaminar2
             return "MOE_DEVICE_REBALANCE";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
+        case ComputeStageType::ROOTED_COLLECTIVE:
+            return "ROOTED_COLLECTIVE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
         case ComputeStageType::ALLGATHER_V:

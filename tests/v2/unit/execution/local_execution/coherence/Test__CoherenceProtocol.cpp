@@ -20,6 +20,7 @@
 #include "backends/DeviceId.h"
 
 #include "../../../../mocks/MockBackend.h"
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 #include <cstring>
 #include <memory>
@@ -96,6 +97,11 @@ public:
 class Test__CoherenceProtocol : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     static constexpr size_t kRows = 4;
     static constexpr size_t kCols = 8;
     static constexpr size_t kElements = kRows * kCols;
@@ -649,6 +655,11 @@ public:
 class Test__CoherenceProtocolFailure : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     static constexpr size_t kRows = 4;
     static constexpr size_t kCols = 8;
 

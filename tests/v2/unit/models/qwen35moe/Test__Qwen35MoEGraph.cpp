@@ -322,6 +322,37 @@ namespace
             return graph;
         }
 
+        /**
+         * @brief Build one FFN graph under an explicit execution phase.
+         *
+         * Row count alone cannot distinguish a short prefill from a grouped
+         * verifier. This helper mirrors the production `buildForwardGraph()`
+         * scope ordering so topology regressions can prove that replicated
+         * decode policy is selected by the typed phase and not merely by M.
+         */
+        ComputeGraph buildFFNGraphForPhase(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            DeviceId device,
+            ForwardExecutionPhase phase)
+        {
+            ForwardExecutionPhaseScope phase_scope(*this, phase);
+            DecodeReplicatedDenseScope decode_dense_scope(
+                *this,
+                seq_len * batch_size);
+            return buildFFNGraph(
+                layer,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                device,
+                /*device_state_publication_stream=*/nullptr);
+        }
+
         ComputeGraph buildAttentionGraphForTokenCount(
             const LayerWeights &layer,
             ActivationBuffers &buffers,
@@ -1006,6 +1037,95 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedSuppressesDenseFFNAllreduceOnlyF
     ASSERT_NE(prefill_graph.getNode("layer0_down_proj"), nullptr);
     EXPECT_NE(prefill_graph.getNode("layer0_down_allreduce"), nullptr)
         << "Prefill remains dense-TP partial compute and must keep the dense FFN allreduce";
+}
+
+/**
+ * @brief Replicated decode keeps the always-on shared expert device-local.
+ *
+ * The phase-split weight plan materializes complete shared-expert gate/up/down
+ * tensors on every LocalTP participant. Summing those complete outputs would
+ * both waste one collective per MoE layer and multiply the shared branch by
+ * TP degree. Every supported MTP verifier row count must therefore omit the
+ * shared allreduce, while an equally small typed prefill must retain it because
+ * prefill still binds the tensor-parallel shared-expert weight view.
+ */
+TEST(Test__Qwen35MoEGraph,
+     DenseDecodeReplicatedSharedExpertIsCollectiveFreeAndMTotal)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    tp_ctx->setBackend(CollectiveBackendType::HOST);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.ffn_column_parallel = true;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 15;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(
+        makeDecodeDenseBindingSource());
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    layer.shared_expert_gate_inp =
+        arena.fp32({static_cast<size_t>(config.d_model)});
+
+    for (int m = 1; m <= 16; ++m)
+    {
+        SCOPED_TRACE("decode_verifier_m=" + std::to_string(m));
+        auto buffers = makeActivationBuffers(
+            arena,
+            m,
+            config.d_model,
+            config.moe.num_experts,
+            config.moe.top_k);
+        ComputeGraph graph = graph_builder.buildFFNGraphForPhase(
+            layer,
+            buffers,
+            /*layer_idx=*/0,
+            /*seq_len=*/m,
+            /*batch_size=*/1,
+            DeviceId::cpu(),
+            ForwardExecutionPhase::Decode);
+
+        ASSERT_NE(graph.getNode("layer0_shared_expert_ffn"), nullptr);
+        EXPECT_EQ(graph.getNode("layer0_shared_expert_allreduce"), nullptr)
+            << "Replicated decode already owns a complete shared-expert row";
+        EXPECT_EQ(graph.getNode("layer0_moe_combine"), nullptr)
+            << "Collective-free shared decode should fuse gate and routed combine";
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_shared_expert_gate",
+            "layer0_shared_expert_ffn"));
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_shared_expert_gate",
+            "layer0_moe_expert_ffn"));
+    }
+
+    constexpr int kShortPrefillRows = 5;
+    auto prefill_buffers = makeActivationBuffers(
+        arena,
+        kShortPrefillRows,
+        config.d_model,
+        config.moe.num_experts,
+        config.moe.top_k);
+    ComputeGraph prefill_graph = graph_builder.buildFFNGraphForPhase(
+        layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/kShortPrefillRows,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        ForwardExecutionPhase::Prefill);
+
+    EXPECT_NE(
+        prefill_graph.getNode("layer0_shared_expert_allreduce"),
+        nullptr)
+        << "Typed prefill remains tensor parallel even when M fits verifier capacity";
 }
 
 TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingAllreduce)

@@ -1161,6 +1161,8 @@ public:
     std::atomic<int> allreduce_multi_call_count{0};
     std::atomic<int> allreduce_multi_on_streams_call_count{0};
     std::atomic<int> allreduce_on_stream_call_count{0};
+    std::atomic<int> reduce_on_stream_call_count{0};
+    std::atomic<int> broadcast_on_stream_call_count{0};
     std::atomic<int> allgather_call_count{0};
     std::atomic<int> allgather_multi_call_count{0};
     std::atomic<int> allgather_on_stream_call_count{0};
@@ -1175,6 +1177,8 @@ public:
     bool should_fail_reduce_scatter = false;
     bool multi_gpu_mode = true;
     bool supports_allreduce_on_stream = true;
+    bool supports_reduce_on_stream = true;
+    bool supports_broadcast_on_stream = true;
     bool supports_allgather_on_stream = true;
 
     // Captured parameters from last call (for verification)
@@ -1187,6 +1191,18 @@ public:
     std::vector<void *> last_allreduce_multi_streams;
     int last_allreduce_on_stream_device_idx = -1;
     void *last_allreduce_on_stream_stream = nullptr;
+    const void *last_reduce_send_buffer = nullptr;
+    void *last_reduce_recv_buffer = nullptr;
+    size_t last_reduce_count = 0;
+    int last_reduce_root = -1;
+    int last_reduce_device_idx = -1;
+    void *last_reduce_stream = nullptr;
+    const void *last_broadcast_send_buffer = nullptr;
+    void *last_broadcast_recv_buffer = nullptr;
+    size_t last_broadcast_count = 0;
+    int last_broadcast_root = -1;
+    int last_broadcast_device_idx = -1;
+    void *last_broadcast_stream = nullptr;
     int last_allgather_on_stream_device_idx = -1;
     void *last_allgather_on_stream_stream = nullptr;
 
@@ -1362,6 +1378,58 @@ public:
         return supports_allreduce_on_stream;
     }
 
+    bool reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream) override
+    {
+        ++reduce_on_stream_call_count;
+        last_reduce_send_buffer = send_buf;
+        last_reduce_recv_buffer = recv_buf;
+        last_reduce_count = count;
+        last_dtype = dtype;
+        last_op = op;
+        last_reduce_root = root;
+        last_reduce_device_idx = device_idx;
+        last_reduce_stream = stream;
+        return supports_reduce_on_stream && !should_fail_allreduce;
+    }
+
+    bool supportsReduceSingleDeviceOnStream() const override
+    {
+        return supports_reduce_on_stream;
+    }
+
+    bool broadcastSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        int root,
+        int device_idx,
+        void *stream) override
+    {
+        ++broadcast_on_stream_call_count;
+        last_broadcast_send_buffer = send_buf;
+        last_broadcast_recv_buffer = recv_buf;
+        last_broadcast_count = count;
+        last_dtype = dtype;
+        last_broadcast_root = root;
+        last_broadcast_device_idx = device_idx;
+        last_broadcast_stream = stream;
+        return supports_broadcast_on_stream && !should_fail_allreduce;
+    }
+
+    bool supportsBroadcastSingleDeviceOnStream() const override
+    {
+        return supports_broadcast_on_stream;
+    }
+
     bool allgatherMulti(const std::vector<const void *> &send_bufs,
                         const std::vector<void *> &recv_bufs,
                         size_t send_count, CollectiveDataType dtype) override
@@ -1408,6 +1476,8 @@ public:
         allreduce_multi_call_count = 0;
         allreduce_multi_on_streams_call_count = 0;
         allreduce_on_stream_call_count = 0;
+        reduce_on_stream_call_count = 0;
+        broadcast_on_stream_call_count = 0;
         allgather_call_count = 0;
         allgather_multi_call_count = 0;
         allgather_on_stream_call_count = 0;
@@ -1420,11 +1490,25 @@ public:
         should_fail_reduce_scatter = false;
         multi_gpu_mode = true;
         supports_allreduce_on_stream = true;
+        supports_reduce_on_stream = true;
+        supports_broadcast_on_stream = true;
         supports_allgather_on_stream = true;
         last_multi_buffers.clear();
         last_allreduce_multi_streams.clear();
         last_allreduce_on_stream_device_idx = -1;
         last_allreduce_on_stream_stream = nullptr;
+        last_reduce_send_buffer = nullptr;
+        last_reduce_recv_buffer = nullptr;
+        last_reduce_count = 0;
+        last_reduce_root = -1;
+        last_reduce_device_idx = -1;
+        last_reduce_stream = nullptr;
+        last_broadcast_send_buffer = nullptr;
+        last_broadcast_recv_buffer = nullptr;
+        last_broadcast_count = 0;
+        last_broadcast_root = -1;
+        last_broadcast_device_idx = -1;
+        last_broadcast_stream = nullptr;
         last_allgather_on_stream_device_idx = -1;
         last_allgather_on_stream_stream = nullptr;
     }
@@ -1652,6 +1736,146 @@ TEST_F(Test__LocalTPContext, RawAllgatherHasNoHostRendezvousGeneration)
     EXPECT_EQ(backend_raw->last_allgather_on_stream_stream, slot1_stream);
     EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0);
     EXPECT_EQ(backend_raw->allreduce_on_stream_call_count.load(), 0);
+}
+
+TEST_F(Test__LocalTPContext,
+       RootedRawCollectivesDelegateExactNativeStreamContracts)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    backend_raw->supports_reduce_on_stream = true;
+    backend_raw->supports_broadcast_on_stream = true;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::NCCL,
+        /*initialized=*/true);
+
+    int send = 17;
+    int root_receive = 0;
+    int broadcast_receive = 0;
+    void *const stream = reinterpret_cast<void *>(0x1234);
+
+    EXPECT_TRUE(ctx->reduceRawOnStream(
+        &send,
+        &root_receive,
+        37,
+        CollectiveDataType::FLOAT32,
+        CollectiveOp::ALLREDUCE_SUM,
+        /*root_device_index=*/1,
+        /*device_index=*/0,
+        stream,
+        "canonical_routes_reduce_to_root"));
+    EXPECT_EQ(backend_raw->reduce_on_stream_call_count.load(), 1);
+    EXPECT_EQ(backend_raw->last_reduce_send_buffer, &send);
+    EXPECT_EQ(backend_raw->last_reduce_recv_buffer, &root_receive);
+    EXPECT_EQ(backend_raw->last_reduce_count, 37u);
+    EXPECT_EQ(backend_raw->last_dtype, CollectiveDataType::FLOAT32);
+    EXPECT_EQ(backend_raw->last_op, CollectiveOp::ALLREDUCE_SUM);
+    EXPECT_EQ(backend_raw->last_reduce_root, 1);
+    EXPECT_EQ(backend_raw->last_reduce_device_idx, 0);
+    EXPECT_EQ(backend_raw->last_reduce_stream, stream);
+
+    EXPECT_TRUE(ctx->broadcastRawOnStream(
+        &root_receive,
+        &broadcast_receive,
+        19,
+        CollectiveDataType::FLOAT32,
+        /*root_device_index=*/1,
+        /*device_index=*/0,
+        stream,
+        "canonical_routes_broadcast"));
+    EXPECT_EQ(backend_raw->broadcast_on_stream_call_count.load(), 1);
+    EXPECT_EQ(backend_raw->last_broadcast_send_buffer, &root_receive);
+    EXPECT_EQ(backend_raw->last_broadcast_recv_buffer, &broadcast_receive);
+    EXPECT_EQ(backend_raw->last_broadcast_count, 19u);
+    EXPECT_EQ(backend_raw->last_broadcast_root, 1);
+    EXPECT_EQ(backend_raw->last_broadcast_device_idx, 0);
+    EXPECT_EQ(backend_raw->last_broadcast_stream, stream);
+
+    EXPECT_EQ(backend_raw->allreduce_on_stream_call_count.load(), 0)
+        << "Rooted reduction must not be emulated with allreduce";
+    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 0)
+        << "Compact publication must use native broadcast, not allgather";
+}
+
+TEST_F(Test__LocalTPContext,
+       RootedRawCollectivesRejectNullStreamAndUnsupportedTransport)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    backend_raw->supports_reduce_on_stream = false;
+    backend_raw->supports_broadcast_on_stream = false;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::RCCL,
+        /*initialized=*/true);
+
+    int value = 1;
+    EXPECT_THROW(
+        ctx->reduceRawOnStream(
+            &value,
+            &value,
+            1,
+            CollectiveDataType::FLOAT32,
+            CollectiveOp::ALLREDUCE_SUM,
+            0,
+            0,
+            nullptr,
+            "null_stream_reduce"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        ctx->broadcastRawOnStream(
+            &value,
+            &value,
+            1,
+            CollectiveDataType::FLOAT32,
+            0,
+            0,
+            nullptr,
+            "null_stream_broadcast"),
+        std::invalid_argument);
+
+    void *const stream = reinterpret_cast<void *>(0x5678);
+    EXPECT_FALSE(ctx->reduceRawOnStream(
+        &value,
+        &value,
+        1,
+        CollectiveDataType::FLOAT32,
+        CollectiveOp::ALLREDUCE_SUM,
+        0,
+        0,
+        stream,
+        "unsupported_reduce"));
+    EXPECT_FALSE(ctx->broadcastRawOnStream(
+        &value,
+        &value,
+        1,
+        CollectiveDataType::FLOAT32,
+        0,
+        0,
+        stream,
+        "unsupported_broadcast"));
+
+    EXPECT_EQ(backend_raw->reduce_on_stream_call_count.load(), 0);
+    EXPECT_EQ(backend_raw->broadcast_on_stream_call_count.load(), 0);
+    EXPECT_EQ(backend_raw->allreduce_on_stream_call_count.load(), 0)
+        << "Unsupported rooted collectives must fail closed without emulation";
 }
 
 TEST_F(Test__LocalTPContext, GroupedOnStreamAllreduceResultSurvivesBackToBackGenerations)

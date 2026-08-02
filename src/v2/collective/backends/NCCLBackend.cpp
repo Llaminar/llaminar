@@ -1740,6 +1740,64 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLBackend::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_ || !coordinator_)
+        {
+            last_error_ = initialized_
+                              ? "No NCCLCoordinator"
+                              : "NCCLBackend not initialized";
+            return false;
+        }
+        if (!coordinator_->reduceSingleDeviceOnStream(
+                send_buf,
+                recv_buf,
+                count,
+                dtype,
+                op,
+                root,
+                device_idx,
+                stream))
+        {
+            last_error_ =
+                "NCCLCoordinator reduceSingleDeviceOnStream failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::supportsReduceSingleDeviceOnStream() const
+    {
+#ifdef HAVE_NCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool NCCLBackend::allgatherSingleDeviceOnStream(
         const void *send_buf,
         void *recv_buf,

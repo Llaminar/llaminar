@@ -10,11 +10,14 @@
 
 #ifdef HAVE_ROCM
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,6 +33,7 @@
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "tensors/TensorClasses.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -156,6 +160,38 @@ namespace
                             host_values.size() * sizeof(T),
                             hipMemcpyHostToDevice),
                   hipSuccess);
+    }
+
+    /**
+     * @brief Copy one device vector to host at the terminal verification boundary.
+     *
+     * Synchronization is deliberately confined to this integration-test result
+     * observation. The captured production transaction being tested contains
+     * no host transfer or host wait.
+     */
+    template <typename T>
+    void downloadDeviceVector(
+        int device,
+        const T *device_ptr,
+        std::vector<T> *host_values)
+    {
+        ASSERT_NE(device_ptr, nullptr);
+        ASSERT_NE(host_values, nullptr);
+        ASSERT_EQ(hipSetDevice(device), hipSuccess);
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                host_values->data(),
+                device_ptr,
+                host_values->size() * sizeof(T),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
     }
 
     void freeDevicePtr(int device, void *ptr)
@@ -1462,6 +1498,371 @@ TEST(Test__LocalTPRCCLGraphCapture, PrefillGraphCaptureBoundaryRendezvousBlocksU
 
     EXPECT_TRUE(second_early_ok);
     EXPECT_TRUE(second_late_ok);
+}
+
+/**
+ * @test Rooted canonical-route publication is graph-captured and byte exact.
+ *
+ * Every route slot has exactly one device owner, matching the production
+ * apportioned-expert contract. The test reduces those independently rounded
+ * slots to participant zero, invokes the production router-order ROCm reducer
+ * only on that root, and broadcasts only the compact output. A separate launch
+ * of the same production reducer over the complete serial slot bank supplies
+ * the byte oracle. Sweeping every verifier row count through depth fifteen,
+ * plus M=31, catches count-dependent collective and launch-geometry holes.
+ */
+TEST(Test__LocalTPRCCLGraphCapture,
+     RCCLCanonicalRouteRootedPublication_GraphCaptured_MTotal_ByteExact)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ ROCm GPUs, found "
+                     << rocm_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices{
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr int kTopK = 8;
+    constexpr int kDModel = 257;
+    constexpr int kRoot = 0;
+    constexpr int kMaximumM = 31;
+
+    std::array<std::unique_ptr<FP32Tensor>, 2> route_slots;
+    std::array<std::unique_ptr<FP32Tensor>, 2> compact_outputs;
+    std::array<hipStream_t, 2> streams{nullptr, nullptr};
+
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(
+                &streams[static_cast<size_t>(participant)],
+                hipStreamNonBlocking),
+            hipSuccess);
+        route_slots[static_cast<size_t>(participant)] =
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(kMaximumM * kTopK),
+                    static_cast<size_t>(kDModel)},
+                DeviceId::rocm(participant));
+        compact_outputs[static_cast<size_t>(participant)] =
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(kMaximumM),
+                    static_cast<size_t>(kDModel)},
+                DeviceId::rocm(participant));
+        ASSERT_TRUE(route_slots[static_cast<size_t>(participant)]
+                        ->ensureOnDevice(
+                            DeviceId::rocm(participant),
+                            streams[static_cast<size_t>(participant)]));
+        ASSERT_TRUE(compact_outputs[static_cast<size_t>(participant)]
+                        ->ensureOnDevice(
+                            DeviceId::rocm(participant),
+                            streams[static_cast<size_t>(participant)]));
+        ASSERT_EQ(
+            hipStreamSynchronize(
+                streams[static_cast<size_t>(participant)]),
+            hipSuccess);
+    }
+    auto serial_route_slots = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{
+            static_cast<size_t>(kMaximumM * kTopK),
+            static_cast<size_t>(kDModel)},
+        DeviceId::rocm(kRoot));
+    auto serial_output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{
+            static_cast<size_t>(kMaximumM),
+            static_cast<size_t>(kDModel)},
+        DeviceId::rocm(kRoot));
+    ASSERT_TRUE(serial_route_slots->ensureOnDevice(
+        DeviceId::rocm(kRoot),
+        streams[0]));
+    ASSERT_TRUE(serial_output->ensureOnDevice(
+        DeviceId::rocm(kRoot),
+        streams[0]));
+    ASSERT_EQ(hipStreamSynchronize(streams[0]), hipSuccess);
+
+    ROCmMoEKernel root_reducer(kRoot);
+    root_reducer.bindGPUStream(
+        ExplicitGPUStream(static_cast<void *>(streams[0])));
+
+    std::vector<int> verifier_rows;
+    for (int m = 1; m <= 16; ++m)
+        verifier_rows.push_back(m);
+    verifier_rows.push_back(31);
+
+    for (const int m : verifier_rows)
+    {
+        const size_t route_elements =
+            static_cast<size_t>(m) * kTopK * kDModel;
+        const size_t output_elements =
+            static_cast<size_t>(m) * kDModel;
+        std::vector<float> serial_host(route_elements);
+        std::array<std::vector<float>, 2> participant_host{
+            std::vector<float>(route_elements, 0.0f),
+            std::vector<float>(route_elements, 0.0f)};
+
+        for (int row = 0; row < m; ++row)
+        {
+            for (int route = 0; route < kTopK; ++route)
+            {
+                const int owner = (row + route) & 1;
+                for (int column = 0; column < kDModel; ++column)
+                {
+                    const size_t index =
+                        (static_cast<size_t>(row) * kTopK + route) *
+                            kDModel +
+                        column;
+                    /*
+                     * Mixed signs and non-power-of-two divisors make each
+                     * ordered FP32 addition observable while avoiding NaNs,
+                     * infinities, and owner values that are exactly zero.
+                     */
+                    const int numerator =
+                        ((row + 3) * 97 +
+                         (route + 5) * 53 +
+                         (column + 7) * 29) %
+                            4093 -
+                        2046;
+                    const float value =
+                        static_cast<float>(numerator) / 37.0f +
+                        (owner == 0 ? 0.03125f : -0.046875f);
+                    serial_host[index] = value;
+                    participant_host[static_cast<size_t>(owner)][index] =
+                        value;
+                }
+            }
+        }
+
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            const hipStream_t stream =
+                streams[static_cast<size_t>(participant)];
+            FP32Tensor *const route_tensor =
+                route_slots[static_cast<size_t>(participant)].get();
+            std::copy(
+                participant_host[static_cast<size_t>(participant)].begin(),
+                participant_host[static_cast<size_t>(participant)].end(),
+                route_tensor->mutable_data());
+            ASSERT_TRUE(route_tensor->ensureOnDevice(
+                DeviceId::rocm(participant),
+                stream));
+            ASSERT_EQ(
+                hipMemsetAsync(
+                    compact_outputs[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr(),
+                    0xA5,
+                    output_elements * sizeof(float),
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+
+        /* Build the serial-row oracle with the production reducer launcher. */
+        ASSERT_EQ(hipSetDevice(kRoot), hipSuccess);
+        std::copy(
+            serial_host.begin(),
+            serial_host.end(),
+            serial_route_slots->mutable_data());
+        ASSERT_TRUE(serial_route_slots->ensureOnDevice(
+            DeviceId::rocm(kRoot),
+            streams[0]));
+        ASSERT_TRUE(root_reducer.reduceCanonicalRouteContributions(
+            serial_route_slots.get(),
+            serial_output.get(),
+            m,
+            kTopK,
+            kDModel));
+        ASSERT_EQ(hipStreamSynchronize(streams[0]), hipSuccess);
+
+        Barrier capture_started(2);
+        Barrier capture_finished(2);
+        std::array<CaptureResult, 2> capture_results{};
+
+        auto capture_participant = [&](int participant)
+        {
+            CaptureResult &result =
+                capture_results[static_cast<size_t>(participant)];
+            const hipStream_t stream =
+                streams[static_cast<size_t>(participant)];
+            result.begin_status = hipSetDevice(participant);
+            if (result.begin_status == hipSuccess)
+            {
+                result.begin_status = hipStreamBeginCapture(
+                    stream,
+                    hipStreamCaptureModeRelaxed);
+            }
+            capture_started.arriveAndWait();
+
+            if (result.begin_status == hipSuccess)
+            {
+                GraphCaptureGuard guard;
+                bool ok = ctx->reduceRawOnStream(
+                    route_slots[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr(),
+                    route_slots[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr(),
+                    route_elements,
+                    CollectiveDataType::FLOAT32,
+                    CollectiveOp::ALLREDUCE_SUM,
+                    kRoot,
+                    participant,
+                    stream,
+                    "canonical_routes_reduce_to_root");
+                if (ok && participant == kRoot)
+                {
+                    ok = root_reducer.reduceCanonicalRouteContributions(
+                        route_slots[0].get(),
+                        compact_outputs[0].get(),
+                        m,
+                        kTopK,
+                        kDModel);
+                }
+                if (ok)
+                {
+                    ok = ctx->broadcastRawOnStream(
+                        compact_outputs[static_cast<size_t>(participant)]
+                            ->gpu_data_ptr(),
+                        compact_outputs[static_cast<size_t>(participant)]
+                            ->gpu_data_ptr(),
+                        output_elements,
+                        CollectiveDataType::FLOAT32,
+                        kRoot,
+                        participant,
+                        stream,
+                        "canonical_routes_broadcast");
+                }
+                result.collective_ok = ok;
+            }
+
+            capture_finished.arriveAndWait();
+            if (result.begin_status == hipSuccess && result.collective_ok)
+            {
+                result.end_status = hipSetDevice(participant);
+                if (result.end_status == hipSuccess)
+                {
+                    result.end_status = hipStreamEndCapture(
+                        stream,
+                        &result.graph);
+                }
+            }
+            if (result.end_status == hipSuccess && result.graph)
+            {
+                result.instantiate_status = hipSetDevice(participant);
+                if (result.instantiate_status == hipSuccess)
+                {
+                    result.instantiate_status = hipGraphInstantiate(
+                        &result.exec,
+                        result.graph,
+                        nullptr,
+                        nullptr,
+                        0);
+                }
+            }
+        };
+
+        std::thread capture0(capture_participant, 0);
+        std::thread capture1(capture_participant, 1);
+        capture0.join();
+        capture1.join();
+
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            const CaptureResult &result =
+                capture_results[static_cast<size_t>(participant)];
+            ASSERT_EQ(result.begin_status, hipSuccess)
+                << "M=" << m << " participant=" << participant;
+            ASSERT_TRUE(result.collective_ok)
+                << "M=" << m << " participant=" << participant;
+            ASSERT_EQ(result.end_status, hipSuccess)
+                << "M=" << m << " participant=" << participant;
+            ASSERT_EQ(result.instantiate_status, hipSuccess)
+                << "M=" << m << " participant=" << participant;
+            ASSERT_NE(result.exec, nullptr);
+        }
+
+        Barrier launch_ready(2);
+        std::array<hipError_t, 2> replay_status{
+            hipSuccess,
+            hipSuccess};
+        auto replay_participant = [&](int participant)
+        {
+            hipError_t &status =
+                replay_status[static_cast<size_t>(participant)];
+            status = hipSetDevice(participant);
+            launch_ready.arriveAndWait();
+            if (status == hipSuccess)
+            {
+                status = hipGraphLaunch(
+                    capture_results[static_cast<size_t>(participant)].exec,
+                    streams[static_cast<size_t>(participant)]);
+            }
+            if (status == hipSuccess)
+            {
+                status = hipStreamSynchronize(
+                    streams[static_cast<size_t>(participant)]);
+            }
+        };
+        std::thread replay0(replay_participant, 0);
+        std::thread replay1(replay_participant, 1);
+        replay0.join();
+        replay1.join();
+        ASSERT_EQ(replay_status[0], hipSuccess) << "M=" << m;
+        ASSERT_EQ(replay_status[1], hipSuccess) << "M=" << m;
+
+        std::vector<float> expected(output_elements);
+        std::array<std::vector<float>, 2> actual{
+            std::vector<float>(output_elements),
+            std::vector<float>(output_elements)};
+        downloadDeviceVector<float>(
+            kRoot,
+            static_cast<const float *>(serial_output->gpu_data_ptr()),
+            &expected);
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            downloadDeviceVector<float>(
+                participant,
+                static_cast<const float *>(
+                    compact_outputs[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr()),
+                &actual[static_cast<size_t>(participant)]);
+            EXPECT_EQ(
+                std::memcmp(
+                    expected.data(),
+                    actual[static_cast<size_t>(participant)].data(),
+                    output_elements * sizeof(float)),
+                0)
+                << "Rooted canonical publication drifted from serial-row bytes"
+                << " M=" << m << " participant=" << participant;
+        }
+
+        destroyCaptureResult(capture_results[0]);
+        destroyCaptureResult(capture_results[1]);
+    }
+
+    root_reducer.clearGPUStreamBinding();
+    ASSERT_EQ(hipSetDevice(kRoot), hipSuccess);
+    serial_output.reset();
+    serial_route_slots.reset();
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        compact_outputs[static_cast<size_t>(participant)].reset();
+        route_slots[static_cast<size_t>(participant)].reset();
+        EXPECT_EQ(
+            hipStreamDestroy(streams[static_cast<size_t>(participant)]),
+            hipSuccess);
+    }
 }
 
 TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Completes)

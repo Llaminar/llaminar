@@ -8782,7 +8782,9 @@ namespace llaminar2
             !params_.output ||
             params_.seq_len <= 0 ||
             params_.top_k <= 0 ||
-            params_.d_model <= 0)
+            params_.d_model <= 0 ||
+            params_.participant_device_index < 0 ||
+            params_.root_device_index < 0)
         {
             LOG_ERROR("[MoECanonicalRouteReduceStage] Invalid execution contract"
                       << " ctx=" << (ctx != nullptr)
@@ -8791,9 +8793,21 @@ namespace llaminar2
                       << " output=" << (params_.output != nullptr)
                       << " seq_len=" << params_.seq_len
                       << " top_k=" << params_.top_k
-                      << " d_model=" << params_.d_model);
+                      << " d_model=" << params_.d_model
+                      << " participant="
+                      << params_.participant_device_index
+                      << " root=" << params_.root_device_index);
             return false;
         }
+
+        /*
+         * The preceding rooted collective leaves the canonical route slots
+         * valid only on the fixed root. Every graph keeps this node so the DAG
+         * remains symmetric, but non-root participants must not read those
+         * slots or launch redundant arithmetic before the compact broadcast.
+         */
+        if (params_.participant_device_index != params_.root_device_index)
+            return true;
 
         if (!moe_kernel_)
         {
@@ -8830,6 +8844,8 @@ namespace llaminar2
 
     size_t MoECanonicalRouteReduceStage::estimatedFlops() const
     {
+        if (params_.participant_device_index != params_.root_device_index)
+            return 0;
         return static_cast<size_t>(params_.seq_len) *
                static_cast<size_t>(params_.d_model) *
                static_cast<size_t>(std::max(0, params_.top_k - 1));
@@ -8855,7 +8871,10 @@ namespace llaminar2
 
     bool MoECanonicalRouteReduceStage::isGraphCapturable() const
     {
-        return params_.device_id.is_gpu() && moe_kernel_ != nullptr;
+        if (!supportsWarmupDependentGraphCapture())
+            return false;
+        return params_.participant_device_index != params_.root_device_index ||
+               moe_kernel_ != nullptr;
     }
 
     bool MoECanonicalRouteReduceStage::supportsWarmupDependentGraphCapture() const
@@ -8865,7 +8884,9 @@ namespace llaminar2
                params_.output &&
                params_.seq_len > 0 &&
                params_.top_k > 0 &&
-               params_.d_model > 0;
+               params_.d_model > 0 &&
+               params_.participant_device_index >= 0 &&
+               params_.root_device_index >= 0;
     }
 
     bool MoECanonicalRouteReduceStage::supportsLazyPrefillGraphCapturePreflight() const
@@ -8894,6 +8915,8 @@ namespace llaminar2
     MoECanonicalRouteReduceStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
+        if (params_.participant_device_index != params_.root_device_index)
+            return reqs;
         if (params_.canonical_route_contributions)
         {
             reqs.addInput(
@@ -8914,6 +8937,8 @@ namespace llaminar2
 
     StageBufferContract MoECanonicalRouteReduceStage::bufferContract() const
     {
+        if (params_.participant_device_index != params_.root_device_index)
+            return {};
         return StageBufferContract::build()
             .addInput(params_.canonical_route_contributions_buffer_id)
             .addOutput(params_.output_buffer_id);
@@ -8922,7 +8947,9 @@ namespace llaminar2
     StageDumpInfo MoECanonicalRouteReduceStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        if (params_.canonical_route_contributions)
+        const bool owns_reduction =
+            params_.participant_device_index == params_.root_device_index;
+        if (owns_reduction && params_.canonical_route_contributions)
         {
             info.addInput(
                 "canonical_route_contributions",
@@ -8930,7 +8957,7 @@ namespace llaminar2
                 static_cast<size_t>(params_.seq_len * params_.top_k),
                 static_cast<size_t>(params_.d_model));
         }
-        if (params_.output)
+        if (owns_reduction && params_.output)
         {
             info.addOutput(
                 "output",
@@ -8941,6 +8968,11 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt(
+            "participant_device_index",
+            params_.participant_device_index);
+        info.addScalarInt("root_device_index", params_.root_device_index);
+        info.addScalarBool("owns_reduction", owns_reduction);
         return info;
     }
 

@@ -7,6 +7,7 @@
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
 #include "stages/AllreduceStage.h"
+#include "stages/TPAllreduceStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/FusedGateUpGEMMStage.h"
 #include "stages/FusedQKVGEMMStage.h"
@@ -173,6 +174,13 @@ namespace llaminar2
     {
         // Allreduce is backend-agnostic (uses MPI directly)
         return std::make_unique<AllreduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createTPLocalRootedCollective(
+        const TPLocalRootedCollectiveStage::Params &params)
+    {
+        return std::make_unique<TPLocalRootedCollectiveStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllGather(

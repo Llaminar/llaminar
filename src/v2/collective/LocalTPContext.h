@@ -112,6 +112,25 @@ namespace llaminar2
             int device_index,
             void *producer_stream,
             const std::string &stage_name) override;
+        bool reduceRawOnStream(
+            const void *local_send,
+            void *root_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name) override;
+        bool broadcastRawOnStream(
+            const void *root_send,
+            void *local_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name) override;
         bool groupedP2PRawOnStream(
             const std::vector<CollectiveP2POp> &ops,
             int device_index,

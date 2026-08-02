@@ -11,12 +11,14 @@
 
 #pragma once
 
+#include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 
 #include <atomic>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -238,5 +240,47 @@ namespace llaminar2::testing
     {
         static MockWorkerGPUContext context{0};
         return context;
+    }
+
+    /**
+     * @brief Install hardware-free CUDA and ROCm worker-context factories.
+     *
+     * Tensor transfer tests often inject a MockBackend so allocation, copies,
+     * and events remain in host memory. The production transfer API also asks
+     * GPUDeviceContextPool for a persistent default stream when a caller uses
+     * the convenience overload without an explicit stream. Injecting only the
+     * backend therefore leaves half of the GPU execution interface real and
+     * can accidentally initialize CUDA or ROCm from a unit test.
+     *
+     * This helper installs the matching worker-context half of that interface.
+     * Each returned stream and event is a stable opaque host address; no CUDA
+     * or HIP API observes it. Registration is process-idempotent because unit
+     * test executables may contain several fixtures that share the same pool.
+     *
+     * @note Call this only from hardware-free unit-test setup. Integration
+     *       tests intentionally retain the real backend factories.
+     */
+    inline void installHardwareFreeGPUContextFactories()
+    {
+        static std::once_flag installed;
+        std::call_once(
+            installed,
+            []
+            {
+                constexpr int kMockDeviceCount = 64;
+                auto &pool = GPUDeviceContextPool::instance();
+                pool.registerNvidiaFactory(
+                    [](int ordinal)
+                    {
+                        return std::make_unique<MockWorkerGPUContext>(ordinal);
+                    },
+                    kMockDeviceCount);
+                pool.registerAMDFactory(
+                    [](int ordinal)
+                    {
+                        return std::make_unique<MockWorkerGPUContext>(ordinal);
+                    },
+                    kMockDeviceCount);
+            });
     }
 } // namespace llaminar2::testing

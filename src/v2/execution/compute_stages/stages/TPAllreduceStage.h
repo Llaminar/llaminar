@@ -34,6 +34,18 @@ namespace llaminar2
     struct WorkspaceRequirements;
 
     /**
+     * @brief Native rooted LocalTP collective selected declaratively by a graph.
+     */
+    enum class TPLocalRootedCollectiveOperation
+    {
+        ReduceSum,
+        Broadcast
+    };
+
+    /** @return Stable diagnostic name for @p operation. */
+    const char *toString(TPLocalRootedCollectiveOperation operation) noexcept;
+
+    /**
      * @brief Workspace-backed control sideband attached to a TP allreduce.
      *
      * The graph builder names persistent device workspace buffers here. At
@@ -233,6 +245,109 @@ namespace llaminar2
     private:
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+    };
+
+    /**
+     * @brief Graph-capturable rooted collective over one preallocated tensor.
+     *
+     * This stage exists for protocols whose result is needed on one fixed root
+     * before a compact publication. `ReduceSum` reduces the complete tensor to
+     * that root; `Broadcast` publishes the root tensor to every participant.
+     * Both operations are issued directly on the executor-selected explicit
+     * stream. There is no host rendezvous, transport emulation, allocation, or
+     * synchronization path.
+     */
+    class TPLocalRootedCollectiveStage final
+        : public IComputeStage,
+          public IWorkspaceConsumer
+    {
+    public:
+        /** @brief Immutable graph-bound operation parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            ILocalTPContext *tp_ctx = nullptr;
+            TensorBase *tensor = nullptr;
+            size_t count = 0;
+            CollectiveDataType dtype = CollectiveDataType::FLOAT32;
+            TPLocalRootedCollectiveOperation operation =
+                TPLocalRootedCollectiveOperation::ReduceSum;
+            int root_device_index = 0;
+            int participant_device_index = -1;
+            std::string stage_name;
+            std::optional<BufferId> tensor_buffer_id;
+            /**
+             * @brief Persistent-workspace metadata collectives ordered after
+             *        the rooted activation collective on the same stream.
+             *
+             * Rebalance metadata used to ride beside the routed activation
+             * allreduce. Keeping these declarations on the replacement stage
+             * preserves one symmetric collective order on every participant
+             * without retaining a dummy activation allreduce.
+             */
+            std::vector<TPAllreduceSidebandWorkspaceBinding>
+                sideband_workspace_bindings;
+        };
+
+        explicit TPLocalRootedCollectiveStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::ROOTED_COLLECTIVE;
+        }
+        std::string name() const override
+        {
+            return "tp_local_rooted_collective";
+        }
+        bool requiresAllreduce() const override { return true; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override;
+        bool supportsWarmupDependentGraphCapture() const override;
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override
+        {
+            return bound_workspace_ != nullptr;
+        }
+        DeviceWorkspaceManager *getWorkspace() const override
+        {
+            return bound_workspace_;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::OUTPUT;
+        }
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override;
+
+        /** @return Immutable operation parameters for graph regressions. */
+        [[nodiscard]] const Params &params() const { return params_; }
+
+    private:
+        void recordBillOfMaterials() const;
+
+        Params params_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
+        /**
+         * @brief Prebound device descriptors for same-stream control collectives.
+         *
+         * Workspace names are resolved once while the graph is bound. Keeping
+         * the resulting descriptors here makes execute() allocation-free and
+         * guarantees that capture observes stable device addresses. The vector
+         * reserves its complete capacity during stage construction and is only
+         * populated outside graph capture by bindWorkspace().
+         */
+        std::vector<LocalTPCollectiveSidebandBuffer> bound_sidebands_;
     };
 
 } // namespace llaminar2

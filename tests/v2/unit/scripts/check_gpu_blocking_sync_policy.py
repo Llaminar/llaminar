@@ -260,7 +260,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "DeviceGraphCaptureController::executeCapturedReplaySegmentVerify", "worker_stream", 3),
         ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "DeviceGraphCaptureController::executeManualReplaySegment", "worker_stream", 3),
         ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "DeviceGraphCaptureController::executeStreamOnlyReplay", "worker_stream", 1),
-        ("src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp", "record", "worker_event", 1),
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp", "DeviceGraphExecutor::runStages", "backend_device", 1),
         ("src/v2/execution/local_execution/graph/StageTimeline.h", "collect", "worker_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),

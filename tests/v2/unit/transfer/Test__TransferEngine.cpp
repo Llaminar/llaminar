@@ -10,6 +10,7 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorSlice.h"
 #include "../../mocks/MockBackend.h"
+#include "../../mocks/MockWorkerGPUContext.h"
 #include "../../utils/TestTensorFactory.h"
 
 #include <cstring>
@@ -173,6 +174,7 @@ class Test__TransferEngine_Execute : public ::testing::Test
 protected:
     void SetUp() override
     {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
         mock_backend_ = std::make_shared<MockBackend>(DeviceType::CUDA);
 
         // Create engine with custom resolver that returns our mock
@@ -930,6 +932,7 @@ class Test__TransferEngine_EventFailure : public ::testing::Test
 protected:
     void SetUp() override
     {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
         mock_ = std::make_shared<FailableEventMockBackend>();
 
         // Resolver returns our failable mock

@@ -1549,10 +1549,13 @@ namespace llaminar2
      * @brief Device-only canonical LocalTP routed-expert reduction.
      *
      * Expert placement is intentionally absent from this stage. Each input
-     * slot has already been allreduced independently, so the stage walks
-     * router slots in increasing order and overwrites one routed output row.
-     * Static, Dynamic, LLEP, and prefix-restored placement therefore share one
-     * visible FP32 addition tree without host orchestration.
+     * slot has already been reduced to one fixed collective root, so only that
+     * participant walks router slots in increasing order and overwrites the
+     * compact routed output. Non-root participants execute a declarative no-op
+     * at the same graph position and receive the result from the following
+     * broadcast. Static, Dynamic, LLEP, and prefix-restored placement therefore
+     * share one visible FP32 addition tree without redundant per-device work or
+     * host orchestration.
      */
     class MoECanonicalRouteReduceStage final : public IComputeStage
     {
@@ -1567,6 +1570,10 @@ namespace llaminar2
             int seq_len = 0;
             int top_k = 0;
             int d_model = 0;
+            /** Communicator-local participant represented by this graph. */
+            int participant_device_index = -1;
+            /** Fixed participant that owns the ordered reduction kernel. */
+            int root_device_index = -1;
             BufferId canonical_route_contributions_buffer_id =
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
@@ -1608,6 +1615,22 @@ namespace llaminar2
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+        /**
+         * @brief Declare coherence only on the participant that runs arithmetic.
+         *
+         * The non-root node exists solely to keep the LocalTP DAG symmetric. It
+         * owns no buffers and performs no memory access, so asking the executor
+         * to apply FULL coherence there would contradict its empty declarative
+         * contract. The root retains ordinary input/output coherence around the
+         * production reduction kernel.
+         */
+        CoherencePolicy coherencePolicy() const override
+        {
+            return params_.participant_device_index ==
+                           params_.root_device_index
+                       ? CoherencePolicy::FULL
+                       : CoherencePolicy::NONE;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
 
         /**

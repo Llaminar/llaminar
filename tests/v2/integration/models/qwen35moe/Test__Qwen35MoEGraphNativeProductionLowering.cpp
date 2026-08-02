@@ -472,24 +472,33 @@ namespace llaminar2::test
             return model_ctx;
         }
 
-        ActivationBuffers makeActivationBuffers(TensorArena &arena)
+        ActivationBuffers makeActivationBuffers(
+            TensorArena &arena,
+            int row_count = kSeqLen)
         {
+            if (row_count <= 0)
+            {
+                throw std::invalid_argument(
+                    "Activation-buffer row count must be positive");
+            }
+            const size_t rows = static_cast<size_t>(row_count);
+
             ActivationBuffers buffers;
-            buffers.attn_proj = arena.fp32({kSeqLen, kDModel});
-            buffers.current_hidden = arena.fp32({kSeqLen, kDModel});
-            buffers.normalized = arena.fp32({kSeqLen, kDModel});
+            buffers.attn_proj = arena.fp32({rows, kDModel});
+            buffers.current_hidden = arena.fp32({rows, kDModel});
+            buffers.normalized = arena.fp32({rows, kDModel});
             fill(static_cast<FP32Tensor *>(buffers.attn_proj), 0.0f);
             fill(static_cast<FP32Tensor *>(buffers.current_hidden), 0.0f);
             fill(static_cast<FP32Tensor *>(buffers.normalized), 0.0f);
 
-            buffers.extensions[BufferId::MOE_EXPERT_INDICES] = arena.fp32({kSeqLen, kTopK});
-            buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = arena.fp32({kSeqLen, kTopK});
-            buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = arena.fp32({kSeqLen, kDModel});
+            buffers.extensions[BufferId::MOE_EXPERT_INDICES] = arena.fp32({rows, kTopK});
+            buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = arena.fp32({rows, kTopK});
+            buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = arena.fp32({rows, kDModel});
             buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
-                arena.fp32({kSeqLen, kTopK, kDModel});
-            buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({kSeqLen, kDModel});
-            buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({kSeqLen, kIntermediate});
-            buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({kSeqLen, kIntermediate});
+                arena.fp32({rows, kTopK, kDModel});
+            buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({rows, kDModel});
+            buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({rows, kIntermediate});
+            buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({rows, kIntermediate});
             return buffers;
         }
 
@@ -695,28 +704,36 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_node->stage->supportsLazyPrefillGraphCapturePreflight())
             << "The fixed-topology grouped prefill path is the graph-capturable MoE dispatch contract";
 
-        const auto *allreduce_node =
-            graph.getNode("layer0_moe_canonical_routes_allreduce");
-        ASSERT_NE(allreduce_node, nullptr)
-            << "Graph-local owner subsets must publish router-ordered route slots through the continuation TP domain";
-        const auto *allreduce_stage =
-            dynamic_cast<const TPAllreduceStage *>(allreduce_node->stage.get());
-        ASSERT_NE(allreduce_stage, nullptr);
+        const auto *rooted_reduce_node =
+            graph.getNode("layer0_moe_canonical_routes_reduce_to_root");
+        ASSERT_NE(rooted_reduce_node, nullptr)
+            << "Graph-local owner subsets must reduce router-ordered route slots to one fixed continuation root";
+        const auto *rooted_reduce_stage =
+            dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                rooted_reduce_node->stage.get());
+        ASSERT_NE(rooted_reduce_stage, nullptr);
         EXPECT_EQ(
-            allreduce_stage->getTensor(),
+            rooted_reduce_stage->params().tensor,
             buffers.extensions.at(
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
         EXPECT_EQ(
-            allreduce_stage->getCount(),
+            rooted_reduce_stage->params().count,
             static_cast<size_t>(kSeqLen * kTopK * kDModel));
-        EXPECT_EQ(allreduce_stage->getPrecision(), "fp32");
         EXPECT_EQ(
-            allreduce_stage->getTensorBufferId(),
+            rooted_reduce_stage->params().dtype,
+            CollectiveDataType::FLOAT32);
+        EXPECT_EQ(
+            rooted_reduce_stage->params().operation,
+            TPLocalRootedCollectiveOperation::ReduceSum);
+        EXPECT_EQ(rooted_reduce_stage->params().participant_device_index, 0);
+        EXPECT_EQ(rooted_reduce_stage->params().root_device_index, 0);
+        EXPECT_EQ(
+            rooted_reduce_stage->params().tensor_buffer_id,
             std::optional<BufferId>{
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS});
         EXPECT_TRUE(hasDependency(
             graph,
-            "layer0_moe_canonical_routes_allreduce",
+            "layer0_moe_canonical_routes_reduce_to_root",
             "layer0_moe_expert_ffn_overlay_fast"));
 
         const auto *reduce_node =
@@ -728,7 +745,7 @@ namespace llaminar2::test
         EXPECT_TRUE(hasDependency(
             graph,
             "layer0_moe_canonical_routes_reduce",
-            "layer0_moe_canonical_routes_allreduce"));
+            "layer0_moe_canonical_routes_reduce_to_root"));
         const auto *reduce_stage =
             dynamic_cast<const MoECanonicalRouteReduceStage *>(
                 reduce_node->stage.get());
@@ -743,6 +760,8 @@ namespace llaminar2::test
         EXPECT_EQ(reduce_stage->params().seq_len, kSeqLen);
         EXPECT_EQ(reduce_stage->params().top_k, kTopK);
         EXPECT_EQ(reduce_stage->params().d_model, kDModel);
+        EXPECT_EQ(reduce_stage->params().participant_device_index, 0);
+        EXPECT_EQ(reduce_stage->params().root_device_index, 0);
         EXPECT_TRUE(reduce_stage->supportsWarmupDependentGraphCapture());
         EXPECT_TRUE(reduce_stage->supportsLazyPrefillGraphCapturePreflight())
             << "A cold LocalTP MoE graph must admit the allocation-free canonical "
@@ -750,7 +769,35 @@ namespace llaminar2::test
         EXPECT_TRUE(reduce_stage->supportsPaddedPrefillGraphCapturePreflight())
             << "Canonical route reduction is row-independent and must not reject "
                "fixed padded prefill buckets";
-        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
+
+        const auto *broadcast_node =
+            graph.getNode("layer0_moe_canonical_routes_broadcast");
+        ASSERT_NE(broadcast_node, nullptr)
+            << "Only the compact routed result should be replicated after the root folds route slots";
+        const auto *broadcast_stage =
+            dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                broadcast_node->stage.get());
+        ASSERT_NE(broadcast_stage, nullptr);
+        EXPECT_EQ(
+            broadcast_stage->params().tensor,
+            buffers.extensions.at(BufferId::MOE_COMBINED_OUTPUT));
+        EXPECT_EQ(
+            broadcast_stage->params().count,
+            static_cast<size_t>(kSeqLen * kDModel));
+        EXPECT_EQ(
+            broadcast_stage->params().operation,
+            TPLocalRootedCollectiveOperation::Broadcast);
+        EXPECT_EQ(broadcast_stage->params().participant_device_index, 0);
+        EXPECT_EQ(broadcast_stage->params().root_device_index, 0);
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_moe_canonical_routes_broadcast",
+            "layer0_moe_canonical_routes_reduce"));
+
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 0u);
+        EXPECT_EQ(
+            countStagesOfType(graph, ComputeStageType::ROOTED_COLLECTIVE),
+            2u);
         EXPECT_EQ(
             countStagesOfType(
                 graph,
@@ -1237,8 +1284,21 @@ namespace llaminar2::test
                "runtime table path instead of failing before executeSingleToken().";
     }
 
+    /**
+     * @brief Prove rooted LocalTP route publication has total verifier-M lowering.
+     *
+     * Every participant must lower the same reduce/fold/broadcast sequence for
+     * every grouped verifier row count.  More importantly, the collective
+     * payload sizes and the root-only fold must scale from the graph's actual M;
+     * retaining an M=1 count in a reused verifier graph would silently publish
+     * stale rows even though the collective ordering itself remained valid.
+     *
+     * M=1..16 covers serial decode and every currently supported speculative
+     * depth.  M=31 is the same deeper sentinel used by the grouped-verifier
+     * kernel sweeps to prove that sixteen rows are not an implementation limit.
+     */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPApportionedExpertAllreduceNameIsStableAcrossParticipants)
+         LocalTPApportionedRootedPublicationIsSymmetricAndMTotal)
     {
         auto plan = makeLocalTPApportionedHotPlan();
         MockLocalTPContext tp_ctx;
@@ -1257,44 +1317,125 @@ namespace llaminar2::test
 
         TensorArena weight_arena;
         auto layer = makeLayerWeights(weight_arena);
-
-        TensorArena activation_arena0;
-        auto buffers0 = makeActivationBuffers(activation_arena0);
-        TensorArena activation_arena1;
-        auto buffers1 = makeActivationBuffers(activation_arena1);
-
         auto model_ctx = makeTestingModelContextWithHotDomainExperts();
-
-        Qwen35MoEGraph graph_builder0(model_ctx, nullptr, config0);
         ScopedDevicePublicationStream publication_stream0(DeviceId::rocm(0));
-        ComputeGraph graph0 = graph_builder0.buildFFNGraph(
-            layer, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
-            publication_stream0.get());
-
-        Qwen35MoEGraph graph_builder1(model_ctx, nullptr, config1);
         ScopedDevicePublicationStream publication_stream1(DeviceId::rocm(1));
-        ComputeGraph graph1 = graph_builder1.buildFFNGraph(
-            layer, buffers1, 0, kSeqLen, kBatchSize, DeviceId::rocm(1),
-            publication_stream1.get());
 
-        const auto allreduces0 = stageNamesOfType(graph0, ComputeStageType::ALLREDUCE);
-        const auto allreduces1 = stageNamesOfType(graph1, ComputeStageType::ALLREDUCE);
-        ASSERT_EQ(allreduces0.size(), 1u);
-        ASSERT_EQ(allreduces1.size(), 1u);
-        EXPECT_EQ(allreduces0, allreduces1)
-            << "LocalTP grouped collectives require every participant graph to enter the same stage name";
-        EXPECT_EQ(allreduces0.front(), "layer0_moe_canonical_routes_allreduce");
-        EXPECT_NE(graph0.getNode("layer0_moe_canonical_routes_reduce"), nullptr);
-        EXPECT_NE(graph1.getNode("layer0_moe_canonical_routes_reduce"), nullptr);
+        std::vector<int> verifier_rows;
+        for (int m = 1; m <= 16; ++m)
+            verifier_rows.push_back(m);
+        verifier_rows.push_back(31);
 
-        const auto *expert_stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
-        const auto *expert_stage1 = expertComputeStage(graph1, "layer0_moe_expert_ffn_overlay_fast");
-        ASSERT_NE(expert_stage0, nullptr);
-        ASSERT_NE(expert_stage1, nullptr);
-        EXPECT_EQ(expert_stage0->fixedTopologyPrefillExpertIdsForTesting(),
-                  (std::vector<int>{0, 1, 2}));
-        EXPECT_EQ(expert_stage1->fixedTopologyPrefillExpertIdsForTesting(),
-                  (std::vector<int>{3, 4, 5}));
+        for (const int m : verifier_rows)
+        {
+            SCOPED_TRACE("verifier_rows=" + std::to_string(m));
+
+            TensorArena activation_arena0;
+            auto buffers0 = makeActivationBuffers(activation_arena0, m);
+            TensorArena activation_arena1;
+            auto buffers1 = makeActivationBuffers(activation_arena1, m);
+
+            Qwen35MoEGraph graph_builder0(model_ctx, nullptr, config0);
+            ComputeGraph graph0 = graph_builder0.buildFFNGraph(
+                layer, buffers0, 0, m, kBatchSize, DeviceId::rocm(0),
+                publication_stream0.get());
+
+            Qwen35MoEGraph graph_builder1(model_ctx, nullptr, config1);
+            ComputeGraph graph1 = graph_builder1.buildFFNGraph(
+                layer, buffers1, 0, m, kBatchSize, DeviceId::rocm(1),
+                publication_stream1.get());
+
+            const auto rooted_collectives0 =
+                stageNamesOfType(graph0, ComputeStageType::ROOTED_COLLECTIVE);
+            const auto rooted_collectives1 =
+                stageNamesOfType(graph1, ComputeStageType::ROOTED_COLLECTIVE);
+            ASSERT_EQ(rooted_collectives0.size(), 2u);
+            ASSERT_EQ(rooted_collectives1.size(), 2u);
+            EXPECT_EQ(rooted_collectives0, rooted_collectives1)
+                << "Every participant must enter identical rooted collectives";
+            EXPECT_EQ(
+                rooted_collectives0.front(),
+                "layer0_moe_canonical_routes_reduce_to_root");
+            EXPECT_EQ(
+                rooted_collectives0.back(),
+                "layer0_moe_canonical_routes_broadcast");
+            EXPECT_TRUE(stageNamesOfType(graph0, ComputeStageType::ALLREDUCE).empty());
+            EXPECT_TRUE(stageNamesOfType(graph1, ComputeStageType::ALLREDUCE).empty());
+
+            const auto *rooted_reduce0 =
+                dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                    graph0.getNode(
+                              "layer0_moe_canonical_routes_reduce_to_root")
+                        ->stage.get());
+            const auto *rooted_reduce1 =
+                dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                    graph1.getNode(
+                              "layer0_moe_canonical_routes_reduce_to_root")
+                        ->stage.get());
+            const auto *broadcast0 =
+                dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                    graph0.getNode(
+                              "layer0_moe_canonical_routes_broadcast")
+                        ->stage.get());
+            const auto *broadcast1 =
+                dynamic_cast<const TPLocalRootedCollectiveStage *>(
+                    graph1.getNode(
+                              "layer0_moe_canonical_routes_broadcast")
+                        ->stage.get());
+            ASSERT_NE(rooted_reduce0, nullptr);
+            ASSERT_NE(rooted_reduce1, nullptr);
+            ASSERT_NE(broadcast0, nullptr);
+            ASSERT_NE(broadcast1, nullptr);
+
+            const size_t expected_route_elements =
+                static_cast<size_t>(m) * kTopK * kDModel;
+            const size_t expected_output_elements =
+                static_cast<size_t>(m) * kDModel;
+            EXPECT_EQ(rooted_reduce0->params().count, expected_route_elements);
+            EXPECT_EQ(rooted_reduce1->params().count, expected_route_elements);
+            EXPECT_EQ(broadcast0->params().count, expected_output_elements);
+            EXPECT_EQ(broadcast1->params().count, expected_output_elements);
+            EXPECT_EQ(rooted_reduce0->params().root_device_index, 0);
+            EXPECT_EQ(rooted_reduce1->params().root_device_index, 0);
+            EXPECT_EQ(broadcast0->params().root_device_index, 0);
+            EXPECT_EQ(broadcast1->params().root_device_index, 0);
+
+            const auto *reducer0 =
+                dynamic_cast<const MoECanonicalRouteReduceStage *>(
+                    graph0.getNode("layer0_moe_canonical_routes_reduce")
+                        ->stage.get());
+            const auto *reducer1 =
+                dynamic_cast<const MoECanonicalRouteReduceStage *>(
+                    graph1.getNode("layer0_moe_canonical_routes_reduce")
+                        ->stage.get());
+            ASSERT_NE(reducer0, nullptr);
+            ASSERT_NE(reducer1, nullptr);
+            EXPECT_EQ(reducer0->params().seq_len, m);
+            EXPECT_EQ(reducer1->params().seq_len, m);
+            EXPECT_EQ(reducer0->params().participant_device_index, 0);
+            EXPECT_EQ(reducer1->params().participant_device_index, 1);
+            EXPECT_EQ(reducer0->params().root_device_index, 0);
+            EXPECT_EQ(reducer1->params().root_device_index, 0);
+            EXPECT_FALSE(reducer0->bufferContract().empty())
+                << "The root graph owns the router-order arithmetic buffers";
+            EXPECT_TRUE(reducer1->bufferContract().empty())
+                << "The non-root graph must not claim root-only arithmetic buffers";
+            EXPECT_EQ(reducer0->coherencePolicy(), CoherencePolicy::FULL);
+            EXPECT_EQ(reducer1->coherencePolicy(), CoherencePolicy::NONE);
+            EXPECT_GT(reducer0->estimatedFlops(), 0u);
+            EXPECT_EQ(reducer1->estimatedFlops(), 0u);
+
+            const auto *expert_stage0 =
+                expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
+            const auto *expert_stage1 =
+                expertComputeStage(graph1, "layer0_moe_expert_ffn_overlay_fast");
+            ASSERT_NE(expert_stage0, nullptr);
+            ASSERT_NE(expert_stage1, nullptr);
+            EXPECT_EQ(expert_stage0->fixedTopologyPrefillExpertIdsForTesting(),
+                      (std::vector<int>{0, 1, 2}));
+            EXPECT_EQ(expert_stage1->fixedTopologyPrefillExpertIdsForTesting(),
+                      (std::vector<int>{3, 4, 5}));
+        }
     }
 
 } // namespace llaminar2::test

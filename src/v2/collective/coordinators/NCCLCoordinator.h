@@ -257,6 +257,39 @@ namespace llaminar2
                                            int device_idx,
                                            void *stream);
 
+        /**
+         * @brief Reduce one participant's device buffer to a fixed root on the
+         *        caller's explicit CUDA stream.
+         *
+         * Every participant in the communicator must submit the same count,
+         * datatype, operation, and root in collective order. The root receives
+         * the reduced values in @p recv_buf; NCCL ignores that pointer on
+         * non-root participants. The method only enqueues stream-ordered device
+         * work. It performs no allocation, host transfer, or synchronization,
+         * and is therefore suitable for participant-local CUDA graph capture.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root-owned device output; ignored by non-root NCCL
+         *        participants but still required to be non-null so callers
+         *        cannot accidentally publish an incomplete buffer contract.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation, such as `ALLREDUCE_SUM`.
+         * @param root Fixed communicator-local root participant.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null CUDA producer stream.
+         * @return true when NCCL accepted the operation for asynchronous
+         *         execution on @p stream.
+         */
+        bool reduceSingleDeviceOnStream(const void *send_buf,
+                                        void *recv_buf,
+                                        size_t count,
+                                        CollectiveDataType dtype,
+                                        CollectiveOp op,
+                                        int root,
+                                        int device_idx,
+                                        void *stream);
+
         bool groupedP2PSingleDeviceOnStream(
             const std::vector<CollectiveP2POp> &ops,
             int device_idx,

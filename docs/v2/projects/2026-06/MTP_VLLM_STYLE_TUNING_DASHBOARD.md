@@ -15,19 +15,15 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 | ExpertParallel fully device-resident MTP | 97% | mirrored-head batching across every EP mode |
 
 - Homogeneous CUDA/ROCm execution is full-graph only. Device parameters select
-  serial/grouped and short/long sequence-parallel regimes inside one immutable
-  captured launch envelope; attention no longer requests host recapture
-  variants.
+  regimes inside one immutable capture; attention does not request recapture.
 - GPU KV append, TurboQuant conversion, verifier publication, and compact
   NCCL/RCCL broadcast use planned persistent workspace and explicit
   producer/consumer event ordering. Hot paths contain no allocation, blocking
   synchronization, segmented execution, or full-logits host observation.
-- CUDA/ROCm MoE prefix restore preserves captures and the stable-address
-  runtime template through explicit graph-build
-  producer streams/events. GPU FFN/MTP graph APIs reject null publication
-  streams before device work.
-- Integration-build unit gate: `585/585` green on 2026-08-01; GPU graph
-  lowering is registered only in the integration tier.
+- MoE prefix restore preserves stable graph addresses through explicit
+  producer events. GPU FFN/MTP APIs reject null publication streams.
+- Integration unit gate: `585/585` green on 2026-08-02. Hardware-free worker
+  contexts keep unit tests CPU-only; physical CUDA/ROCm cases are Integration.
 
 ## Production Matrix
 
@@ -45,40 +41,33 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 ## Fresh Correctness Proofs
 
 - CUDA/ROCm all-format grouped attention is serial-row byte exact for
-  `M=2..16`, D=64/128/256, unequal rows, and long-context boundaries.
-- CPU fused TurboQuant quantization and grouped materialization are byte exact
-  against serial rows for both TQ modes, D=64/128/256, `M=1..16`, plain and
-  RoPE-on-read.
-- CUDA/ROCm TurboQuant cache integration is `8/8` green for TQ4/TQ8; the
-  corresponding CPU cache/TQ gate is `10/10`.
+  `M=2..16`, D=64/128/256, unequal rows, and long contexts.
+- CPU grouped TurboQuant is serial-row byte exact for both TQ modes,
+  D=64/128/256, `M=1..16`, plain and RoPE-on-read.
+- TurboQuant cache gates are CUDA/ROCm `8/8` and CPU `10/10` green.
 - CUDA/ROCm deterministic MoE route planning covers `M=1..4`, top-k 1..16,
   all 256 experts, and 20 repeated exact launches per cell.
 - CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
   byte-equal continuation and complete live state.
 - Release CUDA2 and ROCm2 each pass all eight Dynamic/LLEP cells and `166/166`
-  checks: plain, RAM-prefix, greedy MTP d2, and stochastic dynamic MTP d1..15.
-  Strict PerfStats prove full capture, device verification, movement, clean
-  shutdown, and VRAM release through 2048 generated tokens.
+  checks through 2048 tokens. PerfStats prove full capture, device verification,
+  movement, clean shutdown, and VRAM release.
 - Forward topology now consumes a typed `Prefill`/`Decode` phase instead of
   inferring phase from `M`. The focused MTP regression proves a 14-token prompt
   remains sharded prefill when dynamic MTP permits 16 verifier rows.
-- GPU logits ownership is persistent across the request. Typed gather policy,
-  publication invalidation, and fatal host-access guards prevent stale host
-  buffers and child-runner fallbacks. CUDA2 LLEP PerfStats show no full-logits
-  D2H; only the final 4-byte sampled token crosses to the host. The canonical
-  E2E policy rejects `host_logits_access` explicitly.
+- GPU logits ownership is request-persistent. Fatal host-access guards prevent
+  stale mirrors; only the final 4-byte sampled token crosses to the host.
 - CUDA/ROCm SingleDevice forced-token publication is device-owned and
   graph-captured: both Release lanes pass `31/31` and account for all 96
   transactions without a host control scalar.
-- Transfer stress covers 336 slot rotations and 32 cross-stream reset epochs;
-  source policy forbids eventless publication, GPU sync, hot-path allocation,
-  and direct coherence transitions.
-- CUDA2 LLEP stochastic MTP with RAM-prefix reuse now survives 20 measured
-  request lifecycles: 100 verifier runs, 100 commits, 100 rollbacks, and zero
-  transaction validation failures. Ordinary GPU state summaries perform no
-  logical-state export; the verifier-summary D2H enqueue/sync/wait counters are
-  all zero. The opt-in deep probe first snapshots D2D into dedicated diagnostic
-  storage and exports only that immutable owner.
+- Transfer stress covers 336 slot rotations and 32 cross-stream resets; policy
+  forbids eventless publication, GPU sync, hot allocation, and direct state transitions.
+- Latest canonical Release CUDA2 LLEP stochastic d4..15 plus RAM-prefix E2E is
+  `23/23` green: full capture, no segmentation, 63 verifier runs, 54 rollbacks,
+  and zero transaction validation failures or verifier-summary D2H.
+- Replicated shared-expert residuals no longer enter an invalid allreduce.
+  Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
+  contributions and is covered on NCCL and RCCL.
 
 ## Kernel Economy
 
@@ -96,15 +85,12 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Deterministic MoE route planner: CUDA `3.392 us` versus `22.212 us`
   (`6.55x`), 31 registers and zero spills; ROCm `11.2 us`, 16 VGPR, 33 SGPR,
   1.25 KiB LDS, zero scratch/spills.
-- CUDA2 LLEP stochastic baseline on Qwen3.6-35B: prefill `64.85 tok/s`, decode
-  `24.34 tok/s`; the main verifier graph costs `100.3 ms` per replay and the
-  initial sidecar prelaunch costs `14.1 ms`. Default LLEP selected no movement,
-  so these numbers currently expose overhead without LLEP benefit.
-- The forced-movement CUDA2 LLEP + stochastic dynamic-MTP + RAM-prefix stress
-  lane is correct but deeply uneconomical: `5657.97 tok/s` prefill and only
-  `5.05 tok/s` decode over 20 measured runs. This is the immediate whole-graph
-  Nsight target; correctness fixes must not conceal it with a serial path or
-  disable the production LLEP/MTP/prefix features.
+- Removing the invalid shared-expert allreduce improved the production CUDA2
+  LLEP stochastic lane from `15.368` to `27.790 tok/s` decode (`+80.8%`), with
+  `4030.44 tok/s` prefill. It remains only 16.2% of llama.cpp d3 decode.
+- On this non-P2P RTX 3090 topology, graph-captured NCCL rooted
+  reduce+broadcast at verifier `M=5` costs about `941 us/layer`; collective
+  count, payload, and overlap are the immediate Nsight economy targets.
 
 Matched llama.cpp master comparison, tok/s:
 
@@ -117,8 +103,8 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Profile and tune the full CUDA LLEP lane until its economy matches the
-   correctness proof; inventory every kernel, collective, and launch gap.
+1. Profile the full CUDA LLEP lane; reduce/overlap rooted collectives and tune
+   every dominant kernel until decode exceeds llama.cpp `171.81 tok/s`.
 2. Run the remaining full-context CPU matrix, then close remote-participant
    lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.

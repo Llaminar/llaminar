@@ -316,6 +316,26 @@ namespace llaminar2::test
             return completed && sideband_generation_result_;
         }
 
+        bool collectiveSidebandSpanOnStream(
+            std::span<const LocalTPCollectiveSidebandBuffer> sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name) override
+        {
+            return collectiveSidebandOnStream(
+                std::vector<LocalTPCollectiveSidebandBuffer>(
+                    sidebands.begin(),
+                    sidebands.end()),
+                device_index,
+                producer_stream,
+                anchor_stage_name);
+        }
+
+        bool supportsCollectiveSidebandOnStreamGraphCapture() const override
+        {
+            return raw_allgather_graph_capture_supported_;
+        }
+
         /**
          * @brief Execute one participant-major mock sideband collective.
          *

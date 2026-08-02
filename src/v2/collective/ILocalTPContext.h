@@ -248,6 +248,65 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reduce raw device buffers to one LocalTP root on an explicit stream.
+         *
+         * This primitive is intended for graph-visible activation protocols
+         * that need one deterministic root before a compact publication. It is
+         * enqueue-only and must map to native NCCL/RCCL reduce; host-mediated
+         * or allreduce-based emulation is forbidden.
+         */
+        virtual bool reduceRawOnStream(
+            const void *local_send,
+            void *root_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)local_send;
+            (void)root_recv;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)root_device_index;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Broadcast a raw root-owned device buffer on an explicit stream.
+         *
+         * Every participant must enqueue the same count, datatype, and root in
+         * collective order. The operation is directly graph-capturable and
+         * may not synchronize or stage bytes through the host.
+         */
+        virtual bool broadcastRawOnStream(
+            const void *root_send,
+            void *local_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)root_send;
+            (void)local_recv;
+            (void)count;
+            (void)dtype;
+            (void)root_device_index;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
          * @brief Execute graph-visible grouped send/recv operations on one participant.
          *
          * This is the directed counterpart to allgatherRawOnStream() for

@@ -23,6 +23,7 @@
 #include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/AllreduceStage.h"
+#include "stages/TPAllreduceStage.h"
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
 #include "stages/SendActivationsStage.h"
@@ -307,6 +308,15 @@ namespace llaminar2
         // =====================================================================
         // MPI Communication Stages
         // =====================================================================
+
+        /**
+         * @brief Create one native graph-capturable LocalTP rooted collective.
+         *
+         * The resulting stage always uses the graph-selected explicit stream
+         * and rejects transport emulation or host rendezvous.
+         */
+        static std::unique_ptr<IComputeStage> createTPLocalRootedCollective(
+            const TPLocalRootedCollectiveStage::Params &params);
 
         /**
          * @brief Create an Allreduce stage for MPI collective sum

@@ -723,6 +723,151 @@ TEST(Test__ForwardGraphSignatureHash, UsableAsUnorderedMapKey)
     EXPECT_EQ(map[decode2], 42);
 }
 
+/**
+ * @brief Preserve exact grouped-verifier geometry in replay telemetry.
+ *
+ * GPU replay timings are reclaimed asynchronously, so they cannot derive M
+ * from mutable request state at collection time.  This regression proves the
+ * graph cache receives all cache-key dimensions needed to distinguish an M=5
+ * verifier from its neighboring M=2..4 graph families.
+ */
+TEST(Test__ForwardGraphSignature, ReplayWorkloadGeometryIsExactAndTotal)
+{
+    const ForwardGraphSignature signature{
+        .seq_len = 5,
+        .batch_size = 2,
+        .device = DeviceId::cuda(0),
+        .decode = true,
+        .decode_has_history = true,
+        .all_position_logits = true,
+        .live_mtp_request_batch_condition = false,
+        .all_position_logit_rows = 10,
+        .mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::StochasticRejection,
+        .uses_device_token_ids = true,
+        .uses_device_position_ids = true,
+        .position_policy = ForwardPositionPolicy::ExplicitRows,
+        .uses_device_sequence_lengths = true,
+        .moe_placement_epoch = 17,
+    };
+
+    const auto geometry = replayWorkloadGeometryForSignature(signature);
+    ASSERT_TRUE(geometry.valid());
+    EXPECT_EQ(geometry.seq_len, 5);
+    EXPECT_EQ(geometry.batch_size, 2);
+    EXPECT_EQ(geometry.m, 10);
+    EXPECT_EQ(geometry.all_position_rows, 10);
+    EXPECT_EQ(
+        geometry.verifier_outcome_mode,
+        static_cast<uint8_t>(MTPVerifierOutcomeGraphMode::StochasticRejection));
+    EXPECT_EQ(
+        geometry.position_policy,
+        static_cast<uint8_t>(ForwardPositionPolicy::ExplicitRows));
+    EXPECT_EQ(geometry.moe_placement_epoch, 17u);
+    EXPECT_TRUE(geometry.decode);
+    EXPECT_TRUE(geometry.all_position_logits);
+    EXPECT_FALSE(geometry.live_mtp_request_batch_condition);
+
+    ForwardGraphSignature overflow = signature;
+    overflow.seq_len = std::numeric_limits<int>::max();
+    overflow.batch_size = 2;
+    EXPECT_FALSE(replayWorkloadGeometryForSignature(overflow).valid())
+        << "Overflowing graph dimensions must not publish a fabricated M tag.";
+}
+
+/**
+ * @brief Prove grouped verifier topology is total over M.
+ *
+ * The historical public-forward heuristic treated only M<=4 continuations as
+ * decode. Dynamic MTP consequently changed to prefill collectives at M=5 even
+ * though every verifier row remained serial-decode-equivalent. Exercise both
+ * the current depth-15 range (M<=16 including the bonus row) and out-of-range
+ * values so row count can never become an architectural phase boundary again.
+ */
+TEST(Test__ForwardExecutionPhasePolicy, GroupedVerifierDecodeTopologyIsMTotal)
+{
+    constexpr std::array<int, 12> kVerifierRows{
+        1, 2, 3, 4, 5, 8, 15, 16, 17, 32, 1024, 16384};
+
+    for (const int m : kVerifierRows)
+    {
+        const ForwardExecutionPhase phase = resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::GroupedMTPVerifier,
+            .seq_len = m,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        });
+        EXPECT_EQ(phase, ForwardExecutionPhase::Decode) << "M=" << m;
+    }
+
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::GroupedMTPVerifier,
+            .seq_len = 8,
+            .batch_size = 3,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "Request-batched grouped verification is also decode-equivalent.";
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MTPCondition,
+            .seq_len = 1024,
+            .batch_size = 16,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "Device-resident MTP condition rows cannot select prefill topology.";
+}
+
+/**
+ * @brief Preserve explicit and compatibility policy for ordinary inference.
+ */
+TEST(Test__ForwardExecutionPhasePolicy, MainInferenceRetainsExplicitBoundaries)
+{
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .seq_len = 5,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Prefill);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .seq_len = 4,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Decode);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .force_decode = true,
+            .seq_len = 1024,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .force_prefill = true,
+            .seq_len = 1,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Prefill);
+}
+
 // =========================================================================
 // GraphBuildResult
 // =========================================================================
@@ -2774,6 +2919,20 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
     DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.perf_context = "mtp_decode_sidecar";
+    cache.replay_workload = {
+        .seq_len = 7,
+        .batch_size = 2,
+        .m = 14,
+        .all_position_rows = 12,
+        .verifier_outcome_mode = static_cast<uint8_t>(
+            MTPVerifierOutcomeGraphMode::StochasticRejection),
+        .position_policy = static_cast<uint8_t>(
+            ForwardPositionPolicy::ExplicitRows),
+        .moe_placement_epoch = 29,
+        .decode = true,
+        .all_position_logits = true,
+        .live_mtp_request_batch_condition = false,
+    };
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"sidecar_graph"};
@@ -2822,27 +2981,51 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags total_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
         {"attribution", "gpu_event"},
+        {"batch_size", "2"},
         {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
         {"graph_capture_scope", "full_graph_replay_events"},
         {"graph_count", "1"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
         {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "asynchronous_event_reclaimed"},
         {"timing_scope", "total_replay_gpu_event"},
-        {"type", "capturable"}};
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
     const PerfStatsCollector::Tags segment_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
         {"attribution", "gpu_event"},
+        {"batch_size", "2"},
         {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
         {"first_stage", "sidecar_graph"},
         {"graph_capture_scope", "full_graph_replay_events"},
         {"graph_index", "0"},
         {"last_stage", "sidecar_graph"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
         {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "asynchronous_event_reclaimed"},
         {"timing_scope", "graph_replay_gpu_event"},
-        {"type", "capturable"}};
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
@@ -2853,10 +3036,22 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
 
     const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
+        {"batch_size", "2"},
         {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
         {"graph_count", "1"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
         {"stage_count", "1"},
-        {"type", "capturable"}};
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
     EXPECT_DOUBLE_EQ(findCounterValue(
                          forward_records,
                          "full_graph_replay_final_sync_deferred",

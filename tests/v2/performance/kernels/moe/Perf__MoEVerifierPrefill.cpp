@@ -16,6 +16,9 @@
 #include "../../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_CUDA
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+
 #include <cuda_runtime.h>
 #endif
 
@@ -837,26 +840,6 @@ namespace
         int old_down_kparts_ = 16;
     };
 
-    class CudaGraphOwner
-    {
-    public:
-        ~CudaGraphOwner()
-        {
-            if (exec_)
-                cudaGraphExecDestroy(exec_);
-            if (graph_)
-                cudaGraphDestroy(graph_);
-        }
-
-        cudaGraph_t *graphPtr() { return &graph_; }
-        cudaGraphExec_t *execPtr() { return &exec_; }
-        cudaGraphExec_t execHandle() const { return exec_; }
-
-    private:
-        cudaGraph_t graph_ = nullptr;
-        cudaGraphExec_t exec_ = nullptr;
-    };
-
     /**
      * @brief Stop a timing cell immediately when its launch body is rejected.
      *
@@ -1143,41 +1126,41 @@ namespace
         const double pipeline_ms = timeCudaEvents(stream, iterations, run_pipeline);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        CudaGraphOwner graph;
-        const cudaError_t begin_status =
-            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        if (begin_status != cudaSuccess)
+        /*
+         * Use the production capture owner rather than a raw begin/end pair.
+         * Its GraphCaptureGuard tells TensorBase that stage-local writes are
+         * provisional graph state, so no external completion event is recorded
+         * inside the graph.  Its transaction destructor also closes capture if
+         * a benchmark launch throws, preventing one failed cell from leaving
+         * the CUDA stream in capture mode and poisoning every later cell.
+         */
+        llaminar2::CUDAGraphCapture graph(stream);
         {
-            throw std::runtime_error(
-                std::string("CUDA MoE verifier graph capture begin failed: ") +
-                cudaGetErrorString(begin_status));
+            llaminar2::ScopedBackendGraphCapture capture_transaction(
+                graph,
+                "CUDA MoE routed verifier perf capture");
+            if (!capture_transaction.begin())
+            {
+                throw std::runtime_error(
+                    "CUDA MoE verifier graph capture begin failed");
+            }
+            requireCudaBenchBody(run_grouped(), "graph capture");
+            capture_transaction.finish();
         }
-        const bool captured = run_grouped();
-        const cudaError_t end_status = cudaStreamEndCapture(stream, graph.graphPtr());
-        if (!captured || end_status != cudaSuccess || *graph.graphPtr() == nullptr)
+        if (!graph.instantiate())
         {
             throw std::runtime_error(
-                std::string("CUDA MoE verifier graph capture body failed: ") +
-                cudaGetErrorString(end_status));
-        }
-        const cudaError_t instantiate_status =
-            cudaGraphInstantiate(
-                graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0);
-        if (instantiate_status != cudaSuccess)
-        {
-            throw std::runtime_error(
-                std::string("CUDA MoE verifier graph instantiate failed: ") +
-                cudaGetErrorString(instantiate_status));
+                "CUDA MoE verifier graph instantiate failed");
         }
         for (int i = 0; i < warmups; ++i)
-            EXPECT_EQ(cudaGraphLaunch(graph.execHandle(), stream), cudaSuccess);
+            requireCudaBenchBody(graph.launch(), "graph warmup replay");
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         const double graph_ms = timeCudaEvents(
             stream,
             iterations,
             [&]()
             {
-                return cudaGraphLaunch(graph.execHandle(), stream) == cudaSuccess;
+                return graph.launch();
             });
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
@@ -1390,23 +1373,33 @@ namespace
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        CudaGraphOwner graph;
-        EXPECT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-        const bool captured = run_grouped();
-        const cudaError_t end_status = cudaStreamEndCapture(stream, graph.graphPtr());
-        EXPECT_TRUE(captured);
-        EXPECT_EQ(end_status, cudaSuccess) << cudaGetErrorString(end_status);
-        EXPECT_NE(*graph.graphPtr(), nullptr);
-        EXPECT_EQ(cudaGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0), cudaSuccess);
+        llaminar2::CUDAGraphCapture graph(stream);
+        {
+            llaminar2::ScopedBackendGraphCapture capture_transaction(
+                graph,
+                "CUDA MoE shared-expert verifier perf capture");
+            if (!capture_transaction.begin())
+            {
+                throw std::runtime_error(
+                    "CUDA shared-expert verifier graph capture begin failed");
+            }
+            requireCudaBenchBody(run_grouped(), "shared graph capture");
+            capture_transaction.finish();
+        }
+        if (!graph.instantiate())
+        {
+            throw std::runtime_error(
+                "CUDA shared-expert verifier graph instantiate failed");
+        }
         for (int i = 0; i < warmups; ++i)
-            EXPECT_EQ(cudaGraphLaunch(graph.execHandle(), stream), cudaSuccess);
+            requireCudaBenchBody(graph.launch(), "shared graph warmup replay");
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         const double graph_ms = timeCudaEvents(
             stream,
             iterations,
             [&]()
             {
-                return cudaGraphLaunch(graph.execHandle(), stream) == cudaSuccess;
+                return graph.launch();
             });
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 

@@ -1928,6 +1928,10 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
         fence_body.find("waitForPendingLiveGraphProducersForObservation");
     const auto mailbox_wait_pos =
         fence_body.find("waitForDeviceResidentLogicalSequenceStateMailboxForObservation");
+    const auto prefix_checkpoint_wait_pos =
+        fence_body.find("waitForPendingLivePrefixCheckpointReadyForObservation");
+    const auto mtp_transaction_pos =
+        fence_body.find("currentDeviceResidentMTPTransactionLease");
 
     ASSERT_NE(published_state_join_pos, std::string::npos)
         << "Harvest must join accepted publication and prefix mutation through "
@@ -1936,6 +1940,10 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
         << "Harvest must wait for graph producer streams before exporting GDN/KV payloads.";
     ASSERT_NE(mailbox_wait_pos, std::string::npos)
         << "Harvest must observe the device-resident logical sequence mailbox before exporting.";
+    ASSERT_NE(prefix_checkpoint_wait_pos, std::string::npos)
+        << "Harvest must join an in-flight device prefix checkpoint before exporting.";
+    ASSERT_NE(mtp_transaction_pos, std::string::npos)
+        << "Harvest must join the current device-resident MTP transaction before exporting.";
     const auto latest_forward_pos =
         graph_fence_body.find("waitForForwardGraphOutputReady");
     ASSERT_NE(latest_forward_pos, std::string::npos)
@@ -1945,8 +1953,10 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
     EXPECT_EQ(graph_fence_body.find("insertStreamDependency"), std::string::npos);
     EXPECT_EQ(graph_fence_body.find("synchronizeStream"), std::string::npos);
     EXPECT_EQ(graph_fence_body.find("synchronizeDevice"), std::string::npos);
+    EXPECT_LT(mailbox_wait_pos, prefix_checkpoint_wait_pos);
+    EXPECT_LT(prefix_checkpoint_wait_pos, published_state_join_pos);
     EXPECT_LT(published_state_join_pos, producer_wait_pos);
-    EXPECT_LT(producer_wait_pos, mailbox_wait_pos);
+    EXPECT_LT(producer_wait_pos, mtp_transaction_pos);
 }
 
 /**

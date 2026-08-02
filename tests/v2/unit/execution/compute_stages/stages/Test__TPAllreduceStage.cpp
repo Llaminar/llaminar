@@ -186,6 +186,80 @@ TEST_F(Test__TPAllreduceStage, CoherencePolicyIsOutput)
     EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::OUTPUT);
 }
 
+TEST_F(Test__TPAllreduceStage,
+       RootedCollectiveDeclaresOneCapturableInPlaceGpuTransaction)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::NCCL);
+
+    TPLocalRootedCollectiveStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tp_ctx = &tp_ctx;
+    params.tensor = test_tensor_.get();
+    params.count = 129;
+    params.dtype = CollectiveDataType::FLOAT32;
+    params.operation = TPLocalRootedCollectiveOperation::ReduceSum;
+    params.root_device_index = 1;
+    params.participant_device_index = 0;
+    params.stage_name = "canonical_routes_reduce_to_root";
+    params.tensor_buffer_id = BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+
+    TPLocalRootedCollectiveStage stage(std::move(params));
+    EXPECT_EQ(stage.type(), ComputeStageType::ROOTED_COLLECTIVE);
+    EXPECT_EQ(stage.name(), "tp_local_rooted_collective");
+    EXPECT_TRUE(stage.requiresAllreduce());
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_TRUE(stage.isGraphCapturable());
+
+    const auto requirements = stage.getBufferRequirements();
+    ASSERT_EQ(requirements.buffers.size(), 1u);
+    EXPECT_EQ(requirements.buffers.front().role, BufferRole::INOUT);
+
+    const auto contract = stage.bufferContract();
+    EXPECT_TRUE(contract.inputs.empty());
+    EXPECT_TRUE(contract.outputs.empty());
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(
+        contract.inouts.front().id,
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+    EXPECT_FALSE(contract.inouts.front().prepare_write_storage)
+        << "The rooted collective must consume the producer's existing device allocation";
+}
+
+TEST_F(Test__TPAllreduceStage,
+       RootedCollectiveSidebandsRequireCapturableNativeSupport)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::NCCL);
+
+    TPLocalRootedCollectiveStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tp_ctx = &tp_ctx;
+    params.tensor = test_tensor_.get();
+    params.count = 128;
+    params.root_device_index = 0;
+    params.participant_device_index = 0;
+    params.sideband_workspace_bindings.push_back(
+        TPAllreduceSidebandWorkspaceBinding{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer_name = "local_histogram",
+            .recv_buffer_name = "gathered_histogram",
+            .element_count = 32,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "rebalance_histogram"});
+
+    TPLocalRootedCollectiveStage stage(std::move(params));
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
+
+    tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
+        << "The same-stream sideband is capturable only after the LocalTP context advertises its native primitive";
+}
+
 TEST_F(Test__TPAllreduceStage, SidebandsExecuteOnSameExplicitStreamAfterPrimaryAllreduce)
 {
     const std::string source = readTextFile(LLAMINAR_TP_ALLREDUCE_STAGE_SOURCE);

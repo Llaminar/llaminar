@@ -216,8 +216,48 @@ namespace llaminar2
                 tags.emplace("context", perf_context);
         }
 
+        /**
+         * @brief Attach immutable cache-key geometry to one replay metric.
+         *
+         * The descriptor belongs to the same GraphSegmentCache as the timing
+         * event ring.  This is essential for deferred collection: by the time a
+         * stop event is queried, another MTP transaction may already be active
+         * on the host.  No runner state is sampled here.
+         */
+        void addReplayWorkloadTags(
+            PerfStatsCollector::Tags &tags,
+            const DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry &workload)
+        {
+            if (!workload.valid())
+                return;
+
+            tags.emplace("seq_len", std::to_string(workload.seq_len));
+            tags.emplace("batch_size", std::to_string(workload.batch_size));
+            tags.emplace("m", std::to_string(workload.m));
+            tags.emplace(
+                "all_position_rows",
+                std::to_string(workload.all_position_rows));
+            tags.emplace(
+                "verifier_outcome_mode",
+                std::to_string(workload.verifier_outcome_mode));
+            tags.emplace(
+                "position_policy",
+                std::to_string(workload.position_policy));
+            tags.emplace(
+                "moe_placement_epoch",
+                std::to_string(workload.moe_placement_epoch));
+            tags.emplace("decode", workload.decode ? "true" : "false");
+            tags.emplace(
+                "all_position_logits",
+                workload.all_position_logits ? "true" : "false");
+            tags.emplace(
+                "live_mtp_request_batch_condition",
+                workload.live_mtp_request_batch_condition ? "true" : "false");
+        }
+
         PerfStatsCollector::Tags replaySegmentTags(const DeviceGraphExecutor::GraphSegment &segment,
-                                                   const std::string &perf_context)
+                                                   const std::string &perf_context,
+                                                   const DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry *workload = nullptr)
         {
             PerfStatsCollector::Tags tags{
                 {"type", segmentTypeName(segment)},
@@ -228,6 +268,8 @@ namespace llaminar2
                 tags.emplace("last_stage", segment.stage_names.back());
             }
             addContextTag(tags, perf_context);
+            if (workload)
+                addReplayWorkloadTags(tags, *workload);
             return tags;
         }
 
@@ -256,6 +298,7 @@ namespace llaminar2
                 {"segment_count", std::to_string(cache.segments.size())},
                 {"stage_count", std::to_string(stage_count)}};
             addContextTag(tags, cache.perf_context);
+            addReplayWorkloadTags(tags, cache.replay_workload);
             return tags;
         }
 
@@ -361,7 +404,8 @@ namespace llaminar2
                 {
                     auto unit_tags = replaySegmentTags(
                         segment_cache.segments.front(),
-                        segment_cache.perf_context);
+                        segment_cache.perf_context,
+                        &segment_cache.replay_workload);
                     unit_tags.emplace("graph_index", "0");
                     unit_tags.emplace("sync_scope", sync_scope);
                     PerfStatsCollector::recordTimingNs(
@@ -386,7 +430,8 @@ namespace llaminar2
 
             auto unit_tags = replaySegmentTags(
                 segment_cache.segments[slot.replay_unit_index],
-                segment_cache.perf_context);
+                segment_cache.perf_context,
+                &segment_cache.replay_workload);
             unit_tags.emplace(
                 replayUnitIndexTagName(replay_mode),
                 std::to_string(slot.replay_unit_index));
@@ -988,6 +1033,9 @@ namespace llaminar2
                                              double value,
                                              PerfStatsCollector::Tags tags)
             {
+                addReplayWorkloadTags(
+                    tags,
+                    segment_cache.replay_workload);
                 PerfStatsCollector::addCounter(
                     "stage_gpu",
                     name,
@@ -2844,7 +2892,10 @@ namespace llaminar2
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
-            const auto seg_tags = replaySegmentTags(seg, segment_cache.perf_context);
+            const auto seg_tags = replaySegmentTags(
+                seg,
+                segment_cache.perf_context,
+                &segment_cache.replay_workload);
             if (trace_replay)
             {
                 const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";

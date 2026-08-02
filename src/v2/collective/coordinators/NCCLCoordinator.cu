@@ -1622,6 +1622,95 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid reduce root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!send_buf || !recv_buf || count == 0)
+        {
+            last_error_ = "Invalid reduce buffer/count for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null reduce stream for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        const auto comm =
+            static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+        const auto caller_stream = static_cast<cudaStream_t>(stream);
+
+        static thread_local int tl_last_cuda_device_for_reduce = -1;
+        if (tl_last_cuda_device_for_reduce != ordinal)
+        {
+            const cudaError_t err = cudaSetDevice(ordinal);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") +
+                              cudaGetErrorString(err);
+                return false;
+            }
+            tl_last_cuda_device_for_reduce = ordinal;
+        }
+
+        const nccl::ncclResult_t result = nccl::ncclReduce(
+            send_buf,
+            recv_buf,
+            count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)),
+            toNcclRedOpInt(toOpInt(op)),
+            root,
+            comm,
+            caller_stream);
+        if (result != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclReduce(on-stream) failed: ") +
+                          nccl::ncclGetErrorString(result);
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::groupedP2PSingleDeviceOnStream(
         const std::vector<CollectiveP2POp> &ops,
         int device_idx,

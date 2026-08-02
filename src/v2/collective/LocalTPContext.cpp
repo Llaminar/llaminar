@@ -244,6 +244,65 @@ namespace llaminar2
                 std::move(tags));
         }
 
+        /**
+         * @brief Record one native rooted LocalTP collective without inventing
+         *        allreduce-equivalent traffic.
+         */
+        void recordLocalTPRuntimeRawRootedCollective(
+            const DeviceGroup &device_group,
+            CollectiveBackendType backend,
+            const DeviceId &device,
+            const std::string &stage_name,
+            size_t degree,
+            int device_index,
+            int root_device_index,
+            size_t elements,
+            CollectiveDataType dtype,
+            const char *operation,
+            bool graph_capture)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const size_t element_bytes = collectiveDataTypeBytes(dtype);
+            const std::string primitive =
+                std::string(backend == CollectiveBackendType::NCCL
+                                ? "nccl"
+                                : "rccl") +
+                (std::string(operation) == "reduce" ? "Reduce" : "Broadcast");
+            PerfStatsCollector::Tags tags{
+                {"stage", stage_name.empty() ? "unnamed" : stage_name},
+                {"operation", operation},
+                {"backend", collectiveBackendTypeToString(backend)},
+                {"scope", "local"},
+                {"degree", std::to_string(degree)},
+                {"device_index", std::to_string(device_index)},
+                {"root_device_index", std::to_string(root_device_index)},
+                {"dtype", collectiveDataTypeName(dtype)},
+                {"element_bytes", std::to_string(element_bytes)},
+                {"elements", std::to_string(elements)},
+                {"path", "native_single_device_on_stream"},
+                {"backend_primitive", primitive},
+                {"graph_capture", graph_capture ? "true" : "false"},
+                {"host_rendezvous", "false"},
+                {"homogeneous", device_group.is_homogeneous ? "true" : "false"}};
+
+            PerfStatsCollector::addCounter(
+                "tp_rooted_collective_runtime",
+                "calls",
+                1.0,
+                {},
+                device.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_rooted_collective_runtime",
+                "bytes",
+                static_cast<double>(elements * element_bytes),
+                {},
+                device.toString(),
+                std::move(tags));
+        }
+
         size_t sidebandResultElements(
             LocalTPCollectiveSidebandKind kind,
             size_t element_count,
@@ -2716,6 +2775,158 @@ namespace llaminar2
              {"sideband_count", std::to_string(sideband_count)},
              {"host_rendezvous", "false"},
              {"device_completion_wait", "false"}});
+        return true;
+    }
+
+    bool LocalTPContext::reduceRawOnStream(
+        const void *local_send,
+        void *root_recv,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root_device_index,
+        int device_index,
+        void *producer_stream,
+        const std::string &stage_name)
+    {
+        if (!local_send || !root_recv || count == 0)
+        {
+            LOG_ERROR("LocalTPContext::reduceRawOnStream: invalid buffer/count"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!producer_stream)
+        {
+            throw std::invalid_argument(
+                "LocalTPContext::reduceRawOnStream requires a non-null GPU stream");
+        }
+        if (device_index < 0 || device_index >= degree() ||
+            root_device_index < 0 || root_device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::reduceRawOnStream: invalid participant/root"
+                      << " device_index=" << device_index
+                      << " root_device_index=" << root_device_index
+                      << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (degree() <= 1 || !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL &&
+             backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess() ||
+            !backend_impl_->supportsReduceSingleDeviceOnStream())
+        {
+            LOG_ERROR("LocalTPContext::reduceRawOnStream: homogeneous native rooted reduce is unavailable"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " degree=" << degree());
+            return false;
+        }
+
+        if (!backend_impl_->reduceSingleDeviceOnStream(
+                local_send,
+                root_recv,
+                count,
+                dtype,
+                op,
+                root_device_index,
+                device_index,
+                producer_stream))
+        {
+            LOG_ERROR("LocalTPContext::reduceRawOnStream: native rooted reduce failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        }
+
+        recordLocalTPRuntimeRawRootedCollective(
+            device_group_,
+            backend_,
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
+            stage_name,
+            static_cast<size_t>(degree()),
+            device_index,
+            root_device_index,
+            count,
+            dtype,
+            "reduce",
+            isGraphCaptureActive());
+        return true;
+    }
+
+    bool LocalTPContext::broadcastRawOnStream(
+        const void *root_send,
+        void *local_recv,
+        size_t count,
+        CollectiveDataType dtype,
+        int root_device_index,
+        int device_index,
+        void *producer_stream,
+        const std::string &stage_name)
+    {
+        if (!root_send || !local_recv || count == 0)
+        {
+            LOG_ERROR("LocalTPContext::broadcastRawOnStream: invalid buffer/count"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!producer_stream)
+        {
+            throw std::invalid_argument(
+                "LocalTPContext::broadcastRawOnStream requires a non-null GPU stream");
+        }
+        if (device_index < 0 || device_index >= degree() ||
+            root_device_index < 0 || root_device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::broadcastRawOnStream: invalid participant/root"
+                      << " device_index=" << device_index
+                      << " root_device_index=" << root_device_index
+                      << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (degree() <= 1 || !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL &&
+             backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess() ||
+            !backend_impl_->supportsBroadcastSingleDeviceOnStream())
+        {
+            LOG_ERROR("LocalTPContext::broadcastRawOnStream: homogeneous native broadcast is unavailable"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " degree=" << degree());
+            return false;
+        }
+
+        if (!backend_impl_->broadcastSingleDeviceOnStream(
+                root_send,
+                local_recv,
+                count,
+                dtype,
+                root_device_index,
+                device_index,
+                producer_stream))
+        {
+            LOG_ERROR("LocalTPContext::broadcastRawOnStream: native rooted broadcast failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        }
+
+        recordLocalTPRuntimeRawRootedCollective(
+            device_group_,
+            backend_,
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
+            stage_name,
+            static_cast<size_t>(degree()),
+            device_index,
+            root_device_index,
+            count,
+            dtype,
+            "broadcast",
+            isGraphCaptureActive());
         return true;
     }
 
