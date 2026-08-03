@@ -318,7 +318,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "host_result",
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentStochasticGeneration", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),

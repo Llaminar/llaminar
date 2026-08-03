@@ -340,6 +340,36 @@ namespace
          * parity cells remain the affordable single-request correctness gate.
          */
         test_case.moe_rebalance = movementFriendlyRebalanceConfig(mode);
+        if (mode == MoERebalanceRuntimeMode::LLEP)
+        {
+            ASSERT_NE(test_case.moe_routed_expert_plan, nullptr)
+                << "LLEP parity requires an explicit routed-expert graph plan";
+            auto &plan = *test_case.moe_routed_expert_plan;
+            for (const auto &tier : plan.routed_tiers)
+            {
+                auto domain = std::find_if(
+                    plan.domains.begin(),
+                    plan.domains.end(),
+                    [&](const RoutedExpertDomain &candidate)
+                    {
+                        return candidate.name == tier.domain;
+                    });
+                ASSERT_NE(domain, plan.domains.end())
+                    << "LLEP parity tier '" << tier.name
+                    << "' references missing execution domain '"
+                    << tier.domain << "'";
+                /*
+                 * Runtime rebalance mode controls when placement maintenance
+                 * runs; it deliberately does not rewrite graph scheduling.
+                 * The fixture must therefore declare the production LLEP row
+                 * assignment policy in the graph plan itself.  Keeping that
+                 * distinction explicit prevents a test-only mode flag from
+                 * silently exercising StaticOwner while claiming LLEP parity.
+                 */
+                domain->routed_assignment_policy =
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            }
+        }
         test_case.env_overrides.emplace_back(
             "LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS",
             "0");

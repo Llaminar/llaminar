@@ -888,23 +888,25 @@ namespace llaminar2
         virtual uint64_t graphCaptureVariantSignature() const { return 0; }
 
         /**
-         * @brief Whether warmup can make a cold stage graph-capturable.
+         * @brief Whether explicit launch preparation can make this stage capture-ready.
          *
-         * Stages return true here when their backend and shape support graph
-         * capture in principle, but their cold isGraphCapturable() answer may
-         * remain false until the first warmup execution creates runtime tables,
-         * descriptor banks, kernels, or scratch. The segmented planner may place
-         * these stages in capturable segments before warmup; the capture phase
-         * then hard-fails if isGraphCapturable() is still false.
+         * A stage returns true when its immutable graph topology is supported but
+         * isGraphCapturable() remains false until prepareGraphLaunch() binds
+         * persistent kernels, descriptor tables, scratch pointers, or events.
+         * Preparation must never execute model arithmetic. The planner may admit
+         * such a stage provisionally, then requires preparation to make the
+         * stricter isGraphCapturable() predicate true before beginCapture().
          */
-        virtual bool supportsWarmupDependentGraphCapture() const { return false; }
+        virtual bool supportsGraphCaptureAfterLaunchPreparation() const
+        {
+            return false;
+        }
 
         /**
-         * @brief Human-readable readiness details when warmup-dependent capture fails.
+         * @brief Human-readable readiness details when launch preparation fails.
          *
-         * Returned text is diagnostic only.  It must not allocate device memory or
-         * mutate stage state, because callers may use it from graph-capture
-         * fallback paths.
+         * Returned text is diagnostic only. It must not allocate device memory or
+         * mutate stage state because callers invoke it on fatal capture failures.
          */
         virtual std::string graphCaptureReadinessDebugString() const { return {}; }
 
@@ -1408,15 +1410,12 @@ namespace llaminar2
         /**
          * @brief Reset request-scoped state while preserving captured replay metadata.
          *
-         * A normal session reset may intentionally mark warmup-dependent
-         * backend metadata cold so the next execution warms and captures again.
-         * This hook is used only when the caller is keeping an already
-         * instantiated GPU graph executable alive across a request boundary.
-         * Derived stages must clear stream ownership and transient request
-         * mirrors, but must not invalidate descriptor tables, pointer slots, or
-         * other device metadata that the preserved graph launch reads by
-         * address. The default remains conservative for stages without a
-         * narrower contract.
+         * This hook is used only when the caller keeps an already instantiated
+         * GPU graph executable alive across a request boundary. Derived stages
+         * must clear request-local host bookkeeping without invalidating stream
+         * ownership, descriptor tables, pointer slots, or other persistent
+         * device metadata read by the preserved graph. A request reset must not
+         * force eager initialization or recapture.
          */
         virtual void resetSessionStatePreservingCapturedReplay()
         {

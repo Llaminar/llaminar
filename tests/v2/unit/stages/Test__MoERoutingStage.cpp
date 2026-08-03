@@ -559,9 +559,9 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
     MoERoutingStage unprepared_stage(params);
     EXPECT_FALSE(unprepared_stage.isGraphCapturable());
 #if defined(HAVE_ROCM)
-    EXPECT_TRUE(unprepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_TRUE(unprepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #else
-    EXPECT_FALSE(unprepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(unprepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #endif
 
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
@@ -570,10 +570,10 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
     MoERoutingStage prepared_stage(params);
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(prepared_stage.isGraphCapturable());
-    EXPECT_TRUE(prepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_TRUE(prepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #else
     EXPECT_FALSE(prepared_stage.isGraphCapturable());
-    EXPECT_FALSE(prepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(prepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #endif
 }
 

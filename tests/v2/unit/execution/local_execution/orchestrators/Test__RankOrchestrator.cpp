@@ -548,8 +548,8 @@ public:
             return false;
         }
         if (!request.valid() ||
-            request.request_count <= 0 ||
-            request.request_count > kMockResidentOutcomeRequestCapacity)
+            request.requestCount() <= 0 ||
+            request.requestCount() > kMockResidentOutcomeRequestCapacity)
         {
             if (error)
                 *error = "mock device-resident MTP publication received invalid request";
@@ -557,30 +557,30 @@ public:
         }
 
         resident_target_positions_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
         resident_target_sequence_lengths_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
         resident_accepted_state_counts_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
         resident_next_condition_tokens_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             kMTPSpecDecodeInvalidToken);
         resident_all_drafts_accepted_flags_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
         resident_stopped_flags_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
         resident_publication_ok_flags_.assign(
-            static_cast<size_t>(request.request_count),
+            static_cast<size_t>(request.requestCount()),
             0);
 
         int max_target_cached_tokens = 0;
         for (int request_index = 0;
-             request_index < request.request_count;
+             request_index < request.requestCount();
              ++request_index)
         {
             const size_t meta_base =
@@ -616,9 +616,9 @@ public:
                 request.outcome.meta_device,
                 request.outcome.meta_stride,
                 request_index,
-                request.max_draft_tokens,
+                request.physicalVerifierRowsPerRequest(),
                 base_cached_tokens,
-                request.max_draft_tokens,
+                request.max_state_commit_rows,
                 nullptr,
                 nullptr,
                 nullptr,
@@ -649,7 +649,7 @@ public:
         }
 
         position_ = max_target_cached_tokens;
-        resident_logical_state_request_count_ = request.request_count;
+        resident_logical_state_request_count_ = request.requestCount();
         resident_logical_state_valid_ = true;
         return true;
     }
@@ -1349,6 +1349,8 @@ public:
             staged_resident_output_tokens_.data();
         out_handle->meta_device = staged_resident_meta_.data();
         out_handle->request_count = 1;
+        out_handle->logical_verifier_rows_per_request = draft_token_count;
+        out_handle->physical_verifier_rows_per_request = draft_token_count;
         out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = device_id_;
@@ -1731,6 +1733,7 @@ public:
 
         staged_resident_output_tokens_.fill(-1);
         staged_resident_meta_.fill(0);
+        int logical_verifier_rows_per_request = 0;
         for (int request_index = 0; request_index < request_count; ++request_index)
         {
             const DeviceStochasticBatchOutcomeRequest &request =
@@ -1740,6 +1743,9 @@ public:
             {
                 return false;
             }
+            logical_verifier_rows_per_request = std::max(
+                logical_verifier_rows_per_request,
+                request.row_count + 1);
 
             std::array<int, kSpeculativeBatchMaxRows> row_tokens{};
             std::array<int, kSpeculativeBatchMaxRows> row_accepted{};
@@ -1825,6 +1831,10 @@ public:
             staged_resident_output_tokens_.data();
         out_handle->meta_device = staged_resident_meta_.data();
         out_handle->request_count = request_count;
+        out_handle->logical_verifier_rows_per_request =
+            logical_verifier_rows_per_request;
+        out_handle->physical_verifier_rows_per_request =
+            logical_verifier_rows_per_request;
         out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = device_id_;
@@ -6274,8 +6284,6 @@ TEST_F(Test__RankOrchestrator,
 
     DeviceSpeculativePublicationRequest request;
     request.outcome = handle;
-    request.request_count = 1;
-    request.max_draft_tokens = static_cast<int>(draft_tokens.size());
     request.max_state_commit_rows =
         materialized.target_verifier_state_commit_count;
     request.publish_mtp_shifted_kv = true;
@@ -6694,8 +6702,6 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesEveryPar
 
     DeviceSpeculativePublicationRequest request;
     request.outcome = handle;
-    request.request_count = 1;
-    request.max_draft_tokens = 2;
     request.max_state_commit_rows =
         materialized.target_verifier_state_commit_count;
     request.publish_mtp_shifted_kv = true;

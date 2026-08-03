@@ -270,12 +270,7 @@ namespace llaminar2
          * decode.  The packed request-state bank belongs exclusively to true
          * multi-request execution.
          */
-        return params_.seq_len > 1 &&
-               prefill_replay_params_set_ &&
-               prefill_bucket_seq_len_ == params_.seq_len &&
-               prefill_effective_seq_len_ > 0 &&
-               prefill_effective_seq_len_ < params_.seq_len &&
-               params_.request_count == 1 &&
+        return params_.seq_len > 1 && params_.request_count == 1 &&
                params_.request_seq_len == params_.seq_len &&
                params_.request_seq_lens_device != nullptr &&
                params_.kernel &&

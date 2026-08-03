@@ -87,6 +87,8 @@ namespace llaminar2::test
                         << "Failed to synchronize graph publication stream on "
                         << device_.to_string();
                 }
+                if (row_count_device_)
+                    backend_->free(row_count_device_, ordinal);
                 backend_->destroyStream(stream_, ordinal);
             }
 
@@ -97,10 +99,37 @@ namespace llaminar2::test
 
             [[nodiscard]] void *get() const { return stream_; }
 
+            /**
+             * @brief Publish a test row count to a real device-owned scalar.
+             *
+             * Graph-lowering tests inspect pointer identity but do not execute
+             * stages. Using backend-owned storage still exercises the same
+             * ownership contract as production without introducing fake GPU
+             * addresses into graph metadata.
+             */
+            [[nodiscard]] const int32_t *publishRowCount(int32_t value)
+            {
+                if (!device_.is_gpu() || !backend_ || !stream_)
+                    throw std::runtime_error("Device row-count publication requires a GPU stream");
+                const int ordinal = device_.toKernelDeviceIndex();
+                if (!row_count_device_)
+                    row_count_device_ = backend_->allocate(sizeof(value), ordinal);
+                if (!row_count_device_ ||
+                    !backend_->hostToDevice(
+                        row_count_device_, &value, sizeof(value), ordinal, stream_))
+                {
+                    throw std::runtime_error(
+                        "Failed to publish graph-test row count on " +
+                        device_.to_string());
+                }
+                return static_cast<const int32_t *>(row_count_device_);
+            }
+
         private:
             DeviceId device_;
             IBackend *backend_ = nullptr;
             void *stream_ = nullptr;
+            void *row_count_device_ = nullptr;
         };
 
         class ScopedDebugEnv
@@ -699,7 +728,7 @@ namespace llaminar2::test
         ASSERT_NE(expert_stage, nullptr);
         EXPECT_EQ(expert_stage->fixedTopologyPrefillExpertIdsForTesting(),
                   (std::vector<int>{0, 1, 2}));
-        EXPECT_TRUE(expert_node->stage->supportsWarmupDependentGraphCapture())
+        EXPECT_TRUE(expert_node->stage->supportsGraphCaptureAfterLaunchPreparation())
             << "Cold preflight must allow warmup to build MoE grouped-prefill capture resources";
         EXPECT_TRUE(expert_node->stage->supportsLazyPrefillGraphCapturePreflight())
             << "The fixed-topology grouped prefill path is the graph-capturable MoE dispatch contract";
@@ -762,7 +791,7 @@ namespace llaminar2::test
         EXPECT_EQ(reduce_stage->params().d_model, kDModel);
         EXPECT_EQ(reduce_stage->params().participant_device_index, 0);
         EXPECT_EQ(reduce_stage->params().root_device_index, 0);
-        EXPECT_TRUE(reduce_stage->supportsWarmupDependentGraphCapture());
+        EXPECT_TRUE(reduce_stage->supportsGraphCaptureAfterLaunchPreparation());
         EXPECT_TRUE(reduce_stage->supportsLazyPrefillGraphCapturePreflight())
             << "A cold LocalTP MoE graph must admit the allocation-free canonical "
                "route reducer so eager warmup can bind its backend kernel wrapper";
@@ -854,12 +883,16 @@ namespace llaminar2::test
                 weight_arena.fp32({kIntermediate, kDModel});
             layer.shared_expert_down =
                 weight_arena.fp32({kDModel, kIntermediate});
+            layer.shared_expert_gate_inp =
+                weight_arena.fp32({1, kDModel});
 
             TensorArena activation_arena;
             auto buffers = makeActivationBuffers(activation_arena);
 
             Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
             ScopedDevicePublicationStream publication_stream(device);
+            const int32_t *device_row_count =
+                publication_stream.publishRowCount(/*value=*/2);
             ComputeGraph graph = graph_builder.buildFFNGraph(
                 layer,
                 buffers,
@@ -867,9 +900,17 @@ namespace llaminar2::test
                 /*seq_len=*/2,
                 kBatchSize,
                 device,
-                publication_stream.get());
+                publication_stream.get(),
+                device_row_count);
 
-            ASSERT_NE(graph.getNode("layer0_moe_routing"), nullptr);
+            const auto *router_node = graph.getNode("layer0_moe_routing");
+            ASSERT_NE(router_node, nullptr);
+            const auto *router_stage =
+                dynamic_cast<const MoERoutingStage *>(router_node->stage.get());
+            ASSERT_NE(router_stage, nullptr);
+            EXPECT_EQ(
+                router_stage->activeRowCountDeviceForTesting(),
+                device_row_count);
             const auto *shared_node =
                 graph.getNode("layer0_shared_expert_ffn");
             ASSERT_NE(shared_node, nullptr);
@@ -884,6 +925,18 @@ namespace llaminar2::test
                 "layer0_shared_expert_ffn",
                 "layer0_moe_routing"))
                 << "The grouped shared verifier consumes the router's device Q8 publication";
+
+            const auto *shared_gate_node =
+                graph.getNode("layer0_shared_expert_gate");
+            ASSERT_NE(shared_gate_node, nullptr);
+            const auto *shared_gate_stage =
+                dynamic_cast<const SharedExpertGateStage *>(
+                    shared_gate_node->stage.get());
+            ASSERT_NE(shared_gate_stage, nullptr);
+            EXPECT_EQ(
+                shared_gate_stage->activeRowCountDeviceForTesting(),
+                device_row_count)
+                << "Routing and shared gating must capture the same device geometry owner.";
         }
     }
 

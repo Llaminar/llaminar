@@ -183,6 +183,9 @@ namespace llaminar2
          * @param stream Exact stream on which every graph-body launch is recorded.
          * @param record_graph_body Callback that records all graph work and
          *        returns true only when every required launch was accepted.
+         * @param dependency_ledger Optional frozen arena dependency plan. The
+         *        production prefill executor always supplies one; controller unit
+         *        tests without tensors may omit it.
          * @return true only when recording, capture closure, and graph
          *         instantiation all succeed. A false body result leaves the entry
          *         Cold and is never retried through eager execution.
@@ -191,7 +194,8 @@ namespace llaminar2
             const PrefillGraphCacheKey &key,
             IWorkerGPUContext *gpu_ctx,
             void *stream,
-            const std::function<bool()> &record_graph_body);
+            const std::function<bool()> &record_graph_body,
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr);
 
         /// Launch (replay) the cached graph.
         /// Returns false if not Ready or launch fails.

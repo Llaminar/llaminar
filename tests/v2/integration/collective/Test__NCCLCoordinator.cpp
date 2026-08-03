@@ -29,13 +29,53 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <future>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
 using namespace llaminar2;
+
+namespace
+{
+    /** @brief Restore one process environment variable after a policy test. */
+    class ScopedEnvironment final
+    {
+    public:
+        ScopedEnvironment(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *previous = std::getenv(name))
+                previous_ = previous;
+            installed_ =
+                ::setenv(name, value, /*overwrite=*/1) == 0;
+        }
+
+        ~ScopedEnvironment()
+        {
+            if (previous_)
+                (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+            else
+                (void)::unsetenv(name_.c_str());
+        }
+
+        ScopedEnvironment(const ScopedEnvironment &) = delete;
+        ScopedEnvironment &operator=(const ScopedEnvironment &) = delete;
+
+        /** @brief Return true when the requested value was installed. */
+        [[nodiscard]] bool installed() const noexcept { return installed_; }
+
+    private:
+        std::string name_;
+        std::optional<std::string> previous_;
+        bool installed_ = false;
+    };
+}
 
 // =============================================================================
 // Test Fixture
@@ -181,6 +221,29 @@ protected:
     std::vector<cudaStream_t> producer_streams_;
 };
 
+/**
+ * @brief Reject NCCL's event-injecting graph-mixing protocol before loading.
+ *
+ * CUDA WHILE/SWITCH bodies cannot contain event record/wait nodes. Llaminar's
+ * coordinator owns the complete explicit-stream ordering graph, so enabling a
+ * second NCCL ordering protocol is an invalid process configuration rather
+ * than a mode the runtime may tolerate.
+ */
+TEST_F(Test__NCCLCoordinator, RejectsNCCLGraphMixingProtocol)
+{
+    ScopedEnvironment graph_mixing(
+        "NCCL_GRAPH_MIXING_SUPPORT",
+        "1");
+    ASSERT_TRUE(graph_mixing.installed());
+
+    NCCLCoordinator coordinator;
+    EXPECT_FALSE(coordinator.initialize({0}));
+    EXPECT_NE(
+        coordinator.lastError().find("NCCL_GRAPH_MIXING_SUPPORT must be 0"),
+        std::string::npos);
+    EXPECT_FALSE(coordinator.isInitialized());
+}
+
 // =============================================================================
 // Initialization Tests
 // =============================================================================
@@ -204,6 +267,10 @@ TEST_F(Test__NCCLCoordinator, InitializeSingleGPU)
     EXPECT_TRUE(coord.isInitialized());
     EXPECT_EQ(coord.numDevices(), 1);
     EXPECT_EQ(coord.deviceOrdinal(0), 0);
+    ASSERT_NE(std::getenv("NCCL_GRAPH_MIXING_SUPPORT"), nullptr);
+    EXPECT_STREQ(std::getenv("NCCL_GRAPH_MIXING_SUPPORT"), "0")
+        << "Coordinator initialization must install the conditional-graph-safe "
+           "NCCL ordering policy before loading the library.";
 
     // Clean shutdown
     coord.shutdown();
@@ -237,6 +304,49 @@ TEST_F(Test__NCCLCoordinator, InitializeMultiGPU)
     }
 
     coord.shutdown();
+}
+
+/**
+ * @brief Reproduce fatal CUDAx2 teardown with every local NCCL rank active.
+ *
+ * NCCL communicator abort is an intra-node collective lifecycle operation:
+ * every active rank must enter it. The production failure callback previously
+ * called rank aborts serially, allowing rank zero to wait forever for rank one
+ * and preventing RankOrchestrator destruction. This regression keeps both
+ * communicator ranks live, requests one fatal abort transaction, and verifies
+ * that communicator invalidation plus coordinator join complete promptly.
+ */
+TEST_F(Test__NCCLCoordinator, AbortMultiGPUCliqueCompletesAndShutdownJoins)
+{
+    using namespace std::chrono_literals;
+
+    if (cuda_device_count_ < 2)
+    {
+        GTEST_SKIP() << "Need at least 2 CUDA devices for communicator-abort coverage";
+    }
+
+    NCCLCoordinator coord;
+    ASSERT_TRUE(coord.initialize({0, 1}))
+        << "Failed to initialize CUDAx2 communicator clique: "
+        << coord.lastError();
+    ASSERT_TRUE(coord.isInitialized());
+
+    const auto abort_start = std::chrono::steady_clock::now();
+    coord.abortCommunicators();
+    const auto abort_elapsed =
+        std::chrono::steady_clock::now() - abort_start;
+
+    EXPECT_FALSE(coord.isInitialized());
+    EXPECT_LT(abort_elapsed, 5s)
+        << "All local NCCL ranks must enter abort concurrently; a serial rank "
+           "abort can wait forever for a later rank.";
+
+    const auto shutdown_start = std::chrono::steady_clock::now();
+    coord.shutdown();
+    const auto shutdown_elapsed =
+        std::chrono::steady_clock::now() - shutdown_start;
+    EXPECT_LT(shutdown_elapsed, 5s)
+        << "Coordinator shutdown must join promptly after fatal communicator abort.";
 }
 
 TEST_F(Test__NCCLCoordinator, InitializeNonContiguousDevices)

@@ -390,23 +390,54 @@ namespace
      * @brief Execute one grouped publication entirely inside a HIP graph.
      *
      * The graph owns both payload publication and canonical device metadata
-     * advancement. No persistent host sequence-state copy participates.
+     * advancement. A positive @p logical_rows is staged into one persistent
+     * device scalar before capture and bound through the production padded-row
+     * API; no host sequence-state copy participates in graph execution.
      */
     bool appendGrouped(
         IKVCache &cache,
         const ITensor *k,
         const ITensor *v,
         int verifier_rows,
+        int logical_rows,
         void *opaque_stream)
     {
         const auto stream = static_cast<hipStream_t>(opaque_stream);
         if (!stream || !cache.isGraphCaptureReady())
             return false;
 
+        int32_t *device_logical_rows = nullptr;
+        if (logical_rows > 0)
+        {
+            if (logical_rows > verifier_rows ||
+                hipMalloc(&device_logical_rows, sizeof(int32_t)) != hipSuccess ||
+                hipMemcpyAsync(
+                    device_logical_rows,
+                    &logical_rows,
+                    sizeof(int32_t),
+                    hipMemcpyHostToDevice,
+                    stream) != hipSuccess ||
+                !cache.bindGraphAppendCountSource(
+                    0,
+                    0,
+                    device_logical_rows,
+                    verifier_rows,
+                    opaque_stream))
+            {
+                if (device_logical_rows)
+                    (void)hipFree(device_logical_rows);
+                return false;
+            }
+        }
+
         hipGraph_t graph = nullptr;
         hipGraphExec_t executable = nullptr;
         if (hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal) != hipSuccess)
+        {
+            if (device_logical_rows)
+                (void)hipFree(device_logical_rows);
             return false;
+        }
         bool append_ok = false;
         {
             GraphCaptureGuard guard;
@@ -418,12 +449,16 @@ namespace
         {
             if (graph)
                 (void)hipGraphDestroy(graph);
+            if (device_logical_rows)
+                (void)hipFree(device_logical_rows);
             return false;
         }
         if (hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != hipSuccess ||
             !executable)
         {
             (void)hipGraphDestroy(graph);
+            if (device_logical_rows)
+                (void)hipFree(device_logical_rows);
             return false;
         }
 
@@ -432,6 +467,13 @@ namespace
             hipStreamSynchronize(stream) == hipSuccess;
         (void)hipGraphExecDestroy(executable);
         (void)hipGraphDestroy(graph);
+        if (device_logical_rows)
+        {
+            const bool unbound = cache.bindGraphAppendCountSource(
+                0, 0, nullptr, verifier_rows, opaque_stream);
+            (void)hipFree(device_logical_rows);
+            return replay_ok && unbound;
+        }
         return replay_ok;
     }
 

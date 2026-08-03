@@ -307,15 +307,13 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Request abort of all pending collective operations.
+         * @brief Publish fatal cancellation without destroying graph-owned communicators.
          *
-         * Called when one device thread fails (e.g., graph capture error) and
-         * the other device may be blocked waiting for a matching RCCL call.
-         * This calls ncclCommAbort() on all communicators to force-unblock
-         * any pending operations, preventing deadlocks.
-         *
-         * After calling this, the LocalTPContext is NOT usable for further
-         * collectives. The process should exit soon after.
+         * The first caller closes collective admission and wakes every LocalTP
+         * rendezvous. NCCL/RCCL destruction is deliberately deferred to this
+         * context's destruction boundary because native graph executables may
+         * retain communicator references until their owning device runners are
+         * destroyed.
          */
         void requestAbort();
 
@@ -326,6 +324,17 @@ namespace llaminar2
         bool isAbortRequested() const { return abort_requested_.load(std::memory_order_acquire); }
 
     private:
+        /**
+         * @brief Abort the collective backend after all external graph owners are gone.
+         *
+         * `RankOrchestrator` declares its LocalTP context before its worker pool
+         * and device runners. C++ reverse member destruction therefore retires
+         * workers and native graph executables before this context is destroyed.
+         * Keeping the backend abort private makes the unsafe inverse ordering
+         * impossible through the public LocalTP interface.
+         */
+        void abortBackendAfterGraphOwnersReleased() noexcept;
+
         struct OnStreamCollectiveContract
         {
             bool initialized = false;

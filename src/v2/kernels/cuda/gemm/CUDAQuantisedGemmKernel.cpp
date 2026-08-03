@@ -2030,20 +2030,20 @@ namespace llaminar2
             }
 
             /*
-             * A direct tensor composition does not pass through stage
-             * coherence.  Join the input producer event on this exact stream
-             * before any raw device pointer is read.
+             * Tensor kernels never own placement. The graph executor or a
+             * direct-kernel harness prepares storage first; this boundary only
+             * validates exact residency and joins the producer event.
              */
             const DeviceId target_device = DeviceId::cuda(cuda_device_id_);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(A),
                 target_device,
                 execution_stream);
             if (beta != 0.0f)
-                TransferEngine::prepareDeviceInput(
+                TransferEngine::requireDeviceInput(
                     C, target_device, execution_stream);
             else
-                TransferEngine::prepareDeviceOutput(
+                TransferEngine::requireDeviceOutput(
                     C, target_device, execution_stream);
 
             // Type dispatch based on A and C types
@@ -2293,7 +2293,7 @@ namespace llaminar2
             DeviceId target_device = DeviceId::cuda(cuda_device_id_);
 
             // Step 1: join the input producer to this exact fused stream.
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(input),
                 target_device,
                 execution_stream);
@@ -2425,7 +2425,7 @@ namespace llaminar2
                                       << " but CUDA:" << cuda_device_id_ << " is required");
                             return false;
                         }
-                        TransferEngine::prepareDeviceInput(
+                        TransferEngine::requireDeviceInput(
                             fp32_bias, target_device, execution_stream);
                         d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
                     }
@@ -2792,7 +2792,7 @@ namespace llaminar2
                                 " bias is resident on " + current_dev->to_string() +
                                 " instead of CUDA:" + std::to_string(cuda_device_id_));
                         }
-                        TransferEngine::prepareDeviceInput(
+                        TransferEngine::requireDeviceInput(
                             fp32_bias,
                             target_device,
                             pool.streams[stream_idx]);
@@ -2957,7 +2957,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    TransferEngine::prepareDeviceInput(
+                    TransferEngine::requireDeviceInput(
                         fp32_bias, target_device, execution_stream);
                     d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
 
@@ -3369,19 +3369,19 @@ namespace llaminar2
                 return false;
             }
             const DeviceId target_device = DeviceId::cuda(cuda_device_id_);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(gate),
                 target_device,
                 execution_stream);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(up),
                 target_device,
                 execution_stream);
             if (beta != 0.0f)
-                TransferEngine::prepareDeviceInput(
+                TransferEngine::requireDeviceInput(
                     output, target_device, execution_stream);
             else
-                TransferEngine::prepareDeviceOutput(
+                TransferEngine::requireDeviceOutput(
                     output, target_device, execution_stream);
 
             // Get device pointers (tensors must already be on GPU via DeviceGraphExecutor coherence)

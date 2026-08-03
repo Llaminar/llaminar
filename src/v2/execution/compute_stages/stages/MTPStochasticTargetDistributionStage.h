@@ -60,6 +60,16 @@ namespace llaminar2
             int vocab_size = 0;
             int logits_row_stride = 0;
 
+            /**
+             * Device-owned logical prefix of the physical row allocation.
+             *
+             * A null pointer means every captured row is active. Device-loop
+             * graphs bind the verifier request-length scalar here so one
+             * maximum-capacity capture can skip its inactive suffix without a
+             * host read or changing launch geometry.
+             */
+            const int32_t *active_rows_device = nullptr;
+
             bool apply_penalties = false;
             const int32_t *verifier_input_tokens_device = nullptr;
             const int32_t *generated_token_counts_device = nullptr;

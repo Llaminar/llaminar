@@ -604,13 +604,17 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Request abort of all pending collective operations.
+         * @brief Publish fatal cancellation to every LocalTP participant.
          *
-         * Called when one device thread fails and others may be stuck in
-         * collective calls waiting for matching operations. Forcefully
-         * tears down communicators to unblock pending operations.
+         * This operation closes collective admission and wakes host-side
+         * rendezvous waiters, but it must not destroy NCCL/RCCL communicators.
+         * Captured CUDA/HIP graphs retain communicator references, so the
+         * enclosing graph owner must unwind those graph executables before the
+         * LocalTP context reaches its communicator-abort destruction boundary.
          *
-         * After calling this, the context is NOT usable for further collectives.
+         * After calling this, the context is not usable for further
+         * collectives. The request is idempotent and may be published by any
+         * participant that observes the fatal failure first.
          */
         virtual void requestAbort() = 0;
 

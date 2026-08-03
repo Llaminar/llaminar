@@ -650,6 +650,7 @@ namespace llaminar2
 
     LocalTPContext::~LocalTPContext()
     {
+        abortBackendAfterGraphOwnersReleased();
         releaseGraphCaptureBoundaryDeviceWords();
         releaseFp16ScratchBuffers();
 
@@ -675,17 +676,17 @@ namespace llaminar2
 
     void LocalTPContext::requestAbort()
     {
-        // Set the flag first so other threads see it immediately
-        bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
+        const bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
         if (was_set)
         {
-            LOG_WARN("[LocalTPContext] requestAbort() called but abort already in progress");
+            LOG_TRACE("[LocalTPContext] Fatal cancellation was already published");
             return;
         }
 
-        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices"
-                 << " context_id=" << context_id_
-                 << " context=" << static_cast<const void *>(this));
+        LOG_ERROR("[LocalTPContext] Fatal cancellation published; communicator abort is deferred "
+                  "until native graph owners are released"
+                  << " context_id=" << context_id_
+                  << " context=" << static_cast<const void *>(this));
 
         if (debugEnv().tp_collective_contract_trace)
         {
@@ -706,14 +707,31 @@ namespace llaminar2
             }
         }
 
-        if (backend_impl_)
-        {
-            backend_impl_->abort();
-        }
-
-        // Wake any threads blocked on the barrier condition variable
+        /*
+         * Wake every host rendezvous immediately. The owner now unwinds the
+         * participant runners; LocalTPContext destruction performs the actual
+         * communicator abort only after those graph owners have disappeared.
+         */
         barrier_cv_.notify_all();
         grouped_onstream_allreduce_cv_.notify_all();
+        graph_capture_boundary_cv_.notify_all();
+    }
+
+    void LocalTPContext::abortBackendAfterGraphOwnersReleased() noexcept
+    {
+        if (!abort_requested_.load(std::memory_order_acquire) ||
+            !backend_initialized_ ||
+            !backend_impl_)
+        {
+            return;
+        }
+
+        LOG_ERROR("[LocalTPContext] Native graph owners released; aborting collective backend"
+                  << " context_id=" << context_id_
+                  << " context=" << static_cast<const void *>(this)
+                  << " backend=" << collectiveBackendTypeToString(backend_));
+        backend_impl_->abort();
+        backend_initialized_ = false;
     }
 
     const std::vector<GlobalDeviceAddress> &LocalTPContext::devices() const

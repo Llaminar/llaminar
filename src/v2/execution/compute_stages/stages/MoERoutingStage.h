@@ -99,16 +99,28 @@ namespace llaminar2
             int device_rebalance_apply_layer_idx = -2;
 
             /**
-             * @brief Replay verifier rows through the normal one-token route path.
+             * @brief Select grouped serial-decode-equivalent verifier routing.
              *
-             * MTP all-position verifier batches produce several candidate rows at
-             * once.  The row we later publish must behave exactly as if decode
-             * had processed that token by itself.  Some backend router kernels
-             * choose different math for tiny prefill batches than for M=1 decode,
-             * so this flag asks the stage to split the batch internally and route
-             * each row with seq_len=1 before scattering the rows back.
+             * MTP all-position verifier batches produce several candidate rows
+             * at once.  GPU backends execute those rows as one economical
+             * grouped launch whose per-row K traversal and reduction order are
+             * byte-equivalent to M=1 decode.  This flag never permits production
+             * row replay; it selects the dedicated grouped verifier contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+
+            /**
+             * @brief Device-owned logical row count for every variable-row GPU graph.
+             *
+             * Bucketed prefill and grouped verification both launch a stable
+             * physical M while only a leading prefix belongs to the current
+             * request. The graph captures this model-lifetime address, whose
+             * value is published by request admission or verifier preparation
+             * on the graph's producer stream. Backends invalidate every suffix
+             * route directly from this scalar, so no host replay parameter or
+             * scalar upload can influence captured topology.
+             */
+            const int32_t *active_row_count_device = nullptr;
 
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
@@ -120,8 +132,6 @@ namespace llaminar2
         };
 
         explicit MoERoutingStage(Params params);
-        ~MoERoutingStage() override;
-
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_ROUTER; }
         std::string name() const override { return "moe_router"; }
@@ -131,7 +141,7 @@ namespace llaminar2
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
         /**
          * @brief Describe every routing graph-capture admission predicate.
          *
@@ -144,21 +154,12 @@ namespace llaminar2
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;
-        bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
-        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            /*
-             * `seq_len > 1` alone does not imply padded prefill. Grouped MTP
-             * verifier graphs deliberately route several serial-equivalent
-             * rows in one captured invocation and never publish a host-owned
-             * effective-length scalar. Only updatePrefillReplayParams() arms
-             * that mutable prefill contract, so only an armed stage requires
-             * launcher work before capture and replay.
-             */
-            return hasPrefillReplayParams() && prefill_replay_params_set_
-                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+            return params_.device_id.is_gpu() &&
+                           supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
                        : GraphLaunchPreparationPolicy::None;
         }
         bool supportsBackend(ComputeBackendType backend) const override;
@@ -177,12 +178,11 @@ namespace llaminar2
          */
         void resetSessionState() override;
         /**
-         * @brief Clear routing mirrors while preserving captured MoE replay slots.
+         * @brief Clear routing diagnostics while preserving captured MoE state.
          *
-         * Padded prefill replay refreshes the effective-length scalar before
-         * graph launch and records histogram boundaries after replay. Keeping
-         * the workspace-backed scalar and runtime table identity alive is
-         * required for Ready prefill graphs preserved across clear_cache().
+         * Variable row counts are owned by the request-geometry allocation and
+         * are not stage-local replay metadata. This hook therefore preserves
+         * only immutable launch state and backend descriptor identity.
          */
         void resetSessionStatePreservingCapturedReplay() override;
         /**
@@ -222,9 +222,13 @@ namespace llaminar2
             return params_.routed_row_execution_policy;
         }
 
-    private:
-        struct GpuEffectiveSeqLenState;
+        /** @brief Expose the captured device row-count owner to graph tests. */
+        const int32_t *activeRowCountDeviceForTesting() const noexcept
+        {
+            return params_.active_row_count_device;
+        }
 
+    private:
         Params params_;
 
         /// Stashed routing results for snapshot capture
@@ -233,10 +237,12 @@ namespace llaminar2
         mutable std::vector<float> router_logits_;
 
         /**
-         * @brief Stage-owned MoE kernel and optional non-owning test override.
+         * @brief Graph-local MoE kernel and optional non-owning test override.
          *
-         * The backend object contains mutable launch state and therefore must
-         * never be shared across separately captured graph stages.
+         * A router may share this owner only with its paired routed-expert
+         * consumer so the captured producer/consumer chain can reuse the same
+         * Q8 hidden publication. Separately captured main, verifier, and
+         * maintenance graphs always own distinct backend objects.
          */
         mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
@@ -245,12 +251,10 @@ namespace llaminar2
         /// Pre-allocated routing result (avoids heap allocs per decode token)
         mutable MoERoutingResult cached_routing_;
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
-        int prefill_effective_seq_len_ = 0;
-        int prefill_bucket_seq_len_ = 0;
-        bool prefill_replay_params_set_ = false;
-        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
 
         IMoEKernel *ensureMoEKernel() const;
+        /** @brief Classify the production arithmetic route prepared for capture. */
+        MoERouteLaunchKind routeLaunchKind() const noexcept;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool isDeviceRoutedPrefillExecutionSupported() const;
         bool isDeviceRoutedPrefillGraphCaptureSupported() const;
@@ -260,11 +264,6 @@ namespace llaminar2
         bool isDecodeEquivalentVerifierPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
-        int effectivePrefillSeqLen() const;
-        void refreshPinnedEffectiveSeqLen();
-        bool ensureGpuEffectiveSeqLenStateInitialized();
-        bool uploadGpuEffectiveSeqLen();
-        void releaseGpuEffectiveSeqLenState();
         void recordRuntimeHistogramTokenBoundary() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,

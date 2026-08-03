@@ -1,3 +1,14 @@
+/**
+ * @file IGPUGraphCapture.h
+ * @brief Backend-neutral ownership and composition API for native GPU graphs.
+ *
+ * The interface exposes graph lifecycle operations together with the small set
+ * of native conditional compositions used by fully device-owned generation.
+ * Conditional predicates and selectors always name persistent device rows;
+ * implementations may not materialize those values on the host, insert host
+ * callbacks, synchronize a stream, or allocate replay-time storage.
+ */
+
 #pragma once
 
 #include <cstddef>
@@ -7,6 +18,8 @@
 
 namespace llaminar2
 {
+
+    class IGPUGraphCapture;
 
     /// Result of an in-place graph executable update
     enum class GraphUpdateResult
@@ -49,6 +62,78 @@ namespace llaminar2
                    complete_index >= 0 &&
                    complete_index < control_stride;
         }
+    };
+
+    /**
+     * @brief Device-resident selector and fatal validation policy for a loop switch.
+     *
+     * A single native SWITCH node controls one uniformly shaped request batch.
+     * Every healthy, incomplete request must publish the same selector. Values
+     * outside `[minimum_selector, maximum_selector]`, or disagreement between
+     * active rows, invalidate all active rows before any branch executes. The
+     * selected branch index is the selector value itself, keeping the control
+     * ABI visible and avoiding a second host-authored lookup table.
+     */
+    struct DeviceControlledLoopSwitch
+    {
+        int *control_rows_device = nullptr; ///< Mutable first word of row zero.
+        int control_stride = 0;             ///< Controller words between rows.
+        int request_count = 0;              ///< Uniformly switched request rows.
+        int healthy_index = -1;             ///< Non-zero means the row is valid.
+        int complete_index = -1;            ///< Non-zero means the row is terminal.
+        int selector_index = -1;            ///< Branch index published by the device.
+        int error_index = -1;                ///< Fatal diagnostic word to publish.
+        int minimum_selector = 0;            ///< First implemented branch index.
+        int maximum_selector = -1;           ///< Last implemented branch index.
+        int invalid_selector_error = 0;      ///< Non-zero stable terminal error code.
+
+        /**
+         * @brief Validate scalar layout independently of the branch table.
+         */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return control_rows_device != nullptr && control_stride > 0 &&
+                   request_count > 0 && healthy_index >= 0 &&
+                   healthy_index < control_stride && complete_index >= 0 &&
+                   complete_index < control_stride && selector_index >= 0 &&
+                   selector_index < control_stride && error_index >= 0 &&
+                   error_index < control_stride && minimum_selector >= 0 &&
+                   maximum_selector >= minimum_selector &&
+                   invalid_selector_error != 0;
+        }
+    };
+
+    /**
+     * @brief One named native-graph fragment in a device-controlled transaction.
+     *
+     * The semantic name is part of the composition contract rather than an
+     * incidental log string. Native conditional APIs impose stricter recursive
+     * node rules than ordinary graph replay, so a rejected fragment must identify
+     * the exact producer role that exported an incompatible graph. The name and
+     * capture are borrowed only for the duration of parent construction.
+     */
+    struct DeviceControlledLoopFragment
+    {
+        const char *name = nullptr;                  ///< Stable non-empty producer role.
+        const IGPUGraphCapture *capture = nullptr;   ///< Borrowed captured graph owner.
+
+        /** @brief Verify that the fragment carries complete diagnostic identity. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return name != nullptr && name[0] != '\0' && capture != nullptr;
+        }
+    };
+
+    /**
+     * @brief One complete transaction body selected by a device control value.
+     *
+     * Fragments are cloned in producer-to-consumer order. A branch inside the
+     * declared selector interval must be non-empty: accepting a selector and
+     * executing no transaction would leave the outer WHILE spinning forever.
+     */
+    struct DeviceControlledLoopBranch
+    {
+        std::span<const DeviceControlledLoopFragment> ordered_fragments;
     };
 
     /// Abstract interface for GPU graph capture and replay.
@@ -111,30 +196,46 @@ namespace llaminar2
         }
 
         /**
+         * @brief Report support for a device-selected transaction inside WHILE.
+         *
+         * This is stronger than @ref supportsDeviceControlledWhileLoop: the
+         * backend must support a nested native SWITCH whose selector is updated
+         * by a device kernel on every loop iteration.
+         */
+        [[nodiscard]] virtual bool supportsDeviceControlledSwitchWhileLoop() const noexcept
+        {
+            return false;
+        }
+
+        /**
          * @brief Replace this graph with a device-controlled repetition of captured fragments.
          *
          * The implementation clones every element of @p ordered_body_fragments
          * into one conditional WHILE body, adds an explicit dependency from each
          * fragment to its successor, and appends the device predicate update
-         * after the final fragment. The first iteration is admitted by request
-         * admission; subsequent iterations are controlled exclusively by
-         * @p predicate. No D2H copy, host callback, allocation, or stream
-         * synchronization is permitted in the generated graph.
+         * after the final fragment. Backend-native composers may lower internal
+         * multi-stream event handoffs to equivalent direct dependency edges when
+         * conditional bodies do not admit event nodes. A root wait or terminal
+         * record crosses the fragment boundary and must remain a hard error. The
+         * first iteration is admitted by request admission; subsequent iterations
+         * are controlled exclusively by @p predicate. No D2H copy, host callback,
+         * allocation, or stream synchronization is permitted in the generated
+         * graph.
          *
          * On success the graph is built but not instantiated.  The caller must
          * call instantiate() exactly as it would after endCapture().
          *
-         * @param ordered_body_fragments Captured, non-empty transaction fragments
-         *        in producer-to-consumer order. Every pointer must remain valid
-         *        through this call and must identify the same backend/device
-         *        context as this graph owner. Source captures may own different
-         *        streams: child-graph cloning discards launch-stream identity,
-         *        and the parent dependencies establish transaction ordering.
+         * @param ordered_body_fragments Named, captured, non-empty transaction
+         *        fragments in producer-to-consumer order. Every capture pointer
+         *        must remain valid through this call and identify the same
+         *        backend/device context as this graph owner. Source captures may
+         *        own different streams: child-graph cloning discards launch-stream
+         *        identity, and parent dependencies establish transaction ordering.
          * @param predicate Persistent device controller binding.
          * @return true when this object owns a complete loop graph.
          */
         virtual bool buildDeviceControlledWhileLoop(
-            std::span<const IGPUGraphCapture *const> ordered_body_fragments,
+            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
             const DeviceControlledLoopPredicate &predicate)
         {
             (void)ordered_body_fragments;
@@ -153,8 +254,41 @@ namespace llaminar2
             const IGPUGraphCapture &body,
             const DeviceControlledLoopPredicate &predicate)
         {
-            const IGPUGraphCapture *fragments[] = {&body};
+            const DeviceControlledLoopFragment fragments[] = {{
+                .name = "complete transaction",
+                .capture = &body,
+            }};
             return buildDeviceControlledWhileLoop(fragments, predicate);
+        }
+
+        /**
+         * @brief Replace this graph with a device-controlled WHILE of SWITCH bodies.
+         *
+         * The implementation first evaluates @p predicate to decide whether the
+         * loop may begin. Each iteration validates @p switch_policy on device,
+         * executes exactly one complete branch, then reevaluates @p predicate.
+         * Invalid or divergent selectors execute no branch and make the request
+         * terminally unhealthy. No partial common tail is permitted outside the
+         * branches because it could mutate state after selector validation failed.
+         *
+         * Branch array index is the device selector value. Entries outside the
+         * declared selector interval may be empty; every entry inside it must own
+         * at least one valid captured fragment.
+         *
+         * @param branches Complete transaction bodies indexed by selector value.
+         * @param predicate Device-owned loop continuation policy.
+         * @param switch_policy Device-owned selector and fatal validation policy.
+         * @return true when this object owns a built, uninstantiated parent graph.
+         */
+        virtual bool buildDeviceControlledSwitchWhileLoop(
+            std::span<const DeviceControlledLoopBranch> branches,
+            const DeviceControlledLoopPredicate &predicate,
+            const DeviceControlledLoopSwitch &switch_policy)
+        {
+            (void)branches;
+            (void)predicate;
+            (void)switch_policy;
+            return false;
         }
 
         /**

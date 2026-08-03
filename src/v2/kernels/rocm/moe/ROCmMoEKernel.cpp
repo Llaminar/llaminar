@@ -372,7 +372,7 @@ namespace
             groupedDecodeTags(source, active_slots, d_model, intermediate, route));
     }
 
-    bool ensureTensorOnDevice(llaminar2::ITensor *tensor,
+    bool requireTensorOnDevice(llaminar2::ITensor *tensor,
                               llaminar2::DeviceId device,
                               void *stream,
                               const char *name,
@@ -386,14 +386,14 @@ namespace
         }
 
         (void)context;
-        llaminar2::TransferEngine::prepareDeviceInput(
+        llaminar2::TransferEngine::requireDeviceInput(
             tensor,
             device,
             stream);
         return true;
     }
 
-    bool ensureOutputOnDevice(llaminar2::ITensor *tensor,
+    bool requireOutputOnDevice(llaminar2::ITensor *tensor,
                               llaminar2::DeviceId device,
                               void *stream,
                               const char *name,
@@ -407,7 +407,7 @@ namespace
         }
 
         (void)context;
-        llaminar2::TransferEngine::prepareDeviceOutput(
+        llaminar2::TransferEngine::requireDeviceOutput(
             tensor,
             device,
             stream);
@@ -976,6 +976,7 @@ extern "C"
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
         const int32_t *absolute_position_ids,
+        const int32_t *active_row_count,
         int device_idx, void *stream);
 
     bool hipMoE_plan_prefill_routes_least_loaded_current_batch(
@@ -3813,11 +3814,151 @@ namespace llaminar2
                                     "ROCmMoEKernel::routeWithTensorsEffectiveSeqLen");
     }
 
+    bool ROCmMoEKernel::prepareRouteLaunch(
+        ITensor *gate_weights,
+        const MoERouteLaunchPlan &plan)
+    {
+        constexpr const char *kContext = "ROCmMoEKernel::prepareRouteLaunch";
+        if (!setMoEDevice(device_ordinal_, kContext))
+            return false;
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[" << kContext << "] explicit HIP stream is required");
+            return false;
+        }
+        if (!plan.valid() ||
+            (plan.kind == MoERouteLaunchKind::RuntimeDecode &&
+             plan.physical_rows != 1))
+        {
+            LOG_ERROR("[" << kContext << "] invalid route launch plan"
+                      << " kind=" << static_cast<int>(plan.kind)
+                      << " rows=" << plan.physical_rows
+                      << " d_model=" << plan.d_model
+                      << " num_experts=" << plan.num_experts
+                      << " top_k=" << plan.top_k);
+            return false;
+        }
+
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!requireTensorOnDevice(
+                gate_weights,
+                device,
+                stream,
+                "gate_weights",
+                kContext))
+        {
+            return false;
+        }
+        if (gate_weights->native_type() != TensorType::FP32 &&
+            gate_weights->native_type() != TensorType::BF16)
+        {
+            LOG_ERROR("[" << kContext << "] router gate must be FP32 or BF16, got "
+                      << tensorTypeName(gate_weights->native_type()));
+            return false;
+        }
+
+        const size_t required_gate =
+            static_cast<size_t>(plan.num_experts) *
+            static_cast<size_t>(plan.d_model);
+        if (gate_weights->numel() < required_gate ||
+            !gate_weights->gpu_data_ptr())
+        {
+            LOG_ERROR("[" << kContext << "] router gate capacity or device pointer is invalid"
+                      << " elements=" << gate_weights->numel()
+                      << "/" << required_gate
+                      << " device_ptr=" << gate_weights->gpu_data_ptr());
+            return false;
+        }
+
+        const size_t logits_count =
+            static_cast<size_t>(plan.physical_rows) *
+            static_cast<size_t>(plan.num_experts);
+        const size_t topk_count =
+            static_cast<size_t>(plan.physical_rows) *
+            static_cast<size_t>(plan.top_k);
+        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        {
+            LOG_ERROR("[" << kContext << "] failed to bind persistent route scratch");
+            return false;
+        }
+
+        if (gate_weights->native_type() != TensorType::FP32)
+            return true;
+
+        const auto &rocm_env = debugEnv().rocm;
+        if (plan.kind == MoERouteLaunchKind::DecodeEquivalentVerifier &&
+            rocm_env.moe_router_kpart_decode)
+        {
+            LOG_ERROR("[" << kContext << "] decode-equivalent verifier routing "
+                      "cannot be prepared while k-part decode routing is selected");
+            return false;
+        }
+
+        const auto *gate_device =
+            static_cast<const float *>(gate_weights->gpu_data_ptr());
+        if (rocm_env.moe_router_q8)
+        {
+            if ((plan.d_model % 32) != 0)
+            {
+                LOG_ERROR("[" << kContext << "] Q8 routing requires d_model "
+                          "to be a multiple of 32, got " << plan.d_model);
+                return false;
+            }
+            if (!ensureRouterQ8HiddenScratchCapacity(
+                    plan.physical_rows,
+                    plan.d_model))
+            {
+                LOG_ERROR("[" << kContext << "] failed to bind persistent Q8 hidden-row scratch");
+                return false;
+            }
+            if (!getOrCreateQ8RouterGateCache(
+                    gate_device,
+                    plan.d_model,
+                    plan.num_experts))
+            {
+                LOG_ERROR("[" << kContext << "] failed to publish immutable Q8 router gate");
+                return false;
+            }
+            return true;
+        }
+
+        if (plan.kind == MoERouteLaunchKind::RuntimeDecode &&
+            rocm_env.moe_router_kpart_decode)
+        {
+            if (rocm_env.moe_router_kparts <= 0 ||
+                !ensureRouteLogitsPartialsCapacity(
+                    static_cast<size_t>(plan.num_experts) *
+                    static_cast<size_t>(rocm_env.moe_router_kparts)))
+            {
+                LOG_ERROR("[" << kContext << "] failed to bind persistent k-part route scratch");
+                return false;
+            }
+            return true;
+        }
+
+        const bool fp16_cache_is_consumed =
+            rocm_env.moe_router_fp16 &&
+            (plan.kind != MoERouteLaunchKind::GroupedPrefill ||
+             plan.physical_rows > 1);
+        if (fp16_cache_is_consumed &&
+            !getOrCreateFP16RouterGateCache(
+                gate_device,
+                plan.d_model,
+                plan.num_experts))
+        {
+            LOG_ERROR("[" << kContext << "] failed to publish immutable FP16 router gate");
+            return false;
+        }
+        return true;
+    }
+
     bool ROCmMoEKernel::routeVerifierRowsDecodeEquivalent(
         ITensor *hidden, ITensor *gate_weights,
         int seq_len, int d_model, int num_experts, int top_k,
         bool normalize_weights,
-        ITensor *output_indices, ITensor *output_weights)
+        ITensor *output_indices, ITensor *output_weights,
+        const int *device_effective_seq_len)
     {
         constexpr const char *kContext = "ROCmMoEKernel::routeVerifierRowsDecodeEquivalent";
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
@@ -3842,10 +3983,10 @@ namespace llaminar2
         }
 
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(hidden, device, stream, "hidden", kContext) ||
-            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights", kContext) ||
-            !ensureOutputOnDevice(output_indices, device, stream, "output_indices", kContext) ||
-            !ensureOutputOnDevice(output_weights, device, stream, "output_weights", kContext))
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden", kContext) ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights", kContext) ||
+            !requireOutputOnDevice(output_indices, device, stream, "output_indices", kContext) ||
+            !requireOutputOnDevice(output_weights, device, stream, "output_weights", kContext))
         {
             return false;
         }
@@ -3952,7 +4093,8 @@ namespace llaminar2
                     d_model,
                     num_experts,
                     device_ordinal_,
-                    getStream()))
+                    getStream(),
+                    device_effective_seq_len))
             {
                 LOG_ERROR("[" << kContext << "] grouped Q8 verifier logits failed");
                 return false;
@@ -3982,7 +4124,8 @@ namespace llaminar2
                         d_model,
                         num_experts,
                         device_ordinal_,
-                        getStream()))
+                        getStream(),
+                        device_effective_seq_len))
                 {
                     LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
                     return false;
@@ -3998,7 +4141,7 @@ namespace llaminar2
                          num_experts,
                          device_ordinal_,
                          getStream(),
-                         nullptr))
+                         device_effective_seq_len))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP32 verifier logits failed");
                 return false;
@@ -4014,7 +4157,8 @@ namespace llaminar2
                     d_model,
                     num_experts,
                     device_ordinal_,
-                    getStream()))
+                    getStream(),
+                    device_effective_seq_len))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
                 return false;
@@ -4031,7 +4175,8 @@ namespace llaminar2
                     d_model,
                     num_experts,
                     device_ordinal_,
-                    getStream()))
+                    getStream(),
+                    device_effective_seq_len))
             {
                 LOG_ERROR("[" << kContext << "] grouped BF16 verifier logits failed");
                 return false;
@@ -4053,7 +4198,8 @@ namespace llaminar2
                 top_k,
                 normalize_weights,
                 device_ordinal_,
-                getStream()))
+                getStream(),
+                device_effective_seq_len))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
             return false;
@@ -4418,8 +4564,8 @@ namespace llaminar2
         }
 
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(hidden, device, getStream(), "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
-            !ensureTensorOnDevice(gate_weights, device, getStream(), "gate_weights", "decodeRouteSelectWithReadyRebalanceApply"))
+        if (!requireTensorOnDevice(hidden, device, getStream(), "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
+            !requireTensorOnDevice(gate_weights, device, getStream(), "gate_weights", "decodeRouteSelectWithReadyRebalanceApply"))
         {
             return false;
         }
@@ -4446,8 +4592,8 @@ namespace llaminar2
         if (write_legacy_outputs)
         {
             if (!output_indices || !output_weights ||
-                !ensureOutputOnDevice(output_indices, device, getStream(), "output_indices", "decodeRouteSelectWithReadyRebalanceApply") ||
-                !ensureOutputOnDevice(output_weights, device, getStream(), "output_weights", "decodeRouteSelectWithReadyRebalanceApply"))
+                !requireOutputOnDevice(output_indices, device, getStream(), "output_indices", "decodeRouteSelectWithReadyRebalanceApply") ||
+                !requireOutputOnDevice(output_weights, device, getStream(), "output_weights", "decodeRouteSelectWithReadyRebalanceApply"))
             {
                 return false;
             }
@@ -5478,8 +5624,8 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(source, device, stream, "source", "copyTokenRowFromTensor") ||
-            !ensureOutputOnDevice(row_buffer, device, stream, "row_buffer", "copyTokenRowFromTensor"))
+        if (!requireTensorOnDevice(source, device, stream, "source", "copyTokenRowFromTensor") ||
+            !requireOutputOnDevice(row_buffer, device, stream, "row_buffer", "copyTokenRowFromTensor"))
         {
             return false;
         }
@@ -5561,8 +5707,8 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureOutputOnDevice(destination, device, stream, "destination", "writeTokenRowToTensor") ||
-            !ensureTensorOnDevice(row_buffer, device, stream, "row_buffer", "writeTokenRowToTensor"))
+        if (!requireOutputOnDevice(destination, device, stream, "destination", "writeTokenRowToTensor") ||
+            !requireTensorOnDevice(row_buffer, device, stream, "row_buffer", "writeTokenRowToTensor"))
         {
             return false;
         }
@@ -5585,9 +5731,9 @@ namespace llaminar2
 
         void *stream = getStream();
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensors") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensors") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensors"))
+        if (!requireTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensors") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensors") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensors"))
             return;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -5621,9 +5767,9 @@ namespace llaminar2
 
         void *stream = getStream();
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensorsEffectiveSeqLen"))
+        if (!requireTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensorsEffectiveSeqLen"))
             return false;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -5668,11 +5814,11 @@ namespace llaminar2
 
         void *stream = getStream();
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateAddFromTensors") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensors") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensors") ||
-            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensors") ||
-            !ensureTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensors"))
+        if (!requireTensorOnDevice(input, device, stream, "input", "sharedExpertGateAddFromTensors") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensors") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensors") ||
+            !requireTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensors") ||
+            !requireTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensors"))
             return;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -5715,11 +5861,11 @@ namespace llaminar2
 
         void *stream = getStream();
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
-            !ensureTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
+        if (!requireTensorOnDevice(input, device, stream, "input", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !requireTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
             return false;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -6285,7 +6431,7 @@ namespace llaminar2
             return false;
         if (!capture_active)
         {
-            if (!ensureTensorOnDevice(
+            if (!requireTensorOnDevice(
                     const_cast<TensorBase *>(input),
                     DeviceId::rocm(device_ordinal_),
                     getStream(),
@@ -6403,7 +6549,7 @@ namespace llaminar2
             return false;
         if (!capture_active)
         {
-            if (!ensureTensorOnDevice(
+            if (!requireTensorOnDevice(
                     const_cast<TensorBase *>(input),
                     DeviceId::rocm(device_ordinal_),
                     getStream(),
@@ -6415,7 +6561,7 @@ namespace llaminar2
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         if (!d_routing_indices &&
-            !ensureTensorOnDevice(routing_indices, device, getStream(),
+            !requireTensorOnDevice(routing_indices, device, getStream(),
                                   "routing_indices", "groupedExpertGateUpDecodeFromRouting"))
         {
             return false;
@@ -6431,9 +6577,9 @@ namespace llaminar2
         host_grouped_up_output_ptrs_.assign(static_cast<size_t>(top_k), nullptr);
         for (int i = 0; i < top_k; ++i)
         {
-            if (!ensureOutputOnDevice(gate_outputs[i], device, getStream(),
+            if (!requireOutputOnDevice(gate_outputs[i], device, getStream(),
                                       "gate_output", "groupedExpertGateUpDecodeFromRouting") ||
-                !ensureOutputOnDevice(up_outputs[i], device, getStream(),
+                !requireOutputOnDevice(up_outputs[i], device, getStream(),
                                       "up_output", "groupedExpertGateUpDecodeFromRouting"))
             {
                 return false;
@@ -6620,7 +6766,7 @@ namespace llaminar2
             return false;
         if (!capture_active)
         {
-            if (!ensureTensorOnDevice(
+            if (!requireTensorOnDevice(
                     const_cast<TensorBase *>(input),
                     DeviceId::rocm(device_ordinal_),
                     getStream(),
@@ -6810,7 +6956,7 @@ namespace llaminar2
             return false;
         }
         if (!device_routing_indices &&
-            !ensureTensorOnDevice(
+            !requireTensorOnDevice(
                 routing_indices,
                 device,
                 stream,
@@ -6820,7 +6966,7 @@ namespace llaminar2
             return false;
         }
         if (!device_routing_weights &&
-            !ensureTensorOnDevice(
+            !requireTensorOnDevice(
                 routing_weights,
                 device,
                 stream,
@@ -6882,6 +7028,247 @@ namespace llaminar2
             /*allow_router_q8_reuse=*/false,
             "routing",
             canonical_route_contributions);
+    }
+
+    bool ROCmMoEKernel::prepareGroupedRuntimeDecodeLaunchState(
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        int d_model,
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
+    {
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Runtime grouped-decode preparation "
+                      "requires the exact non-null producer stream");
+            return false;
+        }
+        if (isDecodeGraphCaptureActive())
+        {
+            LOG_ERROR("[ROCmMoEKernel] Runtime grouped-decode launch state must "
+                      "be prepared before graph capture begins");
+            return false;
+        }
+        if (gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
+            top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            d_model <= 0 || intermediate <= 0 ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0 ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (!gateup_table.valid || !gateup_table.device_gate_descs ||
+            !gateup_table.device_up_descs || !down_table.valid ||
+            !down_table.device_descs || gateup_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.d_model != d_model ||
+            down_table.intermediate != intermediate ||
+            !setMoEDevice(device_ordinal_,
+                          "prepareGroupedRuntimeDecodeLaunchState") ||
+            !ensureGroupedGateUpCapacity(top_k, d_model) ||
+            !ensureGroupedDecodeCapacity(top_k, intermediate) ||
+            !ensureGroupedPrefillScratchCapacity(
+                top_k, d_model, intermediate))
+        {
+            return false;
+        }
+
+        if (descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable)
+        {
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_gate_descs,
+                    "ROCm runtime decode gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_up_descs,
+                    "ROCm runtime decode up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    down_table.num_experts,
+                    &runtime_down_descs,
+                    "ROCm runtime decode down descriptors"))
+            {
+                return false;
+            }
+        }
+
+        const int max_dim = std::max(d_model, intermediate);
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_up_ptrs = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            gate_ptrs[slot] =
+                d_prefill_gate_ + static_cast<size_t>(slot) * max_dim;
+            up_ptrs[slot] =
+                d_prefill_up_ + static_cast<size_t>(slot) * intermediate;
+            const_gate_ptrs[slot] = gate_ptrs[slot];
+            const_up_ptrs[slot] = up_ptrs[slot];
+        }
+
+        float **device_gate_ptrs = nullptr;
+        float **device_up_ptrs = nullptr;
+        const float **device_down_gate_ptrs = nullptr;
+        const float **device_down_up_ptrs = nullptr;
+        return stageRuntimeGateUpPointerArrays(
+                   gateup_table.workspace_slot,
+                   RuntimePointerArrayScope::RuntimeFused,
+                   top_k,
+                   gate_ptrs,
+                   up_ptrs,
+                   &device_gate_ptrs,
+                   &device_up_ptrs) &&
+               stageRuntimeDownPointerArrays(
+                   down_table.workspace_slot,
+                   RuntimePointerArrayScope::RuntimeFused,
+                   top_k,
+                   const_gate_ptrs,
+                   const_up_ptrs,
+                   &device_down_gate_ptrs,
+                   &device_down_up_ptrs);
+    }
+
+    bool ROCmMoEKernel::prepareGroupedTableDecodeLaunchState(
+        const int *expert_ids,
+        const float *expert_weights,
+        int gateup_table_id,
+        int down_table_id,
+        int num_active,
+        ITensor *const *gate_outputs,
+        ITensor *const *up_outputs,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Fixed-table grouped-decode preparation "
+                      "requires the exact non-null producer stream");
+            return false;
+        }
+        if (isDecodeGraphCaptureActive())
+        {
+            LOG_ERROR("[ROCmMoEKernel] Fixed-table grouped-decode launch state "
+                      "must be prepared before graph capture begins");
+            return false;
+        }
+        if (!expert_ids || !expert_weights || !gate_outputs || !up_outputs ||
+            !output || gateup_table_id < 0 || down_table_id < 0 ||
+            num_active <= 0 ||
+            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            d_model <= 0 || intermediate <= 0 ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0 ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (!gateup_table.valid || !gateup_table.device_gate_descs ||
+            !gateup_table.device_up_descs || !down_table.valid ||
+            !down_table.device_descs || gateup_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.d_model != d_model ||
+            down_table.intermediate != intermediate ||
+            !setMoEDevice(device_ordinal_,
+                          "prepareGroupedTableDecodeLaunchState"))
+        {
+            return false;
+        }
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            if (expert_ids[slot] < 0 ||
+                expert_ids[slot] >= gateup_table.num_experts ||
+                expert_ids[slot] >= down_table.num_experts)
+            {
+                return false;
+            }
+        }
+        if (!ensureGroupedGateUpCapacity(num_active, d_model) ||
+            !ensureGroupedDecodeCapacity(num_active, intermediate) ||
+            !ensureGroupedGateUpDecodeMetadata(expert_ids, num_active) ||
+            !ensureGroupedDownDecodeMetadata(
+                expert_ids, expert_weights, num_active))
+        {
+            return false;
+        }
+
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_up_ptrs = {};
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            gate_ptrs[slot] = gate_outputs[slot]
+                                  ? static_cast<float *>(
+                                        gate_outputs[slot]->gpu_data_ptr())
+                                  : nullptr;
+            up_ptrs[slot] = up_outputs[slot]
+                                ? static_cast<float *>(
+                                      up_outputs[slot]->gpu_data_ptr())
+                                : nullptr;
+            if (!gate_ptrs[slot] || !up_ptrs[slot])
+            {
+                LOG_ERROR("[ROCmMoEKernel] Fixed-table grouped decode has no "
+                          "persistent gate/up scratch pointer for slot "
+                          << slot);
+                return false;
+            }
+            const_gate_ptrs[slot] = gate_ptrs[slot];
+            const_up_ptrs[slot] = up_ptrs[slot];
+        }
+        if (!output->gpu_data_ptr())
+        {
+            LOG_ERROR("[ROCmMoEKernel] Fixed-table grouped decode output is not "
+                      "bound to persistent device storage before capture");
+            return false;
+        }
+
+        float **device_gate_ptrs = nullptr;
+        float **device_up_ptrs = nullptr;
+        const float **device_down_gate_ptrs = nullptr;
+        const float **device_down_up_ptrs = nullptr;
+        return stageRuntimeGateUpPointerArrays(
+                   gateup_table.workspace_slot,
+                   RuntimePointerArrayScope::TableDecode,
+                   num_active,
+                   gate_ptrs,
+                   up_ptrs,
+                   &device_gate_ptrs,
+                   &device_up_ptrs) &&
+               stageRuntimeDownPointerArrays(
+                   down_table.workspace_slot,
+                   RuntimePointerArrayScope::TableDecode,
+                   num_active,
+                   const_gate_ptrs,
+                   const_up_ptrs,
+                   &device_down_gate_ptrs,
+                   &device_down_up_ptrs);
     }
 
     bool ROCmMoEKernel::groupedExpertDecodeFromRuntime(
@@ -7063,47 +7450,43 @@ namespace llaminar2
             return false;
         if (!d_hidden)
         {
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(input),
                 device,
                 stream);
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
 
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_output && rejectDecodeStagingDuringCapture("fused grouped decode output tensor"))
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical route contribution tensor"
+                                                  : "fused grouped decode output tensor";
+        float *d_publication_output = static_cast<float *>(
+            publication_output->gpu_data_ptr());
+        if (!d_publication_output &&
+            rejectDecodeStagingDuringCapture(publication_output_name))
             return false;
-        if (!d_output)
+        if (!d_publication_output)
         {
-            TransferEngine::prepareDeviceOutput(output, device, stream);
-            d_output = static_cast<float *>(output->gpu_data_ptr());
+            TransferEngine::requireDeviceOutput(
+                publication_output,
+                device,
+                stream);
+            d_publication_output = static_cast<float *>(
+                publication_output->gpu_data_ptr());
         }
-        float *d_canonical_route_contributions = nullptr;
-        if (canonical_route_contributions)
-        {
-            d_canonical_route_contributions = static_cast<float *>(
-                canonical_route_contributions->gpu_data_ptr());
-            if (!d_canonical_route_contributions &&
-                rejectDecodeStagingDuringCapture(
-                    "canonical route contribution tensor"))
-            {
-                return false;
-            }
-            if (!d_canonical_route_contributions)
-            {
-                TransferEngine::prepareDeviceOutput(
-                    canonical_route_contributions,
-                    device,
-                    stream);
-                d_canonical_route_contributions = static_cast<float *>(
-                    canonical_route_contributions->gpu_data_ptr());
-            }
-        }
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : d_publication_output;
+        float *d_canonical_route_contributions = canonical_route_contributions
+                                                     ? d_publication_output
+                                                     : nullptr;
 
-        if (!d_hidden || !d_output || !d_expert_ids || !d_weights ||
+        if (!d_hidden || !d_expert_ids || !d_weights ||
             !d_prefill_gate_ || !d_prefill_up_ ||
-            (canonical_route_contributions &&
-             !d_canonical_route_contributions))
+            (!d_output && !d_canonical_route_contributions))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/output device pointer");
             return false;
@@ -7411,7 +7794,7 @@ namespace llaminar2
             return false;
         if (!d_output)
         {
-            TransferEngine::prepareDeviceOutput(
+            TransferEngine::requireDeviceOutput(
                 output,
                 DeviceId::rocm(device_ordinal_),
                 getStream());
@@ -7507,7 +7890,7 @@ namespace llaminar2
 
         const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         if (!d_routing_indices &&
-            !ensureTensorOnDevice(routing_indices, device, getStream(),
+            !requireTensorOnDevice(routing_indices, device, getStream(),
                                   "routing_indices", "groupedExpertDownDecodeFromRouting"))
         {
             return false;
@@ -7515,7 +7898,7 @@ namespace llaminar2
         d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
         if (!d_weights &&
-            !ensureTensorOnDevice(routing_weights, device, getStream(),
+            !requireTensorOnDevice(routing_weights, device, getStream(),
                                   "routing_weights", "groupedExpertDownDecodeFromRouting"))
         {
             return false;
@@ -7524,7 +7907,7 @@ namespace llaminar2
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_output &&
-            !ensureOutputOnDevice(output, device, getStream(),
+            !requireOutputOnDevice(output, device, getStream(),
                                   "moe_output", "groupedExpertDownDecodeFromRouting"))
         {
             return false;
@@ -8018,7 +8401,8 @@ namespace llaminar2
         const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens, int num_experts, int top_k,
-        const int32_t *absolute_position_ids_device)
+        const int32_t *absolute_position_ids_device,
+        const int32_t *active_row_count_device)
     {
         void *stream = explicitMoELaunchStream(
             launch,
@@ -8029,11 +8413,13 @@ namespace llaminar2
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(stream));
 
-        if (!runtime_layer || !absolute_position_ids_device)
+        if (!runtime_layer || !absolute_position_ids_device ||
+            !active_row_count_device)
         {
             LOG_ERROR(
                 "[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] "
-                "runtime and device position row must be non-null");
+                "runtime, device position row, and device active-row count "
+                "must be non-null");
             return false;
         }
         if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
@@ -8054,6 +8440,7 @@ namespace llaminar2
             num_experts,
             top_k,
             absolute_position_ids_device,
+            active_row_count_device,
             device_ordinal_,
             stream);
     }
@@ -8350,13 +8737,13 @@ namespace llaminar2
         // that race structurally impossible.
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         void *stream = getStream();
-        if (!ensureTensorOnDevice(
+        if (!requireTensorOnDevice(
                 routing_indices,
                 device,
                 stream,
                 "routing_indices",
                 "prepareExpertGroupsAsync") ||
-            !ensureTensorOnDevice(
+            !requireTensorOnDevice(
                 routing_weights,
                 device,
                 stream,
@@ -8567,13 +8954,13 @@ namespace llaminar2
         const int total_slots = seq_len * top_k;
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         void *stream = getStream();
-        if (!ensureTensorOnDevice(
+        if (!requireTensorOnDevice(
                 routing_indices,
                 device,
                 stream,
                 "routing_indices",
                 "prepareExpertGroupsAsyncUsingPublishedMask") ||
-            !ensureTensorOnDevice(
+            !requireTensorOnDevice(
                 routing_weights,
                 device,
                 stream,
@@ -9075,37 +9462,37 @@ namespace llaminar2
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
 
-        // Join the hidden-state producer to this pipeline and allocate the
-        // overwrite-only result on the same device. No host mirror is adopted:
-        // ensureOutputOnDevice deliberately allocates without uploading stale
-        // host bytes because ordered publication defines every output element.
+        // Join the hidden-state producer and the exact publication target to
+        // this pipeline. Canonical LocalTP publication does not own or inspect
+        // the later reducer destination.
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         void *stream = getStream();
-        if (!ensureTensorOnDevice(
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical_route_contributions"
+                                                  : "output";
+        if (!requireTensorOnDevice(
                 hidden,
                 device,
                 stream,
                 "hidden",
                 "executeGroupedPrefillPipeline") ||
-            !ensureOutputOnDevice(
-                output,
+            !requireOutputOnDevice(
+                publication_output,
                 device,
                 stream,
-                "output",
-                "executeGroupedPrefillPipeline") ||
-            (canonical_route_contributions &&
-             !ensureOutputOnDevice(
-                 canonical_route_contributions,
-                 device,
-                 stream,
-                 "canonical_route_contributions",
-                 "executeGroupedPrefillPipeline")))
+                publication_output_name,
+                "executeGroupedPrefillPipeline"))
         {
             return false;
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : static_cast<float *>(output->gpu_data_ptr());
         float *d_canonical_route_contributions =
             canonical_route_contributions
                 ? static_cast<float *>(
@@ -9113,9 +9500,8 @@ namespace llaminar2
                 : nullptr;
 
         if (isGraphCaptureActive() &&
-            (!d_hidden || !d_output ||
-             (canonical_route_contributions &&
-              !d_canonical_route_contributions)))
+            (!d_hidden ||
+             (!d_output && !d_canonical_route_contributions)))
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] null device pointers during graph capture");
             return false;
@@ -9372,39 +9758,39 @@ namespace llaminar2
 
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         void *stream = getStream();
-        if (!ensureTensorOnDevice(
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical_route_contributions"
+                                                  : "output";
+        if (!requireTensorOnDevice(
                 hidden,
                 device,
                 stream,
                 "hidden",
                 "executeGroupedPrefillPipelineFromRuntime") ||
-            !ensureOutputOnDevice(
-                output,
+            !requireOutputOnDevice(
+                publication_output,
                 device,
                 stream,
-                "output",
-                "executeGroupedPrefillPipelineFromRuntime") ||
-            (canonical_route_contributions &&
-             !ensureOutputOnDevice(
-                 canonical_route_contributions,
-                 device,
-                 stream,
-                 "canonical_route_contributions",
-                 "executeGroupedPrefillPipelineFromRuntime")))
+                publication_output_name,
+                "executeGroupedPrefillPipelineFromRuntime"))
         {
             return false;
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : static_cast<float *>(output->gpu_data_ptr());
         float *d_canonical_route_contributions =
             canonical_route_contributions
                 ? static_cast<float *>(
                       canonical_route_contributions->gpu_data_ptr())
                 : nullptr;
-        if (!d_hidden || !d_output ||
-            (canonical_route_contributions &&
-             !d_canonical_route_contributions))
+        if (!d_hidden ||
+            (!d_output && !d_canonical_route_contributions))
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] null device pointers");
             return false;
@@ -9603,13 +9989,13 @@ namespace llaminar2
             return false;
         }
         const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(
+        if (!requireTensorOnDevice(
                 canonical_route_contributions,
                 device,
                 stream,
                 "canonical_route_contributions",
                 "reduceCanonicalRouteContributions") ||
-            !ensureOutputOnDevice(
+            !requireOutputOnDevice(
                 output,
                 device,
                 stream,

@@ -100,28 +100,6 @@ namespace llaminar2
         if (!stream)
             return false;
 
-        /*
-         * The generation controller is the sole authority for transaction
-         * clipping. `verifier_row_capacity` is the exact row geometry of this
-         * captured verifier, including the first condition row; it is never the
-         * larger configured dynamic-depth ceiling. Preparing that exact budget
-         * inside this stage prevents both a host depth shadow and a max-depth
-         * shadow from authorizing state rows that the active graph did not
-         * produce.
-         */
-        if (!params_.backend->enqueuePrepareDeviceGenerationTransactionBudget(
-                params_.generation_control_device,
-                params_.generation_control_stride,
-                params_.request_count,
-                params_.verifier_row_capacity,
-                params_.maintenance_rows_remaining_device,
-                params_.device_id.gpu_ordinal(),
-                stream))
-        {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Transaction budget launch failed");
-            return false;
-        }
-
         const int target_rows_per_request =
             params_.comparison_rows_per_request + 1;
         for (int request = 0; request < params_.request_count; ++request)

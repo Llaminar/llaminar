@@ -198,6 +198,14 @@ namespace
         void setSuppressTimeline(bool) override {}
         void setAccumulatePrefill(bool) override {}
 
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            configured_stop_tokens_ = stop_tokens;
+            ++stop_policy_publication_count_;
+            return true;
+        }
+
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock_gpu"; }
         int get_position() const override { return 0; }
@@ -210,13 +218,20 @@ namespace
 
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
         bool skipLogitsGatherPrefillWasEnabled() const { return skip_logits_gather_prefill_; }
+        int stopPolicyPublicationCount() const { return stop_policy_publication_count_; }
+        const std::vector<int32_t> &configuredStopTokens() const
+        {
+            return configured_stop_tokens_;
+        }
 
     private:
         std::vector<float> logits_;
+        std::vector<int32_t> configured_stop_tokens_;
         PrefixRuntimeStateSnapshot snapshot_;
         bool skip_logits_gather_decode_ = false;
         bool skip_logits_gather_prefill_ = false;
         bool device_argmax_available_ = true;
+        int stop_policy_publication_count_ = 0;
     };
 
     class MockStatsInferenceRunner : public MockCPUInferenceRunner
@@ -234,6 +249,13 @@ namespace
     {
     public:
         bool supportsDecodeStep() const override { return true; }
+
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            configured_stop_tokens_ = stop_tokens;
+            return true;
+        }
 
         void setDecodeSamplingParams(const SamplingParams &params) override
         {
@@ -279,8 +301,13 @@ namespace
         bool samplingParamsSet() const { return sampling_params_set_; }
         float lastTemperature() const { return last_sampling_params_.temperature; }
         const SamplingParams &lastSamplingParams() const { return last_sampling_params_; }
+        const std::vector<int32_t> &configuredStopTokens() const
+        {
+            return configured_stop_tokens_;
+        }
 
     private:
+        std::vector<int32_t> configured_stop_tokens_;
         int decode_step_budget_ = 0;
         int decode_step_calls_ = 0;
         int maintenance_calls_ = 0;
@@ -593,6 +620,8 @@ namespace
             .WillByDefault(Return(false));
         ON_CALL(*tok, is_stop_token(99))
             .WillByDefault(Return(true));
+        ON_CALL(*tok, stop_tokens())
+            .WillByDefault(Return(std::vector<int>{99}));
 
         ON_CALL(*tok, vocab_size())
             .WillByDefault(Return(100));
@@ -804,6 +833,10 @@ TEST(Test__BenchmarkRunnerCPU, EnablesSkipLogitsGatherOnGPU)
         << "GPU device must enable skip-logits-gather for performance";
     EXPECT_TRUE(runner->skipLogitsGatherPrefillWasEnabled())
         << "GPU device must skip prefill logits gather when benchmark sampling stays device-side";
+    EXPECT_GT(runner->stopPolicyPublicationCount(), 0)
+        << "Every GPU benchmark request must publish its fixed-length stop policy before prefill";
+    EXPECT_TRUE(runner->configuredStopTokens().empty())
+        << "A fixed-token throughput benchmark must disable stop tokens on the device as well as in the host decode loop";
 }
 
 /**
@@ -1013,6 +1046,8 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     EXPECT_GT(runner->maintenanceCalls(), 0);
     EXPECT_EQ(runner->sampleGreedyCalls(), 0)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
+    EXPECT_TRUE(runner->configuredStopTokens().empty())
+        << "Orchestrated MTP must receive the same ignore-stop policy as the benchmark host loop";
 }
 
 /**
@@ -1393,6 +1428,21 @@ TEST(Test__BenchmarkRunnerCPU, AdapterForwardsRequestBatchedDecodeContract)
 {
     MockOrchestrationRunner orch;
     InferenceRunnerAdapter adapter(&orch);
+
+    const std::vector<int32_t> stop_tokens = {7, 11};
+    EXPECT_CALL(orch, setStopTokens(stop_tokens));
+    EXPECT_TRUE(adapter.configureMTPRequestStopTokens(stop_tokens));
+
+    EXPECT_CALL(orch, setSamplingParams(_))
+        .WillOnce(Invoke([](const SamplingParams &params) {
+            EXPECT_FLOAT_EQ(params.presence_penalty, 0.5f);
+            EXPECT_FLOAT_EQ(params.frequency_penalty, 0.25f);
+        }));
+    EXPECT_TRUE(adapter.configureMTPRequestPenaltyPolicy(
+        MTPRequestPenaltyPolicy{
+            .presence_penalty = 0.5f,
+            .frequency_penalty = 0.25f,
+        }));
 
     EXPECT_CALL(orch, primaryDeviceId())
         .WillOnce(::testing::Return(DeviceId::cuda(1)));

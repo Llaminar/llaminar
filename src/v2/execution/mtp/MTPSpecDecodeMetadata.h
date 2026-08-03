@@ -389,8 +389,26 @@ namespace llaminar2
         explicit MTPSpecDecodeMetadataWorkspaceBinding(
             MTPSpecDecodeMetadataShape shape = {});
 
-        void setShape(MTPSpecDecodeMetadataShape shape);
-        const MTPSpecDecodeMetadataShape &shape() const { return shape_; }
+        /**
+         * @brief Ensure that the graph-family workspace can represent a geometry.
+         *
+         * Capacity is setup-owned and monotonic. Request-lifetime verifier plans
+         * may be smaller than this reservation, but they must never shrink it:
+         * captured graphs and publication endpoints retain pointers sized from
+         * the largest declared graph family. Growing an already-bound capacity
+         * refreshes the binding and deliberately leaves it invalid when the
+         * allocator has not reserved enough storage for the new minimum.
+         *
+         * @param minimum_capacity Smallest request/depth geometry to retain.
+         * @throws std::invalid_argument when the requested capacity is invalid.
+         */
+        void ensureCapacity(MTPSpecDecodeMetadataShape minimum_capacity);
+
+        /** @brief Return the setup-owned storage capacity, never active request state. */
+        const MTPSpecDecodeMetadataShape &capacity() const { return shape_; }
+
+        /** @brief Test whether a logical plan fits without rebinding or allocation. */
+        bool covers(MTPSpecDecodeMetadataShape requested_shape) const;
 
         WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const override;

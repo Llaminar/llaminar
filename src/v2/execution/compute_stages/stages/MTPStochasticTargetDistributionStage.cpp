@@ -91,7 +91,8 @@ namespace llaminar2
                     params_.generated_token_counts_device,
                     params_.penalty_policy_device,
                     params_.device_id.gpu_ordinal(),
-                    stream))
+                    stream,
+                    params_.active_rows_device))
             {
                 LOG_ERROR("[MTPStochasticTargetDistributionStage] Device-history penalty transform failed");
                 return false;
@@ -113,7 +114,8 @@ namespace llaminar2
                 params_.target_probs_device,
                 params_.topk_partial_values_device,
                 params_.topk_partial_indices_device,
-                params_.topk_partial_capacity))
+                params_.topk_partial_capacity,
+                params_.active_rows_device))
         {
             LOG_ERROR("[MTPStochasticTargetDistributionStage] Compact target-row construction failed");
             return false;
@@ -151,6 +153,9 @@ namespace llaminar2
         StageDumpInfo info;
         info.addScalarInt("first_logit_row", params_.first_logit_row);
         info.addScalarInt("row_count", params_.row_count);
+        info.addScalarBool(
+            "device_owned_active_rows",
+            params_.active_rows_device != nullptr);
         info.addScalarInt("vocab_size", params_.vocab_size);
         info.addScalarInt("first_target_slot", params_.first_target_slot);
         info.addScalarInt("top_k", params_.top_k);
@@ -164,9 +169,13 @@ namespace llaminar2
     MTPStochasticTargetDistributionStage::bufferContract() const
     {
         StageBufferContract contract;
-        contract.inputs.reserve(params_.apply_penalties ? 4U : 1U);
+        contract.inputs.reserve(
+            (params_.apply_penalties ? 4U : 1U) +
+            (params_.active_rows_device ? 1U : 0U));
         contract.outputs.reserve(params_.apply_penalties ? 5U : 4U);
         contract.addInput(BufferId::ALL_POSITION_LOGITS);
+        if (params_.active_rows_device)
+            contract.addInput(BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
         if (params_.apply_penalties)
         {
             contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
@@ -191,6 +200,7 @@ namespace llaminar2
                params_.row_count == other.row_count &&
                params_.vocab_size == other.vocab_size &&
                params_.logits_row_stride == other.logits_row_stride &&
+               params_.active_rows_device == other.active_rows_device &&
                params_.apply_penalties == other.apply_penalties &&
                params_.verifier_input_tokens_device ==
                    other.verifier_input_tokens_device &&

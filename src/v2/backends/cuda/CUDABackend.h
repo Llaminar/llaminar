@@ -133,6 +133,7 @@ namespace llaminar2
             const void *verifier_input_tokens_device,
             const void *generated_token_counts_device,
             const void *penalty_policy_device,
+            const void *active_rows_device,
             int device_id,
             void *stream,
             void *out_values_device,
@@ -150,7 +151,8 @@ namespace llaminar2
             const void *generated_token_counts_device,
             const void *penalty_policy_device,
             int device_id,
-            void *stream) override;
+            void *stream,
+            const void *active_rows_device = nullptr) override;
         bool enqueueApplyMTPBranchPenaltiesToF32RowDevice(
             void *data_device,
             int cols,
@@ -214,7 +216,8 @@ namespace llaminar2
             void *out_probs_device,
             void *scratch_values_device = nullptr,
             void *scratch_indices_device = nullptr,
-            int scratch_capacity = 0) override;
+            int scratch_capacity = 0,
+            const void *active_rows_device = nullptr) override;
         bool enqueueBuildTopKTopPProcessedLogitsF32Device(
             const void *data_device,
             int row_count,
@@ -541,6 +544,7 @@ namespace llaminar2
             const void *verify_tokens_device,
             const void *draft_tokens_device,
             int compare_row_count,
+            const void *active_verifier_row_count_device,
             const void *stop_tokens_device,
             int device_id,
             void *stream,
@@ -562,6 +566,7 @@ namespace llaminar2
         bool enqueueInitializeDeviceGeneration(
             int request_count,
             int max_new_tokens,
+            const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
             int response_token_stride,
             void *response_tokens_device,
             int control_stride,
@@ -666,12 +671,27 @@ namespace llaminar2
             const void *base_positions_device,
             const void *valid_graph_rows_device,
             int valid_graph_row_count,
+            void *generation_control_device,
+            int generation_control_stride,
             int request_count,
             int padded_seq_len,
             int device_id,
             void *stream,
             void *out_position_ids_device,
             void *out_request_lengths_device) override;
+        bool enqueuePrepareMTPVerifierControlledRow(
+            const void *first_token_device,
+            const void *draft_tokens_device,
+            const void *base_position_device,
+            void *generation_control_row_device,
+            int generation_control_stride,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_position_ids_device,
+            void *out_request_length_device,
+            void *out_base_position_snapshot_device) override;
         bool enqueueInitializeMTPDeviceLogicalState(
             const void *sampled_tokens_device,
             const void *target_positions_device,

@@ -133,6 +133,7 @@ namespace llaminar2
                 params_.binding.verifier_input_tokens_device,
                 params_.binding.generated_token_counts_device,
                 params_.binding.penalty_policy_device,
+                params_.binding.active_verifier_row_count_device,
                 params_.device_id.gpu_ordinal(),
                 stream,
                 params_.binding.argmax_values_device,
@@ -149,13 +150,14 @@ namespace llaminar2
                 params_.binding.verifier_tokens_device,
                 params_.binding.verifier_input_tokens_device,
                 params_.verifier_row_count - 1,
+                params_.binding.active_verifier_row_count_device,
                 params_.binding.stop_tokens_device,
                 params_.device_id.gpu_ordinal(),
                 stream,
                 params_.binding.output_token_capacity,
                 params_.binding.output_tokens_device,
                 params_.binding.output_meta_device,
-                /*max_state_commit_rows_device=*/nullptr,
+                params_.binding.transaction_commit_budget_device,
                 params_.binding.penalty_policy_device))
         {
             LOG_ERROR("[MTPVerifierOutcomeStage] Greedy compact outcome reduction failed");
@@ -215,6 +217,8 @@ namespace llaminar2
 
         contract.addInput(BufferId::ALL_POSITION_LOGITS);
         contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
+        contract.addInput(BufferId::MTP_VERIFIER_REQUEST_LENGTHS, "INT32");
+        contract.addInput(BufferId::MTP_GENERATION_CONTROL, "INT32");
         contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);

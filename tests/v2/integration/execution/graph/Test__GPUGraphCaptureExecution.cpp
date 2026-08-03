@@ -86,6 +86,7 @@ protected:
     IWorkerGPUContext *gpu_ctx_ = nullptr;
     std::unique_ptr<IDeviceContext> device_ctx_;
     std::unique_ptr<IGPUGraphCapture> capture_;
+    BufferArena arena_;
 
     // Tensor storage (keeps tensors alive for the duration of the test)
     std::vector<std::unique_ptr<TensorBase>> tensor_storage_;
@@ -141,10 +142,13 @@ protected:
      * before beginCapture(), then wait once on the upload stream. No allocation
      * or H2D transfer is allowed inside the captured graph.
      *
-     * @return true when every tensor has a stable device address and the
-     *         context-owned stream has completed all uploads.
+     * @param excluded_tensor Optional internal output whose cold device-storage
+     *        lifecycle should be left for capture preflight to exercise.
+     * @return true when every included tensor has a stable device address and
+     *         the context-owned stream has completed all uploads.
      */
-    bool prepareFixtureTensorsForGPUExecution()
+    bool prepareFixtureTensorsForGPUExecution(
+        ITensor *excluded_tensor = nullptr)
     {
         if (!gpu_ctx_ || !device_ctx_)
             return false;
@@ -156,6 +160,8 @@ protected:
         const DeviceId device = device_ctx_->deviceId();
         for (const auto &tensor : tensor_storage_)
         {
+            if (tensor.get() == excluded_tensor)
+                continue;
             if (!tensor || !tensor->ensureOnDevice(device, stream))
                 return false;
         }
@@ -176,6 +182,7 @@ protected:
         DeviceGraphExecutor &executor,
         ITensor *externally_visible_output)
     {
+        executor.setArena(&arena_);
         const std::array<ITensor *, 1> outputs = {
             externally_visible_output};
         return executor.executeWithGraphCapture(
@@ -211,17 +218,25 @@ protected:
      * @param[out] norm_input  Raw pointer to the RMSNorm input tensor
      * @param[out] residual    Raw pointer to the residual tensor
      * @param[out] result_output Raw pointer to the final output tensor
+     * @param[out] norm_output_out Optional raw pointer to the internal edge.
+     * @param strict_copy_consumer When true, the second stage performs a D2D
+     *        copy and invokes StageGPUExecution::requirePreparedInput(), directly
+     *        exercising capture-time internal-edge authority.
      * @return Populated ComputeGraph
      */
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
                                         FP32Tensor *&norm_input,
                                         FP32Tensor *&residual,
-                                        FP32Tensor *&result_output)
+                                        FP32Tensor *&result_output,
+                                        FP32Tensor **norm_output_out = nullptr,
+                                        bool strict_copy_consumer = false)
     {
         const DeviceId device = device_ctx_->deviceId();
 
         norm_input = createFP32Tensor({seq_len, d_model});
         auto *norm_output = createFP32Tensor({seq_len, d_model});
+        if (norm_output_out)
+            *norm_output_out = norm_output;
         auto *gamma = createFP32Tensor({d_model});
         residual = createFP32Tensor({seq_len, d_model});
         result_output = createFP32Tensor({seq_len, d_model});
@@ -248,13 +263,30 @@ protected:
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
         norm_params.device_id = device;
+        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
-        res_params.residual = residual;
+        res_params.residual = strict_copy_consumer ? nullptr : residual;
         res_params.output = result_output;
         res_params.num_elements = num_elements;
         res_params.device_id = device;
+        res_params.input_buffer_id = BufferId::NORMALIZED;
+        if (!strict_copy_consumer)
+            res_params.residual_buffer_id = BufferId::RESIDUAL;
+        res_params.output_buffer_id = BufferId::ATTN_PROJ;
+
+        /*
+         * Bind the same typed arena identities used by production graphs. The
+         * fixture owns the tensors; BufferArena owns coherence and ordering.
+         * Rebinding is intentional because several tests build a fresh graph
+         * with the same logical BufferIds after completing an earlier launch.
+         */
+        EXPECT_TRUE(arena_.bindExternalBuffer(BufferId::HIDDEN_STATE, norm_input));
+        EXPECT_TRUE(arena_.bindExternalBuffer(BufferId::NORMALIZED, norm_output));
+        EXPECT_TRUE(arena_.bindExternalBuffer(BufferId::RESIDUAL, residual));
+        EXPECT_TRUE(arena_.bindExternalBuffer(BufferId::ATTN_PROJ, result_output));
 
         // Assemble graph with dependency
         ComputeGraph graph;
@@ -286,6 +318,7 @@ TEST_F(GPUGraphCaptureExecutionTest, FirstExecution_ProducesCorrectOutput)
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
 
     // Execute via graph capture path
     bool success = executeCapturedGraph(graph, executor, result);
@@ -310,6 +343,92 @@ TEST_F(GPUGraphCaptureExecutionTest, FirstExecution_ProducesCorrectOutput)
     {
         ASSERT_FALSE(std::isnan(out[i])) << "NaN at index " << i;
         ASSERT_FALSE(std::isinf(out[i])) << "Inf at index " << i;
+    }
+}
+
+TEST_F(GPUGraphCaptureExecutionTest,
+       InternalHostAuthoritativeIntermediateIsNotAnExternalCaptureInput)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    FP32Tensor *internal_norm_output = nullptr;
+    auto graph = buildNormResidualGraph(
+        /*seq_len=*/2,
+        /*d_model=*/32,
+        norm_input,
+        residual,
+        result,
+        &internal_norm_output,
+        /*strict_copy_consumer=*/true);
+    ASSERT_NE(internal_norm_output, nullptr);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    ASSERT_NE(internal_norm_output->gpu_data_ptr(), nullptr);
+
+    /*
+     * Reproduce the lazy MTP sidecar state exactly: arena storage has a stable
+     * device address, but its value is not valid until the first captured stage
+     * produces it. Preflight must not demand pre-existing device authority for
+     * this internal edge.
+     */
+    internal_norm_output->mutable_data()[0] = -123.0f;
+    ASSERT_EQ(
+        internal_norm_output->coherenceState(),
+        TensorCoherenceState::HOST_AUTHORITATIVE);
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
+
+    const float *output = result->data();
+    for (size_t index = 0; index < result->numel(); ++index)
+    {
+        EXPECT_TRUE(std::isfinite(output[index]))
+            << "Captured producer/consumer chain emitted invalid output at " << index;
+    }
+}
+
+TEST_F(GPUGraphCaptureExecutionTest,
+       ColdInternalOutputStorageIsAllocatedBeforeCapture)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    FP32Tensor *internal_norm_output = nullptr;
+    auto graph = buildNormResidualGraph(
+        /*seq_len=*/2,
+        /*d_model=*/32,
+        norm_input,
+        residual,
+        result,
+        &internal_norm_output,
+        /*strict_copy_consumer=*/true);
+    ASSERT_NE(internal_norm_output, nullptr);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution(internal_norm_output));
+    ASSERT_EQ(internal_norm_output->gpu_data_ptr(), nullptr)
+        << "The regression requires a genuinely cold internal output";
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
+
+    ASSERT_NE(internal_norm_output->gpu_data_ptr(), nullptr);
+    ASSERT_EQ(
+        internal_norm_output->current_device(),
+        std::optional<DeviceId>{device_ctx_->deviceId()});
+    const float *output = result->data();
+    for (size_t index = 0; index < result->numel(); ++index)
+    {
+        EXPECT_TRUE(std::isfinite(output[index]))
+            << "Cold-output capture emitted invalid output at " << index;
     }
 }
 
@@ -538,6 +657,7 @@ TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
 
     // Empty set still requires one complete captured graph.
     std::unordered_set<std::string> empty_collectives;
@@ -638,12 +758,18 @@ TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
     params.eps = 1e-5f;
     params.seq_len = static_cast<int>(seq_len);
     params.device_id = device_ctx_->deviceId();
+    params.input_buffer_id = BufferId::HIDDEN_STATE;
+    params.output_buffer_id = BufferId::NORMALIZED;
+
+    ASSERT_TRUE(arena_.bindExternalBuffer(BufferId::HIDDEN_STATE, input));
+    ASSERT_TRUE(arena_.bindExternalBuffer(BufferId::NORMALIZED, output));
 
     ComputeGraph graph;
     graph.addNode("solo_rmsnorm", ComputeStageFactory::createRMSNorm(params), device_ctx_->deviceId());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
 
     ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
     ASSERT_TRUE(executeCapturedGraph(graph, executor, output));
@@ -679,6 +805,7 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
 
     ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
     ASSERT_TRUE(executor.executeFastDecode(graph1, device_ctx_.get()));

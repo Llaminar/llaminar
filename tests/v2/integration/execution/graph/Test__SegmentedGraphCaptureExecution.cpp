@@ -119,11 +119,14 @@ protected:
      * addresses before warmup, capture, and replay bind the stages to their
      * dedicated stream.
      *
-     * @return true when every tensor is resident and the upload stream has
-     *         completed; false on allocation, transfer, or synchronization
+     * @param excluded_tensor Optional internal output left without GPU storage
+     *        so cached capture preparation owns its first allocation.
+     * @return true when every included tensor is resident and the upload stream
+     *         has completed; false on allocation, transfer, or synchronization
      *         failure.
      */
-    bool prepareFixtureTensorsForGPUExecution()
+    bool prepareFixtureTensorsForGPUExecution(
+        ITensor *excluded_tensor = nullptr)
     {
         if (!gpu_ctx_ || !device_ctx_)
             return false;
@@ -135,11 +138,15 @@ protected:
         const DeviceId device = device_ctx_->deviceId();
         for (const auto &tensor : tensor_storage_)
         {
+            if (tensor.get() == excluded_tensor)
+                continue;
             if (!tensor || !tensor->ensureOnDevice(device, upload_stream))
                 return false;
         }
         for (auto *tensor : arena_tensors_)
         {
+            if (tensor == excluded_tensor)
+                continue;
             if (!tensor || !tensor->ensureOnDevice(device, upload_stream))
                 return false;
         }
@@ -150,13 +157,17 @@ protected:
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
                                         FP32Tensor *&norm_input,
                                         FP32Tensor *&residual,
-                                        FP32Tensor *&result_output)
+                                        FP32Tensor *&result_output,
+                                        FP32Tensor **norm_output_out = nullptr,
+                                        bool strict_copy_consumer = false)
     {
         const DeviceId device = device_ctx_->deviceId();
         norm_input = createArenaFP32Tensor(
             BufferId::HIDDEN_STATE, {seq_len, d_model});
         auto *norm_output = createArenaFP32Tensor(
             BufferId::NORMALIZED, {seq_len, d_model});
+        if (norm_output_out)
+            *norm_output_out = norm_output;
         auto *gamma = createFP32Tensor({d_model});
         residual = createArenaFP32Tensor(
             BufferId::RESIDUAL, {seq_len, d_model});
@@ -183,12 +194,13 @@ protected:
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
-        res_params.residual = residual;
+        res_params.residual = strict_copy_consumer ? nullptr : residual;
         res_params.output = result_output;
         res_params.num_elements = num_elements;
         res_params.device_id = device;
         res_params.input_buffer_id = BufferId::NORMALIZED;
-        res_params.residual_buffer_id = BufferId::RESIDUAL;
+        if (!strict_copy_consumer)
+            res_params.residual_buffer_id = BufferId::RESIDUAL;
         res_params.output_buffer_id = BufferId::ATTN_OUTPUT;
 
         ComputeGraph graph;
@@ -400,6 +412,59 @@ TEST_F(CachedGraphReplayExecutionTest, FirstUseMaterializesReplayWithoutSecondMu
         EXPECT_NEAR(replay[i], first_use_output[i], 1e-5f)
             << "Replay output differs from the single first-use execution at index " << i;
     }
+}
+
+TEST_F(CachedGraphReplayExecutionTest,
+       FirstCaptureAllocatesColdInternalProducerStorage)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+
+    constexpr size_t seq_len = 2;
+    constexpr size_t d_model = 32;
+    constexpr size_t num_elements = seq_len * d_model;
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    FP32Tensor *internal_norm_output = nullptr;
+    auto graph = buildNormResidualGraph(
+        seq_len,
+        d_model,
+        norm_input,
+        residual,
+        result,
+        &internal_norm_output,
+        /*strict_copy_consumer=*/true);
+    ASSERT_NE(internal_norm_output, nullptr);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution(internal_norm_output));
+    ASSERT_EQ(internal_norm_output->gpu_data_ptr(), nullptr)
+        << "The regression requires a cold internal producer output";
+
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        device_ctx_.get(),
+        segment_cache,
+        dispatch_stream,
+        gpu_ctx_,
+        nullptr));
+    ASSERT_NE(internal_norm_output->gpu_data_ptr(), nullptr);
+    ASSERT_EQ(
+        internal_norm_output->current_device(),
+        std::optional<DeviceId>{device_ctx_->deviceId()});
+    assertTensorFiniteAndNonZero(
+        result,
+        num_elements,
+        segment_cache.capture_stream);
 }
 
 TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunctional)

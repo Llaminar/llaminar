@@ -122,6 +122,25 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     local domain_name="qwen36_moe_${accelerator}_hot"
     local tp_devices="${accelerator}:0,${accelerator}:1"
     local feature_flags
+    local routed_compute
+    local routed_phase
+    local routed_assignment
+
+    case "$rebalance_mode" in
+        dynamic)
+            routed_compute="apportioned"
+            routed_phase="uniform"
+            routed_assignment="static-owner"
+            ;;
+        llep)
+            routed_compute="replicated"
+            routed_phase="prefill-apportioned-decode-replicated"
+            routed_assignment="least-loaded-resident"
+            ;;
+        *)
+            die "unsupported Qwen3.6 MoE rebalance mode '$rebalance_mode'"
+            ;;
+    esac
 
     feature_flags="--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto --prefix-cache-moe-policy placement-fingerprint"
     feature_flags+=" --mtp --mtp-draft-tokens 4 --mtp-min-draft-tokens 1"
@@ -135,7 +154,7 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     feature_flags+=" --moe-routed-expert-shared-domain ${domain_name}"
     feature_flags+=" --moe-routed-expert-residency static-by-id"
     feature_flags+=" --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated"
-    feature_flags+=" --moe-routed-expert-domain ${domain_name}=${tp_devices};scope=local;backend=${collective_backend};routed_compute=apportioned;owner=0"
+    feature_flags+=" --moe-routed-expert-domain ${domain_name}=${tp_devices};scope=local;backend=${collective_backend};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_assignment=${routed_assignment};owner=0"
     feature_flags+=" --moe-routed-expert-tier hot@${domain_name};priority=0;max-experts-per-layer=256;memory-mb=8192"
     feature_flags+=" --moe-rebalance ${rebalance_mode}"
     feature_flags+=" --moe-hot-expert-cache off"

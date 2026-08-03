@@ -23,6 +23,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../transfer/TransferEngine.h"
 
+#include <algorithm>
 #include <sstream>
 #include <unordered_set>
 
@@ -504,6 +505,156 @@ namespace llaminar2
     // Single-Graph Capture/Replay
     // =========================================================================
 
+    std::unique_ptr<GraphCaptureDependencyLedger>
+    DeviceGraphExecutor::planGraphCaptureDependencies(
+        ComputeGraph &graph,
+        std::span<const std::string> stage_names,
+        DeviceId capture_device,
+        void *capture_stream,
+        const char *context)
+    {
+        if (!capture_device.is_gpu() || !capture_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Capture dependency planning requires an "
+                "exact GPU and non-null stream");
+            return nullptr;
+        }
+
+        const std::string capture_context =
+            context ? context : "graph_capture_dependencies";
+        std::vector<GraphCaptureDependencyLedger::StagePlan> stage_plans;
+        stage_plans.reserve(stage_names.size());
+
+        /*
+         * BufferId, rather than a tensor's current coherence flag, defines the
+         * topological producer.  A tensor may still be HOST_AUTHORITATIVE while
+         * its producer kernel is merely being recorded.  The canonical storage
+         * owner is retained only after that BufferId decision has been made.
+         */
+        std::unordered_map<BufferId, size_t> latest_producer;
+
+        auto canonical_owner = [&](BufferId id,
+                                   const std::string &stage_name,
+                                   const char *access) -> const TensorBase *
+        {
+            if (!arena_)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Capture dependency stage '"
+                          << stage_name << "' declares arena " << access
+                          << " " << bufferIdName(id) << " without a BufferArena ("
+                          << capture_context << ")");
+                return nullptr;
+            }
+            ITensor *tensor = arena_->getTensor(id);
+            auto *base = dynamic_cast<TensorBase *>(tensor);
+            const TensorBase *owner = base ? base->transferStorageOwner() : nullptr;
+            if (!owner)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Capture dependency stage '"
+                          << stage_name << "' has no canonical tensor owner for "
+                          << access << " " << bufferIdName(id) << " ("
+                          << capture_context << ")");
+            }
+            return owner;
+        };
+
+        for (size_t stage_index = 0; stage_index < stage_names.size(); ++stage_index)
+        {
+            const std::string &stage_name = stage_names[stage_index];
+            ComputeNode *node = graph.getNode(stage_name);
+            if (!node || !node->stage)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Capture dependency plan is missing stage '"
+                          << stage_name << "' (" << capture_context << ")");
+                return nullptr;
+            }
+
+            DeviceId stage_device =
+                node->device.is_valid() ? node->device : node->stage->device();
+            if (!stage_device.is_valid())
+                stage_device = capture_device;
+            if (stage_device != capture_device)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Capture dependency stage '"
+                          << stage_name << "' belongs to "
+                          << stage_device.toString() << " instead of "
+                          << capture_device.toString() << " ("
+                          << capture_context << ")");
+                return nullptr;
+            }
+
+            GraphCaptureDependencyLedger::StagePlan plan;
+            plan.stage_identity = node->stage.get();
+            plan.stage_name = stage_name;
+            const StageBufferContract contract = node->stage->bufferContract();
+
+            std::unordered_map<const TensorBase *, size_t> internal_owners;
+            std::unordered_set<const TensorBase *> external_owners;
+            for (const auto &binding : contract.allArenaReads())
+            {
+                const TensorBase *owner =
+                    canonical_owner(binding.id, stage_name, "read");
+                if (!owner)
+                    return nullptr;
+
+                const auto producer = latest_producer.find(binding.id);
+                if (producer == latest_producer.end())
+                {
+                    if (internal_owners.count(owner) == 0)
+                        external_owners.insert(owner);
+                    continue;
+                }
+
+                external_owners.erase(owner);
+                auto [it, inserted] =
+                    internal_owners.emplace(owner, producer->second);
+                if (!inserted)
+                    it->second = std::max(it->second, producer->second);
+            }
+
+            plan.external_inputs.assign(
+                external_owners.begin(), external_owners.end());
+            plan.internal_inputs.reserve(internal_owners.size());
+            for (const auto &[owner, producer_stage_index] : internal_owners)
+            {
+                plan.internal_inputs.push_back({
+                    .tensor = owner,
+                    .producer_stage_index = producer_stage_index,
+                });
+            }
+
+            std::unordered_set<const TensorBase *> output_owners;
+            for (const auto &binding : contract.allWrites())
+            {
+                const TensorBase *owner =
+                    canonical_owner(binding.id, stage_name, "write");
+                if (!owner)
+                    return nullptr;
+                if (output_owners.insert(owner).second)
+                    plan.outputs.push_back(owner);
+                latest_producer[binding.id] = stage_index;
+            }
+
+            stage_plans.push_back(std::move(plan));
+        }
+
+        try
+        {
+            return std::make_unique<GraphCaptureDependencyLedger>(
+                capture_device,
+                capture_stream,
+                std::move(stage_plans),
+                capture_context);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Capture dependency planning failed ("
+                      << capture_context << "): " << e.what());
+            return nullptr;
+        }
+    }
+
     bool DeviceGraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
                                                       IGPUGraphCapture *capture,
                                                       std::span<ITensor *const> externally_visible_outputs,
@@ -622,20 +773,34 @@ namespace llaminar2
          * capture stream before beginCapture(); stage execution inside the
          * transaction is validation-only and must never add an external wait.
          */
-        if (!prepareInputsForGraphCapture(
+        if (!prepareGraphStorageForCapture(
                 graph,
                 ctx,
                 gpu_stream,
                 "single_graph_capture"))
         {
-            LOG_ERROR("[DeviceGraphExecutor] Single-graph capture input preflight failed");
+            LOG_ERROR("[DeviceGraphExecutor] Single-graph capture storage preflight failed");
+            return false;
+        }
+
+        auto dependency_ledger = planGraphCaptureDependencies(
+            graph,
+            std::span<const std::string>(order.data(), order.size()),
+            ctx->deviceId(),
+            gpu_stream,
+            "single_graph_capture");
+        if (!dependency_ledger)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Single-graph capture dependency planning failed");
             return false;
         }
 
         // Step 1: Begin one structurally owned capture transaction.
         ScopedBackendGraphCapture capture_transaction(
             *capture,
-            "single-graph capture");
+            "single-graph capture",
+            dependency_ledger.get());
         if (!capture_transaction.begin())
         {
             LOG_ERROR("[DeviceGraphExecutor] GPU graph beginCapture failed");
@@ -648,10 +813,16 @@ namespace llaminar2
 
         bool exec_success = true;
 
+        const StageRunPolicy capture_policy = StageRunPolicy::capturePhase();
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
-            if (!node->stage->execute(ctx))
+            if (!node || !node->stage ||
+                !runStage(
+                    *node,
+                    ctx,
+                    capture_policy,
+                    /*is_collective=*/false))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed during graph capture: " << name);
                 exec_success = false;
@@ -808,7 +979,8 @@ namespace llaminar2
                 policy.force_recapture,
                 policy.defer_final_sync,
                 policy.capture_boundary,
-                policy.graph_replay_plan_policy);
+                policy.graph_replay_plan_policy,
+                policy.launch_dependency);
 
             if (success)
             {
@@ -862,7 +1034,8 @@ namespace llaminar2
                                                                bool force_recapture,
                                                                bool defer_final_sync,
                                                                GraphCaptureBoundaryHook capture_boundary,
-                                                               GraphReplayPlanPolicy plan_policy)
+                                                               GraphReplayPlanPolicy plan_policy,
+                                                               GraphLaunchDependencyHook launch_dependency)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -1011,14 +1184,14 @@ namespace llaminar2
             DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
             DeviceGraphCaptureController::ReplayHooks fast_hooks{
-                nullptr, // cohere_inputs — skipped during normal replay (skip_coherence=true)
-                [&](ComputeNode &node) -> bool
+                .cohere_inputs = nullptr,
+                .execute_node = [&](ComputeNode &node) -> bool
                 {
                     return executeNode(node, ctx);
                 },
-                prepare_graph_snapshot_copies,
-                record_graph_snapshot_copies,
-                [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
+                .prepare_snapshot_copies = prepare_graph_snapshot_copies,
+                .record_snapshot_copies = record_graph_snapshot_copies,
+                .post_launch = [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
                 {
                     DeviceGraphCaptureController::postCapturedSegmentLaunch(
                         graph, seg, current_step, stream,
@@ -1027,7 +1200,9 @@ namespace llaminar2
                             mark_arena_write_dirty(id, device);
                         });
                 },
-                nullptr};
+                .capture_boundary = nullptr,
+                .launch_dependency = launch_dependency,
+            };
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
@@ -1043,7 +1218,7 @@ namespace llaminar2
             return true;
         }
 
-        // ===== SLOW PATH: Phase 1 (Warmup) or Phase 2 (Capture) =====
+        // ===== FIRST-CAPTURE PATH =====
         auto post_captured_segment_launch = [&](GraphSegment &seg, void *stream)
         {
             DeviceGraphCaptureController::postCapturedSegmentLaunch(
@@ -1057,28 +1232,24 @@ namespace llaminar2
                 });
         };
 
-        auto cohere_replay_stage = [&](ComputeNode &node) -> bool
+        auto cohere_replay_stage = [&](
+                                       ComputeNode &node,
+                                       const std::vector<BufferBinding> &external_reads,
+                                       std::unordered_set<ITensor *> &prepared_inputs,
+                                       std::unordered_set<ITensor *> &prepared_outputs) -> bool
         {
-            const auto policy = node.stage->coherencePolicy();
-            if (policy != CoherencePolicy::INPUT && policy != CoherencePolicy::FULL)
-            {
-                return true;
-            }
-
-            if (!arena_)
-            {
-                LOG_ERROR("[DeviceGraphExecutor] No arena for replay coherence on stage: " << node.name);
-                return false;
-            }
-
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
             const StageBufferContract contract = node.stage->bufferContract();
             void *const coherence_stream = segment_cache.capture_stream;
-            if (!coherence_stream)
+            if (!prepareStageArenaFrontierForCapture(
+                    node,
+                    external_reads,
+                    ctx->deviceId(),
+                    coherence_stream,
+                    prepared_inputs,
+                    prepared_outputs,
+                    "cached_graph_segment"))
             {
-                LOG_ERROR("[DeviceGraphExecutor] Replay coherence for stage '"
-                          << node.name
-                          << "' requires the graph cache's exact non-null capture stream");
                 return false;
             }
 
@@ -1091,17 +1262,6 @@ namespace llaminar2
             }
             if (!validatePreparedWeightBindings(node, contract, target_device))
                 return false;
-
-            // Cohere arena-managed reads (inputs + inouts)
-            for (const auto &binding : contract.allArenaReads())
-            {
-                if (!arena_->prepareForRead(
-                        binding.id, target_device, coherence_stream))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for replay stage: " << node.name);
-                    return false;
-                }
-            }
 
             // Validate exact weight residency and join producer ordering.
             // Graph capture is never an allocation or lazy-upload boundary.
@@ -1118,29 +1278,37 @@ namespace llaminar2
                 node.weights_cohered = true;
             }
 
-            // Cohere arena-managed writes that require fresh storage.
-            for (const auto &binding : contract.writesRequiringPrepare())
-            {
-                if (!arena_->prepareForWrite(
-                        binding.id, target_device, coherence_stream))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for replay stage: " << node.name);
-                    return false;
-                }
-            }
-
             return true;
         };
 
         auto cohere_segment_inputs = [&](const GraphSegment &seg) -> bool
         {
+            std::unordered_set<ITensor *> prepared_inputs;
+            std::unordered_set<ITensor *> prepared_outputs;
             return DeviceGraphCaptureController::cohereReplaySegmentInputs(
                 graph,
                 seg,
-                [&](ComputeNode &node)
+                [&](ComputeNode &node,
+                    const std::vector<BufferBinding> &external_reads)
                 {
-                    return cohere_replay_stage(node);
+                    return cohere_replay_stage(
+                        node,
+                        external_reads,
+                        prepared_inputs,
+                        prepared_outputs);
                 });
+        };
+
+        auto plan_capture_dependencies = [&](const GraphSegment &seg)
+            -> std::unique_ptr<GraphCaptureDependencyLedger>
+        {
+            return planGraphCaptureDependencies(
+                graph,
+                std::span<const std::string>(
+                    seg.stage_names.data(), seg.stage_names.size()),
+                ctx->deviceId(),
+                segment_cache.capture_stream,
+                "cached_graph_segment");
         };
 
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
@@ -1152,29 +1320,43 @@ namespace llaminar2
             return node.stage && node.stage->isCollectiveStage();
         };
 
+        const StageRunPolicy capture_phase_policy =
+            StageRunPolicy::capturePhase();
+
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
-            [&](const GraphSegment &segment)
+            .cohere_inputs = [&](const GraphSegment &segment)
             {
                 return cohere_segment_inputs(segment);
             },
-            [&](ComputeNode &node)
+            .execute_node = [&](ComputeNode &node)
             {
+                if (isGraphCaptureActive())
+                {
+                    return runStage(
+                        node,
+                        ctx,
+                        capture_phase_policy,
+                        is_collective_node(node),
+                        &segment_cache.snapshot_manifest);
+                }
                 return executeNode(node, ctx);
             },
-            prepare_graph_snapshot_copies,
-            record_graph_snapshot_copies,
-            [&](GraphSegment &segment, void *stream)
+            .prepare_snapshot_copies = prepare_graph_snapshot_copies,
+            .record_snapshot_copies = record_graph_snapshot_copies,
+            .post_launch = [&](GraphSegment &segment, void *stream)
             {
                 post_captured_segment_launch(segment, stream);
             },
-            capture_boundary};
+            .capture_boundary = capture_boundary,
+            .launch_dependency = launch_dependency,
+            .plan_capture_dependencies = plan_capture_dependencies,
+        };
 
         // Capture and replay share the same post-launch lifecycle. All mutable
         // GPU state is published by captured kernels and explicit event edges.
-        const StageRunPolicy capture_phase_policy = StageRunPolicy::capturePhase();
         DeviceGraphCaptureController::ReplayHooks capture_hooks{
-            replay_hooks.cohere_inputs,
-            [&](ComputeNode &node)
+            .cohere_inputs = replay_hooks.cohere_inputs,
+            .execute_node = [&](ComputeNode &node)
             {
                 return runStage(
                     node,
@@ -1183,9 +1365,9 @@ namespace llaminar2
                     is_collective_node(node),
                     &segment_cache.snapshot_manifest);
             },
-            replay_hooks.prepare_snapshot_copies,
-            record_graph_snapshot_copies,
-            [&](GraphSegment &segment, void *stream)
+            .prepare_snapshot_copies = replay_hooks.prepare_snapshot_copies,
+            .record_snapshot_copies = record_graph_snapshot_copies,
+            .post_launch = [&](GraphSegment &segment, void *stream)
             {
                 DeviceGraphCaptureController::postCapturedSegmentLaunch(
                     graph,
@@ -1197,7 +1379,10 @@ namespace llaminar2
                         mark_arena_write_dirty(id, device);
                     });
             },
-            capture_boundary};
+            .capture_boundary = capture_boundary,
+            .launch_dependency = launch_dependency,
+            .plan_capture_dependencies = plan_capture_dependencies,
+        };
 
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
         {
@@ -1214,22 +1399,13 @@ namespace llaminar2
             return true;
         }
 
-        // ===== Phase 1: Warmup + replay materialization (first call) =====
-        // Warmup executes the logical transaction exactly once and initializes
-        // stage-owned launch metadata. The same initialization transaction then
-        // records and instantiates the future replay graph without launching it.
-        // Consequently a successful first call always leaves a replay-ready cache;
-        // there is no second-invocation window in which a parent graph can observe
-        // initialized-but-uncaptured state.
-        //
-        // CRITICAL: Run warmup on the CAPTURE stream (not default stream). CK and
-        // ROCm kernel dispatch may cache per-stream state (dispatch tables, workspace
-        // allocations). If warmup runs on the default stream, the capture stream sees
-        // "fresh" kernel contexts that trigger capture-unsafe lazy initialization,
-        // causing intermittent "operation failed due to a previous error during capture".
-        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Warmup)
+        // ===== First use: prepare, capture, instantiate, and launch =====
+        // Launch preparation binds immutable topology only. No stage arithmetic
+        // runs outside the graph, so transaction zero is the first launch of the
+        // captured executable and follows the exact same path as every replay.
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Capture)
         {
-            DeviceGraphCaptureController::executeWarmupPhase(
+            DeviceGraphCaptureController::buildCapturePlan(
                 graph,
                 segment_cache,
                 collective_nodes,
@@ -1237,7 +1413,7 @@ namespace llaminar2
                 collectives_graph_capturable,
                 plan_policy);
 
-            // Create the capture stream early so warmup runs on it.
+            // The graph and every preparation operation own this exact stream.
             if (!segment_cache.ensureCaptureStream(
                     gpu_ctx,
                     ctx ? ctx->deviceId() : DeviceId::invalid(),
@@ -1245,10 +1421,10 @@ namespace llaminar2
                         ? config_.worker_gpu_context_uses_process_pool
                         : true))
             {
-                LOG_ERROR("[DeviceGraphExecutor] GPU graph warmup could not establish its explicit capture stream");
+                LOG_ERROR("[DeviceGraphExecutor] GPU graph capture could not establish its explicit stream");
                 return false;
             }
-            void *warmup_stream = segment_cache.capture_stream;
+            void *capture_stream = segment_cache.capture_stream;
 
             if (!DeviceGraphCaptureController::prepareReplayGpuTiming(
                     segment_cache,
@@ -1256,112 +1432,40 @@ namespace llaminar2
                     ctx ? ctx->deviceId().toString() : std::string{}))
             {
                 LOG_ERROR(
-                    "[DeviceGraphExecutor] GPU graph warmup could not establish "
+                    "[DeviceGraphExecutor] GPU graph capture could not establish "
                     "its fixed asynchronous replay timing ring");
                 return false;
             }
 
             /*
              * Preserve stream order entirely on device. Previous decode work,
-             * including KV/GDN writes, was queued on the worker stream. Warmup
-             * consumes those tensors on the capture stream, so record one
+             * including KV/GDN writes, was queued on the worker stream. Capture
+             * consumes those tensors on its own stream, so record one
              * worker-stream event and make the capture stream wait for it.
-             * A device synchronize here both destroys overlap and lets one
-             * LocalTP rank race ahead into collective warmup while another rank
-             * is still changing streams.
+             * A device synchronization here would destroy overlap and obscure
+             * the producer/consumer edge represented by this event.
              */
-            if (gpu_stream && gpu_stream != warmup_stream)
+            if (gpu_stream && gpu_stream != capture_stream)
             {
                 if (!segment_cache.orderCaptureStreamAfter(
                         gpu_ctx,
                         gpu_stream))
                 {
                     LOG_ERROR(
-                        "[DeviceGraphExecutor] GPU graph warmup could not "
+                        "[DeviceGraphExecutor] GPU graph capture could not "
                         "publish its worker-to-capture stream handoff");
                     return false;
                 }
                 PerfStatsCollector::addCounter(
                     "forward_graph",
-                    "warmup_stream_event_handoffs",
+                    "capture_stream_event_handoffs",
                     1.0,
                     "decode",
                     ctx ? ctx->deviceId().toString() : std::string{},
                     {{"context", segment_cache.perf_context}});
             }
 
-            /*
-             * LocalTP participants must enter warmup as one lifecycle. Actual
-             * capture already invokes this hook before each beginCapture(); the
-             * first warmup execution is equally collective-bearing and must not
-             * be allowed to drift independently across ranks.
-             */
-            if (capture_boundary)
-            {
-                std::ostringstream boundary;
-                boundary << "before_warmup:"
-                         << "phase=warmup"
-                         << ":step=" << current_step
-                         << ":scope=full_graph";
-                if (!segment_cache.perf_context.empty())
-                    boundary << ":context=" << segment_cache.perf_context;
-                if (!capture_boundary(boundary.str(), gpu_stream))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphExecutor] GPU graph warmup boundary "
-                        "rendezvous failed: "
-                        << boundary.str());
-                    return false;
-                }
-            }
-
-            // Point all stages at the capture stream for warmup execution.
-            for (const auto &name : graph.getExecutionOrder())
-            {
-                auto *node = graph.getNode(name);
-                if (node && node->stage)
-                {
-                    node->stage->setGPUStream(warmup_stream);
-                }
-            }
-
-            // Warmup executes all stages normally (no capture) to ensure launch
-            // metadata and prebound workspace state are complete on the capture
-            // stream. Preserve the capture-stream assignment above:
-            // the generic fast-decode entry point intentionally rebinds eager
-            // eager passes to the worker stream to avoid stale stream
-            // ownership of live device state.
-            auto warmup_policy = StageRunPolicy::fastDecode();
-            warmup_policy.preserve_gpu_streams = true;
-            if (!runStages(
-                    graph,
-                    ctx,
-                    warmup_policy,
-                    collective_nodes,
-                    &segment_cache.snapshot_manifest))
-            {
-                return false;
-            }
-
-            /*
-             * Recording a native graph does not execute its captured kernels.
-             * Materialize immediately after warmup, but explicitly suppress the
-             * capture finalizer's launch/manual-execution semantics. This keeps
-             * the user-visible transaction byte-for-byte identical to the single
-             * warmup execution while making the cache composable before control
-             * returns to its caller.
-             */
             graph.reset();
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "decode_graph_phase",
-                1.0,
-                "decode",
-                ctx ? ctx->deviceId().toString() : std::string{},
-                {{"context", segment_cache.perf_context},
-                 {"phase", DeviceGraphCaptureController::phaseName(
-                               DeviceGraphCaptureController::Phase::Capture)},
-                 {"initialization_transaction", "warmup_then_materialize"}});
             const auto capture_result =
                 DeviceGraphCaptureController::executeCapturePhase(
                     graph,
@@ -1370,9 +1474,7 @@ namespace llaminar2
                     gpu_ctx,
                     has_collective_nodes,
                     current_step,
-                    capture_hooks,
-                    DeviceGraphCaptureController::CapturePublicationPolicy::
-                        MaterializeOnly);
+                    capture_hooks);
             if (capture_result.reset_cache)
             {
                 segment_cache.reset(
@@ -1382,17 +1484,9 @@ namespace llaminar2
             {
                 return false;
             }
+            segment_cache.initialized = true;
             segment_cache.needs_capture = false;
             return true;
-        }
-
-        // ===== Invalid externally visible capture state =====
-        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Capture)
-        {
-            LOG_ERROR(
-                "[DeviceGraphExecutor] GPU graph cache exposed a partial "
-                "warmup-without-capture state; first-use materialization is atomic");
-            return false;
         }
 
         // Replay is handled by the fast path above; this point is unreachable.

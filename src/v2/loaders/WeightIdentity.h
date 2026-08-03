@@ -1,3 +1,13 @@
+/**
+ * @file WeightIdentity.h
+ * @brief Typed identity, derivation, residency, and lifecycle metadata for model weights.
+ *
+ * Weight roles describe semantic use rather than merely matching tensor names or
+ * ranks. Preparation and graph construction use these roles to choose packed
+ * GEMM representations, immutable scalar/vector storage, expert residency, and
+ * release policy without relying on ambiguous shape heuristics.
+ */
+
 #pragma once
 
 #include "../backends/DeviceId.h"
@@ -37,6 +47,8 @@ namespace llaminar2
         MoEExpertUp,
         MoEExpertDown,
         SharedExpertGate,
+        /** Input-dependent sigmoid gate vector; immutable FP32, never a GEMM weight. */
+        SharedExpertInputGate,
         SharedExpertUp,
         SharedExpertDown,
         Norm,
@@ -54,6 +66,7 @@ namespace llaminar2
     inline bool isSharedExpertRole(WeightRole role)
     {
         return role == WeightRole::SharedExpertGate ||
+               role == WeightRole::SharedExpertInputGate ||
                role == WeightRole::SharedExpertUp ||
                role == WeightRole::SharedExpertDown;
     }

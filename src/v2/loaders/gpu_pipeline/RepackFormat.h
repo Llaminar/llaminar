@@ -55,6 +55,7 @@ struct RepackKernels {
                                   int N, int K,
                                   int output_N,
                                   int output_row_offset,
+                                  int packed_group_rows,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;

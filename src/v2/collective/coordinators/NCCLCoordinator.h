@@ -513,6 +513,16 @@ namespace llaminar2
         // Direct execution mutex — serializes direct-path allreduce calls
         // that bypass the coordinator thread (see allreduceMultiWithComputeDeps)
         std::mutex direct_exec_mutex_;
+
+        /**
+         * @brief Serialize the one fatal communicator-abort transaction.
+         *
+         * LocalTP can receive the same participant failure through more than
+         * one observer. Only one caller may detach and abort the communicator
+         * clique; later callers observe the already-invalidated handles and
+         * merely request coordinator shutdown.
+         */
+        std::mutex abort_mutex_;
     };
 
 } // namespace llaminar2

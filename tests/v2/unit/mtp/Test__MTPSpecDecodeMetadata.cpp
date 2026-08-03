@@ -198,7 +198,7 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
     EXPECT_FALSE(binding.devicePointers().complete());
 }
 
-TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingCapacityGrowthRequiresRebind)
 {
     if (!hasCPUBackend())
     {
@@ -223,7 +223,7 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
     // persistent metadata buffers. The binding must report an undersized
     // workspace and clear device pointers rather than continuing with stale
     // pointers from the previous shape.
-    binding.setShape(large_shape);
+    binding.ensureCapacity(large_shape);
     EXPECT_FALSE(binding.hasWorkspace());
     EXPECT_THAT(binding.bindingError(), HasSubstr("too small"));
     EXPECT_FALSE(binding.devicePointers().complete());
@@ -233,6 +233,122 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
     binding.bindWorkspace(&large_workspace);
     EXPECT_TRUE(binding.hasWorkspace()) << binding.bindingError();
     EXPECT_TRUE(binding.devicePointers().complete());
+}
+
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingCapacityCannotShrink)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape large_capacity{
+        .max_requests = 2,
+        .max_draft_tokens = 8,
+    };
+    const MTPSpecDecodeMetadataShape small_request{
+        .max_requests = 1,
+        .max_draft_tokens = 3,
+    };
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(large_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    const auto pointers_before = binding.devicePointers();
+
+    binding.ensureCapacity(small_request);
+
+    EXPECT_EQ(binding.capacity().max_requests, 2);
+    EXPECT_EQ(binding.capacity().max_draft_tokens, 8);
+    EXPECT_TRUE(binding.covers(small_request));
+    EXPECT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    EXPECT_EQ(
+        binding.devicePointers().verifier_logit_rows,
+        pointers_before.verifier_logit_rows);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, SmallerVerifierPlanUsesReservedCapacityWithoutMutation)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape workspace_capacity{
+        .max_requests = 1,
+        .max_draft_tokens = 8,
+    };
+    const MTPSpecDecodeMetadataShape request_shape{
+        .max_requests = 1,
+        .max_draft_tokens = 5,
+    };
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {3, 5, 7, 9, 11};
+    const MTPSpecDecodeVerifierInputPlan plan =
+        buildMTPSpecDecodeVerifierInputPlan(request_shape, {request});
+    ASSERT_TRUE(plan.ok) << plan.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(workspace_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierInputPlan(
+            plan,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+
+    ASSERT_TRUE(upload.ok) << upload.error;
+    EXPECT_EQ(binding.capacity().max_requests, 1);
+    EXPECT_EQ(binding.capacity().max_draft_tokens, 8);
+    EXPECT_TRUE(binding.covers(request_shape));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, VerifierPlanCannotOverflowReservedCapacity)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape workspace_capacity{
+        .max_requests = 1,
+        .max_draft_tokens = 3,
+    };
+    const MTPSpecDecodeMetadataShape request_shape{
+        .max_requests = 1,
+        .max_draft_tokens = 5,
+    };
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {3, 5, 7, 9, 11};
+    const MTPSpecDecodeVerifierInputPlan plan =
+        buildMTPSpecDecodeVerifierInputPlan(request_shape, {request});
+    ASSERT_TRUE(plan.ok) << plan.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(workspace_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierInputPlan(
+            plan,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+
+    EXPECT_FALSE(upload.ok);
+    EXPECT_THAT(upload.error, HasSubstr("setup-owned workspace capacity"));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingDoesNotRequireCommittedRowCompatibilityBuffers)

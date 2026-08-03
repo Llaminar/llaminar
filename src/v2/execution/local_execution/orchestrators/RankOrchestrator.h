@@ -938,7 +938,7 @@ namespace llaminar2
         const void *prepareMTPVerifierInputTokenBatchOnDevice(
             const DeviceMTPVerifierInputBatchRequest *requests,
             int request_count,
-            int padded_seq_len) override;
+            int logical_padded_seq_len) override;
         const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
             const int32_t *verifier_tokens,
             int total_verifier_input_tokens,
@@ -999,14 +999,14 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
-        bool beginDeviceResidentStochasticGeneration(
+        bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens) override;
-        bool materializeDeviceResidentStochasticGeneration(
+        bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth) override;
-        bool launchDeviceResidentStochasticGeneration() override;
-        bool finishDeviceResidentStochasticGeneration(
+        bool launchDeviceResidentGeneration() override;
+        bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
@@ -1595,7 +1595,14 @@ namespace llaminar2
         /// PP activation transfer contract (built during initializePPDeviceRunners)
         std::unique_ptr<PPActivationContract> pp_activation_contract_;
 
-        /// LOCAL TP context for collective operations (TP mode)
+        /**
+         * @brief LOCAL TP context for collective operations (TP mode).
+         *
+         * This member must remain declared before `device_runners_` and
+         * `tp_worker_pool_`. Reverse member destruction then joins worker
+         * threads and destroys native graph owners before LocalTPContext may
+         * abort NCCL/RCCL communicators after a fatal cancellation.
+         */
         std::unique_ptr<ILocalTPContext> tp_ctx_;
 
         /// LOCAL PP context for inter-stage transfers (PP mode)
@@ -1604,9 +1611,13 @@ namespace llaminar2
         /// Effective parallelism mode (resolved from config)
         ParallelismMode mode_ = ParallelismMode::TP;
 
-        /// Per-device inference runners
-        /// In TP mode: one runner per device
-        /// In PP mode: one runner per stage
+        /**
+         * @brief Per-device inference runners and native collective-graph owners.
+         *
+         * In TP mode there is one runner per device; in PP mode there is one
+         * runner per stage. These members are destroyed before `tp_ctx_`, which
+         * is the mandatory NCCL/RCCL graph-reference release order.
+         */
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners_;
 
         /// PP stage runners (when stages are TP domains, these are RankOrchestrator)

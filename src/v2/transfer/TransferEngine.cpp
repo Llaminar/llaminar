@@ -169,6 +169,12 @@ namespace llaminar2
                 "TransferEngine::prepareDeviceInput requires the exact "
                 "non-null consumer stream");
         }
+        if (isGraphCaptureActive())
+        {
+            throw std::logic_error(
+                "TransferEngine::prepareDeviceInput is forbidden during GPU "
+                "graph capture; capture consumers must use requireDeviceInput");
+        }
 
         TensorBase *base = requireTransferStorageOwner(
             tensor,
@@ -213,12 +219,38 @@ namespace llaminar2
 
         if (!base->gpu_data_ptr_ ||
             !base->gpu_device_.has_value() ||
-            *base->gpu_device_ != target_device ||
-            !::llaminar2::isDeviceValid(base->coherence_state_))
+            *base->gpu_device_ != target_device)
         {
             throw std::runtime_error(
-                "TransferEngine::requireDeviceInput requires valid pre-existing "
-                "storage on " +
+                "TransferEngine::requireDeviceInput requires pre-existing "
+                "storage on the exact device " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        /*
+         * An earlier stage in this exact capture transaction has recorded, but
+         * not yet executed, the producer kernel.  Stable storage plus the frozen
+         * topological ledger is the complete proof here; publishing global device
+         * authority or importing an old event would both describe the wrong
+         * generation.  Unknown and graph-external inputs continue through the
+         * strict coherence/event checks below.
+         */
+        if (auto *ledger = currentGraphCaptureDependencyLedger())
+        {
+            const auto disposition = ledger->classifyInput(
+                base, target_device, consumer_stream);
+            if (disposition ==
+                GraphCaptureDependencyLedger::InputDisposition::InternalRecorded)
+            {
+                return;
+            }
+        }
+
+        if (!::llaminar2::isDeviceValid(base->coherence_state_))
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput requires globally valid "
+                "external input bytes on " +
                 target_device.toString() + tensorTransferState(*base));
         }
 
@@ -346,7 +378,45 @@ namespace llaminar2
                 "TransferEngine::prepareDeviceOutput requires the exact "
                 "non-null producer stream");
         }
+        if (isGraphCaptureActive())
+        {
+            throw std::logic_error(
+                "TransferEngine::prepareDeviceOutput is forbidden during GPU "
+                "graph capture; capture writers must use requireDeviceOutput");
+        }
         allocateDeviceStorage(tensor, target_device);
+    }
+
+    void TransferEngine::requireDeviceOutput(
+        ITensor *tensor,
+        DeviceId target_device,
+        void *producer_stream)
+    {
+        if (!target_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::requireDeviceOutput requires a GPU target");
+        }
+        if (!producer_stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::requireDeviceOutput requires the exact "
+                "non-null producer stream");
+        }
+
+        TensorBase *base = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::requireDeviceOutput");
+        std::lock_guard<std::mutex> lock(base->coherence_mutex_);
+        if (!base->gpu_data_ptr_ ||
+            !base->gpu_device_.has_value() ||
+            *base->gpu_device_ != target_device)
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceOutput requires pre-existing "
+                "storage on the exact device " +
+                target_device.toString() + tensorTransferState(*base));
+        }
     }
 
     void TransferEngine::publishDeviceWrite(
@@ -367,6 +437,29 @@ namespace llaminar2
             throw std::invalid_argument(
                 "TransferEngine::publishDeviceWrite requires the exact "
                 "non-null producer stream");
+        }
+
+        if (auto *ledger = currentGraphCaptureDependencyLedger())
+        {
+            ledger->validateRecordedPublication(
+                tensor, device, producer_stream);
+            std::lock_guard<std::mutex> lock(tensor->coherence_mutex_);
+            if (!tensor->gpu_data_ptr_ ||
+                !tensor->gpu_device_.has_value() ||
+                *tensor->gpu_device_ != device)
+            {
+                throw std::runtime_error(
+                    "TransferEngine::publishDeviceWrite recorded a graph output "
+                    "without stable storage on " +
+                    device.toString() + tensorTransferState(*tensor));
+            }
+
+            /*
+             * Recording is not execution.  The graph boundary publishes the
+             * actual completed generation after launch, with one exact stream
+             * event.  Do not mutate coherence or add per-stage event nodes here.
+             */
+            return;
         }
         tensor->publishDeviceWriteStateWithEvent(device, producer_stream);
     }

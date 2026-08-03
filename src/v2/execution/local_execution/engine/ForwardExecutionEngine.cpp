@@ -249,7 +249,23 @@ namespace llaminar2
             const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan)
         {
             ForwardInput chunk_input = base_input;
-            chunk_input.token_ids = plan.chunk.token_ids.data();
+            switch (plan.chunk.token_authority)
+            {
+            case PrefillChunkTokenAuthority::HostPaddedRows:
+                chunk_input.token_ids = plan.chunk.token_ids.data();
+                chunk_input.token_ids_device = nullptr;
+                break;
+            case PrefillChunkTokenAuthority::DeviceAdmissionBank:
+                /*
+                 * Request admission has already initialized every physical row
+                 * through the selected bucket. Keeping the host pointer null is
+                 * part of the device-ownership contract, not an absent-input
+                 * fallback: the graph embeds the stable arena pointer below.
+                 */
+                chunk_input.token_ids = nullptr;
+                chunk_input.token_ids_device = base_input.token_ids_device;
+                break;
+            }
             chunk_input.position_policy = plan.position_policy;
             if (plan.position_policy == ForwardPositionPolicy::ContiguousOffset)
             {
@@ -559,9 +575,21 @@ namespace llaminar2
     {
         PrefillChunkRuntimePlan plan;
 
-        if (!input.token_ids)
+        if (!input.token_ids && !input.token_ids_device)
         {
-            plan.error = "bucketed prefill requires token_ids";
+            plan.error = "bucketed prefill requires one authoritative token source";
+            return plan;
+        }
+        if (input.token_ids && input.token_ids_device)
+        {
+            plan.error =
+                "bucketed prefill rejects simultaneous host and device token authorities";
+            return plan;
+        }
+        if (input.token_ids_device && !input.device.is_gpu())
+        {
+            plan.error =
+                "bucketed prefill device token input requires a GPU device";
             return plan;
         }
         if (input.batch_size != 1)
@@ -587,11 +615,18 @@ namespace llaminar2
         plan.chunk.token_offset = token_offset;
         plan.chunk.real_count = real_seq_len;
         plan.chunk.bucket_seq_len = plan.selection.bucket_seq_len;
-        plan.chunk.token_ids = padPrefillTokensToBucket(
-            input.token_ids,
-            real_seq_len,
-            plan.selection.bucket_seq_len,
-            pad_token_id);
+        plan.chunk.token_authority = input.token_ids_device
+                                         ? PrefillChunkTokenAuthority::DeviceAdmissionBank
+                                         : PrefillChunkTokenAuthority::HostPaddedRows;
+        if (plan.chunk.token_authority ==
+            PrefillChunkTokenAuthority::HostPaddedRows)
+        {
+            plan.chunk.token_ids = padPrefillTokensToBucket(
+                input.token_ids,
+                real_seq_len,
+                plan.selection.bucket_seq_len,
+                pad_token_id);
+        }
         if (plan.position_policy == ForwardPositionPolicy::ExplicitRows)
         {
             plan.chunk.position_ids = buildPrefillChunkPositionIds(
@@ -601,7 +636,9 @@ namespace llaminar2
                 input.batch_size);
         }
 
-        if (plan.chunk.token_ids.empty() ||
+        if ((plan.chunk.token_authority ==
+                 PrefillChunkTokenAuthority::HostPaddedRows &&
+             plan.chunk.token_ids.empty()) ||
             (plan.position_policy == ForwardPositionPolicy::ExplicitRows &&
              plan.chunk.position_ids.empty()))
         {
@@ -1537,6 +1574,62 @@ namespace llaminar2
             last_all_position_verifier_graph_, error);
     }
 
+    std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>
+    ForwardExecutionEngine::deviceLoopGraphTemplate(
+        const ForwardGraphSignature &signature,
+        std::string *error) const
+    {
+        auto reject = [&](const std::string &reason)
+            -> std::optional<DeviceLoopGraphTemplateView>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+
+        const auto cache_it = cache_.find(signature);
+        if (cache_it == cache_.end())
+        {
+            return reject(
+                "no cached forward graph matches the exact signature");
+        }
+        if (!cache_it->second.valid || !cache_it->second.graph)
+        {
+            return reject(
+                "the exact forward graph cache entry is not valid");
+        }
+
+        const ForwardGraphCache &cache = cache_it->second;
+        if (!signature.device.is_gpu() || !signature.decode)
+            return reject("device-loop composition requires a GPU decode graph");
+        if (!signature.uses_device_token_ids ||
+            !signature.uses_device_position_ids)
+        {
+            return reject(
+                "device-loop composition requires device-owned token and position rows");
+        }
+        if (!cache.phase3_active)
+            return reject("forward graph is not replay-ready");
+
+        std::string template_error;
+        const auto template_view = cache.segment_cache.deviceLoopGraphTemplate(
+            *cache.graph,
+            &template_error);
+        if (!template_view)
+            return reject(template_error);
+
+        DeviceLoopGraphTemplateView view;
+        view.capture = template_view->capture;
+        view.signature = signature;
+        view.device = signature.device;
+        view.stream = template_view->stream;
+        view.stage_count = template_view->stage_count;
+        view.captured_node_count = template_view->captured_node_count;
+        return view;
+    }
+
     void ForwardExecutionEngine::clearLastAllPositionVerifierForwardGraph()
     {
         last_all_position_verifier_graph_ = {};
@@ -1583,39 +1676,12 @@ namespace llaminar2
         if (!state.valid)
             return reject("no successful forward graph is retained");
 
-        const auto cache_it = cache_.find(state.signature);
-        if (cache_it == cache_.end() || !cache_it->second.valid ||
-            !cache_it->second.graph)
+        auto view = deviceLoopGraphTemplate(state.signature, error);
+        if (!view && error &&
+            *error == "no cached forward graph matches the exact signature")
         {
-            return reject("retained forward graph no longer owns a valid cache entry");
+            *error = "retained forward graph no longer owns a valid cache entry";
         }
-
-        const ForwardGraphCache &cache = cache_it->second;
-        if (!state.signature.device.is_gpu() || !state.signature.decode)
-            return reject("device-loop composition requires a GPU decode graph");
-        if (!state.signature.uses_device_token_ids ||
-            !state.signature.uses_device_position_ids)
-        {
-            return reject(
-                "device-loop composition requires device-owned token and position rows");
-        }
-        if (!cache.phase3_active)
-        {
-            return reject("forward graph is not replay-ready");
-        }
-        std::string template_error;
-        const auto template_view = cache.segment_cache.deviceLoopGraphTemplate(
-            *cache.graph,
-            &template_error);
-        if (!template_view)
-            return reject(template_error);
-        DeviceLoopGraphTemplateView view;
-        view.capture = template_view->capture;
-        view.signature = state.signature;
-        view.device = state.signature.device;
-        view.stream = template_view->stream;
-        view.stage_count = template_view->stage_count;
-        view.captured_node_count = template_view->captured_node_count;
         return view;
     }
 
@@ -3057,14 +3123,32 @@ namespace llaminar2
              * graph-owned ordering. This is a nonblocking device-side fence; it
              * performs no stream or device synchronization.
              */
-            if (!executor_.prepareInputsForGraphCapture(
+            if (!executor_.prepareGraphStorageForCapture(
                     *forward_cache.graph,
                     ctx,
                     stream,
                     "prefill_graph_capture"))
             {
-                LOG_ERROR("[ForwardExecutionEngine] Prefill graph input dependency preparation failed for seq_len="
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph storage preparation failed for seq_len="
                           << input.seq_len);
+                return false;
+            }
+
+            const auto &prefill_capture_order =
+                forward_cache.graph->getExecutionOrder();
+            auto dependency_ledger = executor_.planGraphCaptureDependencies(
+                *forward_cache.graph,
+                std::span<const std::string>(
+                    prefill_capture_order.data(), prefill_capture_order.size()),
+                input.device,
+                stream,
+                "prefill_graph_capture");
+            if (!dependency_ledger)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Prefill graph dependency planning "
+                    "failed for seq_len="
+                    << input.seq_len);
                 return false;
             }
 
@@ -3100,7 +3184,8 @@ namespace llaminar2
                             ctx,
                             &forward_cache.collective_nodes,
                             &forward_cache.snapshot_manifest);
-                    }))
+                    },
+                    dependency_ledger.get()))
             {
                 LOG_ERROR(
                     "[ForwardExecutionEngine] Mandatory prefill graph capture transaction failed for seq_len="

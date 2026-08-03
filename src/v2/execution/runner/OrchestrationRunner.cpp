@@ -3790,10 +3790,6 @@ namespace llaminar2
 
                 DeviceSpeculativePublicationRequest publication_request;
                 publication_request.outcome = resident_request_batch_outcome;
-                publication_request.request_count =
-                    tx.scheduled_batch.request_count;
-                publication_request.max_draft_tokens =
-                    resident_request_batch_verifier_rows;
                 publication_request.max_state_commit_rows =
                     resident_request_batch_verifier_rows;
                 publication_request.publish_mtp_shifted_kv =
@@ -3808,10 +3804,15 @@ namespace llaminar2
                         {},
                         {{"sampling", "greedy"},
                          {"request_count",
-                          std::to_string(publication_request.request_count)},
-                         {"max_draft_tokens",
+                          std::to_string(publication_request.requestCount())},
+                         {"logical_verifier_rows",
                           std::to_string(
-                              publication_request.max_draft_tokens)}});
+                              publication_request
+                                  .logicalVerifierRowsPerRequest())},
+                         {"physical_verifier_rows",
+                          std::to_string(
+                              publication_request
+                                  .physicalVerifierRowsPerRequest())}});
                     tx.published =
                         runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
                             publication_request,
@@ -3891,10 +3892,10 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"request_count",
-                      std::to_string(publication_request.request_count)},
-                     {"max_draft_tokens",
+                      std::to_string(publication_request.requestCount())},
+                     {"logical_verifier_rows",
                       std::to_string(
-                          publication_request.max_draft_tokens)},
+                          publication_request.logicalVerifierRowsPerRequest())},
                      {"sampling", "greedy"}});
                 tx.ok = true;
 
@@ -4465,10 +4466,6 @@ namespace llaminar2
 
                 DeviceSpeculativePublicationRequest publication_request;
                 publication_request.outcome = resident_request_batch_outcome;
-                publication_request.request_count =
-                    tx.scheduled_batch.request_count;
-                publication_request.max_draft_tokens =
-                    resident_request_batch_verifier_rows;
                 publication_request.max_state_commit_rows =
                     resident_request_batch_verifier_rows;
                 publication_request.publish_mtp_shifted_kv =
@@ -4483,10 +4480,15 @@ namespace llaminar2
                         {},
                         {{"sampling", "stochastic"},
                          {"request_count",
-                          std::to_string(publication_request.request_count)},
-                         {"max_draft_tokens",
+                          std::to_string(publication_request.requestCount())},
+                         {"logical_verifier_rows",
                           std::to_string(
-                              publication_request.max_draft_tokens)}});
+                              publication_request
+                                  .logicalVerifierRowsPerRequest())},
+                         {"physical_verifier_rows",
+                          std::to_string(
+                              publication_request
+                                  .physicalVerifierRowsPerRequest())}});
                     tx.published =
                         runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
                             publication_request,
@@ -4589,10 +4591,10 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"request_count",
-                      std::to_string(publication_request.request_count)},
-                     {"max_draft_tokens",
+                      std::to_string(publication_request.requestCount())},
+                     {"logical_verifier_rows",
                       std::to_string(
-                          publication_request.max_draft_tokens)}});
+                          publication_request.logicalVerifierRowsPerRequest())}});
                 tx.ok = true;
             }
             else
@@ -5003,16 +5005,16 @@ namespace llaminar2
         return true;
     }
 
-    bool OrchestrationRunner::admitScalarDeviceResidentStochasticGeneration(
-        bool stochastic_device_verify)
+    bool OrchestrationRunner::admitScalarDeviceResidentGeneration(
+        bool grouped_device_verify)
     {
-        if (!stochastic_device_verify || !device_generation_admission_pending_)
+        if (!grouped_device_verify || !device_generation_admission_pending_)
             return true;
         if (!runner_ || !decode_transaction_planning_position_.has_value() ||
             *decode_transaction_planning_position_ < 0)
         {
             return setError(
-                "GPU stochastic MTP generation admission has no initialized prefill boundary");
+                "GPU grouped MTP generation admission has no initialized prefill boundary");
         }
 
         int response_budget = decode_step_token_budget_;
@@ -5028,15 +5030,15 @@ namespace llaminar2
         if (response_budget <= 0)
         {
             return setError(
-                "GPU stochastic MTP generation admission has no positive response capacity");
+                "GPU grouped MTP generation admission has no positive response capacity");
         }
 
-        if (!runner_->beginDeviceResidentStochasticGeneration(
+        if (!runner_->beginDeviceResidentGeneration(
                 /*request_count=*/1,
                 response_budget))
         {
             return setError(
-                "Failed to admit the device-resident stochastic generation response ledger");
+                "Failed to admit the device-resident GPU generation response ledger");
         }
 
         device_generation_admission_pending_ = false;
@@ -5048,7 +5050,7 @@ namespace llaminar2
             {},
             {{"request_count", "1"},
              {"response_budget", std::to_string(response_budget)},
-             {"boundary", "first_scalar_stochastic_mtp_decode"}});
+             {"boundary", "first_scalar_grouped_mtp_decode"}});
         return true;
     }
 
@@ -5565,14 +5567,6 @@ namespace llaminar2
         const bool use_serial_sample_equivalent_host_stochastic =
             stochastic_host_verify &&
             active_sampling_params_.seed != 0;
-        if (!admitScalarDeviceResidentStochasticGeneration(
-                stochastic_device_verify))
-        {
-            return fail_without_checkpoint(
-                last_error_.empty()
-                    ? "GPU stochastic MTP generation admission failed"
-                    : last_error_);
-        }
         const bool use_sampling_penalties =
             active_sampling_params_.has_penalties() && !stochastic_verify;
         if (stochastic_device_verify &&
@@ -5673,6 +5667,14 @@ namespace llaminar2
              */
             return fail_without_checkpoint(
                 "Grouped decode-equivalent MTP verifier has no grouped publication path; GPU grouped verifier requires device-resident accepted-state publication");
+        }
+        if (!admitScalarDeviceResidentGeneration(
+                use_grouped_outcome_device_resident_publication_verifier))
+        {
+            return fail_without_checkpoint(
+                last_error_.empty()
+                    ? "GPU grouped MTP generation admission failed"
+                    : last_error_);
         }
         const bool use_grouped_outcome_host_publication_verifier =
             verifier_policy.path ==
@@ -6485,13 +6487,52 @@ namespace llaminar2
              * next direct-emit or verifier publication observes a cache-head
              * mismatch.
              */
-            std::string condition_sidecar_position_error;
-            const std::optional<int> condition_sidecar_position =
-                currentDecodeTransactionPositionForPlanning(
-                    "condition forward shifted commit",
-                    &condition_sidecar_position_error);
-            if (!condition_sidecar_position)
-                return fail_after_checkpoint(condition_sidecar_position_error);
+            const bool gpu_condition_forward =
+                runner_->primaryDeviceId().is_gpu();
+            constexpr int kConditionTargetSampleSlot = 0;
+            DeviceResidentLogicalSequenceStateHandle condition_state;
+            std::optional<int> cpu_condition_sidecar_position;
+
+            if (gpu_condition_forward)
+            {
+                /*
+                 * The compact verifier publisher owns the condition token and
+                 * its pre-forward logical position as one event-published
+                 * device transaction. Preserve the token D2D before shifted-KV
+                 * maintenance consumes that one-shot mailbox. The persistent
+                 * target slot then becomes the sole token source for the main
+                 * condition graph; no host token or position is uploaded.
+                 */
+                condition_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                if (!condition_state.valid())
+                {
+                    return fail_after_checkpoint(
+                        "GPU MTP condition forward requires a device-resident logical-state mailbox");
+                }
+                if (!runner_
+                         ->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                             condition_state,
+                             /*request_index=*/0,
+                             kConditionTargetSampleSlot))
+                {
+                    return fail_after_checkpoint(
+                        "GPU MTP condition forward could not preserve its resident token in the device target slot");
+                }
+            }
+            else
+            {
+                std::string condition_sidecar_position_error;
+                cpu_condition_sidecar_position =
+                    currentDecodeTransactionPositionForPlanning(
+                        "condition forward shifted commit",
+                        &condition_sidecar_position_error);
+                if (!cpu_condition_sidecar_position)
+                {
+                    return fail_after_checkpoint(
+                        condition_sidecar_position_error);
+                }
+            }
 
             bool condition_shifted_commit_ok = false;
             {
@@ -6499,12 +6540,18 @@ namespace llaminar2
                     "mtp",
                     "condition_forward_shifted_commit",
                     "decode");
-                condition_shifted_commit_ok =
-                    runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
-                        condition_token,
-                        /*already_appended_tokens=*/0,
-                        /*allow_speculative_discard=*/true,
-                        *condition_sidecar_position);
+                condition_shifted_commit_ok = gpu_condition_forward
+                    ? runner_
+                          ->commitMTPShiftedRowFromDeviceResidentLogicalState(
+                              condition_state,
+                              /*request_index=*/0,
+                              /*already_appended_tokens=*/0,
+                              /*allow_speculative_discard=*/true)
+                    : runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                          condition_token,
+                          /*already_appended_tokens=*/0,
+                          /*allow_speculative_discard=*/true,
+                          *cpu_condition_sidecar_position);
             }
             if (!condition_shifted_commit_ok)
             {
@@ -6527,25 +6574,18 @@ namespace llaminar2
                 * let that consumer enforce ordering on the same stream.
                 */
                 runner_->setMTPMainDecodeSyncDeferralEnabled(can_defer_main_decode_sync);
-                if (runner_->primaryDeviceId().is_gpu())
+                if (gpu_condition_forward)
                 {
                     /*
-                     * A GPU condition row is valid only as the token/position pair
-                     * published by the current logical-state transaction. The
-                     * host token is a response shadow; feeding it through ordinary
-                     * forward() would leave replicated MoE routing without a
-                     * device logical position and could pair stale host state with
-                     * a newer KV publication.
+                     * Shifted-KV publication consumed the original logical-state
+                     * mailbox. Recompose the condition token from the durable
+                     * target slot with the now-current device KV position, then
+                     * launch the captured main graph from that typed mailbox.
                      */
-                    const DeviceResidentLogicalSequenceStateHandle
-                        condition_state =
-                            runner_->deviceResidentLogicalSequenceState();
-                    ok = condition_state.valid() &&
-                         runner_
-                             ->advanceMTPMainConditionFromDeviceResidentLogicalState(
+                    ok = runner_
+                             ->advanceMTPMainConditionFromDeviceTargetSample(
                                  condition_token,
-                                 condition_state,
-                                 /*request_index=*/0);
+                                 kConditionTargetSampleSlot);
                 }
                 else
                 {
@@ -7039,26 +7079,58 @@ namespace llaminar2
             const int budgeted_speculative_outputs =
                 std::max(0, decode_step_token_budget_ -
                                   first_token_output_budget_cost);
-            speculative_draft_count =
-                std::min(speculative_draft_count, budgeted_speculative_outputs);
             draft_count_budget_limited =
-                speculative_draft_count != requested_speculative_draft_count;
+                budgeted_speculative_outputs <
+                requested_speculative_draft_count;
             if (draft_count_budget_limited)
             {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "draft_steps_budget_clamped",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"configured", std::to_string(requested_speculative_draft_count)},
-                     {"effective", std::to_string(speculative_draft_count)},
-                     {"token_budget", std::to_string(decode_step_token_budget_)}});
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "draft_steps_budget_skipped",
-                    static_cast<double>(requested_speculative_draft_count - speculative_draft_count),
-                    "decode");
+                const bool resident_controller_owns_commit_budget =
+                    use_grouped_outcome_device_resident_publication_verifier &&
+                    runner_->primaryDeviceId().is_gpu() &&
+                    budgeted_speculative_outputs > 0;
+                if (resident_controller_owns_commit_budget)
+                {
+                    /*
+                     * The device selector names the complete transaction width.
+                     * Trimming sidecars here would make host response budget a
+                     * second graph-geometry authority and leave captured token
+                     * rows narrower than the resident selector. Execute the
+                     * selected transaction and let its device commit budget
+                     * limit serial-visible output and state publication.
+                     */
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "draft_budget_delegated_to_device_controller",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"selected_depth",
+                          std::to_string(requested_speculative_draft_count)},
+                         {"speculative_output_budget",
+                          std::to_string(budgeted_speculative_outputs)},
+                         {"token_budget",
+                          std::to_string(decode_step_token_budget_)}});
+                }
+                else
+                {
+                    speculative_draft_count = std::min(
+                        speculative_draft_count,
+                        budgeted_speculative_outputs);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "draft_steps_budget_clamped",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"configured", std::to_string(requested_speculative_draft_count)},
+                         {"effective", std::to_string(speculative_draft_count)},
+                         {"token_budget", std::to_string(decode_step_token_budget_)}});
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "draft_steps_budget_skipped",
+                        static_cast<double>(requested_speculative_draft_count - speculative_draft_count),
+                        "decode");
+                }
             }
         }
 
@@ -10094,9 +10166,6 @@ namespace llaminar2
                     {
                         DeviceSpeculativePublicationRequest publication_request;
                         publication_request.outcome = device_outcome_handle;
-                        publication_request.request_count = 1;
-                        publication_request.max_draft_tokens =
-                            static_cast<int>(draft_tokens.size());
                         publication_request.max_state_commit_rows =
                             visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
@@ -10134,9 +10203,10 @@ namespace llaminar2
                             {{"verifier_path",
                               "all_position_state_publication"},
                              {"request_count", "1"},
-                             {"max_draft_tokens",
+                             {"logical_verifier_rows",
                               std::to_string(
-                                  publication_request.max_draft_tokens)}});
+                                  publication_request
+                                      .logicalVerifierRowsPerRequest())}});
 
                         const bool can_prelaunch_next_first_sidecar =
                             use_sidecar_stream_handoff_for_stochastic &&
@@ -10604,9 +10674,6 @@ namespace llaminar2
                     {
                         DeviceSpeculativePublicationRequest publication_request;
                         publication_request.outcome = device_outcome_handle;
-                        publication_request.request_count = 1;
-                        publication_request.max_draft_tokens =
-                            static_cast<int>(draft_tokens.size());
                         publication_request.max_state_commit_rows =
                             visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
@@ -10646,9 +10713,10 @@ namespace llaminar2
                               "all_position_state_publication"},
                              {"sampling", "greedy"},
                              {"request_count", "1"},
-                             {"max_draft_tokens",
+                             {"logical_verifier_rows",
                               std::to_string(
-                                  publication_request.max_draft_tokens)}});
+                                  publication_request
+                                      .logicalVerifierRowsPerRequest())}});
                     }
 
                     DeviceSpeculativeVerifyBatchOutcome device_outcome;
@@ -12021,9 +12089,6 @@ namespace llaminar2
 
                 DeviceSpeculativePublicationRequest publication_request;
                 publication_request.outcome = outcome_handle;
-                publication_request.request_count = 1;
-                publication_request.max_draft_tokens =
-                    static_cast<int>(draft_tokens.size());
                 publication_request.max_state_commit_rows =
                     visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
@@ -12042,8 +12107,12 @@ namespace llaminar2
                     {},
                     {{"policy_path", "grouped_outcome_device_resident_publication"},
                      {"sampling", "stochastic"},
-                     {"max_draft_tokens",
-                      std::to_string(publication_request.max_draft_tokens)}});
+                     {"logical_verifier_rows",
+                      std::to_string(
+                          publication_request.logicalVerifierRowsPerRequest())},
+                     {"physical_verifier_rows",
+                      std::to_string(
+                          publication_request.physicalVerifierRowsPerRequest())}});
 
                 std::string publication_error;
                 {
@@ -12054,9 +12123,10 @@ namespace llaminar2
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"},
                          {"request_count", "1"},
-                         {"max_draft_tokens",
+                         {"logical_verifier_rows",
                           std::to_string(
-                              publication_request.max_draft_tokens)}});
+                              publication_request
+                                  .logicalVerifierRowsPerRequest())}});
                     if (!runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
                             publication_request,
                             &publication_error))
@@ -12074,8 +12144,9 @@ namespace llaminar2
                     {},
                     {{"policy_path", "grouped_outcome_device_resident_publication"},
                      {"request_count", "1"},
-                     {"max_draft_tokens",
-                      std::to_string(publication_request.max_draft_tokens)},
+                     {"logical_verifier_rows",
+                      std::to_string(
+                          publication_request.logicalVerifierRowsPerRequest())},
                      {"shifted_commits",
                       std::to_string(shifted_publication_commit_count)}});
 
@@ -12110,11 +12181,11 @@ namespace llaminar2
                     }
 
                     const int parent_draft_depth =
-                        publication_request.max_draft_tokens - 1;
+                        publication_request.logicalVerifierRowsPerRequest() - 1;
                     if (parent_draft_depth <= 0 ||
                         !runner_
-                             ->materializeDeviceResidentStochasticGeneration(
-                                 publication_request.request_count,
+                             ->materializeDeviceResidentGeneration(
+                                 publication_request.requestCount(),
                                  parent_draft_depth))
                     {
                         return fail_after_checkpoint(
@@ -12122,7 +12193,7 @@ namespace llaminar2
                     }
 
                     if (!runner_
-                             ->launchDeviceResidentStochasticGeneration())
+                             ->launchDeviceResidentGeneration())
                     {
                         return fail_after_checkpoint(
                             "Fixed-depth stochastic MTP could not launch its native device-generation graph");
@@ -12130,7 +12201,7 @@ namespace llaminar2
 
                     DeviceGenerationTerminalResult terminal;
                     if (!runner_
-                             ->finishDeviceResidentStochasticGeneration(
+                             ->finishDeviceResidentGeneration(
                                  &terminal) ||
                         !terminal.valid() || terminal.requests.size() != 1u)
                     {
@@ -12207,7 +12278,7 @@ namespace llaminar2
                     mtp_stats_.verifier_token_count +=
                         transactions *
                         static_cast<uint64_t>(
-                            publication_request.max_draft_tokens);
+                            publication_request.logicalVerifierRowsPerRequest());
                     mtp_stats_.accepted_tokens += accepted;
                     mtp_stats_.rejected_tokens += rejected;
                     mtp_stats_.rollbacks += rejected;
@@ -12256,10 +12327,42 @@ namespace llaminar2
                         static_cast<double>(
                             transactions *
                             static_cast<uint64_t>(
-                                publication_request.max_draft_tokens)),
+                                publication_request
+                                    .logicalVerifierRowsPerRequest())),
                         "decode",
                         {},
                         terminal_tags);
+                    /*
+                     * Captured WHILE iterations do not re-enter the host
+                     * verifier orchestration that normally publishes this
+                     * route counter. The terminal controller ledger is the
+                     * authoritative execution record for the whole parent
+                     * launch, so publish the exact completed transaction count
+                     * here. This lets PerfStats prove that a reused parent ran
+                     * the grouped, decode-equivalent stochastic verifier; a
+                     * graph-cache hit must never make the production path
+                     * invisible to correctness gates.
+                     */
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "grouped_decode_equivalent_stochastic_verifier_runs",
+                        static_cast<double>(transactions),
+                        "decode",
+                        {},
+                        {{"execution", "native_device_generation_parent"},
+                         {"verifier_forward_tokens",
+                          std::to_string(
+                              transactions *
+                              static_cast<uint64_t>(
+                                  publication_request
+                                      .logicalVerifierRowsPerRequest()))},
+                         {"verifier_rows",
+                          std::to_string(
+                              publication_request
+                                  .logicalVerifierRowsPerRequest())},
+                         {"replay_forward_tokens", "0"},
+                         {"accepted_tokens", std::to_string(accepted)},
+                         {"state_publication", "device_resident"}});
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "stochastic_accept_tests",
@@ -13298,9 +13401,6 @@ namespace llaminar2
 
                 DeviceSpeculativePublicationRequest publication_request;
                 publication_request.outcome = outcome_handle;
-                publication_request.request_count = 1;
-                publication_request.max_draft_tokens =
-                    static_cast<int>(draft_tokens.size());
                 publication_request.max_state_commit_rows =
                     visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
@@ -13321,9 +13421,14 @@ namespace llaminar2
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"},
                          {"request_count", "1"},
-                         {"max_draft_tokens",
+                         {"logical_verifier_rows",
                           std::to_string(
-                              publication_request.max_draft_tokens)},
+                              publication_request
+                                  .logicalVerifierRowsPerRequest())},
+                         {"physical_verifier_rows",
+                          std::to_string(
+                              publication_request
+                                  .physicalVerifierRowsPerRequest())},
                          {"sampling", "greedy"}});
                     if (!runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
                             publication_request,
@@ -13342,8 +13447,9 @@ namespace llaminar2
                     {},
                     {{"policy_path", "grouped_outcome_device_resident_publication"},
                      {"request_count", "1"},
-                     {"max_draft_tokens",
-                      std::to_string(publication_request.max_draft_tokens)},
+                     {"logical_verifier_rows",
+                      std::to_string(
+                          publication_request.logicalVerifierRowsPerRequest())},
                      {"shifted_commits",
                       std::to_string(shifted_publication_commit_count)},
                      {"sampling", "greedy"}});

@@ -147,16 +147,29 @@ namespace
         const int *__restrict__ post_append_cached_tokens,
         int seq_len,
         int query_rows,
-        int kv_stride)
+        int kv_stride,
+        const int *__restrict__ active_query_rows_device)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
             return;
 
         const int kv_len = max(1, *post_append_cached_tokens);
-        const int logical_seq_len = max(1, seq_len);
+        const int logical_seq_len = active_query_rows_device
+                                        ? max(1, min(query_rows,
+                                                     *active_query_rows_device))
+                                        : max(1, seq_len);
+        if (row >= logical_seq_len)
+        {
+            out[row].kv_len = 1;
+            out[row].kv_stride = max(kv_len, kv_stride);
+            out[row].position_offset = 0;
+            out[row].mask_stride = 1;
+            return;
+        }
         const int base_position = max(0, kv_len - logical_seq_len);
-        const int row_kv_len = max(1, kv_len - (query_rows - 1 - row));
+        const int row_kv_len =
+            max(1, kv_len - (logical_seq_len - 1 - row));
         out[row].kv_len = row_kv_len;
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = base_position + row;
@@ -2906,6 +2919,7 @@ extern "C"
         int seq_len,
         int query_rows,
         int kv_stride,
+        const int *active_query_rows_device,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
@@ -2921,7 +2935,8 @@ extern "C"
             post_append_cached_tokens,
             seq_len,
             query_rows,
-            kv_stride);
+            kv_stride,
+            active_query_rows_device);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

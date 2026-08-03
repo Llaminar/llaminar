@@ -20,7 +20,6 @@
 #include "kernels/rope/RoPEDeviceParams.h"
 #include <cmath>
 #include <cstdio>
-#include <vector>
 
 // =========================================================================
 // Inverse Frequency Cache (CPU-side, mirrors RoPEPrimitives.cpp)
@@ -839,6 +838,36 @@ __global__ void cuda_rope_publish_device_params_kernel(
     device_params->pos_offset = pos_offset;
 }
 
+/**
+ * @brief Materialize one immutable RoPE inverse-frequency table on device.
+ *
+ * The table is graph setup state, but its producer still has to obey the same
+ * stream-ordering rules as ordinary inference data.  Computing it here keeps
+ * the complete publication on @p stream and avoids an asynchronous H2D copy
+ * from a temporary host vector whose lifetime ends before the copy is required
+ * to complete.  Kernel arguments are captured by value, so CUDA graph capture
+ * also records no host-memory dependency.
+ *
+ * @param d_inv_freq Destination table containing @p half_dim FP32 values.
+ * @param half_dim Number of rotary pairs in one head.
+ * @param neg_log_base Precomputed `-log(theta)` scalar passed by value.
+ * @param rotary_dim Full rotary prefix width used by the model.
+ */
+__global__ void cuda_rope_populate_inv_freq_kernel(
+    float *__restrict__ d_inv_freq,
+    int half_dim,
+    float neg_log_base,
+    int rotary_dim)
+{
+    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= half_dim)
+        return;
+
+    const float exponent = (2.0f * static_cast<float>(pair)) /
+                           static_cast<float>(rotary_dim);
+    d_inv_freq[pair] = expf(neg_log_base * exponent);
+}
+
 extern "C"
 {
     // =========================================================================
@@ -878,7 +907,8 @@ extern "C"
      * @param head_dim The head dimension
      * @param freq_base The frequency base (rope_theta)
      * @param device_idx CUDA device index
-     * @return true on success
+     * @param stream Exact producer stream for the immutable device table.
+     * @return true when the device producer was enqueued successfully.
      *
      * Formula: inv_freq[i] = 1.0 / (freq_base^(2i/head_dim))
      */
@@ -889,25 +919,24 @@ extern "C"
         int device_idx,
         cudaStream_t stream)
     {
-        if (!d_inv_freq)
+        if (!d_inv_freq || !stream || head_dim <= 0 ||
+            (head_dim % 2) != 0 || !std::isfinite(freq_base) ||
+            freq_base <= 0.0f)
             return false;
 
         const int half_dim = head_dim / 2;
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
 
-        // Compute on host
-        std::vector<float> h_inv_freq(half_dim);
-        const float log_base = std::log(freq_base);
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float exponent = (2.0f * i) / head_dim;
-            h_inv_freq[i] = std::exp(-log_base * exponent);
-        }
-
-        // Copy to device
-        cudaSetDevice(device_idx);
-        cudaError_t err = cudaMemcpyAsync(d_inv_freq, h_inv_freq.data(),
-                                          half_dim * sizeof(float), cudaMemcpyHostToDevice, stream);
-        return err == cudaSuccess;
+        constexpr int kThreads = 64;
+        const int blocks = (half_dim + kThreads - 1) / kThreads;
+        const float neg_log_base = -std::log(freq_base);
+        cuda_rope_populate_inv_freq_kernel<<<blocks, kThreads, 0, stream>>>(
+            d_inv_freq,
+            half_dim,
+            neg_log_base,
+            head_dim);
+        return ropeLaunchOk("cudaOps_rope_populate_inv_freq");
     }
 
     /**

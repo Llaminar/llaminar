@@ -1091,6 +1091,29 @@ namespace llaminar2
                 "requires the graph-local device position row");
         }
 
+        if (params_.device_id.is_gpu() &&
+            params_.seq_len > 1 &&
+            params_.routed_assignment_policy ==
+                RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+            params_.prefill_llep_tp_ctx &&
+            params_.prefill_llep_assignment_mode ==
+                PrefillLLEPAssignmentMode::LogicalPositionResidentOnly &&
+            !params_.active_row_count_device)
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] logical-position resident LLEP "
+                "requires the graph-local device active-row count");
+        }
+
+        if (params_.combine_shared_expert_in_verifier &&
+            params_.shared_gate_inp &&
+            params_.shared_gate_inp->native_type() != TensorType::FP32)
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] GPU combined verifier shared-gate input "
+                "must be normalized to FP32 by model-weight preparation");
+        }
+
         /*
          * Runtime placement publication indexes these tables by global expert
          * id even when a participant currently owns no experts. Full model
@@ -1134,8 +1157,6 @@ namespace llaminar2
     bool MoEExpertComputeStage::usesGraphStableFixedTopologyPrefillPlacement() const
     {
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
-               !params_.force_grouped_verifier_prefill_for_decode &&
                canUseFixedTopologyGroupedPrefill();
     }
 
@@ -1950,7 +1971,7 @@ namespace llaminar2
             params_.num_experts <= 0)
         {
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             return true;
         }
 
@@ -1960,16 +1981,16 @@ namespace llaminar2
                       << " layer=" << params_.layer_idx
                       << " device=" << params_.device_id.to_string());
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             return false;
         }
 
-        const bool was_capture_ready = runtime_grouped_decode_warmed_;
+        const bool was_capture_ready = runtime_grouped_decode_launch_state_prepared_;
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
         {
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             return false;
         }
 
@@ -1991,12 +2012,12 @@ namespace llaminar2
                       << " layer=" << params_.layer_idx
                       << " device=" << params_.device_id.to_string());
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             return false;
         }
 
         moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank();
-        runtime_grouped_decode_warmed_ =
+        runtime_grouped_decode_launch_state_prepared_ =
             preserve_capture_ready && was_capture_ready &&
             grouped_gateup_desc_table_id_ >= 0 &&
             grouped_down_desc_table_id_ >= 0 &&
@@ -2040,6 +2061,16 @@ namespace llaminar2
                 return false;
         }
 
+        if (params_.use_runtime_prefill_grouping &&
+            !initializeMoERuntimeTableForGroupedPrefill())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to prepare persistent "
+                      "runtime grouping state before graph capture"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
         return true;
     }
 
@@ -2057,7 +2088,9 @@ namespace llaminar2
             return false;
         }
 
-        if (params_.device_id.is_gpu() && !params_.output_registered_in_arena)
+        if (params_.device_id.is_gpu() &&
+            !params_.output_registered_in_arena &&
+            !params_.canonical_route_contributions)
         {
             auto *output_tensor = dynamic_cast<TensorBase *>(params_.output);
             const auto output_device =
@@ -2267,7 +2300,7 @@ namespace llaminar2
             }
 
             if (params_.device_id.is_gpu())
-                gpuExecution().publish(params_.output);
+                publishPublicationTarget();
             return true;
         }
 
@@ -2512,6 +2545,24 @@ namespace llaminar2
     // - Reuses a single pair of scratch buffers across all experts
     // =========================================================================
 
+    ITensor *MoEExpertComputeStage::publicationTarget() const
+    {
+        ITensor *target = params_.canonical_route_contributions
+                              ? params_.canonical_route_contributions
+                              : params_.output;
+        if (!target)
+        {
+            throw std::logic_error(
+                "MoEExpertComputeStage has no routed-expert publication target");
+        }
+        return target;
+    }
+
+    void MoEExpertComputeStage::publishPublicationTarget() const
+    {
+        gpuExecution().publish(publicationTarget());
+    }
+
     bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)
     {
         const int d_model = params_.d_model;
@@ -2535,8 +2586,20 @@ namespace llaminar2
 
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Zero output via tensor-aware kernel (works for both CPU and GPU)
-        kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
+        /*
+         * GPU fused decode overwrites exactly one publication target: either
+         * the final MoE row or the canonical route-contribution tensor. It
+         * must not initialize the inactive later-reducer output, and an extra
+         * memset would add a needless captured launch. CPU decode accumulates
+         * into the final row below, so only that host-owned path needs an
+         * explicit zero before projection work begins.
+         */
+        if (!is_gpu)
+        {
+            kernel->zeroBuffer(
+                params_.output,
+                static_cast<size_t>(d_model) * sizeof(float));
+        }
 
         // Expert-ID ownership range.
         const int local_start = params_.local_expert_start;
@@ -2709,11 +2772,8 @@ namespace llaminar2
             }
 
             if (!isGraphCaptureActive())
-                runtime_grouped_decode_warmed_ = true;
-            gpuExecution().publish(
-                params_.canonical_route_contributions
-                    ? params_.canonical_route_contributions
-                    : params_.output);
+                runtime_grouped_decode_launch_state_prepared_ = true;
+            publishPublicationTarget();
             return true;
         }
 
@@ -2827,10 +2887,7 @@ namespace llaminar2
                 return false;
             }
 
-            gpuExecution().publish(
-                params_.canonical_route_contributions
-                    ? params_.canonical_route_contributions
-                    : params_.output);
+            publishPublicationTarget();
             return true;
         }
 
@@ -3926,7 +3983,7 @@ namespace llaminar2
 
         const bool grouped_ok = executeFixedTopologyGroupedPrefill(kernel, seq_len);
         if (grouped_ok)
-            gpuExecution().publish(params_.output);
+            publishPublicationTarget();
         return grouped_ok;
     }
 
@@ -4202,7 +4259,7 @@ namespace llaminar2
         grouped_gateup_desc_table_d_model_ = d_model;
         grouped_gateup_desc_table_intermediate_ = intermediate;
         grouped_gateup_desc_table_dirty_ = false;
-        runtime_grouped_decode_warmed_ = false;
+        runtime_grouped_decode_launch_state_prepared_ = false;
         return true;
     }
 
@@ -4280,7 +4337,7 @@ namespace llaminar2
         grouped_down_desc_table_d_model_ = d_model;
         grouped_down_desc_table_intermediate_ = intermediate;
         grouped_down_desc_table_dirty_ = false;
-        runtime_grouped_decode_warmed_ = false;
+        runtime_grouped_decode_launch_state_prepared_ = false;
         return true;
     }
 
@@ -4950,38 +5007,9 @@ namespace llaminar2
     {
         if (!params_.shared_gate_inp)
             return nullptr;
-
-        if (params_.shared_gate_inp->native_type() == TensorType::FP32)
-            return params_.shared_gate_inp;
-
-        const bool needs_refresh =
-            !combined_shared_gate_inp_fp32_ ||
-            combined_shared_gate_inp_source_ != params_.shared_gate_inp ||
-            combined_shared_gate_inp_fp32_->shape() != params_.shared_gate_inp->shape();
-        if (needs_refresh)
-        {
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Combined verifier shared-gate "
-                          "input was not normalized before graph capture"
-                          << " layer=" << params_.layer_idx);
-                return nullptr;
-            }
-            combined_shared_gate_inp_fp32_ =
-                std::make_shared<FP32Tensor>(params_.shared_gate_inp->shape());
-            combined_shared_gate_inp_source_ = params_.shared_gate_inp;
-
-            /*
-             * The backend grouping kernels read the shared-gate vector as `float*`.
-             * The standalone SharedExpertGateStage already normalizes non-FP32
-             * tensors this way; the combined verifier path must do the same or the
-             * fast verifier lane can restore/publish states that do not match the
-             * row-by-row decode contract.
-             */
-            params_.shared_gate_inp->to_fp32(combined_shared_gate_inp_fp32_->mutable_data());
-        }
-
-        return combined_shared_gate_inp_fp32_.get();
+        return params_.shared_gate_inp->native_type() == TensorType::FP32
+                   ? params_.shared_gate_inp
+                   : nullptr;
     }
 
     bool MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const
@@ -5340,7 +5368,9 @@ namespace llaminar2
                 ? transfer_state_override
                 : params_.prefill_llep_transfer_state.get();
         if (!transfer_state ||
-            !transfer_state->ensure(params_.device_id, workspace_name) ||
+            !transfer_state->isMaterializedFor(
+                params_.device_id,
+                workspace_name) ||
             !transfer_state->transferStream() ||
             !transfer_state->computeReadyEvent() ||
             !transfer_state->transferDoneEvent())
@@ -6008,7 +6038,8 @@ namespace llaminar2
                             seq_len,
                             num_experts,
                             top_k,
-                            params_.absolute_position_ids_device);
+                            params_.absolute_position_ids_device,
+                            params_.active_row_count_device);
                     if (groups_prepared)
                     {
                         PerfStatsCollector::addCounter(
@@ -6171,7 +6202,7 @@ namespace llaminar2
                params_.input &&
                params_.output &&
                moe_kernel_ &&
-               runtime_grouped_decode_warmed_ &&
+               runtime_grouped_decode_launch_state_prepared_ &&
                params_.moe_runtime_table &&
                moe_runtime_layer_ &&
                moe_runtime_table_initialized_ &&
@@ -6708,14 +6739,14 @@ namespace llaminar2
             << " runtime_decode_initialized="
             << perfBool(moe_runtime_table_initialized_)
             << " runtime_decode_warmed="
-            << perfBool(runtime_grouped_decode_warmed_)
+            << perfBool(runtime_grouped_decode_launch_state_prepared_)
             << " runtime_decode_ready=" << perfBool(runtime_decode_ready)
             << " gateup_desc=" << grouped_gateup_desc_table_id_
             << " down_desc=" << grouped_down_desc_table_id_;
         return out.str();
     }
 
-    bool MoEExpertComputeStage::supportsWarmupDependentGraphCapture() const
+    bool MoEExpertComputeStage::supportsGraphCaptureAfterLaunchPreparation() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
@@ -6747,7 +6778,8 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-        return supportsLazyPrefillGraphCapturePreflight();
+        return supportsLazyPrefillGraphCapturePreflight() &&
+               params_.active_row_count_device != nullptr;
     }
 
     bool MoEExpertComputeStage::prepareGraphLaunch(
@@ -6763,6 +6795,45 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+
+        if (supportsGraphCaptureAfterLaunchPreparation())
+        {
+            if (!refreshGraphStablePlacement(
+                    /*preserve_capture_ready=*/false))
+            {
+                return false;
+            }
+
+            const bool runtime_decode =
+                !params_.force_grouped_verifier_prefill_for_decode &&
+                params_.seq_len == 1 && params_.moe_runtime_table;
+            if (runtime_decode)
+            {
+                IMoEKernel *kernel = ensureMoEKernel();
+                const MoEDecodeDescriptorSource descriptor_source =
+                    params_.runtime_decode_uses_mutable_descriptors
+                        ? MoEDecodeDescriptorSource::RuntimePlacementTable
+                        : MoEDecodeDescriptorSource::StaticDescriptorTable;
+                if (!kernel ||
+                    !kernel->prepareGroupedRuntimeDecodeLaunchState(
+                        grouped_gateup_desc_table_id_,
+                        grouped_down_desc_table_id_,
+                        params_.top_k,
+                        params_.d_model,
+                        params_.expert_intermediate,
+                        descriptor_source))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to prepare fused "
+                              "runtime grouped-decode launch state"
+                              << " layer=" << params_.layer_idx
+                              << " device=" << params_.device_id.to_string());
+                    runtime_grouped_decode_launch_state_prepared_ = false;
+                    return false;
+                }
+                runtime_grouped_decode_launch_state_prepared_ = true;
+            }
+        }
+
         const bool prepare_current_batch =
             requestsTransferBackedCurrentBatchPrefillLLEP();
         const bool prepare_prefix_rehydration =
@@ -6776,31 +6847,29 @@ namespace llaminar2
                 "valid graph-owned LocalTP binding");
         }
         if (prepare_current_batch &&
-            !params_.prefill_llep_transfer_state->prepareForCapture(
+            !params_.prefill_llep_transfer_state->materializeCaptureResources(
                 params_.device_id,
-                params_.prefill_llep_workspace_name,
-                stream))
+                params_.prefill_llep_workspace_name))
         {
             throw std::runtime_error(
                 "Transfer-backed current-batch LLEP graph preparation could "
-                "not publish its rolling-lane event ordering");
+                "not materialize its persistent transfer resources");
         }
         if (prepare_prefix_rehydration &&
             (!params_.prefix_runtime_rehydration_transfer_state ||
              !params_.prefix_runtime_rehydration_transfer_state->
-                 prepareForCapture(
+                 materializeCaptureResources(
                      params_.device_id,
-                     params_.prefill_llep_workspace_name,
-                     stream)))
+                     params_.prefill_llep_workspace_name)))
         {
             throw std::runtime_error(
                 "Prefix-runtime rehydration graph preparation could not "
-                "establish distinct event ownership");
+                "materialize distinct transfer-event ownership");
         }
 
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_rebalance_llep_prefill_precapture_lane_event_fence",
+            "device_rebalance_llep_prefill_capture_resources_materialized",
             1.0,
             "prefill",
             params_.device_id.to_string(),
@@ -7107,7 +7176,7 @@ namespace llaminar2
     {
         if (workspace != bound_workspace_)
         {
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
         }
 
@@ -7204,7 +7273,7 @@ namespace llaminar2
         }
 
         bound_workspace_ = nullptr;
-        runtime_grouped_decode_warmed_ = false;
+        runtime_grouped_decode_launch_state_prepared_ = false;
         invalidateFixedTopologyMaskPublication();
     }
 
@@ -7776,7 +7845,7 @@ namespace llaminar2
             d_model,
             intermediate);
         if (ok)
-            grouped_decode_warmed_ = true;
+            grouped_decode_launch_state_prepared_ = true;
         return ok;
     }
 
@@ -7923,6 +7992,93 @@ namespace llaminar2
         }
     }
 
+    bool SharedExpertFFNStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu())
+            return true;
+        if (!stream)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+
+        ensureGemmEnginesCached();
+        if (!cached_gate_gemm_ || !cached_up_gemm_ || !cached_down_gemm_)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Persistent shared-expert GEMM "
+                      "engines are unavailable before graph capture");
+            return false;
+        }
+        bindStageStream(cached_gate_gemm_);
+        bindStageStream(cached_up_gemm_);
+        bindStageStream(cached_down_gemm_);
+        if (!validatePlannedScratch(
+                std::max(1, params_.seq_len), params_.intermediate))
+        {
+            return false;
+        }
+
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (!kernel)
+            return false;
+
+        if (shouldUseGroupedVerifierPrefillRoute())
+        {
+            if (!ensureSharedGroupedGateUpDescriptorTable(
+                    kernel, params_.d_model, params_.intermediate) ||
+                !ensureSharedGroupedDownDescriptorTable(
+                    kernel, params_.d_model, params_.intermediate) ||
+                !kernel->prepareSharedExpertPrefillGroup(params_.seq_len))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] Failed to prepare the fixed "
+                          "grouped verifier launch state before graph capture");
+                return false;
+            }
+            return true;
+        }
+
+        if (!shouldUseGroupedDecodeRoute())
+            return true;
+
+        if (!ensureSharedGroupedGateUpDescriptorTable(
+                kernel, params_.d_model, params_.intermediate) ||
+            !ensureSharedGroupedDownDescriptorTable(
+                kernel, params_.d_model, params_.intermediate))
+        {
+            return false;
+        }
+
+        constexpr int expert_id = 0;
+        constexpr float expert_weight = 1.0f;
+        ITensor *gate_outputs[1] = {scratch_gate_};
+        ITensor *up_outputs[1] = {scratch_up_};
+        if (!kernel->prepareGroupedTableDecodeLaunchState(
+                &expert_id,
+                &expert_weight,
+                shared_grouped_gateup_desc_table_id_,
+                shared_grouped_down_desc_table_id_,
+                /*num_active=*/1,
+                gate_outputs,
+                up_outputs,
+                params_.output,
+                params_.d_model,
+                params_.intermediate))
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Failed to prepare persistent "
+                      "shared-expert grouped-decode pointer tables");
+            grouped_decode_launch_state_prepared_ = false;
+            return false;
+        }
+
+        grouped_decode_launch_state_prepared_ = true;
+        return true;
+    }
+
     bool SharedExpertFFNStage::isGraphCapturable() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
@@ -7933,7 +8089,7 @@ namespace llaminar2
 
         /*
          * Forced verifier replay is a small-M grouped-prefill path for M=1..4.
-         * Do not test grouped_decode_warmed_ here: that flag is only written by
+         * Do not test grouped_decode_launch_state_prepared_ here: that flag is only written by
          * tryGroupedDecode(), while verifier replay deliberately executes
          * tryGroupedVerifierPrefill() and owns its own warmup contract.
          */
@@ -7956,7 +8112,7 @@ namespace llaminar2
             {
                 if (!supportsSharedExpertGroupedDecodeGraphCaptureBackend(params_.device_id))
                     return false;
-                return grouped_decode_warmed_ && scratch_seq_len_ >= 1 && moe_kernel_ != nullptr;
+                return grouped_decode_launch_state_prepared_ && scratch_seq_len_ >= 1 && moe_kernel_ != nullptr;
             }
             return scratch_seq_len_ >= 1;
         }
@@ -7969,7 +8125,7 @@ namespace llaminar2
 #endif
     }
 
-    bool SharedExpertFFNStage::supportsWarmupDependentGraphCapture() const
+    bool SharedExpertFFNStage::supportsGraphCaptureAfterLaunchPreparation() const
     {
         if (supportsPaddedPrefillGraphCapturePreflight())
             return true;
@@ -8008,7 +8164,7 @@ namespace llaminar2
             << " scratch_seq_len=" << scratch_seq_len_
             << " scratch_ready=" << perfBool(scratch_seq_len_ >= std::max(1, params_.seq_len))
             << " moe_kernel=" << perfBool(moe_kernel_ != nullptr)
-            << " grouped_decode_warmed=" << perfBool(grouped_decode_warmed_)
+            << " grouped_decode_warmed=" << perfBool(grouped_decode_launch_state_prepared_)
             << " workspace_bound=" << perfBool(bound_workspace_ != nullptr)
             << " gate_gemm=" << perfBool(cached_gate_gemm_ != nullptr)
             << " up_gemm=" << perfBool(cached_up_gemm_ != nullptr)
@@ -8219,7 +8375,7 @@ namespace llaminar2
 
         bound_workspace_ = workspace;
         if (workspace_changed)
-            grouped_decode_warmed_ = false;
+            grouped_decode_launch_state_prepared_ = false;
         LOG_TRACE("[SharedExpertFFNStage] Bound workspace to gate/up/down GEMM engines");
     }
 
@@ -8233,7 +8389,7 @@ namespace llaminar2
             c->unbindWorkspace();
 
         bound_workspace_ = nullptr;
-        grouped_decode_warmed_ = false;
+        grouped_decode_launch_state_prepared_ = false;
     }
 
     bool SharedExpertFFNStage::hasWorkspace() const
@@ -8253,42 +8409,15 @@ namespace llaminar2
     SharedExpertGateStage::SharedExpertGateStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
-    }
+        if (!params_.gate_inp ||
+            params_.gate_inp->native_type() == TensorType::FP32)
+        {
+            return;
+        }
 
-    struct SharedExpertGateStage::GpuEffectiveSeqLenState
-    {
-        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
-        int *device_effective_seq_len = nullptr; ///< Workspace scalar read by shared-gate kernels.
-        bool device_value_uploaded = false;      ///< True once device scalar matches host_effective_seq_len.
-    };
-
-    SharedExpertGateStage::~SharedExpertGateStage()
-    {
-        releaseGpuEffectiveSeqLenState();
-    }
-
-    void SharedExpertGateStage::resetSessionState()
-    {
-        IComputeStage::resetSessionState();
-        prefill_effective_seq_len_ = 0;
-        prefill_replay_params_set_ = false;
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-    }
-
-    void SharedExpertGateStage::resetSessionStatePreservingCapturedReplay()
-    {
-        IComputeStage::resetSessionState();
-        prefill_effective_seq_len_ = 0;
-        prefill_replay_params_set_ = false;
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-    }
-
-    void SharedExpertGateStage::resetSessionStatePreservingLazyInitialization()
-    {
-        resetSessionStatePreservingCapturedReplay();
+        throw std::invalid_argument(
+            "[SharedExpertGateStage] Shared-expert input gate must be normalized "
+            "to FP32 by model-weight preparation");
     }
 
     void SharedExpertGateStage::invalidateKernelDynamicState()
@@ -8300,183 +8429,46 @@ namespace llaminar2
         owned_moe_kernel_->clearGPUStreamBinding();
     }
 
-    int SharedExpertGateStage::effectivePrefillSeqLen() const
-    {
-        if (!prefill_replay_params_set_ || prefill_effective_seq_len_ <= 0)
-            return params_.seq_len;
-        return std::clamp(prefill_effective_seq_len_, 1, std::max(1, params_.seq_len));
-    }
-
-    void SharedExpertGateStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
-    {
-        prefill_replay_params_set_ = true;
-        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
-        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
-        refreshPinnedEffectiveSeqLen();
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && hasGPUStream() && bound_workspace_)
-            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
-    }
-
-    void SharedExpertGateStage::refreshPinnedEffectiveSeqLen()
-    {
-        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
-            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
-    }
-
-    bool SharedExpertGateStage::ensureGpuEffectiveSeqLenStateInitialized()
-    {
-        if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) ||
-            bound_workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) < sizeof(int))
-        {
-            LOG_ERROR("[SharedExpertGateStage] Missing graph workspace buffer '"
-                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
-                      << "' for padded shared-expert gate replay on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        auto *device_effective_seq_len = static_cast<int *>(
-            bound_workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN));
-        if (!device_effective_seq_len)
-        {
-            LOG_ERROR("[SharedExpertGateStage] Graph workspace buffer '"
-                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
-                      << "' resolved to null on " << params_.device_id.toString());
-            return false;
-        }
-
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
-            return true;
-        }
-
-        auto state = std::make_unique<GpuEffectiveSeqLenState>();
-        state->device = params_.device_id;
-        state->device_effective_seq_len = device_effective_seq_len;
-
-        bool allocated = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectHostParam(
-                params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectHostParam(
-                params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-
-        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
-        {
-            LOG_ERROR("[SharedExpertGateStage] Failed to allocate pinned effective-length scalar for "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        gpu_effective_seq_len_state_ = std::move(state);
-        refreshPinnedEffectiveSeqLen();
-        return true;
-    }
-
-    bool SharedExpertGateStage::uploadGpuEffectiveSeqLen()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return false;
-        refreshPinnedEffectiveSeqLen();
-
-        if (isGraphCaptureActive())
-        {
-            if (!gpu_effective_seq_len_state_->device_value_uploaded)
-            {
-                LOG_ERROR("[SharedExpertGateStage] Effective sequence length scalar was not uploaded before graph capture");
-                return false;
-            }
-            return true;
-        }
-
-        bool uploaded = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            uploaded = cuda::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            uploaded = rocm::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
-        return uploaded;
-    }
-
-    void SharedExpertGateStage::releaseGpuEffectiveSeqLenState()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return;
-
-        if (gpu_effective_seq_len_state_->device.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            cuda::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-        else if (gpu_effective_seq_len_state_->device.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            rocm::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-
-        gpu_effective_seq_len_state_.reset();
-    }
-
     bool SharedExpertGateStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
     {
         (void)ctx;
+        if (params_.device_id.is_gpu() && !stream)
+        {
+            LOG_ERROR("[SharedExpertGateStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
         if (stream)
             setGPUStream(stream);
 
-        if (!hasPrefillReplayParams() || !prefill_replay_params_set_)
-            return true;
+        if (params_.device_id.is_gpu())
+        {
+            TensorBase *gate_input = effectiveGateInput();
+            if (!gate_input || !ensureMoEKernel())
+                return false;
+            if (!gateInputReadyForGraphCapture())
+            {
+                LOG_ERROR("[SharedExpertGateStage] Shared gate vector is not "
+                          "resident on the graph device; model-weight preparation "
+                          "must complete before graph launch preparation");
+                return false;
+            }
+        }
 
-        if (!ensureGpuEffectiveSeqLenStateInitialized())
-            return false;
-        const bool uploaded = uploadGpuEffectiveSeqLen();
-        if (uploaded && PerfStatsCollector::isEnabled())
+        if (params_.seq_len > 1 && params_.active_row_count_device &&
+            PerfStatsCollector::isEnabled())
         {
             PerfStatsCollector::addCounter(
                 "moe",
-                "shared_gate_padded_prefill_effective_len_prepare",
+                "shared_gate_device_row_count_bound",
                 1.0,
                 "prefill",
                 params_.device_id.toString(),
                 PerfStatsCollector::Tags{
-                    {"bucket_seq_len", std::to_string(params_.seq_len)},
-                    {"effective_seq_len", std::to_string(effectivePrefillSeqLen())}});
+                    {"physical_rows", std::to_string(params_.seq_len)},
+                    {"row_count_source", "device_request_geometry"}});
         }
-        return uploaded;
+        return true;
     }
 
     TensorBase *SharedExpertGateStage::effectiveGateInput() const
@@ -8484,25 +8476,9 @@ namespace llaminar2
         if (!params_.gate_inp)
             return nullptr;
 
-        if (params_.gate_inp->native_type() == TensorType::FP32)
-            return params_.gate_inp;
-
-        const size_t count = params_.gate_inp->numel();
-        if (!fp32_gate_inp_ || fp32_gate_source_ != params_.gate_inp ||
-            fp32_gate_inp_->shape() != params_.gate_inp->shape())
-        {
-            fp32_gate_inp_ = std::make_shared<FP32Tensor>(params_.gate_inp->shape());
-            params_.gate_inp->to_fp32(fp32_gate_inp_->mutable_data());
-            fp32_gate_source_ = params_.gate_inp;
-        }
-        else if (fp32_gate_inp_->numel() != count)
-        {
-            fp32_gate_inp_ = std::make_shared<FP32Tensor>(params_.gate_inp->shape());
-            params_.gate_inp->to_fp32(fp32_gate_inp_->mutable_data());
-            fp32_gate_source_ = params_.gate_inp;
-        }
-
-        return fp32_gate_inp_.get();
+        return params_.gate_inp->native_type() == TensorType::FP32
+                   ? params_.gate_inp
+                   : nullptr;
     }
 
     bool SharedExpertGateStage::gateInputReadyForGraphCapture() const
@@ -8510,12 +8486,7 @@ namespace llaminar2
         if (!params_.gate_inp)
             return false;
 
-        const TensorBase *gate_input =
-            (params_.gate_inp->native_type() == TensorType::FP32)
-                ? params_.gate_inp
-                : ((fp32_gate_inp_ && fp32_gate_source_ == params_.gate_inp)
-                       ? fp32_gate_inp_.get()
-                       : nullptr);
+        const TensorBase *gate_input = effectiveGateInput();
 
         if (!gate_input)
             return false;
@@ -8563,18 +8534,32 @@ namespace llaminar2
         }
 
         IMoEKernel *kernel = ensureMoEKernel();
+        const int32_t *device_active_rows =
+            params_.device_id.is_gpu() && seq_len > 1
+                ? params_.active_row_count_device
+                : nullptr;
+        if (device_active_rows && PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "moe",
+                "shared_gate_device_row_count_execute",
+                1.0,
+                "prefill",
+                params_.device_id.toString(),
+                PerfStatsCollector::Tags{
+                    {"physical_rows", std::to_string(seq_len)},
+                    {"row_count_source", "device_request_geometry"}});
+        }
 
         if (fused_combine)
         {
-            if (hasPrefillReplayParams() && prefill_replay_params_set_)
+            if (device_active_rows)
             {
-                if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
-                    return false;
                 if (!kernel->sharedExpertGateAddFromTensorsEffectiveSeqLen(
                         params_.input, gate_inp, params_.shared_output,
                         params_.routed_residual, params_.combined_output,
                         seq_len, d_model,
-                        gpu_effective_seq_len_state_->device_effective_seq_len))
+                        device_active_rows))
                 {
                     LOG_ERROR("[SharedExpertGateStage] Effective-length fused shared gate-add failed");
                     return false;
@@ -8598,14 +8583,12 @@ namespace llaminar2
             return true;
         }
 
-        if (hasPrefillReplayParams() && prefill_replay_params_set_)
+        if (device_active_rows)
         {
-            if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
-                return false;
             if (!kernel->sharedExpertGateFromTensorsEffectiveSeqLen(
                     params_.input, gate_inp, params_.shared_output,
                     seq_len, d_model,
-                    gpu_effective_seq_len_state_->device_effective_seq_len))
+                    device_active_rows))
             {
                 LOG_ERROR("[SharedExpertGateStage] Effective-length shared gate failed");
                 return false;
@@ -8679,17 +8662,19 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
+        // Single kernel call (sigmoid gating): pure kernel launch after explicit
+        // launch-state preparation.
         // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
         // because the stage is just a kernel launch with stable device pointers.
-        // MoE kernel must already be cached (from warmup execution).
+        // MoE kernel and stable input placement must already be bound by
+        // prepareGraphLaunch().
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                moe_kernel_ != nullptr &&
                gateInputReadyForGraphCapture();
 #endif
     }
 
-    bool SharedExpertGateStage::supportsWarmupDependentGraphCapture() const
+    bool SharedExpertGateStage::supportsGraphCaptureAfterLaunchPreparation() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
@@ -8719,7 +8704,8 @@ namespace llaminar2
 
     bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-        return supportsLazyPrefillGraphCapturePreflight();
+        return supportsLazyPrefillGraphCapturePreflight() &&
+               params_.active_row_count_device != nullptr;
     }
 
     bool SharedExpertGateStage::supportsPaddedPrefillRealLengthContract() const
@@ -8732,27 +8718,17 @@ namespace llaminar2
         (void)m;
         (void)n;
         (void)k;
-        WorkspaceRequirements reqs;
-        if (hasPrefillReplayParams())
-            MoEWorkspaceBuffers::add(reqs, MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN, sizeof(int));
-        return reqs;
+        return WorkspaceRequirements{};
     }
 
     void SharedExpertGateStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
     }
 
     void SharedExpertGateStage::unbindWorkspace()
     {
         bound_workspace_ = nullptr;
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        }
     }
 
     bool SharedExpertGateStage::hasWorkspace() const
@@ -8939,13 +8915,37 @@ namespace llaminar2
 
     bool MoECanonicalRouteReduceStage::isGraphCapturable() const
     {
-        if (!supportsWarmupDependentGraphCapture())
+        if (!supportsGraphCaptureAfterLaunchPreparation())
             return false;
         return params_.participant_device_index != params_.root_device_index ||
                moe_kernel_ != nullptr;
     }
 
-    bool MoECanonicalRouteReduceStage::supportsWarmupDependentGraphCapture() const
+    bool MoECanonicalRouteReduceStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[MoECanonicalRouteReduceStage] Graph launch preparation "
+                      "requires the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+        if (params_.participant_device_index != params_.root_device_index)
+            return true;
+
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        return bindStageStream(moe_kernel_) != nullptr;
+    }
+
+    bool MoECanonicalRouteReduceStage::supportsGraphCaptureAfterLaunchPreparation() const
     {
         return params_.device_id.is_gpu() &&
                params_.canonical_route_contributions &&
@@ -8959,7 +8959,7 @@ namespace llaminar2
 
     bool MoECanonicalRouteReduceStage::supportsLazyPrefillGraphCapturePreflight() const
     {
-        if (!supportsWarmupDependentGraphCapture())
+        if (!supportsGraphCaptureAfterLaunchPreparation())
             return false;
 
         if (params_.device_id.is_cuda())

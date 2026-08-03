@@ -4594,6 +4594,10 @@ namespace llaminar2
                 routed_pipeline_kernel_owner;
             route_params.force_decode_equivalent_verifier_prefill =
                 forceDecodeEquivalentMoERouting(device);
+            route_params.active_row_count_device =
+                device.is_gpu() && batch_size == 1
+                    ? sequence_lengths_device
+                    : nullptr;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -4766,6 +4770,10 @@ namespace llaminar2
                 expert_params.absolute_position_ids_device =
                     stage_device.is_gpu()
                         ? absolute_position_ids_device
+                        : nullptr;
+                expert_params.active_row_count_device =
+                    stage_device.is_gpu() && batch_size == 1
+                        ? sequence_lengths_device
                         : nullptr;
                 expert_params.my_socket_id = std::max(0, config_.tp_device_idx);
                 expert_params.participant_count =
@@ -6162,6 +6170,10 @@ namespace llaminar2
                 gate_params.shared_output = shared_output;
                 gate_params.seq_len = total_tokens;
                 gate_params.d_model = config_.d_model;
+                gate_params.active_row_count_device =
+                    shared_device.is_gpu() && batch_size == 1
+                        ? sequence_lengths_device
+                        : nullptr;
                 gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
                 gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
                 if (gate_writes_combined_output)

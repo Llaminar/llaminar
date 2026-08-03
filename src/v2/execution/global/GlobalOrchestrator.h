@@ -134,6 +134,38 @@ namespace llaminar2
         const IInferenceRunner *lastLocalRunner() const;
 
         void clearCacheAll();
+        /**
+         * @brief Admit one immutable stop-token policy into every local runner.
+         *
+         * Global orchestration is a transparent ownership boundary: request
+         * controls belong to the leaf runners that own captured execution, not
+         * to this registry.  A null child or a rejected policy is therefore a
+         * fatal topology error.  The method stops immediately rather than
+         * leaving later participants configured under a partially accepted
+         * request.
+         *
+         * @param stop_tokens Complete model-specific stop-token set.
+         * @return True after every registered runner accepts the policy.
+         * @throws std::logic_error if the registry has no usable runner.
+         * @throws std::runtime_error if any runner rejects the policy.
+         */
+        bool configureMTPRequestStopTokensAll(
+            const std::vector<int32_t> &stop_tokens);
+        /**
+         * @brief Admit one immutable penalty policy into every local runner.
+         *
+         * The policy is staged at request admission and later published by each
+         * leaf on its exact producer stream.  Global orchestration must never
+         * retain a wrapper-only copy because captured verifier consumers cannot
+         * observe such host state.
+         *
+         * @param policy Request-constant presence and frequency penalties.
+         * @return True after every registered runner accepts the policy.
+         * @throws std::logic_error if the registry has no usable runner.
+         * @throws std::runtime_error if any runner rejects the policy.
+         */
+        bool configureMTPRequestPenaltyPolicyAll(
+            const MTPRequestPenaltyPolicy &policy);
         void setSkipLogitsGatherDecodeAll(bool skip);
         void setSkipLogitsGatherPrefillAll(bool skip);
         void setSuppressTimelineAll(bool suppress);
@@ -372,6 +404,16 @@ namespace llaminar2
             int position_offset_override = -1) override;
         bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
+        /**
+         * @brief Forward request stop-token admission to every graph owner.
+         */
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Forward request penalty admission to every graph owner.
+         */
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
         bool setComputeAllPositionLogits(bool enabled) override;
         /**
          * @brief Forward compact verifier LM-head row packing to local runners.

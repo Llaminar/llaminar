@@ -336,7 +336,8 @@ namespace llaminar2
         const PrefillGraphCacheKey &key,
         IWorkerGPUContext *gpu_ctx,
         void *stream,
-        const std::function<bool()> &record_graph_body)
+        const std::function<bool()> &record_graph_body,
+        GraphCaptureDependencyLedger *dependency_ledger)
     {
         auto it = entries_.find(key);
         if (it == entries_.end() ||
@@ -388,7 +389,8 @@ namespace llaminar2
         ScopedBackendGraphCapture capture_transaction(
             *gpu_ctx,
             *pending_capture,
-            operation);
+            operation,
+            dependency_ledger);
         if (!capture_transaction.begin())
         {
             LOG_ERROR("[PrefillGraphCache] beginCapture() failed on GPU graph object");

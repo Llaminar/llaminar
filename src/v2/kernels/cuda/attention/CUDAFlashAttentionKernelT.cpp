@@ -148,6 +148,7 @@ extern "C"
         int seq_len,
         int query_rows,
         int kv_stride,
+        const int *active_query_rows_device,
         void *stream);
 
     int cudaFlashAttn_prepare_device_params_from_geometry(
@@ -1749,7 +1750,8 @@ namespace llaminar2
             int seq_len,
             int query_rows,
             void *stream,
-            int kv_stride)
+            int kv_stride,
+            const int *active_query_rows_device)
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
@@ -1786,6 +1788,7 @@ namespace llaminar2
                 seq_len,
                 sanitized_query_rows,
                 kv_stride,
+                active_query_rows_device,
                 stream);
             if (rc != 0)
             {

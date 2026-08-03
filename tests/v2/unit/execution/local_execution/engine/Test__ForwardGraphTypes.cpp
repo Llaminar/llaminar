@@ -32,18 +32,19 @@ namespace
     class FakeSegmentStage final : public IComputeStage
     {
     public:
-        FakeSegmentStage(bool capturable,
+        FakeSegmentStage(DeviceId device,
+                         bool capturable,
                          bool manual_boundary = false,
                          ComputeStageType stage_type = ComputeStageType::COPY,
-                         bool warmup_dependent_capture = false,
+                         bool launch_preparation_dependent_capture = false,
                          bool segment_boundary_before = false,
                          bool segment_boundary_after = false,
                          const uint64_t *variant_signature = nullptr)
-            : IComputeStage(DeviceId::cpu()),
+            : IComputeStage(device),
               capturable_(capturable),
               manual_boundary_(manual_boundary),
               stage_type_(stage_type),
-              warmup_dependent_capture_(warmup_dependent_capture),
+              launch_preparation_dependent_capture_(launch_preparation_dependent_capture),
               segment_boundary_before_(segment_boundary_before),
               segment_boundary_after_(segment_boundary_after),
               variant_signature_(variant_signature)
@@ -54,12 +55,19 @@ namespace
         ComputeStageType type() const override { return stage_type_; }
         std::string name() const override { return "fake_segment_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
         bool isGraphCapturable() const override { return capturable_; }
         uint64_t graphCaptureVariantSignature() const override
         {
             return variant_signature_ ? *variant_signature_ : 0;
         }
-        bool supportsWarmupDependentGraphCapture() const override { return warmup_dependent_capture_; }
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        {
+            return launch_preparation_dependent_capture_;
+        }
         bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
         bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
@@ -69,7 +77,7 @@ namespace
         bool capturable_ = true;
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
-        bool warmup_dependent_capture_ = false;
+        bool launch_preparation_dependent_capture_ = false;
         bool segment_boundary_before_ = false;
         bool segment_boundary_after_ = false;
         const uint64_t *variant_signature_ = nullptr;
@@ -81,8 +89,11 @@ namespace
         explicit FakeGraphLaunchPrepStage(
             DeviceId device,
             GraphLaunchPreparationPolicy policy =
-                GraphLaunchPreparationPolicy::CaptureAndReplay)
-            : IComputeStage(device), policy_(policy)
+                GraphLaunchPreparationPolicy::CaptureAndReplay,
+            bool capture_requires_preparation = false)
+            : IComputeStage(device),
+              policy_(policy),
+              capture_requires_preparation_(capture_requires_preparation)
         {
         }
 
@@ -96,7 +107,18 @@ namespace
         ComputeStageType type() const override { return ComputeStageType::COPY; }
         std::string name() const override { return "fake_graph_launch_prep_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
-        bool isGraphCapturable() const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        bool isGraphCapturable() const override
+        {
+            return !capture_requires_preparation_ || prepare_calls_ > 0;
+        }
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        {
+            return capture_requires_preparation_;
+        }
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
             return policy_;
@@ -124,6 +146,7 @@ namespace
 
     private:
         GraphLaunchPreparationPolicy policy_;
+        bool capture_requires_preparation_ = false;
     };
 
     /**
@@ -152,6 +175,10 @@ namespace
         std::string name() const override { return "fake_capture_failure_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
         bool isGraphCapturable() const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
         int execute_calls_ = 0;
@@ -400,22 +427,24 @@ namespace
                              bool capturable,
                              bool manual_boundary = false,
                              ComputeStageType stage_type = ComputeStageType::COPY,
-                             bool warmup_dependent_capture = false,
+                             bool launch_preparation_dependent_capture = false,
                              bool segment_boundary_before = false,
                              bool segment_boundary_after = false,
-                             const uint64_t *variant_signature = nullptr)
+                             const uint64_t *variant_signature = nullptr,
+                             DeviceId device = DeviceId::cpu())
     {
         graph.addNode(
             name,
             std::make_unique<FakeSegmentStage>(
+                device,
                 capturable,
                 manual_boundary,
                 stage_type,
-                warmup_dependent_capture,
+                launch_preparation_dependent_capture,
                 segment_boundary_before,
                 segment_boundary_after,
                 variant_signature),
-            DeviceId::cpu());
+            device);
     }
 
     FakeGraphLaunchPrepStage *addFakeGraphLaunchPrepStage(
@@ -423,9 +452,13 @@ namespace
         const std::string &name,
         DeviceId device,
         GraphLaunchPreparationPolicy policy =
-            GraphLaunchPreparationPolicy::CaptureAndReplay)
+            GraphLaunchPreparationPolicy::CaptureAndReplay,
+        bool capture_requires_preparation = false)
     {
-        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(device, policy);
+        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(
+            device,
+            policy,
+            capture_requires_preparation);
         auto *raw_stage = stage.get();
         graph.addNode(name, std::move(stage), device);
         return raw_stage;
@@ -1372,7 +1405,7 @@ TEST(Test__GraphSegmentCache, ResetCanPreserveCaptureStream)
 /**
  * @brief Prove the worker-to-capture transition is a GPU event edge.
  *
- * This is the lifecycle edge that protects the first graph warmup from reading
+ * This is the lifecycle edge that protects the first graph capture from reading
  * stale KV/GDN state. It must never regress to a host wait or a full-device
  * synchronization, both of which distort LocalTP collective ordering.
  */
@@ -1395,16 +1428,22 @@ TEST(Test__GraphSegmentCache, CaptureStreamHandoffUsesEventWithoutDeviceSync)
 }
 
 /**
- * @brief Exercise the complete warmup transaction with a LocalTP-style hook.
+ * @brief Exercise transaction-zero capture with a LocalTP-style hook.
  *
  * The first cached-decode invocation must queue the event handoff, invoke one
- * deterministic full-graph boundary, and only then execute warmup stages on the
- * capture stream. Actual LocalTP wires this hook to its rank rendezvous.
+ * deterministic capture-entry/exit pair, prepare every launch, record model
+ * arithmetic once, and launch the resulting executable. Actual LocalTP wires
+ * this hook to its rank rendezvous.
  */
-TEST(Test__GraphSegmentCache, WarmupInvokesBoundaryAfterEventHandoff)
+TEST(Test__GraphSegmentCache, FirstCaptureInvokesBoundaryAfterEventHandoff)
 {
     ComputeGraph graph;
-    addFakeSegmentStage(graph, "collective_graph_stage", true);
+    auto *stage = addFakeGraphLaunchPrepStage(
+        graph,
+        "collective_graph_stage",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureOnly,
+        /*capture_requires_preparation=*/true);
 
     DeviceGraphExecutor executor;
     BufferArena arena;
@@ -1438,29 +1477,149 @@ TEST(Test__GraphSegmentCache, WarmupInvokesBoundaryAfterEventHandoff)
             return true;
         }));
 
-    ASSERT_EQ(observed_boundaries.size(), 3u)
-        << "Atomic first use requires warmup, capture-begin, and capture-end rendezvous.";
-    EXPECT_NE(observed_boundaries[0].first.find("phase=warmup"), std::string::npos);
-    EXPECT_NE(observed_boundaries[0].first.find("scope=full_graph"), std::string::npos);
+    ASSERT_EQ(observed_boundaries.size(), 2u)
+        << "Atomic first use requires one capture-begin/capture-end rendezvous pair.";
+    EXPECT_NE(observed_boundaries[0].first.find("capture_begin"), std::string::npos);
     EXPECT_NE(observed_boundaries[0].first.find("context=main_decode"), std::string::npos);
-    EXPECT_EQ(observed_boundaries[0].second, gpu_ctx.defaultStream());
-    EXPECT_NE(observed_boundaries[1].first.find("capture_begin"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[0].second, cache.capture_stream);
+    EXPECT_NE(observed_boundaries[1].first.find("capture_end"), std::string::npos);
     EXPECT_EQ(observed_boundaries[1].second, cache.capture_stream);
-    EXPECT_NE(observed_boundaries[2].first.find("capture_end"), std::string::npos);
-    EXPECT_EQ(observed_boundaries[2].second, cache.capture_stream);
+    EXPECT_EQ(stage->prepare_calls_, 1);
+    EXPECT_EQ(stage->execute_calls_, 1)
+        << "Transaction zero must record model arithmetic exactly once.";
+    EXPECT_TRUE(stage->executed_after_prepare_);
     EXPECT_GE(gpu_ctx.events_recorded_, 1);
     EXPECT_GE(gpu_ctx.events_waited_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0)
+        << "Transaction-zero capture must not rendezvous with the host.";
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_TRUE(cache.initialized);
     EXPECT_FALSE(cache.needs_capture);
 }
 
+/**
+ * @brief Prove a live external event stays outside capture on transaction zero.
+ *
+ * The same typed hook must run after capture/instantiation but before the first
+ * executable launch, then immediately before every steady replay.  This is the
+ * lifecycle used by device-owned MoE maintenance: recording the event wait
+ * before native capture would export a root event into a conditional child
+ * graph, while running it after launch would race the live-state producer.
+ */
+TEST(Test__GraphSegmentCache,
+     LaunchDependencyRunsAfterCaptureAndImmediatelyBeforeEveryLaunch)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(
+        graph,
+        "live_state_consumer",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureAndReplay,
+        /*capture_requires_preparation=*/true);
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "launch_dependency_lifecycle";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+
+    void *const producer_event = gpu_ctx.createEvent();
+    ASSERT_NE(producer_event, nullptr);
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
+    int hook_event_records = 0;
+    int hook_event_waits = 0;
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *execution_stream) -> bool
+    {
+        EXPECT_EQ(execution_stream, cache.capture_stream);
+        EXPECT_EQ(cache.segments.size(), 1u);
+        if (cache.segments.size() != 1u)
+            return false;
+        auto *capture = dynamic_cast<FakeReplayGraphCapture *>(
+            cache.segments.front().capture.get());
+        EXPECT_NE(capture, nullptr);
+        if (!capture)
+            return false;
+
+        EXPECT_EQ(capture->begin_capture_calls_, 1);
+        EXPECT_EQ(capture->end_capture_calls_, 1)
+            << "The external event join must run only after native capture closes.";
+        EXPECT_EQ(capture->instantiate_calls_, 1);
+        EXPECT_EQ(capture->launch_calls_, static_cast<int>(phases.size()))
+            << "The hook must be the immediate precondition of each launch.";
+
+        if (!gpu_ctx.recordEventChecked(
+                producer_event,
+                gpu_ctx.defaultStream()))
+        {
+            return false;
+        }
+        ++hook_event_records;
+        if (!gpu_ctx.waitEventChecked(producer_event, execution_stream))
+            return false;
+        ++hook_event_waits;
+        phases.push_back(phase);
+        return true;
+    };
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph,
+        launch_dependency));
+
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph,
+        launch_dependency));
+
+    ASSERT_EQ(phases.size(), 2u);
+    EXPECT_EQ(
+        phases[0],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    EXPECT_EQ(
+        phases[1],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
+    EXPECT_EQ(hook_event_records, 2);
+    EXPECT_EQ(hook_event_waits, 2);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    gpu_ctx.destroyEvent(producer_event);
+}
+
 TEST(Test__GraphSegmentCache, GraphLifecyclePhaseNamesAreCanonical)
 {
-    EXPECT_STREQ(
-        DeviceGraphCaptureController::phaseName(
-            DeviceGraphCaptureController::Phase::Warmup),
-        "warmup");
     EXPECT_STREQ(
         DeviceGraphCaptureController::phaseName(
             DeviceGraphCaptureController::Phase::Capture),
@@ -1471,7 +1630,7 @@ TEST(Test__GraphSegmentCache, GraphLifecyclePhaseNamesAreCanonical)
         "replay");
 }
 
-TEST(Test__GraphSegmentCache, WarmupSegmentsSkipPostWarmupResegmentForStableDenseStages)
+TEST(Test__GraphSegmentCache, CapturePlanKeepsStableDenseStagesMonolithic)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "a", true);
@@ -1479,44 +1638,44 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsSkipPostWarmupResegmentForStableDens
     graph.addDependency("b", "a");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::executeWarmupPhase(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         nullptr,
         false,
         false);
 
-    EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
     ASSERT_EQ(cache.segments.size(), 1u);
     EXPECT_TRUE(cache.segments[0].capturable);
 }
 
-TEST(Test__GraphSegmentCache, WarmupSegmentsPlanWarmupDependentStagesWithoutResegment)
+TEST(Test__GraphSegmentCache, CapturePlanIncludesLaunchPreparationDependentStages)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
     addFakeSegmentStage(
         graph,
-        "warmup_dependent",
+        "launch_preparation_dependent",
         false,
         false,
         ComputeStageType::MOE_EXPERT_FFN,
         true);
     addFakeSegmentStage(graph, "after", true);
-    graph.addDependency("warmup_dependent", "before");
-    graph.addDependency("after", "warmup_dependent");
+    graph.addDependency("launch_preparation_dependent", "before");
+    graph.addDependency("after", "launch_preparation_dependent");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::executeWarmupPhase(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         nullptr,
         false,
         false);
 
-    EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
     ASSERT_EQ(cache.segments.size(), 1u);
     EXPECT_TRUE(cache.segments[0].capturable);
     ASSERT_EQ(cache.segments[0].stage_names.size(), 3u);
@@ -1543,7 +1702,7 @@ TEST(Test__GraphSegmentCache, CaptureBoundariesCannotSegmentGraphWithoutHeteroge
 
     DeviceGraphExecutor::GraphSegmentCache cache;
     EXPECT_THROW(
-        DeviceGraphCaptureController::buildWarmupSegments(
+        DeviceGraphCaptureController::buildCapturePlan(
             graph,
             cache,
             nullptr,
@@ -1563,7 +1722,8 @@ TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.events_created_, 1);
     EXPECT_EQ(gpu_ctx.events_recorded_, 1);
-    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1)
+        << "Resource teardown must establish terminal host ownership.";
     EXPECT_EQ(gpu_ctx.events_destroyed_, 1);
     EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1);
 }
@@ -2101,7 +2261,7 @@ TEST(Test__GraphSegmentCache, HeterogeneousCollectivePolicyAdmitsNamedSparseBoun
 
     std::unordered_set<std::string> collective_nodes = {"sparse_dispatch"};
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         &collective_nodes,
@@ -2130,7 +2290,7 @@ TEST(Test__GraphSegmentCache, NonCollectiveManualBoundaryIsFatal)
 
     DeviceGraphExecutor::GraphSegmentCache cache;
     EXPECT_THROW(
-        DeviceGraphCaptureController::buildWarmupSegments(
+        DeviceGraphCaptureController::buildCapturePlan(
             graph,
             cache,
             nullptr,
@@ -2150,7 +2310,7 @@ TEST(Test__GraphSegmentCache, HomogeneousCollectiveCannotUseSegmentedReplay)
     std::unordered_set<std::string> collective_nodes = {"collective"};
     DeviceGraphExecutor::GraphSegmentCache cache;
     EXPECT_THROW(
-        DeviceGraphCaptureController::buildWarmupSegments(
+        DeviceGraphCaptureController::buildCapturePlan(
             graph,
             cache,
             &collective_nodes,
@@ -2170,7 +2330,7 @@ TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePer
 
     std::unordered_set<std::string> collective_nodes = {"graph_safe_collective"};
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         &collective_nodes,
@@ -2235,7 +2395,7 @@ TEST(Test__GraphSegmentCache, TPKVStateAllGatherRemainsInsideWholeCapturedGraph)
     std::unordered_set<std::string> collective_nodes{
         "tp_kv_state_allgather"};
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         &collective_nodes,
@@ -2264,7 +2424,7 @@ TEST(Test__GraphSegmentCache, UnauthorizedSegmentedPlanPublishesPerfStatsBeforeH
 
     DeviceGraphExecutor::GraphSegmentCache cache;
     EXPECT_THROW(
-        DeviceGraphCaptureController::buildWarmupSegments(
+        DeviceGraphCaptureController::buildCapturePlan(
             graph,
             cache,
             nullptr,
@@ -2342,7 +2502,7 @@ TEST(Test__GraphSegmentCache, FullGraphPlanPublishesPerfStatsAsGraph)
     graph.addDependency("lm_head", "gemm");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         nullptr,
@@ -2413,6 +2573,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         /*full_graph_replay=*/true,
         /*perf_context=*/"",
         /*device_name=*/"CUDA:0",
+        /*launch_dependency_cb=*/{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -2457,6 +2618,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         /*full_graph_replay=*/true,
         /*perf_context=*/"main_verifier",
         /*device_name=*/"CUDA:0",
+        /*launch_dependency_cb=*/{},
         [](DeviceGraphExecutor::GraphSegment &, void *) {}));
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
@@ -2492,16 +2654,17 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
         cache,
         &gpu_ctx,
         "ROCm:0"));
-    const int events_created_during_warmup = gpu_ctx.events_created_;
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -2574,9 +2737,9 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", stage_segment_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", aggregate_tags), 0u);
-    EXPECT_EQ(events_created_during_warmup, 32);
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup + 1)
-        << "Replay timing events must all be allocated during warmup; the only "
+    EXPECT_EQ(events_created_during_capture_setup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup + 1)
+        << "Replay timing events must all be allocated during capture setup; the only "
            "new event is the cache's ordinary final ownership fence.";
     EXPECT_EQ(gpu_ctx.events_recorded_, 3);
     EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
@@ -2602,11 +2765,12 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -2649,11 +2813,12 @@ TEST(Test__GraphSegmentCache, ReplaySkipsCaptureOnlyPreparation)
     llaminar2::testing::MockDeviceContext ctx(
         DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -2692,22 +2857,26 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     int coherence_calls = 0;
     std::vector<std::string> transaction_order;
     DeviceGraphCaptureController::ReplayHooks hooks{
-        [&](const DeviceGraphExecutor::GraphSegment &segment)
+        .cohere_inputs = [&](const DeviceGraphExecutor::GraphSegment &segment)
         {
             ++coherence_calls;
             transaction_order.emplace_back("cohere_inputs");
             return segment.stage_names == std::vector<std::string>{"row_select"} &&
                    prep_stage->prepare_calls_ == 1;
         },
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {},
-        [&](const std::string &, void *stream)
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+        .capture_boundary = [&](const std::string &, void *stream)
         {
             transaction_order.emplace_back("capture_boundary");
             return stream == cache.capture_stream && coherence_calls == 1;
-        }};
+        },
+    };
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
         graph,
@@ -2788,11 +2957,15 @@ TEST(Test__GraphSegmentCache, CapturePhaseRejectsMissingInputPreflight)
         DeviceId::cuda(0),
         ComputeBackendType::GPU_CUDA);
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
         graph,
@@ -2839,11 +3012,18 @@ TEST(Test__GraphSegmentCache, CaptureStageFailureEndsCaptureAndStopsExecution)
         DeviceId::rocm(0),
         ComputeBackendType::GPU_ROCM);
     DeviceGraphCaptureController::ReplayHooks hooks{
-        [](const DeviceGraphExecutor::GraphSegment &) { return true; },
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = [](const DeviceGraphExecutor::GraphSegment &)
+        {
+            return true;
+        },
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
         graph,
@@ -2867,9 +3047,11 @@ TEST(Test__GraphSegmentCache, CaptureStageFailureEndsCaptureAndStopsExecution)
         << "A capture failure must not re-execute the failed stage eagerly";
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0)
         << "Capture entry and failure handling must not synchronize the stream";
-    EXPECT_EQ(gpu_ctx.events_created_, 1);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
-    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_created_, 0)
+        << "Native capture entry must not allocate a host-observed fence.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0)
+        << "Capture failure cleanup must close capture without a host wait.";
 }
 
 TEST(Test__GraphSegmentCache, CaptureManualSegmentRecordsSnapshotsAfterExecuteNodeCallback)
@@ -2890,23 +3072,24 @@ TEST(Test__GraphSegmentCache, CaptureManualSegmentRecordsSnapshotsAfterExecuteNo
     int prepare_snapshot_calls = 0;
     int record_snapshot_calls = 0;
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        [&](ComputeNode &node)
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
         {
             ++execute_calls;
             return node.stage && node.stage->execute(&ctx);
         },
-        [&](ComputeNode &, void *stream)
+        .prepare_snapshot_copies = [&](ComputeNode &, void *stream)
         {
             ++prepare_snapshot_calls;
             return stream == cache.capture_stream;
         },
-        [&](ComputeNode &, void *stream)
+        .record_snapshot_copies = [&](ComputeNode &, void *stream)
         {
             ++record_snapshot_calls;
             return stream == cache.capture_stream;
         },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
         graph,
@@ -2943,23 +3126,24 @@ TEST(Test__GraphSegmentCache, ReplayManualSegmentRecordsSnapshotsAfterExecuteNod
     int prepare_snapshot_calls = 0;
     int record_snapshot_calls = 0;
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        [&](ComputeNode &node)
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
         {
             ++execute_calls;
             return node.stage && node.stage->execute(&ctx);
         },
-        [&](ComputeNode &, void *stream)
+        .prepare_snapshot_copies = [&](ComputeNode &, void *stream)
         {
             ++prepare_snapshot_calls;
             return stream == cache.capture_stream;
         },
-        [&](ComputeNode &, void *stream)
+        .record_snapshot_copies = [&](ComputeNode &, void *stream)
         {
             ++record_snapshot_calls;
             return stream == cache.capture_stream;
         },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3000,16 +3184,17 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
         cache,
         &gpu_ctx,
         "CUDA:0"));
-    const int events_created_during_warmup = gpu_ctx.events_created_;
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3049,8 +3234,8 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
-    EXPECT_EQ(events_created_during_warmup, 32);
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup + 1);
+    EXPECT_EQ(events_created_during_capture_setup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup + 1);
     EXPECT_EQ(gpu_ctx.events_recorded_, 3);
     EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
     EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
@@ -3092,17 +3277,18 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
         cache,
         &gpu_ctx,
         "ROCm:0"));
-    const int events_created_during_warmup = gpu_ctx.events_created_;
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
     gpu_ctx.query_event_ready_ = false;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3119,7 +3305,7 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
     ASSERT_TRUE(result.success);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
     EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup)
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup)
         << "Deferred replay must not allocate timing events in the hot path.";
     EXPECT_TRUE(PerfStatsCollector::snapshot({"stage_gpu"}).empty())
         << "An incomplete asynchronous timing interval must remain cache-owned.";
@@ -3179,7 +3365,7 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventRec
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup);
     EXPECT_EQ(gpu_ctx.events_recorded_, 2);
     EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
     EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
@@ -3231,18 +3417,19 @@ TEST(Test__GraphSegmentCache, DeferredReplayTimingUsesBoundedNonblockingSampling
         cache,
         &gpu_ctx,
         "CUDA:0"));
-    const int events_created_during_warmup = gpu_ctx.events_created_;
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
     gpu_ctx.query_event_ready_ = false;
 
     llaminar2::testing::MockDeviceContext ctx(
         DeviceId::cuda(0),
         ComputeBackendType::GPU_CUDA);
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     constexpr uint64_t kReplayBurst = 20;
     for (uint64_t replay = 0; replay < kReplayBurst; ++replay)
@@ -3261,12 +3448,12 @@ TEST(Test__GraphSegmentCache, DeferredReplayTimingUsesBoundedNonblockingSampling
         ASSERT_TRUE(result.success) << "replay=" << replay;
     }
 
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup);
     EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
     EXPECT_EQ(cache.replay_gpu_timing_busy_samples, 4u);
     EXPECT_EQ(gpu_ctx.events_recorded_, 32)
-        << "Only the sixteen warmup-owned slots may record start/stop pairs.";
+        << "Only the sixteen capture-owned slots may record start/stop pairs.";
 
     gpu_ctx.query_event_ready_ = true;
     ASSERT_TRUE(DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
@@ -3329,11 +3516,12 @@ TEST(Test__GraphSegmentCache, CudaDeferredReplayDoesNotSynchronizeCapturedSegmen
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3390,11 +3578,12 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDefersFinalFenceWithoutOpt
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3450,16 +3639,17 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
         cache,
         &gpu_ctx,
         "ROCm:0"));
-    const int events_created_during_warmup = gpu_ctx.events_created_;
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](ComputeNode &, void *) { return true; },
-        [](ComputeNode &, void *) { return true; },
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -3476,8 +3666,8 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
     ASSERT_TRUE(result.success);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
     EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
-    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup)
-        << "Captured-collective replay must borrow only warmup-owned timing events.";
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup)
+        << "Captured-collective replay must borrow only capture-owned timing events.";
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
@@ -3507,7 +3697,8 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         false,
         false,
         false,
-        &variant);
+        &variant,
+        DeviceId::rocm(0));
 
     FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor executor;
@@ -3568,7 +3759,17 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
 TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
 {
     ComputeGraph graph;
-    addFakeSegmentStage(graph, "verifier_graph", true);
+    addFakeSegmentStage(
+        graph,
+        "verifier_graph",
+        true,
+        false,
+        ComputeStageType::COPY,
+        false,
+        false,
+        false,
+        nullptr,
+        DeviceId::rocm(0));
 
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
@@ -3593,11 +3794,14 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
         /*current_step=*/0,
         "unit_recapture",
         [](const DeviceGraphExecutor::GraphSegment &) { return true; },
+        {},
+        [](ComputeNode &) { return true; },
         DeviceGraphExecutor::GraphCaptureBoundaryHook{},
         [](ComputeNode &, void *)
         {
             return true;
         },
+        DeviceGraphExecutor::GraphLaunchDependencyHook{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -3612,7 +3816,17 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
 TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
 {
     ComputeGraph graph;
-    addFakeSegmentStage(graph, "verifier_graph", true);
+    addFakeSegmentStage(
+        graph,
+        "verifier_graph",
+        true,
+        false,
+        ComputeStageType::COPY,
+        false,
+        false,
+        false,
+        nullptr,
+        DeviceId::cuda(0));
 
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
@@ -3636,11 +3850,14 @@ TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
         /*current_step=*/0,
         "unit_recapture",
         [](const DeviceGraphExecutor::GraphSegment &) { return true; },
+        {},
+        [](ComputeNode &) { return true; },
         DeviceGraphExecutor::GraphCaptureBoundaryHook{},
         [](ComputeNode &, void *)
         {
             return true;
         },
+        DeviceGraphExecutor::GraphLaunchDependencyHook{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;

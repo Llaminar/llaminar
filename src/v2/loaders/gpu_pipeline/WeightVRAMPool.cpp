@@ -251,10 +251,10 @@ namespace llaminar2
              *
              * This matters for packed GGUF formats such as Q6_K and IQ3_S:
              * their kernels issue 16-, 32-, and wider-bit source loads. A
-             * 512 MiB budget shared by two devices and then divided across
-             * three lanes yields an odd 89,478,485-byte capacity. Using that
-             * value as the old physical stride made the first non-zero lane
-             * fault with cudaErrorMisalignedAddress.
+             * A configured per-GPU budget divided across three lanes can yield
+             * an odd byte capacity. Using that value as the old physical stride
+             * made the first non-zero lane fault with a misaligned-address
+             * error.
              */
             staging_slot_stride_bytes_ = alignUp(max_staging, kAlignment);
             staging_region_bytes_ =
@@ -394,6 +394,9 @@ namespace llaminar2
 
         WeightSlot slot;
         slot.payload_bytes = plan.payload_bytes;
+        slot.scales_bytes = plan.scales_bytes;
+        slot.mins_bytes = plan.mins_bytes;
+        slot.emins_bytes = plan.emins_bytes;
         slot.staging_bytes = plan.staging_bytes;
 
         if (base)

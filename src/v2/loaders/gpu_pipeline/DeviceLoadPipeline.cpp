@@ -18,6 +18,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
@@ -58,6 +60,152 @@ namespace llaminar2
             });
 
         return backward_jumps;
+    }
+
+    std::vector<CoalescedWeightJobRun> coalesceContiguousWeightJobs(
+        const std::vector<WeightJob> &jobs,
+        const std::vector<const void *> &source_owners)
+    {
+        if (jobs.size() != source_owners.size())
+        {
+            throw std::invalid_argument(
+                "coalesceContiguousWeightJobs requires one source owner per job");
+        }
+        if (jobs.empty())
+            return {};
+
+        std::vector<size_t> ordered_indices(jobs.size());
+        std::iota(ordered_indices.begin(), ordered_indices.end(), size_t{0});
+
+        for (size_t index = 0; index < jobs.size(); ++index)
+        {
+            const auto &job = jobs[index];
+            const int full_n = job.full_N > 0 ? job.full_N : job.N;
+            const int full_k = job.full_K > 0 ? job.full_K : job.K;
+            if (!source_owners[index])
+            {
+                throw std::invalid_argument(
+                    "coalesceContiguousWeightJobs requires a non-null immutable source owner for '" +
+                    job.name + "'");
+            }
+            if (!job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
+                job.raw_bytes % static_cast<size_t>(job.N) != 0)
+            {
+                throw std::invalid_argument(
+                    "coalesceContiguousWeightJobs received malformed whole-matrix job '" +
+                    job.name + "'");
+            }
+            if (job.row_offset != 0 || full_n != job.N || full_k != job.K)
+            {
+                throw std::invalid_argument(
+                    "coalesceContiguousWeightJobs must run before row chunking for '" +
+                    job.name + "'");
+            }
+            if (job.packed_group_rows != 0)
+            {
+                throw std::invalid_argument(
+                    "coalesceContiguousWeightJobs requires ungrouped logical input for '" +
+                    job.name + "'");
+            }
+        }
+
+        std::stable_sort(
+            ordered_indices.begin(), ordered_indices.end(),
+            [&](size_t lhs_index, size_t rhs_index)
+            {
+                const auto lhs_owner =
+                    reinterpret_cast<uintptr_t>(source_owners[lhs_index]);
+                const auto rhs_owner =
+                    reinterpret_cast<uintptr_t>(source_owners[rhs_index]);
+                if (lhs_owner != rhs_owner)
+                    return lhs_owner < rhs_owner;
+
+                const auto lhs_source = reinterpret_cast<uintptr_t>(
+                    jobs[lhs_index].host_raw_data);
+                const auto rhs_source = reinterpret_cast<uintptr_t>(
+                    jobs[rhs_index].host_raw_data);
+                return lhs_source < rhs_source;
+            });
+
+        std::vector<CoalescedWeightJobRun> runs;
+        runs.reserve(jobs.size());
+        size_t previous_index = std::numeric_limits<size_t>::max();
+
+        for (const size_t source_index : ordered_indices)
+        {
+            const auto &source = jobs[source_index];
+            const size_t source_bytes_per_row =
+                source.raw_bytes / static_cast<size_t>(source.N);
+
+            bool append = false;
+            if (!runs.empty() && previous_index != std::numeric_limits<size_t>::max())
+            {
+                const auto &previous = jobs[previous_index];
+                const size_t previous_bytes_per_row =
+                    previous.raw_bytes / static_cast<size_t>(previous.N);
+                const auto previous_address = reinterpret_cast<uintptr_t>(
+                    previous.host_raw_data);
+                const auto source_address = reinterpret_cast<uintptr_t>(
+                    source.host_raw_data);
+                const bool previous_end_representable =
+                    previous_address <=
+                    std::numeric_limits<uintptr_t>::max() - previous.raw_bytes;
+
+                append =
+                    source_owners[source_index] == source_owners[previous_index] &&
+                    source.format == previous.format &&
+                    source.N == previous.N &&
+                    source.K == previous.K &&
+                    source.is_asymmetric == previous.is_asymmetric &&
+                    source_bytes_per_row == previous_bytes_per_row &&
+                    previous_end_representable &&
+                    source_address == previous_address + previous.raw_bytes;
+            }
+
+            if (!append)
+            {
+                CoalescedWeightJobRun run;
+                run.job = source;
+                run.job.row_offset = 0;
+                run.job.full_N = source.N;
+                run.job.full_K = source.K;
+                run.members.push_back({
+                    .source_job_index = source_index,
+                    .row_offset = 0,
+                });
+                runs.push_back(std::move(run));
+                previous_index = source_index;
+                continue;
+            }
+
+            auto &run = runs.back();
+            if (source.N > std::numeric_limits<int>::max() - run.job.N)
+            {
+                throw std::overflow_error(
+                    "coalesceContiguousWeightJobs row count overflow for '" +
+                    source.name + "'");
+            }
+            if (source.raw_bytes >
+                std::numeric_limits<size_t>::max() - run.job.raw_bytes)
+            {
+                throw std::overflow_error(
+                    "coalesceContiguousWeightJobs byte count overflow for '" +
+                    source.name + "'");
+            }
+
+            const int member_row_offset = run.job.N;
+            run.members.push_back({
+                .source_job_index = source_index,
+                .row_offset = member_row_offset,
+            });
+            run.job.N += source.N;
+            run.job.full_N = run.job.N;
+            run.job.raw_bytes += source.raw_bytes;
+            run.job.packed_group_rows = source.N;
+            previous_index = source_index;
+        }
+
+        return runs;
     }
 
     namespace
@@ -642,6 +790,16 @@ namespace llaminar2
                                                                          << " full_N=" << full_n);
                 return false;
             }
+            if (job.packed_group_rows < 0 ||
+                (job.packed_group_rows > 0 &&
+                 (job.packed_group_rows > full_n ||
+                  full_n % job.packed_group_rows != 0)))
+            {
+                LOG_ERROR("DeviceLoadPipeline: invalid packed group geometry for '"
+                          << job.name << "' packed_group_rows="
+                          << job.packed_group_rows << " full_N=" << full_n);
+                return false;
+            }
             if (job.K <= 0 || full_k <= 0 || job.raw_bytes > max_staging)
             {
                 LOG_ERROR("DeviceLoadPipeline: invalid bounded row-chunk geometry for '"
@@ -833,6 +991,7 @@ namespace llaminar2
                     static_cast<uint32_t *>(slot->d_native_vnni_emins),
                     job.N, job.K,
                     full_n, job.row_offset,
+                    job.packed_group_rows,
                     repack_stream_);
 
                 if (!repack_ok)

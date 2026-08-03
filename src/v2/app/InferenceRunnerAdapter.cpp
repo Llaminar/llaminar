@@ -5,6 +5,7 @@
 
 #include "app/InferenceRunnerAdapter.h"
 
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -121,8 +122,13 @@ namespace llaminar2
 
     void InferenceRunnerAdapter::setDecodeSamplingParams(const SamplingParams &params)
     {
-        if (orch_runner_)
-            orch_runner_->setSamplingParams(params);
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure decode sampling on a null orchestration runner");
+        }
+        sampling_params_ = params;
+        orch_runner_->setSamplingParams(sampling_params_);
     }
 
     void InferenceRunnerAdapter::setDecodeStepTokenBudget(int max_tokens)
@@ -205,6 +211,34 @@ namespace llaminar2
     PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe() const
     {
         return orch_runner_ ? orch_runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+    }
+
+    bool InferenceRunnerAdapter::configureMTPRequestStopTokens(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request stop tokens on a null "
+                "orchestration runner");
+        }
+        orch_runner_->setStopTokens(stop_tokens);
+        return true;
+    }
+
+    bool InferenceRunnerAdapter::configureMTPRequestPenaltyPolicy(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request penalty policy on a null "
+                "orchestration runner");
+        }
+        sampling_params_.presence_penalty = policy.presence_penalty;
+        sampling_params_.frequency_penalty = policy.frequency_penalty;
+        orch_runner_->setSamplingParams(sampling_params_);
+        return true;
     }
 
 } // namespace llaminar2

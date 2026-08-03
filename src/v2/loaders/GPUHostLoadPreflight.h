@@ -14,9 +14,32 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 
 namespace llaminar2
 {
+    /**
+     * @brief Convert the DebugEnv startup-staging setting into one GPU's budget.
+     *
+     * The environment value is intentionally per device: every GPU owns an
+     * independent pinned upload ring and matching device scratch region.  This
+     * helper accepts no device-count argument, which prevents callers from
+     * accidentally dividing the configured cap across concurrently loading
+     * devices.  Zero and negative values retain the explicit unlimited mode.
+     *
+     * @param configured_mebibytes Per-GPU `LLAMINAR_GPU_LOAD_STAGING_MB` value.
+     * @return Per-GPU byte cap, or `std::nullopt` for unlimited staging.
+     */
+    [[nodiscard]] inline std::optional<size_t> gpuPerDeviceLoadStagingBudgetBytes(
+        int configured_mebibytes) noexcept
+    {
+        if (configured_mebibytes <= 0)
+            return std::nullopt;
+
+        constexpr size_t kBytesPerMiB = 1024ULL * 1024ULL;
+        return static_cast<size_t>(configured_mebibytes) * kBytesPerMiB;
+    }
+
     /**
      * @brief Compute the transient host bytes required by weight loading.
      *

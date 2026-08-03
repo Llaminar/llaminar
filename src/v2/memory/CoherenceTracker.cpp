@@ -4,6 +4,7 @@
  */
 
 #include "CoherenceTracker.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/TensorClasses.h"
 #include "transfer/TransferEngine.h"
 #include "utils/Logger.h"
@@ -18,6 +19,18 @@ namespace llaminar2
     {
         if (!tensor)
             return true; // External or null — nothing to do
+
+        /*
+         * Native capture is validation-only: allocation, upload, migration, and
+         * external event discovery have already happened before beginCapture().
+         * TransferEngine consults the scoped dependency ledger to distinguish an
+         * earlier recorded producer from a strict graph-external input.
+         */
+        if (target.is_gpu() && currentGraphCaptureDependencyLedger())
+        {
+            TransferEngine::requireDeviceInput(tensor, target, stream);
+            return true;
+        }
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
         // Invariant: if the arena says DEVICE is authoritative, the tensor
@@ -80,8 +93,16 @@ namespace llaminar2
 
         if (target.is_gpu())
         {
-            // Output-only storage must never upload stale host bytes.
-            TransferEngine::prepareDeviceOutput(tensor, target, stream);
+            /*
+             * Capture preflight has already established stable output
+             * addresses. Recording may validate that allocation but must not
+             * call the placement-capable API, even when it would happen to be
+             * a no-op for the current process state.
+             */
+            if (isGraphCaptureActive())
+                TransferEngine::requireDeviceOutput(tensor, target, stream);
+            else
+                TransferEngine::prepareDeviceOutput(tensor, target, stream);
         }
         // CPU writes just use the existing host buffer — nothing to allocate
 
@@ -125,6 +146,15 @@ namespace llaminar2
         if (device.is_gpu())
         {
             TransferEngine::publishDeviceWrite(tensor, device, stream);
+            if (currentGraphCaptureDependencyLedger())
+            {
+                /*
+                 * The producer is only recorded.  ScopedGraphCaptureStage owns
+                 * the in-transaction edge, and the post-launch graph boundary
+                 * will publish real global authority.
+                 */
+                return;
+            }
         }
         else
         {
@@ -137,6 +167,16 @@ namespace llaminar2
     void CoherenceTracker::markWrittenFlagsOnly(TensorBase *tensor, CoherenceState &state,
                                                 DeviceId device)
     {
+        if (device.is_gpu() && currentGraphCaptureDependencyLedger())
+        {
+            /*
+             * Do not make a recorded-but-unlaunched write globally visible.
+             * Stage completion advances the capture ledger without mutating the
+             * arena or TensorBase coherence state.
+             */
+            return;
+        }
+
         markWritten(state, device);
 
         // Lightweight graph-replay publication: the graph executor owns the

@@ -55,6 +55,49 @@ namespace llaminar2
     };
 
     /**
+     * @brief Arithmetic route selected for one prepared MoE routing graph.
+     *
+     * The route kind is capture identity.  Backends use it to bind exactly the
+     * persistent scratch and immutable converted weights consumed by the
+     * corresponding production kernel before graph capture begins.
+     */
+    enum class MoERouteLaunchKind : uint8_t
+    {
+        /// One-token routing that publishes the live device runtime table.
+        RuntimeDecode = 0,
+        /// Ordinary multi-row routing with a stable physical row capacity.
+        GroupedPrefill = 1,
+        /// Grouped MTP routing with serial-decode-equivalent row arithmetic.
+        DecodeEquivalentVerifier = 2,
+    };
+
+    /**
+     * @brief Immutable geometry and arithmetic policy for router preparation.
+     *
+     * This value contains no live request state.  The physical row count is a
+     * graph-capture capacity; a separate device scalar owns the logical row
+     * count at replay time.
+     */
+    struct MoERouteLaunchPlan
+    {
+        MoERouteLaunchKind kind = MoERouteLaunchKind::GroupedPrefill;
+        int physical_rows = 0;
+        int d_model = 0;
+        int num_experts = 0;
+        int top_k = 0;
+
+        /** @brief Return whether every launch dimension is internally valid. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return physical_rows > 0 &&
+                   d_model > 0 &&
+                   num_experts > 0 &&
+                   top_k > 0 &&
+                   top_k <= num_experts;
+        }
+    };
+
+    /**
      * @brief Immutable host launch metadata for one device-resident MoE call.
      *
      * GPU MoE execution may be captured concurrently by the main graph, an MTP
@@ -283,6 +326,11 @@ namespace llaminar2
          * - no H2D copies from stack-owned row indices,
          * - no allocation after graph warmup has declared the route workspace.
          *
+         * @param device_effective_seq_len Optional device INT32 logical row
+         *        count for a fixed-width graph. Rows at or above this value
+         *        must publish `expert=-1, weight=0` and cannot reach expert
+         *        state. The pointer is replay data, not graph identity.
+         *
          * The default deliberately returns false; verifier correctness should fail
          * loudly on a backend that has not implemented the rowwise contract.
          */
@@ -290,7 +338,8 @@ namespace llaminar2
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,
             bool normalize_weights,
-            ITensor *output_indices, ITensor *output_weights)
+            ITensor *output_indices, ITensor *output_weights,
+            const int *device_effective_seq_len = nullptr)
         {
             (void)hidden;
             (void)gate_weights;
@@ -301,6 +350,34 @@ namespace llaminar2
             (void)normalize_weights;
             (void)output_indices;
             (void)output_weights;
+            (void)device_effective_seq_len;
+            return false;
+        }
+
+        /**
+         * @brief Prepare every persistent resource used by a captured router.
+         *
+         * GPU implementations must bind route scratch, row-quantization
+         * scratch, and any immutable Q8/FP16 gate publication required by
+         * @p plan on the kernel's exact producer stream.  Conversion kernels
+         * may run here because this is a setup boundary before capture; routing
+         * arithmetic and output publication must not run here.
+         *
+         * The default is a hard unsupported result.  A GPU backend cannot
+         * become graph-capturable merely by inheriting a no-op preparation.
+         *
+         * @param gate_weights Device-resident router matrix whose stable
+         *        address participates in immutable-cache identity.
+         * @param plan Typed graph geometry and arithmetic route.
+         * @return `true` only when the subsequent capture performs no lazy
+         *         allocation, conversion, or host-to-device publication.
+         */
+        virtual bool prepareRouteLaunch(
+            ITensor *gate_weights,
+            const MoERouteLaunchPlan &plan)
+        {
+            (void)gate_weights;
+            (void)plan;
             return false;
         }
 
@@ -803,12 +880,20 @@ namespace llaminar2
          * @param gateup_descriptor_table_id Persistent gate/up descriptor table.
          * @param down_descriptor_table_id Persistent down descriptor table.
          * @param top_k Number of routed expert slots in this row.
-         * @param output Device-resident weighted MoE output row.
+         * @param output Weighted MoE output consumed by the later canonical
+         *        reducer when @p canonical_route_contributions is non-null;
+         *        otherwise this is the device-resident publication target.
+         *        A canonical producer must not require, allocate, read, or
+         *        write this later reducer target.
          * @param d_model Model hidden width.
          * @param intermediate Expert intermediate width.
          * @param expert_mask Optional immutable participant-local ownership
          *        mask. Masked routes must become inactive device metadata
          *        without modifying the original routing tensors.
+         * @param canonical_route_contributions Optional device-resident
+         *        [1, top_k, d_model] publication target. When supplied, this
+         *        tensor is the producer's sole output and @p output may not yet
+         *        have device storage.
          * @return true after the output write has been published on the exact
          *         producer stream; false on any contract or launch failure.
          */
@@ -868,12 +953,83 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare immutable backend state for fused runtime-table decode capture.
+         *
+         * A captured grouped decode launch embeds persistent descriptor-table and
+         * scratch-pointer addresses. Backends must bind every required workspace
+         * slice and publish those pointer arrays on their exact producer stream
+         * before native graph capture begins. This method performs only that
+         * launch-topology preparation: it must not execute expert arithmetic,
+         * consume runtime routing values, allocate transient device memory, copy
+         * model activations, or synchronize a stream or device.
+         *
+         * @return true only when a subsequent groupedExpertDecodeFromRuntime()
+         *         call is capture-ready without eager arithmetic.
+         */
+        virtual bool prepareGroupedRuntimeDecodeLaunchState(
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            int d_model,
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source)
+        {
+            (void)gateup_descriptor_table_id;
+            (void)down_descriptor_table_id;
+            (void)top_k;
+            (void)d_model;
+            (void)intermediate;
+            (void)descriptor_source;
+            return false;
+        }
+
+        /**
+         * @brief Prepare immutable backend state for fixed-table grouped decode capture.
+         *
+         * Shared-expert decode uses fixed host-known expert metadata but device-
+         * resident projection scratch. Before capture, the backend publishes the
+         * fixed metadata and exact scratch addresses into persistent workspace.
+         * No GEMV, GEMM, SwiGLU, or down operation may run here; the first model
+         * transaction is executed only by the captured graph.
+         *
+         * @return true only when both table-decode launches are capture-ready.
+         */
+        virtual bool prepareGroupedTableDecodeLaunchState(
+            const int *expert_ids,
+            const float *expert_weights,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int num_active,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)expert_ids;
+            (void)expert_weights;
+            (void)gateup_descriptor_table_id;
+            (void)down_descriptor_table_id;
+            (void)num_active;
+            (void)gate_outputs;
+            (void)up_outputs;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
          * @brief Fused runtime-table single-token expert decode.
          *
          * Backends may fuse runtime-routed gate/up projection, SwiGLU
          * quantization, and down projection into one graph-capturable launch
-         * sequence. The default returns false so existing backends keep the
-         * established gate/up plus down path.
+         * sequence. When @p canonical_route_contributions is supplied, it is
+         * the sole publication target; @p output belongs to the later
+         * canonical reducer and may not yet have device storage. The producer
+         * must not require, allocate, read, or write that inactive target. The
+         * default returns false so existing backends keep the established
+         * gate/up plus down path.
          */
         virtual bool groupedExpertDecodeFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
@@ -1658,13 +1814,20 @@ namespace llaminar2
          * @param absolute_position_ids_device Device-resident INT32 absolute
          *        position for every grouped row. This must be the exact
          *        graph-local row consumed by RoPE and must never be null.
+         * @param active_row_count_device Device-resident INT32 logical row
+         *        count within the physically captured grouped width. This is
+         *        the same request-geometry scalar consumed by routing and
+         *        downstream row-masked epilogues. Implementations must read it
+         *        on the launch stream and leave every physical suffix row
+         *        untouched; host reconstruction of this value is forbidden.
          */
         virtual bool assignPrefillRoutesLeastLoadedResident(
             const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            const int32_t *absolute_position_ids_device)
+            const int32_t *absolute_position_ids_device,
+            const int32_t *active_row_count_device)
         {
             (void)launch;
             (void)runtime_layer;
@@ -1673,6 +1836,7 @@ namespace llaminar2
             (void)num_experts;
             (void)top_k;
             (void)absolute_position_ids_device;
+            (void)active_row_count_device;
             return false;
         }
 
@@ -1875,7 +2039,10 @@ namespace llaminar2
          * synchronization.
          *
          * @param hidden         Input hidden states [seq_len, d_model]
-         * @param output         Output buffer [seq_len, d_model] (overwritten)
+         * @param output         Final output [seq_len, d_model]. This is the
+         *        publication target only when
+         *        @p canonical_route_contributions is null; otherwise it is a
+         *        later reducer target that may not yet have device storage.
          * @param gate_desc_table_id  Descriptor table ID for gate weights
          * @param up_desc_table_id    Descriptor table ID for up weights (same table)
          * @param down_desc_table_id  Descriptor table ID for down weights
@@ -1884,6 +2051,10 @@ namespace llaminar2
          * @param intermediate   Expert intermediate dimension
          * @param num_experts    Total number of experts
          * @param top_k          Experts per token
+         * @param canonical_route_contributions Optional device-resident
+         *        [seq_len, top_k, d_model] publication target. When supplied,
+         *        the producer must not require, allocate, read, or write
+         *        @p output.
          * @return true on success
          */
         virtual bool executeGroupedPrefillPipeline(
@@ -1915,7 +2086,11 @@ namespace llaminar2
          * for counts, offsets, grouped token ids, and grouped route weights.
          * Implementations must not read device-side count values on the host;
          * all route and mutable descriptor data remains device-resident and
-         * graph-capturable.
+         * graph-capturable. Publication ownership matches
+         * executeGroupedPrefillPipeline(): a non-null
+         * @p canonical_route_contributions is the sole producer output, while
+         * @p output belongs to the later canonical reducer and may not yet
+         * have device storage.
          */
         virtual bool executeGroupedPrefillPipelineFromRuntime(
             DeviceMoELayerRuntime *device_runtime_layer,

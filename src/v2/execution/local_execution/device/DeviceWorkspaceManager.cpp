@@ -258,6 +258,12 @@ namespace llaminar2
                     canonical.required || descriptor.required;
                 if (canonical.regime != descriptor.regime)
                     canonical.regime = WorkspaceExecutionRegime::Any;
+                if (descriptor.content_lifetime ==
+                    WorkspaceContentLifetime::SerialGraphFamily)
+                {
+                    canonical.content_lifetime =
+                        WorkspaceContentLifetime::SerialGraphFamily;
+                }
             }
         }
 
@@ -325,6 +331,34 @@ namespace llaminar2
                             coexistent_live_extents[rhs][lhs],
                             rhs_extent);
                 }
+            }
+        }
+
+        /*
+         * Participant cliques model scratch whose contents die at each event
+         * boundary. Initialize-once buffers are different: their bytes remain
+         * live while every other serial participant runs. Make that lifetime a
+         * conflict with the maximum published extent of every other name so
+         * the placement algorithm cannot reuse the interval merely because a
+         * particular graph omits the persistent consumer.
+         */
+        for (size_t persistent = 0; persistent < count; ++persistent)
+        {
+            if (descriptors[persistent].content_lifetime !=
+                WorkspaceContentLifetime::SerialGraphFamily)
+            {
+                continue;
+            }
+            for (size_t other = 0; other < count; ++other)
+            {
+                if (other == persistent)
+                    continue;
+                coexistent_live_extents[persistent][other] = std::max(
+                    coexistent_live_extents[persistent][other],
+                    descriptors[persistent].size_bytes);
+                coexistent_live_extents[other][persistent] = std::max(
+                    coexistent_live_extents[other][persistent],
+                    descriptors[other].size_bytes);
             }
         }
 

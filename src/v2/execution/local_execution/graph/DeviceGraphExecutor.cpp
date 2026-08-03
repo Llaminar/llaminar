@@ -753,7 +753,110 @@ namespace llaminar2
             snapshot_manifest);
     }
 
-    bool DeviceGraphExecutor::prepareInputsForGraphCapture(
+    bool DeviceGraphExecutor::prepareStageArenaFrontierForCapture(
+        ComputeNode &node,
+        const std::vector<BufferBinding> &external_reads,
+        DeviceId capture_device,
+        void *capture_stream,
+        std::unordered_set<ITensor *> &prepared_inputs,
+        std::unordered_set<ITensor *> &prepared_outputs,
+        const char *context)
+    {
+        if (!arena_ || !node.stage)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena capture frontier requires an arena and stage"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (!capture_device.is_gpu() || !capture_stream)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena capture frontier requires a GPU and exact stream"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena frontier must be prepared before beginCapture()"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        DeviceId target_device =
+            node.device.is_valid() ? node.device : node.stage->device();
+        if (!target_device.is_valid())
+            target_device = capture_device;
+        if (target_device != capture_device)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] A native graph capture cannot span "
+                      << capture_device.toString() << " and "
+                      << target_device.toString() << " at stage '" << node.name << "'"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        try
+        {
+            for (const auto &binding : external_reads)
+            {
+                ITensor *tensor = arena_->getTensor(binding.id);
+                if (!tensor)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Graph input "
+                              << bufferIdName(binding.id)
+                              << " is not bound for stage '" << node.name << "'"
+                              << (context ? std::string(" (") + context + ")" : std::string()));
+                    return false;
+                }
+                if (!prepared_inputs.insert(tensor).second)
+                    continue;
+
+                TransferEngine::requireDeviceInput(
+                    tensor,
+                    capture_device,
+                    capture_stream);
+            }
+
+            const StageBufferContract contract = node.stage->bufferContract();
+            for (const auto &binding : contract.writesRequiringPrepare())
+            {
+                ITensor *tensor = arena_->getTensor(binding.id);
+                if (!tensor)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Graph output "
+                              << bufferIdName(binding.id)
+                              << " is not bound for stage '" << node.name << "'"
+                              << (context ? std::string(" (") + context + ")" : std::string()));
+                    return false;
+                }
+                if (!prepared_outputs.insert(tensor).second)
+                    continue;
+
+                if (!arena_->prepareForWrite(
+                        binding.id,
+                        capture_device,
+                        capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Failed to allocate graph output "
+                              << bufferIdName(binding.id)
+                              << " before capture at stage '" << node.name << "'"
+                              << (context ? std::string(" (") + context + ")" : std::string()));
+                    return false;
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Failed to prepare graph arena frontier at stage '"
+                      << node.name << "'"
+                      << (context ? std::string(" (") + context + ")" : std::string())
+                      << ": " << e.what());
+            return false;
+        }
+
+        return true;
+    }
+
+    bool DeviceGraphExecutor::prepareGraphStorageForCapture(
         ComputeGraph &graph,
         IDeviceContext *ctx,
         void *capture_stream,
@@ -761,81 +864,54 @@ namespace llaminar2
     {
         if (!arena_)
         {
-            LOG_ERROR("[DeviceGraphExecutor] Cannot prepare graph input dependencies without a BufferArena"
+            LOG_ERROR("[DeviceGraphExecutor] Cannot prepare graph storage without a BufferArena"
                       << (context ? std::string(" (") + context + ")" : std::string()));
             return false;
         }
         if (!ctx || !ctx->isGPU())
         {
-            LOG_ERROR("[DeviceGraphExecutor] Graph input dependency preparation requires a GPU context"
+            LOG_ERROR("[DeviceGraphExecutor] Graph storage preparation requires a GPU context"
                       << (context ? std::string(" (") + context + ")" : std::string()));
             return false;
         }
         if (!capture_stream)
         {
-            LOG_ERROR("[DeviceGraphExecutor] Graph input dependency preparation requires the exact capture stream"
+            LOG_ERROR("[DeviceGraphExecutor] Graph storage preparation requires the exact capture stream"
                       << (context ? std::string(" (") + context + ")" : std::string()));
             return false;
         }
         if (isGraphCaptureActive())
         {
-            LOG_ERROR("[DeviceGraphExecutor] Graph input dependencies must be prepared before beginCapture()"
+            LOG_ERROR("[DeviceGraphExecutor] Graph storage must be prepared before beginCapture()"
                       << (context ? std::string(" (") + context + ")" : std::string()));
             return false;
         }
 
         const DeviceId capture_device = ctx->deviceId();
         std::unordered_set<ITensor *> prepared_inputs;
+        std::unordered_set<ITensor *> prepared_outputs;
+        GraphArenaDependencyTracker dependency_tracker;
 
-        try
+        for (const auto &name : graph.getExecutionOrder())
         {
-            for (const auto &name : graph.getExecutionOrder())
+            ComputeNode *node = graph.getNode(name);
+            if (!node || !node->stage)
+                continue;
+
+            const StageBufferContract contract = node->stage->bufferContract();
+            const auto external_reads =
+                dependency_tracker.observeStage(contract);
+            if (!prepareStageArenaFrontierForCapture(
+                    *node,
+                    external_reads,
+                    capture_device,
+                    capture_stream,
+                    prepared_inputs,
+                    prepared_outputs,
+                    context))
             {
-                ComputeNode *node = graph.getNode(name);
-                if (!node || !node->stage)
-                    continue;
-
-                DeviceId target_device =
-                    node->device.is_valid() ? node->device : node->stage->device();
-                if (!target_device.is_valid())
-                    target_device = capture_device;
-                if (target_device != capture_device)
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] A native graph capture cannot span "
-                              << capture_device.toString() << " and "
-                              << target_device.toString() << " at stage '" << name << "'"
-                              << (context ? std::string(" (") + context + ")" : std::string()));
-                    return false;
-                }
-
-                const StageBufferContract contract = node->stage->bufferContract();
-                for (const auto &binding : contract.allArenaReads())
-                {
-                    ITensor *tensor = arena_->getTensor(binding.id);
-                    if (!tensor)
-                    {
-                        LOG_ERROR("[DeviceGraphExecutor] Graph input "
-                                  << bufferIdName(binding.id)
-                                  << " is not bound for stage '" << name << "'"
-                                  << (context ? std::string(" (") + context + ")" : std::string()));
-                        return false;
-                    }
-                    if (!prepared_inputs.insert(tensor).second)
-                        continue;
-
-                    TransferEngine::requireDeviceInput(
-                        tensor,
-                        capture_device,
-                        capture_stream);
-                }
+                return false;
             }
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[DeviceGraphExecutor] Failed to prepare graph input dependencies"
-                      << (context ? std::string(" (") + context + ")" : std::string())
-                      << ": " << e.what());
-            return false;
         }
 
         return true;
@@ -956,43 +1032,6 @@ namespace llaminar2
         }
 
         const bool capture_active = isGraphCaptureActive();
-        if (!record_device_copy && !capture_active)
-        {
-            /*
-             * Snapshot preparation is a validation boundary, not a source
-             * discovery fallback. Warmup must already have executed every
-             * selected producer, copied its point-in-time bytes, and finalized
-             * the exact descriptor that capture will record. Re-entering stage
-             * dump metadata here can expose a pre-execution projection tensor
-             * instead of the cache/workspace view selected by production.
-             */
-            const auto warmed = snapshot_manifest.stage_copies.find(node.name);
-            if (warmed != snapshot_manifest.stage_copies.end() &&
-                !warmed->second.outputs.empty())
-            {
-                for (const auto &copy : warmed->second.outputs)
-                {
-                    if (!copy.descriptor_finalized || !copy.storage ||
-                        !copy.device.is_gpu() || !copy.source_ptr ||
-                        copy.byte_size == 0)
-                    {
-                        LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '"
-                                  << node.name
-                                  << "' reached capture preparation without a finalized warmup manifest");
-                        return false;
-                    }
-                }
-                return true;
-            }
-
-            if (snapshot_manifest.outputless_stages.contains(node.name))
-                return true;
-
-            LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '"
-                      << node.name
-                      << "' reached capture preparation before warmup finalized its device manifest");
-            return false;
-        }
 
         StageDumpInfo dump_info = node.stage->refreshDumpInfoSnapshot();
         std::vector<size_t> graph_output_indices;
@@ -1017,16 +1056,12 @@ namespace llaminar2
             }
 
             /*
-             * This call follows a real eager/warmup execution. Record an
-             * explicit outputless manifest so later preparation/publication can
-             * distinguish intentional absence from skipped warmup. Retire any
-             * older slot manifest for the same stage name and graph variant.
+             * Record intentional absence during launch preparation. Capture
+             * must observe the same outputless contract; a later appearance is
+             * descriptor drift and therefore fatal.
              */
-            if (record_device_copy)
-            {
-                snapshot_manifest.stage_copies.erase(node.name);
-                snapshot_manifest.outputless_stages.insert(node.name);
-            }
+            snapshot_manifest.stage_copies.erase(node.name);
+            snapshot_manifest.outputless_stages.insert(node.name);
             return true;
         }
 
@@ -1174,10 +1209,10 @@ namespace llaminar2
             else
             {
                 /*
-                 * A real eager/warmup execution is authoritative: it resolved
-                 * the production source selected by the stage. Allocation-only
-                 * preparation returned through the finalized-manifest boundary
-                 * above, so this branch can only publish executed stage state.
+                 * Launch preparation is the sole authority for captured
+                 * snapshot topology. Stages must expose their final persistent
+                 * output pointer before arithmetic begins; capture later proves
+                 * that the executed producer reports the identical descriptor.
                  */
                 copy.name = output_name;
                 copy.dtype = output_dtype;
@@ -1187,6 +1222,7 @@ namespace llaminar2
                 copy.byte_size = output_byte_size;
                 copy.device = copy_device;
                 copy.source_ptr = source_ptr;
+                copy.descriptor_finalized = true;
             }
 
             const size_t storage_elements =
@@ -1270,10 +1306,6 @@ namespace llaminar2
                           << copy.byte_size << " device=" << copy_device.toString());
                 return false;
             }
-
-            // From this point onward the descriptor came from an executed
-            // producer, not from allocation-only pre-capture introspection.
-            copy.descriptor_finalized = true;
 
             if (isGraphCaptureActive())
             {
@@ -2042,6 +2074,31 @@ namespace llaminar2
     }
 
     bool DeviceGraphExecutor::runStage(
+        ComputeNode &node,
+        IDeviceContext *ctx,
+        const StageRunPolicy &policy,
+        bool is_collective,
+        GraphSnapshotManifest *snapshot_manifest)
+    {
+        if (!node.stage)
+            return runStageImpl(
+                node, ctx, policy, is_collective, snapshot_manifest);
+
+        /*
+         * Every execution path converges here.  During native capture the scope
+         * advances the frozen dependency plan only after the complete canonical
+         * stage runner succeeds; exceptions and false returns leave the
+         * transaction failed and cannot expose a partially recorded producer.
+         */
+        ScopedGraphCaptureStage capture_stage(node.stage.get());
+        const bool success = runStageImpl(
+            node, ctx, policy, is_collective, snapshot_manifest);
+        if (success)
+            capture_stage.complete();
+        return success;
+    }
+
+    bool DeviceGraphExecutor::runStageImpl(
         ComputeNode &node,
         IDeviceContext *ctx,
         const StageRunPolicy &policy,

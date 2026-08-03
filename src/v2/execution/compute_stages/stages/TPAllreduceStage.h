@@ -46,6 +46,26 @@ namespace llaminar2
     const char *toString(TPLocalRootedCollectiveOperation operation) noexcept;
 
     /**
+     * @brief Exact tensor ownership role of one rooted-collective participant.
+     *
+     * A rooted collective is not uniformly in-place on every participant.
+     * Reduce contributors and the broadcast root only consume their local
+     * tensor, while the reduce root and broadcast receivers produce bytes.
+     * Keeping this distinction typed prevents the graph executor from
+     * requiring nonexistent receiver input or publishing imaginary writes.
+     */
+    enum class TPLocalRootedCollectiveTensorRole
+    {
+        ReduceRootInOut,
+        ReduceContributorInput,
+        BroadcastRootInput,
+        BroadcastReceiverOutput
+    };
+
+    /** @return Stable diagnostic name for @p role. */
+    const char *toString(TPLocalRootedCollectiveTensorRole role) noexcept;
+
+    /**
      * @brief Workspace-backed control sideband attached to a TP allreduce.
      *
      * The graph builder names persistent device workspace buffers here. At
@@ -241,13 +261,15 @@ namespace llaminar2
     };
 
     /**
-     * @brief Graph-capturable rooted collective over one preallocated tensor.
+     * @brief Graph-capturable rooted collective with participant-specific ownership.
      *
      * This stage exists for protocols whose result is needed on one fixed root
      * before a compact publication. `ReduceSum` reduces the complete tensor to
      * that root; `Broadcast` publishes the root tensor to every participant.
-     * Both operations are issued directly on the executor-selected explicit
-     * stream. There is no host rendezvous, transport emulation, allocation, or
+     * The declarative contract distinguishes existing root/contributor inputs
+     * from receiver outputs that the executor prepares before capture. Both
+     * operations are issued directly on the executor-selected explicit stream.
+     * There is no host rendezvous, transport emulation, hot-path allocation, or
      * synchronization path.
      */
     class TPLocalRootedCollectiveStage final
@@ -297,7 +319,6 @@ namespace llaminar2
         bool requiresAllreduce() const override { return true; }
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -319,6 +340,13 @@ namespace llaminar2
         {
             return CoherencePolicy::OUTPUT;
         }
+        /**
+         * @brief Return this participant's exact read/write ownership role.
+         * @return Role derived solely from the graph-bound operation, root,
+         *         and participant indices.
+         */
+        [[nodiscard]] TPLocalRootedCollectiveTensorRole tensorRole() const
+            noexcept;
         /** @return Immutable operation parameters for graph regressions. */
         [[nodiscard]] const Params &params() const { return params_; }
 

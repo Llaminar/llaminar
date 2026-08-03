@@ -9,7 +9,6 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
-#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../transfer/TransferEngine.h"
@@ -19,18 +18,9 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <sstream>
-
-#ifdef HAVE_CUDA
-#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
-#endif
 
 namespace llaminar2
 {
@@ -85,24 +75,11 @@ namespace llaminar2
         }
     } // namespace
 
-    struct MoERoutingStage::GpuEffectiveSeqLenState
-    {
-        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
-        int *device_effective_seq_len = nullptr; ///< Workspace scalar read by GPU routing kernels.
-        bool device_value_uploaded = false;      ///< True when device scalar matches the host value.
-    };
-
     MoERoutingStage::MoERoutingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
-    }
-
-    MoERoutingStage::~MoERoutingStage()
-    {
-        releaseGpuEffectiveSeqLenState();
     }
 
     void MoERoutingStage::resetSessionState()
@@ -112,11 +89,6 @@ namespace llaminar2
         routing_weights_.clear();
         router_logits_.clear();
         cached_routing_ = MoERoutingResult{};
-        prefill_effective_seq_len_ = 0;
-        prefill_bucket_seq_len_ = 0;
-        prefill_replay_params_set_ = false;
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
     }
 
     void MoERoutingStage::resetSessionStatePreservingCapturedReplay()
@@ -126,11 +98,6 @@ namespace llaminar2
         routing_weights_.clear();
         router_logits_.clear();
         cached_routing_ = MoERoutingResult{};
-        prefill_effective_seq_len_ = 0;
-        prefill_bucket_seq_len_ = 0;
-        prefill_replay_params_set_ = false;
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
     }
 
     void MoERoutingStage::resetSessionStatePreservingLazyInitialization()
@@ -182,6 +149,18 @@ namespace llaminar2
         return kernel;
     }
 
+    MoERouteLaunchKind MoERoutingStage::routeLaunchKind() const noexcept
+    {
+        if (params_.force_decode_equivalent_verifier_prefill)
+            return MoERouteLaunchKind::DecodeEquivalentVerifier;
+        if (params_.seq_len == 1 &&
+            !params_.force_grouped_verifier_prefill_for_decode)
+        {
+            return MoERouteLaunchKind::RuntimeDecode;
+        }
+        return MoERouteLaunchKind::GroupedPrefill;
+    }
+
     void MoERoutingStage::stashRoutingResults(
         const std::vector<int> &expert_indices,
         const std::vector<float> &expert_weights,
@@ -204,185 +183,71 @@ namespace llaminar2
             params_.decode_histogram->recordTokenBoundary(params_.layer_idx);
     }
 
-    int MoERoutingStage::effectivePrefillSeqLen() const
-    {
-        if (!prefill_replay_params_set_ || prefill_effective_seq_len_ <= 0)
-            return params_.seq_len;
-        return std::clamp(prefill_effective_seq_len_, 1, std::max(1, params_.seq_len));
-    }
-
-    void MoERoutingStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
-    {
-        prefill_replay_params_set_ = true;
-        prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
-        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
-        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
-        refreshPinnedEffectiveSeqLen();
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && hasGPUStream() && bound_workspace_)
-            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
-    }
-
-    void MoERoutingStage::refreshPinnedEffectiveSeqLen()
-    {
-        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
-            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
-    }
-
-    bool MoERoutingStage::ensureGpuEffectiveSeqLenStateInitialized()
-    {
-        if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) ||
-            bound_workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) < sizeof(int))
-        {
-            LOG_ERROR("[MoERoutingStage] Missing graph workspace buffer '"
-                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
-                      << "' for padded MoE prefill replay on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        auto *device_effective_seq_len = static_cast<int *>(
-            bound_workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN));
-        if (!device_effective_seq_len)
-        {
-            LOG_ERROR("[MoERoutingStage] Graph workspace buffer '"
-                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
-                      << "' resolved to null on " << params_.device_id.toString());
-            return false;
-        }
-
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
-            return true;
-        }
-
-        auto state = std::make_unique<GpuEffectiveSeqLenState>();
-        state->device = params_.device_id;
-        state->device_effective_seq_len = device_effective_seq_len;
-
-        bool allocated = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectHostParam(
-                params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectHostParam(
-                params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-
-        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
-        {
-            LOG_ERROR("[MoERoutingStage] Failed to allocate pinned effective-length scalar for "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        gpu_effective_seq_len_state_ = std::move(state);
-        refreshPinnedEffectiveSeqLen();
-        return true;
-    }
-
-    bool MoERoutingStage::uploadGpuEffectiveSeqLen()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return false;
-        refreshPinnedEffectiveSeqLen();
-
-        if (isGraphCaptureActive())
-        {
-            if (!gpu_effective_seq_len_state_->device_value_uploaded)
-            {
-                LOG_ERROR("[MoERoutingStage] Effective sequence length scalar was not uploaded before graph capture");
-                return false;
-            }
-            return true;
-        }
-
-        bool uploaded = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            uploaded = cuda::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            uploaded = rocm::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
-        return uploaded;
-    }
-
-    void MoERoutingStage::releaseGpuEffectiveSeqLenState()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return;
-
-        if (gpu_effective_seq_len_state_->device.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            cuda::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-        else if (gpu_effective_seq_len_state_->device.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            rocm::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-
-        gpu_effective_seq_len_state_.reset();
-    }
-
     bool MoERoutingStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
     {
         (void)ctx;
+        if (params_.device_id.is_gpu() && !stream)
+        {
+            LOG_ERROR("[MoERoutingStage] Graph launch preparation requires the "
+                      "exact non-null producer stream");
+            return false;
+        }
         if (stream)
             setGPUStream(stream);
 
-        if (!hasPrefillReplayParams() || !prefill_replay_params_set_)
-            return true;
-
-        if (!ensureGpuEffectiveSeqLenStateInitialized())
+        /*
+         * Resolve and bind the backend wrapper before beginCapture(). Creating
+         * the wrapper from execute() used to require an eager routing pass; no
+         * routing values or model outputs are produced by this preparation.
+         */
+        IMoEKernel *kernel = nullptr;
+        if (params_.device_id.is_gpu())
+            kernel = ensureMoEKernel();
+        if (params_.device_id.is_gpu() && !kernel)
+        {
+            LOG_ERROR("[MoERoutingStage] Failed to bind the persistent MoE "
+                      "routing kernel before graph capture");
             return false;
-        const bool uploaded = uploadGpuEffectiveSeqLen();
-        if (uploaded && PerfStatsCollector::isEnabled())
+        }
+
+        if (params_.device_id.is_gpu())
+        {
+            const MoERouteLaunchPlan launch_plan{
+                .kind = routeLaunchKind(),
+                .physical_rows = params_.seq_len,
+                .d_model = params_.d_model,
+                .num_experts = params_.num_experts,
+                .top_k = params_.top_k,
+            };
+            if (!kernel->prepareRouteLaunch(
+                    params_.gate_weights,
+                    launch_plan))
+            {
+                LOG_ERROR("[MoERoutingStage] Failed to prepare persistent "
+                          "routing resources before graph capture"
+                          << " device=" << params_.device_id.toString()
+                          << " layer=" << params_.layer_idx
+                          << " kind=" << static_cast<int>(launch_plan.kind)
+                          << " rows=" << launch_plan.physical_rows);
+                return false;
+            }
+        }
+
+        if (params_.seq_len > 1 && params_.active_row_count_device &&
+            PerfStatsCollector::isEnabled())
         {
             PerfStatsCollector::addCounter(
                 "moe",
-                "routing_padded_prefill_effective_len_prepare",
+                "routing_device_row_count_bound",
                 1.0,
                 "prefill",
                 params_.device_id.toString(),
                 PerfStatsCollector::Tags{
-                    {"bucket_seq_len", std::to_string(params_.seq_len)},
-                    {"effective_seq_len", std::to_string(effectivePrefillSeqLen())},
+                    {"physical_rows", std::to_string(params_.seq_len)},
+                    {"row_count_source", "device_request_geometry"},
                     {"layer", std::to_string(params_.layer_idx)}});
         }
-        return uploaded;
+        return true;
     }
 
     bool MoERoutingStage::executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx)
@@ -509,7 +374,8 @@ namespace llaminar2
                     top_k,
                     params_.norm_topk_prob,
                     full_indices,
-                    full_output_weights))
+                    full_output_weights,
+                    params_.active_row_count_device))
             {
                 LOG_ERROR("[MoERoutingStage] Decode-equivalent GPU verifier row routing failed "
                           "for layer " << params_.layer_idx);
@@ -812,47 +678,38 @@ namespace llaminar2
             return false;
         }
 
-        const bool padded_prefill_replay =
-            params_.device_id.is_gpu() &&
-            seq_len > 1 &&
-            prefill_replay_params_set_ &&
-            effectivePrefillSeqLen() < seq_len;
-        const int *device_effective_seq_len = nullptr;
-        if (padded_prefill_replay)
+        const int32_t *device_active_rows =
+            params_.device_id.is_gpu() && seq_len > 1
+                ? params_.active_row_count_device
+                : nullptr;
+        if (device_active_rows && PerfStatsCollector::isEnabled())
         {
             /*
-             * Bucketed GPU prefill graphs keep launch dimensions fixed, so
-             * MoE routing must read the real prompt length from device memory
-             * and produce invalid routes for padded rows. Otherwise replaying
-             * a shorter request through a captured larger bucket lets padded
-             * hidden rows mutate grouped expert state.
+             * The stage deliberately does not read this scalar on the host.
+             * Request admission or verifier preparation publishes it before
+             * graph consumption, and the backend kernel masks the physical
+             * suffix on every capture and replay, including a full first use.
              */
-            if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
-                return false;
-            device_effective_seq_len = gpu_effective_seq_len_state_->device_effective_seq_len;
-            if (PerfStatsCollector::isEnabled())
-            {
-                PerfStatsCollector::addCounter(
-                    "moe",
-                    "routing_padded_prefill_effective_len_execute",
-                    1.0,
-                    "prefill",
-                    params_.device_id.toString(),
-                    PerfStatsCollector::Tags{
-                        {"bucket_seq_len", std::to_string(seq_len)},
-                        {"effective_seq_len", std::to_string(effectivePrefillSeqLen())},
-                        {"layer", std::to_string(params_.layer_idx)}});
-            }
+            PerfStatsCollector::addCounter(
+                "moe",
+                "routing_device_row_count_execute",
+                1.0,
+                "prefill",
+                params_.device_id.toString(),
+                PerfStatsCollector::Tags{
+                    {"physical_rows", std::to_string(seq_len)},
+                    {"row_count_source", "device_request_geometry"},
+                    {"layer", std::to_string(params_.layer_idx)}});
         }
 
-        const bool routed = device_effective_seq_len
+        const bool routed = device_active_rows
                                 ? kernel->routeWithTensorsEffectiveSeqLen(
                                       params_.input, params_.gate_weights,
                                       seq_len, d_model, num_experts, top_k,
                                       params_.norm_topk_prob,
                                       params_.output_indices, params_.output_weights,
                                       cached_routing_,
-                                      device_effective_seq_len)
+                                      device_active_rows)
                                 : kernel->routeWithTensors(
                                       params_.input, params_.gate_weights,
                                       seq_len, d_model, num_experts, top_k,
@@ -937,7 +794,7 @@ namespace llaminar2
                isDeviceRoutedPrefillGraphCapturable();
     }
 
-    bool MoERoutingStage::supportsWarmupDependentGraphCapture() const
+    bool MoERoutingStage::supportsGraphCaptureAfterLaunchPreparation() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
@@ -999,6 +856,8 @@ namespace llaminar2
             << " kernel=" << (moe_kernel_ ? "true" : "false")
             << " runtime_table=" << (params_.moe_runtime_table ? "true" : "false")
             << " runtime_layer=" << (moe_runtime_layer_ ? "true" : "false")
+            << " active_row_count_device="
+            << (params_.active_row_count_device ? "true" : "false")
             << " runtime_decode_ready="
             << (runtime_decode_ready ? "true" : "false")
             << " grouped_prefill_supported="
@@ -1021,12 +880,14 @@ namespace llaminar2
 
     bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-        return supportsLazyPrefillGraphCapturePreflight();
+        return supportsLazyPrefillGraphCapturePreflight() &&
+               params_.active_row_count_device != nullptr;
     }
 
     bool MoERoutingStage::supportsPaddedPrefillRealLengthContract() const
     {
-        return isDeviceRoutedPrefillGraphCaptureSupported();
+        return isDeviceRoutedPrefillGraphCaptureSupported() &&
+               params_.active_row_count_device != nullptr;
     }
 
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
@@ -1081,17 +942,17 @@ namespace llaminar2
     {
         // Cold padded-bucket preflight can run before ensureMoEKernel() has
         // been called. Validate the backend, shape, and tensor contract here;
-        // isDeviceRoutedPrefillGraphCapturable() adds warmed-kernel readiness.
+        // isDeviceRoutedPrefillGraphCapturable() adds prepared-kernel readiness.
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                isDeviceRoutedPrefillExecutionSupported();
     }
 
     bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const
     {
-        // Prefill routing is graph-capturable on supported GPU backends when the full path is
-        // device-only and the lazy MoE kernel has already been resolved during
-        // normal warmup. routeWithTensors() in non-snapshot Release builds does
-        // no D2H and no backend stream synchronization, so data stays device-resident.
+        // Prefill routing is graph-capturable on supported GPU backends when
+        // the full path is device-only and explicit launch preparation has
+        // resolved the lazy MoE kernel. routeWithTensors() in non-snapshot
+        // Release builds performs no D2H or backend stream synchronization.
         return isDeviceRoutedPrefillGraphCaptureSupported() && moe_kernel_ != nullptr;
     }
 
@@ -1231,11 +1092,15 @@ namespace llaminar2
         WorkspaceRequirements reqs =
             params_.device_id.is_rocm()
                 ? MoEWorkspaceBuffers::rocmRouting(
-                params_.seq_len,
-                params_.d_model,
-                params_.num_experts,
+                      params_.seq_len,
+                      params_.d_model,
+                      params_.num_experts,
                       params_.top_k)
-                : MoEWorkspaceBuffers::routing(params_.seq_len, params_.num_experts, params_.top_k);
+                : MoEWorkspaceBuffers::cudaRouting(
+                      params_.seq_len,
+                      params_.d_model,
+                      params_.num_experts,
+                      params_.top_k);
 
         if (params_.device_rebalance_route_apply)
         {
@@ -1293,11 +1158,6 @@ namespace llaminar2
 
     void MoERoutingStage::unbindWorkspace()
     {
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        }
         bindWorkspace(nullptr);
     }
 

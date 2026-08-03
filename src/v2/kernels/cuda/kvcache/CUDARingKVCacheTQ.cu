@@ -773,11 +773,13 @@ namespace llaminar2
         }
         bool ok = false;
         const int index = layer * batch_size_ + seq_idx;
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
         if (prepared_tq_sources)
         {
             ok = cuda_tq_copy_prepared_rows_ring_dynamic(
                 d_k, d_v, entry.d_K, entry.d_V,
-                &d_head_params_[index], /*d_row_count=*/nullptr,
+                &d_head_params_[index], d_append_count,
                 max_seq_len_, verifier_rows,
                 k_pos_bytes_, v_pos_bytes_, k_head_major, v_head_major,
                 local_n_kv_heads_, stream);
@@ -788,16 +790,16 @@ namespace llaminar2
                 static_cast<const float *>(d_k),
                 static_cast<const float *>(d_v),
                 d_rotations, entry.d_K, entry.d_V,
-                &d_head_params_[index], /*d_row_count=*/nullptr,
+                &d_head_params_[index], d_append_count,
                 max_seq_len_, verifier_rows,
                 local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
                 mode_, stream);
         }
         if (ok)
         {
-            cuda_kv_sequence_state_advance(
+            cuda_kv_sequence_state_advance_dynamic(
                 &d_head_params_[index], &d_count_params_[index],
-                verifier_rows, max_seq_len_, stream);
+                d_append_count, verifier_rows, max_seq_len_, stream);
         }
         if (!ok)
         {
@@ -818,6 +820,7 @@ namespace llaminar2
              {"source_k_layout", k_head_major ? "head_major" : "position_major"},
              {"source_v_layout", v_head_major ? "head_major" : "position_major"},
              {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"row_count_policy", d_append_count ? "resident_device_count" : "captured_exact_shape"},
              {"topology", is_sharded() ? "local_tp_shard" : "replicated"},
              {"commit_policy", "single_grouped_metadata_commit"},
              {"local_kv_heads", std::to_string(local_n_kv_heads_)},

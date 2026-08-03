@@ -23,6 +23,27 @@ namespace
     /** @brief HIP copy/synchronization policy consumed by the shared harness. */
     struct ROCmRuntime
     {
+        bool allocateDevice(void **pointer, size_t bytes) const
+        {
+            return hipMalloc(pointer, bytes) == hipSuccess;
+        }
+
+        void freeDevice(void *pointer) const
+        {
+            (void)hipFree(pointer);
+        }
+
+        bool copyHostToDevice(
+            void *destination,
+            const void *source,
+            size_t bytes,
+            void *stream) const
+        {
+            return hipMemcpyAsync(
+                       destination, source, bytes, hipMemcpyHostToDevice,
+                       static_cast<hipStream_t>(stream)) == hipSuccess;
+        }
+
         void copyDeviceToHost(
             void *destination,
             const void *source,

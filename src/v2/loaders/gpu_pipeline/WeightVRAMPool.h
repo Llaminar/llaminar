@@ -41,6 +41,9 @@ namespace llaminar2
             void *d_native_vnni_mins = nullptr;
             void *d_native_vnni_emins = nullptr;
             size_t payload_bytes = 0;
+            size_t scales_bytes = 0;
+            size_t mins_bytes = 0;
+            size_t emins_bytes = 0;
             size_t staging_bytes = 0;
         };
 

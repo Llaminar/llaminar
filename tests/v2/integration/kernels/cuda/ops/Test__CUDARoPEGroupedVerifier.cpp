@@ -23,6 +23,27 @@ namespace
     /** @brief CUDA copy/synchronization policy consumed by the shared harness. */
     struct CudaRuntime
     {
+        bool allocateDevice(void **pointer, size_t bytes) const
+        {
+            return cudaMalloc(pointer, bytes) == cudaSuccess;
+        }
+
+        void freeDevice(void *pointer) const
+        {
+            (void)cudaFree(pointer);
+        }
+
+        bool copyHostToDevice(
+            void *destination,
+            const void *source,
+            size_t bytes,
+            void *stream) const
+        {
+            return cudaMemcpyAsync(
+                       destination, source, bytes, cudaMemcpyHostToDevice,
+                       static_cast<cudaStream_t>(stream)) == cudaSuccess;
+        }
+
         void copyDeviceToHost(
             void *destination,
             const void *source,

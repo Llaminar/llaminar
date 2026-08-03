@@ -32,6 +32,51 @@ namespace llaminar2
             FullGraph
         };
 
+        const char *graphExecutableLaunchPhaseName(
+            DeviceGraphExecutor::GraphExecutableLaunchPhase phase)
+        {
+            using Phase = DeviceGraphExecutor::GraphExecutableLaunchPhase;
+            switch (phase)
+            {
+            case Phase::InitialTransaction:
+                return "initial_transaction";
+            case Phase::SteadyReplay:
+                return "steady_replay";
+            case Phase::DiagnosticRecapture:
+                return "diagnostic_recapture";
+            case Phase::DiagnosticVerification:
+                return "diagnostic_verification";
+            }
+            return "unknown";
+        }
+
+        bool applyGraphLaunchDependency(
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &hook,
+            DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *execution_stream)
+        {
+            if (!hook)
+                return true;
+            if (!execution_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Captured executable launch "
+                    "dependency requires the exact non-null graph stream"
+                    << " phase=" << graphExecutableLaunchPhaseName(phase));
+                return false;
+            }
+            if (!hook(phase, execution_stream))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Captured executable launch "
+                    "dependency was rejected"
+                    << " phase=" << graphExecutableLaunchPhaseName(phase)
+                    << " stream=" << execution_stream);
+                return false;
+            }
+            return true;
+        }
+
         const char *captureModeTag(GraphReplayCaptureMode mode)
         {
             return mode == GraphReplayCaptureMode::FullGraph ? "full_graph" : "segmented";
@@ -184,6 +229,47 @@ namespace llaminar2
             }
             out << ']';
             return out.str();
+        }
+
+        /**
+         * @brief Materialize one frozen stage-order ledger before beginCapture().
+         *
+         * The production executor supplies arena-derived internal edges.  Pure
+         * controller tests have no BufferArena and receive an empty plan.  If
+         * such a test invokes the production runStage() path, stage entry fails
+         * immediately because there is no planned stage; simple state-machine
+         * callback tests can still exercise begin/end orchestration without
+         * constructing tensors.
+         */
+        std::unique_ptr<GraphCaptureDependencyLedger> planCaptureDependencies(
+            ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            DeviceId device,
+            void *stream,
+            const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+                const DeviceGraphExecutor::GraphSegment &)> &planner,
+            const std::string &context)
+        {
+            if (planner)
+                return planner(segment);
+
+            (void)graph;
+            (void)segment;
+            std::vector<GraphCaptureDependencyLedger::StagePlan> stages;
+
+            try
+            {
+                return std::make_unique<GraphCaptureDependencyLedger>(
+                    device, stream, std::move(stages), context);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Strict capture dependency "
+                    "planning failed ("
+                    << context << "): " << e.what());
+                return nullptr;
+            }
         }
 
         std::string graphCaptureBoundaryName(
@@ -519,7 +605,7 @@ namespace llaminar2
             {
                 LOG_ERROR(
                     "[DeviceGraphCaptureController] GPU replay timing was "
-                    "selected without its warmup-owned event ring");
+                    "selected without its capture-owned event ring");
                 return false;
             }
             if (!reclaimReplayGpuTimingNonblockingImpl(segment_cache, gpu_ctx))
@@ -586,8 +672,6 @@ namespace llaminar2
     {
         switch (phase)
         {
-        case Phase::Warmup:
-            return "warmup";
         case Phase::Capture:
             return "capture";
         case Phase::Replay:
@@ -608,22 +692,16 @@ namespace llaminar2
 
         if (!initialized)
         {
-            return {Phase::Warmup, decode_step};
+            return {Phase::Capture, decode_step};
         }
 
         if (needs_capture)
         {
-            needs_capture = false;
-            return {Phase::Capture, decode_step};
+            throw std::logic_error(
+                "GPU graph cache exposed initialized-without-executable state");
         }
 
         return {Phase::Replay, decode_step};
-    }
-
-    void DeviceGraphCaptureController::markWarmupComplete(bool &initialized, bool &needs_capture)
-    {
-        initialized = true;
-        needs_capture = true;
     }
 
     void DeviceGraphCaptureController::prepareDeviceForGraphCapture(IDeviceContext *ctx)
@@ -733,7 +811,7 @@ namespace llaminar2
             "forward_graph",
             "replay_timing_event_slots_preallocated",
             static_cast<double>(slot_capacity),
-            "warmup",
+            "capture",
             device_name,
             {{"context", segment_cache.perf_context},
              {"replay_mode", captureModeTag(replay_mode)}});
@@ -754,27 +832,7 @@ namespace llaminar2
         return reclaimReplayGpuTimingNonblockingImpl(segment_cache, gpu_ctx);
     }
 
-    void DeviceGraphCaptureController::executeWarmupPhase(
-        ComputeGraph &graph,
-        DeviceGraphExecutor::GraphSegmentCache &segment_cache,
-        const std::unordered_set<std::string> *collective_nodes,
-        bool has_collective_nodes,
-        bool collectives_graph_capturable,
-        DeviceGraphExecutor::GraphReplayPlanPolicy plan_policy)
-    {
-        buildWarmupSegments(
-            graph,
-            segment_cache,
-            collective_nodes,
-            has_collective_nodes,
-            collectives_graph_capturable,
-            plan_policy);
-        markWarmupComplete(
-            segment_cache.initialized,
-            segment_cache.needs_capture);
-    }
-
-    void DeviceGraphCaptureController::buildWarmupSegments(
+    void DeviceGraphCaptureController::buildCapturePlan(
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegmentCache &segment_cache,
         const std::unordered_set<std::string> *collective_nodes,
@@ -818,9 +876,9 @@ namespace llaminar2
 
             // Start from stage capability, then layer on safety gates.
             bool stage_capturable = node->stage->isGraphCapturable();
-            const bool warmup_dependent_capture =
-                !stage_capturable && node->stage->supportsWarmupDependentGraphCapture();
-            if (warmup_dependent_capture)
+            const bool preparation_dependent_capture =
+                !stage_capturable && node->stage->supportsGraphCaptureAfterLaunchPreparation();
+            if (preparation_dependent_capture)
             {
                 stage_capturable = true;
             }
@@ -1139,8 +1197,8 @@ namespace llaminar2
                             << " [" << stage_name
                             << ": type="
                             << computeStageTypeName(node->stage->type())
-                            << ", warmup_preflight="
-                            << (node->stage->supportsWarmupDependentGraphCapture()
+                            << ", launch_preparation="
+                            << (node->stage->supportsGraphCaptureAfterLaunchPreparation()
                                     ? "true"
                                     : "false");
                         if (!readiness.empty())
@@ -1448,6 +1506,7 @@ namespace llaminar2
         bool full_graph_replay,
         const std::string &perf_context,
         const std::string &device_name,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!gpu_ctx)
@@ -1476,6 +1535,14 @@ namespace llaminar2
         const GraphReplayCaptureMode replay_mode = full_graph_replay
                                                        ? GraphReplayCaptureMode::FullGraph
                                                        : GraphReplayCaptureMode::Segmented;
+
+        if (!applyGraphLaunchDependency(
+                launch_dependency_cb,
+                DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay,
+                capture_stream))
+        {
+            return false;
+        }
 
         // Time the graph launch itself
         auto launch_t0 = std::chrono::high_resolution_clock::now();
@@ -1546,8 +1613,12 @@ namespace llaminar2
         uint64_t current_step,
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+        const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+            const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
+        const std::function<bool(ComputeNode &)> &execute_node_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!ctx || !gpu_ctx)
@@ -1558,6 +1629,13 @@ namespace llaminar2
         if (!segment.capture)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Re-capture missing segment capture");
+            return false;
+        }
+        if (!execute_node_cb)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Re-capture requires the canonical "
+                "executor stage hook");
             return false;
         }
 
@@ -1603,6 +1681,15 @@ namespace llaminar2
 
         bool exec_ok = true;
         std::string failed_stage_name;
+        auto dependency_ledger = planCaptureDependencies(
+            graph,
+            segment,
+            ctx->deviceId(),
+            capture_stream,
+            plan_capture_dependencies_cb,
+            "segment_recapture_" + std::to_string(segment_index));
+        if (!dependency_ledger)
+            return false;
         {
             if (capture_boundary_cb)
             {
@@ -1625,7 +1712,8 @@ namespace llaminar2
                 *gpu_ctx,
                 *segment.capture,
                 "segment recapture index=" +
-                    std::to_string(segment_index));
+                    std::to_string(segment_index),
+                dependency_ledger.get());
             if (!capture_transaction.begin())
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Re-capture beginCapture failed, seg " << segment_index);
@@ -1635,7 +1723,7 @@ namespace llaminar2
             for (const auto &stage_name : segment.stage_names)
             {
                 auto *node = graph.getNode(stage_name);
-                if (!node || !node->stage || !node->stage->execute(ctx))
+                if (!node || !node->stage || !execute_node_cb(*node))
                 {
                     exec_ok = false;
                     failed_stage_name = stage_name;
@@ -1721,6 +1809,14 @@ namespace llaminar2
             }
         }
 
+        if (!applyGraphLaunchDependency(
+                launch_dependency_cb,
+                DeviceGraphExecutor::GraphExecutableLaunchPhase::DiagnosticRecapture,
+                capture_stream))
+        {
+            return false;
+        }
+
         if (!segment.capture->launch())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Re-capture launch failed");
@@ -1745,6 +1841,7 @@ namespace llaminar2
         void *capture_stream,
         bool needs_segment_sync,
         int segment_index,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         VerifyReplayResult result{false, false};
@@ -1765,6 +1862,13 @@ namespace llaminar2
             // Verify mode compares "captured replay" against "direct execute".
             // Non-idempotent stages (e.g. residual accumulation) can legitimately
             // diverge on re-execution, so we skip comparison but still run replay.
+            if (!applyGraphLaunchDependency(
+                    launch_dependency_cb,
+                    DeviceGraphExecutor::GraphExecutableLaunchPhase::DiagnosticVerification,
+                    capture_stream))
+            {
+                return result;
+            }
             if (!segment.capture->launch())
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Verify-skip: graph launch failed, seg " << segment_index);
@@ -1796,6 +1900,13 @@ namespace llaminar2
             return result;
         }
 
+        if (!applyGraphLaunchDependency(
+                launch_dependency_cb,
+                DeviceGraphExecutor::GraphExecutableLaunchPhase::DiagnosticVerification,
+                capture_stream))
+        {
+            return result;
+        }
         if (!segment.capture->launch())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Verify: graph launch failed, seg " << segment_index);
@@ -1982,13 +2093,10 @@ namespace llaminar2
         IDeviceContext *ctx,
         IWorkerGPUContext *gpu_ctx,
         void *capture_stream,
-        bool has_collective_nodes,
         bool full_graph_capture,
         const std::string &perf_context,
         uint64_t current_step,
-        CapturePublicationPolicy publication_policy,
-        const std::function<bool(ComputeNode &)> &execute_node_cb,
-        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!ctx || !gpu_ctx)
@@ -2091,69 +2199,19 @@ namespace llaminar2
         }
 
         /*
-         * A successful warmup has already executed this logical transaction.
-         * Native stream capture above records launch topology but does not run
-         * the recorded work. Stop after instantiation so first-use setup cannot
-         * advance KV, GDN, convolution, sampler, or controller state twice. The
-         * warmup's ordinary stage lifecycle remains the sole output publication
-         * for this invocation; the new executable is owned only by future replay
-         * or by a composed parent graph.
+         * Capture records launch topology but does not execute it. Transaction
+         * zero is therefore always the first launch of the new executable,
+         * including graphs containing NCCL/RCCL nodes. Re-running stage methods
+         * manually here would bypass the captured collective topology and create
+         * a second, host-orchestrated execution contract.
          */
-        if (publication_policy ==
-            CapturePublicationPolicy::MaterializeOnly)
+        if (!applyGraphLaunchDependency(
+                launch_dependency_cb,
+                DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction,
+                capture_stream))
         {
-            segment.last_executed_step = current_step;
-            LOG_DEBUG(
-                "[DeviceGraphCaptureController] Segment captured and instantiated "
-                "without a second logical execution: "
-                << segment.capture->nodeCount() << " nodes, "
-                << segment.stage_names.size() << " stages");
-            return true;
+            return false;
         }
-
-        if (has_collective_nodes)
-        {
-            bool phase2_exec_ok = true;
-            for (const auto &stage_name : segment.stage_names)
-            {
-                auto *node = graph.getNode(stage_name);
-                if (!node || !node->stage)
-                {
-                    LOG_ERROR("[DeviceGraphCaptureController] Capturable segment missing stage during Phase-2 execution: " << stage_name);
-                    phase2_exec_ok = false;
-                    break;
-                }
-
-                if (!execute_node_cb(*node))
-                {
-                    LOG_ERROR("[DeviceGraphCaptureController] Capturable segment stage failed during Phase-2 execution: " << stage_name);
-                    phase2_exec_ok = false;
-                    break;
-                }
-                if (record_snapshot_copies_cb &&
-                    !record_snapshot_copies_cb(*node, capture_stream))
-                {
-                    LOG_ERROR("[DeviceGraphCaptureController] Capturable segment snapshot copy failed during Phase-2 execution: "
-                              << stage_name);
-                    phase2_exec_ok = false;
-                    break;
-                }
-                graph.markCompleted(stage_name);
-            }
-
-            if (!phase2_exec_ok)
-            {
-                return false;
-            }
-
-            // Capture records device-side state publication directly into the
-            // graph. The host owns no corresponding replay bookkeeping.
-            segment.last_executed_step = current_step;
-            LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+executed (Phase-2 semantics): "
-                      << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
-            return true;
-        }
-
         if (!segment.capture->launch())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Segment initial launch failed");
@@ -2319,8 +2377,12 @@ namespace llaminar2
         uint64_t current_step,
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+        const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+            const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         ReplayCapturableResult result{};
@@ -2373,8 +2435,11 @@ namespace llaminar2
                 current_step,
                 perf_context,
                 cohere_inputs_cb,
+                plan_capture_dependencies_cb,
+                execute_node_cb,
                 capture_boundary_cb,
                 record_snapshot_copies_cb,
+                launch_dependency_cb,
                 post_launch_cb);
             result.success = recapture_ok;
             return result;
@@ -2390,6 +2455,7 @@ namespace llaminar2
                 capture_stream,
                 needs_segment_sync,
                 segment_index,
+                launch_dependency_cb,
                 post_launch_cb);
             result.success = verify_result.success;
             result.skipped_non_idempotent = verify_result.skipped_non_idempotent;
@@ -2404,6 +2470,7 @@ namespace llaminar2
             full_graph_replay,
             perf_context,
             device_name,
+            launch_dependency_cb,
             post_launch_cb);
         result.success = launch_ok;
         return result;
@@ -2425,8 +2492,11 @@ namespace llaminar2
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+            const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         ReplaySegmentResult result{};
@@ -2447,8 +2517,11 @@ namespace llaminar2
                 current_step,
                 perf_context,
                 cohere_inputs_cb,
+                execute_node_cb,
+                plan_capture_dependencies_cb,
                 capture_boundary_cb,
                 record_snapshot_copies_cb,
+                launch_dependency_cb,
                 post_launch_cb);
             result.success = capturable_result.success;
             result.skipped_non_idempotent = capturable_result.skipped_non_idempotent;
@@ -2477,8 +2550,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         bool has_collective_nodes,
         uint64_t current_step,
-        const ReplayHooks &hooks,
-        CapturePublicationPolicy publication_policy)
+        const ReplayHooks &hooks)
     {
         CapturePhaseResult result{};
 
@@ -2499,26 +2571,55 @@ namespace llaminar2
 
         const bool full_graph_capture =
             captureModeForCache(segment_cache) == GraphReplayCaptureMode::FullGraph;
-        if (publication_policy == CapturePublicationPolicy::MaterializeOnly &&
-            !full_graph_capture)
+
+        /*
+         * A cross-lifetime dependency has exactly one legal placement: directly
+         * before launching one complete captured executable.  A segmented plan
+         * would make "before launch" ambiguous and could interleave host/manual
+         * work between the dependency and its consumer. Reject that topology at
+         * the controller boundary instead of relying on caller discipline.
+         */
+        if (hooks.launch_dependency &&
+            (!full_graph_capture ||
+             segment_cache.segments.size() != 1u ||
+             !segment_cache.segments.front().capturable))
         {
             LOG_ERROR(
-                "[DeviceGraphCaptureController] Materialization-only capture "
-                "requires one complete graph; manual or segmented execution is forbidden");
+                "[DeviceGraphCaptureController] A captured executable launch "
+                "dependency requires exactly one complete capturable graph");
             result.reset_cache = true;
             return result;
         }
 
         /*
-         * Some MoE stages only know whether their graph-capturable fast path is
-         * available after the warmup pass has prepared backend resources.  Make
-         * that decision before recording any Phase-2 segment.  The old behavior
-         * discovered this inside the segment loop after earlier captured
-         * segments had already mutated activation buffers, then restarted the
-         * whole decode graph from those dirty buffers. That is not a valid
-         * replay/restore boundary. A failed warmup-dependent preflight is now a
-         * hard capture-contract failure before any Phase-2 segment executes.
+         * Launch preparation owns immutable topology setup and must complete for
+         * every provisional capture unit before any native capture begins. This
+         * replaces eager model execution as the source of kernel wrappers,
+         * descriptor tables, pointer arrays, and transfer events. Only after
+         * preparation may the stricter capture-readiness predicates be trusted.
          */
+        for (const auto &seg : segment_cache.segments)
+        {
+            if (!seg.capturable)
+                continue;
+            for (const auto &stage_name : seg.stage_names)
+            {
+                auto *node = graph.getNode(stage_name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(capture_stream);
+            }
+            if (!prepareGraphLaunchMetadata(
+                    graph,
+                    seg,
+                    ctx,
+                    capture_stream,
+                    GraphLaunchPreparationPhase::Capture))
+            {
+                result.reset_cache = true;
+                return result;
+            }
+        }
+
         for (const auto &seg : segment_cache.segments)
         {
             if (!seg.capturable)
@@ -2528,26 +2629,29 @@ namespace llaminar2
                 auto *node = graph.getNode(stage_name);
                 if (!node || !node->stage)
                     continue;
-                if (node->stage->supportsWarmupDependentGraphCapture() &&
-                    !node->stage->isGraphCapturable())
+                if (!node->stage->isGraphCapturable())
                 {
                     const std::string readiness =
                         node->stage->graphCaptureReadinessDebugString();
                     LOG_ERROR(
-                        "[DeviceGraphCaptureController] Warmup-dependent stage '"
+                        "[DeviceGraphCaptureController] Prepared stage '"
                         << stage_name
-                        << "' is not graph-capturable after warmup"
+                        << "' is not graph-capturable after launch preparation"
                         << (readiness.empty() ? "" : "; ")
                         << readiness
                         << "; mandatory capture cannot proceed");
                     PerfStatsCollector::addCounter(
                         "forward_graph",
-                        "warmup_dependent_capture_not_ready",
+                        "launch_preparation_capture_not_ready",
                         1.0,
                         "decode",
                         ctx ? ctx->deviceId().toString() : std::string{},
                         {{"stage", stage_name},
                          {"stage_type", computeStageTypeName(node->stage->type())},
+                         {"preparation_dependent",
+                          node->stage->supportsGraphCaptureAfterLaunchPreparation()
+                              ? "true"
+                              : "false"},
                          {"context", segment_cache.perf_context},
                          {"readiness", readiness.empty() ? std::string("unspecified") : readiness}});
                     result.reset_cache = true;
@@ -2561,44 +2665,8 @@ namespace llaminar2
             auto &seg = segment_cache.segments[segment_index];
             if (seg.capturable)
             {
-                // Capturable path: set stream -> begin capture -> execute nodes
-                // into graph -> end capture -> finalize for Phase-2 semantics.
-                for (const auto &stage_name : seg.stage_names)
-                {
-                    auto *node = graph.getNode(stage_name);
-                    if (node && node->stage)
-                    {
-                        node->stage->setGPUStream(capture_stream);
-                    }
-                }
-                for (const auto &stage_name : seg.stage_names)
-                {
-                    auto *node = graph.getNode(stage_name);
-                    if (!node || !node->stage)
-                    {
-                        continue;
-                    }
-                    if (node->stage->supportsWarmupDependentGraphCapture() &&
-                        !node->stage->isGraphCapturable())
-                    {
-                        LOG_ERROR("[DeviceGraphCaptureController] Warmup-dependent stage '"
-                                  << stage_name
-                                  << "' is still not graph-capturable after warmup");
-                        result.reset_cache = true;
-                        return result;
-                    }
-                }
-
-                if (!prepareGraphLaunchMetadata(
-                        graph,
-                        seg,
-                        ctx,
-                        capture_stream,
-                        GraphLaunchPreparationPhase::Capture))
-                {
-                    result.reset_cache = true;
-                    return result;
-                }
+                // Capturable path: prepared stream -> begin capture -> record
+                // nodes -> end capture -> instantiate and launch transaction zero.
 
                 /*
                  * Snapshot copy nodes need their per-stage output descriptors and
@@ -2619,7 +2687,7 @@ namespace llaminar2
                             continue;
                         if (!hooks.prepare_snapshot_copies(*node, capture_stream))
                         {
-                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot prewarm failed before cached graph capture: "
+                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot descriptor preparation failed before cached graph capture: "
                                       << stage_name);
                             result.reset_cache = true;
                             result.success = false;
@@ -2630,7 +2698,7 @@ namespace llaminar2
 
                 /*
                  * This is the mandatory external-event import boundary for
-                 * Phase-2 native capture. It deliberately follows every
+                 * native capture. It deliberately follows every
                  * stage-owned metadata/snapshot preparation call: either may
                  * publish a fresh completion event on an eager stream. The
                  * complete segment is prejoined before the LocalTP rendezvous,
@@ -2657,10 +2725,14 @@ namespace llaminar2
                     return result;
                 }
 
-                // Native capture requires an idle stream. Fence exactly the
-                // capture stream's prior warmup work with the cache-owned event;
-                // no device-wide or stream-wide synchronization participates.
-                segment_cache.waitForCaptureStreamFence();
+                /*
+                 * Launch preparation and native capture share one exact stream.
+                 * The stream queue itself orders setup writes before the capture
+                 * boundary; waiting for a host-visible event here would insert
+                 * an intermediate CPU rendezvous into transaction zero. CUDA
+                 * and HIP begin capture after the stream's previously submitted
+                 * work without requiring a host synchronization.
+                 */
 
                 if (hooks.capture_boundary)
                 {
@@ -2690,6 +2762,30 @@ namespace llaminar2
                     return result;
                 }
 
+                if (!hooks.execute_node)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Native graph capture "
+                        "requires the canonical executor stage hook");
+                    result.reset_cache = true;
+                    result.success = false;
+                    return result;
+                }
+
+                auto dependency_ledger = planCaptureDependencies(
+                    graph,
+                    seg,
+                    ctx->deviceId(),
+                    capture_stream,
+                    hooks.plan_capture_dependencies,
+                    "capture_phase_segment_" + std::to_string(segment_index));
+                if (!dependency_ledger)
+                {
+                    result.reset_cache = true;
+                    result.success = false;
+                    return result;
+                }
+
                 bool exec_ok = true;
                 std::string failed_stage_name;
                 {
@@ -2698,7 +2794,8 @@ namespace llaminar2
                         *seg.capture,
                         "capture phase segment=" +
                             std::to_string(segment_index) +
-                            " stages=" + describeSegmentStages(seg));
+                            " stages=" + describeSegmentStages(seg),
+                        dependency_ledger.get());
                     if (!capture_transaction.begin())
                     {
                         LOG_ERROR("[DeviceGraphCaptureController] beginCapture failed for segment");
@@ -2709,7 +2806,7 @@ namespace llaminar2
                     for (const auto &stage_name : seg.stage_names)
                     {
                         auto *node = graph.getNode(stage_name);
-                        if (!node || !node->stage || !node->stage->execute(ctx))
+                        if (!node || !node->stage || !hooks.execute_node(*node))
                         {
                             LOG_ERROR("[DeviceGraphCaptureController] Stage failed during cached graph capture: " << stage_name);
                             exec_ok = false;
@@ -2778,13 +2875,10 @@ namespace llaminar2
                     ctx,
                     gpu_ctx,
                     capture_stream,
-                    has_collective_nodes,
                     full_graph_capture,
                     segment_cache.perf_context,
                     current_step,
-                    publication_policy,
-                    hooks.execute_node,
-                    hooks.record_snapshot_copies,
+                    hooks.launch_dependency,
                     hooks.post_launch);
                 if (!capture_finalize_ok)
                 {
@@ -2797,7 +2891,7 @@ namespace llaminar2
                 /*
                  * Manual segments are declarative members of the segmented
                  * plan, not a recovery path. They execute exactly once in the
-                 * same position during warmup, capture phase, and replay.
+                 * same position during capture and replay.
                  */
                 const bool manual_capture_ok = executeCapturePhaseManualSegment(
                     graph,
@@ -2854,8 +2948,27 @@ namespace llaminar2
         const bool recapture_mode = exec_cfg.gpu_graph_recapture || force_recapture;
         const bool stream_only_mode = exec_cfg.gpu_graph_stream_only;
         const bool stream_only_default = exec_cfg.gpu_graph_stream_only_default;
+        const GraphReplayCaptureMode replay_mode = captureModeForCache(segment_cache);
+        const bool full_graph_replay = replay_mode == GraphReplayCaptureMode::FullGraph;
+        if (hooks.launch_dependency &&
+            (!full_graph_replay ||
+             segment_cache.segments.size() != 1u ||
+             !segment_cache.segments.front().capturable))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] A captured executable launch "
+                "dependency cannot decorate segmented or manual replay");
+            return result;
+        }
         if (stream_only_mode)
         {
+            if (hooks.launch_dependency)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Stream-only diagnostics "
+                    "cannot satisfy a captured executable launch dependency");
+                return result;
+            }
             // Diagnostics mode: avoid graph launch and just run stages on the
             // selected stream to isolate stream-related issues.
             result.success = executeStreamOnlyReplay(
@@ -2889,8 +3002,6 @@ namespace llaminar2
         const auto &device_id = ctx->deviceId();
         const std::string device_name = device_id.toString();
         const int total_segments = static_cast<int>(segment_cache.segments.size());
-        const GraphReplayCaptureMode replay_mode = captureModeForCache(segment_cache);
-        const bool full_graph_replay = replay_mode == GraphReplayCaptureMode::FullGraph;
         auto replay_total_tags = replayCacheTags(segment_cache, replay_mode);
         replay_total_tags.emplace(
             "sync_scope",
@@ -2960,7 +3071,7 @@ namespace llaminar2
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
-            // segment metadata prepared during warmup.
+            // segment metadata prepared during capture setup.
             const auto replay_result = executeReplaySegment(
                 graph,
                 seg,
@@ -2977,8 +3088,10 @@ namespace llaminar2
                 segment_cache.perf_context,
                 hooks.cohere_inputs,
                 hooks.execute_node,
+                hooks.plan_capture_dependencies,
                 hooks.capture_boundary,
                 hooks.record_snapshot_copies,
+                hooks.launch_dependency,
                 hooks.post_launch);
             if (PerfStatsCollector::isEnabled())
             {
@@ -3134,8 +3247,11 @@ namespace llaminar2
     bool DeviceGraphCaptureController::cohereReplaySegmentInputs(
         ComputeGraph &graph,
         const DeviceGraphExecutor::GraphSegment &segment,
-        const std::function<bool(ComputeNode &)> &cohere_stage_cb)
+        const std::function<bool(
+            ComputeNode &,
+            const std::vector<BufferBinding> &)> &cohere_stage_cb)
     {
+        GraphArenaDependencyTracker dependency_tracker;
         for (const auto &stage_name : segment.stage_names)
         {
             auto *node = graph.getNode(stage_name);
@@ -3144,7 +3260,10 @@ namespace llaminar2
                 continue;
             }
 
-            if (!cohere_stage_cb(*node))
+            const StageBufferContract contract = node->stage->bufferContract();
+            const auto external_reads =
+                dependency_tracker.observeStage(contract);
+            if (!cohere_stage_cb(*node, external_reads))
             {
                 return false;
             }

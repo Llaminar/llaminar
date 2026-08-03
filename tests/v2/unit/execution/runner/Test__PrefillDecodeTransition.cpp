@@ -1152,7 +1152,7 @@ namespace
                 request.outcome.mtp_transaction;
             if (!transaction.valid() ||
                 transaction.state->device != primary_device_ ||
-                transaction.state->request_count != request.request_count ||
+                transaction.state->request_count != request.requestCount() ||
                 !transaction.state->coversDepth(0))
             {
                 if (error)
@@ -1165,7 +1165,7 @@ namespace
 
             const int *meta = request.outcome.meta_device;
             for (int request_index = 0;
-                 request_index < request.request_count;
+                 request_index < request.requestCount();
                  ++request_index)
             {
                 const size_t meta_base =
@@ -1203,9 +1203,10 @@ namespace
                     request.outcome.meta_device,
                     request.outcome.meta_stride,
                     request_index,
-                    /*padded_state_rows_per_request=*/request.max_draft_tokens,
+                    /*padded_state_rows_per_request=*/
+                        request.physicalVerifierRowsPerRequest(),
                     base_cached_tokens,
-                    request.max_draft_tokens,
+                    request.max_state_commit_rows,
                     nullptr,
                     nullptr,
                     nullptr,
@@ -1236,7 +1237,7 @@ namespace
                         shiftedTargetForMainTokens(target_cached_tokens);
                 }
             }
-            if (request.request_count == 1)
+            if (request.requestCount() == 1)
             {
                 const int output_count =
                     request.outcome.meta_device[
@@ -1276,7 +1277,7 @@ namespace
                         .first_token_already_in_history = 0;
                 }
             }
-            resident_logical_state_request_count_ = request.request_count;
+            resident_logical_state_request_count_ = request.requestCount();
             resident_logical_state_valid_ = true;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
@@ -2277,6 +2278,7 @@ namespace
             DeviceSpeculativeOutcomeHandle *out_handle) override
         {
             using namespace sampling_math;
+            device_generation_lifecycle_events_.push_back("resident_verifier");
             if (!out_handle)
                 return false;
             *out_handle = DeviceSpeculativeOutcomeHandle{};
@@ -2339,6 +2341,8 @@ namespace
             out_handle->output_tokens_device = resident_output_tokens_.data();
             out_handle->meta_device = resident_meta_.data();
             out_handle->request_count = 1;
+            out_handle->logical_verifier_rows_per_request = draft_token_count;
+            out_handle->physical_verifier_rows_per_request = draft_token_count;
             out_handle->output_token_stride =
                 kSpeculativeBatchMaxOutputTokens;
             out_handle->meta_stride = kSpeculativeBatchMetaCount;
@@ -2350,6 +2354,7 @@ namespace
                     [](void *) {});
             out_handle->mtp_transaction =
                 makeMockMTPTransactionLease(/*request_count=*/1);
+            out_handle->device_generation_controller_owned = true;
             out_handle->mirrored_local_tp_locally_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             const bool valid = out_handle->valid();
@@ -2401,6 +2406,7 @@ namespace
 
             resident_output_tokens_.fill(-1);
             resident_meta_.fill(0);
+            int logical_verifier_rows_per_request = 0;
             for (int request_index = 0;
                  request_index < request_count;
                  ++request_index)
@@ -2416,6 +2422,9 @@ namespace
                 {
                     return false;
                 }
+                logical_verifier_rows_per_request = std::max(
+                    logical_verifier_rows_per_request,
+                    request.verifier_token_count);
 
                 last_request_batch_outcome_request_ids_.push_back(
                     request.request_id);
@@ -2532,6 +2541,10 @@ namespace
             out_handle->output_tokens_device = resident_output_tokens_.data();
             out_handle->meta_device = resident_meta_.data();
             out_handle->request_count = request_count;
+            out_handle->logical_verifier_rows_per_request =
+                logical_verifier_rows_per_request;
+            out_handle->physical_verifier_rows_per_request =
+                logical_verifier_rows_per_request;
             out_handle->output_token_stride =
                 kSpeculativeBatchMaxOutputTokens;
             out_handle->meta_stride = sampling_math::kSpeculativeBatchMetaCount;
@@ -3938,9 +3951,13 @@ namespace
             if (request_count > kMockResidentOutcomeRequestCapacity)
                 return false;
 
+            int logical_verifier_rows_per_request = 0;
             for (int i = 0; i < request_count; ++i)
             {
                 const DeviceStochasticBatchOutcomeRequest &request = requests[i];
+                logical_verifier_rows_per_request = std::max(
+                    logical_verifier_rows_per_request,
+                    request.row_count + 1);
                 last_request_batch_outcome_request_ids_.push_back(
                     request.request_id);
                 last_request_batch_outcome_row_counts_.push_back(
@@ -4546,6 +4563,10 @@ namespace
                 resident_output_tokens_.data();
             out_handle->meta_device = resident_meta_.data();
             out_handle->request_count = request_count;
+            out_handle->logical_verifier_rows_per_request =
+                logical_verifier_rows_per_request;
+            out_handle->physical_verifier_rows_per_request =
+                logical_verifier_rows_per_request;
             out_handle->output_token_stride =
                 sampling_math::kSpeculativeBatchMaxOutputTokens;
             out_handle->meta_stride =
@@ -4625,7 +4646,7 @@ namespace
             return true;
         }
 
-        bool beginDeviceResidentStochasticGeneration(
+        bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens) override
         {
@@ -7114,7 +7135,7 @@ namespace
             "rank_verifier_token_batches_prepared_from_device_slots",
             {{"participants", "2"},
              {"requests", "2"},
-             {"padded_seq_len", "3"}});
+             {"logical_padded_seq_len", "3"}});
         ASSERT_NE(verifier_token_batch, nullptr)
             << "The regression must prove child-specific device mailbox translation at the verifier boundary.";
         EXPECT_EQ(verifier_token_batch->value, 1.0);
@@ -7218,6 +7239,8 @@ namespace
         handle.output_tokens_device = output_tokens;
         handle.meta_device = meta;
         handle.request_count = 1;
+        handle.logical_verifier_rows_per_request = 1;
+        handle.physical_verifier_rows_per_request = 1;
         handle.stream = &stream_token;
         handle.response_ready_event =
             std::shared_ptr<void>(&response_ready_event_token, [](void *) {});
@@ -7525,8 +7548,11 @@ namespace
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
                                 "host_outcome_bridge"));
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().requestCount(), 2);
+        EXPECT_EQ(
+            mock->lastDeviceResidentPublicationRequest()
+                .logicalVerifierRowsPerRequest(),
+            2);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid())
             << "GPU request-batch publication must carry the child-local "
@@ -7647,8 +7673,11 @@ namespace
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
                                 "host_outcome_bridge"));
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().requestCount(), 2);
+        EXPECT_EQ(
+            mock->lastDeviceResidentPublicationRequest()
+                .logicalVerifierRowsPerRequest(),
+            3);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid())
             << "GPU request-batch publication must consume its canonical "
@@ -7761,8 +7790,11 @@ namespace
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
                                 "host_outcome_bridge"));
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().requestCount(), 2);
+        EXPECT_EQ(
+            mock->lastDeviceResidentPublicationRequest()
+                .logicalVerifierRowsPerRequest(),
+            3);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid());
         const auto &events = mock->executionEvents();
@@ -7853,8 +7885,11 @@ namespace
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
                                 "host_outcome_bridge"));
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().requestCount(), 2);
+        EXPECT_EQ(
+            mock->lastDeviceResidentPublicationRequest()
+                .logicalVerifierRowsPerRequest(),
+            3);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid());
         const auto &events = mock->executionEvents();
@@ -8124,8 +8159,11 @@ namespace
                "should try to avoid.";
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
-        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 4);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().requestCount(), 2);
+        EXPECT_EQ(
+            mock->lastDeviceResidentPublicationRequest()
+                .logicalVerifierRowsPerRequest(),
+            4);
         PerfStatsCollector::reset();
     }
 
@@ -11047,8 +11085,8 @@ namespace
             const DeviceSpeculativePublicationRequest &publication_request =
                 mock->lastDeviceResidentPublicationRequest();
             EXPECT_TRUE(publication_request.valid());
-            EXPECT_EQ(publication_request.request_count, 1);
-            EXPECT_EQ(publication_request.max_draft_tokens, 2);
+            EXPECT_EQ(publication_request.requestCount(), 1);
+            EXPECT_EQ(publication_request.logicalVerifierRowsPerRequest(), 2);
             EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
             EXPECT_TRUE(publication_request.penalty_policy.enabled());
             EXPECT_EQ(mock->deviceGeneratedTokenCount(
@@ -11833,8 +11871,8 @@ namespace
         const DeviceSpeculativePublicationRequest &request =
             mock->lastDeviceResidentPublicationRequest();
         EXPECT_TRUE(request.valid());
-        EXPECT_EQ(request.request_count, 1);
-        EXPECT_EQ(request.max_draft_tokens, 2);
+        EXPECT_EQ(request.requestCount(), 1);
+        EXPECT_EQ(request.logicalVerifierRowsPerRequest(), 2);
         ASSERT_TRUE(request.outcome.mtp_transaction.valid())
             << "Device-resident publication should use the verifier outcome's "
                "request-scoped shifted-cache transaction.";
@@ -12606,6 +12644,15 @@ namespace
             EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
             EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
             EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 1)
+                << "Greedy grouped verification must use the same resident "
+                   "generation controller as stochastic grouped verification.";
+            EXPECT_EQ(mock->lastDeviceGenerationRequestCount(), 1);
+            EXPECT_GT(mock->lastDeviceGenerationMaxNewTokens(), 0)
+                << "Admission must carry the runner's positive remaining "
+                   "response budget into the device controller.";
+            EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
+                        ElementsAre("admission", "resident_verifier"));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_NE(findPerfRecordWithTags(
@@ -12749,8 +12796,8 @@ namespace
             const DeviceSpeculativePublicationRequest &publication_request =
                 mock->lastDeviceResidentPublicationRequest();
             EXPECT_TRUE(publication_request.valid());
-            EXPECT_EQ(publication_request.request_count, 1);
-            EXPECT_EQ(publication_request.max_draft_tokens, 2);
+            EXPECT_EQ(publication_request.requestCount(), 1);
+            EXPECT_EQ(publication_request.logicalVerifierRowsPerRequest(), 2);
             EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
             EXPECT_TRUE(publication_request.penalty_policy.enabled());
             EXPECT_FLOAT_EQ(publication_request.penalty_policy.presence_penalty,
@@ -13184,6 +13231,94 @@ namespace
                                         {"draft_tokens", "device_deferred:4"},
                                         {"committed_output_tokens", "7,9,9,9"}});
             ASSERT_NE(spec_tx, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Keep resident verifier geometry independent of a short response boundary.
+     *
+     * A five-row grouped transaction represents one condition token plus four
+     * speculative drafts. A four-token response boundary may shorten only the
+     * device-owned commit prefix; it must not trim a sidecar or recapture the
+     * verifier as four rows after request admission selected five. The mock's
+     * explicit commit boundary models the production controller value consumed
+     * by the captured compact-outcome reducer.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           GPUShortResponseBudgetPreservesResidentVerifierTransactionWidth)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_gpu_short_budget_resident_width_unit.json";
+        {
+            ScopedEnv enable(
+                "LLAMINAR_PERF_STATS_JSON",
+                export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/4,
+                /*chained_mtp_support=*/true);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/5);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->setVerifierAcceptedPrefixScript({4});
+            mock->setNextVerifierCommitBoundaryRows(/*rows=*/4);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            runner->setDecodeStepTokenBudget(/*max_tokens=*/4);
+            const GenerationResult step = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(/*max_tokens=*/0);
+
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(
+                step.tokens,
+                ElementsAre(
+                    MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 3)
+                << "The finite response boundary must not suppress any selected "
+                   "device sidecar.";
+            EXPECT_EQ(mock->lastPrepareMTPVerifierDraftTokenCount(), 4);
+            EXPECT_EQ(mock->lastPrepareMTPVerifierTotalTokens(), 5);
+            EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), 5);
+            EXPECT_EQ(
+                mock->lastDeviceResidentPublicationRequest()
+                    .logicalVerifierRowsPerRequest(),
+                5);
+            EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 1);
+            EXPECT_EQ(mock->lastDeviceGenerationMaxNewTokens(), 4);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            EXPECT_NE(
+                findPerfRecordWithTags(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "draft_budget_delegated_to_device_controller",
+                    {{"selected_depth", "4"},
+                     {"speculative_output_budget", "3"},
+                     {"token_budget", "4"}}),
+                nullptr);
+            EXPECT_EQ(
+                findPerfRecord(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "draft_steps_budget_clamped"),
+                nullptr)
+                << "The host must not become a second geometry authority for a "
+                   "resident GPU transaction.";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

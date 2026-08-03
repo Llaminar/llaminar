@@ -1225,6 +1225,7 @@ public:
     // Call counters
     std::atomic<int> initialize_call_count{0};
     std::atomic<int> shutdown_call_count{0};
+    std::atomic<int> *external_abort_call_count = nullptr;
     std::atomic<int> allreduce_call_count{0};
     std::atomic<int> allreduce_multi_call_count{0};
     std::atomic<int> allreduce_multi_on_streams_call_count{0};
@@ -1317,6 +1318,13 @@ public:
     void shutdown() override
     {
         shutdown_call_count++;
+        initialized_ = false;
+    }
+
+    void abort() override
+    {
+        if (external_abort_call_count)
+            external_abort_call_count->fetch_add(1, std::memory_order_relaxed);
         initialized_ = false;
     }
 
@@ -1590,6 +1598,44 @@ private:
 // =============================================================================
 // Backend Initialization Tests
 // =============================================================================
+
+/**
+ * @test Fatal cancellation cannot abort a communicator before graph-owner teardown.
+ *
+ * Native NCCL/RCCL graphs retain communicator references. The public abort
+ * request must therefore only close admission; the LocalTP owner destruction
+ * boundary performs the backend abort after its device runners are gone.
+ */
+TEST_F(Test__LocalTPContext, AbortRequestDefersBackendAbortUntilContextDestruction)
+{
+    std::atomic<int> backend_abort_calls{0};
+
+    {
+        auto ctx_base = createLocalTPContext(
+            {cpu0_, GlobalDeviceAddress::cpu(1)},
+            {},
+            CollectiveBackendType::HOST);
+        auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+        ASSERT_NE(ctx, nullptr);
+
+        auto backend = std::make_unique<MockCollectiveBackend>();
+        backend->external_abort_call_count = &backend_abort_calls;
+        ctx->setBackendForTesting(
+            std::move(backend),
+            CollectiveBackendType::NCCL,
+            /*initialized=*/true);
+
+        ctx->requestAbort();
+        ctx->requestAbort();
+
+        EXPECT_TRUE(ctx->isAbortRequested());
+        EXPECT_EQ(backend_abort_calls.load(std::memory_order_relaxed), 0)
+            << "requestAbort must not destroy a communicator retained by a native graph";
+    }
+
+    EXPECT_EQ(backend_abort_calls.load(std::memory_order_relaxed), 1)
+        << "the graph-owner release boundary must abort the backend exactly once";
+}
 
 /**
  * @test Single device skips backend initialization

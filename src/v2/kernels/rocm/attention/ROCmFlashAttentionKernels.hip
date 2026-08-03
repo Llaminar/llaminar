@@ -83,7 +83,8 @@ namespace
         const int *__restrict__ post_append_cached_tokens,
         int seq_len,
         int query_rows,
-        int kv_stride)
+        int kv_stride,
+        const int *__restrict__ active_query_rows_device)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -91,10 +92,27 @@ namespace
 
         const int raw_kv_len = *post_append_cached_tokens;
         const int kv_len = raw_kv_len > 1 ? raw_kv_len : 1;
-        const int logical_seq_len = seq_len > 1 ? seq_len : 1;
+        const int raw_logical_seq_len = active_query_rows_device
+                                            ? *active_query_rows_device
+                                            : seq_len;
+        const int logical_seq_len =
+            raw_logical_seq_len > 1
+                ? (raw_logical_seq_len < query_rows
+                       ? raw_logical_seq_len
+                       : query_rows)
+                : 1;
+        if (row >= logical_seq_len)
+        {
+            out[row].kv_len = 1;
+            out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+            out[row].position_offset = 0;
+            out[row].mask_stride = 1;
+            return;
+        }
         const int base_position_raw = kv_len - logical_seq_len;
         const int base_position = base_position_raw > 0 ? base_position_raw : 0;
-        const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
+        const int row_kv_len_raw =
+            kv_len - (logical_seq_len - 1 - row);
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
         out[row].kv_len = row_kv_len;
         out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
@@ -2691,6 +2709,7 @@ extern "C"
         int seq_len,
         int query_rows,
         int kv_stride,
+        const int *active_query_rows_device,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
@@ -2706,7 +2725,8 @@ extern "C"
                            post_append_cached_tokens,
                            seq_len,
                            query_rows,
-                           kv_stride);
+                           kv_stride,
+                           active_query_rows_device);
         const hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

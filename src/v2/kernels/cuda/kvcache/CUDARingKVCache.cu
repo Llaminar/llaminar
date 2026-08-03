@@ -296,21 +296,25 @@ namespace llaminar2
         const T *__restrict__ d_K_new,
         const T *__restrict__ d_V_new,
         const int *__restrict__ d_head,
+        const int *__restrict__ d_row_count,
         int max_seq_len,
         int kv_storage_dim,
         int head_storage_dim,
         int source_verifier_rows,
-        int source_start_row,
-        int rows_to_write,
         bool k_source_head_major,
         bool v_source_head_major)
     {
-        const int token_idx = blockIdx.x;
+        const int source_row = blockIdx.x;
         const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
-        if (token_idx >= rows_to_write || elem_idx >= kv_storage_dim)
+        const int rows_to_write =
+            effective_append_tokens(d_row_count, source_verifier_rows);
+        const int source_start_row = rows_to_write > max_seq_len
+                                         ? rows_to_write - max_seq_len
+                                         : 0;
+        if (source_row < source_start_row || source_row >= rows_to_write ||
+            elem_idx >= kv_storage_dim)
             return;
 
-        const int source_row = source_start_row + token_idx;
         const int head = *d_head;
         const int dst_pos = (head + source_row) % max_seq_len;
         const int dst_offset = dst_pos * kv_storage_dim + elem_idx;
@@ -1410,20 +1414,23 @@ namespace llaminar2
     static void cuda_ring_append_verifier_rows_dynamic_typed(
         T *d_K_cache, T *d_V_cache,
         const T *d_K_new, const T *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         cudaStream_t stream)
     {
-        if (rows_to_write <= 0)
+        if (source_verifier_rows <= 0)
             return;
 
         dim3 block(256);
-        dim3 grid(rows_to_write, (kv_storage_dim + static_cast<int>(block.x) - 1) / static_cast<int>(block.x));
+        dim3 grid(source_verifier_rows,
+                  (kv_storage_dim + static_cast<int>(block.x) - 1) /
+                      static_cast<int>(block.x));
         ring_append_verifier_rows_dynamic_kernel<T><<<grid, block, 0, stream>>>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-            source_verifier_rows, source_start_row, rows_to_write,
+            d_head, d_row_count, max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows,
             k_source_head_major, v_source_head_major);
     }
 
@@ -2300,8 +2307,6 @@ namespace llaminar2
 
         EntryT &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
-        const int source_start = std::max(0, verifier_rows - max_seq_len_);
-        const int rows_to_write = verifier_rows - source_start;
 
         const int head_storage_dim =
             (Precision == ActivationPrecision::Q8_1)
@@ -2314,14 +2319,17 @@ namespace llaminar2
             return false;
         }
         const int idx = layer * batch_size_ + seq_idx;
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
         cuda_ring_append_verifier_rows_dynamic_typed<DataT>(
             entry.d_K, entry.d_V, typed_k, typed_v,
-            &d_head_params_[idx], max_seq_len_, kv_storage_dim_, head_storage_dim,
-            verifier_rows, source_start, rows_to_write,
+            &d_head_params_[idx], d_append_count,
+            max_seq_len_, kv_storage_dim_, head_storage_dim,
+            verifier_rows,
             k_head_major, v_head_major, stream);
-        cuda_kv_sequence_state_advance(
+        cuda_kv_sequence_state_advance_dynamic(
             &d_head_params_[idx], &d_count_params_[idx],
-            verifier_rows, max_seq_len_, stream);
+            d_append_count, verifier_rows, max_seq_len_, stream);
 
         const cudaError_t launch_err = cudaGetLastError();
         if (launch_err != cudaSuccess)
@@ -2348,6 +2356,7 @@ namespace llaminar2
              {"source_k_layout", k_head_major ? "head_major" : "position_major"},
              {"source_v_layout", v_head_major ? "head_major" : "position_major"},
              {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"row_count_policy", d_append_count ? "resident_device_count" : "captured_exact_shape"},
              {"topology", (local_n_kv_heads_ != n_kv_heads_ || kv_head_start_ != 0)
                               ? "local_tp_shard"
                               : "replicated"},

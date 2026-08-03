@@ -1,17 +1,266 @@
+/**
+ * @file GraphCaptureGuard.h
+ * @brief Structural ownership for GPU graph recording and its data dependencies.
+ *
+ * Native CUDA/HIP graph capture records work without executing that work.  A
+ * tensor written by an earlier recorded stage is therefore a valid input to a
+ * later recorded stage even though the tensor's globally visible coherence
+ * state must not claim that the write has completed.  This file keeps those two
+ * facts separate:
+ *
+ * - GraphCaptureDependencyLedger describes the exact topological stage order
+ *   and graph-internal inputs for one capture transaction.
+ * - GraphCaptureGuard publishes that ledger only to the recording thread.
+ * - ScopedGraphCaptureStage advances the ledger through the canonical stage
+ *   runner.
+ * - ScopedBackendGraphCapture owns the indivisible backend begin/end interval.
+ *
+ * The resulting contract makes an unrecorded internal producer, a different
+ * stream, a different device, or an out-of-order stage a hard failure.  It also
+ * avoids pretending that recorded-but-unlaunched bytes are globally device
+ * authoritative.
+ */
+
 #pragma once
 
+#include "../../../backends/DeviceId.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../utils/Logger.h"
 
 #include <exception>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
+    class TensorBase;
+
+    /**
+     * @brief Precomputed producer/consumer proof for one native graph capture.
+     *
+     * The graph executor builds this ledger before beginCapture(), while arena
+     * contracts and BufferIds are still available.  During recording,
+     * TransferEngine only sees tensor identities, so each internal input stores
+     * the canonical transfer-storage owner and the earlier stage index that
+     * produces it.  No container grows inside the capture window.
+     */
+    class GraphCaptureDependencyLedger final
+    {
+    public:
+        /** @brief One tensor consumed from an earlier stage in this transaction. */
+        struct InternalInput
+        {
+            const TensorBase *tensor = nullptr; ///< Canonical storage owner.
+            size_t producer_stage_index = 0;    ///< Earlier stage that records the write.
+        };
+
+        /** @brief Immutable dependency description for one topological stage. */
+        struct StagePlan
+        {
+            const void *stage_identity = nullptr; ///< Exact IComputeStage object identity.
+            std::string stage_name;               ///< Stable diagnostic name.
+            std::vector<const TensorBase *> external_inputs; ///< Inputs joined before capture.
+            std::vector<InternalInput> internal_inputs;       ///< Inputs produced in this graph.
+            std::vector<const TensorBase *> outputs;          ///< Declared arena write owners.
+        };
+
+        /** @brief How TransferEngine must validate one current-stage input. */
+        enum class InputDisposition
+        {
+            StrictExternal, ///< Require globally valid residency and a prejoined event.
+            InternalRecorded ///< Earlier producer is ordered by this native graph stream.
+        };
+
+        /**
+         * @brief Construct a frozen dependency plan before native capture begins.
+         *
+         * @param device Exact GPU owning the capture transaction.
+         * @param stream Exact non-null native capture stream.
+         * @param stages Stages in the precise order in which they will be recorded.
+         * @param context Stable diagnostic label for lifecycle failures.
+         */
+        GraphCaptureDependencyLedger(
+            DeviceId device,
+            void *stream,
+            std::vector<StagePlan> stages,
+            std::string context)
+            : device_(device),
+              stream_(stream),
+              stages_(std::move(stages)),
+              context_(std::move(context))
+        {
+            if (!device_.is_gpu())
+                throw std::invalid_argument(
+                    "GraphCaptureDependencyLedger requires a GPU device");
+            if (!stream_)
+                throw std::invalid_argument(
+                    "GraphCaptureDependencyLedger requires an exact non-null stream");
+            for (const auto &stage : stages_)
+            {
+                if (!stage.stage_identity)
+                    throw std::invalid_argument(
+                        "GraphCaptureDependencyLedger contains a null stage identity");
+            }
+        }
+
+        /** @brief Arm the frozen plan for one recording pass. */
+        void beginCapture()
+        {
+            if (active_)
+                throw std::logic_error(
+                    "GraphCaptureDependencyLedger cannot begin twice: " + context_);
+            active_ = true;
+            failed_ = false;
+            stage_cursor_ = 0;
+            current_stage_active_ = false;
+        }
+
+        /** @brief Clear thread-local recording state without publishing tensor authority. */
+        void endCapture() noexcept
+        {
+            active_ = false;
+            current_stage_active_ = false;
+            stage_cursor_ = 0;
+        }
+
+        /**
+         * @brief Enter the next exact stage in the precomputed topological plan.
+         * @param stage_identity Exact IComputeStage object about to record work.
+         */
+        void beginStage(const void *stage_identity)
+        {
+            if (!active_ || current_stage_active_ || stage_cursor_ >= stages_.size())
+                throw std::logic_error(
+                    "Graph capture stage lifecycle is invalid: " + context_);
+            const auto &expected = stages_[stage_cursor_];
+            if (expected.stage_identity != stage_identity)
+            {
+                throw std::logic_error(
+                    "Graph capture stage order mismatch: expected '" +
+                    expected.stage_name + "' in " + context_);
+            }
+            current_stage_active_ = true;
+        }
+
+        /** @brief Commit the current stage after every required launch was recorded. */
+        void completeStage(const void *stage_identity)
+        {
+            requireCurrentStage(stage_identity);
+            current_stage_active_ = false;
+            ++stage_cursor_;
+        }
+
+        /** @brief Mark a failed stage so capture closure can remain exception-safe. */
+        void abortCurrentStage() noexcept
+        {
+            if (current_stage_active_)
+            {
+                current_stage_active_ = false;
+                failed_ = true;
+            }
+        }
+
+        /**
+         * @brief Classify one tensor read made by the currently recording stage.
+         *
+         * An internal input is accepted only when its producer index is strictly
+         * earlier than the current stage.  Unknown tensors, including weights and
+         * stage-owned metadata, remain strict external inputs.
+         */
+        InputDisposition classifyInput(
+            const TensorBase *tensor,
+            DeviceId device,
+            void *stream) const
+        {
+            requireCurrentTransaction(device, stream);
+            if (!current_stage_active_ || stage_cursor_ >= stages_.size())
+                throw std::logic_error(
+                    "Graph capture input was requested outside a stage: " + context_);
+
+            const auto &stage = stages_[stage_cursor_];
+            for (const auto &input : stage.internal_inputs)
+            {
+                if (input.tensor != tensor)
+                    continue;
+                if (input.producer_stage_index >= stage_cursor_)
+                {
+                    throw std::logic_error(
+                        "Graph capture internal input precedes its producer in stage '" +
+                        stage.stage_name + "' (" + context_ + ")");
+                }
+                return InputDisposition::InternalRecorded;
+            }
+            return InputDisposition::StrictExternal;
+        }
+
+        /**
+         * @brief Validate a stage-local publication without recording an event.
+         *
+         * Stage kernels historically called publishDeviceWrite() immediately
+         * after enqueueing work.  Inside native capture that work has only been
+         * recorded, so the transaction validates provenance here and defers real
+         * authority/event publication to the post-launch graph boundary.
+         */
+        void validateRecordedPublication(
+            const TensorBase *,
+            DeviceId device,
+            void *stream) const
+        {
+            requireCurrentTransaction(device, stream);
+            if (!current_stage_active_ || stage_cursor_ >= stages_.size())
+                throw std::logic_error(
+                    "Graph capture publication occurred outside a stage: " + context_);
+        }
+
+        /** @brief True when every planned stage was recorded successfully. */
+        bool allStagesRecorded() const noexcept
+        {
+            return !current_stage_active_ && stage_cursor_ == stages_.size();
+        }
+
+        /** @brief True when a stage launch rejected the current transaction. */
+        bool failed() const noexcept { return failed_; }
+
+    private:
+        void requireCurrentTransaction(DeviceId device, void *stream) const
+        {
+            if (!active_)
+                throw std::logic_error(
+                    "Graph capture dependency ledger is not active: " + context_);
+            if (device != device_ || stream != stream_)
+            {
+                throw std::logic_error(
+                    "Graph capture dependency used a different device or stream: " +
+                    context_);
+            }
+        }
+
+        void requireCurrentStage(const void *stage_identity) const
+        {
+            if (!active_ || !current_stage_active_ || stage_cursor_ >= stages_.size() ||
+                stages_[stage_cursor_].stage_identity != stage_identity)
+            {
+                throw std::logic_error(
+                    "Graph capture stage completion does not match the active stage: " +
+                    context_);
+            }
+        }
+
+        DeviceId device_;
+        void *stream_ = nullptr;
+        std::vector<StagePlan> stages_;
+        std::string context_;
+        size_t stage_cursor_ = 0;
+        bool active_ = false;
+        bool current_stage_active_ = false;
+        bool failed_ = false;
+    };
+
     /**
      * @brief Thread-local flag indicating that the current thread is inside
      *        a HIP/CUDA graph capture recording window.
@@ -23,27 +272,38 @@ namespace llaminar2
      *   - hipMemcpy (synchronous variants)
      *   - hipEventSynchronize
      *
-     * Code that might call these operations (e.g., TensorBase::ensureOnDevice)
-     * can check isGraphCaptureActive() and take a fast path that avoids sync.
+     * Code that might call these operations can check isGraphCaptureActive()
+     * and reject the invalid operation with a precise diagnostic. It must not
+     * substitute a weaker execution path.
      *
      * Usage:
-     *   // In capture controller (between beginCapture/endCapture):
+     *   // In a low-level capture harness (production uses
+     *   // ScopedBackendGraphCapture plus DeviceGraphExecutor::runStage()):
      *   {
      *       GraphCaptureGuard guard;  // sets flag true
-     *       for (auto& stage : stages)
-     *           stage->execute(ctx);
+     *       record_kernel_body_on_the_exact_stream();
      *   }  // guard destructor sets flag false
      *
      *   // In tensor code:
-     *   if (isGraphCaptureActive() && device_valid_)
-     *       return true;  // skip sync, data already on device from warmup
+     *   if (isGraphCaptureActive() && operation_requires_host_wait)
+     *       throw std::logic_error("host wait is forbidden during capture");
      */
 
     /// Thread-local flag: true when inside a graph capture recording window.
     inline thread_local bool tls_graph_capture_active = false;
 
+    /// Exact dependency ledger for the current production capture transaction.
+    inline thread_local GraphCaptureDependencyLedger *
+        tls_graph_capture_dependency_ledger = nullptr;
+
     /// Query whether the current thread is recording into a GPU graph.
     inline bool isGraphCaptureActive() { return tls_graph_capture_active; }
+
+    /** @brief Return the current typed dependency transaction, if one is installed. */
+    inline GraphCaptureDependencyLedger *currentGraphCaptureDependencyLedger()
+    {
+        return tls_graph_capture_dependency_ledger;
+    }
 
     /**
      * @brief RAII guard that sets the graph-capture-active flag for the
@@ -52,14 +312,30 @@ namespace llaminar2
     class GraphCaptureGuard
     {
     public:
-        GraphCaptureGuard()
-            : prev_(tls_graph_capture_active)
+        explicit GraphCaptureGuard(
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr)
+            : prev_(tls_graph_capture_active),
+              prev_dependency_ledger_(tls_graph_capture_dependency_ledger),
+              owned_dependency_ledger_(dependency_ledger)
         {
+            if (dependency_ledger && prev_dependency_ledger_ &&
+                dependency_ledger != prev_dependency_ledger_)
+            {
+                throw std::logic_error(
+                    "Nested GPU graph capture cannot replace the active dependency ledger");
+            }
+            if (owned_dependency_ledger_)
+                owned_dependency_ledger_->beginCapture();
             tls_graph_capture_active = true;
+            tls_graph_capture_dependency_ledger =
+                dependency_ledger ? dependency_ledger : prev_dependency_ledger_;
         }
 
         ~GraphCaptureGuard()
         {
+            if (owned_dependency_ledger_)
+                owned_dependency_ledger_->endCapture();
+            tls_graph_capture_dependency_ledger = prev_dependency_ledger_;
             tls_graph_capture_active = prev_;
         }
 
@@ -69,6 +345,53 @@ namespace llaminar2
 
     private:
         bool prev_; ///< Previous graph-capture flag (for nested guard support).
+        GraphCaptureDependencyLedger *prev_dependency_ledger_ = nullptr;
+        GraphCaptureDependencyLedger *owned_dependency_ledger_ = nullptr;
+    };
+
+    /**
+     * @brief RAII stage cursor for the canonical executor while capture is active.
+     *
+     * A failed or exceptional stage aborts the ledger entry in the destructor.
+     * Successful callers must invoke complete() exactly once after every launch
+     * and publication check has succeeded.
+     */
+    class ScopedGraphCaptureStage final
+    {
+    public:
+        explicit ScopedGraphCaptureStage(const void *stage_identity)
+            : ledger_(currentGraphCaptureDependencyLedger()),
+              stage_identity_(stage_identity)
+        {
+            if (ledger_)
+                ledger_->beginStage(stage_identity_);
+        }
+
+        ~ScopedGraphCaptureStage()
+        {
+            if (ledger_ && !completed_)
+                ledger_->abortCurrentStage();
+        }
+
+        ScopedGraphCaptureStage(const ScopedGraphCaptureStage &) = delete;
+        ScopedGraphCaptureStage &operator=(const ScopedGraphCaptureStage &) = delete;
+
+        /** @brief Commit the current stage to the capture dependency sequence. */
+        void complete()
+        {
+            if (!ledger_)
+                return;
+            if (completed_)
+                throw std::logic_error(
+                    "ScopedGraphCaptureStage cannot complete twice");
+            ledger_->completeStage(stage_identity_);
+            completed_ = true;
+        }
+
+    private:
+        GraphCaptureDependencyLedger *ledger_ = nullptr;
+        const void *stage_identity_ = nullptr;
+        bool completed_ = false;
     };
 
     /**
@@ -100,10 +423,12 @@ namespace llaminar2
         ScopedBackendGraphCapture(
             IWorkerGPUContext &gpu_context,
             IGPUGraphCapture &capture,
-            std::string operation)
+            std::string operation,
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr)
             : gpu_context_(&gpu_context),
               capture_(capture),
-              operation_(std::move(operation))
+              operation_(std::move(operation)),
+              dependency_ledger_(dependency_ledger)
         {
         }
 
@@ -116,9 +441,11 @@ namespace llaminar2
          */
         ScopedBackendGraphCapture(
             IGPUGraphCapture &capture,
-            std::string operation)
+            std::string operation,
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr)
             : capture_(capture),
-              operation_(std::move(operation))
+              operation_(std::move(operation)),
+              dependency_ledger_(dependency_ledger)
         {
         }
 
@@ -167,8 +494,13 @@ namespace llaminar2
                 return false;
             }
 
-            capture_guard_.emplace();
+            /*
+             * Publish backend ownership before constructing software guards. If
+             * ledger validation throws, stack unwinding must still make this
+             * object's destructor close the already-open native capture.
+             */
             active_ = true;
+            capture_guard_.emplace(dependency_ledger_);
             return true;
         }
 
@@ -184,6 +516,10 @@ namespace llaminar2
                 throw std::logic_error(
                     "ScopedBackendGraphCapture cannot finish an inactive capture");
 
+            const bool incomplete_dependency_plan =
+                dependency_ledger_ && !dependency_ledger_->failed() &&
+                !dependency_ledger_->allStagesRecorded();
+
             clearSoftwareCaptureState();
             active_ = false;
             if (!capture_.endCapture())
@@ -193,6 +529,13 @@ namespace llaminar2
                     "failure for "
                     << operation_);
                 std::terminate();
+            }
+            if (incomplete_dependency_plan)
+            {
+                throw std::logic_error(
+                    "GPU graph capture closed before every dependency-planned stage "
+                    "was recorded for " +
+                    operation_);
             }
         }
 
@@ -207,6 +550,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_context_ = nullptr;
         IGPUGraphCapture &capture_;
         std::string operation_;
+        GraphCaptureDependencyLedger *dependency_ledger_ = nullptr;
         std::optional<GraphCaptureGuard> capture_guard_;
         bool active_ = false;
     };

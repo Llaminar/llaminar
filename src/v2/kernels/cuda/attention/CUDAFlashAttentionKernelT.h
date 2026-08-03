@@ -303,7 +303,8 @@ namespace llaminar2
                 int seq_len,
                 int query_rows,
                 void *stream,
-                int kv_stride) override;
+                int kv_stride,
+                const int *active_query_rows_device = nullptr) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,

@@ -19,6 +19,7 @@
 #include "collective/BackendRouter.h"
 #include "collective/LocalTPContext.h"
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
@@ -5910,6 +5911,73 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Materialize bounded participant-local verifier geometry after a failed proof.
+     *
+     * Grouped LocalTP verification derives each participant's absolute RoPE
+     * positions from that participant's device-owned KV count. A disagreement
+     * at the first RoPE stage is otherwise difficult to distinguish from a
+     * kernel-workspace defect because both inputs remain entirely device
+     * resident. This diagnostic calls the existing failed-mirror digest API
+     * only after snapshot diagnostics have already made the test an explicit
+     * host-observation boundary, and reports only scalar live positions, the
+     * bounded verifier position row, and its logical request length.
+     *
+     * @param runner Focused proof runner, either one device or a LocalTP rank.
+     * @return Human-readable participant geometry suitable for assertion output.
+     */
+    inline std::string captureMoEVerifierGeometryDiagnostic(
+        IInferenceRunner &runner)
+    {
+        std::vector<DeviceGraphOrchestrator *> participants;
+        if (auto *rank = dynamic_cast<RankOrchestrator *>(&runner))
+        {
+            participants.reserve(static_cast<size_t>(rank->device_count()));
+            for (int participant = 0;
+                 participant < rank->device_count();
+                 ++participant)
+            {
+                auto *device_runner = dynamic_cast<DeviceGraphOrchestrator *>(
+                    rank->deviceRunner(participant));
+                if (device_runner)
+                    participants.push_back(device_runner);
+            }
+        }
+        else if (auto *device_runner =
+                     dynamic_cast<DeviceGraphOrchestrator *>(&runner))
+        {
+            participants.push_back(device_runner);
+        }
+
+        std::ostringstream report;
+        for (size_t participant = 0;
+             participant < participants.size();
+             ++participant)
+        {
+            const auto digests =
+                participants[participant]->captureFailedMirroredMTPDigests();
+            for (const auto &digest : digests)
+            {
+                if (digest.name != "main_live_position" &&
+                    digest.name != "mtp_live_position" &&
+                    digest.name != "grouped_verifier_position_ids" &&
+                    digest.name != "grouped_verifier_request_lengths")
+                {
+                    continue;
+                }
+                report << "\nparticipant" << participant << '_'
+                       << digest.name
+                       << " available="
+                       << (digest.available ? "true" : "false")
+                       << " bytes=" << digest.byte_count
+                       << " hash=0x" << std::hex << digest.hash << std::dec;
+                if (!digest.value_preview.empty())
+                    report << " values=" << digest.value_preview;
+            }
+        }
+        return report.str();
+    }
+
+    /**
      * @brief Return stage snapshot keys that localize prefix-restore drift.
      *
      * Prefix restore failures frequently appear first as a KV payload mismatch
@@ -7684,9 +7752,6 @@ namespace llaminar2::test::parity::qwen36
                    "handle produced on the verifier stream";
             DeviceSpeculativePublicationRequest publication_request;
             publication_request.outcome = *resident_outcome;
-            publication_request.request_count = 1;
-            publication_request.max_draft_tokens =
-                static_cast<int>(verifier_tokens.size());
             publication_request.max_state_commit_rows =
                 committed_verifier_rows;
             publication_request.publish_mtp_shifted_kv = true;
@@ -8837,6 +8902,7 @@ namespace llaminar2::test::parity::qwen36
         std::vector<std::vector<float>> independent_serial_logits_by_row;
         std::vector<std::map<std::string, std::vector<float>>>
             independent_serial_snapshots_by_row;
+        std::vector<std::string> independent_serial_geometry_by_row;
 
         if (stochastic_summary_params.has_value())
         {
@@ -8950,6 +9016,8 @@ namespace llaminar2::test::parity::qwen36
                 static_cast<size_t>(verifier_row_count));
             independent_serial_snapshots_by_row.reserve(
                 static_cast<size_t>(verifier_row_count));
+            independent_serial_geometry_by_row.reserve(
+                static_cast<size_t>(verifier_row_count));
 
             ScopedMoEVerifierSnapshotCapture independent_snapshot_capture;
             if (grouped_snapshot_diagnostic)
@@ -9019,6 +9087,8 @@ namespace llaminar2::test::parity::qwen36
                 {
                     independent_serial_snapshots_by_row.push_back(
                         captureMoERunnerSnapshots(*serial_runner));
+                    independent_serial_geometry_by_row.push_back(
+                        captureMoEVerifierGeometryDiagnostic(*serial_runner));
                 }
             }
 
@@ -9059,6 +9129,73 @@ namespace llaminar2::test::parity::qwen36
             }
             ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label;
             return -1;
+        };
+
+        auto consume_main_logits_handoff = [&](const char *label) -> bool
+        {
+            /*
+             * Explicit token paths control which token the focused oracle
+             * forwards, but every forward still publishes one exact logits
+             * producer stream.  Consume that handoff through the ordinary
+             * device sampler before another forward can publish the same role.
+             * Ignoring the sampled value preserves the explicit stochastic
+             * trajectory while exercising production stream ownership.
+             */
+            return sample_current(label) >= 0;
+        };
+
+        auto prepare_device_owned_verifier_row =
+            [&](const std::vector<int32_t> &tokens,
+                bool producers_already_device_owned) -> const void *
+        {
+            if (tokens.size() < 2)
+            {
+                ADD_FAILURE()
+                    << "grouped verifier device composition requires a "
+                       "condition and at least one draft row";
+                return nullptr;
+            }
+
+            constexpr int kConditionTargetSlot = 0;
+            constexpr int kFirstDraftSlot = 0;
+            const int draft_count = static_cast<int>(tokens.size()) - 1;
+            if (!producers_already_device_owned)
+            {
+                /*
+                 * Fixture data crosses the admission boundary once, into the
+                 * same persistent target/draft banks used by production.  The
+                 * grouped forward never receives a host-authored token row.
+                 * Chained publication skips this block because its accepted-
+                 * state kernel and sidecars already own these exact slots.
+                 */
+                if (!runner->stageStochasticTargetTokenForDeviceSampling(
+                        tokens.front(), kConditionTargetSlot) ||
+                    !runner->stageStochasticDraftTokensForDeviceVerification(
+                        tokens.data() + 1,
+                        draft_count,
+                        kFirstDraftSlot))
+                {
+                    ADD_FAILURE()
+                        << "failed to admit focused verifier fixture tokens "
+                           "into the production device banks";
+                    return nullptr;
+                }
+            }
+
+            const DeviceMTPVerifierInputBatchRequest request{
+                .request_id = 0,
+                .first_token = -1,
+                .first_token_from_device = true,
+                .first_target_sample_slot = kConditionTargetSlot,
+                .first_draft_slot = kFirstDraftSlot,
+                .draft_token_count = draft_count,
+                .total_verifier_input_tokens =
+                    static_cast<int>(tokens.size()),
+            };
+            return runner->prepareMTPVerifierInputTokenBatchOnDevice(
+                &request,
+                /*request_count=*/1,
+                static_cast<int>(tokens.size()));
         };
 
         auto commit_device_rebalance_boundary =
@@ -9185,9 +9322,11 @@ namespace llaminar2::test::parity::qwen36
             *runner,
             "grouped verifier candidate prefill"))
             << "prefill forward failed";
+        const int32_t prefill_sample = sample_current("prefill");
+        ASSERT_GE(prefill_sample, 0);
         if (serial_token_path.empty())
         {
-            EXPECT_EQ(sample_current("prefill"), token_path[0]);
+            EXPECT_EQ(prefill_sample, token_path[0]);
         }
         /*
          * Production generation enters one committed boundary after sampling
@@ -9211,6 +9350,7 @@ namespace llaminar2::test::parity::qwen36
             }
             ASSERT_TRUE(runner->forward(&token, 1))
                 << "serial setup forward failed at token index " << i;
+            ASSERT_TRUE(consume_main_logits_handoff("serial setup"));
             token_after_setup =
                 token_path[static_cast<size_t>(i + 1)];
             ASSERT_TRUE(commit_device_rebalance_boundary("serial setup"));
@@ -9283,16 +9423,10 @@ namespace llaminar2::test::parity::qwen36
                     return false;
                 }
                 runner->setMTPAllPositionVerifierSyncDeferralEnabled(true);
-                *tokens_device = consume_device_draft_slots
-                                     ? runner->prepareMTPVerifierInputTokensOnDevice(
-                                           tokens.front(),
-                                           /*first_draft_slot=*/0,
-                                           static_cast<int>(tokens.size() - 1),
-                                           static_cast<int>(tokens.size()))
-                                     : runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                                           tokens.data(),
-                                           static_cast<int>(tokens.size()),
-                                           static_cast<int>(tokens.size() - 1));
+                *tokens_device = prepare_device_owned_verifier_row(
+                    tokens,
+                    /*producers_already_device_owned=*/
+                        consume_device_draft_slots);
                 if (!*tokens_device)
                 {
                     ADD_FAILURE()
@@ -9442,9 +9576,6 @@ namespace llaminar2::test::parity::qwen36
 
             DeviceSpeculativePublicationRequest publication_request;
             publication_request.outcome = resident_outcome;
-            publication_request.request_count = 1;
-            publication_request.max_draft_tokens =
-                static_cast<int>(publication_tokens.size());
             publication_request.max_state_commit_rows =
                 accepted_grouped_rows_before_verifier;
             publication_request.publish_mtp_shifted_kv = true;
@@ -9801,6 +9932,8 @@ namespace llaminar2::test::parity::qwen36
             }
             ASSERT_TRUE(runner->forward(&next_verifier_token, 1))
                 << "serial verifier-token extension failed at row " << i;
+            ASSERT_TRUE(consume_main_logits_handoff(
+                "serial verifier-token discovery"));
             next_verifier_token =
                 token_path[static_cast<size_t>(
                     serial_setup_token_count + i + 1)];
@@ -9857,10 +9990,9 @@ namespace llaminar2::test::parity::qwen36
         if (device.is_gpu())
         {
             const void *verifier_tokens_device =
-                runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                    verifier_tokens.data(),
-                    static_cast<int>(verifier_tokens.size()),
-                    static_cast<int>(verifier_tokens.size() - 1));
+                prepare_device_owned_verifier_row(
+                    verifier_tokens,
+                    /*producers_already_device_owned=*/false);
             ASSERT_NE(verifier_tokens_device, nullptr)
                 << "MoE GPU grouped verifier must bind its arena-owned token row";
             grouped_forward_ok =
@@ -9962,6 +10094,10 @@ namespace llaminar2::test::parity::qwen36
             grouped_snapshot_diagnostic
                 ? captureMoERunnerSnapshots(*runner)
                 : std::map<std::string, std::vector<float>>{};
+        const std::string grouped_verifier_geometry_diagnostic =
+            grouped_snapshot_diagnostic
+                ? captureMoEVerifierGeometryDiagnostic(*runner)
+                : std::string{};
         if (stochastic_summary_outcome.has_value())
         {
             EXPECT_FALSE(stochastic_summary_outcome->all_speculative_accepted)
@@ -10003,6 +10139,8 @@ namespace llaminar2::test::parity::qwen36
         serial_snapshots_by_row.reserve(verifier_tokens.size());
         std::vector<std::string> serial_top5_by_row;
         serial_top5_by_row.reserve(verifier_tokens.size());
+        std::vector<std::string> serial_geometry_by_row;
+        serial_geometry_by_row.reserve(verifier_tokens.size());
 
         if (!independent_serial_logits_by_row.empty())
         {
@@ -10022,6 +10160,7 @@ namespace llaminar2::test::parity::qwen36
             serial_rows = independent_serial_rows;
             serial_logits_by_row = independent_serial_logits_by_row;
             serial_snapshots_by_row = independent_serial_snapshots_by_row;
+            serial_geometry_by_row = independent_serial_geometry_by_row;
             for (const auto &serial_logits : serial_logits_by_row)
             {
                 serial_top5_by_row.push_back(
@@ -10051,6 +10190,11 @@ namespace llaminar2::test::parity::qwen36
                         << "MoE serial row " << row
                         << " verifier forward failed at token index "
                         << token_idx;
+                    if (token_idx < row)
+                    {
+                        ASSERT_TRUE(consume_main_logits_handoff(
+                            "serial verifier replay prefix"));
+                    }
                 }
                 const std::string sample_label =
                     "MoE serial grouped verifier row " + std::to_string(row);
@@ -10068,6 +10212,8 @@ namespace llaminar2::test::parity::qwen36
                 {
                     serial_snapshots_by_row.push_back(
                         captureMoERunnerSnapshots(*runner));
+                    serial_geometry_by_row.push_back(
+                        captureMoEVerifierGeometryDiagnostic(*runner));
                 }
             }
         }
@@ -10150,13 +10296,23 @@ namespace llaminar2::test::parity::qwen36
 
             const bool explicit_raw_snapshot_dump =
                 std::getenv("LLAMINAR_MOE_GROUPED_VERIFIER_RAW_SNAPSHOT_DUMP") != nullptr;
-            if (explicit_raw_snapshot_dump && raw_key_set.empty())
+            if (explicit_raw_snapshot_dump)
             {
-                raw_key_set.insert("layer3_FFN_NORM");
-                raw_key_set.insert("layer3_MOE_ROUTING_INDICES");
-                raw_key_set.insert("layer3_MOE_ROUTING_WEIGHTS");
-                raw_key_set.insert("layer3_MOE_EXPERT_OUTPUT");
-                raw_key_set.insert("layer3_MOE_COMBINED_OUTPUT");
+                /*
+                 * Participant-local LLEP scratch can differ before its
+                 * replicated combine boundary and therefore become the first
+                 * raw key selected above without representing a model-level
+                 * divergence. An explicit dump always includes the first
+                 * full-attention RoPE chain, even when another local key is
+                 * already present, so the exact equal-input/different-output
+                 * boundary cannot be hidden by scratch ownership.
+                 */
+                raw_key_set.insert("layer3_Q_PROJECTION");
+                raw_key_set.insert("layer3_K_PROJECTION");
+                raw_key_set.insert("layer3_Q_NORM");
+                raw_key_set.insert("layer3_K_NORM");
+                raw_key_set.insert("layer3_Q_ROPE");
+                raw_key_set.insert("layer3_K_ROPE");
             }
 
             const bool raw_snapshot_dump =
@@ -10231,6 +10387,12 @@ namespace llaminar2::test::parity::qwen36
             diag << "\ngrouped_snapshot_csv=" << csv_path;
             if (!raw_snapshot_path.empty())
                 diag << "\ngrouped_raw_snapshot_csv=" << raw_snapshot_path;
+            diag << grouped_verifier_geometry_diagnostic;
+            for (size_t row = 0; row < serial_geometry_by_row.size(); ++row)
+            {
+                diag << "\nserial_row" << row << "_geometry:"
+                     << serial_geometry_by_row[row];
+            }
             diag << "\nserial_decode_path_perfstats:\n"
                  << PerfStatsCollector::summaryString(
                         {"moe_runtime_decode",

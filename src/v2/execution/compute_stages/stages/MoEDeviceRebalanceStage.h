@@ -138,38 +138,42 @@ namespace llaminar2
         ~DeviceMoERebalanceTransferState();
 
         /**
-         * @brief Materialize the persistent auxiliary stream and ordering events.
+         * @brief Materialize persistent resources before native graph capture.
          *
-         * This method is suitable for eager execution setup. Graph-captured
-         * callers should use prepareForCapture(), which additionally orders the
-         * public capture stream after work already queued on the transfer lane.
+         * This is a topology operation only: it may create the context-owned
+         * auxiliary stream and this transaction's two event handles, but it must
+         * never enqueue work or establish a dependency on either stream. Every
+         * captured transaction records compute-ready inside the graph, performs
+         * auxiliary work, and joins transfer-done back to its public graph stream.
+         * That complete transaction edge makes graph completion the sole replay
+         * lifetime boundary and keeps exported child fragments self-contained.
+         *
+         * Calling this method again is valid only for the same backend, device,
+         * and named lane. A partially initialized or aliased state is a fatal
+         * construction error rather than permission to rebind live graph events.
          *
          * @param device GPU that owns the stream and event resources.
          * @param name_suffix Stable name of the shared auxiliary stream lane.
-         * @return true when all persistent resources are available.
+         * @return true when all persistent resources are bound to this identity.
          */
-        bool ensure(DeviceId device, const std::string &name_suffix);
+        bool materializeCaptureResources(
+            DeviceId device,
+            const std::string &name_suffix);
 
         /**
-         * @brief Prepare this transaction's event edges for graph launch.
+         * @brief Validate that capture preparation installed the exact resources.
          *
-         * Stream and event creation must happen before CUDA/HIP capture begins.
-         * The shared auxiliary stream can retain work from an earlier eager
-         * launch or graph replay. This method records this owner's terminal
-         * event after that stream work and queues a wait on the public capture
-         * stream, making the lifetime boundary explicit without a host or
-         * device synchronization.
+         * Execution calls this read-only predicate instead of attempting lazy
+         * allocation. A false result therefore fails the graph transaction before
+         * any kernel or collective is submitted.
          *
-         * @param device GPU that owns both streams.
-         * @param name_suffix Stable name of the shared auxiliary stream lane.
-         * @param capture_stream Explicit stream on which capture/replay will start.
-         * @return true when resources exist and the device-side ordering edge was
-         *         queued successfully.
+         * @param device GPU expected to own the resources.
+         * @param name_suffix Stable lane identity expected by the stage.
+         * @return true only for a complete, identity-matching resource set.
          */
-        bool prepareForCapture(
+        [[nodiscard]] bool isMaterializedFor(
             DeviceId device,
-            const std::string &name_suffix,
-            void *capture_stream);
+            const std::string &name_suffix) const;
 
         void release();
 
@@ -180,6 +184,7 @@ namespace llaminar2
     private:
         IBackend *event_backend_ = nullptr;
         int event_device_ordinal_ = -1;
+        std::string stream_lane_name_;
         void *transfer_stream_ = nullptr;
         void *compute_ready_event_ = nullptr;
         void *transfer_done_event_ = nullptr;
@@ -388,7 +393,7 @@ namespace llaminar2
         bool runsApply() const;
         bool validateCommon(const char *context) const;
         std::string workspaceSuffix() const;
-        bool ensureAsyncTransferState();
+        bool requireMaterializedAsyncTransferState() const;
         DeviceMoERebalanceTransferState *transferState() const;
     };
 

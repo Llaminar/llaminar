@@ -19,6 +19,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 
+#include <algorithm>
 #include <functional>
 
 #ifdef HAVE_RCCL
@@ -306,30 +307,111 @@ namespace llaminar2
     void RCCLCoordinator::abortCommunicators()
     {
 #ifdef HAVE_RCCL
-        LOG_WARN("[RCCLCoordinator] Aborting all " << comms_.size()
-                                                   << " communicators to unblock pending RCCL operations");
+        std::lock_guard<std::mutex> abort_lock(abort_mutex_);
 
-        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        /*
+         * RCCL inherits NCCL's all-active-ranks abort contract. Calling local
+         * ranks serially can strand rank zero waiting for a rank the host has
+         * not entered yet. Close collective admission, detach every handle from
+         * ordinary cleanup, and make all active ranks enter ncclCommAbort before
+         * joining any of them. This mirrors CUDA and keeps backend failure
+         * lifecycles symmetric.
+         *
+         * RCCL communicator cleanup on this hardware is unsafe before the first
+         * collective initializes its internal mappings. In that unused case no
+         * device work exists to unblock, so preserve the established graceful
+         * cleanup path instead of invoking ncclCommAbort.
+         */
+        initialized_.store(false, std::memory_order_release);
+        const bool has_collective_work =
+            collective_performed_.load(std::memory_order_acquire);
+
+        std::vector<void *> communicators;
+        if (has_collective_work)
         {
-            if (comms_[i] != nullptr)
-            {
-                if (i < static_cast<int>(device_ordinals_.size()))
-                {
-                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                }
-                rccl::ncclResult_t r = rccl::ncclCommAbort(
-                    static_cast<rccl::ncclComm_t>(comms_[i]));
-                if (r != rccl::ncclSuccess)
-                {
-                    LOG_WARN("[RCCLCoordinator] ncclCommAbort on device "
-                             << i << " returned: " << rccl::ncclGetErrorString(r));
-                }
-                comms_[i] = nullptr; // Prevent double-free in cleanup
-            }
+            communicators = comms_;
+        }
+        else
+        {
+            communicators.assign(comms_.size(), nullptr);
         }
 
-        // Mark as uninitialized so no further collectives are attempted
-        initialized_.store(false);
+        size_t active_count = 0;
+        for (void *communicator : communicators)
+            active_count += communicator != nullptr ? 1U : 0U;
+        LOG_WARN("[RCCLCoordinator] Aborting " << active_count
+                                                << " active communicator ranks concurrently"
+                                                << " collective_performed="
+                                                << has_collective_work);
+
+        std::vector<hipError_t> device_results(
+            communicators.size(), hipSuccess);
+        std::vector<rccl::ncclResult_t> abort_results(
+            communicators.size(), rccl::ncclSuccess);
+        std::vector<std::thread> abort_threads;
+        abort_threads.reserve(active_count);
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
+        {
+            if (!communicators[rank])
+                continue;
+            abort_threads.emplace_back([&, rank]()
+            {
+                if (rank >= device_ordinals_.size())
+                {
+                    device_results[rank] = hipErrorInvalidDevice;
+                    abort_results[rank] = rccl::ncclInvalidArgument;
+                    return;
+                }
+                device_results[rank] =
+                    trackedHipSetDevice(device_ordinals_[rank]);
+                if (device_results[rank] != hipSuccess)
+                {
+                    abort_results[rank] = rccl::ncclUnhandledCudaError;
+                    return;
+                }
+                abort_results[rank] = rccl::ncclCommAbort(
+                    static_cast<rccl::ncclComm_t>(communicators[rank]));
+            });
+        }
+
+        /* Every active local rank has entered RCCL before any join occurs. */
+        for (std::thread &thread : abort_threads)
+            thread.join();
+
+        if (has_collective_work)
+        {
+            /*
+             * Preserve stable handles until abort has interrupted every caller
+             * that crossed admission before the fatal flag. Cleanup begins only
+             * after these entries are invalidated.
+             */
+            std::fill(comms_.begin(), comms_.end(), nullptr);
+        }
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
+        {
+            if (!communicators[rank])
+                continue;
+            if (device_results[rank] != hipSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] Fatal HIP device selection failure while aborting rank "
+                          << rank << " device="
+                          << (rank < device_ordinals_.size()
+                                  ? device_ordinals_[rank]
+                                  : -1)
+                          << " error="
+                          << hipGetErrorString(device_results[rank]));
+                continue;
+            }
+            if (abort_results[rank] != rccl::ncclSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] ncclCommAbort failed for rank "
+                          << rank << " device=" << device_ordinals_[rank]
+                          << " error="
+                          << rccl::ncclGetErrorString(abort_results[rank]));
+            }
+        }
 
         // Signal coordinator thread to stop (it may be waiting)
         {
@@ -338,7 +420,7 @@ namespace llaminar2
         }
         queue_cv_.notify_all();
 
-        LOG_WARN("[RCCLCoordinator] All communicators aborted");
+        LOG_WARN("[RCCLCoordinator] Concurrent communicator abort complete");
 #else
         LOG_WARN("[RCCLCoordinator] abortCommunicators() called but RCCL not available");
 #endif

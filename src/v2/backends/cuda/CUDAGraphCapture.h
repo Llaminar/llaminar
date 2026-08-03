@@ -40,10 +40,22 @@ namespace llaminar2
             return false;
 #endif
         }
+        [[nodiscard]] bool supportsDeviceControlledSwitchWhileLoop() const noexcept override
+        {
+#if CUDART_VERSION >= 13000
+            return true;
+#else
+            return false;
+#endif
+        }
         using IGPUGraphCapture::buildDeviceControlledWhileLoop;
         bool buildDeviceControlledWhileLoop(
-            std::span<const IGPUGraphCapture *const> ordered_body_fragments,
+            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
             const DeviceControlledLoopPredicate &predicate) override;
+        bool buildDeviceControlledSwitchWhileLoop(
+            std::span<const DeviceControlledLoopBranch> branches,
+            const DeviceControlledLoopPredicate &predicate,
+            const DeviceControlledLoopSwitch &switch_policy) override;
         [[nodiscard]] void *executionStream() const noexcept override
         {
             return static_cast<void *>(stream_);

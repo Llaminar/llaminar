@@ -1,3 +1,8 @@
+/**
+ * @file Test__WeightPlan.cpp
+ * @brief Unit tests for declarative weight planning and frozen materialization.
+ */
+
 #include <gtest/gtest.h>
 
 #include "loaders/WeightPlan.h"
@@ -163,6 +168,67 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     EXPECT_EQ(down.prepared->kind, PreparedWeightKind::CpuPackedGemm);
     EXPECT_NE(down.tensor, nullptr);
     EXPECT_EQ(frozen.optionalLayer(0, "missing.weight"), nullptr);
+}
+
+TEST(Test__WeightManagerMaterialize,
+     SharedExpertInputGateOwnsFP32StorageWithoutReformattingGateMatrix)
+{
+    constexpr size_t hidden = 64;
+    constexpr size_t intermediate = 32;
+    const std::string input_gate_name = "blk.0.ffn_gate_inp_shexp.weight";
+    const std::string gate_matrix_name = "blk.0.ffn_gate_shexp.weight";
+
+    auto loader = MockModelLoaderBuilder()
+                      .addQ8_0RandomTensor(input_gate_name, {1, hidden})
+                      .addQ8_0RandomTensor(gate_matrix_name, {intermediate, hidden})
+                      .build();
+
+    const auto source_input_gate = loader->loadTensor(input_gate_name);
+    ASSERT_NE(source_input_gate, nullptr);
+    ASSERT_EQ(source_input_gate->native_type(), TensorType::Q8_0);
+    std::vector<float> expected_input_gate(source_input_gate->numel());
+    source_input_gate->to_fp32(expected_input_gate.data());
+
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{100};
+    strategy.devices = {DeviceId::cpu()};
+
+    WeightPlan plan(strategy);
+    for (const std::string &name : {input_gate_name, gate_matrix_name})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = DeviceId::cpu();
+        requirement.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+        plan.add(requirement);
+    }
+
+    FrozenModelWeightSet frozen = manager.materialize(plan);
+    ASSERT_NO_THROW(frozen.validateForGraph());
+
+    const auto &input_gate = frozen.layer(0, "ffn_gate_inp_shexp.weight");
+    ASSERT_NE(input_gate.tensor, nullptr);
+    ASSERT_TRUE(input_gate.tensor_owner);
+    EXPECT_EQ(input_gate.identity.role, WeightRole::SharedExpertInputGate);
+    EXPECT_EQ(input_gate.tensor_owner.get(), input_gate.tensor);
+    EXPECT_EQ(input_gate.tensor->native_type(), TensorType::FP32);
+    EXPECT_EQ(input_gate.tensor->shape(), (std::vector<size_t>{1, hidden}));
+    ASSERT_EQ(input_gate.tensor->numel(), expected_input_gate.size());
+    for (size_t index = 0; index < expected_input_gate.size(); ++index)
+    {
+        EXPECT_FLOAT_EQ(input_gate.tensor->data()[index], expected_input_gate[index])
+            << "Prepared shared-expert input gate differs at element " << index;
+    }
+
+    const auto &gate_matrix = frozen.layer(0, "ffn_gate_shexp.weight");
+    ASSERT_NE(gate_matrix.tensor, nullptr);
+    EXPECT_EQ(gate_matrix.identity.role, WeightRole::SharedExpertGate);
+    EXPECT_EQ(gate_matrix.tensor->native_type(), TensorType::Q8_0)
+        << "The shared-expert GEMM gate matrix must retain its native codebook";
+    EXPECT_EQ(gate_matrix.tensor->shape(),
+              (std::vector<size_t>{intermediate, hidden}));
 }
 
 TEST(Test__WeightManagerMaterialize, ProducesTiedAliasBindingFromSourceName)

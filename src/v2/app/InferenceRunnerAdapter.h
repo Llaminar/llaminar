@@ -60,10 +60,25 @@ namespace llaminar2
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        /**
+         * @brief Admit stop tokens through the orchestration ownership layer.
+         *
+         * The adapter does not own graph state.  It forwards the complete
+         * request policy to IOrchestrationRunner, whose concrete implementation
+         * publishes it to the underlying graph owners before prefill.
+         */
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Admit MTP penalties through orchestration sampling policy.
+         */
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
 
     private:
         IOrchestrationRunner *orch_runner_;
         int position_;
+        SamplingParams sampling_params_{};
     };
 
 } // namespace llaminar2

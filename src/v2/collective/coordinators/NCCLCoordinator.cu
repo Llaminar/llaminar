@@ -20,6 +20,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+
 #ifdef HAVE_NCCL
 #include "../backends/NCCLDynamicLoader.h"
 #include "../backends/NCCLNetworkPolicy.h"
@@ -29,6 +34,57 @@ namespace nccl = llaminar2::nccl_dynamic;
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        constexpr const char *kNCCLGraphMixingEnvironment =
+            "NCCL_GRAPH_MIXING_SUPPORT";
+
+        /**
+         * @brief Install Llaminar's process-wide NCCL graph ordering policy.
+         *
+         * NCCL's graph-mixing protocol records an event at every captured
+         * collective and inserts a root wait when a communicator may be mixed
+         * between eager and captured launches. CUDA conditional bodies reject
+         * those event nodes. Llaminar has a stronger ordering authority: every
+         * operation on a communicator enters this coordinator and every
+         * producer/consumer edge names an explicit stream. Disabling NCCL's
+         * redundant protocol therefore preserves the coordinator DAG while
+         * keeping captured collective fragments legal inside WHILE/SWITCH.
+         *
+         * The variable must be fixed before the NCCL shared object or any
+         * communicator is initialized. A conflicting external value is a fatal
+         * configuration error; silently overriding it would make graph
+         * behavior depend on initialization order.
+         *
+         * @param error Receives an actionable diagnostic on failure.
+         * @return true when the process environment contains the required value.
+         */
+        bool installNCCLGraphOrderingPolicy(std::string &error)
+        {
+            const char *configured =
+                std::getenv(kNCCLGraphMixingEnvironment);
+            if (configured && std::strcmp(configured, "0") != 0)
+            {
+                error = std::string(kNCCLGraphMixingEnvironment) +
+                        " must be 0 because Llaminar owns communicator "
+                        "ordering and CUDA conditional graphs forbid NCCL's "
+                        "mixing event nodes; received '" + configured + "'";
+                return false;
+            }
+
+            if (!configured &&
+                ::setenv(kNCCLGraphMixingEnvironment, "0", /*overwrite=*/0) != 0)
+            {
+                error = std::string("Could not install ") +
+                        kNCCLGraphMixingEnvironment +
+                        "=0 before NCCL initialization (errno=" +
+                        std::to_string(errno) + ")";
+                return false;
+            }
+            return true;
+        }
+    }
 
     // ============================================================================
     // Helper Macros for Error Checking
@@ -219,6 +275,12 @@ namespace llaminar2
             return false;
         }
 
+        if (!installNCCLGraphOrderingPolicy(last_error_))
+        {
+            LOG_ERROR("[NCCLCoordinator] " << last_error_);
+            return false;
+        }
+
         // Ensure NCCL is loaded
         if (!nccl::isLoaded() && !nccl::load())
         {
@@ -308,30 +370,97 @@ namespace llaminar2
     void NCCLCoordinator::abortCommunicators()
     {
 #ifdef HAVE_NCCL
-        LOG_WARN("[NCCLCoordinator] Aborting all " << comms_.size()
-                                                   << " communicators to unblock pending NCCL operations");
+        std::lock_guard<std::mutex> abort_lock(abort_mutex_);
 
-        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        /*
+         * NVIDIA requires every active rank in a communicator to enter
+         * ncclCommAbort. A serial loop is therefore self-deadlocking for a
+         * single-process clique: rank zero can wait for rank one before the
+         * host has even called rank one's abort. This was observed directly in
+         * CUDAx2 failure teardown as pncclCommAbort waiting forever while the
+         * RankOrchestrator destructor joined the failure-callback thread.
+         *
+         * First close admission and detach every handle from ordinary cleanup.
+         * Then launch one host thread per active local rank, so all ranks enter
+         * NCCL before this owner joins any of them. Thread creation is confined
+         * to the fatal teardown path; no inference or graph-capture path can
+         * reach it.
+         */
+        initialized_.store(false, std::memory_order_release);
+
+        std::vector<void *> communicators = comms_;
+        size_t active_count = 0;
+        for (void *communicator : communicators)
+            active_count += communicator != nullptr ? 1U : 0U;
+
+        LOG_WARN("[NCCLCoordinator] Aborting " << active_count
+                                                << " active communicator ranks concurrently");
+
+        std::vector<cudaError_t> device_results(
+            communicators.size(), cudaSuccess);
+        std::vector<nccl::ncclResult_t> abort_results(
+            communicators.size(), nccl::ncclSuccess);
+        std::vector<std::thread> abort_threads;
+        abort_threads.reserve(active_count);
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
         {
-            if (comms_[i] != nullptr)
+            if (!communicators[rank])
+                continue;
+            abort_threads.emplace_back([&, rank]()
             {
-                if (i < static_cast<int>(device_ordinals_.size()))
+                if (rank >= device_ordinals_.size())
                 {
-                    CUDA_CHECK_VOID(cudaSetDevice(device_ordinals_[i]));
+                    device_results[rank] = cudaErrorInvalidDevice;
+                    abort_results[rank] = nccl::ncclInvalidArgument;
+                    return;
                 }
-                nccl::ncclResult_t r = nccl::ncclCommAbort(
-                    static_cast<nccl::ncclComm_t>(comms_[i]));
-                if (r != nccl::ncclSuccess)
+                device_results[rank] = cudaSetDevice(device_ordinals_[rank]);
+                if (device_results[rank] != cudaSuccess)
                 {
-                    LOG_WARN("[NCCLCoordinator] ncclCommAbort on device "
-                             << i << " returned: " << nccl::ncclGetErrorString(r));
+                    abort_results[rank] = nccl::ncclUnhandledCudaError;
+                    return;
                 }
-                comms_[i] = nullptr; // Prevent double-free in cleanup
-            }
+                abort_results[rank] = nccl::ncclCommAbort(
+                    static_cast<nccl::ncclComm_t>(communicators[rank]));
+            });
         }
 
-        // Mark as uninitialized so no further collectives are attempted
-        initialized_.store(false);
+        /* All active ranks have entered their abort call before any join. */
+        for (std::thread &thread : abort_threads)
+            thread.join();
+
+        /*
+         * Keep the published handle table read-only while abort interrupts a
+         * caller that already passed the admission flag. Once every NCCL abort
+         * has returned, no operation can still own a live handle and ordinary
+         * coordinator cleanup must see only null entries.
+         */
+        std::fill(comms_.begin(), comms_.end(), nullptr);
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
+        {
+            if (!communicators[rank])
+                continue;
+            if (device_results[rank] != cudaSuccess)
+            {
+                LOG_ERROR("[NCCLCoordinator] Fatal CUDA device selection failure while aborting rank "
+                          << rank << " device="
+                          << (rank < device_ordinals_.size()
+                                  ? device_ordinals_[rank]
+                                  : -1)
+                          << " error="
+                          << cudaGetErrorString(device_results[rank]));
+                continue;
+            }
+            if (abort_results[rank] != nccl::ncclSuccess)
+            {
+                LOG_ERROR("[NCCLCoordinator] ncclCommAbort failed for rank "
+                          << rank << " device=" << device_ordinals_[rank]
+                          << " error="
+                          << nccl::ncclGetErrorString(abort_results[rank]));
+            }
+        }
 
         // Signal coordinator thread to stop (it may be waiting)
         {
@@ -340,7 +469,7 @@ namespace llaminar2
         }
         queue_cv_.notify_all();
 
-        LOG_WARN("[NCCLCoordinator] All communicators aborted");
+        LOG_WARN("[NCCLCoordinator] Concurrent communicator abort complete");
 #else
         LOG_WARN("[NCCLCoordinator] abortCommunicators() called but NCCL not available");
 #endif

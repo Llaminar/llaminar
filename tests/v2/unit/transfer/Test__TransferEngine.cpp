@@ -1379,6 +1379,67 @@ TEST_F(Test__TransferEngine_EventFailure, NullOutputPreparationStreamFailsBefore
     EXPECT_FALSE(tensor->current_device().has_value());
 }
 
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    RequireDeviceOutputAcceptsInvalidPreallocatedBytesWithoutAllocation)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(
+        tensor.get(),
+        DeviceId::cuda(0));
+    ASSERT_FALSE(tensor->deviceValid());
+    const size_t allocations_before = mock_->getAllocationCount();
+
+    EXPECT_NO_THROW(
+        TransferEngine::requireDeviceOutput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x0A117001)));
+
+    EXPECT_EQ(mock_->getAllocationCount(), allocations_before)
+        << "Execution-time output validation must never allocate.";
+    EXPECT_FALSE(tensor->deviceValid())
+        << "Storage validation must not publish unwritten bytes.";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureRejectsPlacementCapableInputEvenWhenDeviceBytesAreValid)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    GraphCaptureGuard capture_guard;
+
+    EXPECT_THROW(
+        TransferEngine::prepareDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x0A117002)),
+        std::logic_error)
+        << "A no-op placement call can still import stale generation state into capture.";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureRejectsPlacementCapableOutputEvenWhenStorageExists)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(
+        tensor.get(),
+        DeviceId::cuda(0));
+    const size_t allocations_before = mock_->getAllocationCount();
+    GraphCaptureGuard capture_guard;
+
+    EXPECT_THROW(
+        TransferEngine::prepareDeviceOutput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x0A117003)),
+        std::logic_error);
+    EXPECT_EQ(mock_->getAllocationCount(), allocations_before);
+}
+
 TEST_F(Test__TransferEngine_EventFailure, AllocationOnlyStorageDoesNotPublishAuthority)
 {
     auto tensor = TestTensorFactory::createFP32Ones({4, 4});
@@ -1396,6 +1457,148 @@ TEST_F(Test__TransferEngine_EventFailure, AllocationOnlyStorageDoesNotPublishAut
         << "Allocation alone must not publish unwritten device bytes";
     EXPECT_EQ(mock_->getEventCreateCount(), 0u);
     EXPECT_EQ(mock_->getEventRecordCount(), 0u);
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureLedgerAdmitsOnlyAnEarlierRecordedInternalProducer)
+{
+    auto internal = TestTensorFactory::createFP32Ones({4, 4});
+    auto external = TestTensorFactory::createFP32Ones({4, 4});
+    internal->setBackendForTesting(mock_.get());
+    external->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(internal.get(), DeviceId::cuda(0));
+    TransferEngine::allocateDeviceStorage(external.get(), DeviceId::cuda(0));
+    ASSERT_FALSE(internal->deviceValid());
+    ASSERT_FALSE(external->deviceValid());
+
+    int producer_stage = 0;
+    int consumer_stage = 0;
+    void *capture_stream = reinterpret_cast<void *>(0xCA970001);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages;
+    stages.push_back({
+        .stage_identity = &producer_stage,
+        .stage_name = "producer",
+        .outputs = {internal->transferStorageOwner()},
+    });
+    stages.push_back({
+        .stage_identity = &consumer_stage,
+        .stage_name = "consumer",
+        .external_inputs = {external->transferStorageOwner()},
+        .internal_inputs = {{
+            .tensor = internal->transferStorageOwner(),
+            .producer_stage_index = 0,
+        }},
+    });
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0), capture_stream, std::move(stages), "unit_capture");
+
+    {
+        GraphCaptureGuard capture_guard(&ledger);
+        {
+            ScopedGraphCaptureStage producer_scope(&producer_stage);
+            EXPECT_NO_THROW(TransferEngine::publishDeviceWrite(
+                internal.get(), DeviceId::cuda(0), capture_stream));
+            EXPECT_FALSE(internal->deviceValid())
+                << "Recording a producer must not publish unexecuted bytes";
+            EXPECT_EQ(mock_->getEventRecordCount(), 0u)
+                << "Captured stage publication must not create per-tensor events";
+            producer_scope.complete();
+        }
+        {
+            ScopedGraphCaptureStage consumer_scope(&consumer_stage);
+            EXPECT_NO_THROW(TransferEngine::requireDeviceInput(
+                internal.get(), DeviceId::cuda(0), capture_stream));
+            EXPECT_THROW(
+                TransferEngine::requireDeviceInput(
+                    external.get(), DeviceId::cuda(0), capture_stream),
+                std::runtime_error)
+                << "An allocated external tensor still needs globally valid bytes";
+            consumer_scope.complete();
+        }
+    }
+
+    EXPECT_FALSE(internal->deviceValid());
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            internal.get(), DeviceId::cuda(0), capture_stream),
+        std::runtime_error)
+        << "The internal-edge proof must not escape its capture transaction";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureLedgerRejectsInternalInputWhoseProducerIsNotEarlier)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(tensor.get(), DeviceId::cuda(0));
+
+    int invalid_consumer_stage = 0;
+    void *capture_stream = reinterpret_cast<void *>(0xCA970002);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {{
+        .stage_identity = &invalid_consumer_stage,
+        .stage_name = "consumer_before_producer",
+        .internal_inputs = {{
+            .tensor = tensor->transferStorageOwner(),
+            .producer_stage_index = 0,
+        }},
+    }};
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0), capture_stream, std::move(stages), "invalid_order");
+
+    GraphCaptureGuard capture_guard(&ledger);
+    ScopedGraphCaptureStage consumer_scope(&invalid_consumer_stage);
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            tensor.get(), DeviceId::cuda(0), capture_stream),
+        std::logic_error);
+    consumer_scope.complete();
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureLedgerRejectsDifferentConsumerStream)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(tensor.get(), DeviceId::cuda(0));
+
+    int producer_stage = 0;
+    int consumer_stage = 0;
+    void *capture_stream = reinterpret_cast<void *>(0xCA970003);
+    void *different_stream = reinterpret_cast<void *>(0xCA970004);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {
+        {
+            .stage_identity = &producer_stage,
+            .stage_name = "producer",
+            .outputs = {tensor->transferStorageOwner()},
+        },
+        {
+            .stage_identity = &consumer_stage,
+            .stage_name = "consumer",
+            .internal_inputs = {{
+                .tensor = tensor->transferStorageOwner(),
+                .producer_stage_index = 0,
+            }},
+        },
+    };
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0), capture_stream, std::move(stages), "stream_identity");
+
+    GraphCaptureGuard capture_guard(&ledger);
+    {
+        ScopedGraphCaptureStage producer_scope(&producer_stage);
+        producer_scope.complete();
+    }
+    {
+        ScopedGraphCaptureStage consumer_scope(&consumer_stage);
+        EXPECT_THROW(
+            TransferEngine::requireDeviceInput(
+                tensor.get(), DeviceId::cuda(0), different_stream),
+            std::logic_error);
+        consumer_scope.complete();
+    }
 }
 
 TEST_F(Test__TransferEngine_EventFailure, CurrentDevicePublicationRejectsNullStream)

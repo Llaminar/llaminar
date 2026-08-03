@@ -2322,24 +2322,21 @@ namespace llaminar2
             }
 
             /*
-             * Join the activation producer to the exact GEMM stream before
-             * reading its device pointer. DeviceGraphExecutor normally
-             * establishes this edge, but the tensor-aware API is also used by
-             * grouped MoE composition and direct integration tests. Leaving
-             * the edge implicit lets an asynchronous H2D upload race the first
-             * activation-quantization kernel.
+             * Tensor kernels never own placement. The graph executor or a
+             * direct-kernel harness prepares storage first; this boundary only
+             * validates exact residency and joins the producer event.
              */
             const DeviceId target_device =
                 DeviceId::rocm(rocm_device_id_);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<FP32Tensor *>(A_fp32),
                 target_device,
                 gpu_stream_);
             if (beta != 0.0f)
-                TransferEngine::prepareDeviceInput(
+                TransferEngine::requireDeviceInput(
                     C_fp32, target_device, gpu_stream_);
             else
-                TransferEngine::prepareDeviceOutput(
+                TransferEngine::requireDeviceOutput(
                     C_fp32, target_device, gpu_stream_);
 
             // Check if tensors are on GPU
@@ -2432,7 +2429,7 @@ namespace llaminar2
                     auto *bias_tensor = const_cast<TensorBase *>(bias);
                     const auto target_device =
                         DeviceId::rocm(rocm_device_id_);
-                    TransferEngine::prepareDeviceInput(
+                    TransferEngine::requireDeviceInput(
                         bias_tensor, target_device, gpu_stream_);
 
                     d_bias = static_cast<const float *>(bias->gpu_data_ptr());
@@ -2715,7 +2712,7 @@ namespace llaminar2
                         auto *bias_tensor = const_cast<TensorBase *>(bias);
                         const auto target_device =
                             DeviceId::rocm(rocm_device_id_);
-                        TransferEngine::prepareDeviceInput(
+                        TransferEngine::requireDeviceInput(
                             bias_tensor, target_device, gpu_stream_);
 
                         d_bias = static_cast<const float *>(bias->gpu_data_ptr());
@@ -3053,7 +3050,7 @@ namespace llaminar2
                     auto *bias_tensor = const_cast<TensorBase *>(bias);
                     const auto target_device =
                         DeviceId::rocm(rocm_device_id_);
-                    TransferEngine::prepareDeviceInput(
+                    TransferEngine::requireDeviceInput(
                         bias_tensor, target_device, gpu_stream_);
 
                     d_prefill_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
@@ -3267,7 +3264,7 @@ namespace llaminar2
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
                     return false;
                 }
-                TransferEngine::prepareDeviceInput(
+                TransferEngine::requireDeviceInput(
                     fp32_input,
                     DeviceId::rocm(rocm_device_id_),
                     gpu_stream_);
@@ -3938,7 +3935,7 @@ namespace llaminar2
                             mark_batched_bypass("bias_wrong_gpu");
                             break;
                         }
-                        TransferEngine::prepareDeviceInput(
+                        TransferEngine::requireDeviceInput(
                             bias_tensor, target_device, gpu_stream_);
                         d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
 
@@ -4418,7 +4415,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    TransferEngine::prepareDeviceInput(
+                    TransferEngine::requireDeviceInput(
                         bias_tensor, target_device, gpu_stream_);
                     d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
 
@@ -5816,19 +5813,19 @@ namespace llaminar2
              */
             const DeviceId target_device =
                 DeviceId::rocm(rocm_device_id_);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(gate),
                 target_device,
                 gpu_stream_);
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<TensorBase *>(up),
                 target_device,
                 gpu_stream_);
             if (beta != 0.0f)
-                TransferEngine::prepareDeviceInput(
+                TransferEngine::requireDeviceInput(
                     output, target_device, gpu_stream_);
             else
-                TransferEngine::prepareDeviceOutput(
+                TransferEngine::requireDeviceOutput(
                     output, target_device, gpu_stream_);
 
             // Get GPU data pointers after both producer events are joined.

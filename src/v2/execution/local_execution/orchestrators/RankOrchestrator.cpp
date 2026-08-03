@@ -7768,6 +7768,8 @@ namespace llaminar2
         out_handle->output_tokens_device = rank_compact_output_tokens_.data();
         out_handle->meta_device = rank_compact_output_meta_.data();
         out_handle->request_count = 1;
+        out_handle->logical_verifier_rows_per_request = draft_token_count;
+        out_handle->physical_verifier_rows_per_request = draft_token_count;
         out_handle->output_token_stride = rank_compact_output_token_stride_;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = primaryDeviceId();
@@ -8121,6 +8123,10 @@ namespace llaminar2
                             std::to_string(i));
             }
             if (child.request_count != primary.request_count ||
+                child.logical_verifier_rows_per_request !=
+                    primary.logical_verifier_rows_per_request ||
+                child.physical_verifier_rows_per_request !=
+                    primary.physical_verifier_rows_per_request ||
                 child.output_token_stride != primary.output_token_stride ||
                 child.meta_stride != primary.meta_stride)
             {
@@ -10326,26 +10332,26 @@ namespace llaminar2
     const void *RankOrchestrator::prepareMTPVerifierInputTokenBatchOnDevice(
         const DeviceMTPVerifierInputBatchRequest *requests,
         int request_count,
-        int padded_seq_len)
+        int logical_padded_seq_len)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->prepareMTPVerifierInputTokenBatchOnDevice(
                 requests,
                 request_count,
-                padded_seq_len);
+                logical_padded_seq_len);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]->prepareMTPVerifierInputTokenBatchOnDevice(
                 requests,
                 request_count,
-                padded_seq_len);
+                logical_padded_seq_len);
         }
         if (device_runners_.size() < 2 ||
             !requests ||
             request_count <= 0 ||
-            padded_seq_len <= 0)
+            logical_padded_seq_len <= 0)
         {
             return nullptr;
         }
@@ -10373,7 +10379,7 @@ namespace llaminar2
         rank_mtp_verifier_child_token_inputs_.assign(
             device_runners_.size(),
             nullptr);
-        rank_mtp_verifier_child_token_count_ = padded_seq_len;
+        rank_mtp_verifier_child_token_count_ = logical_padded_seq_len;
         for (size_t i = 0; i < device_runners_.size(); ++i)
         {
             if (!device_runners_[i])
@@ -10383,7 +10389,7 @@ namespace llaminar2
                 device_runners_[i]->prepareMTPVerifierInputTokenBatchOnDevice(
                     requests,
                     request_count,
-                    padded_seq_len);
+                    logical_padded_seq_len);
             if (!rank_mtp_verifier_child_token_inputs_[i])
             {
                 rank_mtp_verifier_child_token_inputs_.clear();
@@ -10400,7 +10406,8 @@ namespace llaminar2
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
              {"requests", std::to_string(request_count)},
-             {"padded_seq_len", std::to_string(padded_seq_len)}});
+             {"logical_padded_seq_len",
+              std::to_string(logical_padded_seq_len)}});
         return rank_mtp_verifier_child_token_inputs_.data();
     }
 
@@ -10712,13 +10719,13 @@ namespace llaminar2
         return copyDeviceSpeculativeOutcomesToHost(handle, out);
     }
 
-    bool RankOrchestrator::beginDeviceResidentStochasticGeneration(
+    bool RankOrchestrator::beginDeviceResidentGeneration(
         int request_count,
         int max_new_tokens)
     {
         if (request_count <= 0 || max_new_tokens <= 0)
         {
-            LOG_ERROR("[RankOrchestrator] Invalid device-resident stochastic generation admission: requests="
+            LOG_ERROR("[RankOrchestrator] Invalid device-resident generation admission: requests="
                       << request_count << " max_new_tokens=" << max_new_tokens);
             return false;
         }
@@ -10727,7 +10734,7 @@ namespace llaminar2
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         if (participants.empty())
         {
-            LOG_ERROR("[RankOrchestrator] Device-resident stochastic generation admission has no participants");
+            LOG_ERROR("[RankOrchestrator] Device-resident generation admission has no participants");
             return false;
         }
 
@@ -10742,11 +10749,11 @@ namespace llaminar2
         {
             if (!participants[participant] ||
                 !participants[participant]
-                     ->beginDeviceResidentStochasticGeneration(
+                     ->beginDeviceResidentGeneration(
                          request_count,
                          max_new_tokens))
             {
-                LOG_ERROR("[RankOrchestrator] Device-resident stochastic generation admission failed on participant "
+                LOG_ERROR("[RankOrchestrator] Device-resident generation admission failed on participant "
                           << participant);
                 return false;
             }
@@ -10754,7 +10761,7 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::materializeDeviceResidentStochasticGeneration(
+    bool RankOrchestrator::materializeDeviceResidentGeneration(
         int request_count,
         int draft_depth)
     {
@@ -10778,7 +10785,7 @@ namespace llaminar2
         {
             return participants.front() &&
                    participants.front()
-                       ->materializeDeviceResidentStochasticGeneration(
+                       ->materializeDeviceResidentGeneration(
                            request_count,
                            draft_depth);
         }
@@ -10841,7 +10848,7 @@ namespace llaminar2
                 ROCmKernelProfiler::setCurrentDevice(device.ordinal);
                 CUDAKernelProfiler::setCurrentDevice(device.ordinal);
                 return worker_participants[i]
-                    ->materializeDeviceResidentStochasticGeneration(
+                    ->materializeDeviceResidentGeneration(
                         request_count,
                         draft_depth);
             });
@@ -10871,7 +10878,7 @@ namespace llaminar2
         if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
-                "materializeDeviceResidentStochasticGeneration",
+                "materializeDeviceResidentGeneration",
                 collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
@@ -10885,7 +10892,7 @@ namespace llaminar2
         return all_success;
     }
 
-    bool RankOrchestrator::launchDeviceResidentStochasticGeneration()
+    bool RankOrchestrator::launchDeviceResidentGeneration()
     {
         const auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
@@ -10909,7 +10916,7 @@ namespace llaminar2
         {
             if (!participants[participant_index] ||
                 !participants[participant_index]
-                     ->launchDeviceResidentStochasticGeneration())
+                     ->launchDeviceResidentGeneration())
             {
                 LOG_ERROR("[RankOrchestrator] Device-generation parent launch failed on participant "
                           << participant_index);
@@ -10930,7 +10937,7 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::finishDeviceResidentStochasticGeneration(
+    bool RankOrchestrator::finishDeviceResidentGeneration(
         DeviceGenerationTerminalResult *out_result)
     {
         if (out_result)
@@ -10958,7 +10965,7 @@ namespace llaminar2
             DeviceGenerationTerminalResult participant_result;
             if (!participants[participant_index] ||
                 !participants[participant_index]
-                     ->finishDeviceResidentStochasticGeneration(
+                     ->finishDeviceResidentGeneration(
                          &participant_result) ||
                 !participant_result.valid())
             {
@@ -11292,6 +11299,8 @@ namespace llaminar2
         out_handle->output_tokens_device = rank_compact_output_tokens_.data();
         out_handle->meta_device = rank_compact_output_meta_.data();
         out_handle->request_count = 1;
+        out_handle->logical_verifier_rows_per_request = request.row_count + 1;
+        out_handle->physical_verifier_rows_per_request = request.row_count + 1;
         out_handle->output_token_stride = rank_compact_output_token_stride_;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = primaryDeviceId();
@@ -11495,6 +11504,12 @@ namespace llaminar2
             outcome.device == rank_mirrored_primary_outcome_.device &&
             outcome.request_count ==
                 rank_mirrored_primary_outcome_.request_count &&
+            outcome.logical_verifier_rows_per_request ==
+                rank_mirrored_primary_outcome_
+                    .logical_verifier_rows_per_request &&
+            outcome.physical_verifier_rows_per_request ==
+                rank_mirrored_primary_outcome_
+                    .physical_verifier_rows_per_request &&
             outcome.output_token_stride ==
                 rank_mirrored_primary_outcome_.output_token_stride &&
             outcome.meta_stride == rank_mirrored_primary_outcome_.meta_stride &&
@@ -11835,7 +11850,7 @@ namespace llaminar2
 
         std::string mailbox_error;
         if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
-                request.request_count,
+                request.requestCount(),
                 "accepted_state_publication",
                 &mailbox_error))
         {
@@ -11853,8 +11868,11 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
-             {"request_count", std::to_string(request.request_count)},
-             {"max_draft_tokens", std::to_string(request.max_draft_tokens)},
+             {"request_count", std::to_string(request.requestCount())},
+             {"logical_verifier_rows",
+              std::to_string(request.logicalVerifierRowsPerRequest())},
+             {"physical_verifier_rows",
+              std::to_string(request.physicalVerifierRowsPerRequest())},
              {"implementation", "mirrored_child_device_publish"}});
         return true;
     }

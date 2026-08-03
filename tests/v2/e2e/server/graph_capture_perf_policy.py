@@ -203,11 +203,10 @@ def _incomplete_graph_contexts(
     """Return GPU graph contexts that did not advance through their lifecycle.
 
     ``decode_graph_phase`` is emitted once for each invocation and aggregated
-    by device, context, and phase. A context may legitimately execute only its
-    warmup once in a tiny cell. Once it is exercised twice, however, the second
-    invocation must capture. Once it is exercised three times, the third must
-    replay. Repeated warmup is therefore an ownership/reset defect, not
-    acceptable evidence of graph planning.
+    by device, context, and phase. Transaction zero must prepare, capture,
+    instantiate, and launch one executable atomically. Every later invocation
+    must replay that executable. The retired eager ``warmup`` phase is therefore
+    always an ownership defect, not acceptable graph-planning evidence.
 
     A capture phase counts only when PerfStats also reports a non-empty
     instantiated full-graph executable for the same device and context. This
@@ -259,12 +258,15 @@ def _incomplete_graph_contexts(
         total = sum(counts.values())
         capture_count = counts.get("capture", 0.0)
         replay_count = counts.get("replay", 0.0)
+        warmup_count = counts.get("warmup", 0.0)
         reasons: list[str] = []
-        if total >= 2.0 and capture_count <= 0.0:
-            reasons.append("missing capture after repeated execution")
+        if warmup_count > 0.0:
+            reasons.append("retired eager warmup phase was executed")
+        if total >= 1.0 and capture_count <= 0.0:
+            reasons.append("missing transaction-zero capture")
         if capture_count > 0.0 and key not in executable_contexts:
             reasons.append("capture has no context-matched executable nodes")
-        if total >= 3.0 and replay_count <= 0.0:
+        if total >= 2.0 and replay_count <= 0.0:
             reasons.append("missing replay after repeated execution")
         if reasons:
             label = f"{device or 'unknown'}:{context}"
@@ -350,7 +352,7 @@ def validate_graph_capture_policy(
         )
     elif incomplete_contexts:
         error = (
-            "GPU graph contexts did not complete warmup/capture/replay "
+            "GPU graph contexts did not complete capture/replay "
             "lifecycle: " + ", ".join(incomplete_contexts)
         )
 

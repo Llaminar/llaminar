@@ -187,45 +187,108 @@ TEST_F(Test__TPAllreduceStage, CoherencePolicyIsOutput)
 }
 
 TEST_F(Test__TPAllreduceStage,
-       RootedCollectiveDeclaresOneCapturableInPlaceGpuTransaction)
+       RootedCollectiveContractsEncodeEveryParticipantRole)
 {
     llaminar2::test::MockLocalTPContext tp_ctx;
     tp_ctx.setDevices({cuda0_, cuda1_});
     tp_ctx.setBackend(CollectiveBackendType::NCCL);
 
-    TPLocalRootedCollectiveStage::Params params;
-    params.device_id = DeviceId::cuda(0);
-    params.tp_ctx = &tp_ctx;
-    params.tensor = test_tensor_.get();
-    params.count = 129;
-    params.dtype = CollectiveDataType::FLOAT32;
-    params.operation = TPLocalRootedCollectiveOperation::ReduceSum;
-    params.root_device_index = 1;
-    params.participant_device_index = 0;
-    params.stage_name = "canonical_routes_reduce_to_root";
-    params.tensor_buffer_id = BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+    struct ExpectedRole
+    {
+        TPLocalRootedCollectiveOperation operation;
+        int participant;
+        TPLocalRootedCollectiveTensorRole tensor_role;
+        BufferRole buffer_role;
+        size_t input_count;
+        size_t output_count;
+        size_t inout_count;
+    };
 
-    TPLocalRootedCollectiveStage stage(std::move(params));
-    EXPECT_EQ(stage.type(), ComputeStageType::ROOTED_COLLECTIVE);
-    EXPECT_EQ(stage.name(), "tp_local_rooted_collective");
-    EXPECT_TRUE(stage.requiresAllreduce());
-    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
-    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
-    EXPECT_TRUE(stage.isGraphCapturable());
+    constexpr ExpectedRole cases[] = {
+        {.operation = TPLocalRootedCollectiveOperation::ReduceSum,
+         .participant = 1,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::ReduceRootInOut,
+         .buffer_role = BufferRole::INOUT,
+         .input_count = 0,
+         .output_count = 0,
+         .inout_count = 1},
+        {.operation = TPLocalRootedCollectiveOperation::ReduceSum,
+         .participant = 0,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::ReduceContributorInput,
+         .buffer_role = BufferRole::INPUT,
+         .input_count = 1,
+         .output_count = 0,
+         .inout_count = 0},
+        {.operation = TPLocalRootedCollectiveOperation::Broadcast,
+         .participant = 1,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::BroadcastRootInput,
+         .buffer_role = BufferRole::INPUT,
+         .input_count = 1,
+         .output_count = 0,
+         .inout_count = 0},
+        {.operation = TPLocalRootedCollectiveOperation::Broadcast,
+         .participant = 0,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput,
+         .buffer_role = BufferRole::OUTPUT,
+         .input_count = 0,
+         .output_count = 1,
+         .inout_count = 0},
+    };
 
-    const auto requirements = stage.getBufferRequirements();
-    ASSERT_EQ(requirements.buffers.size(), 1u);
-    EXPECT_EQ(requirements.buffers.front().role, BufferRole::INOUT);
+    for (const auto &expected : cases)
+    {
+        SCOPED_TRACE(
+            std::string(toString(expected.operation)) + "/participant=" +
+            std::to_string(expected.participant));
 
-    const auto contract = stage.bufferContract();
-    EXPECT_TRUE(contract.inputs.empty());
-    EXPECT_TRUE(contract.outputs.empty());
-    ASSERT_EQ(contract.inouts.size(), 1u);
-    EXPECT_EQ(
-        contract.inouts.front().id,
-        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
-    EXPECT_FALSE(contract.inouts.front().prepare_write_storage)
-        << "The rooted collective must consume the producer's existing device allocation";
+        TPLocalRootedCollectiveStage::Params params;
+        params.device_id = DeviceId::cuda(expected.participant);
+        params.tp_ctx = &tp_ctx;
+        params.tensor = test_tensor_.get();
+        params.count = 129;
+        params.dtype = CollectiveDataType::FLOAT32;
+        params.operation = expected.operation;
+        params.root_device_index = 1;
+        params.participant_device_index = expected.participant;
+        params.stage_name = "canonical_routes_rooted_collective";
+        params.tensor_buffer_id =
+            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+
+        TPLocalRootedCollectiveStage stage(std::move(params));
+        EXPECT_EQ(stage.type(), ComputeStageType::ROOTED_COLLECTIVE);
+        EXPECT_EQ(stage.name(), "tp_local_rooted_collective");
+        EXPECT_TRUE(stage.requiresAllreduce());
+        EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+        EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation())
+            << "Rooted collectives expose their complete static capture contract directly.";
+        EXPECT_TRUE(stage.isGraphCapturable());
+        EXPECT_EQ(stage.tensorRole(), expected.tensor_role);
+
+        const auto requirements = stage.getBufferRequirements();
+        ASSERT_EQ(requirements.buffers.size(), 1u);
+        EXPECT_EQ(requirements.buffers.front().role, expected.buffer_role);
+
+        const auto contract = stage.bufferContract();
+        EXPECT_EQ(contract.inputs.size(), expected.input_count);
+        EXPECT_EQ(contract.outputs.size(), expected.output_count);
+        EXPECT_EQ(contract.inouts.size(), expected.inout_count);
+        EXPECT_EQ(contract.bindingCount(), 1u);
+
+        if (!contract.inouts.empty())
+        {
+            EXPECT_FALSE(contract.inouts.front().prepare_write_storage)
+                << "The reduce root consumes the producer's existing allocation";
+        }
+        if (!contract.outputs.empty())
+        {
+            EXPECT_TRUE(contract.outputs.front().prepare_write_storage)
+                << "A broadcast receiver owns a newly prepared destination";
+        }
+    }
 }
 
 TEST_F(Test__TPAllreduceStage,
@@ -253,11 +316,13 @@ TEST_F(Test__TPAllreduceStage,
             .name = "rebalance_histogram"});
 
     TPLocalRootedCollectiveStage stage(std::move(params));
-    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_FALSE(stage.isGraphCapturable());
 
     tp_ctx.setRawAllgatherGraphCaptureSupported(true);
-    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
-        << "The same-stream sideband is capturable only after the LocalTP context advertises its native primitive";
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "The same-stream sideband becomes directly capturable when the LocalTP context exposes its native primitive";
 }
 
 TEST_F(Test__TPAllreduceStage, SidebandsExecuteOnSameExplicitStreamAfterPrimaryAllreduce)

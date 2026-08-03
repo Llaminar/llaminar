@@ -358,6 +358,85 @@ namespace llaminar2::sampling_math
     };
 
     /**
+     * @brief Device-side MTP depth policy mode admitted before generation.
+     */
+    enum class DeviceGenerationDepthPolicyMode : int
+    {
+        Fixed = 0,
+        Observe = 1,
+        Dynamic = 2,
+    };
+
+    /**
+     * @brief Fixed-width request policy consumed by the resident depth controller.
+     *
+     * Floating-point policy thresholds are converted to parts-per-million by
+     * request admission. Device transitions can consequently compare integer
+     * counters with a fixed arithmetic order on CUDA and ROCm, and CPU tests can
+     * prove the same decisions without backend-specific floating-point drift.
+     */
+    struct DeviceGenerationDepthPolicy
+    {
+        static constexpr int kRateScale = 1'000'000;
+        static constexpr int kMaximumSupportedDraftDepth = 15;
+
+        DeviceGenerationDepthPolicyMode mode =
+            DeviceGenerationDepthPolicyMode::Fixed;
+        int initial_depth = 1;
+        int minimum_depth = 1;
+        int maximum_depth = 1;
+        int window_size = 16;
+        int minimum_samples = 4;
+        int cooldown_steps = 8;
+        int promote_consecutive_windows = 3;
+        int promote_full_accept_rate_ppm = kRateScale;
+        int demote_zero_accept_rate_ppm = 300'000;
+        int demote_acceptance_rate_ppm = 550'000;
+
+        /**
+         * @brief Construct a hard-pinned policy for tests and fixed-depth lanes.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationDepthPolicy fixed(
+            int depth)
+        {
+            DeviceGenerationDepthPolicy policy;
+            policy.mode = DeviceGenerationDepthPolicyMode::Fixed;
+            policy.initial_depth = depth;
+            policy.minimum_depth = depth;
+            policy.maximum_depth = depth;
+            return policy;
+        }
+
+        /**
+         * @brief Validate all fields without consulting host configuration.
+         */
+        LLAMINAR_SAMPLING_HD bool valid() const
+        {
+            const bool mode_valid =
+                mode == DeviceGenerationDepthPolicyMode::Fixed ||
+                mode == DeviceGenerationDepthPolicyMode::Observe ||
+                mode == DeviceGenerationDepthPolicyMode::Dynamic;
+            const bool rates_valid =
+                promote_full_accept_rate_ppm >= 0 &&
+                promote_full_accept_rate_ppm <= kRateScale &&
+                demote_zero_accept_rate_ppm >= 0 &&
+                demote_zero_accept_rate_ppm <= kRateScale &&
+                demote_acceptance_rate_ppm >= 0 &&
+                demote_acceptance_rate_ppm <= kRateScale;
+            return mode_valid && minimum_depth > 0 &&
+                   maximum_depth >= minimum_depth &&
+                   maximum_depth <= kMaximumSupportedDraftDepth &&
+                   initial_depth >= minimum_depth &&
+                   initial_depth <= maximum_depth && window_size > 0 &&
+                   minimum_samples > 0 && cooldown_steps >= 0 &&
+                   promote_consecutive_windows > 0 && rates_valid &&
+                   (mode != DeviceGenerationDepthPolicyMode::Fixed ||
+                    (minimum_depth == maximum_depth &&
+                     initial_depth == minimum_depth));
+        }
+    };
+
+    /**
      * @brief Stable control-word layout for a device-owned generation request.
      *
      * A speculative verifier transaction produces a compact token row and a
@@ -389,7 +468,36 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlErrorCode = 11,
         /** Total main-graph state rows committed across every transaction. */
         kDeviceGenerationControlPublishedStateCommitCount = 12,
-        kDeviceGenerationControlCount = 13,
+        /** Active SWITCH selector and number of speculative comparison rows. */
+        kDeviceGenerationControlCurrentDraftDepth = 13,
+        /** Logical verifier width, including the leading condition row. */
+        kDeviceGenerationControlActiveVerifierRowCount = 14,
+        kDeviceGenerationControlMinimumDraftDepth = 15,
+        kDeviceGenerationControlMaximumDraftDepth = 16,
+        kDeviceGenerationControlDepthPolicyMode = 17,
+        kDeviceGenerationControlDepthWindowSize = 18,
+        kDeviceGenerationControlDepthMinimumSamples = 19,
+        kDeviceGenerationControlDepthCooldownSteps = 20,
+        kDeviceGenerationControlDepthPromoteConsecutiveWindows = 21,
+        kDeviceGenerationControlDepthPromoteFullAcceptRatePPM = 22,
+        kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM = 23,
+        kDeviceGenerationControlDepthDemoteAcceptanceRatePPM = 24,
+        kDeviceGenerationControlDepthStepsSinceChange = 25,
+        kDeviceGenerationControlDepthPromotionStreak = 26,
+        kDeviceGenerationControlDepthWindowVerifierRuns = 27,
+        kDeviceGenerationControlDepthWindowAttemptedTokens = 28,
+        kDeviceGenerationControlDepthWindowAcceptedTokens = 29,
+        kDeviceGenerationControlDepthWindowRejectedTokens = 30,
+        kDeviceGenerationControlDepthWindowRollbacks = 31,
+        kDeviceGenerationControlDepthWindowFullAccepts = 32,
+        kDeviceGenerationControlDepthWindowZeroAccepts = 33,
+        kDeviceGenerationControlDepthWindowAcceptedPrefixSum = 34,
+        kDeviceGenerationControlDepthEvaluatedWindows = 35,
+        kDeviceGenerationControlDepthUpdates = 36,
+        kDeviceGenerationControlDepthPromotions = 37,
+        kDeviceGenerationControlDepthDemotions = 38,
+        kDeviceGenerationControlDepthLastRecommendedDepth = 39,
+        kDeviceGenerationControlCount = 40,
     };
 
     /**
@@ -412,6 +520,8 @@ namespace llaminar2::sampling_math
         ResponseCapacityExceeded = 7,
         InvalidVerifierCounts = 8,
         InvalidPublicationMetadata = 9,
+        InvalidDepthPolicy = 10,
+        InvalidDepthSelector = 11,
     };
 
     /**
@@ -453,12 +563,14 @@ namespace llaminar2::sampling_math
      * @param max_new_tokens Number of response tokens requested by the caller.
      * @param response_capacity Number of token slots in the persistent response
      *        row.  It must cover the complete request budget.
+     * @param depth_policy Immutable fixed/dynamic policy admitted for this request.
      * @param control Writable row with @ref kDeviceGenerationControlCount words.
      * @return true when the initialized controller is valid.
      */
     LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
         int max_new_tokens,
         int response_capacity,
+        const DeviceGenerationDepthPolicy &depth_policy,
         int *control)
     {
         if (!control)
@@ -475,9 +587,43 @@ namespace llaminar2::sampling_math
                 static_cast<int>(DeviceGenerationError::InvalidInitialization);
             return false;
         }
+        if (!depth_policy.valid())
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidDepthPolicy);
+            return false;
+        }
 
         control[kDeviceGenerationControlOk] = 1;
         control[kDeviceGenerationControlRemainingTokenCount] = max_new_tokens;
+        control[kDeviceGenerationControlCurrentDraftDepth] =
+            depth_policy.initial_depth;
+        control[kDeviceGenerationControlActiveVerifierRowCount] =
+            depth_policy.initial_depth + 1;
+        control[kDeviceGenerationControlMinimumDraftDepth] =
+            depth_policy.minimum_depth;
+        control[kDeviceGenerationControlMaximumDraftDepth] =
+            depth_policy.maximum_depth;
+        control[kDeviceGenerationControlDepthPolicyMode] =
+            static_cast<int>(depth_policy.mode);
+        control[kDeviceGenerationControlDepthWindowSize] =
+            depth_policy.window_size;
+        control[kDeviceGenerationControlDepthMinimumSamples] =
+            depth_policy.minimum_samples;
+        control[kDeviceGenerationControlDepthCooldownSteps] =
+            depth_policy.cooldown_steps;
+        control[kDeviceGenerationControlDepthPromoteConsecutiveWindows] =
+            depth_policy.promote_consecutive_windows;
+        control[kDeviceGenerationControlDepthPromoteFullAcceptRatePPM] =
+            depth_policy.promote_full_accept_rate_ppm;
+        control[kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM] =
+            depth_policy.demote_zero_accept_rate_ppm;
+        control[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] =
+            depth_policy.demote_acceptance_rate_ppm;
+        control[kDeviceGenerationControlDepthStepsSinceChange] =
+            depth_policy.cooldown_steps;
+        control[kDeviceGenerationControlDepthLastRecommendedDepth] =
+            depth_policy.initial_depth;
         return true;
     }
 
@@ -531,14 +677,207 @@ namespace llaminar2::sampling_math
             return 0;
         }
 
-        int budget = remaining < verifier_row_capacity
+        const int active_verifier_rows =
+            control[kDeviceGenerationControlActiveVerifierRowCount];
+        if (active_verifier_rows <= 1 ||
+            active_verifier_rows > verifier_row_capacity)
+        {
+            fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidDepthSelector);
+            return 0;
+        }
+
+        int budget = remaining < active_verifier_rows
                          ? remaining
-                         : verifier_row_capacity;
+                         : active_verifier_rows;
         budget = budget < maintenance_rows_remaining
                      ? budget
                      : maintenance_rows_remaining;
         control[kDeviceGenerationControlTransactionCommitBudget] = budget;
         return budget;
+    }
+
+    /**
+     * @brief Compare one integer ratio with a PPM threshold without division.
+     */
+    LLAMINAR_SAMPLING_HD bool device_generation_rate_at_least(
+        int numerator,
+        int denominator,
+        int threshold_ppm)
+    {
+        if (numerator < 0 || denominator <= 0 ||
+            threshold_ppm < 0 ||
+            threshold_ppm > DeviceGenerationDepthPolicy::kRateScale)
+        {
+            return false;
+        }
+        return static_cast<int64_t>(numerator) *
+                   DeviceGenerationDepthPolicy::kRateScale >=
+               static_cast<int64_t>(denominator) * threshold_ppm;
+    }
+
+    /**
+     * @brief Record one verifier outcome and publish the next device depth.
+     *
+     * The transition intentionally uses only integer counters. Fixed mode does
+     * no adaptive bookkeeping. Observe mode evaluates the same windows and
+     * records `LastRecommendedDepth` while retaining the active selector.
+     * Dynamic mode applies one-step promotion/demotion with cooldown and
+     * promotion hysteresis. The complete policy state remains in this row and
+     * is consumed by the next native SWITCH iteration without host polling.
+     */
+    LLAMINAR_SAMPLING_HD bool record_device_generation_depth_observation(
+        int accepted_prefix,
+        bool rollback,
+        bool budget_limited,
+        int *control)
+    {
+        if (!control || control[kDeviceGenerationControlOk] == 0)
+            return false;
+
+        const int mode = control[kDeviceGenerationControlDepthPolicyMode];
+        const int current =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        const int minimum =
+            control[kDeviceGenerationControlMinimumDraftDepth];
+        const int maximum =
+            control[kDeviceGenerationControlMaximumDraftDepth];
+        if (current < minimum || current > maximum || minimum <= 0 ||
+            maximum > DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth ||
+            (mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) &&
+             mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Observe) &&
+             mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic)))
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidDepthPolicy);
+        }
+        if (mode == static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) ||
+            budget_limited)
+        {
+            return true;
+        }
+
+        if (accepted_prefix < 0 || accepted_prefix > current)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidVerifierCounts);
+        }
+
+        ++control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        control[kDeviceGenerationControlDepthWindowAttemptedTokens] += current;
+        control[kDeviceGenerationControlDepthWindowAcceptedTokens] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowRejectedTokens] +=
+            current - accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowRollbacks] +=
+            rollback ? 1 : 0;
+        control[kDeviceGenerationControlDepthWindowFullAccepts] +=
+            accepted_prefix == current ? 1 : 0;
+        control[kDeviceGenerationControlDepthWindowZeroAccepts] +=
+            accepted_prefix == 0 ? 1 : 0;
+        ++control[kDeviceGenerationControlDepthStepsSinceChange];
+
+        const int verifier_runs =
+            control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const int required_samples =
+            control[kDeviceGenerationControlDepthWindowSize] >
+                    control[kDeviceGenerationControlDepthMinimumSamples]
+                ? control[kDeviceGenerationControlDepthWindowSize]
+                : control[kDeviceGenerationControlDepthMinimumSamples];
+        if (verifier_runs < required_samples)
+            return true;
+
+        int recommended = current;
+        int promotion_streak =
+            control[kDeviceGenerationControlDepthPromotionStreak];
+        const bool cooldown_complete =
+            control[kDeviceGenerationControlDepthStepsSinceChange] >=
+            control[kDeviceGenerationControlDepthCooldownSteps];
+        const int attempted =
+            control[kDeviceGenerationControlDepthWindowAttemptedTokens];
+        const int accepted =
+            control[kDeviceGenerationControlDepthWindowAcceptedTokens];
+        const int zero_accepts =
+            control[kDeviceGenerationControlDepthWindowZeroAccepts];
+        const int full_accepts =
+            control[kDeviceGenerationControlDepthWindowFullAccepts];
+
+        if (cooldown_complete && current > minimum &&
+            device_generation_rate_at_least(
+                zero_accepts,
+                verifier_runs,
+                control[
+                    kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM]))
+        {
+            recommended = current - 1;
+            promotion_streak = 0;
+        }
+        else if (cooldown_complete && current > minimum &&
+                 !device_generation_rate_at_least(
+                     accepted,
+                     attempted,
+                     control[
+                         kDeviceGenerationControlDepthDemoteAcceptanceRatePPM]))
+        {
+            recommended = current - 1;
+            promotion_streak = 0;
+        }
+        else if (cooldown_complete && current < maximum &&
+                 zero_accepts == 0 &&
+                 device_generation_rate_at_least(
+                     full_accepts,
+                     verifier_runs,
+                     control[
+                         kDeviceGenerationControlDepthPromoteFullAcceptRatePPM]))
+        {
+            ++promotion_streak;
+            if (promotion_streak >=
+                control[
+                    kDeviceGenerationControlDepthPromoteConsecutiveWindows])
+            {
+                recommended = current + 1;
+                promotion_streak = 0;
+            }
+        }
+        else
+        {
+            promotion_streak = 0;
+        }
+
+        control[kDeviceGenerationControlDepthPromotionStreak] =
+            promotion_streak;
+        control[kDeviceGenerationControlDepthLastRecommendedDepth] =
+            recommended;
+        ++control[kDeviceGenerationControlDepthEvaluatedWindows];
+
+        if (mode == static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic) &&
+            recommended != current)
+        {
+            control[kDeviceGenerationControlCurrentDraftDepth] = recommended;
+            control[kDeviceGenerationControlActiveVerifierRowCount] =
+                recommended + 1;
+            control[kDeviceGenerationControlDepthStepsSinceChange] = 0;
+            ++control[kDeviceGenerationControlDepthUpdates];
+            if (recommended > current)
+                ++control[kDeviceGenerationControlDepthPromotions];
+            else
+                ++control[kDeviceGenerationControlDepthDemotions];
+        }
+
+        control[kDeviceGenerationControlDepthWindowVerifierRuns] = 0;
+        control[kDeviceGenerationControlDepthWindowAttemptedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowAcceptedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowRejectedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowRollbacks] = 0;
+        control[kDeviceGenerationControlDepthWindowFullAccepts] = 0;
+        control[kDeviceGenerationControlDepthWindowZeroAccepts] = 0;
+        control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] = 0;
+        return true;
     }
 
     /**
@@ -662,6 +1001,12 @@ namespace llaminar2::sampling_math
             !model_stopped &&
             compact_meta[kSpecBatchMetaAllSpeculativeAccepted] == 0 &&
             compact_meta[kSpecBatchMetaCommitBoundaryClipped] == 0;
+        const int transaction_budget =
+            control[kDeviceGenerationControlTransactionCommitBudget];
+        const int active_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        const bool budget_limited =
+            transaction_budget < active_depth + 1;
 
         control[kDeviceGenerationControlResponseTokenCount] =
             next_response_count;
@@ -684,7 +1029,11 @@ namespace llaminar2::sampling_math
             verifier_state_count;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
-        return true;
+        return record_device_generation_depth_observation(
+            accepted_prefix,
+            rejected_transaction,
+            budget_limited,
+            control);
     }
 
     /**

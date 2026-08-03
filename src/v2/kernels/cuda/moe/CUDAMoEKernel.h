@@ -93,7 +93,19 @@ namespace llaminar2
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,
             bool normalize_weights,
-            ITensor *output_indices, ITensor *output_weights) override;
+            ITensor *output_indices, ITensor *output_weights,
+            const int *device_effective_seq_len = nullptr) override;
+
+        /**
+         * @brief Bind CUDA router scratch and immutable gate caches before capture.
+         *
+         * This setup-only operation may quantize an FP32 router matrix into its
+         * persistent Q8 workspace slot, but it never computes or publishes a
+         * route result.
+         */
+        bool prepareRouteLaunch(
+            ITensor *gate_weights,
+            const MoERouteLaunchPlan &plan) override;
 
         bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
@@ -211,7 +223,8 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            const int32_t *absolute_position_ids_device) override;
+            const int32_t *absolute_position_ids_device,
+            const int32_t *active_row_count_device) override;
 
         bool planPrefillRoutesLeastLoadedCurrentBatch(
             const MoEKernelLaunchContext &launch,
@@ -389,6 +402,28 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layer,
             int table_id,
             int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
+        /** @copydoc IMoEKernel::prepareGroupedRuntimeDecodeLaunchState */
+        bool prepareGroupedRuntimeDecodeLaunchState(
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            int d_model,
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source) override;
+
+        /** @copydoc IMoEKernel::prepareGroupedTableDecodeLaunchState */
+        bool prepareGroupedTableDecodeLaunchState(
+            const int *expert_ids,
+            const float *expert_weights,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int num_active,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
             ITensor *output,
             int d_model,
             int intermediate) override;

@@ -128,7 +128,7 @@ namespace llaminar2
         }
         const auto target = DeviceId::cuda(device_id());
 
-        const auto prepare_input = [&](const ITensor *tensor, const char *label)
+        const auto require_input = [&](const ITensor *tensor, const char *label)
         {
             if (const auto *prepared =
                     dynamic_cast<const PreparedGpuTensorView *>(tensor))
@@ -148,18 +148,18 @@ namespace llaminar2
              * above may bypass this join, because it names the exact stream on
              * which its parent was already ordered.
              */
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<ITensor *>(tensor), target, gpu_stream);
         };
-        prepare_input(K, "K");
-        prepare_input(V, "V");
+        require_input(K, "K");
+        require_input(V, "V");
 
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data after TransferEngine preparation");
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks validated GPU storage");
             return false;
         }
 

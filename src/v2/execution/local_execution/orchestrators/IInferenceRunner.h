@@ -210,6 +210,26 @@ namespace llaminar2
          */
         int *meta_device = nullptr;
         int request_count = 0;
+        /**
+         * @brief Number of real verifier rows in each logical request.
+         *
+         * This value is produced beside the compact outcome and is therefore
+         * the only authority publication may use for commit-policy bounds.
+         * Dynamic-depth scalar MTP can place this logical row count inside a
+         * larger captured bucket; consumers must never infer it from graph
+         * geometry or re-declare it in a later handoff.
+         */
+        int logical_verifier_rows_per_request = 0;
+        /**
+         * @brief Immutable row stride owned by the captured verifier graph.
+         *
+         * For scalar GPU MTP this may be the next power-of-two bucket above
+         * @ref logical_verifier_rows_per_request. Request-batched and CPU
+         * producers use exact geometry. The producer seals both values into
+         * this handle so publication can address physical verifier state while
+         * committing only the logical prefix.
+         */
+        int physical_verifier_rows_per_request = 0;
         int output_token_stride = sampling_math::kSpeculativeBatchMaxOutputTokens;
         int meta_stride = sampling_math::kSpeculativeBatchMetaCount;
         DeviceId device;
@@ -246,12 +266,11 @@ namespace llaminar2
         /**
          * @brief Whether the compact row participates in the resident response ledger.
          *
-         * Stochastic production reduction sets this bit only after it has
-         * consumed the request-admission controller event and published a
-         * device-owned transaction budget.  Accepted-state publication then
-         * must use the fused response-commit/publication kernel.  Greedy
-         * graph-terminal outcomes have a separate captured reducer and leave
-         * this false until that graph is migrated to the same controller ABI.
+         * Every production GPU grouped reducer sets this bit only after captured
+         * verifier preparation has consumed the request-admission event and
+         * published a device-owned transaction budget. Accepted-state
+         * publication must then use the fused response-commit/publication kernel
+         * for both greedy and stochastic sampling.
          */
         bool device_generation_controller_owned = false;
         /**
@@ -268,6 +287,12 @@ namespace llaminar2
             return output_tokens_device != nullptr &&
                    meta_device != nullptr &&
                    request_count > 0 &&
+                   logical_verifier_rows_per_request > 0 &&
+                   physical_verifier_rows_per_request >=
+                       logical_verifier_rows_per_request &&
+                   (request_count == 1 ||
+                    physical_verifier_rows_per_request ==
+                        logical_verifier_rows_per_request) &&
                    output_token_stride > 0 &&
                    meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
                    stream != nullptr &&
@@ -320,23 +345,22 @@ namespace llaminar2
     /**
      * @brief Static graph shape for publication from a device outcome row.
      *
-     * Dynamic positions, cache lengths, accepted counts, and shifted-cache
-     * ownership all come from resident device state. The caller supplies only
-     * capture geometry and policy; there is intentionally no host position or
-     * alternate cache-count payload in this request.
+     * Dynamic positions, cache lengths, accepted counts, request cardinality,
+     * logical verifier width, physical captured stride, and shifted-cache
+     * ownership all come from the producer-owned outcome handle. The caller
+     * supplies only commit policy; there is intentionally no duplicate geometry,
+     * host position, or alternate cache-count payload in this request.
      */
     struct DeviceSpeculativePublicationRequest
     {
         DeviceSpeculativeOutcomeHandle outcome;
-        int request_count = 0;
-        int max_draft_tokens = 0;
         /**
          * @brief Maximum verifier prefix allowed to become serial-visible state.
          *
-         * This is deliberately separate from @ref max_draft_tokens.  The latter
-         * is verifier graph capacity; this value is the response-boundary commit
-         * limit.  An all-accepted terminal row may be valid speculative evidence
-         * while still being one row beyond the caller-visible serial state.
+         * This is deliberately separate from the outcome's logical and physical
+         * verifier widths. An all-accepted terminal row may be valid speculative
+         * evidence while still being one row beyond the caller-visible serial
+         * state.
          */
         int max_state_commit_rows = -1;
         bool publish_mtp_shifted_kv = true;
@@ -351,16 +375,29 @@ namespace llaminar2
          */
         MTPRequestPenaltyPolicy penalty_policy{};
 
+        [[nodiscard]] int requestCount() const noexcept
+        {
+            return outcome.request_count;
+        }
+
+        [[nodiscard]] int logicalVerifierRowsPerRequest() const noexcept
+        {
+            return outcome.logical_verifier_rows_per_request;
+        }
+
+        [[nodiscard]] int physicalVerifierRowsPerRequest() const noexcept
+        {
+            return outcome.physical_verifier_rows_per_request;
+        }
+
         bool valid() const
         {
             return outcome.valid() &&
                    outcome.mtp_transaction.valid() &&
-                   request_count > 0 &&
-                   outcome.request_count == request_count &&
-                   max_draft_tokens > 0 &&
                    max_state_commit_rows >= 0 &&
-                   max_state_commit_rows <= max_draft_tokens &&
-                   (!penalty_policy.enabled() || request_count == 1);
+                   max_state_commit_rows <=
+                       logicalVerifierRowsPerRequest() &&
+                   (!penalty_policy.enabled() || requestCount() == 1);
         }
     };
 
@@ -1088,18 +1125,21 @@ namespace llaminar2
          *
          * @param requests Value-owned row composition descriptors.
          * @param request_count Number of logical rows in the matrix.
-         * @param padded_seq_len Row width of the matrix consumed by the graph.
+         * @param logical_padded_seq_len Largest real row width in this logical
+         *        transaction. GPU scalar implementations may bind that logical
+         *        prefix into a larger reusable physical capture bucket; the
+         *        implementation owns and validates that physical stride.
          * @return Stable device pointer on success, nullptr if the runner cannot
          *         execute the contract exactly.
          */
         virtual const void *prepareMTPVerifierInputTokenBatchOnDevice(
             const DeviceMTPVerifierInputBatchRequest *requests,
             int request_count,
-            int padded_seq_len)
+            int logical_padded_seq_len)
         {
             (void)requests;
             (void)request_count;
-            (void)padded_seq_len;
+            (void)logical_padded_seq_len;
             return nullptr;
         }
 
@@ -3961,7 +4001,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Admit one stochastic generation response ledger on the device.
+         * @brief Admit one grouped generation response ledger on the device.
          *
          * GPU implementations initialize persistent response-token and control
          * rows exactly once after prefill.  Every later verifier transaction
@@ -3974,7 +4014,7 @@ namespace llaminar2
          * @param max_new_tokens Exact terminal response budget per request.
          * @return true when generation may begin.
          */
-        virtual bool beginDeviceResidentStochasticGeneration(
+        virtual bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens)
         {
@@ -3984,7 +4024,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compose the exact fixed-depth stochastic generation parent.
+         * @brief Compose the exact fixed-depth device generation parent.
          *
          * The first externally orchestrated transaction must already have
          * committed its resident response/state rows, and every child graph in
@@ -4005,7 +4045,7 @@ namespace llaminar2
          *        graph family. The verifier child owns `draft_depth + 1` rows.
          * @return true when the complete parent executable is ready to launch.
          */
-        virtual bool materializeDeviceResidentStochasticGeneration(
+        virtual bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth)
         {
@@ -4015,7 +4055,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Launch the complete graph-owned stochastic generation loop.
+         * @brief Launch the complete graph-owned device generation loop.
          *
          * The first transaction has already committed its compact outcome and
          * materialized the exact fixed-depth child graph family. GPU runners
@@ -4024,7 +4064,7 @@ namespace llaminar2
          * after the terminal iteration. The method is asynchronous and may be
          * called exactly once for an admitted request.
          */
-        virtual bool launchDeviceResidentStochasticGeneration()
+        virtual bool launchDeviceResidentGeneration()
         {
             return false;
         }
@@ -4038,7 +4078,7 @@ namespace llaminar2
          * controller ABI before releasing the request lifecycle.  Calling this
          * method before every request is terminal is an error, not a polling API.
          */
-        virtual bool finishDeviceResidentStochasticGeneration(
+        virtual bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result)
         {
             (void)out_result;

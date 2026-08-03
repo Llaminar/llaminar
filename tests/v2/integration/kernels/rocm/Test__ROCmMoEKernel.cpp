@@ -2383,6 +2383,16 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
                              hipMemcpyHostToDevice,
                              stream),
               hipSuccess);
+    HipAllocation active_row_count_device(sizeof(int32_t));
+    const int32_t active_row_count = seq_len;
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            active_row_count_device.get(),
+            &active_row_count,
+            sizeof(active_row_count),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
 
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
@@ -2399,7 +2409,8 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
         seq_len,
         num_experts,
         top_k,
-        device_positions));
+        device_positions,
+        static_cast<const int32_t *>(active_row_count_device.get())));
     ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
         runtime_table.deviceLayerState(0),
         seq_len,
@@ -2524,6 +2535,7 @@ TEST(Test__ROCmMoEKernel,
     runtime_config.top_k = top_k;
     runtime_config.mirror_to_device = true;
     runtime_config.prefill_token_capacity = max_m;
+    runtime_config.deferred_verifier_token_capacity = max_m;
     MoERuntimeTable runtime_table(runtime_config);
 
     DeviceMoELayerRuntime baseline = runtime_table.hostLayerState(0);
@@ -2664,9 +2676,107 @@ TEST(Test__ROCmMoEKernel,
         }
     }
 
+    /*
+     * Capture one physical M=31 graph and vary only device-owned inputs on
+     * replay. Routing invalidates the inactive suffix and resident assignment
+     * independently consumes the same logical row-count scalar before it can
+     * dereference any suffix route.
+     */
+    hipGraph_t graph = nullptr;
+    ASSERT_EQ(
+        hipStreamBeginCapture(
+            stream,
+            hipStreamCaptureModeGlobal),
+        hipSuccess);
+    ASSERT_TRUE(kernel.groupPrefillRoutes(
+        runtime_table.deviceLayerState(0),
+        routing_indices.get(),
+        routing_weights.get(),
+        max_m,
+        max_m,
+        num_experts,
+        top_k,
+        /*filter_to_local_runtime_experts=*/false));
+    ASSERT_TRUE(kernel.assignPrefillRoutesLeastLoadedResident(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        max_m,
+        max_m,
+        num_experts,
+        top_k,
+        device_positions,
+        static_cast<const int32_t *>(
+            accepted_count_device.get())));
+    ASSERT_TRUE(kernel.regroupPrefillRoutesFromRuntimeAssignments(
+        runtime_table.deviceLayerState(0),
+        max_m,
+        max_m,
+        num_experts,
+        top_k,
+        /*retain_routes_for_deferred_commit=*/true));
+    ASSERT_TRUE(kernel.commitGroupedVerifierHistograms(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        static_cast<const int32_t *>(
+            accepted_count_device.get()),
+        static_cast<const int32_t *>(
+            publication_ok_device.get()),
+        /*request_count=*/1,
+        /*rows_per_request=*/max_m,
+        /*total_rows=*/max_m,
+        num_experts,
+        top_k));
+    ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    ASSERT_NE(graph, nullptr);
+
+    hipGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(
+        hipGraphInstantiate(
+            &graph_exec,
+            graph,
+            nullptr,
+            nullptr,
+            0),
+        hipSuccess);
+
     for (const int m : verifier_rows)
     {
         SCOPED_TRACE("M=" + std::to_string(m));
+        std::array<float, max_slots> replay_route_indices{};
+        std::array<float, max_slots> replay_route_weights{};
+        for (int row = 0; row < max_m; ++row)
+        {
+            for (int route = 0; route < top_k; ++route)
+            {
+                const size_t slot =
+                    static_cast<size_t>(row * top_k + route);
+                replay_route_indices[slot] =
+                    row < m
+                        ? static_cast<float>(
+                              route_pattern[
+                                  static_cast<size_t>(row) %
+                                  route_pattern.size()]
+                                           [static_cast<size_t>(route)])
+                        : -1.0f;
+                replay_route_weights[slot] = row < m ? 0.5f : 0.0f;
+            }
+        }
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                routing_indices->gpu_data_ptr(),
+                replay_route_indices.data(),
+                sizeof(replay_route_indices),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                routing_weights->gpu_data_ptr(),
+                replay_route_weights.data(),
+                sizeof(replay_route_weights),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
         ASSERT_EQ(
             hipMemcpyAsync(
                 runtime_table.deviceLayerState(0),
@@ -2683,60 +2793,6 @@ TEST(Test__ROCmMoEKernel,
                 sizeof(accepted_count),
                 hipMemcpyHostToDevice,
                 stream),
-            hipSuccess);
-
-        hipGraph_t graph = nullptr;
-        ASSERT_EQ(
-            hipStreamBeginCapture(
-                stream,
-                hipStreamCaptureModeGlobal),
-            hipSuccess);
-        ASSERT_TRUE(kernel.groupPrefillRoutes(
-            runtime_table.deviceLayerState(0),
-            routing_indices.get(),
-            routing_weights.get(),
-            m,
-            m,
-            num_experts,
-            top_k,
-            /*filter_to_local_runtime_experts=*/false));
-        ASSERT_TRUE(kernel.assignPrefillRoutesLeastLoadedResident(
-            moeLaunchContext(stream),
-            runtime_table.deviceLayerState(0),
-            m,
-            m,
-            num_experts,
-            top_k,
-            device_positions));
-        ASSERT_TRUE(kernel.regroupPrefillRoutesFromRuntimeAssignments(
-            runtime_table.deviceLayerState(0),
-            m,
-            m,
-            num_experts,
-            top_k));
-        ASSERT_TRUE(kernel.commitGroupedVerifierHistograms(
-            moeLaunchContext(stream),
-            runtime_table.deviceLayerState(0),
-            static_cast<const int32_t *>(
-                accepted_count_device.get()),
-            static_cast<const int32_t *>(
-                publication_ok_device.get()),
-            /*request_count=*/1,
-            /*rows_per_request=*/m,
-            /*total_rows=*/m,
-            num_experts,
-            top_k));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-        ASSERT_NE(graph, nullptr);
-
-        hipGraphExec_t graph_exec = nullptr;
-        ASSERT_EQ(
-            hipGraphInstantiate(
-                &graph_exec,
-                graph,
-                nullptr,
-                nullptr,
-                0),
             hipSuccess);
         ASSERT_EQ(
             hipGraphLaunch(graph_exec, stream),
@@ -2834,10 +2890,10 @@ TEST(Test__ROCmMoEKernel,
         EXPECT_EQ(participants_after_history_change, participants)
             << "resident assignment consumed mutable workload history";
 
-        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
-        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
     }
 
+    ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
     ASSERT_EQ(hipFree(device_positions), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
@@ -19152,6 +19208,140 @@ TEST(Test__ROCmMoEKernel, VerifierRowsBF16RouteUsesDecodeEquivalentRouter)
     }
 }
 
+/**
+ * @brief Capture the ROCm Q8 verifier router without an eager routing warmup.
+ *
+ * Router preparation publishes the immutable Q8 gate and binds every
+ * workspace-backed row buffer before HIP capture.  Capture then records only
+ * production routing kernels; a cache conversion or allocation attempted from
+ * inside capture is a hard regression.
+ */
+TEST(Test__ROCmMoEKernel,
+     PreparedQ8VerifierRouterCapturesWithoutEagerWarmup)
+{
+    SKIP_IF_NO_ROCM();
+
+    ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
+    ScopedROCmEnvOverride kpart_env(
+        "LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE",
+        "0");
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+
+    constexpr int seq_len = 8;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 16;
+    constexpr int top_k = 4;
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = rocmMoETestStream();
+
+    auto hidden = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+        -0.25f,
+        0.25f,
+        2026080301);
+    auto gate = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)},
+        -0.25f,
+        0.25f,
+        2026080302);
+    auto indices = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+    auto weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+    ASSERT_TRUE(gate->ensureOnDevice(device, stream));
+    ASSERT_TRUE(indices->ensureOnDevice(device, stream));
+    ASSERT_TRUE(weights->ensureOnDevice(device, stream));
+
+    ROCmMoEKernel kernel(0);
+    bindROCmMoETestStream(kernel);
+    auto workspace = bindDefaultMoEWorkspace(
+        kernel,
+        seq_len,
+        d_model,
+        /*intermediate=*/128,
+        num_experts,
+        top_k);
+    const MoERouteLaunchPlan launch_plan{
+        .kind = MoERouteLaunchKind::DecodeEquivalentVerifier,
+        .physical_rows = seq_len,
+        .d_model = d_model,
+        .num_experts = num_experts,
+        .top_k = top_k,
+    };
+    ASSERT_TRUE(kernel.prepareRouteLaunch(gate.get(), launch_plan));
+
+    PerfStatsCollector::reset();
+    hipGraph_t graph = nullptr;
+    ASSERT_EQ(
+        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+        hipSuccess);
+    bool captured = false;
+    {
+        GraphCaptureGuard capture_guard;
+        captured = kernel.routeVerifierRowsDecodeEquivalent(
+            hidden.get(),
+            gate.get(),
+            seq_len,
+            d_model,
+            num_experts,
+            top_k,
+            /*normalize_weights=*/true,
+            indices.get(),
+            weights.get());
+    }
+    const hipError_t capture_status = hipStreamEndCapture(stream, &graph);
+    ASSERT_TRUE(captured);
+    ASSERT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    hipGraphExec_t executable = nullptr;
+    ASSERT_EQ(
+        hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    std::vector<float> indices_host(indices->numel());
+    std::vector<float> weights_host(weights->numel());
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            indices_host.data(),
+            indices->gpu_data_ptr(),
+            indices_host.size() * sizeof(float),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            weights_host.data(),
+            weights->gpu_data_ptr(),
+            weights_host.size() * sizeof(float),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    for (size_t slot = 0; slot < indices_host.size(); ++slot)
+    {
+        EXPECT_GE(indices_host[slot], 0.0f);
+        EXPECT_LT(indices_host[slot], static_cast<float>(num_experts));
+        EXPECT_TRUE(std::isfinite(weights_host[slot]));
+    }
+
+    double route_calls = 0.0;
+    for (const auto &record : PerfStatsCollector::snapshot(
+             {"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"}))
+    {
+        route_calls += record.value;
+    }
+    EXPECT_EQ(route_calls, 1.0)
+        << "only graph recording may invoke routing; preparation must not run an eager row";
+    PerfStatsCollector::reset();
+
+    EXPECT_EQ(hipGraphExecDestroy(executable), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+}
+
 TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
 {
     SKIP_IF_NO_ROCM();
@@ -21796,7 +21986,10 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
 
         auto grouped_output = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-        ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        if (masked_local_tp)
+            ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr);
+        else
+            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
         auto canonical_route_contributions = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len),
              static_cast<size_t>(top_k),
@@ -21838,6 +22031,11 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 : nullptr));
         if (masked_local_tp)
         {
+            ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr)
+                << format_name << " M=" << seq_len
+                << " canonical producer must not allocate or touch the later "
+                   "reducer output";
+            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
             ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
                 canonical_route_contributions.get(),
                 grouped_output.get(),
@@ -21945,7 +22143,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             stage_canonical_route_contributions->numel(),
             std::numeric_limits<float>::quiet_NaN());
         ASSERT_TRUE(direct_output->ensureOnDevice(device, stream));
-        ASSERT_TRUE(stage_output->ensureOnDevice(device, stream));
+        ASSERT_EQ(stage_output->gpu_data_ptr(), nullptr);
         ASSERT_TRUE(
             stage_canonical_route_contributions->ensureOnDevice(
                 device,
@@ -22008,6 +22206,11 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             << format_name
             << " partial-ownership M=1 verifier stage must admit the "
                "mask-aware explicit-routing path";
+        ASSERT_EQ(stage_output->gpu_data_ptr(), nullptr)
+            << format_name
+            << " M=1 canonical producer must leave the later reducer output "
+               "unallocated";
+        ASSERT_TRUE(stage_output->ensureOnDevice(device, stream));
 
         MoECanonicalRouteReduceStage::Params reduce_params;
         reduce_params.device_id = device;
@@ -22123,10 +22326,13 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
             ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
             ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
-            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+            if (masked_local_tp)
+                ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr);
+            else
+                ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
             ASSERT_TRUE(
                 canonical_route_contributions->ensureOnDevice(device, stream));
-            ASSERT_TRUE(runtime_grouped_output->ensureOnDevice(device, stream));
+            ASSERT_EQ(runtime_grouped_output->gpu_data_ptr(), nullptr);
 
             /*
              * Every tested row count enters through the production verifier
@@ -22181,6 +22387,11 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     : nullptr));
             if (masked_local_tp)
             {
+                ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr)
+                    << format_name << " M=" << seq_len
+                    << " production canonical producer must not allocate or "
+                       "touch the later reducer output";
+                ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
                 ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
                     canonical_route_contributions.get(),
                     grouped_output.get(),
@@ -22214,9 +22425,24 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     d_model,
                     intermediate,
                     num_experts,
-                    top_k))
+                    top_k,
+                    canonical_route_contributions.get()))
                     << format_name << " runtime-placement grouped verifier M="
                     << seq_len;
+                ASSERT_EQ(runtime_grouped_output->gpu_data_ptr(), nullptr)
+                    << format_name << " M=" << seq_len
+                    << " runtime canonical producer must leave the later "
+                       "reducer output unallocated";
+                ASSERT_TRUE(
+                    runtime_grouped_output->ensureOnDevice(device, stream));
+                ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                    canonical_route_contributions.get(),
+                    runtime_grouped_output.get(),
+                    seq_len,
+                    top_k,
+                    d_model))
+                    << format_name
+                    << " runtime canonical route reduction M=" << seq_len;
             }
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             ASSERT_TRUE(grouped_output->ensureOnHost(stream));

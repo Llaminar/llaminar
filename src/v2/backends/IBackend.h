@@ -25,6 +25,11 @@
 
 namespace llaminar2
 {
+    namespace sampling_math
+    {
+        struct DeviceGenerationDepthPolicy;
+    }
+
 
     /**
      * @class IBackend
@@ -751,6 +756,11 @@ namespace llaminar2
          * histogram plus only the preceding tokens in that row's speculative
          * branch.  Implementations must preserve serial float operation order
          * and deterministic lowest-token tie breaking.
+         *
+         * @param active_rows_device Resident INT32 logical verifier width. This
+         *        pointer is mandatory for grouped GPU verification: both argmax
+         *        passes must ignore the inactive suffix of a larger captured
+         *        physical bucket without consulting a host scalar.
          */
         virtual bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
             const void *data_device,
@@ -759,6 +769,7 @@ namespace llaminar2
             const void *verifier_input_tokens_device,
             const void *generated_token_counts_device,
             const void *penalty_policy_device,
+            const void *active_rows_device,
             int device_id,
             void *stream,
             void *out_values_device,
@@ -774,6 +785,7 @@ namespace llaminar2
             (void)verifier_input_tokens_device;
             (void)generated_token_counts_device;
             (void)penalty_policy_device;
+            (void)active_rows_device;
             (void)device_id;
             (void)stream;
             (void)out_values_device;
@@ -798,6 +810,10 @@ namespace llaminar2
          * Implementations must enqueue one graph-capturable operation on the
          * exact non-null producer stream.  Allocations, copies, atomics, and
          * synchronization are forbidden.
+         * @param active_rows_device Optional resident INT32 logical row count.
+         *        The captured @p rows remains physical capacity; work at or
+         *        beyond the resident count must be skipped before reading logits
+         *        or speculative-prefix tokens.
          */
         virtual bool enqueueApplyMTPPenaltiesToF32RowsDevice(
             void *data_device,
@@ -808,7 +824,8 @@ namespace llaminar2
             const void *generated_token_counts_device,
             const void *penalty_policy_device,
             int device_id,
-            void *stream)
+            void *stream,
+            const void *active_rows_device = nullptr)
         {
             (void)data_device;
             (void)rows;
@@ -819,6 +836,7 @@ namespace llaminar2
             (void)penalty_policy_device;
             (void)device_id;
             (void)stream;
+            (void)active_rows_device;
             return false;
         }
 
@@ -1068,6 +1086,8 @@ namespace llaminar2
          * scalar distribution builder above. It lets the runner queue all
          * all-position verifier target rows behind one explicit stream handoff
          * instead of launching a scalar table builder per row.
+         * @param active_rows_device Optional resident INT32 logical row count;
+         *        inactive physical suffix rows perform no vocabulary work.
          */
         virtual bool enqueueBuildTopKTopPDistributionsF32Device(
             const void *data_device,
@@ -1084,7 +1104,8 @@ namespace llaminar2
             void *out_probs_device,
             void *scratch_values_device = nullptr,
             void *scratch_indices_device = nullptr,
-            int scratch_capacity = 0)
+            int scratch_capacity = 0,
+            const void *active_rows_device = nullptr)
         {
             (void)data_device;
             (void)row_count;
@@ -1101,6 +1122,7 @@ namespace llaminar2
             (void)scratch_values_device;
             (void)scratch_indices_device;
             (void)scratch_capacity;
+            (void)active_rows_device;
             return false;
         }
 
@@ -2046,8 +2068,12 @@ namespace llaminar2
          * @param target_probs_device Compact target probability rows.
          * @param target_row_stride Entries between compact target rows.
          * @param top_k Number of entries inspected in each compact row.
-         * @param row_count Number of speculative comparison rows; one additional
-         *        bonus row must be present in the target matrix.
+         * @param row_count Physical speculative-comparison capacity captured by
+         *        the graph. The resident generation controller selects a logical
+         *        depth in `[1, row_count]`; one additional target row at that
+         *        logical depth supplies the bonus sample. This distinction lets
+         *        one maximum-capacity executable serve every MTP depth without
+         *        recapture or a host-authored launch parameter.
          * @param threshold_seed Immutable request sampling seed.
          * @param threshold_position_device Resident pre-verifier base position.
          * @param threshold_position_offset Logical offset of comparison row zero.
@@ -2121,7 +2147,10 @@ namespace llaminar2
          *        token used only when all speculative rows accept.
          * @param draft_tokens_device INT32 verifier input row
          *        `[first_token, draft_1, ...]`.
-         * @param compare_row_count Number of speculative rows to compare.
+         * @param compare_row_count Maximum physical speculative rows captured.
+         * @param active_verifier_row_count_device Device INT32 logical verifier
+         *        rows. The reducer compares exactly this value minus one and
+         *        ignores every physical suffix row.
          * @param first_token Legacy host shadow of `draft_tokens_device[0]`.
          *        GPU reducers must read entry zero from @p draft_tokens_device
          *        so deferred first-token paths do not need a pre-verifier D2H.
@@ -2184,6 +2213,7 @@ namespace llaminar2
             const void *verify_tokens_device,
             const void *draft_tokens_device,
             int compare_row_count,
+            const void *active_verifier_row_count_device,
             const void *stop_tokens_device,
             int device_id,
             void *stream,
@@ -2196,6 +2226,7 @@ namespace llaminar2
             (void)verify_tokens_device;
             (void)draft_tokens_device;
             (void)compare_row_count;
+            (void)active_verifier_row_count_device;
             (void)stop_tokens_device;
             (void)device_id;
             (void)stream;
@@ -2252,6 +2283,7 @@ namespace llaminar2
         virtual bool enqueueInitializeDeviceGeneration(
             int request_count,
             int max_new_tokens,
+            const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
             int response_token_stride,
             void *response_tokens_device,
             int control_stride,
@@ -2261,6 +2293,7 @@ namespace llaminar2
         {
             (void)request_count;
             (void)max_new_tokens;
+            (void)depth_policy;
             (void)response_token_stride;
             (void)response_tokens_device;
             (void)control_stride;
@@ -2619,11 +2652,19 @@ namespace llaminar2
          * bounded launch gives RoPE, short-conv, and GDN recurrence one ordered
          * geometry publication without introducing another H2D transfer.
          *
-         * When @p valid_graph_rows_device is null, the input is rectangular and
-         * every request length is @p padded_seq_len. Otherwise the array contains
-         * @p valid_graph_row_count flattened request-major physical indices. An
-         * implementation must count those indices per request exactly; gaps are
-         * padding and must not mutate recurrent state.
+         * When @p valid_graph_rows_device is null, each request owns the same
+         * dense logical prefix and its length is
+         * `valid_graph_row_count / request_count`. This may be smaller than
+         * @p padded_seq_len for a fixed-width scalar verifier bucket. Otherwise
+         * the array contains @p valid_graph_row_count flattened request-major
+         * physical indices. An implementation must count those indices per
+         * request exactly; gaps are padding and must not mutate recurrent state.
+         *
+         * A device-generation parent supplies @p generation_control_device.
+         * In that mode each request length comes from the controller's active
+         * verifier-row field, and the kernel must validate that it equals the
+         * current draft depth plus one. Invalid controller geometry is a fatal
+         * controller error, never a reason to use the static row plan.
          *
          * Implementations must be graph-capturable, allocation-free, transfer-free,
          * and asynchronous on the explicit non-null @p stream.
@@ -2631,6 +2672,9 @@ namespace llaminar2
          * @param base_positions_device Device INT32 next-position row.
          * @param valid_graph_rows_device Optional device INT32 physical valid rows.
          * @param valid_graph_row_count Number of entries in the valid-row array.
+         * @param generation_control_device Optional mutable controller rows.
+         * @param generation_control_stride Controller words between requests;
+         *        zero exactly when @p generation_control_device is null.
          * @param request_count Number of independent request rows.
          * @param padded_seq_len Physical verifier columns per request.
          * @param device_id GPU ordinal owning all inputs and outputs.
@@ -2643,6 +2687,8 @@ namespace llaminar2
             const void *base_positions_device,
             const void *valid_graph_rows_device,
             int valid_graph_row_count,
+            void *generation_control_device,
+            int generation_control_stride,
             int request_count,
             int padded_seq_len,
             int device_id,
@@ -2653,12 +2699,75 @@ namespace llaminar2
             (void)base_positions_device;
             (void)valid_graph_rows_device;
             (void)valid_graph_row_count;
+            (void)generation_control_device;
+            (void)generation_control_stride;
             (void)request_count;
             (void)padded_seq_len;
             (void)device_id;
             (void)stream;
             (void)out_position_ids_device;
             (void)out_request_lengths_device;
+            return false;
+        }
+
+        /**
+         * @brief Fuse one controller-owned verifier token row and its geometry.
+         *
+         * Device-controlled generation changes draft depth between parent-loop
+         * iterations. Capturing memcpy byte counts would freeze that depth in the
+         * executable, so this primitive reads the authoritative controller row on
+         * device and publishes the complete padded verifier input in one launch:
+         * condition token, active draft prefix, zeroed inactive suffix, absolute
+         * positions, logical request length, and pre-verifier KV base snapshot.
+         * Invalid depth/row relations terminally poison the controller through the
+         * shared DeviceGenerationError ABI; they never select a static copy path.
+         *
+         * Implementations must be graph-capturable, allocation-free, transfer-free,
+         * and asynchronous on the exact non-null @p stream.
+         *
+         * @param first_token_device Device INT32 condition token.
+         * @param draft_tokens_device Device INT32 draft slots, with capacity at
+         *        least `padded_seq_len - 1`.
+         * @param base_position_device Device INT32 live next-position scalar.
+         * @param generation_control_row_device First word of the request's
+         *        mutable generation-controller row.
+         * @param generation_control_stride Number of INT32 words in that row.
+         * @param padded_seq_len Physical verifier width captured by this branch.
+         * @param device_id GPU ordinal owning every pointer.
+         * @param stream Exact producer stream.
+         * @param out_tokens_device Device INT32 padded verifier token row.
+         * @param out_position_ids_device Device INT32 padded absolute positions.
+         * @param out_request_length_device Device INT32 logical row count.
+         * @param out_base_position_snapshot_device Device INT32 immutable base
+         *        snapshot consumed by accepted-state publication.
+         * @return true when the fused publication was enqueued.
+         */
+        virtual bool enqueuePrepareMTPVerifierControlledRow(
+            const void *first_token_device,
+            const void *draft_tokens_device,
+            const void *base_position_device,
+            void *generation_control_row_device,
+            int generation_control_stride,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_position_ids_device,
+            void *out_request_length_device,
+            void *out_base_position_snapshot_device)
+        {
+            (void)first_token_device;
+            (void)draft_tokens_device;
+            (void)base_position_device;
+            (void)generation_control_row_device;
+            (void)generation_control_stride;
+            (void)padded_seq_len;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_position_ids_device;
+            (void)out_request_length_device;
+            (void)out_base_position_snapshot_device;
             return false;
         }
 

@@ -624,10 +624,12 @@ namespace llaminar2
         /**
          * @brief Prepare one bucketed prefill chunk from a ForwardInput.
          *
-         * @param input ForwardInput with stable buffers. `input.token_ids` must
-         *        point to the first real token of the current chunk; `token_offset`
-         *        supplies the absolute prompt offset for position IDs and is not
-         *        added to the token pointer.
+         * @param input ForwardInput with exactly one authoritative token source.
+         *        CPU/host execution supplies `token_ids`, which this planner owns
+         *        and pads. GPU request admission supplies `token_ids_device`, a
+         *        stable arena bank whose inactive tail is already initialized.
+         *        `token_offset` supplies the absolute prompt offset for position
+         *        IDs and is not added to either token pointer.
          * @param allow_padded_execution Leave false for callers that have not
          *        opted into fixed-bucket execution. Setting it true prepares
          *        padded buffers for runPrefillChunk(); graph safety is still
@@ -771,6 +773,24 @@ namespace llaminar2
          */
         std::optional<DeviceLoopGraphTemplateView>
         lastExecutedDeviceLoopGraphTemplate(std::string *error = nullptr) const;
+
+        /**
+         * @brief Export one replay-ready capture by its complete immutable signature.
+         *
+         * Parent graph construction may compose several forward geometries at
+         * once, so mutable "last executed" state is not a sufficient identity.
+         * This lookup requires an exact ForwardGraphSignature cache hit and never
+         * substitutes a nearby bucket, a newer execution, or an eager path.
+         *
+         * @param signature Complete forward-cache identity embedded by capture.
+         * @param error Optional diagnostic describing the first violated hard
+         *        contract. Failure never mutates cache state.
+         * @return Immutable capture view when the exact entry is replay-ready.
+         */
+        std::optional<DeviceLoopGraphTemplateView>
+        deviceLoopGraphTemplate(
+            const ForwardGraphSignature &signature,
+            std::string *error = nullptr) const;
 
         /**
          * @brief Export the retained all-position verifier capture for composition.
@@ -963,7 +983,7 @@ namespace llaminar2
          * This method also records a one-shot recapture request for the next
          * all-position verifier graph.  That matters when the shifted-cache
          * mutation happens before the verifier cache exists, or while it is
-         * between warmup/capture/replay phases: the next verifier execution
+         * between capture/replay phases: the next verifier execution
          * still has to settle on a freshly captured executable before the
          * request is consumed.
          */

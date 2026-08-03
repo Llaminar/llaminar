@@ -1388,12 +1388,14 @@ namespace llaminar2::test::gpu_kv_verifier
         int head_dim,
         const std::string &source_layout,
         const std::string &execution_mode,
+        const std::string &row_count_policy,
         const std::string &topology)
     {
         std::ostringstream out;
         out << cache_format << '|' << source_format << "|M" << verifier_rows
             << "|D" << head_dim
-            << '|' << source_layout << '|' << execution_mode << '|' << topology;
+            << '|' << source_layout << '|' << execution_mode
+            << '|' << row_count_policy << '|' << topology;
         return out.str();
     }
 
@@ -1429,6 +1431,7 @@ namespace llaminar2::test::gpu_kv_verifier
         ScopedPerfStats perfstats;
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
         std::set<std::string> expected_routes;
+        uint64_t expected_call_count = 0;
         uint32_t seed = 1001;
 
         for (const auto &format : kFormatCases)
@@ -1444,31 +1447,56 @@ namespace llaminar2::test::gpu_kv_verifier
                     {
                         for (const int verifier_rows : kGroupedVerifierRuntimeRows)
                         {
-                            const char *layout_label = source_head_major
-                                                           ? "head_major"
-                                                           : "position_major";
-                            constexpr const char *execution_mode = "graph_captured";
-                            SCOPED_TRACE(std::string(backend_label) +
-                                         " cache=" + format.cache_label +
-                                         " source=" + format.source_label +
-                                         " topology=" + topology.label +
-                                         " layout=" + layout_label +
-                                         " M=" + std::to_string(verifier_rows) +
-                                         " D=" + std::to_string(head_dim) +
-                                         " execution=" + execution_mode);
+                            struct LogicalRowCase
+                            {
+                                int rows;
+                                bool resident_count;
+                            };
+                            std::vector<LogicalRowCase> logical_cases{
+                                {verifier_rows, false}};
+                            if (verifier_rows == 8)
+                            {
+                                for (int logical_rows = 1;
+                                     logical_rows <= verifier_rows;
+                                     ++logical_rows)
+                                {
+                                    logical_cases.push_back(
+                                        {logical_rows, true});
+                                }
+                            }
 
-                            auto serial = makeBoundCache(
-                                device, format.cache_precision, topology,
-                                max_seq_len, head_dim, &tq_context);
-                            auto grouped = makeBoundCache(
-                                device, format.cache_precision, topology,
-                                max_seq_len, head_dim, &tq_context);
+                            for (const auto logical : logical_cases)
+                            {
+                                const char *layout_label = source_head_major
+                                                               ? "head_major"
+                                                               : "position_major";
+                                constexpr const char *execution_mode = "graph_captured";
+                                const char *row_count_policy = logical.resident_count
+                                                                   ? "resident_device_count"
+                                                                   : "captured_exact_shape";
+                                SCOPED_TRACE(std::string(backend_label) +
+                                             " cache=" + format.cache_label +
+                                             " source=" + format.source_label +
+                                             " topology=" + topology.label +
+                                             " layout=" + layout_label +
+                                             " physical_M=" + std::to_string(verifier_rows) +
+                                             " logical_M=" + std::to_string(logical.rows) +
+                                             " D=" + std::to_string(head_dim) +
+                                             " row_count=" + row_count_policy +
+                                             " execution=" + execution_mode);
+
+                                auto serial = makeBoundCache(
+                                    device, format.cache_precision, topology,
+                                    max_seq_len, head_dim, &tq_context);
+                                auto grouped = makeBoundCache(
+                                    device, format.cache_precision, topology,
+                                    max_seq_len, head_dim, &tq_context);
 
                             // The prefix leaves exactly two free positions.
                             // M=2 fills the ring, while every larger certified
                             // depth wraps without assigning two source rows to
                             // the same destination slot in one grouped launch.
-                            const TensorType history_type =
+                                const TensorType history_type =
                                 isTurboQuantCachePrecision(format.cache_precision)
                                     ? TensorType::FP32
                                     : (format.cache_precision == ActivationPrecision::FP32
@@ -1478,37 +1506,37 @@ namespace llaminar2::test::gpu_kv_verifier
                                                  : format.cache_precision == ActivationPrecision::FP16
                                                        ? TensorType::FP16
                                                        : TensorType::Q8_1);
-                            auto history_k = makeTensor(
+                                auto history_k = makeTensor(
                                 history_type,
                                 {prefix_rows, static_cast<size_t>(kv_dim)}, seed++, head_dim);
-                            auto history_v = makeTensor(
+                                auto history_v = makeTensor(
                                 history_type,
                                 {prefix_rows, static_cast<size_t>(kv_dim)}, seed++, head_dim);
-                            ensureOnDevice(history_k.get(), device, stream);
-                            ensureOnDevice(history_v.get(), device, stream);
-                            ASSERT_TRUE(serial.cache->appendWithStream(
+                                ensureOnDevice(history_k.get(), device, stream);
+                                ensureOnDevice(history_v.get(), device, stream);
+                                ASSERT_TRUE(serial.cache->appendWithStream(
                                 0, 0, history_k.get(), history_v.get(), prefix_rows, stream));
-                            ASSERT_TRUE(grouped.cache->appendWithStream(
+                                ASSERT_TRUE(grouped.cache->appendWithStream(
                                 0, 0, history_k.get(), history_v.get(), prefix_rows, stream));
 
-                            const size_t source_rows = source_head_major
+                                const size_t source_rows = source_head_major
                                                            ? static_cast<size_t>(local_heads * verifier_rows)
                                                            : static_cast<size_t>(verifier_rows);
-                            const size_t source_cols = source_head_major
+                                const size_t source_cols = source_head_major
                                                            ? static_cast<size_t>(head_dim)
                                                            : static_cast<size_t>(kv_dim);
-                            auto verifier_k = makeTensor(
+                                auto verifier_k = makeTensor(
                                 format.source_k_type, {source_rows, source_cols}, seed++, head_dim);
-                            auto verifier_v = makeTensor(
+                                auto verifier_v = makeTensor(
                                 format.source_v_type, {source_rows, source_cols}, seed++, head_dim);
-                            ensureOnDevice(verifier_k.get(), device, stream);
-                            ensureOnDevice(verifier_v.get(), device, stream);
+                                ensureOnDevice(verifier_k.get(), device, stream);
+                                ensureOnDevice(verifier_v.get(), device, stream);
 
                             std::vector<std::unique_ptr<ITensor>> serial_k_rows;
                             std::vector<std::unique_ptr<ITensor>> serial_v_rows;
-                            serial_k_rows.reserve(verifier_rows);
-                            serial_v_rows.reserve(verifier_rows);
-                            for (int row_index = 0; row_index < verifier_rows; ++row_index)
+                                serial_k_rows.reserve(logical.rows);
+                                serial_v_rows.reserve(logical.rows);
+                                for (int row_index = 0; row_index < logical.rows; ++row_index)
                             {
                                 auto k_row = extractPositionRow(
                                     *verifier_k, format.source_k_type, row_index,
@@ -1526,22 +1554,24 @@ namespace llaminar2::test::gpu_kv_verifier
                                 serial_v_rows.push_back(std::move(v_row));
                             }
 
-                            ASSERT_TRUE(grouped_append(
+                                ASSERT_TRUE(grouped_append(
                                 *grouped.cache, verifier_k.get(), verifier_v.get(),
-                                verifier_rows, stream));
+                                verifier_rows,
+                                logical.resident_count ? logical.rows : 0,
+                                stream));
 
-                            IKVCache::KVCacheSequenceState serial_state;
-                            IKVCache::KVCacheSequenceState grouped_state;
-                            ASSERT_TRUE(observe_state(
+                                IKVCache::KVCacheSequenceState serial_state;
+                                IKVCache::KVCacheSequenceState grouped_state;
+                                ASSERT_TRUE(observe_state(
                                 *serial.cache, max_seq_len, stream, &serial_state));
-                            ASSERT_TRUE(observe_state(
+                                ASSERT_TRUE(observe_state(
                                 *grouped.cache, max_seq_len, stream, &grouped_state));
                             EXPECT_EQ(grouped_state.cached_tokens, serial_state.cached_tokens);
                             EXPECT_EQ(grouped_state.implementation_head,
                                       serial_state.implementation_head);
                             EXPECT_EQ(grouped_state.wrapped, serial_state.wrapped);
 
-                            const auto layout = serial.cache->logicalBlockLayout(
+                                const auto layout = serial.cache->logicalBlockLayout(
                                 0, serial_state.cached_tokens);
                             ASSERT_GT(layout.k_bytes, 0u);
                             ASSERT_GT(layout.v_bytes, 0u);
@@ -1551,20 +1581,20 @@ namespace llaminar2::test::gpu_kv_verifier
                             std::vector<uint8_t> serial_v(layout.v_bytes, 0);
                             std::vector<uint8_t> grouped_k(layout.k_bytes, 0);
                             std::vector<uint8_t> grouped_v(layout.v_bytes, 0);
-                            const IKVCache::KVCacheLogicalBlockDescriptor descriptor{
+                                const IKVCache::KVCacheLogicalBlockDescriptor descriptor{
                                 .layer = 0,
                                 .seq_idx = 0,
                                 .logical_token_start = 0,
                                 .token_count = serial_state.cached_tokens,
                                 .stream = stream,
                             };
-                            ASSERT_TRUE(serial.cache->exportLogicalBlock(
+                                ASSERT_TRUE(serial.cache->exportLogicalBlock(
                                 descriptor, serial_k.data(), serial_v.data()));
-                            ASSERT_TRUE(grouped.cache->exportLogicalBlock(
+                                ASSERT_TRUE(grouped.cache->exportLogicalBlock(
                                 descriptor, grouped_k.data(), grouped_v.data()));
                             EXPECT_EQ(grouped_k, serial_k)
                                 << "Grouped K cache payload is not serial-decode byte exact";
-                            EXPECT_EQ(grouped_v, serial_v)
+                                EXPECT_EQ(grouped_v, serial_v)
                                 << "Grouped V cache payload is not serial-decode byte exact";
 
                             // Prefix-cache restore consumes the same native
@@ -1573,7 +1603,7 @@ namespace llaminar2::test::gpu_kv_verifier
                             // production cache so newly supported formats (in
                             // particular asymmetric TQ and LocalTP shards) do
                             // not pass publication while remaining unrestorable.
-                            auto restored = makeBoundCache(
+                                auto restored = makeBoundCache(
                                 device, format.cache_precision, topology,
                                 max_seq_len, head_dim, &tq_context);
                             ASSERT_TRUE(restored.cache->importLogicalBlock(
@@ -1592,10 +1622,13 @@ namespace llaminar2::test::gpu_kv_verifier
                             EXPECT_EQ(restored_v, serial_v)
                                 << "Prefix restore changed native V payload bytes";
 
-                            expected_routes.insert(routeKey(
+                                expected_routes.insert(routeKey(
                                 format.cache_label, format.source_label,
                                 verifier_rows, head_dim,
-                                layout_label, execution_mode, topology.label));
+                                layout_label, execution_mode,
+                                row_count_policy, topology.label));
+                                ++expected_call_count;
+                            }
                         }
                     }
                 }
@@ -1621,6 +1654,7 @@ namespace llaminar2::test::gpu_kv_verifier
                 std::stoi(tag(record, "verifier_rows")),
                 std::stoi(tag(record, "head_dim")),
                 tag(record, "source_k_layout"), tag(record, "execution_mode"),
+                tag(record, "row_count_policy"),
                 tag(record, "topology")));
             total_calls += record.count;
         }
@@ -1628,7 +1662,7 @@ namespace llaminar2::test::gpu_kv_verifier
         EXPECT_EQ(observed_routes, expected_routes)
             << PerfStatsCollector::summaryString(
                    {std::string("kernel.") + counter_name}, 300);
-        EXPECT_EQ(total_calls, expected_routes.size())
+        EXPECT_EQ(total_calls, expected_call_count)
             << "Every matrix cell must enter the grouped implementation exactly once\n"
             << PerfStatsCollector::summaryString(
                    {std::string("kernel.") + counter_name}, 300);

@@ -2676,7 +2676,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_VARIANT=<id>` - Force IQ4-codebook ratio prefill tile variant (`-1`=use global/auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_KB=<n>` - Force IQ4-codebook ratio prefill split-K blocks (`0`=use global/auto)
      * - `LLAMINAR_ROCM_REPACK_SLOTS=<n>` - Ring-buffer slot count for startup GPU repack pipeline
-     * - `LLAMINAR_GPU_LOAD_STAGING_MB=<mb>` - Pinned-host startup staging cap, mirrored by device scratch (default 512 MiB, 0=unlimited)
+     * - `LLAMINAR_GPU_LOAD_STAGING_MB=<mb>` - Per-GPU pinned-host startup staging cap, mirrored by per-GPU device scratch (default 512 MiB, 0=unlimited)
      * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - Legacy alias for the startup staging cap
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
@@ -2783,7 +2783,7 @@ namespace llaminar2
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
-        int repack_budget_mb = 512; ///< Pinned-host startup staging cap in MiB, shared by parallel device loads and mirrored by device scratch; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_budget_mb = 512; ///< Per-GPU pinned-host startup staging cap in MiB, mirrored by per-GPU device scratch; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
         int repack_streams = 3;   ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
 
         ROCmConfig()

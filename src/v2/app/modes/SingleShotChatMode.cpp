@@ -138,6 +138,14 @@ namespace llaminar2
             LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
         }
 
+        SamplingParams sampling_params;
+        sampling_params.temperature = config.temperature;
+        sampling_params.top_k = config.top_k;
+        sampling_params.top_p = config.top_p;
+        sampling_params.seed = config.seed;
+        runner->setSamplingParams(sampling_params);
+        runner->setStopTokens(tokenizer->stop_tokens());
+
         if (!runner->prefill(token_ids))
         {
             if (mpi_ctx->rank() == 0)
@@ -158,14 +166,6 @@ namespace llaminar2
         {
             LOG_INFO("Generating response (max " << max_tokens << " tokens)...");
         }
-
-        // Configure sampling params from CLI config
-        SamplingParams sampling_params;
-        sampling_params.temperature = config.temperature;
-        sampling_params.top_k = config.top_k;
-        sampling_params.top_p = config.top_p;
-        sampling_params.seed = config.seed;
-        runner->setSamplingParams(sampling_params);
 
         if (mpi_ctx->rank() == 0)
         {

@@ -3872,8 +3872,7 @@ namespace llaminar2
              * and corrupt every request shorter than the physical graph width.
              */
             const int32_t *kv_append_lengths_device =
-                config_.live_mtp_request_batch_condition ||
-                        config_.grouped_mtp_verifier
+                config_.live_mtp_request_batch_condition
                     ? nullptr
                     : request_sequence_lengths_device;
             const bool phase_split_handoff =
@@ -4164,6 +4163,10 @@ namespace llaminar2
              */
             attn_params.kv_cache = kv_cache;
             attn_params.layer_idx = kv_stage_layer;
+            attn_params.active_query_rows_device =
+                device.is_gpu() && batch_size == 1
+                    ? request_sequence_lengths_device
+                    : nullptr;
             /*
              * GPU attention has one production source: the post-append,
              * device-owned KV cache. This is true for prefill, continuation

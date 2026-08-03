@@ -480,7 +480,7 @@ namespace llaminar2
             int committed_tokens,
             const char *source);
         /**
-         * @brief Admit the scalar GPU stochastic-generation ledger exactly once.
+         * @brief Admit the scalar GPU generation ledger exactly once.
          *
          * Every public inference surface ultimately enters MTP through
          * decodeStepMTP(), whereas only the convenience generate() API owns an
@@ -494,12 +494,11 @@ namespace llaminar2
          * stop state, and producer/consumer ordering remain exclusively in the
          * persistent device controller and its event-published handoffs.
          *
-         * @param stochastic_device_verify Whether this decode transaction uses
-         *        the production GPU stochastic verifier.
+         * @param grouped_device_verify Whether this decode transaction uses the
+         *        production GPU grouped verifier and resident publisher.
          * @return true when admission is unnecessary or has completed.
          */
-        bool admitScalarDeviceResidentStochasticGeneration(
-            bool stochastic_device_verify);
+        bool admitScalarDeviceResidentGeneration(bool grouped_device_verify);
         /**
          * @brief Advance the scheduler position after one committed decode row.
          *
@@ -818,7 +817,7 @@ namespace llaminar2
          * @brief Whether successful prefill still needs one GPU ledger admission.
          *
          * Prefill establishes a new request lifecycle, but it does not know the
-         * caller's response budget.  The first scalar stochastic MTP decode owns
+         * caller's response budget. The first scalar grouped GPU MTP decode owns
          * that budget and clears this marker only after every device participant
          * has initialized and event-published its resident controller.
          */

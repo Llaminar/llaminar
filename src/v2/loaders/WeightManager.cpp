@@ -7,6 +7,7 @@
 #include "WeightManager.h"
 #include "MmapRegion.h"
 #include "PreparedWeightStore.h"
+#include "GPUHostLoadPreflight.h"
 #include "GPUVramPreflight.h"
 #include "utils/VramBillOfMaterials.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
@@ -219,6 +220,7 @@ namespace llaminar2
             case WeightRole::OutputNorm:
             case WeightRole::GDNSsmParam:
             case WeightRole::MoERouter:
+            case WeightRole::SharedExpertInputGate:
             case WeightRole::Norm:
             case WeightRole::Bias:
             case WeightRole::Other:
@@ -264,6 +266,7 @@ namespace llaminar2
                 binding.identity.role == WeightRole::OutputNorm ||
                 binding.identity.role == WeightRole::GDNSsmParam ||
                 binding.identity.role == WeightRole::MoERouter ||
+                binding.identity.role == WeightRole::SharedExpertInputGate ||
                 binding.identity.role == WeightRole::Norm ||
                 binding.identity.role == WeightRole::Bias)
             {
@@ -320,21 +323,48 @@ namespace llaminar2
                    endsWith(name, "ssm_beta.weight");
         }
 
-        std::shared_ptr<TensorBase> createGdnTinySsmProjectionFp32Override(
+        /**
+         * @brief Materialize weights whose graph-native representation is FP32.
+         *
+         * The returned tensor is immutable model-owned storage created during
+         * weight materialization. Execution stages therefore never dequantize,
+         * allocate, or maintain host mirrors. Semantic role controls the shared
+         * expert input gate; the narrowly named predicate preserves the existing
+         * Q8_0 GDN alpha/beta override.
+         *
+         * @param name Canonical model weight name used for diagnostics.
+         * @param role Semantic graph role selected by the weight plan.
+         * @param source Loaded source tensor.
+         * @param target_device Device that will consume the prepared tensor.
+         * @return Owned FP32 replacement, or nullptr when no override is required.
+         */
+        std::shared_ptr<TensorBase> createModelPreparedFp32Override(
             const std::string &name,
+            WeightRole role,
             const TensorBase *source,
             DeviceId target_device)
         {
-            if (!isGdnTinySsmProjectionOverride(name, source))
+            if (!source || source->native_type() == TensorType::FP32)
+                return nullptr;
+
+            const bool shared_expert_input_gate =
+                role == WeightRole::SharedExpertInputGate;
+            const bool gdn_tiny_projection =
+                isGdnTinySsmProjectionOverride(name, source);
+            if (!shared_expert_input_gate && !gdn_tiny_projection)
                 return nullptr;
 
             auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
             source->to_fp32(fp32->mutable_data());
-            fp32->setDebugName(name + "@fp32-ssm-projection");
+            const char *purpose = shared_expert_input_gate
+                                      ? "shared-expert-input-gate"
+                                      : "ssm-projection";
+            fp32->setDebugName(name + "@fp32-" + purpose);
             LOG_DEBUG("[WeightManager] Dequantized " << name
-                                                      << " from Q8_0 to FP32 for "
+                                                      << " from " << source->dtype_name()
+                                                      << " to FP32 for "
                                                       << target_device.to_string()
-                                                      << " GDN projection path");
+                                                      << " " << purpose << " path");
             return fp32;
         }
 
@@ -1867,8 +1897,9 @@ namespace llaminar2
 
             binding.slice = mergeRequirementSlice(binding.slice, requirement.slice);
 
-            if (auto fp32_override = createGdnTinySsmProjectionFp32Override(
+            if (auto fp32_override = createModelPreparedFp32Override(
                     requirement.canonical_name,
+                    binding.identity.role,
                     tensor.get(),
                     requirement.target_device))
             {
@@ -3200,16 +3231,9 @@ namespace llaminar2
 
         const auto gemm_wall_start = std::chrono::high_resolution_clock::now();
 
-        const size_t gpu_device_count = static_cast<size_t>(std::count_if(
-            devices.begin(), devices.end(), [](DeviceId device)
-            { return device.is_gpu(); }));
         const auto &gpu_load_cfg = debugEnv().rocm;
         const std::optional<size_t> per_gpu_staging_budget =
-            gpu_load_cfg.repack_budget_mb > 0 && gpu_device_count > 0
-                ? std::optional<size_t>{
-                      (static_cast<size_t>(gpu_load_cfg.repack_budget_mb) * 1024ULL * 1024ULL) /
-                      gpu_device_count}
-                : std::nullopt;
+            gpuPerDeviceLoadStagingBudgetBytes(gpu_load_cfg.repack_budget_mb);
 
         {
             std::vector<std::future<bool>> gemm_futures;
@@ -4749,8 +4773,12 @@ namespace llaminar2
 
         for (auto &dense_job : gemm_weights)
         {
-            auto fp32_override = createGdnTinySsmProjectionFp32Override(
+            const WeightRole role = dense_job.binding.has_value()
+                                        ? dense_job.binding->identity.role
+                                        : inferWeightRole(dense_job.name);
+            auto fp32_override = createModelPreparedFp32Override(
                 dense_job.name,
+                role,
                 dense_job.tensor,
                 target_device);
             if (!fp32_override)
@@ -4964,7 +4992,7 @@ namespace llaminar2
         orchestrator->addDevice(target_device.ordinal);
 
         size_t max_raw_bytes = 0;
-        size_t planned_count = 0;
+        size_t planned_storage_count = 0;
         std::vector<std::pair<std::string, const NativeVnniFormatInfo *>> weight_formats;
         weight_formats.reserve(gemm_weights.size());
 
@@ -4990,7 +5018,7 @@ namespace llaminar2
 
                     orchestrator->planRawWeight(target_device.ordinal, name, N, K, raw_bytes);
                     max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
-                    ++planned_count;
+                    ++planned_storage_count;
                     weight_formats.emplace_back(name, nullptr);
                     continue;
                 }
@@ -5009,58 +5037,190 @@ namespace llaminar2
                                      vnni->payload_bytes, vnni->is_asymmetric,
                                      vnni->has_emins, raw_bytes);
             max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
-            ++planned_count;
+            ++planned_storage_count;
             weight_formats.emplace_back(name, vnni);
         }
 
-        // Plan MoE expert weights into the same orchestrator
+        // Plan MoE expert weights into contiguous parent-backed slabs. Graphs
+        // retain one logical GEMM engine per expert, but GGUF stores every expert
+        // for one layer/role parent in adjacent bytes. Keeping those two
+        // granularities separate avoids tens of thousands of tiny pread, H2D,
+        // event, and repack transactions without changing graph-visible expert
+        // identity.
+        struct MoEPackedStorageRef
+        {
+            std::string slot_name;
+            int row_offset = 0;
+        };
+
         std::vector<const NativeVnniFormatInfo *> moe_vnni_infos;
         moe_vnni_infos.reserve(moe_jobs.size());
-        for (const auto &mj : moe_jobs)
+        std::vector<MoEPackedStorageRef> moe_storage_refs(moe_jobs.size());
+        std::vector<WeightJob> moe_logical_jobs;
+        std::vector<const void *> moe_source_owners;
+        std::vector<size_t> moe_logical_to_semantic;
+        moe_logical_jobs.reserve(moe_jobs.size());
+        moe_source_owners.reserve(moe_jobs.size());
+        moe_logical_to_semantic.reserve(moe_jobs.size());
+        size_t moe_jobs_without_raw_source = 0;
+
+        for (size_t semantic_index = 0; semantic_index < moe_jobs.size(); ++semantic_index)
         {
+            const auto &mj = moe_jobs[semantic_index];
             auto *unpackable = dynamic_cast<IINT8Unpackable *>(mj.view.get());
             const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            WeightJob logical_job;
+            logical_job.name = mj.slot_name;
+            logical_job.host_raw_data = mj.view ? mj.view->raw_data() : nullptr;
+
             if (!vnni)
             {
                 // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
-                // they go through the pipeline as raw H2D copies.
+                // contiguous expert rows go through the same slab plan as a raw
+                // H2D copy.
                 const auto type = mj.view->native_type();
                 if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
                 {
-                    const int N = static_cast<int>(mj.view->rows());
-                    const int K = static_cast<int>(mj.view->cols());
-                    const size_t raw_bytes = mj.view->size_bytes();
-
-                    orchestrator->planRawWeight(target_device.ordinal, mj.slot_name, N, K, raw_bytes);
-                    max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
-                    ++planned_count;
+                    logical_job.raw_bytes = mj.view->size_bytes();
+                    logical_job.format = RepackFormat::RAW_FP;
+                    logical_job.N = static_cast<int>(mj.view->rows());
+                    logical_job.K = static_cast<int>(mj.view->cols());
+                    logical_job.is_asymmetric = false;
                     moe_vnni_infos.push_back(nullptr);
-                    continue;
                 }
-                // Any quantized type that doesn't implement IINT8Unpackable is a bug.
-                throw std::runtime_error(
-                    "[WeightManager] GPU pipeline: MoE expert view does not implement "
-                    "IINT8Unpackable (unsupported quantized type for GPU repack): " +
-                    mj.slot_name);
+                else
+                {
+                    // Any quantized type that doesn't implement IINT8Unpackable is a bug.
+                    throw std::runtime_error(
+                        "[WeightManager] GPU pipeline: MoE expert view does not implement "
+                        "IINT8Unpackable (unsupported quantized type for GPU repack): " +
+                        mj.slot_name);
+                }
+            }
+            else
+            {
+                const auto repack_format =
+                    codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+                if (!repack_format)
+                {
+                    throw std::runtime_error(
+                        "[WeightManager] GPU pipeline has no MoE repack implementation for " +
+                        mj.slot_name + " (codebook=" +
+                        std::to_string(static_cast<int>(vnni->codebook_id)) +
+                        ", superblock=" + std::to_string(vnni->is_superblock) + ")");
+                }
+
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm() &&
+                    vnni->codebook_id >= 11 && vnni->codebook_id <= 17 &&
+                    !rocm::ensureIQGridTablesInitialized(target_device.ordinal))
+                {
+                    throw std::runtime_error(
+                        "[WeightManager] GPU pipeline failed to initialize ROCm IQ grid tables for " +
+                        target_device.to_string());
+                }
+#endif
+
+                logical_job.raw_bytes = quantizedViewRawBytes(*mj.view);
+                logical_job.format = *repack_format;
+                logical_job.N = static_cast<int>(mj.view->rows());
+                logical_job.K = static_cast<int>(mj.view->cols());
+                logical_job.is_asymmetric = vnni->is_asymmetric;
+                moe_vnni_infos.push_back(vnni);
             }
 
-            // 2D view: rows()=rows_per_expert, cols()=cols
-            const int N = static_cast<int>(mj.view->rows());
-            const int K = static_cast<int>(mj.view->cols());
-            const size_t raw_bytes = quantizedViewRawBytes(*mj.view);
+            if (!logical_job.host_raw_data || logical_job.raw_bytes == 0)
+            {
+                ++moe_jobs_without_raw_source;
+                continue;
+            }
 
-            orchestrator->planWeight(target_device.ordinal, mj.slot_name, N, K,
-                                     vnni->payload_bytes, vnni->is_asymmetric,
-                                     vnni->has_emins, raw_bytes);
-            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
-            ++planned_count;
-            moe_vnni_infos.push_back(vnni);
+            moe_logical_to_semantic.push_back(semantic_index);
+            moe_source_owners.push_back(mj.parent_owner.get());
+            moe_logical_jobs.push_back(std::move(logical_job));
         }
 
-        if (planned_count == 0)
+        if (moe_jobs_without_raw_source != 0 &&
+            moe_jobs_without_raw_source != moe_jobs.size())
         {
-            LOG_WARN("[WeightManager] GPU pipeline: no weights to load");
-            return false;
+            throw std::runtime_error(
+                "[WeightManager] GPU pipeline observed a partially released MoE parent set; "
+                "all requested expert sources must share one explicit preparation lifetime");
+        }
+        if (!moe_jobs.empty() &&
+            moe_jobs_without_raw_source == moe_jobs.size() &&
+            max_raw_bytes != 0)
+        {
+            throw std::runtime_error(
+                "[WeightManager] GPU pipeline cannot mix host-backed dense preparation with "
+                "MoE expert requests whose immutable parent sources were already released");
+        }
+
+        std::vector<CoalescedWeightJobRun> moe_storage_runs;
+        if (!moe_logical_jobs.empty())
+        {
+            moe_storage_runs = coalesceContiguousWeightJobs(
+                moe_logical_jobs, moe_source_owners);
+
+            for (size_t run_index = 0; run_index < moe_storage_runs.size(); ++run_index)
+            {
+                auto &run = moe_storage_runs[run_index];
+                const size_t first_semantic_index =
+                    moe_logical_to_semantic.at(run.members.front().source_job_index);
+                run.job.name = moe_jobs[first_semantic_index].slot_name +
+                               "__packed_run_" + std::to_string(run_index);
+
+                for (const auto &member : run.members)
+                {
+                    const size_t semantic_index =
+                        moe_logical_to_semantic.at(member.source_job_index);
+                    moe_storage_refs[semantic_index] = {
+                        .slot_name = run.job.name,
+                        .row_offset = member.row_offset,
+                    };
+                }
+
+                const auto *vnni = moe_vnni_infos[first_semantic_index];
+                if (vnni)
+                {
+                    orchestrator->planWeight(
+                        target_device.ordinal,
+                        run.job.name,
+                        run.job.N,
+                        run.job.K,
+                        vnni->payload_bytes,
+                        vnni->is_asymmetric,
+                        vnni->has_emins,
+                        run.job.raw_bytes);
+                }
+                else
+                {
+                    orchestrator->planRawWeight(
+                        target_device.ordinal,
+                        run.job.name,
+                        run.job.N,
+                        run.job.K,
+                        run.job.raw_bytes);
+                }
+
+                max_raw_bytes = std::max(max_raw_bytes, run.job.raw_bytes);
+                ++planned_storage_count;
+            }
+
+            LOG_DEBUG("[WeightManager] GPU pipeline: coalesced "
+                      << moe_jobs.size() << " logical MoE expert matrices into "
+                      << moe_storage_runs.size() << " contiguous packed source runs for "
+                      << target_device.to_string());
+            if (PerfStatsCollector::isEnabled())
+            {
+                const std::string device = target_device.to_string();
+                PerfStatsCollector::addCounter(
+                    "weight_loading", "gpu_pipeline_moe_logical_jobs",
+                    static_cast<double>(moe_jobs.size()), "load", device);
+                PerfStatsCollector::addCounter(
+                    "weight_loading", "gpu_pipeline_moe_packed_source_runs",
+                    static_cast<double>(moe_storage_runs.size()), "load", device);
+            }
         }
 
         if (max_raw_bytes == 0)
@@ -5149,12 +5309,14 @@ namespace llaminar2
                 }
             }
 
-            LOG_DEBUG("[WeightManager] GPU pipeline: planned " << planned_count
-                                                               << " weights for " << target_device.to_string()
-                                                               << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
-                                                               << " missing_dense=" << missing_dense
-                                                               << " aliased_experts=" << aliased_experts
-                                                               << " missing_experts=" << missing_experts);
+            LOG_DEBUG("[WeightManager] GPU pipeline: resolved "
+                      << (gemm_weights.size() + moe_jobs.size())
+                      << " logical weights from existing prepared state for "
+                      << target_device.to_string()
+                      << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
+                      << " missing_dense=" << missing_dense
+                      << " aliased_experts=" << aliased_experts
+                      << " missing_experts=" << missing_experts);
 
             return missing_dense == 0 && missing_experts == 0;
         }
@@ -5315,62 +5477,12 @@ namespace llaminar2
             orchestrator->addWeightJob(target_device.ordinal, job);
         }
 
-        // Add MoE expert weight jobs
-        for (size_t i = 0; i < moe_jobs.size(); ++i)
+        // Add one source job per contiguous MoE parent run. The orchestrator may
+        // split a run further at row boundaries to honor the fixed staging
+        // budget, but it never reintroduces one transaction per logical expert.
+        for (const auto &run : moe_storage_runs)
         {
-            const auto *vnni = moe_vnni_infos[i];
-            if (!vnni)
-            {
-                // Floating-point MoE expert: submit as RAW_FP passthrough job
-                const auto &mj = moe_jobs[i];
-                const auto type = mj.view->native_type();
-                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
-                {
-                    WeightJob job;
-                    job.name = mj.slot_name;
-                    job.host_raw_data = mj.view->raw_data();
-                    job.raw_bytes = mj.view->size_bytes();
-                    job.format = RepackFormat::RAW_FP;
-                    job.N = static_cast<int>(mj.view->rows());
-                    job.K = static_cast<int>(mj.view->cols());
-                    job.is_asymmetric = false;
-                    orchestrator->addWeightJob(target_device.ordinal, job);
-                }
-                continue;
-            }
-
-            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
-            if (!repack_fmt)
-            {
-                throw std::runtime_error(
-                    "[WeightManager] GPU pipeline has no MoE repack implementation for " +
-                    moe_jobs[i].slot_name + " (codebook=" +
-                    std::to_string(static_cast<int>(vnni->codebook_id)) +
-                    ", superblock=" + std::to_string(vnni->is_superblock) + ")");
-            }
-
-#ifdef HAVE_ROCM
-            if (target_device.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
-            {
-                if (!rocm::ensureIQGridTablesInitialized(target_device.ordinal))
-                {
-                    LOG_ERROR("[WeightManager] GPU pipeline: failed to initialize ROCm IQ grid tables for "
-                              << target_device.to_string());
-                    return false;
-                }
-            }
-#endif
-
-            WeightJob job;
-            job.name = moe_jobs[i].slot_name;
-            job.host_raw_data = moe_jobs[i].view->raw_data();
-            job.raw_bytes = quantizedViewRawBytes(*moe_jobs[i].view);
-            job.format = *repack_fmt;
-            job.N = static_cast<int>(moe_jobs[i].view->rows());
-            job.K = static_cast<int>(moe_jobs[i].view->cols());
-            job.is_asymmetric = vnni->is_asymmetric;
-
-            orchestrator->addWeightJob(target_device.ordinal, job);
+            orchestrator->addWeightJob(target_device.ordinal, run.job);
         }
 
         // ------------------------------------------------------------------
@@ -5628,17 +5740,91 @@ namespace llaminar2
         {
             const auto *vnni = moe_vnni_infos[i];
             const auto &mj = moe_jobs[i];
+            const auto &storage = moe_storage_refs[i];
 
-            auto slot = pool->getSlot(mj.slot_name);
+            if (storage.slot_name.empty() || storage.row_offset < 0)
+            {
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline has no packed storage mapping for MoE expert " +
+                    mj.slot_name);
+            }
+
+            auto slot = pool->getSlot(storage.slot_name);
             if (!slot)
             {
-                if (vnni)
-                    LOG_WARN("[WeightManager] GPU pipeline: no slot for MoE expert " << mj.slot_name);
-                continue;
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline has no coalesced pool slot '" +
+                    storage.slot_name + "' for MoE expert " + mj.slot_name);
             }
 
             const int N = static_cast<int>(mj.view->rows());
             const int K = static_cast<int>(mj.view->cols());
+
+            uint8_t *expert_payload = nullptr;
+            void *expert_scales = nullptr;
+            void *expert_mins = nullptr;
+            void *expert_emins = nullptr;
+
+            auto require_region = [&](size_t offset,
+                                      size_t bytes,
+                                      size_t available,
+                                      const char *region)
+            {
+                if (offset > available || bytes > available - offset)
+                {
+                    throw std::runtime_error(
+                        "[WeightManager] GPU pipeline " + std::string(region) +
+                        " subregion exceeds coalesced slot '" + storage.slot_name +
+                        "' for MoE expert " + mj.slot_name);
+                }
+            };
+
+            if (!vnni)
+            {
+                const size_t raw_bytes = mj.view->size_bytes();
+                if (N <= 0 || raw_bytes % static_cast<size_t>(N) != 0)
+                {
+                    throw std::runtime_error(
+                        "[WeightManager] GPU pipeline FP MoE expert has invalid row-byte geometry: " +
+                        mj.slot_name);
+                }
+                const size_t bytes_per_row = raw_bytes / static_cast<size_t>(N);
+                const size_t payload_offset =
+                    static_cast<size_t>(storage.row_offset) * bytes_per_row;
+                require_region(payload_offset, raw_bytes, slot->payload_bytes, "payload");
+                expert_payload = slot->d_native_vnni_payload + payload_offset;
+            }
+            else
+            {
+                const auto offsets = nativeVnniPackedRegionSizes(
+                    static_cast<size_t>(storage.row_offset),
+                    static_cast<size_t>(K),
+                    *vnni);
+                const auto lengths = nativeVnniPackedRegionSizes(
+                    static_cast<size_t>(N),
+                    static_cast<size_t>(K),
+                    *vnni);
+
+                require_region(offsets.payload_bytes, lengths.payload_bytes,
+                               slot->payload_bytes, "payload");
+                require_region(offsets.scales_bytes, lengths.scales_bytes,
+                               slot->scales_bytes, "scales");
+                require_region(offsets.mins_bytes, lengths.mins_bytes,
+                               slot->mins_bytes, "mins");
+                require_region(offsets.emins_bytes, lengths.emins_bytes,
+                               slot->emins_bytes, "embedded-mins");
+
+                expert_payload = slot->d_native_vnni_payload + offsets.payload_bytes;
+                expert_scales = slot->d_native_vnni_scales
+                                    ? static_cast<uint8_t *>(slot->d_native_vnni_scales) + offsets.scales_bytes
+                                    : nullptr;
+                expert_mins = slot->d_native_vnni_mins
+                                  ? static_cast<uint8_t *>(slot->d_native_vnni_mins) + offsets.mins_bytes
+                                  : nullptr;
+                expert_emins = slot->d_native_vnni_emins
+                                   ? static_cast<uint8_t *>(slot->d_native_vnni_emins) + offsets.emins_bytes
+                                   : nullptr;
+            }
 
             std::shared_ptr<ITensorGemm> kernel;
 
@@ -5655,7 +5841,7 @@ namespace llaminar2
                     else if (type == TensorType::BF16)
                         precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
                     kernel = std::make_shared<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
-                        slot->d_native_vnni_payload, N, K,
+                        expert_payload, N, K,
                         target_device.ordinal, precision, orchestrator);
                 }
 #endif
@@ -5668,7 +5854,7 @@ namespace llaminar2
                     else if (type == TensorType::BF16)
                         precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
                     kernel = std::make_shared<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
-                        slot->d_native_vnni_payload, N, K,
+                        expert_payload, N, K,
                         target_device.ordinal, precision, orchestrator);
                 }
 #endif
@@ -5682,10 +5868,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
                         N, K, target_device.ordinal,
-                        slot->d_native_vnni_payload,
-                        slot->d_native_vnni_scales,
-                        slot->d_native_vnni_mins,
-                        slot->d_native_vnni_emins,
+                        expert_payload,
+                        expert_scales,
+                        expert_mins,
+                        expert_emins,
                         canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator);
                 }
@@ -5696,10 +5882,10 @@ namespace llaminar2
                 {
                     kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
                         N, K, target_device.ordinal,
-                        slot->d_native_vnni_payload,
-                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        expert_payload,
+                        static_cast<uint16_t *>(expert_scales),
+                        static_cast<uint16_t *>(expert_mins),
+                        static_cast<uint32_t *>(expert_emins),
                         canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator);
                 }
@@ -5819,8 +6005,18 @@ namespace llaminar2
             num_gpu_packed_ += registered;
         }
 
-        const size_t total_registered = registered + moe_registered;
-        return total_registered == planned_count;
+        const bool complete =
+            registered == gemm_weights.size() &&
+            moe_registered == moe_jobs.size();
+        if (!complete)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline registration incomplete for "
+                      << target_device.to_string()
+                      << ": dense=" << registered << "/" << gemm_weights.size()
+                      << " moe=" << moe_registered << "/" << moe_jobs.size()
+                      << " packed_storage_runs=" << planned_storage_count);
+        }
+        return complete;
     }
 
     bool WeightManager::uploadFrozenNonGemmWeights(

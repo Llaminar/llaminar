@@ -5,7 +5,10 @@
  * RoPE graph replay must not record host-to-device copies. Contiguous positions
  * use a pre-uploaded device scalar for pos_offset; explicit position IDs use a
  * pre-uploaded workspace row buffer so request-batched verifier rows can replay
- * without rebuilding the graph.
+ * without rebuilding the graph. Production MTP coverage also binds the
+ * arena-owned device position row used by the captured verifier graph and
+ * requires its grouped output to match independent M=1 GPU launches byte for
+ * byte.
  */
 
 #include <gtest/gtest.h>
@@ -41,6 +44,14 @@ namespace
     constexpr int kHeadDim = 8;
     constexpr float kThetaBase = 10000.0f;
 
+    constexpr int kQwenPhysicalRows = 8;
+    constexpr int kQwenLogicalRows = 6;
+    constexpr int kQwenQHeads = 8;
+    constexpr int kQwenKVHeads = 1;
+    constexpr int kQwenHeadDim = 256;
+    constexpr float kQwenThetaBase = 10000000.0f;
+    constexpr float kQwenPartialRotaryFactor = 0.25f;
+
     std::unique_ptr<FP32Tensor> makeTensor(const std::vector<float> &values, int rows, int cols)
     {
         auto tensor = std::make_unique<FP32Tensor>(
@@ -70,7 +81,58 @@ namespace
         ASSERT_EQ(actual.size(), expected.size());
         for (size_t i = 0; i < actual.size(); ++i)
         {
-            EXPECT_NEAR(actual[i], expected[i], 2e-4f) << "i=" << i;
+            if (std::abs(actual[i] - expected[i]) > 2e-4f)
+            {
+                ADD_FAILURE() << "first mismatch at i=" << i
+                              << ": actual=" << actual[i]
+                              << " expected=" << expected[i];
+                return;
+            }
+        }
+    }
+
+    /**
+     * @brief Require native FP32 byte equality for a contiguous row interval.
+     *
+     * Floating-point tolerance would hide precisely the arithmetic-order or
+     * position-lifecycle defect this production regression is intended to
+     * catch. Reporting the first byte keeps failures useful even for NaN bit
+     * patterns and signed zero.
+     */
+    void expectRowsByteEqual(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t row_elements,
+        int first_row,
+        int row_count,
+        const char *label)
+    {
+        ASSERT_GE(first_row, 0);
+        ASSERT_GT(row_count, 0);
+        const size_t first_element = static_cast<size_t>(first_row) * row_elements;
+        const size_t element_count = static_cast<size_t>(row_count) * row_elements;
+        ASSERT_LE(first_element + element_count, actual.size());
+        ASSERT_LE(first_element + element_count, expected.size());
+
+        const auto *actual_bytes = reinterpret_cast<const unsigned char *>(
+            actual.data() + first_element);
+        const auto *expected_bytes = reinterpret_cast<const unsigned char *>(
+            expected.data() + first_element);
+        const size_t byte_count = element_count * sizeof(float);
+        if (std::memcmp(actual_bytes, expected_bytes, byte_count) == 0)
+            return;
+
+        for (size_t byte = 0; byte < byte_count; ++byte)
+        {
+            if (actual_bytes[byte] != expected_bytes[byte])
+            {
+                ADD_FAILURE() << label << " first mismatch at row "
+                              << first_row + static_cast<int>(byte / (row_elements * sizeof(float)))
+                              << ", row byte " << byte % (row_elements * sizeof(float))
+                              << ": captured=" << static_cast<unsigned>(actual_bytes[byte])
+                              << " serial=" << static_cast<unsigned>(expected_bytes[byte]);
+                return;
+            }
         }
     }
 
@@ -84,21 +146,28 @@ namespace
         const std::vector<float> &q_input,
         const std::vector<float> &k_input,
         int pos_offset,
-        const std::vector<int> *position_ids = nullptr)
+        const std::vector<int> *position_ids = nullptr,
+        int seq_len = kSeqLen,
+        int q_heads = kQHeads,
+        int kv_heads = kKVHeads,
+        int head_dim = kHeadDim,
+        float theta_base = kThetaBase,
+        float partial_rotary_factor = 1.0f)
     {
-        auto q = makeTensor(q_input, kSeqLen, kQHeads * kHeadDim);
-        auto k = makeTensor(k_input, kSeqLen, kKVHeads * kHeadDim);
+        auto q = makeTensor(q_input, seq_len, q_heads * head_dim);
+        auto k = makeTensor(k_input, seq_len, kv_heads * head_dim);
 
         RoPEStage::Params params{};
         params.device_id = DeviceId::cpu();
         params.Q = q.get();
         params.K = k.get();
-        params.n_heads = kQHeads;
-        params.n_kv_heads = kKVHeads;
-        params.head_dim = kHeadDim;
-        params.seq_len = kSeqLen;
+        params.n_heads = q_heads;
+        params.n_kv_heads = kv_heads;
+        params.head_dim = head_dim;
+        params.seq_len = seq_len;
         params.pos_offset = pos_offset;
-        params.theta_base = kThetaBase;
+        params.theta_base = theta_base;
+        params.partial_rotary_factor = partial_rotary_factor;
         if (position_ids)
         {
             params.position_ids = position_ids->data();
@@ -171,6 +240,26 @@ namespace
     void launch(GraphExecT exec, StreamT stream) { ASSERT_EQ(cudaGraphLaunch(exec, stream), cudaSuccess); }
     void destroyGraphExec(GraphExecT exec) { ASSERT_EQ(cudaGraphExecDestroy(exec), cudaSuccess); }
     void destroyGraph(GraphT graph) { ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess); }
+    void expectNoHostToDeviceNodes(GraphT graph)
+    {
+        size_t node_count = 0;
+        ASSERT_EQ(cudaGraphGetNodes(graph, nullptr, &node_count), cudaSuccess);
+        std::vector<cudaGraphNode_t> nodes(node_count);
+        ASSERT_EQ(cudaGraphGetNodes(graph, nodes.data(), &node_count), cudaSuccess);
+        for (size_t index = 0; index < node_count; ++index)
+        {
+            cudaGraphNodeType type{};
+            ASSERT_EQ(cudaGraphNodeGetType(nodes[index], &type), cudaSuccess);
+            if (type != cudaGraphNodeTypeMemcpy)
+                continue;
+
+            cudaMemcpy3DParms params{};
+            ASSERT_EQ(cudaGraphMemcpyNodeGetParams(nodes[index], &params), cudaSuccess);
+            EXPECT_NE(params.kind, cudaMemcpyHostToDevice)
+                << "RoPE graph node " << index
+                << " captured an H2D dependency instead of device-owned initialization";
+        }
+    }
 #else
     using StreamT = hipStream_t;
     using EventT = hipEvent_t;
@@ -226,6 +315,26 @@ namespace
     void launch(GraphExecT exec, StreamT stream) { ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess); }
     void destroyGraphExec(GraphExecT exec) { ASSERT_EQ(hipGraphExecDestroy(exec), hipSuccess); }
     void destroyGraph(GraphT graph) { ASSERT_EQ(hipGraphDestroy(graph), hipSuccess); }
+    void expectNoHostToDeviceNodes(GraphT graph)
+    {
+        size_t node_count = 0;
+        ASSERT_EQ(hipGraphGetNodes(graph, nullptr, &node_count), hipSuccess);
+        std::vector<hipGraphNode_t> nodes(node_count);
+        ASSERT_EQ(hipGraphGetNodes(graph, nodes.data(), &node_count), hipSuccess);
+        for (size_t index = 0; index < node_count; ++index)
+        {
+            hipGraphNodeType type{};
+            ASSERT_EQ(hipGraphNodeGetType(nodes[index], &type), hipSuccess);
+            if (type != hipGraphNodeTypeMemcpy)
+                continue;
+
+            hipMemcpy3DParms params{};
+            ASSERT_EQ(hipGraphMemcpyNodeGetParams(nodes[index], &params), hipSuccess);
+            EXPECT_NE(params.kind, hipMemcpyHostToDevice)
+                << "RoPE graph node " << index
+                << " captured an H2D dependency instead of device-owned initialization";
+        }
+    }
 #endif
 
     void uploadTensor(FP32Tensor &tensor, const std::vector<float> &values, StreamT stream)
@@ -261,11 +370,17 @@ namespace
         const std::vector<float> &q_input,
         const std::vector<float> &k_input,
         StreamT stream,
-        const int *position_ids = nullptr)
+        const int *position_ids = nullptr,
+        int seq_len = kSeqLen,
+        int q_heads = kQHeads,
+        int kv_heads = kKVHeads,
+        int head_dim = kHeadDim,
+        float theta_base = kThetaBase,
+        float partial_rotary_factor = 1.0f)
     {
         const DeviceId device = testDevice();
-        auto q = makeTensor(q_input, kSeqLen, kQHeads * kHeadDim);
-        auto k = makeTensor(k_input, kSeqLen, kKVHeads * kHeadDim);
+        auto q = makeTensor(q_input, seq_len, q_heads * head_dim);
+        auto k = makeTensor(k_input, seq_len, kv_heads * head_dim);
         if (!q->ensureOnDevice(device, stream) || !k->ensureOnDevice(device, stream))
             throw std::runtime_error("Failed to upload RoPE graph-capture tensors");
         synchronize(stream);
@@ -274,11 +389,12 @@ namespace
         params.device_id = device;
         params.Q = q.get();
         params.K = k.get();
-        params.n_heads = kQHeads;
-        params.n_kv_heads = kKVHeads;
-        params.head_dim = kHeadDim;
-        params.seq_len = kSeqLen;
-        params.theta_base = kThetaBase;
+        params.n_heads = q_heads;
+        params.n_kv_heads = kv_heads;
+        params.head_dim = head_dim;
+        params.seq_len = seq_len;
+        params.theta_base = theta_base;
+        params.partial_rotary_factor = partial_rotary_factor;
         params.position_ids = position_ids;
 
         auto stage = std::make_unique<RoPEStage>(params);
@@ -287,7 +403,8 @@ namespace
         auto *consumer = stage->getKernelAsWorkspaceConsumer();
         if (!consumer)
             throw std::runtime_error("RoPE kernel does not expose workspace binding");
-        const auto requirements = consumer->getWorkspaceRequirements(kSeqLen, kQHeads * kHeadDim, 0);
+        const auto requirements = consumer->getWorkspaceRequirements(
+            seq_len, q_heads * head_dim, 0);
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             device,
             requirements.total_bytes_with_alignment() + 4096);
@@ -505,6 +622,330 @@ TEST(Test__RoPEGraphCaptureNoH2D, ExplicitPositionIdsReplayWithUpdatedDeviceRows
 
     destroyGraphExec(graph_exec);
     destroyGraph(graph);
+    destroyStream(stream);
+#endif
+}
+
+/**
+ * @brief Proves first-use invariant-table initialization has no host dependency.
+ *
+ * Production graph families can capture a RoPE stage before any eager execution
+ * has materialized its inverse-frequency table.  That first-use path must be a
+ * stream-ordered device producer.  In particular, an asynchronous copy from a
+ * temporary host vector is invalid because graph replay retains the source
+ * address after the vector has been destroyed.
+ */
+TEST(Test__RoPEGraphCaptureNoH2D, FirstUseInvariantTableCaptureIsDeviceOwned)
+{
+#if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    GTEST_SKIP() << "No GPU graph-capture backend selected";
+#else
+    if (!hasDevice())
+        GTEST_SKIP() << "No " << backendName() << " device available";
+    setDevice();
+
+    const auto q_input = makeValues(kSeqLen, kQHeads * kHeadDim, 0.375f);
+    const auto k_input = makeValues(kSeqLen, kKVHeads * kHeadDim, -0.25f);
+    constexpr int pos_offset = 37;
+
+    StreamT stream{};
+    createStream(&stream);
+    auto bundle = makeGpuStage(q_input, k_input, stream);
+    bundle.stage->updateDynamicParams(pos_offset, kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
+
+    GraphT graph{};
+    GraphExecT graph_exec{};
+    {
+        GraphCaptureGuard guard;
+        beginCapture(stream);
+        ASSERT_TRUE(bundle.stage->execute(bundle.ctx.get()));
+        endCapture(stream, &graph);
+    }
+    ASSERT_NE(graph, nullptr);
+    expectNoHostToDeviceNodes(graph);
+    instantiate(&graph_exec, graph);
+
+    // Exercise the captured source lifetime after unrelated host allocations.
+    std::vector<unsigned char> host_churn(4U * 1024U * 1024U, 0xa5U);
+    ASSERT_EQ(host_churn.front(), 0xa5U);
+    launch(graph_exec, stream);
+    synchronize(stream);
+
+    const auto reference = computeCpuReference(q_input, k_input, pos_offset);
+    expectNear(downloadTensor(*bundle.q, q_input.size(), stream), reference.q);
+    expectNear(downloadTensor(*bundle.k, k_input.size(), stream), reference.k);
+
+    destroyGraphExec(graph_exec);
+    destroyGraph(graph);
+    destroyStream(stream);
+#endif
+}
+
+/**
+ * @brief Proves distinct graph-family invariants cannot overwrite one another.
+ *
+ * Both stages deliberately share one workspace. Graph A captures full-width
+ * RoPE, then graph B publishes and captures a different partial-width/theta
+ * table before A ever launches. A single mutable `rope_inv_freq` address would
+ * make A consume B's frequencies. Exact fixed-slot publications keep both graph
+ * arguments valid for their complete executable lifetime.
+ */
+TEST(Test__RoPEGraphCaptureNoH2D, DistinctGraphFamilyPublicationsRemainImmutable)
+{
+#if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    GTEST_SKIP() << "No GPU graph-capture backend selected";
+#else
+    if (!hasDevice())
+        GTEST_SKIP() << "No " << backendName() << " device available";
+    setDevice();
+
+    constexpr int a_pos_offset = 41;
+    constexpr int b_pos_offset = 73;
+    constexpr float b_theta = 1000000.0f;
+    constexpr float b_partial_rotary = 0.5f;
+    const auto a_q_input = makeValues(kSeqLen, kQHeads * kHeadDim, 0.3125f);
+    const auto a_k_input = makeValues(kSeqLen, kKVHeads * kHeadDim, -0.1875f);
+    const auto b_q_input = makeValues(kSeqLen, kQHeads * kHeadDim, 0.625f);
+    const auto b_k_input = makeValues(kSeqLen, kKVHeads * kHeadDim, -0.4375f);
+
+    StreamT stream{};
+    createStream(&stream);
+    auto graph_a = makeGpuStage(a_q_input, a_k_input, stream);
+    auto graph_b = makeGpuStage(
+        b_q_input,
+        b_k_input,
+        stream,
+        nullptr,
+        kSeqLen,
+        kQHeads,
+        kKVHeads,
+        kHeadDim,
+        b_theta,
+        b_partial_rotary);
+
+    auto *consumer_a = graph_a.stage->getKernelAsWorkspaceConsumer();
+    auto *consumer_b = graph_b.stage->getKernelAsWorkspaceConsumer();
+    ASSERT_NE(consumer_a, nullptr);
+    ASSERT_NE(consumer_b, nullptr);
+    const auto shared_requirements = consumer_a->getWorkspaceRequirements(
+        kSeqLen, kQHeads * kHeadDim, 0);
+    auto shared_workspace = std::make_unique<DeviceWorkspaceManager>(
+        testDevice(),
+        shared_requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(shared_workspace->allocate(shared_requirements));
+    consumer_a->bindWorkspace(shared_workspace.get());
+    consumer_b->bindWorkspace(shared_workspace.get());
+
+    graph_a.stage->updateDynamicParams(a_pos_offset, kSeqLen);
+    ASSERT_TRUE(graph_a.stage->prepareGraphLaunch(graph_a.ctx.get(), stream));
+    GraphT native_graph_a{};
+    GraphExecT executable_a{};
+    {
+        GraphCaptureGuard guard;
+        beginCapture(stream);
+        ASSERT_TRUE(graph_a.stage->execute(graph_a.ctx.get()));
+        endCapture(stream, &native_graph_a);
+    }
+    ASSERT_NE(native_graph_a, nullptr);
+    expectNoHostToDeviceNodes(native_graph_a);
+    instantiate(&executable_a, native_graph_a);
+
+    graph_b.stage->updateDynamicParams(b_pos_offset, kSeqLen);
+    ASSERT_TRUE(graph_b.stage->prepareGraphLaunch(graph_b.ctx.get(), stream));
+    GraphT native_graph_b{};
+    GraphExecT executable_b{};
+    {
+        GraphCaptureGuard guard;
+        beginCapture(stream);
+        ASSERT_TRUE(graph_b.stage->execute(graph_b.ctx.get()));
+        endCapture(stream, &native_graph_b);
+    }
+    ASSERT_NE(native_graph_b, nullptr);
+    expectNoHostToDeviceNodes(native_graph_b);
+    instantiate(&executable_b, native_graph_b);
+
+    // B's invariant producer is already ordered before these launches. Prepare
+    // each graph's mutable scalar immediately before replay, exactly as the
+    // production executor does. This must not republish either invariant table.
+    ASSERT_TRUE(graph_a.stage->prepareGraphLaunch(graph_a.ctx.get(), stream));
+    launch(executable_a, stream);
+    ASSERT_TRUE(graph_b.stage->prepareGraphLaunch(graph_b.ctx.get(), stream));
+    launch(executable_b, stream);
+    synchronize(stream);
+
+    const auto reference_a = computeCpuReference(
+        a_q_input, a_k_input, a_pos_offset);
+    const auto reference_b = computeCpuReference(
+        b_q_input,
+        b_k_input,
+        b_pos_offset,
+        nullptr,
+        kSeqLen,
+        kQHeads,
+        kKVHeads,
+        kHeadDim,
+        b_theta,
+        b_partial_rotary);
+    expectNear(
+        downloadTensor(*graph_a.q, a_q_input.size(), stream),
+        reference_a.q);
+    expectNear(
+        downloadTensor(*graph_a.k, a_k_input.size(), stream),
+        reference_a.k);
+    expectNear(
+        downloadTensor(*graph_b.q, b_q_input.size(), stream),
+        reference_b.q);
+    expectNear(
+        downloadTensor(*graph_b.k, b_k_input.size(), stream),
+        reference_b.k);
+
+    destroyGraphExec(executable_b);
+    destroyGraph(native_graph_b);
+    destroyGraphExec(executable_a);
+    destroyGraph(native_graph_a);
+    destroyStream(stream);
+#endif
+}
+
+TEST(Test__RoPEGraphCaptureNoH2D, Qwen36ExternalDeviceRowsReplayIsByteEqualToSerialGPU)
+{
+#if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    GTEST_SKIP() << "No GPU graph-capture backend selected";
+#else
+    if (!hasDevice())
+        GTEST_SKIP() << "No " << backendName() << " device available";
+    setDevice();
+
+    constexpr size_t q_row_elements =
+        static_cast<size_t>(kQwenQHeads) * kQwenHeadDim;
+    constexpr size_t k_row_elements =
+        static_cast<size_t>(kQwenKVHeads) * kQwenHeadDim;
+    const std::vector<int> positions{88, 89, 90, 91, 92, 93, 94, 95};
+    const auto q_input = makeValues(
+        kQwenPhysicalRows, static_cast<int>(q_row_elements), 0.21875f);
+    const auto k_input = makeValues(
+        kQwenPhysicalRows, static_cast<int>(k_row_elements), -0.15625f);
+
+    StreamT stream{};
+    createStream(&stream);
+
+    void *positions_device = nullptr;
+    allocateDevice(
+        &positions_device,
+        positions.size() * sizeof(positions.front()));
+    ASSERT_NE(positions_device, nullptr);
+    upload(
+        positions_device,
+        positions.data(),
+        positions.size() * sizeof(positions.front()),
+        stream);
+    synchronize(stream);
+
+    auto grouped = makeGpuStage(
+        q_input,
+        k_input,
+        stream,
+        nullptr,
+        kQwenPhysicalRows,
+        kQwenQHeads,
+        kQwenKVHeads,
+        kQwenHeadDim,
+        kQwenThetaBase,
+        kQwenPartialRotaryFactor);
+    grouped.stage->updateDynamicDevicePositionIds(
+        positions_device, kQwenPhysicalRows);
+    ASSERT_TRUE(grouped.stage->prepareGraphLaunch(grouped.ctx.get(), stream));
+
+    // Initialize invariant frequency tables before capture, then restore the
+    // exact source bytes consumed by the production-shaped captured launch.
+    ASSERT_TRUE(grouped.stage->execute(grouped.ctx.get()));
+    synchronize(stream);
+    uploadTensor(*grouped.q, q_input, stream);
+    uploadTensor(*grouped.k, k_input, stream);
+
+    GraphT graph{};
+    GraphExecT graph_exec{};
+    {
+        GraphCaptureGuard guard;
+        beginCapture(stream);
+        ASSERT_TRUE(grouped.stage->prepareGraphLaunch(grouped.ctx.get(), stream));
+        ASSERT_TRUE(grouped.stage->execute(grouped.ctx.get()));
+        endCapture(stream, &graph);
+    }
+    ASSERT_NE(graph, nullptr);
+    instantiate(&graph_exec, graph);
+    launch(graph_exec, stream);
+    synchronize(stream);
+
+    const auto captured_q = downloadTensor(*grouped.q, q_input.size(), stream);
+    const auto captured_k = downloadTensor(*grouped.k, k_input.size(), stream);
+    std::vector<float> serial_q(q_input.size());
+    std::vector<float> serial_k(k_input.size());
+
+    /*
+     * Build the oracle from the backend's real M=1 contiguous-device-scalar
+     * route. Each row receives its own stage/kernel state, matching serial
+     * decode rather than replaying rows inside a grouped implementation.
+     */
+    for (int row = 0; row < kQwenPhysicalRows; ++row)
+    {
+        const auto q_first = q_input.begin() +
+                             static_cast<ptrdiff_t>(row * q_row_elements);
+        const auto k_first = k_input.begin() +
+                             static_cast<ptrdiff_t>(row * k_row_elements);
+        std::vector<float> q_row(q_first, q_first + q_row_elements);
+        std::vector<float> k_row(k_first, k_first + k_row_elements);
+        auto serial = makeGpuStage(
+            q_row,
+            k_row,
+            stream,
+            nullptr,
+            /*seq_len=*/1,
+            kQwenQHeads,
+            kQwenKVHeads,
+            kQwenHeadDim,
+            kQwenThetaBase,
+            kQwenPartialRotaryFactor);
+        serial.stage->updateDynamicParams(
+            positions[static_cast<size_t>(row)], /*seq_len=*/1);
+        ASSERT_TRUE(serial.stage->prepareGraphLaunch(serial.ctx.get(), stream));
+        ASSERT_TRUE(serial.stage->execute(serial.ctx.get()));
+        synchronize(stream);
+
+        const auto q_result = downloadTensor(*serial.q, q_row_elements, stream);
+        const auto k_result = downloadTensor(*serial.k, k_row_elements, stream);
+        std::copy(
+            q_result.begin(), q_result.end(),
+            serial_q.begin() + static_cast<ptrdiff_t>(row * q_row_elements));
+        std::copy(
+            k_result.begin(), k_result.end(),
+            serial_k.begin() + static_cast<ptrdiff_t>(row * k_row_elements));
+    }
+
+    // The first six rows reproduce the failing MTP transaction. The two
+    // physical padding rows are checked separately so a future row-coupled
+    // implementation cannot hide a padding-dependent arithmetic change.
+    expectRowsByteEqual(
+        captured_q, serial_q, q_row_elements,
+        /*first_row=*/0, kQwenLogicalRows, "Q logical verifier rows");
+    expectRowsByteEqual(
+        captured_k, serial_k, k_row_elements,
+        /*first_row=*/0, kQwenLogicalRows, "K logical verifier rows");
+    expectRowsByteEqual(
+        captured_q, serial_q, q_row_elements,
+        /*first_row=*/kQwenLogicalRows,
+        kQwenPhysicalRows - kQwenLogicalRows,
+        "Q physical padding rows");
+    expectRowsByteEqual(
+        captured_k, serial_k, k_row_elements,
+        /*first_row=*/kQwenLogicalRows,
+        kQwenPhysicalRows - kQwenLogicalRows,
+        "K physical padding rows");
+
+    destroyGraphExec(graph_exec);
+    destroyGraph(graph);
+    freeDevice(positions_device);
     destroyStream(stream);
 #endif
 }

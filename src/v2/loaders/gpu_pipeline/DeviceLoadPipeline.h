@@ -38,7 +38,71 @@ namespace llaminar2
         int full_N = 0;
         int full_K = 0;
 
+        /**
+         * Rows in one independently addressable packed matrix.
+         *
+         * Zero selects the ordinary block-major `[K-block][full_N row]`
+         * layout. A positive value selects grouped block-major storage:
+         * `[group][K-block][group row]`. Coalesced MoE parent runs set this to
+         * one expert's row count, preserving every expert's standalone byte
+         * layout while allowing one source upload and one high-occupancy repack
+         * launch. Row chunks may cross group boundaries because kernels derive
+         * group identity from the absolute row offset.
+         */
+        int packed_group_rows = 0;
+
     };
+
+    /**
+     * @brief Maps one logical source matrix into a coalesced storage run.
+     *
+     * MoE graphs address experts individually, but GGUF stores every expert of
+     * one layer/role parent contiguously. The loader therefore records the
+     * original logical job index and the first packed row assigned to it inside
+     * a larger run. Registration uses this row offset to construct an
+     * individual GEMM engine without restoring one upload/repack transaction per
+     * expert.
+     */
+    struct CoalescedWeightJobMember
+    {
+        size_t source_job_index = 0; ///< Index in the caller's logical job vector.
+        int row_offset = 0;          ///< First row in the coalesced packed matrix.
+    };
+
+    /**
+     * @brief One contiguous source range that can be staged and repacked as a unit.
+     */
+    struct CoalescedWeightJobRun
+    {
+        WeightJob job;                                 ///< Aggregate matrix submitted to the pipeline.
+        std::vector<CoalescedWeightJobMember> members; ///< Logical matrices represented by the run.
+    };
+
+    /**
+     * @brief Coalesce adjacent logical matrices from the same immutable owner.
+     *
+     * Two jobs are combined only when they have the same non-null source owner,
+     * format, N/K geometry, metadata layout, bytes-per-row, and adjacent source
+     * ranges. A source gap, a different parent, or any format difference starts
+     * a new run. This makes arbitrary expert subsets safe while reducing a fully
+     * resident MoE layer from hundreds of tiny transactions to one bounded,
+     * row-chunked transaction per contiguous parent range.
+     *
+     * Input jobs may be in graph discovery order. The helper orders them by
+     * owner and source address while retaining original indices in the member
+     * map. Pre-chunked jobs are rejected because coalescing is a planning
+     * operation that must happen before LoadOrchestrator applies its staging
+     * budget.
+     *
+     * @param jobs Logical whole-matrix source jobs.
+     * @param source_owners Immutable parent identity for each job.
+     * @return Coalesced runs and exact logical-to-packed row mappings.
+     * @throws std::invalid_argument for malformed or mismatched input vectors.
+     * @throws std::overflow_error when aggregate rows or bytes exceed their types.
+     */
+    std::vector<CoalescedWeightJobRun> coalesceContiguousWeightJobs(
+        const std::vector<WeightJob> &jobs,
+        const std::vector<const void *> &source_owners);
 
     /**
      * @brief Order upload jobs by source address to preserve GGUF read locality.

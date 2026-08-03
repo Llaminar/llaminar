@@ -13,7 +13,7 @@ namespace llaminar2
     /**
      * @brief Stateless helper that owns GPU graph capture/replay phase orchestration logic.
      *
-     * This controller extracts the warmup/capture/replay state machine from `DeviceGraphExecutor`
+     * This controller extracts the capture/replay state machine from `DeviceGraphExecutor`
      * so executor code stays focused on mandatory execution policy and
      * node-level primitives.
      *
@@ -51,32 +51,13 @@ namespace llaminar2
             bool skipped_non_idempotent = false;
         };
 
-        /**
-         * @brief Result for the full Phase-2 capture pass.
-         */
+        /** @brief Result for recording and launching the first captured transaction. */
         struct CapturePhaseResult
         {
             /// True when all segments in capture phase completed successfully.
             bool success = false;
             /// True when caller should reset `GraphSegmentCache` resources.
             bool reset_cache = false;
-        };
-
-        /**
-         * @brief Decide whether Phase-2 capture also executes the new graph.
-         *
-         * `ExecuteCapturedWork` is used when capture itself is the logical
-         * invocation. `MaterializeOnly` is used immediately after a successful
-         * warmup in the same initialization transaction: warmup already produced
-         * the user-visible result, so Phase 2 may record and instantiate the
-         * future replay executable but must not launch or manually re-execute any
-         * stage. This closed policy prevents first-use graph setup from mutating
-         * KV or recurrent state twice.
-         */
-        enum class CapturePublicationPolicy : uint8_t
-        {
-            ExecuteCapturedWork,
-            MaterializeOnly,
         };
 
         /**
@@ -121,6 +102,25 @@ namespace llaminar2
              * begin-only LocalTP lifecycle accidentally.
              */
             DeviceGraphExecutor::GraphCaptureBoundaryHook capture_boundary;
+            /**
+             * @brief Join cross-lifetime producers immediately before launch.
+             *
+             * This is intentionally distinct from @ref cohere_inputs. Input
+             * coherence runs before beginCapture() and proves stable tensor
+             * ownership; this hook represents live producers whose event must
+             * remain outside the reusable graph body.
+             */
+            DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency;
+            /**
+             * @brief Build the immutable internal-edge ledger for one capture unit.
+             *
+             * Production executors resolve arena BufferIds to canonical tensor
+             * owners here.  Controller-only tests may omit the hook and receive a
+             * strict ledger in which every tensor remains graph-external.
+             */
+            std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+                const DeviceGraphExecutor::GraphSegment &)>
+                plan_capture_dependencies;
         };
 
         /**
@@ -139,9 +139,7 @@ namespace llaminar2
          */
         enum class Phase
         {
-            /// First graph-replay pass: execute normally and build replay metadata.
-            Warmup,
-            /// Explicit capture of a caller-supplied initialized cache state.
+            /// First use: prepare launch state, capture, instantiate, and launch once.
             Capture,
             /// Steady state: replay captured graph units.
             Replay
@@ -160,7 +158,7 @@ namespace llaminar2
 
         /**
          * @brief Return the canonical PerfStats label for a replay phase.
-         * @param phase Typed warmup, capture, or replay phase.
+         * @param phase Typed capture or replay phase.
          * @return Stable label consumed by graph-lifecycle validators.
          *
          * Every graph launch path, including optimized direct launches, must
@@ -171,18 +169,13 @@ namespace llaminar2
         static const char *phaseName(Phase phase);
 
         /**
-         * @brief Advance decode replay step and select warmup/capture/replay phase.
-         * @param initialized Whether graph-replay state has completed warmup.
-         * @param needs_capture In/out flag requesting Phase-2 capture.
+         * @brief Advance decode replay step and select capture or replay.
+         * @param initialized Whether a complete executable has been launched.
+         * @param needs_capture Legacy partial-state sentinel; true is fatal.
          * @param decode_step In/out monotonic step counter.
          * @return Phase transition decision with updated step.
          */
         static Transition beginStep(bool initialized, bool &needs_capture, uint64_t &decode_step);
-
-        /**
-         * @brief Mark warmup completion and arm capture phase for next step.
-         */
-        static void markWarmupComplete(bool &initialized, bool &needs_capture);
 
         /**
          * @brief Apply backend-specific device preparation for cached graph capture.
@@ -214,7 +207,7 @@ namespace llaminar2
          * @brief Allocate the bounded replay-timing event ring before graph capture.
          *
          * When GPU stage timing is disabled this is a no-op. When it is enabled,
-         * the complete bounded sampling ring is created here during warmup;
+         * the complete bounded sampling ring is created before first capture;
          * allocation failure is fatal to the selected profiling execution mode.
          * A burst larger than the ring is counted as unsampled while all slots
          * are busy; it never changes inference ordering. No replay invocation
@@ -237,25 +230,13 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx);
 
         /**
-         * @brief Execute warmup-phase bookkeeping (segment build + state transition).
-         */
-        static void executeWarmupPhase(
-            ComputeGraph &graph,
-            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
-            const std::unordered_set<std::string> *collective_nodes,
-            bool has_collective_nodes,
-            bool collectives_graph_capturable = false,
-            DeviceGraphExecutor::GraphReplayPlanPolicy plan_policy =
-                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
-
-        /**
-         * @brief Build and validate the execution plan for warmup/capture/replay.
+         * @brief Build and validate the execution plan for capture/replay.
          *
          * Homogeneous domains must produce one full graph. A caller-proven
          * heterogeneous collective domain may produce alternating captured and
          * manual units where cross-device execution prevents monolithic capture.
          */
-        static void buildWarmupSegments(
+        static void buildCapturePlan(
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegmentCache &segment_cache,
             const std::unordered_set<std::string> *collective_nodes,
@@ -308,6 +289,7 @@ namespace llaminar2
             bool full_graph_replay,
             const std::string &perf_context,
             const std::string &device_name,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -323,8 +305,12 @@ namespace llaminar2
             uint64_t current_step,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+            const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+                const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
+            const std::function<bool(ComputeNode &)> &execute_node_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -338,6 +324,7 @@ namespace llaminar2
             void *capture_stream,
             bool needs_segment_sync,
             int segment_index,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -353,8 +340,8 @@ namespace llaminar2
          *        admitted heterogeneous collective plan.
          * @param perf_context Stable graph-owner context attached to the
          *        executable-node PerfStats evidence.
-         * @param publication_policy Whether the captured executable represents
-         *        this invocation or is only being materialized for future replay.
+         * @param launch_dependency_cb Optional cross-lifetime event join queued
+         *        after instantiation and immediately before transaction zero.
          */
         static bool finalizeCapturePhaseCapturableSegment(
             ComputeGraph &graph,
@@ -362,13 +349,10 @@ namespace llaminar2
             IDeviceContext *ctx,
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
-            bool has_collective_nodes,
             bool full_graph_capture,
             const std::string &perf_context,
             uint64_t current_step,
-            CapturePublicationPolicy publication_policy,
-            const std::function<bool(ComputeNode &)> &execute_node_cb,
-            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -412,8 +396,12 @@ namespace llaminar2
             uint64_t current_step,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+            const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+                const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -435,16 +423,19 @@ namespace llaminar2
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
+                const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
          * @brief Execute full Phase-2 capture over all segments.
          *
-         * Materialization-only capture requires one complete capturable graph;
-         * a manual unit would necessarily execute host-orchestrated work and is
-         * therefore rejected rather than silently changing semantics.
+         * Capture, instantiation, launch-dependency publication, and transaction
+         * zero form one atomic first-use operation.  This API never leaves a
+         * materialized-but-unlaunched executable for a caller to repair later.
          */
         static CapturePhaseResult executeCapturePhase(
             ComputeGraph &graph,
@@ -453,9 +444,7 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
             uint64_t current_step,
-            const ReplayHooks &hooks,
-            CapturePublicationPolicy publication_policy =
-                CapturePublicationPolicy::ExecuteCapturedWork);
+            const ReplayHooks &hooks);
 
         /**
          * @brief Execute full replay phase over all segments.
@@ -478,7 +467,9 @@ namespace llaminar2
         static bool cohereReplaySegmentInputs(
             ComputeGraph &graph,
             const DeviceGraphExecutor::GraphSegment &segment,
-            const std::function<bool(ComputeNode &)> &cohere_stage_cb);
+            const std::function<bool(
+                ComputeNode &,
+                const std::vector<BufferBinding> &)> &cohere_stage_cb);
 
         /**
          * @brief Post-launch lifecycle for one captured segment.

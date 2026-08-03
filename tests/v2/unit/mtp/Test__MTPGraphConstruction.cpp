@@ -1401,6 +1401,8 @@ TEST(Test__MTPGraphConstruction,
     MTPVerifierOutcomeGraphBinding binding{
         .verifier_input_tokens_device =
             reinterpret_cast<const int32_t *>(0x1000),
+        .active_verifier_row_count_device =
+            reinterpret_cast<const int32_t *>(0x1100),
         .stop_tokens_device =
             reinterpret_cast<const int32_t *>(0x2000),
         .penalty_policy_device =
@@ -1467,21 +1469,24 @@ TEST(Test__MTPGraphConstruction,
 
     EXPECT_TRUE(has_input(BufferId::ALL_POSITION_LOGITS));
     EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_INPUT_TOKENS));
+    EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_REQUEST_LENGTHS));
     EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_STOP_TOKENS));
     EXPECT_TRUE(has_input(BufferId::MTP_GREEDY_PENALTY_POLICY));
+    EXPECT_TRUE(has_input(BufferId::MTP_GENERATED_TOKEN_COUNTS));
     EXPECT_TRUE(has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
     EXPECT_TRUE(
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
     EXPECT_TRUE(
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
-    EXPECT_TRUE(std::any_of(
+    EXPECT_FALSE(std::any_of(
         contract.inouts.begin(),
         contract.inouts.end(),
         [](const BufferBinding &binding)
         {
             return binding.id ==
                    BufferId::MTP_GENERATED_TOKEN_COUNTS;
-        }));
+        }))
+        << "Outcome reduction may read generated-token history, but accepted-state publication is its sole writer.";
 
     MTPVerifierOutcomeStage mirrored_participant_stage({
         .device_id = DeviceId::cuda(1),

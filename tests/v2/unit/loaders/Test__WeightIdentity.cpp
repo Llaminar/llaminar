@@ -1,3 +1,8 @@
+/**
+ * @file Test__WeightIdentity.cpp
+ * @brief Unit tests for semantic weight identity and lifecycle classification.
+ */
+
 #include <gtest/gtest.h>
 
 #include "loaders/WeightIdentity.h"
@@ -30,7 +35,7 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_exps.weight"), WeightRole::MoEExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp.weight"), WeightRole::MoERouter);
     EXPECT_EQ(inferWeightRole("blk.40.ffn_gate_inp.weight"), WeightRole::MoERouter);
-    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp_shexp.weight"), WeightRole::SharedExpertGate);
+    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp_shexp.weight"), WeightRole::SharedExpertInputGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_shexp.weight"), WeightRole::SharedExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_up_shexp.weight"), WeightRole::SharedExpertUp);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_down_shexp.weight"), WeightRole::SharedExpertDown);
@@ -52,6 +57,7 @@ TEST(Test__WeightIdentity, DistinguishesRoutedExpertsFromSharedExperts)
     EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertDown));
 
     EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertGate));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertInputGate));
     EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertUp));
     EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertDown));
 

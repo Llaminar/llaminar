@@ -2625,6 +2625,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesH
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
+    CudaAllocation active_row_count_device(sizeof(int32_t));
+    const int32_t active_row_count = seq_len;
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            active_row_count_device.get(),
+            &active_row_count,
+            sizeof(active_row_count),
+            cudaMemcpyHostToDevice,
+            stream_),
+        cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
@@ -2641,7 +2651,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesH
         seq_len,
         num_experts,
         top_k,
-        device_positions));
+        device_positions,
+        static_cast<const int32_t *>(active_row_count_device.get())));
     ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
         runtime_table.deviceLayerState(0),
         seq_len,
@@ -2763,6 +2774,7 @@ TEST_F(Test__CUDAMoEKernel,
     runtime_config.top_k = top_k;
     runtime_config.mirror_to_device = true;
     runtime_config.prefill_token_capacity = max_m;
+    runtime_config.deferred_verifier_token_capacity = max_m;
     llaminar2::MoERuntimeTable runtime_table(runtime_config);
 
     llaminar2::DeviceMoELayerRuntime baseline =
@@ -2904,9 +2916,96 @@ TEST_F(Test__CUDAMoEKernel,
         }
     }
 
+    /*
+     * Capture one physical M=31 graph and vary only device-owned inputs on
+     * replay. This is the production contract: the route tensor marks the
+     * inactive suffix while the scalar independently prevents resident
+     * assignment from ever dereferencing those invalid route ids.
+     */
+    ScopedCudaTestGraph graph(
+        stream_,
+        "resident verifier assignment physical-width lifecycle");
+    ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
+        runtime_table.deviceLayerState(0),
+        routing_indices.get(),
+        routing_weights.get(),
+        max_m,
+        max_m,
+        num_experts,
+        top_k,
+        /*filter_to_local_runtime_experts=*/false));
+    ASSERT_TRUE(
+        cuda_kernel_->assignPrefillRoutesLeastLoadedResident(
+            launchContext(),
+            runtime_table.deviceLayerState(0),
+            max_m,
+            max_m,
+            num_experts,
+            top_k,
+            device_positions,
+            static_cast<const int32_t *>(
+                accepted_count_device.get())));
+    ASSERT_TRUE(
+        cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+            runtime_table.deviceLayerState(0),
+            max_m,
+            max_m,
+            num_experts,
+            top_k,
+            /*retain_routes_for_deferred_commit=*/true));
+    ASSERT_TRUE(
+        cuda_kernel_->commitGroupedVerifierHistograms(
+            launchContext(),
+            runtime_table.deviceLayerState(0),
+            static_cast<const int32_t *>(
+                accepted_count_device.get()),
+            static_cast<const int32_t *>(
+                publication_ok_device.get()),
+            /*request_count=*/1,
+            /*rows_per_request=*/max_m,
+            /*total_rows=*/max_m,
+            num_experts,
+            top_k));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
     for (const int m : verifier_rows)
     {
         SCOPED_TRACE("M=" + std::to_string(m));
+        std::array<float, max_slots> replay_route_indices{};
+        std::array<float, max_slots> replay_route_weights{};
+        for (int row = 0; row < max_m; ++row)
+        {
+            for (int route = 0; route < top_k; ++route)
+            {
+                const size_t slot =
+                    static_cast<size_t>(row * top_k + route);
+                replay_route_indices[slot] =
+                    row < m
+                        ? static_cast<float>(
+                              route_pattern[
+                                  static_cast<size_t>(row) %
+                                  route_pattern.size()]
+                                           [static_cast<size_t>(route)])
+                        : -1.0f;
+                replay_route_weights[slot] = row < m ? 0.5f : 0.0f;
+            }
+        }
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                routing_indices->gpu_data_ptr(),
+                replay_route_indices.data(),
+                sizeof(replay_route_indices),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                routing_weights->gpu_data_ptr(),
+                replay_route_weights.data(),
+                sizeof(replay_route_weights),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
         ASSERT_EQ(
             cudaMemcpyAsync(
                 runtime_table.deviceLayerState(0),
@@ -2924,49 +3023,6 @@ TEST_F(Test__CUDAMoEKernel,
                 cudaMemcpyHostToDevice,
                 stream_),
             cudaSuccess);
-
-        ScopedCudaTestGraph graph(
-            stream_,
-            "resident verifier assignment lifecycle");
-        ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
-            runtime_table.deviceLayerState(0),
-            routing_indices.get(),
-            routing_weights.get(),
-            m,
-            m,
-            num_experts,
-            top_k,
-            /*filter_to_local_runtime_experts=*/false));
-        ASSERT_TRUE(
-            cuda_kernel_->assignPrefillRoutesLeastLoadedResident(
-                launchContext(),
-                runtime_table.deviceLayerState(0),
-                m,
-                m,
-                num_experts,
-                top_k,
-                device_positions));
-        ASSERT_TRUE(
-            cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
-                runtime_table.deviceLayerState(0),
-                m,
-            m,
-            num_experts,
-            top_k));
-        ASSERT_TRUE(
-            cuda_kernel_->commitGroupedVerifierHistograms(
-                launchContext(),
-                runtime_table.deviceLayerState(0),
-                static_cast<const int32_t *>(
-                    accepted_count_device.get()),
-                static_cast<const int32_t *>(
-                    publication_ok_device.get()),
-                /*request_count=*/1,
-                /*rows_per_request=*/m,
-                /*total_rows=*/m,
-                num_experts,
-                top_k));
-        ASSERT_TRUE(graph.finishAndInstantiate());
         ASSERT_TRUE(graph.launch());
         ASSERT_EQ(
             cudaStreamSynchronize(stream_),
@@ -15130,6 +15186,115 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
 #endif
 }
 
+/**
+ * @brief Capture the CUDA Q8 verifier router without executing an eager row.
+ *
+ * The production graph controller prepares immutable router-gate conversion
+ * and persistent row scratch before `cudaStreamBeginCapture`.  This regression
+ * starts capture immediately after that setup boundary, so a reintroduced lazy
+ * cache lookup fails here instead of first appearing in the CUDAx2 LLEP E2E.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       PreparedQ8VerifierRouterCapturesWithoutEagerWarmup)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedCudaMoERouterQ8Config q8_config(
+        /*router_q8=*/true,
+        /*reuse_router_q8_hidden=*/true);
+    constexpr int seq_len = 8;
+    constexpr int d_model = 2048;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+
+    std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (size_t i = 0; i < hidden_values.size(); ++i)
+        hidden_values[i] = 0.04f * std::sin(0.007f * static_cast<float>(i + 1));
+    for (size_t i = 0; i < gate_values.size(); ++i)
+        gate_values[i] = 0.03f * std::cos(0.011f * static_cast<float>(i + 3));
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto indices = makeZeros({seq_len, top_k});
+    auto weights = makeZeros({seq_len, top_k});
+    const llaminar2::DeviceId device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights->ensureOnDevice(device, stream_));
+
+    const llaminar2::MoERouteLaunchPlan launch_plan{
+        .kind = llaminar2::MoERouteLaunchKind::DecodeEquivalentVerifier,
+        .physical_rows = seq_len,
+        .d_model = d_model,
+        .num_experts = num_experts,
+        .top_k = top_k,
+    };
+    ASSERT_TRUE(cuda_kernel_->prepareRouteLaunch(gate.get(), launch_plan));
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+    llaminar2::PerfStatsCollector::reset();
+    ScopedCudaTestGraph graph(
+        stream_,
+        "prepared Q8 verifier router without eager warmup");
+    ASSERT_TRUE(cuda_kernel_->routeVerifierRowsDecodeEquivalent(
+        hidden.get(),
+        gate.get(),
+        seq_len,
+        d_model,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        indices.get(),
+        weights.get()));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::vector<float> indices_host(indices->numel());
+    std::vector<float> weights_host(weights->numel());
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            indices_host.data(),
+            indices->gpu_data_ptr(),
+            indices_host.size() * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream_),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            weights_host.data(),
+            weights->gpu_data_ptr(),
+            weights_host.size() * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream_),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    for (size_t slot = 0; slot < indices_host.size(); ++slot)
+    {
+        EXPECT_GE(indices_host[slot], 0.0f);
+        EXPECT_LT(indices_host[slot], static_cast<float>(num_experts));
+        EXPECT_TRUE(std::isfinite(weights_host[slot]));
+    }
+
+    double route_calls = 0.0;
+    for (const auto &record : llaminar2::PerfStatsCollector::snapshot(
+             {"kernel.cuda_moe_router_decode_equivalent_runtime_m_calls"}))
+    {
+        route_calls += record.value;
+    }
+    EXPECT_EQ(route_calls, 1.0)
+        << "only graph recording may invoke routing; preparation must not run an eager row";
+    llaminar2::PerfStatsCollector::reset();
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter)
 {
 #ifndef HAVE_CUDA
@@ -19701,7 +19866,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
 
             auto runtime_prefill_output = makeZeros(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-            ASSERT_TRUE(runtime_prefill_output->ensureOnDevice(device, stream_));
+            auto canonical_route_contributions = makeZeros(
+                {static_cast<size_t>(seq_len),
+                 static_cast<size_t>(top_k),
+                 static_cast<size_t>(d_model)});
+            ASSERT_EQ(runtime_prefill_output->gpu_data_ptr(), nullptr);
+            ASSERT_TRUE(
+                canonical_route_contributions->ensureOnDevice(device, stream_));
 
             ASSERT_TRUE(moe_kernel.routeVerifierRowsDecodeEquivalent(
                 hidden.get(),
@@ -19734,8 +19905,22 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 d_model,
                 intermediate,
                 num_experts,
-                top_k))
+                top_k,
+                canonical_route_contributions.get()))
                 << format.label << " runtime grouped verifier prefill M=" << seq_len;
+            ASSERT_EQ(runtime_prefill_output->gpu_data_ptr(), nullptr)
+                << format.label << " M=" << seq_len
+                << " runtime canonical producer must leave the later reducer "
+                   "output unallocated";
+            ASSERT_TRUE(runtime_prefill_output->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                canonical_route_contributions.get(),
+                runtime_prefill_output.get(),
+                seq_len,
+                top_k,
+                d_model))
+                << format.label
+                << " runtime canonical route reduction M=" << seq_len;
             ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
             ASSERT_TRUE(runtime_prefill_output->ensureOnHost(stream_));
             const std::vector<float> grouped_values(
@@ -21070,7 +21255,10 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
 
             auto grouped_output = llaminar2::test::TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+            if (masked_local_tp)
+                ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr);
+            else
+                ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
             auto canonical_route_contributions =
                 llaminar2::test::TestTensorFactory::createFP32(
                     {static_cast<size_t>(seq_len),
@@ -21125,6 +21313,11 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 << " grouped verifier prefill M=" << seq_len;
             if (masked_local_tp)
             {
+                ASSERT_EQ(grouped_output->gpu_data_ptr(), nullptr)
+                    << case_label << " M=" << seq_len
+                    << " canonical producer must not allocate or touch the "
+                       "later reducer output";
+                ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
                 ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
                     canonical_route_contributions.get(),
                     grouped_output.get(),
@@ -21263,7 +21456,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 stage_canonical_route_contributions->numel(),
                 std::numeric_limits<float>::quiet_NaN());
             ASSERT_TRUE(direct_output->ensureOnDevice(device, stream_));
-            ASSERT_TRUE(stage_output->ensureOnDevice(device, stream_));
+            ASSERT_EQ(stage_output->gpu_data_ptr(), nullptr);
             ASSERT_TRUE(
                 stage_canonical_route_contributions->ensureOnDevice(
                     device,
@@ -21323,6 +21516,11 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 << case_label
                 << " partial-ownership M=1 verifier stage must admit the "
                    "mask-aware explicit-routing path";
+            ASSERT_EQ(stage_output->gpu_data_ptr(), nullptr)
+                << case_label
+                << " M=1 canonical producer must leave the later reducer "
+                   "output unallocated";
+            ASSERT_TRUE(stage_output->ensureOnDevice(device, stream_));
 
             llaminar2::MoECanonicalRouteReduceStage::Params reduce_params;
             reduce_params.device_id = device;

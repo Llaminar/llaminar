@@ -935,7 +935,8 @@ namespace llaminar2
                             logical_seq_len,
                             query_rows_for_params,
                             gpuStream(),
-                            effective_kv_stride))
+                            effective_kv_stride,
+                            params_.active_query_rows_device))
                     {
                         LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
                                   << params_.layer_idx << " on " << params_.device_id.toString());

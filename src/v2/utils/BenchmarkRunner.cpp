@@ -827,6 +827,29 @@ namespace llaminar2
 
     std::pair<bool, double> BenchmarkRunner::runPrefill(const std::vector<int> &tokens)
     {
+        /*
+         * Throughput benchmarks have a fixed `-n` response contract and every
+         * decode invocation below deliberately ignores model stop tokens.  That
+         * policy must be admitted identically on CPU and GPU: publishing the
+         * tokenizer's stop set to the device while only the host ignores it lets
+         * a device-owned generation loop terminate early.  The benchmark then
+         * attempts a second decode transaction against the already-consumed
+         * request admission.
+         *
+         * An empty request stop set makes `-n` the sole terminal condition for
+         * the complete request, including captured MTP verifier/controller
+         * execution.  It is published before prefill through the ordinary
+         * request-admission path; decode never polls or repairs the policy.
+         */
+        static const std::vector<int32_t> kFixedLengthBenchmarkStopTokens;
+        if (!runner_->configureMTPRequestStopTokens(
+                kFixedLengthBenchmarkStopTokens))
+        {
+            last_failure_reason_ =
+                "benchmark runner rejected fixed-length stop policy at request admission";
+            return {false, 0.0};
+        }
+
         // Synchronize all ranks before timing (skip for single-rank)
         if (mpi_ctx_->world_size() > 1)
             mpi_ctx_->barrier();

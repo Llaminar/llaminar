@@ -802,6 +802,16 @@ namespace llaminar2
                   << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
 
         runner_.setSamplingParams(effective);
+        /*
+         * Stop policy is part of request admission, just like sampling policy.
+         * In particular, a captured MTP verifier must see ChatML terminators on
+         * device before prefill publishes the first decode boundary.  The HTTP
+         * response loop may still recognize the terminal token after the final
+         * result is materialized, but it is not allowed to become an alternate
+         * authority that clips a transaction after later verifier rows have
+         * already mutated KV or recurrent state.
+         */
+        runner_.setStopTokens(tokenizer_.stop_tokens());
 
         // Encode with chat template (pass tools for tool-aware templates)
         std::string tools_json;

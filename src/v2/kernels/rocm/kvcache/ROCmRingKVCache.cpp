@@ -175,16 +175,16 @@ namespace llaminar2
 
     extern "C" void hip_ring_append_verifier_rows_dynamic_fp32(
         float *, float *, const float *, const float *,
-        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+        const int *, const int *, int, int, int, int, bool, bool, hipStream_t);
     extern "C" void hip_ring_append_verifier_rows_dynamic_fp16(
         _Float16 *, _Float16 *, const _Float16 *, const _Float16 *,
-        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+        const int *, const int *, int, int, int, int, bool, bool, hipStream_t);
     extern "C" void hip_ring_append_verifier_rows_dynamic_bf16(
         hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
-        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+        const int *, const int *, int, int, int, int, bool, bool, hipStream_t);
     extern "C" void hip_ring_append_verifier_rows_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
-        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+        const int *, const int *, int, int, int, int, bool, bool, hipStream_t);
 
     extern "C" bool hip_convert_tensor_to_fp16(
         const void *d_src,
@@ -282,7 +282,7 @@ namespace llaminar2
         }
         const auto target = DeviceId::rocm(device_id());
 
-        const auto prepare_input = [&](const ITensor *tensor, const char *label)
+        const auto require_input = [&](const ITensor *tensor, const char *label)
         {
             if (const auto *prepared =
                     dynamic_cast<const PreparedGpuTensorView *>(tensor))
@@ -302,18 +302,18 @@ namespace llaminar2
              * carries the exact backend-qualified device and stream on which
              * the parent tensor was already ordered.
              */
-            TransferEngine::prepareDeviceInput(
+            TransferEngine::requireDeviceInput(
                 const_cast<ITensor *>(tensor), target, gpu_stream);
         };
-        prepare_input(K, "K");
-        prepare_input(V, "V");
+        require_input(K, "K");
+        require_input(V, "V");
 
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[IROCmRingKVCache::appendWithStream] K or V tensor lacks GPU data after TransferEngine preparation");
+            LOG_ERROR("[IROCmRingKVCache::appendWithStream] K or V tensor lacks validated GPU storage");
             return false;
         }
 
@@ -1144,35 +1144,38 @@ namespace llaminar2
 
         EntryT &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
-        const int source_start = std::max(0, verifier_rows - max_seq_len_);
-        const int rows_to_write = verifier_rows - source_start;
 
         const int head_storage_dim =
             (Precision == ActivationPrecision::Q8_1)
                 ? (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE
                 : head_dim_;
 
-        auto launch_dynamic = [&](const int *d_head)
+        auto launch_dynamic = [&](const int *d_head,
+                                  const int *d_append_count)
         {
             if constexpr (Precision == ActivationPrecision::FP32)
                 hip_ring_append_verifier_rows_dynamic_fp32(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                           verifier_rows, source_start, rows_to_write,
+                                                           d_head, d_append_count,
+                                                           max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows,
                                                            k_head_major, v_head_major, stream);
             else if constexpr (Precision == ActivationPrecision::FP16)
                 hip_ring_append_verifier_rows_dynamic_fp16(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                           verifier_rows, source_start, rows_to_write,
+                                                           d_head, d_append_count,
+                                                           max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows,
                                                            k_head_major, v_head_major, stream);
             else if constexpr (Precision == ActivationPrecision::BF16)
                 hip_ring_append_verifier_rows_dynamic_bf16(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                           verifier_rows, source_start, rows_to_write,
+                                                           d_head, d_append_count,
+                                                           max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows,
                                                            k_head_major, v_head_major, stream);
             else
                 hip_ring_append_verifier_rows_dynamic_q8_1(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                           verifier_rows, source_start, rows_to_write,
+                                                           d_head, d_append_count,
+                                                           max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows,
                                                            k_head_major, v_head_major, stream);
         };
 
@@ -1182,10 +1185,12 @@ namespace llaminar2
             return false;
         }
         const int idx = layer * batch_size_ + seq_idx;
-        launch_dynamic(&d_head_params_[idx]);
-        hip_kv_sequence_state_advance(
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
+        launch_dynamic(&d_head_params_[idx], d_append_count);
+        hip_kv_sequence_state_advance_dynamic(
             &d_head_params_[idx], &d_count_params_[idx],
-            verifier_rows, max_seq_len_, stream);
+            d_append_count, verifier_rows, max_seq_len_, stream);
 
         const hipError_t launch_err = hipGetLastError();
         if (launch_err != hipSuccess)
@@ -1211,6 +1216,7 @@ namespace llaminar2
              {"source_k_layout", k_head_major ? "head_major" : "position_major"},
              {"source_v_layout", v_head_major ? "head_major" : "position_major"},
              {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"row_count_policy", d_append_count ? "resident_device_count" : "captured_exact_shape"},
              {"topology", (local_n_kv_heads_ != n_kv_heads_ || kv_head_start_ != 0)
                               ? "local_tp_shard"
                               : "replicated"},

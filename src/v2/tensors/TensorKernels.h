@@ -1940,19 +1940,25 @@ namespace llaminar2
          * @param kv_stride Stable positive physical request-major K/V row
          *        capacity. This value is mandatory because the live count is a
          *        device pointer and cannot safely determine host launch shape.
+         * @param active_query_rows_device Optional device INT32 logical width.
+         *        When non-null, @p seq_len and @p query_rows remain immutable
+         *        physical launch geometry while this scalar determines which
+         *        leading rows may observe and publish serial-equivalent state.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
             void *stream,
-            int kv_stride)
+            int kv_stride,
+            const int *active_query_rows_device = nullptr)
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;
             (void)query_rows;
             (void)stream;
             (void)kv_stride;
+            (void)active_query_rows_device;
             return false;
         }
     };
@@ -2548,6 +2554,29 @@ namespace llaminar2
     class ITensorRoPE : public ITensorKernel
     {
     public:
+        /**
+         * @brief Prepare immutable RoPE state before GPU graph capture.
+         *
+         * GPU implementations publish the exact `(rotary_dim, rope_theta)`
+         * inverse-frequency table on their bound explicit stream and adopt its
+         * readiness event. The operation is setup-only: captured execution must
+         * consume the resulting device pointer without registry access,
+         * allocation, transfer, or lazy initialization. CPU implementations do
+         * not need a device publication and therefore use this no-op default.
+         *
+         * @param rotary_dim Number of head elements rotated by RoPE.
+         * @param rope_theta Positive finite RoPE frequency base.
+         * @return True when the exact invariant state is ready for capture.
+         */
+        virtual bool prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            (void)rotary_dim;
+            (void)rope_theta;
+            return true;
+        }
+
         /**
          * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
          *

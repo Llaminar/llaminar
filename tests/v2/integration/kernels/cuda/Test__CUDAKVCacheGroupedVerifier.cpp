@@ -391,24 +391,55 @@ namespace
      * @brief Execute one grouped publication entirely inside a CUDA graph.
      *
      * The captured kernels read and advance the cache's canonical device head
-     * and count. No host sequence metadata is uploaded before capture or
-     * adopted after replay.
+     * and count. When @p logical_rows is positive, test setup publishes that
+     * value into a persistent device scalar before capture and binds the scalar
+     * through the same cache API used by production padded verifier graphs.
+     * The captured graph itself contains no host transfer or state adoption.
      */
     bool appendGrouped(
         IKVCache &cache,
         const ITensor *k,
         const ITensor *v,
         int verifier_rows,
+        int logical_rows,
         void *opaque_stream)
     {
         const auto stream = static_cast<cudaStream_t>(opaque_stream);
         if (!stream || !cache.isGraphCaptureReady())
             return false;
 
+        int32_t *device_logical_rows = nullptr;
+        if (logical_rows > 0)
+        {
+            if (logical_rows > verifier_rows ||
+                cudaMalloc(&device_logical_rows, sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpyAsync(
+                    device_logical_rows,
+                    &logical_rows,
+                    sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    stream) != cudaSuccess ||
+                !cache.bindGraphAppendCountSource(
+                    0,
+                    0,
+                    device_logical_rows,
+                    verifier_rows,
+                    opaque_stream))
+            {
+                if (device_logical_rows)
+                    (void)cudaFree(device_logical_rows);
+                return false;
+            }
+        }
+
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t executable = nullptr;
         if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess)
+        {
+            if (device_logical_rows)
+                (void)cudaFree(device_logical_rows);
             return false;
+        }
         bool append_ok = false;
         {
             GraphCaptureGuard guard;
@@ -420,12 +451,16 @@ namespace
         {
             if (graph)
                 (void)cudaGraphDestroy(graph);
+            if (device_logical_rows)
+                (void)cudaFree(device_logical_rows);
             return false;
         }
         if (cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess ||
             !executable)
         {
             (void)cudaGraphDestroy(graph);
+            if (device_logical_rows)
+                (void)cudaFree(device_logical_rows);
             return false;
         }
 
@@ -434,6 +469,13 @@ namespace
             cudaStreamSynchronize(stream) == cudaSuccess;
         (void)cudaGraphExecDestroy(executable);
         (void)cudaGraphDestroy(graph);
+        if (device_logical_rows)
+        {
+            const bool unbound = cache.bindGraphAppendCountSource(
+                0, 0, nullptr, verifier_rows, opaque_stream);
+            (void)cudaFree(device_logical_rows);
+            return replay_ok && unbound;
+        }
         return replay_ok;
     }
 

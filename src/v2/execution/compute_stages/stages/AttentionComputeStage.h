@@ -78,6 +78,16 @@ namespace llaminar2
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
+            /**
+             * @brief Device-owned logical query width for a scalar GPU graph.
+             *
+             * A fixed-width grouped-verifier graph can launch more physical
+             * rows than the current MTP transaction owns. Attention derives
+             * serial-equivalent per-row KV horizons from this stable scalar;
+             * no host length participates in capture or replay.
+             */
+            const int32_t *active_query_rows_device = nullptr;
+
             // When true, read K/V from kv_cache at execution time instead of
             // using the statically-wired K/V pointers. Enables GPU prefill to
             // use post-append FP16 cache tensors instead of Q8_1 projections.

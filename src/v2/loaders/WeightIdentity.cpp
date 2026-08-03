@@ -1,3 +1,8 @@
+/**
+ * @file WeightIdentity.cpp
+ * @brief Implements semantic model-weight identity and canonical-name inference.
+ */
+
 #include "WeightIdentity.h"
 
 #include <functional>
@@ -26,6 +31,7 @@ namespace llaminar2
         case WeightRole::MoEExpertUp: return "MoEExpertUp";
         case WeightRole::MoEExpertDown: return "MoEExpertDown";
         case WeightRole::SharedExpertGate: return "SharedExpertGate";
+        case WeightRole::SharedExpertInputGate: return "SharedExpertInputGate";
         case WeightRole::SharedExpertUp: return "SharedExpertUp";
         case WeightRole::SharedExpertDown: return "SharedExpertDown";
         case WeightRole::Norm: return "Norm";
@@ -119,7 +125,7 @@ namespace llaminar2
         if (name.find("ffn_up_exps.weight") != std::string::npos) return WeightRole::MoEExpertUp;
         if (name.find("ffn_down_exps.weight") != std::string::npos) return WeightRole::MoEExpertDown;
         if (name.find("ffn_gate_inp.weight") != std::string::npos) return WeightRole::MoERouter;
-        if (name.find("ffn_gate_inp_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
+        if (name.find("ffn_gate_inp_shexp.weight") != std::string::npos) return WeightRole::SharedExpertInputGate;
         if (name.find("ffn_gate_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
         if (name.find("ffn_up_shexp.weight") != std::string::npos) return WeightRole::SharedExpertUp;
         if (name.find("ffn_down_shexp.weight") != std::string::npos) return WeightRole::SharedExpertDown;

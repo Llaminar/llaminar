@@ -35,6 +35,7 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "loaders/gpu_pipeline/WeightTranslator.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "../utils/TestTensorFactory.h"
 
 #ifdef HAVE_CUDA
@@ -169,6 +170,53 @@ private:
     std::unique_ptr<MmapRegion> region_;
 };
 
+using VnniTensorFactory =
+    std::function<std::unique_ptr<TensorBase>(size_t, size_t)>;
+
+/**
+ * @brief One launchable source format and its deterministic tensor factory.
+ */
+struct VnniFormatCase
+{
+    const char* name;
+    VnniTensorFactory create;
+};
+
+/**
+ * @brief Return the single all-format catalog shared by packing regressions.
+ *
+ * Keeping row-chunk and grouped-layout tests on one catalog prevents a newly
+ * supported codebook from being certified by one storage mode but silently
+ * omitted from the other.
+ */
+const std::vector<VnniFormatCase>& allLaunchableVnniFormats()
+{
+    static const std::vector<VnniFormatCase> formats = {
+        {"Q4_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_0Random({n, k}); }},
+        {"IQ4_NL", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"Q4_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q5_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_0Random({n, k}); }},
+        {"Q5_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q8_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_0Random({n, k}); }},
+        {"Q8_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_1Random({n, k}); }},
+        {"Q8_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_KRandom({n, k}); }},
+        {"IQ4_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_XSRandom({n, k}); }},
+        {"Q4_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_KRandom({n, k}); }},
+        {"Q5_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_KRandom({n, k}); }},
+        {"Q6_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ6_KRandom({n, k}); }},
+        {"Q3_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ3_KRandom({n, k}); }},
+        {"Q2_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ2_KRandom({n, k}); }},
+        {"IQ3_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_SRandom({n, k}); }},
+        {"IQ3_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+        {"IQ2_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_SRandom({n, k}); }},
+        {"IQ2_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+        {"IQ2_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+        {"IQ1_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_SRandom({n, k}); }},
+        {"IQ1_M", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_MRandom({n, k}); }},
+    };
+    return formats;
+}
+
 // ============================================================================
 // Test fixture — parameterized over backend name
 // ============================================================================
@@ -256,12 +304,14 @@ protected:
                             uint8_t* d_payload, uint16_t* d_scales,
                             uint16_t* d_mins, uint32_t* d_emins,
                             int N, int K, int output_N,
-                            int output_row_offset) {
+                            int output_row_offset,
+                            int packed_group_rows = 0) {
         if (device_type_ == DeviceType::CUDA) {
 #ifdef HAVE_CUDA
             return launchVnniRepackCUDA(
                 format, d_raw, d_payload, d_scales, d_mins, d_emins,
-                N, K, output_N, output_row_offset, stream_);
+                N, K, output_N, output_row_offset,
+                packed_group_rows, stream_);
 #else
             return false;
 #endif
@@ -270,7 +320,8 @@ protected:
 #ifdef HAVE_ROCM
             return launchVnniRepack(
                 format, d_raw, d_payload, d_scales, d_mins, d_emins,
-                N, K, output_N, output_row_offset, stream_);
+                N, K, output_N, output_row_offset,
+                packed_group_rows, stream_);
 #else
             return false;
 #endif
@@ -479,36 +530,7 @@ TEST_P(VnniUnpackTest, RoundTrip_Q8_K) {
  * stride.
  */
 TEST_P(VnniUnpackTest, RowChunkedRepackMatchesWholeMatrixForEveryFormat) {
-    using Factory =
-        std::function<std::unique_ptr<TensorBase>(size_t, size_t)>;
-    struct FormatCase {
-        const char* name;
-        Factory create;
-    };
-
-    const std::vector<FormatCase> formats = {
-        {"Q4_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_0Random({n, k}); }},
-        {"IQ4_NL", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_NLRandom({n, k}); }},
-        {"Q4_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_1Random({n, k}); }},
-        {"Q5_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_0Random({n, k}); }},
-        {"Q5_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_1Random({n, k}); }},
-        {"Q8_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_0Random({n, k}); }},
-        {"Q8_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_1Random({n, k}); }},
-        {"Q8_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_KRandom({n, k}); }},
-        {"IQ4_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_XSRandom({n, k}); }},
-        {"Q4_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_KRandom({n, k}); }},
-        {"Q5_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_KRandom({n, k}); }},
-        {"Q6_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ6_KRandom({n, k}); }},
-        {"Q3_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ3_KRandom({n, k}); }},
-        {"Q2_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ2_KRandom({n, k}); }},
-        {"IQ3_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_SRandom({n, k}); }},
-        {"IQ3_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
-        {"IQ2_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_SRandom({n, k}); }},
-        {"IQ2_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XSRandom({n, k}); }},
-        {"IQ2_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
-        {"IQ1_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_SRandom({n, k}); }},
-        {"IQ1_M", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_MRandom({n, k}); }},
-    };
+    const auto& formats = allLaunchableVnniFormats();
 
     constexpr int N = 11;
     constexpr int K = 256;
@@ -614,6 +636,182 @@ TEST_P(VnniUnpackTest, RowChunkedRepackMatchesWholeMatrixForEveryFormat) {
             whole_mins, chunked_mins, mins_bytes, "mins");
         expect_device_bytes_equal(
             whole_emins, chunked_emins, emins_bytes, "emins");
+    }
+}
+
+/**
+ * @brief Prove coalesced expert packing equals independent expert launches.
+ *
+ * Production reads one contiguous GGUF parent and packs it into a slab whose
+ * expert subregions must remain directly consumable by the existing GEMM and
+ * transfer kernels. The bounded chunks below intentionally begin and end
+ * inside different seven-row experts. This catches both the historical
+ * full-N block-major interleaving bug and chunk-boundary indexing mistakes for
+ * every payload/metadata geometry on both GPU backends.
+ */
+TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
+    constexpr int kExpertCount = 3;
+    constexpr int kRowsPerExpert = 7;
+    constexpr int kTotalRows = kExpertCount * kRowsPerExpert;
+    constexpr int kColumns = 256;
+    constexpr int kMaximumChunkRows = 8;
+    constexpr int kChunkRows[] = {5, 8, 8};
+
+    for (const auto& format_case : allLaunchableVnniFormats()) {
+        SCOPED_TRACE(::testing::Message()
+                     << GetParam() << "/" << format_case.name);
+
+        auto tensor = format_case.create(kTotalRows, kColumns);
+        ASSERT_NE(tensor, nullptr);
+        const auto* unpackable =
+            dynamic_cast<const IINT8Unpackable*>(tensor.get());
+        ASSERT_NE(unpackable, nullptr);
+        const auto* info = unpackable->vnniFormatInfo();
+        ASSERT_NE(info, nullptr);
+        const auto format = codebookIdToRepackFormat(
+            info->codebook_id, info->is_superblock);
+        ASSERT_TRUE(format.has_value());
+        ASSERT_EQ(
+            tensor->size_bytes() % static_cast<size_t>(kTotalRows), 0u);
+
+        const size_t source_row_bytes =
+            tensor->size_bytes() / static_cast<size_t>(kTotalRows);
+        const auto expert_regions = nativeVnniPackedRegionSizes(
+            kRowsPerExpert, kColumns, *info);
+        const auto slab_regions = nativeVnniPackedRegionSizes(
+            kTotalRows, kColumns, *info);
+
+        ASSERT_EQ(
+            slab_regions.payload_bytes,
+            kExpertCount * expert_regions.payload_bytes);
+        ASSERT_EQ(
+            slab_regions.scales_bytes,
+            kExpertCount * expert_regions.scales_bytes);
+        ASSERT_EQ(
+            slab_regions.mins_bytes,
+            kExpertCount * expert_regions.mins_bytes);
+        ASSERT_EQ(
+            slab_regions.emins_bytes,
+            kExpertCount * expert_regions.emins_bytes);
+
+        GpuMem standalone_raw(
+            backend_, device_id_,
+            source_row_bytes * static_cast<size_t>(kRowsPerExpert));
+        GpuMem grouped_raw(
+            backend_, device_id_,
+            source_row_bytes * static_cast<size_t>(kMaximumChunkRows));
+        GpuMem standalone_payload(
+            backend_, device_id_, slab_regions.payload_bytes);
+        GpuMem standalone_scales(
+            backend_, device_id_, slab_regions.scales_bytes);
+        GpuMem standalone_mins(
+            backend_, device_id_, slab_regions.mins_bytes);
+        GpuMem standalone_emins(
+            backend_, device_id_, slab_regions.emins_bytes);
+        GpuMem grouped_payload(
+            backend_, device_id_, slab_regions.payload_bytes);
+        GpuMem grouped_scales(
+            backend_, device_id_, slab_regions.scales_bytes);
+        GpuMem grouped_mins(
+            backend_, device_id_, slab_regions.mins_bytes);
+        GpuMem grouped_emins(
+            backend_, device_id_, slab_regions.emins_bytes);
+
+        ASSERT_NE(standalone_raw.ptr, nullptr);
+        ASSERT_NE(grouped_raw.ptr, nullptr);
+        ASSERT_NE(standalone_payload.ptr, nullptr);
+        ASSERT_NE(standalone_scales.ptr, nullptr);
+        ASSERT_NE(grouped_payload.ptr, nullptr);
+        ASSERT_NE(grouped_scales.ptr, nullptr);
+
+        const auto* source =
+            static_cast<const uint8_t*>(tensor->raw_data());
+        for (int expert = 0; expert < kExpertCount; ++expert) {
+            const size_t source_offset =
+                static_cast<size_t>(expert * kRowsPerExpert) *
+                source_row_bytes;
+            ASSERT_TRUE(backend_->hostToDevice(
+                standalone_raw.ptr,
+                source + source_offset,
+                source_row_bytes * static_cast<size_t>(kRowsPerExpert),
+                device_id_, stream_));
+
+            auto* payload = standalone_payload.u8() +
+                            static_cast<size_t>(expert) *
+                                expert_regions.payload_bytes;
+            auto* scales = reinterpret_cast<uint16_t*>(
+                standalone_scales.u8() +
+                static_cast<size_t>(expert) * expert_regions.scales_bytes);
+            auto* mins = info->is_asymmetric
+                             ? reinterpret_cast<uint16_t*>(
+                                   standalone_mins.u8() +
+                                   static_cast<size_t>(expert) *
+                                       expert_regions.mins_bytes)
+                             : nullptr;
+            auto* emins = info->has_emins
+                              ? reinterpret_cast<uint32_t*>(
+                                    standalone_emins.u8() +
+                                    static_cast<size_t>(expert) *
+                                        expert_regions.emins_bytes)
+                              : nullptr;
+            ASSERT_TRUE(forwardRepackChunk(
+                *format, standalone_raw.ptr,
+                payload, scales, mins, emins,
+                kRowsPerExpert, kColumns, kRowsPerExpert, 0));
+        }
+
+        int row_offset = 0;
+        for (const int chunk_rows : kChunkRows) {
+            const size_t chunk_bytes =
+                static_cast<size_t>(chunk_rows) * source_row_bytes;
+            ASSERT_TRUE(backend_->hostToDevice(
+                grouped_raw.ptr,
+                source + static_cast<size_t>(row_offset) * source_row_bytes,
+                chunk_bytes, device_id_, stream_));
+            ASSERT_TRUE(forwardRepackChunk(
+                *format, grouped_raw.ptr,
+                grouped_payload.u8(), grouped_scales.u16(),
+                info->is_asymmetric ? grouped_mins.u16() : nullptr,
+                info->has_emins ? grouped_emins.u32() : nullptr,
+                chunk_rows, kColumns, kTotalRows, row_offset,
+                kRowsPerExpert));
+            row_offset += chunk_rows;
+        }
+        ASSERT_EQ(row_offset, kTotalRows);
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+
+        auto expect_device_bytes_equal =
+            [&](const GpuMem& standalone,
+                const GpuMem& grouped,
+                size_t bytes,
+                const char* field) {
+                if (bytes == 0)
+                    return;
+                std::vector<uint8_t> expected(bytes);
+                std::vector<uint8_t> actual(bytes);
+                ASSERT_TRUE(backend_->deviceToHost(
+                    expected.data(), standalone.ptr, bytes,
+                    device_id_, stream_));
+                ASSERT_TRUE(backend_->deviceToHost(
+                    actual.data(), grouped.ptr, bytes,
+                    device_id_, stream_));
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(stream_, device_id_));
+                EXPECT_EQ(actual, expected) << field;
+            };
+
+        expect_device_bytes_equal(
+            standalone_payload, grouped_payload,
+            slab_regions.payload_bytes, "payload");
+        expect_device_bytes_equal(
+            standalone_scales, grouped_scales,
+            slab_regions.scales_bytes, "scales");
+        expect_device_bytes_equal(
+            standalone_mins, grouped_mins,
+            slab_regions.mins_bytes, "mins");
+        expect_device_bytes_equal(
+            standalone_emins, grouped_emins,
+            slab_regions.emins_bytes, "emins");
     }
 }
 

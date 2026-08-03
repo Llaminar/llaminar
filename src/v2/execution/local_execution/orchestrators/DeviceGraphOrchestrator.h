@@ -53,6 +53,7 @@
 #include "../../prefix_cache/PrefixStorageBackend.h"   // PrefixBlockHandle restore-source ownership
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
+#include "../../mtp/MTPVerifierPolicy.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
@@ -1975,7 +1976,7 @@ namespace llaminar2
         const void *prepareMTPVerifierInputTokenBatchOnDevice(
             const DeviceMTPVerifierInputBatchRequest *requests,
             int request_count,
-            int padded_seq_len) override;
+            int logical_padded_seq_len) override;
         const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
             const int32_t *verifier_tokens,
             int total_verifier_input_tokens,
@@ -2723,14 +2724,14 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
-        bool beginDeviceResidentStochasticGeneration(
+        bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens) override;
-        bool materializeDeviceResidentStochasticGeneration(
+        bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth) override;
-        bool launchDeviceResidentStochasticGeneration() override;
-        bool finishDeviceResidentStochasticGeneration(
+        bool launchDeviceResidentGeneration() override;
+        bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;
 
         /**
@@ -2794,11 +2795,11 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
-         * @brief Borrow the all-position forward paired with active preparation.
+         * @brief Borrow the all-position forward paired with the exact registry key.
          *
          * This is intentionally not a general forwarding wrapper around
-         * ForwardExecutionEngine.  The active preparation identity must validate
-         * first, and the retained forward signature must consume that exact
+         * ForwardExecutionEngine. The requested preparation registry slot must
+         * validate first, and its retained forward signature must consume that exact
          * request geometry and compact row count through persistent device token,
          * position, and length inputs.
          *
@@ -4241,6 +4242,64 @@ namespace llaminar2
             const char *reason);
 
         /**
+         * @brief Initialize persistent target/draft sample banks before decode.
+         *
+         * The banks are range-published by independent sampler operations, but
+         * BufferArena tracks authority at tensor granularity. Setup therefore
+         * fills every slot with an invalid sentinel and publishes each backing
+         * tensor once. This establishes stable completion-event storage before
+         * the hot path; later readiness publication only re-records existing
+         * events on the exact sampler stream.
+         *
+         * Per-slot readiness remains the semantic validity gate. Initializing
+         * the backing tensors does not make any slot consumable.
+         *
+         * @param producer_stream Explicit setup stream carrying all fills.
+         * @param reason Stable lifecycle reason used by fatal diagnostics.
+         * @return true after every bank has initialized device authority.
+         */
+        bool initializeAndPublishMTPSampleBanksOnStream(
+            void *producer_stream,
+            const char *reason);
+
+        /**
+         * @brief Initialize the persistent response ledger and controller on device.
+         *
+         * Arena allocation establishes stable addresses but does not establish
+         * initialized bytes or device authority.  This setup-only operation
+         * fills the complete response ledger with the invalid-token sentinel,
+         * clears every controller row, and publishes both writes through their
+         * exact producer stream.  Performing the first publication during
+         * setup also creates the persistent tensor completion events before a
+         * request enters the generation hot path.
+         *
+         * @param producer_stream Explicit setup stream carrying both fills.
+         * @param reason Stable lifecycle reason used by fatal diagnostics.
+         * @return true only after both arena tensors hold initialized,
+         *         event-published device authority.
+         */
+        bool initializeAndPublishDeviceGenerationStorageOnStream(
+            void *producer_stream,
+            const char *reason);
+
+        /**
+         * @brief Publish both device-generation arena tensors as one lifecycle edge.
+         *
+         * Every device-generation producer writes the response ledger and the
+         * controller as one logical transaction.  Keeping their arena
+         * publication behind this helper prevents the private controller event
+         * and the graph executor's arena frontier from observing different
+         * generations of the same transaction.
+         *
+         * @param producer_stream Exact stream carrying the complete transaction.
+         * @param producer Stable producer name used by diagnostics.
+         * @return true only when both arena tensors publish the exact stream.
+         */
+        bool publishDeviceGenerationArenaState(
+            void *producer_stream,
+            const char *producer);
+
+        /**
          * @brief Clear the device-side "sample token is ready" marker for one draft slot.
          *
          * Draft sample slots are reused across decode iterations.  Clearing
@@ -4285,7 +4344,9 @@ namespace llaminar2
          * runner-owned device slot.  A host D2H scalar read is only an optional
          * observation of that slot; it must not erase the device readiness edge.
          * This helper records a backend event on the producer stream immediately
-         * after the sample kernel so later GPU consumers can wait without using
+         * after the sample kernel and publishes the draft bank through
+         * BufferArena on that same stream. Later GPU consumers can therefore
+         * validate device authority and wait for the exact slot without using
          * the device-default stream or synchronizing the CPU.
          */
         bool recordStochasticDraftSampleReady(
@@ -4300,7 +4361,8 @@ namespace llaminar2
          * in a separate arena buffer so verifier row outputs can overwrite
          * STOCHASTIC_VERIFY_TOKENS without corrupting the first generated token,
          * and a host read of the first token remains independent from device
-         * summary-kernel ownership.
+         * summary-kernel ownership. The same call also publishes tensor-level
+         * arena authority on the exact target-sampler stream.
          */
         bool recordStochasticTargetSampleReady(
             int slot,
@@ -6239,7 +6301,55 @@ namespace llaminar2
         };
 
         /**
-         * @brief Capture owner for one immutable grouped-verifier preparation geometry.
+         * @brief Immutable controller policy embedded by verifier preparation.
+         *
+         * Standalone grouped verification derives its logical width from the
+         * staged row plan. A device-generation parent instead reads live depth
+         * from its resident controller. Those kernels have different pointer
+         * topology and must therefore own distinct capture slots even when
+         * request count and physical row geometry match.
+         */
+        enum class MTPVerifierPreparationControlPolicy : uint8_t
+        {
+            Standalone = 0,
+            DeviceGenerationControlled = 1,
+            Count = 2,
+        };
+
+        static constexpr size_t
+            kMTPVerifierPreparationControlPolicyCount =
+                static_cast<size_t>(
+                    MTPVerifierPreparationControlPolicy::Count);
+
+        /**
+         * @brief Exact structural address of one verifier-preparation capture.
+         *
+         * Controller policy, request count, and physical row stride are known
+         * before graph lookup. They therefore address one deterministic slot in
+         * the bounded registry; no caller may search by recency, compare nearest
+         * geometries, or replace a same-generation slot with different pointer
+         * topology.
+         */
+        struct MTPVerifierPreparationGraphKey
+        {
+            MTPVerifierPreparationControlPolicy control_policy =
+                MTPVerifierPreparationControlPolicy::Standalone;
+            int request_count = 0;
+            int padded_seq_len = 0;
+
+            [[nodiscard]] bool populated() const noexcept
+            {
+                return control_policy !=
+                           MTPVerifierPreparationControlPolicy::Count &&
+                       request_count > 0 && padded_seq_len > 0;
+            }
+
+            bool operator==(
+                const MTPVerifierPreparationGraphKey &) const = default;
+        };
+
+        /**
+         * @brief Capture owner for one immutable grouped-verifier registry key.
          *
          * Dynamic token values and KV metadata remain behind persistent device
          * addresses.  The graph identity contains only pointer topology,
@@ -6249,9 +6359,12 @@ namespace llaminar2
          */
         struct MTPVerifierPreparationGraphCache
         {
+            MTPVerifierPreparationGraphKey key;
             std::unique_ptr<ComputeGraph> graph;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             MTPVerifierPreparationStage *stage = nullptr;
+            /** Exact replay-ready forward capture paired with this preparation. */
+            std::optional<ForwardGraphSignature> paired_forward_signature;
             uint64_t workspace_generation = 0;
             bool valid = false;
 
@@ -6277,41 +6390,11 @@ namespace llaminar2
                     DeviceGraphExecutor::GraphSegmentCache::
                         StreamResetPolicy::Destroy);
                 graph.reset();
+                key = {};
                 stage = nullptr;
+                paired_forward_signature.reset();
                 workspace_generation = 0;
                 valid = false;
-            }
-        };
-
-        /**
-         * @brief Identity of the verifier preparation that completed this transaction.
-         *
-         * A family index by itself is insufficient: an invalidated owner can be
-         * repopulated at the same index.  Retaining the exact stage address and
-         * workspace generation makes replacement, arena rebinding, and stale
-         * geometry observable without reading any device value on host.
-         */
-        struct ActiveMTPVerifierPreparationGraph
-        {
-            size_t family_index = 0;
-            const MTPVerifierPreparationStage *stage = nullptr;
-            uint64_t workspace_generation = 0;
-            int request_count = 0;
-            int padded_seq_len = 0;
-
-            [[nodiscard]] bool valid() const noexcept
-            {
-                return stage != nullptr && workspace_generation != 0 &&
-                       request_count > 0 && padded_seq_len > 0;
-            }
-
-            void clear() noexcept
-            {
-                family_index = 0;
-                stage = nullptr;
-                workspace_generation = 0;
-                request_count = 0;
-                padded_seq_len = 0;
             }
         };
 
@@ -6337,6 +6420,25 @@ namespace llaminar2
             size_t fragment_count = 0;
             bool valid = false;
             bool launched = false;
+
+            /**
+             * @brief Retire one successfully materialized request launch.
+             *
+             * The executable and its child identities remain valid across the
+             * request boundary. Only one-shot launch ownership changes; the
+             * next admission may replay this parent when every child still has
+             * the same complete capture identity.
+             *
+             * @return true only when a live executable owned an in-flight
+             *         request launch.
+             */
+            [[nodiscard]] bool retireCompletedLaunch() noexcept
+            {
+                if (!valid || !launched)
+                    return false;
+                launched = false;
+                return true;
+            }
 
             void invalidateGraph() noexcept
             {
@@ -6496,19 +6598,30 @@ namespace llaminar2
         std::vector<std::unique_ptr<MTPDraftTokenPublicationGraphCache>>
             mtp_draft_token_publication_graphs_;
 
-        /// Bounded immutable graph family for resident verifier preparation.
+        /**
+         * @brief Deterministic request-count/physical-width registry.
+         *
+         * Slot `((policy * request_capacity) + requests - 1) *
+         * mtp_max_verifier_rows_ + (rows - 1)` owns exactly that key for the
+         * current workspace generation. Scalar MTP populates only canonical
+         * physical buckets; request-batched MTP uses its exact physical stride.
+         */
         std::vector<std::unique_ptr<MTPVerifierPreparationGraphCache>>
             mtp_verifier_preparation_graphs_;
-
-        /// Exact preparation capture admitted for the current verifier transaction.
-        ActiveMTPVerifierPreparationGraph
-            active_mtp_verifier_preparation_graph_;
 
         /// CUDA conditional parent assembled from the exact active MTP fragments.
         MTPDeviceGenerationLoopGraphCache mtp_device_generation_loop_graph_;
 
-        /// Allocation-free ordered child-capture scratch for parent construction.
-        std::vector<const IGPUGraphCapture *>
+        /**
+         * @brief Allocation-free named child-capture transaction assembled in
+         *        explicit producer-to-consumer order.
+         *
+         * Names travel into backend validation so a native conditional-body
+         * restriction identifies the responsible graph role rather than an
+         * opaque pointer or ordinal. Capacity is reserved with MTP workspace
+         * setup and no element is added during graph replay.
+         */
+        std::vector<DeviceControlledLoopFragment>
             mtp_device_generation_loop_fragment_scratch_;
 
         /**
@@ -7346,7 +7459,7 @@ namespace llaminar2
         struct PendingMTPVerifierDeviceTokenBatchPlan
         {
             int request_count = 0;
-            int padded_seq_len = 0;
+            int logical_padded_seq_len = 0;
             std::vector<DeviceMTPVerifierInputBatchRequest> requests;
         };
         std::optional<PendingMTPVerifierDeviceTokenBatchPlan>
@@ -7365,7 +7478,8 @@ namespace llaminar2
         {
             bool valid = false;
             int request_count = 0;
-            int padded_seq_len = 0;
+            int logical_padded_seq_len = 0;
+            int physical_padded_seq_len = 0;
             int total_token_capacity = 0;
         };
         MaterializedMTPVerifierDeviceTokenBatch
@@ -8638,6 +8752,27 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Seal verifier geometry into a newly produced compact outcome.
+         *
+         * The retained all-position forward graph is the physical-stride
+         * authority. The outcome producer supplies only the real logical width;
+         * this helper proves the graph belongs to the same request batch and to
+         * the canonical scalar-bucket policy before publishing both values in
+         * @p handle. Publication requests cannot override either value.
+         *
+         * @param handle Compact outcome being completed by the producer.
+         * @param request_count Number of logical requests represented by the graph.
+         * @param logical_rows_per_request Number of real verifier rows per request.
+         * @param producer_name Stable diagnostic name for the producing path.
+         * @return true when the retained graph proves and seals the geometry.
+         */
+        bool sealDeviceSpeculativeOutcomeVerifierGeometry(
+            DeviceSpeculativeOutcomeHandle *handle,
+            int request_count,
+            int logical_rows_per_request,
+            const char *producer_name);
+
+        /**
          * @brief Build or validate one fixed-depth proposal publication graph.
          *
          * Setup resolves the fresh sidecar logit row, branch-history pointers,
@@ -8666,13 +8801,13 @@ namespace llaminar2
         /**
          * @brief Find or capture the exact resident grouped-verifier prelude.
          *
-         * The returned family index is stable until execution caches or the
-         * workspace generation are invalidated. No live token or KV value is
-         * inspected on host while selecting the graph.
+         * The returned typed key deterministically addresses one preallocated
+         * registry slot until the workspace generation is invalidated. No live
+         * token or KV value is inspected on host while selecting the graph.
          */
         bool materializeMTPVerifierPreparationGraph(
             const MTPVerifierPreparationStage::Params &params,
-            size_t *family_index,
+            MTPVerifierPreparationGraphKey *key,
             std::string *error = nullptr);
 
         /**
@@ -8684,8 +8819,78 @@ namespace llaminar2
          */
         bool executeMTPVerifierPreparationCaptured(
             void *producer_stream,
-            size_t family_index,
+            const MTPVerifierPreparationGraphKey &key,
             std::string *error = nullptr);
+
+        /**
+         * @brief Pair a just-completed verifier forward with its exact registry owner.
+         *
+         * Preparation and forward both receive the same immutable physical
+         * geometry. After the forward succeeds, this method resolves that typed
+         * key directly, validates the complete ForwardGraphSignature, and stores
+         * it on that registry owner. Parent composition never consults mutable
+         * recency state.
+         *
+         * @param key Exact request-count/physical-width registry address.
+         * @param error Optional first violated pairing invariant.
+         * @return true when the exact replay-ready pair is durably published.
+         */
+        bool bindMTPVerifierForwardGraphPair(
+            const MTPVerifierPreparationGraphKey &key,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Resolve one typed preparation key to its deterministic slot.
+         *
+         * Scalar keys must already be canonical power-of-two/final physical
+         * buckets. Multi-request keys retain the exact padded stride. This
+         * function is the sole registry-address calculation.
+         *
+         * @param key Structural graph key to validate.
+         * @param error Optional first violated key/registry invariant.
+         * @return Flat preallocated slot, or nullopt on invalid geometry.
+         */
+        [[nodiscard]] std::optional<size_t>
+        mtpVerifierPreparationRegistryIndex(
+            const MTPVerifierPreparationGraphKey &key,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Resolve the verifier-preparation policy owned by this request.
+         *
+         * A zero active controller count identifies standalone grouped
+         * verification. Any positive count must exactly match the request and
+         * the persistent storage geometry; partial or stale admission is a hard
+         * lifecycle error rather than an implicit policy change.
+         *
+         * @param request_count Logical request rows entering the verifier.
+         * @param error Optional first violated lifecycle invariant.
+         * @return Exact capture policy, or nullopt for malformed admission.
+         */
+        [[nodiscard]] std::optional<
+            MTPVerifierPreparationControlPolicy>
+        mtpVerifierPreparationControlPolicyForRequest(
+            int request_count,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Resolve the immutable physical-width policy for this request.
+         *
+         * Dynamic scalar generation changes verifier depth in the resident
+         * controller after publication. It therefore owns one maximum-width
+         * graph envelope. Fixed, observe-only, standalone, and request-batched
+         * transactions retain their bounded logical geometry. Malformed
+         * controller admission is rejected through the same lifecycle check as
+         * verifier preparation; geometry may never guess controller ownership.
+         *
+         * @param request_count Logical requests entering the verifier.
+         * @param error Optional first violated lifecycle invariant.
+         * @return Exact graph-width policy, or nullopt for malformed admission.
+         */
+        [[nodiscard]] std::optional<MTPVerifierPhysicalWidthPolicy>
+        mtpVerifierPhysicalWidthPolicyForRequest(
+            int request_count,
+            std::string *error = nullptr) const;
 
         /**
          * @brief Assemble one fixed-depth stochastic transaction into a CUDA WHILE graph.

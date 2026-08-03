@@ -680,6 +680,61 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_GPUUsesContiguousDe
     EXPECT_EQ(plan.chunk.token_offset, 32);
 }
 
+TEST_F(Test__ForwardExecutionEngine,
+       PrefillChunkRuntimePlan_GPUDeviceAdmissionNeedsNoHostMirror)
+{
+    const std::array<int32_t, 8> admitted_device_rows{};
+    auto input = makeTestInput(
+        /*seq_len=*/5,
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        /*token_ids=*/nullptr,
+        /*position_ids=*/nullptr);
+    input.token_ids_device = admitted_device_rows.data();
+    input.token_offset = 48;
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        input,
+        std::vector<int>{4, 8},
+        /*pad_token_id=*/99,
+        /*allow_padded_execution=*/true);
+
+    ASSERT_TRUE(plan) << plan.error;
+    EXPECT_TRUE(plan.padding_required);
+    EXPECT_EQ(
+        plan.chunk.token_authority,
+        PrefillChunkTokenAuthority::DeviceAdmissionBank);
+    EXPECT_TRUE(plan.chunk.token_ids.empty())
+        << "Device-owned prefill must not manufacture a host token shadow.";
+    EXPECT_EQ(plan.chunk.real_count, 5);
+    EXPECT_EQ(plan.chunk.bucket_seq_len, 8);
+    EXPECT_EQ(plan.chunk.token_offset, 48);
+    EXPECT_EQ(plan.position_policy, ForwardPositionPolicy::ContiguousOffset);
+}
+
+TEST_F(Test__ForwardExecutionEngine,
+       PrefillChunkRuntimePlan_RejectsHostShadowOfDeviceAdmission)
+{
+    const std::array<int32_t, 4> host_rows{};
+    const std::array<int32_t, 4> admitted_device_rows{};
+    auto input = makeTestInput(
+        /*seq_len=*/4,
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        host_rows.data(),
+        /*position_ids=*/nullptr);
+    input.token_ids_device = admitted_device_rows.data();
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        input,
+        std::vector<int>{4},
+        /*pad_token_id=*/99,
+        /*allow_padded_execution=*/true);
+
+    EXPECT_FALSE(plan);
+    EXPECT_NE(plan.error.find("simultaneous host and device"), std::string::npos);
+}
+
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_UsesPositionOffsetWhenTokenOffsetIsAbsent)
 {
     const std::vector<int> tokens = {21, 22, 23, 24};
@@ -700,7 +755,7 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_UsesPositionOffsetW
     EXPECT_EQ(plan.chunk.position_ids, (std::vector<int>{256, 257, 258, 259}));
 }
 
-TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RequiresTokenIds)
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RequiresOneTokenAuthority)
 {
     auto input = makeTestInput(4, 1, DeviceId::cpu(), nullptr, nullptr);
 
@@ -711,7 +766,7 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RequiresTokenIds)
         /*allow_padded_execution=*/false);
 
     EXPECT_FALSE(plan);
-    EXPECT_NE(plan.error.find("requires token_ids"), std::string::npos);
+    EXPECT_NE(plan.error.find("one authoritative token source"), std::string::npos);
 }
 
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RejectsEmptyBucketList)
@@ -1273,6 +1328,59 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBuck
     EXPECT_EQ(host.last_forward_input.token_offset, 88);
     EXPECT_EQ(host.last_forward_input.position_offset, 88);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine,
+       RunPrefillChunk_DeviceAdmissionPreservesSoleDeviceTokenAuthority)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+
+    const std::array<int32_t, 4> admitted_device_rows{};
+    auto base_input = makeTestInput(
+        /*seq_len=*/3,
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        /*token_ids=*/nullptr,
+        /*position_ids=*/nullptr);
+    base_input.token_ids_device = admitted_device_rows.data();
+    base_input.token_offset = 88;
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/7,
+        /*allow_padded_execution=*/true);
+    ASSERT_TRUE(plan) << plan.error;
+    ASSERT_TRUE(plan.padding_required);
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.last_token_ids_pointer, nullptr);
+    EXPECT_EQ(
+        host.last_token_ids_device_pointer,
+        admitted_device_rows.data());
+    EXPECT_TRUE(host.last_token_ids.empty());
+    EXPECT_EQ(host.last_forward_input.seq_len, 4);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 3);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
+    EXPECT_EQ(host.last_forward_input.token_offset, 88);
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedReplayParamsRefreshAfterGpuStreamBinding)
@@ -1896,6 +2004,91 @@ TEST_F(
     EXPECT_EQ(host.build_forward_graph_calls, 1);
     EXPECT_GT(host.build_decode_policy_calls, 0)
         << "Typed MTP rows must bypass the ordinary decode_seq_len heuristic.";
+}
+
+/**
+ * @brief Exact capture identity retains every bounded verifier geometry.
+ *
+ * A device-owned dynamic-depth parent graph composes all four physical verifier
+ * buckets simultaneously. Mutable "last graph" state must therefore be only a
+ * convenience view: exact lookup must retain 2/4/8/16 independently and an
+ * unknown geometry must fail instead of silently borrowing a nearby capture.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    DeviceLoopGraphTemplate_ExactSignatureRetainsEveryVerifierBucket)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+    host.mock_capture_policy.allow_fast_decode = true;
+    host.mock_capture_policy.allow_cached_graph_replay = true;
+
+    constexpr std::array<int, 4> kVerifierBuckets = {2, 4, 8, 16};
+    std::array<ForwardGraphSignature, kVerifierBuckets.size()> signatures{};
+    std::array<const IGPUGraphCapture *, kVerifierBuckets.size()> captures{};
+    std::array<int, kVerifierBuckets.back()> tokens{};
+    std::array<int, kVerifierBuckets.back()> positions{};
+    for (int row = 0; row < kVerifierBuckets.back(); ++row)
+    {
+        tokens[static_cast<size_t>(row)] = 900 + row;
+        positions[static_cast<size_t>(row)] = 1900 + row;
+    }
+
+    for (size_t bucket_index = 0;
+         bucket_index < kVerifierBuckets.size();
+         ++bucket_index)
+    {
+        const int rows = kVerifierBuckets[bucket_index];
+        auto input = makeTestInput(
+            rows,
+            /*batch_size=*/1,
+            DeviceId::cuda(0),
+            tokens.data(),
+            positions.data());
+        input.token_ids_device = tokens.data();
+        input.position_ids_device = positions.data();
+        input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+
+        const auto last = engine.lastAllPositionVerifierForwardGraph();
+        ASSERT_TRUE(last.has_value());
+        signatures[bucket_index] = last->signature;
+
+        std::string error;
+        const auto exact = engine.deviceLoopGraphTemplate(
+            signatures[bucket_index],
+            &error);
+        ASSERT_TRUE(exact.has_value()) << error;
+        EXPECT_EQ(exact->signature.seq_len, rows);
+        captures[bucket_index] = exact->capture;
+    }
+
+    for (size_t bucket_index = 0;
+         bucket_index < kVerifierBuckets.size();
+         ++bucket_index)
+    {
+        std::string error;
+        const auto exact = engine.deviceLoopGraphTemplate(
+            signatures[bucket_index],
+            &error);
+        ASSERT_TRUE(exact.has_value()) << error;
+        EXPECT_EQ(exact->capture, captures[bucket_index]);
+        EXPECT_EQ(exact->signature, signatures[bucket_index]);
+    }
+
+    ForwardGraphSignature absent = signatures.front();
+    absent.seq_len = 3;
+    absent.all_position_logit_rows = 3;
+    std::string absent_error;
+    EXPECT_FALSE(engine.deviceLoopGraphTemplate(absent, &absent_error));
+    EXPECT_NE(absent_error.find("exact signature"), std::string::npos);
 }
 
 /**

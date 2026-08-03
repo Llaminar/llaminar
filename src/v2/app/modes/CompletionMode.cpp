@@ -136,6 +136,16 @@ namespace llaminar2
             LOG_DEBUG("  seed: " << sampling_params.seed);
         }
 
+        /*
+         * Prefill seals immutable request policy into the resident GPU request
+         * state.  Install sampling and tokenizer stop policy before that
+         * boundary so grouped generation cannot observe stale defaults or rely
+         * on the host output loop to discover an EOS after speculative state was
+         * already committed.
+         */
+        runner->setSamplingParams(sampling_params);
+        runner->setStopTokens(tokenizer->stop_tokens());
+
         // Run prefill
         if (mpi_ctx->rank() == 0)
         {
@@ -162,9 +172,6 @@ namespace llaminar2
                 LOG_DEBUG("Prefill complete. Generating " << config.n_predict << " tokens...\n");
             }
         }
-
-        // Configure GPU-side sampling
-        runner->setSamplingParams(sampling_params);
 
         if (mpi_ctx->rank() == 0)
         {

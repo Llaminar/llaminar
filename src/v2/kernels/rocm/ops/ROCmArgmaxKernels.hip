@@ -296,6 +296,7 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
     const int *__restrict__ verifier_input_tokens,
     const int *__restrict__ generated_token_counts,
     const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device,
     float *__restrict__ partial_vals,
     int *__restrict__ partial_idxs,
     int row_partial_capacity)
@@ -306,7 +307,8 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
         shared_mem + blockDim.x * sizeof(float));
 
     const int row = blockIdx.y;
-    if (row >= rows)
+    const int active_rows = *active_rows_device;
+    if (active_rows <= 0 || active_rows > rows || row >= active_rows)
         return;
 
     const int tid = threadIdx.x;
@@ -416,8 +418,13 @@ __global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
     int cols,
     int row_stride,
     const int *__restrict__ generated_token_counts,
-    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
 {
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
     const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
     if (request_policy.enabled == 0)
         return;
@@ -438,7 +445,7 @@ __global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
             penalty += request_policy.frequency_penalty *
                        static_cast<float>(count);
         }
-        for (int row = 0; row < rows; ++row)
+        for (int row = 0; row < active_rows; ++row)
         {
             data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
                  static_cast<size_t>(token)] -= penalty;
@@ -467,8 +474,13 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
     int row_stride,
     const int *__restrict__ verifier_input_tokens,
     const int *__restrict__ generated_token_counts,
-    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
 {
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
     const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
     if (request_policy.enabled == 0)
         return;
@@ -482,11 +494,11 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
     if (blockIdx.x == 0)
     {
         for (int row = static_cast<int>(threadIdx.x);
-             row < rows;
+             row < active_rows;
              row += static_cast<int>(blockDim.x))
         {
             for (int candidate_index = prefix_begin;
-                 candidate_index < rows;
+                 candidate_index < active_rows;
                  ++candidate_index)
             {
                 const int token = verifier_input_tokens[candidate_index];
@@ -535,7 +547,7 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
     {
         bool verifier_branch_token = false;
         for (int history_index = prefix_begin;
-             history_index < rows;
+             history_index < active_rows;
              ++history_index)
         {
             verifier_branch_token |=
@@ -556,7 +568,7 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
             penalty += request_policy.frequency_penalty *
                        static_cast<float>(count);
         }
-        for (int row = 0; row < rows; ++row)
+        for (int row = 0; row < active_rows; ++row)
         {
             data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
                  static_cast<size_t>(token)] -= penalty;
@@ -740,7 +752,7 @@ __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
         stopped_flags[0] == 0 && output_count > accepted_state_count ? 1 : 0;
 }
 
-template <bool PUBLISH_MTP_CHAIN>
+template <bool PUBLISH_MTP_CHAIN, bool DEVICE_ACTIVE_ROWS = false>
 __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     const float *__restrict__ partial_vals,
     const int *__restrict__ partial_idxs,
@@ -751,7 +763,8 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     int output_stride,
     int *__restrict__ chain_condition_tokens,
     int *__restrict__ chain_position_ids,
-    int chain_position_increment)
+    int chain_position_increment,
+    const int *__restrict__ active_rows_device)
 {
     extern __shared__ char shared_mem[];
     const int wave_count = static_cast<int>(blockDim.x) / warpSize;
@@ -760,6 +773,15 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
         shared_mem + wave_count * sizeof(float));
 
     const int row = blockIdx.x;
+    if constexpr (DEVICE_ACTIVE_ROWS)
+    {
+        const int active_rows = *active_rows_device;
+        if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.x) ||
+            row >= active_rows)
+        {
+            return;
+        }
+    }
     const int tid = threadIdx.x;
     const int base = row * row_partial_capacity;
 
@@ -903,7 +925,8 @@ static bool launchROCmArgmaxF32BatchedRowsGeometry(
             output_stride,
             chain_condition_tokens,
             chain_position_ids,
-            chain_position_increment);
+            chain_position_increment,
+            nullptr);
     }
     else
     {
@@ -922,7 +945,8 @@ static bool launchROCmArgmaxF32BatchedRowsGeometry(
             output_stride,
             nullptr,
             nullptr,
-            0);
+            0,
+            nullptr);
     }
 
     const hipError_t err = hipGetLastError();
@@ -1232,6 +1256,7 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
     const int *verifier_input_tokens,
     const int *generated_token_counts,
     const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *active_rows,
     float *out_values,
     int *out_indices,
     float *partial_vals,
@@ -1243,7 +1268,7 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
 {
     if (rows <= 0 || cols <= 0 || row_stride < cols ||
         !data || !verifier_input_tokens || !generated_token_counts ||
-        !policy || !out_values || !out_indices ||
+        !policy || !active_rows || !out_values || !out_indices ||
         !partial_vals || !partial_idxs || partial_capacity < rows ||
         !stream || output_stride <= 0)
     {
@@ -1280,11 +1305,13 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         verifier_input_tokens,
         generated_token_counts,
         policy,
+        active_rows,
         partial_vals,
         partial_idxs,
         row_partial_capacity);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<false>),
+        HIP_KERNEL_NAME(
+            rocm_argmax_finalize_f32_batched_rows_kernel<false, true>),
         dim3(rows),
         dim3(ARGMAX_FINALIZE_THREADS),
         static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
@@ -1299,7 +1326,8 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         output_stride,
         nullptr,
         nullptr,
-        0);
+        0,
+        active_rows);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
@@ -1320,6 +1348,7 @@ bool rocmOps_apply_mtp_penalties_f32_rows(
     const int *verifier_input_tokens,
     const int *generated_token_counts,
     const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *active_rows,
     int device_idx,
     void *stream)
 {
@@ -1347,7 +1376,8 @@ bool rocmOps_apply_mtp_penalties_f32_rows(
             row_stride,
             verifier_input_tokens,
             generated_token_counts,
-            policy);
+            policy,
+            active_rows);
     }
     else
     {
@@ -1362,7 +1392,8 @@ bool rocmOps_apply_mtp_penalties_f32_rows(
             cols,
             row_stride,
             generated_token_counts,
-            policy);
+            policy,
+            active_rows);
     }
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

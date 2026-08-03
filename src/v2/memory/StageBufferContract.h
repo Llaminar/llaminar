@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstddef>
+#include <unordered_set>
 #include <vector>
 #include "BufferId.h"
 #include "BufferAccess.h"
@@ -206,6 +207,51 @@ namespace llaminar2
             }
             return result;
         }
+    };
+
+    /**
+     * @brief Classifies arena reads at a captured graph's external frontier.
+     *
+     * The tracker consumes stage contracts in topological execution order. A
+     * read is external only when no earlier stage in the same capture unit has
+     * produced that BufferId. Reads of internal intermediates must not be joined
+     * or validated before capture: their producer kernels establish residency
+     * and ordering inside the native graph itself.
+     *
+     * One tracker instance represents exactly one capture unit. Starting a new
+     * instance at a segment boundary intentionally treats values produced by a
+     * prior segment as external dependencies of the next segment.
+     */
+    class GraphArenaDependencyTracker final
+    {
+    public:
+        /**
+         * @brief Observe one stage and return newly encountered external reads.
+         * @param contract Declarative contract for the next topological stage.
+         * @return Reads whose producer lies outside this capture unit.
+         */
+        std::vector<BufferBinding> observeStage(
+            const StageBufferContract &contract)
+        {
+            std::vector<BufferBinding> external_reads;
+            for (const auto &binding : contract.allArenaReads())
+            {
+                if (produced_.count(binding.id) == 0 &&
+                    joined_external_reads_.insert(binding.id).second)
+                {
+                    external_reads.push_back(binding);
+                }
+            }
+
+            for (const auto &binding : contract.allWrites())
+                produced_.insert(binding.id);
+
+            return external_reads;
+        }
+
+    private:
+        std::unordered_set<BufferId> produced_;
+        std::unordered_set<BufferId> joined_external_reads_;
     };
 
 } // namespace llaminar2

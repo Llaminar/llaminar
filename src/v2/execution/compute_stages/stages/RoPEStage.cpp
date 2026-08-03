@@ -506,6 +506,24 @@ namespace llaminar2
          */
         setGPUStream(stream);
         bindStageStream(kernel);
+
+        const int requested_rotary_dim = static_cast<int>(
+            static_cast<float>(params_.head_dim) *
+            params_.partial_rotary_factor);
+        const int effective_rotary_dim =
+            requested_rotary_dim > 0 && requested_rotary_dim < params_.head_dim
+                ? requested_rotary_dim
+                : params_.head_dim;
+        if (!kernel->prepareInvariantDeviceState(
+                effective_rotary_dim,
+                params_.theta_base))
+        {
+            LOG_ERROR("[RoPEStage] Failed to prepare immutable RoPE state"
+                      << " rotary_dim=" << effective_rotary_dim
+                      << " theta=" << params_.theta_base);
+            return false;
+        }
+
         if (params_.position_ids_device && params_.seq_len > 0)
         {
             kernel->setDynamicDevicePositionIds(params_.position_ids_device, params_.seq_len);

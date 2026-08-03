@@ -7,6 +7,7 @@
 
 #include "../../../backends/IBackend.h"
 #include "../../../kernels/IKVCache.h"
+#include "../../../kernels/common/SamplingMath.h"
 #include "../../../memory/BufferId.h"
 #include "../../../utils/Logger.h"
 
@@ -39,6 +40,8 @@ namespace llaminar2
     bool MTPVerifierPreparationStage::validate() const
     {
         const int total_rows = params_.request_count * params_.padded_seq_len;
+        const bool has_generation_control =
+            params_.generation_control_device != nullptr;
         if (!params_.device_id.is_gpu() || !params_.backend)
         {
             LOG_ERROR("[MTPVerifierPreparationStage] An explicit GPU backend is required");
@@ -53,7 +56,9 @@ namespace llaminar2
                 params_.token_rows.end(),
                 [&](const TokenRowBinding &row)
                 {
-                    return row.valid(params_.padded_seq_len);
+                    return row.valid(params_.padded_seq_len) &&
+                           (!has_generation_control ||
+                            row.draft_tokens_device != nullptr);
                 }))
         {
             LOG_ERROR("[MTPVerifierPreparationStage] Token-row cardinality or geometry is invalid");
@@ -66,9 +71,18 @@ namespace llaminar2
             params_.valid_graph_row_count <= 0 ||
             params_.valid_graph_row_count > total_rows ||
             (!params_.valid_graph_rows_device &&
-             params_.valid_graph_row_count != total_rows))
+             params_.valid_graph_row_count % params_.request_count != 0))
         {
             LOG_ERROR("[MTPVerifierPreparationStage] Device-owned verifier geometry bindings are incomplete");
+            return false;
+        }
+        if (has_generation_control !=
+                (params_.generation_control_stride > 0) ||
+            (has_generation_control &&
+             params_.generation_control_stride <
+                 sampling_math::kDeviceGenerationControlCount))
+        {
+            LOG_ERROR("[MTPVerifierPreparationStage] Device-generation controller geometry is incomplete");
             return false;
         }
         if (static_cast<int>(params_.main_kv_checkpoints.size()) !=
@@ -103,42 +117,60 @@ namespace llaminar2
          * padding, then overwrite the valid prefix from authoritative device
          * sources. Rectangular scalar verification therefore pays no memset.
          */
-        for (const TokenRowBinding &row : params_.token_rows)
+        const bool device_generation_controlled =
+            params_.generation_control_device != nullptr;
+        if (device_generation_controlled &&
+            !params_.backend->enqueuePrepareDeviceGenerationTransactionBudget(
+                params_.generation_control_device,
+                params_.generation_control_stride,
+                params_.request_count,
+                params_.padded_seq_len,
+                params_.maintenance_rows_remaining_device,
+                device_ordinal,
+                stream))
         {
-            const int valid_tokens = row.draft_token_count + 1;
-            if (valid_tokens < params_.padded_seq_len &&
-                !params_.backend->memset(
-                    row.destination_device,
-                    0,
-                    static_cast<size_t>(params_.padded_seq_len) *
+            LOG_ERROR("[MTPVerifierPreparationStage] Failed to publish the resident verifier transaction budget");
+            return false;
+        }
+        if (!device_generation_controlled)
+        {
+            for (const TokenRowBinding &row : params_.token_rows)
+            {
+                const int valid_tokens = row.draft_token_count + 1;
+                if (valid_tokens < params_.padded_seq_len &&
+                    !params_.backend->memset(
+                        row.destination_device,
+                        0,
+                        static_cast<size_t>(params_.padded_seq_len) *
+                            sizeof(int32_t),
+                        device_ordinal,
+                        stream))
+                {
+                    LOG_ERROR("[MTPVerifierPreparationStage] Failed to clear an inactive verifier token suffix");
+                    return false;
+                }
+                if (!params_.backend->deviceCopyAsync(
+                        row.destination_device,
+                        row.first_token_device,
                         sizeof(int32_t),
-                    device_ordinal,
-                    stream))
-            {
-                LOG_ERROR("[MTPVerifierPreparationStage] Failed to clear an inactive verifier token suffix");
-                return false;
-            }
-            if (!params_.backend->deviceCopyAsync(
-                    row.destination_device,
-                    row.first_token_device,
-                    sizeof(int32_t),
-                    device_ordinal,
-                    stream))
-            {
-                LOG_ERROR("[MTPVerifierPreparationStage] Failed to publish a resident verifier condition token");
-                return false;
-            }
-            if (row.draft_token_count > 0 &&
-                !params_.backend->deviceCopyAsync(
-                    row.destination_device + 1,
-                    row.draft_tokens_device,
-                    static_cast<size_t>(row.draft_token_count) *
-                        sizeof(int32_t),
-                    device_ordinal,
-                    stream))
-            {
-                LOG_ERROR("[MTPVerifierPreparationStage] Failed to publish resident verifier draft tokens");
-                return false;
+                        device_ordinal,
+                        stream))
+                {
+                    LOG_ERROR("[MTPVerifierPreparationStage] Failed to publish a resident verifier condition token");
+                    return false;
+                }
+                if (row.draft_token_count > 0 &&
+                    !params_.backend->deviceCopyAsync(
+                        row.destination_device + 1,
+                        row.draft_tokens_device,
+                        static_cast<size_t>(row.draft_token_count) *
+                            sizeof(int32_t),
+                        device_ordinal,
+                        stream))
+                {
+                    LOG_ERROR("[MTPVerifierPreparationStage] Failed to publish resident verifier draft tokens");
+                    return false;
+                }
             }
         }
 
@@ -165,30 +197,66 @@ namespace llaminar2
             }
         }
 
-        if (!params_.backend->enqueuePrepareMTPVerifierGeometry(
-                params_.base_cached_tokens_device,
-                params_.valid_graph_rows_device,
-                params_.valid_graph_row_count,
-                params_.request_count,
-                params_.padded_seq_len,
-                device_ordinal,
-                stream,
-                params_.position_ids_device,
-                params_.request_lengths_device))
+        if (device_generation_controlled)
         {
-            LOG_ERROR("[MTPVerifierPreparationStage] Device verifier geometry publication failed");
-            return false;
+            for (int request = 0; request < params_.request_count; ++request)
+            {
+                const TokenRowBinding &row =
+                    params_.token_rows[static_cast<size_t>(request)];
+                if (!params_.backend->enqueuePrepareMTPVerifierControlledRow(
+                        row.first_token_device,
+                        row.draft_tokens_device,
+                        params_.base_cached_tokens_device + request,
+                        params_.generation_control_device +
+                            static_cast<size_t>(request) *
+                                static_cast<size_t>(
+                                    params_.generation_control_stride),
+                        params_.generation_control_stride,
+                        params_.padded_seq_len,
+                        device_ordinal,
+                        stream,
+                        row.destination_device,
+                        params_.position_ids_device +
+                            static_cast<size_t>(request) *
+                                static_cast<size_t>(params_.padded_seq_len),
+                        params_.request_lengths_device + request,
+                        params_.base_cached_tokens_snapshot_device + request))
+                {
+                    LOG_ERROR("[MTPVerifierPreparationStage] Controlled verifier transaction publication failed for request "
+                              << request);
+                    return false;
+                }
+            }
         }
-
-        if (!params_.backend->deviceCopyAsync(
-                params_.base_cached_tokens_snapshot_device,
-                params_.base_cached_tokens_device,
-                static_cast<size_t>(params_.request_count) * sizeof(int32_t),
-                device_ordinal,
-                stream))
+        else
         {
-            LOG_ERROR("[MTPVerifierPreparationStage] Device verifier base-count snapshot failed");
-            return false;
+            if (!params_.backend->enqueuePrepareMTPVerifierGeometry(
+                    params_.base_cached_tokens_device,
+                    params_.valid_graph_rows_device,
+                    params_.valid_graph_row_count,
+                    /*generation_control_device=*/nullptr,
+                    /*generation_control_stride=*/0,
+                    params_.request_count,
+                    params_.padded_seq_len,
+                    device_ordinal,
+                    stream,
+                    params_.position_ids_device,
+                    params_.request_lengths_device))
+            {
+                LOG_ERROR("[MTPVerifierPreparationStage] Device verifier geometry publication failed");
+                return false;
+            }
+            if (!params_.backend->deviceCopyAsync(
+                    params_.base_cached_tokens_snapshot_device,
+                    params_.base_cached_tokens_device,
+                    static_cast<size_t>(params_.request_count) *
+                        sizeof(int32_t),
+                    device_ordinal,
+                    stream))
+            {
+                LOG_ERROR("[MTPVerifierPreparationStage] Device verifier base-count snapshot failed");
+                return false;
+            }
         }
         return true;
     }
@@ -233,6 +301,9 @@ namespace llaminar2
         info.addScalarBool(
             "ragged_geometry",
             params_.valid_graph_rows_device != nullptr);
+        info.addScalarBool(
+            "device_generation_controlled_geometry",
+            params_.generation_control_device != nullptr);
         return info;
     }
 
@@ -244,26 +315,61 @@ namespace llaminar2
         contract.addOutput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
         contract.addOutput(BufferId::MTP_VERIFIER_POSITION_IDS);
         contract.addOutput(BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
+        if (params_.generation_control_device)
+        {
+            contract.addPreallocatedInOut(
+                BufferId::MTP_GENERATION_CONTROL,
+                "INT32");
+        }
         return contract;
     }
 
     bool MTPVerifierPreparationStage::hasSameCaptureIdentity(
         const Params &other) const noexcept
     {
+        const bool device_generation_controlled =
+            params_.generation_control_device != nullptr;
+        const bool other_device_generation_controlled =
+            other.generation_control_device != nullptr;
+        if (device_generation_controlled !=
+            other_device_generation_controlled)
+        {
+            return false;
+        }
+        const auto token_row_identity_equal =
+            [device_generation_controlled](
+                const TokenRowBinding &left,
+                const TokenRowBinding &right)
+        {
+            return left.first_token_device == right.first_token_device &&
+                   left.draft_tokens_device == right.draft_tokens_device &&
+                   left.destination_device == right.destination_device &&
+                   (device_generation_controlled ||
+                    left.draft_token_count == right.draft_token_count);
+        };
         return params_.device_id == other.device_id &&
                params_.backend == other.backend &&
                params_.token_rows.size() == other.token_rows.size() &&
                std::equal(
                    params_.token_rows.begin(),
                    params_.token_rows.end(),
-                   other.token_rows.begin()) &&
+                   other.token_rows.begin(),
+                   token_row_identity_equal) &&
                params_.request_count == other.request_count &&
                params_.padded_seq_len == other.padded_seq_len &&
                params_.base_cached_tokens_device ==
                    other.base_cached_tokens_device &&
-               params_.valid_graph_rows_device ==
-                   other.valid_graph_rows_device &&
-               params_.valid_graph_row_count == other.valid_graph_row_count &&
+               (device_generation_controlled ||
+                (params_.valid_graph_rows_device ==
+                     other.valid_graph_rows_device &&
+                 params_.valid_graph_row_count ==
+                     other.valid_graph_row_count)) &&
+               params_.generation_control_device ==
+                   other.generation_control_device &&
+               params_.generation_control_stride ==
+                   other.generation_control_stride &&
+               params_.maintenance_rows_remaining_device ==
+                   other.maintenance_rows_remaining_device &&
                params_.position_ids_device == other.position_ids_device &&
                params_.request_lengths_device ==
                    other.request_lengths_device &&
@@ -291,6 +397,13 @@ namespace llaminar2
             << ",valid_graph_rows="
             << static_cast<const void *>(params.valid_graph_rows_device)
             << ",valid_graph_row_count=" << params.valid_graph_row_count
+            << ",generation_control="
+            << static_cast<const void *>(params.generation_control_device)
+            << ",generation_control_stride="
+            << params.generation_control_stride
+            << ",maintenance_rows_remaining="
+            << static_cast<const void *>(
+                   params.maintenance_rows_remaining_device)
             << ",position_ids="
             << static_cast<const void *>(params.position_ids_device)
             << ",request_lengths="

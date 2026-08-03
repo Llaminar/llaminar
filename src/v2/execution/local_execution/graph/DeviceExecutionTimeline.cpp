@@ -74,10 +74,9 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::DeviceGenerationController,
                     .consumers = roles({
                         DeviceTimelineRole::DeviceGenerationController,
-                        DeviceTimelineRole::VerifierSummary,
+                        DeviceTimelineRole::AllPositionVerifier,
                         DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::RequestStateReset,
-                        DeviceTimelineRole::Diagnostics,
                     }),
                 },
                 {

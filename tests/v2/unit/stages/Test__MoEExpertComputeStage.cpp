@@ -871,54 +871,38 @@ TEST_F(MoEExpertComputeStageTest, SharedGate_AppliesSigmoidGating)
     }
 }
 
-TEST_F(MoEExpertComputeStageTest, SharedGate_MaterializesBF16GateInputAsFP32ForTensorKernel)
+TEST_F(MoEExpertComputeStageTest, SharedGate_RejectsStageLocalGateNormalizationOnEveryBackend)
 {
-    const int seq = 1;
-    const int d = 4;
-
-    auto input = TestTensorFactory::createFP32({seq, d});
-    BF16Tensor gate_inp({1, static_cast<size_t>(d)});
-    auto shared_output = TestTensorFactory::createFP32({seq, d});
-
-    const float input_values[d] = {1.0f, -2.0f, 0.5f, 3.0f};
-    const float gate_values[d] = {0.03125f, -0.125f, 0.0625f, 0.25f};
-    for (int i = 0; i < d; ++i)
-    {
-        input->mutable_data()[i] = input_values[i];
-        shared_output->mutable_data()[i] = 2.0f;
-    }
-    gate_inp.from_fp32(gate_values, d);
+    BF16Tensor gate_inp({1, 4});
     ASSERT_EQ(gate_inp.native_type(), TensorType::BF16);
 
-    SharedExpertGateStage::Params params;
-    params.device_id = DeviceId::cpu();
-    params.input = input.get();
-    params.gate_inp = &gate_inp;
-    params.shared_output = shared_output.get();
-    params.seq_len = seq;
-    params.d_model = d;
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SharedExpertGateStage::Params params;
+        params.device_id = device;
+        params.gate_inp = &gate_inp;
 
-    CapturingMoEKernel kernel;
-    SharedExpertGateStage stage(params);
-    stage.setMoEKernelForTesting(&kernel);
-    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
-
-    EXPECT_EQ(kernel.observed_gate_type_id, static_cast<int>(TensorType::FP32))
-        << "SharedExpertGateStage must not pass BF16 gate vectors into tensor-aware GPU-style kernels";
-
-    std::vector<float> gate_fp32(d);
-    gate_inp.to_fp32(gate_fp32.data());
-    float dot = 0.0f;
-    for (int i = 0; i < d; ++i)
-        dot += gate_fp32[i] * input_values[i];
-    const float expected_gate = 1.0f / (1.0f + std::exp(-dot));
-
-    const float *out = shared_output->data();
-    for (int i = 0; i < d; ++i)
-        EXPECT_NEAR(out[i], 2.0f * expected_gate, 1e-5f) << "Gate mismatch at dim " << i;
+        EXPECT_THROW((void)SharedExpertGateStage(params), std::invalid_argument)
+            << device.to_string()
+            << " must receive the immutable FP32 model-prepared input gate";
+    }
 }
 
-TEST_F(MoEExpertComputeStageTest, CombinedSharedVerifierMaterializesBF16GateInputAsFP32)
+TEST_F(MoEExpertComputeStageTest,
+       SharedGate_GPURejectsForwardTimeGateNormalization)
+{
+    BF16Tensor gate_inp({1, 4});
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.gate_inp = &gate_inp;
+
+    EXPECT_THROW((void)SharedExpertGateStage(params), std::invalid_argument)
+        << "GPU graph construction must receive a model-prepared FP32 gate vector; "
+           "the stage may not create a host mirror for later upload.";
+}
+
+TEST_F(MoEExpertComputeStageTest,
+       CombinedSharedVerifierRejectsHotPathGateNormalization)
 {
     const int d = 4;
 
@@ -930,21 +914,11 @@ TEST_F(MoEExpertComputeStageTest, CombinedSharedVerifierMaterializesBF16GateInpu
     MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::rocm(0);
     params.shared_gate_inp = &gate_inp;
+    params.combine_shared_expert_in_verifier = true;
 
-    MoEExpertComputeStage stage(params);
-    TensorBase *effective_gate = stage.combinedSharedGateInputForTesting();
-
-    ASSERT_NE(effective_gate, nullptr);
-    EXPECT_EQ(effective_gate->native_type(), TensorType::FP32)
-        << "Combined MoE verifier grouping kernels read the shared gate input as float*, "
-        << "so non-FP32 weights must be normalized exactly like SharedExpertGateStage.";
-
-    const float *effective_values = effective_gate->data();
-    std::vector<float> expected(d);
-    gate_inp.to_fp32(expected.data());
-    for (int i = 0; i < d; ++i)
-        EXPECT_FLOAT_EQ(effective_values[i], expected[static_cast<size_t>(i)])
-            << "Converted shared gate value mismatch at dim " << i;
+    EXPECT_THROW((void)MoEExpertComputeStage(params), std::invalid_argument)
+        << "GPU forward must not allocate a host FP32 mirror for a model weight; "
+           "weight preparation owns normalization before graph construction.";
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedGate_FusedCombinePublishesGatedSharedAndCombinedOutput)

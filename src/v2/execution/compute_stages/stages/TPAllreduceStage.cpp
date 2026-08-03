@@ -38,6 +38,22 @@ namespace llaminar2
         return "unknown";
     }
 
+    const char *toString(TPLocalRootedCollectiveTensorRole role) noexcept
+    {
+        switch (role)
+        {
+        case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+            return "reduce-root-inout";
+        case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+            return "reduce-contributor-input";
+        case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+            return "broadcast-root-input";
+        case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+            return "broadcast-receiver-output";
+        }
+        return "unknown";
+    }
+
     namespace
     {
         constexpr const char *kDefaultAllreducePrecision = "fp32";
@@ -676,6 +692,23 @@ namespace llaminar2
             params_.sideband_workspace_bindings.size());
     }
 
+    TPLocalRootedCollectiveTensorRole
+    TPLocalRootedCollectiveStage::tensorRole() const noexcept
+    {
+        const bool is_root =
+            params_.participant_device_index == params_.root_device_index;
+        if (params_.operation ==
+            TPLocalRootedCollectiveOperation::ReduceSum)
+        {
+            return is_root
+                       ? TPLocalRootedCollectiveTensorRole::ReduceRootInOut
+                       : TPLocalRootedCollectiveTensorRole::ReduceContributorInput;
+        }
+        return is_root
+                   ? TPLocalRootedCollectiveTensorRole::BroadcastRootInput
+                   : TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput;
+    }
+
     bool TPLocalRootedCollectiveStage::execute(IDeviceContext *ctx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
@@ -713,6 +746,7 @@ namespace llaminar2
                       << " stage=" << (params_.stage_name.empty()
                                              ? "(none)"
                                              : params_.stage_name)
+                      << " role=" << toString(tensorRole())
                       << " stream=" << stream
                       << " buffer=" << buffer);
             return false;
@@ -796,7 +830,13 @@ namespace llaminar2
             }
         }
 
-        execution.publish(params_.tensor);
+        const auto role = tensorRole();
+        if (role == TPLocalRootedCollectiveTensorRole::ReduceRootInOut ||
+            role ==
+                TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+        {
+            execution.publish(params_.tensor);
+        }
         recordBillOfMaterials();
         return true;
     }
@@ -821,11 +861,6 @@ namespace llaminar2
 
     bool TPLocalRootedCollectiveStage::isGraphCapturable() const
     {
-        return supportsWarmupDependentGraphCapture();
-    }
-
-    bool TPLocalRootedCollectiveStage::supportsWarmupDependentGraphCapture() const
-    {
         return params_.device_id.is_gpu() && params_.tp_ctx &&
                params_.tp_ctx->degree() > 1 && params_.tensor &&
                params_.count > 0 && params_.participant_device_index >= 0 &&
@@ -843,10 +878,22 @@ namespace llaminar2
         StageBufferRequirements requirements;
         if (params_.tensor)
         {
-            requirements.addInout(
-                "tensor",
-                params_.tensor->shape(),
-                toBufferTensorType(params_.tensor->native_type()));
+            const auto shape = params_.tensor->shape();
+            const auto type =
+                toBufferTensorType(params_.tensor->native_type());
+            switch (tensorRole())
+            {
+            case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+                requirements.addInout("tensor", shape, type);
+                break;
+            case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+            case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+                requirements.addInput("tensor", shape, type);
+                break;
+            case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+                requirements.addOutput("tensor", shape, type);
+                break;
+            }
         }
         return requirements;
     }
@@ -855,8 +902,22 @@ namespace llaminar2
     {
         if (!params_.tensor_buffer_id)
             return {};
-        return StageBufferContract::build()
-            .addPreallocatedInOut(*params_.tensor_buffer_id);
+
+        StageBufferContract contract = StageBufferContract::build();
+        switch (tensorRole())
+        {
+        case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+            contract.addPreallocatedInOut(*params_.tensor_buffer_id);
+            break;
+        case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+        case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+            contract.addInput(*params_.tensor_buffer_id);
+            break;
+        case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+            contract.addOutput(*params_.tensor_buffer_id);
+            break;
+        }
+        return contract;
     }
 
     StageDumpInfo TPLocalRootedCollectiveStage::buildDumpInfoImpl() const
@@ -864,18 +925,30 @@ namespace llaminar2
         StageDumpInfo info;
         if (params_.tensor)
         {
-            info.addInput(
-                "tensor",
-                params_.tensor,
-                1,
-                params_.count);
-            info.addOutput(
-                "tensor",
-                params_.tensor,
-                1,
-                params_.count);
+            const auto role = tensorRole();
+            if (role !=
+                TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+            {
+                info.addInput(
+                    "tensor",
+                    params_.tensor,
+                    1,
+                    params_.count);
+            }
+            if (role ==
+                    TPLocalRootedCollectiveTensorRole::ReduceRootInOut ||
+                role ==
+                    TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+            {
+                info.addOutput(
+                    "tensor",
+                    params_.tensor,
+                    1,
+                    params_.count);
+            }
         }
         info.addScalarInt("operation", static_cast<int>(params_.operation));
+        info.addScalarInt("tensor_role", static_cast<int>(tensorRole()));
         info.addScalarInt("root_device_index", params_.root_device_index);
         info.addScalarInt(
             "participant_device_index",

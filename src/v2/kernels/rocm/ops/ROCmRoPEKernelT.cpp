@@ -26,6 +26,9 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../kernels/rope/RoPEDeviceParams.h"
 #include <hip/hip_runtime.h>
+#include <bit>
+#include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -151,6 +154,15 @@ extern "C"
 
 namespace
 {
+    constexpr const char *kROCmRoPEInvariantPublicationDomain =
+        "rocm_rope_inverse_frequency_tables";
+
+    /** @brief Return the collision-free FP32 identity used by publications. */
+    std::uint32_t ropeThetaBits(float theta) noexcept
+    {
+        return std::bit_cast<std::uint32_t>(theta);
+    }
+
     bool isHIPStreamCapturing(hipStream_t stream, const char *context)
     {
         if (llaminar2::isGraphCaptureActive())
@@ -277,6 +289,172 @@ namespace
     }
 
     /**
+     * @brief Publish or adopt one immutable ROCm RoPE frequency table.
+     *
+     * Publication happens once during graph setup on the exact producer stream.
+     * Every graph-local adopter receives a stable workspace slot and waits on
+     * the producer event once per stream binding. Graph replay subsequently
+     * uses only the retained device pointer and performs no registry work.
+     */
+    bool prepareHIPRoPEInvariantPublication(
+        llaminar2::DeviceWorkspaceManager *workspace,
+        hipStream_t stream,
+        int device_idx,
+        int rotary_dim,
+        float rope_theta,
+        std::shared_ptr<llaminar2::rope::RoPEInvariantWorkspacePublication>
+            &current,
+        void *&adoption_stream,
+        const char *context)
+    {
+        if (!workspace || !stream || device_idx < 0 || rotary_dim <= 0 ||
+            (rotary_dim % 2) != 0 ||
+            rotary_dim / 2 > llaminar2::rope::kMaxInverseFrequencyValues ||
+            !std::isfinite(rope_theta) || rope_theta <= 0.0f)
+        {
+            LOG_ERROR("[" << context << "] Invalid immutable RoPE publication"
+                          << " workspace=" << workspace
+                          << " stream=" << static_cast<void *>(stream)
+                          << " device=" << device_idx
+                          << " rotary_dim=" << rotary_dim
+                          << " theta=" << rope_theta);
+            return false;
+        }
+        if (!workspace->device().is_rocm() ||
+            workspace->device().rocm_ordinal() != device_idx)
+        {
+            LOG_ERROR("[" << context << "] RoPE publication workspace/device mismatch: "
+                          << workspace->device().to_string()
+                          << " requested rocm:" << device_idx);
+            return false;
+        }
+
+        const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+        const bool exact_current =
+            current && current->device_values && current->ready_event &&
+            current->rotary_dim == rotary_dim &&
+            current->theta_bits == theta_bits;
+        if (exact_current && adoption_stream == static_cast<void *>(stream))
+            return true;
+
+        if (isHIPStreamCapturing(stream, context))
+        {
+            LOG_ERROR("[" << context << "] Immutable RoPE state was not adopted "
+                          "on the exact HIP stream before graph capture");
+            return false;
+        }
+
+        if (!exact_current)
+        {
+            llaminar2::PersistentWorkspacePublicationKey key{
+                .word0 = static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(rotary_dim)),
+                .word1 = static_cast<std::uint64_t>(theta_bits),
+                .word2 = static_cast<std::uint64_t>(
+                    llaminar2::rope::kMaxInverseFrequencyValues),
+                .word3 = 1U,
+            };
+            const auto result = workspace->getOrCreatePersistentPublication(
+                kROCmRoPEInvariantPublicationDomain,
+                key,
+                llaminar2::rope::kInvariantPublicationSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    const std::size_t payload_bytes =
+                        static_cast<std::size_t>(rotary_dim / 2) *
+                        sizeof(float);
+                    auto *device_values = static_cast<float *>(
+                        workspace->getPersistentSlotBuffer(
+                            llaminar2::RoPEWorkspaceBuffers::INV_FREQ,
+                            llaminar2::rope::kInvariantPublicationSlots,
+                            slot,
+                            payload_bytes));
+                    if (!device_values)
+                        return {};
+
+                    hipEvent_t ready_event = nullptr;
+                    hipError_t err = hipEventCreateWithFlags(
+                        &ready_event,
+                        hipEventDisableTiming);
+                    if (err != hipSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Failed to create RoPE readiness event: "
+                                      << hipGetErrorString(err));
+                        return {};
+                    }
+
+                    auto publication = std::shared_ptr<
+                        llaminar2::rope::RoPEInvariantWorkspacePublication>(
+                        new llaminar2::rope::RoPEInvariantWorkspacePublication{
+                            .ready_event = static_cast<void *>(ready_event),
+                            .device_values = device_values,
+                            .rotary_dim = rotary_dim,
+                            .theta_bits = theta_bits,
+                            .workspace_slot = slot,
+                        },
+                        [](llaminar2::rope::RoPEInvariantWorkspacePublication *value)
+                        {
+                            if (value && value->ready_event)
+                            {
+                                (void)hipEventDestroy(
+                                    static_cast<hipEvent_t>(
+                                        value->ready_event));
+                            }
+                            delete value;
+                        });
+
+                    if (!hipOps_rope_populate_inv_freq(
+                            device_values,
+                            rotary_dim,
+                            rope_theta,
+                            device_idx,
+                            stream))
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Device RoPE frequency producer failed");
+                        return {};
+                    }
+                    err = hipEventRecord(ready_event, stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Cannot publish RoPE readiness: "
+                                      << hipGetErrorString(err));
+                        // Device work was submitted; rollback without its event
+                        // would expose an unordered slot to a later publisher.
+                        std::terminate();
+                    }
+                    return publication;
+                });
+            if (!result)
+            {
+                LOG_ERROR("[" << context
+                              << "] Failed to publish immutable RoPE table");
+                return false;
+            }
+            current = std::static_pointer_cast<
+                llaminar2::rope::RoPEInvariantWorkspacePublication>(
+                result.publication);
+            adoption_stream = nullptr;
+        }
+
+        const hipError_t wait_err = hipStreamWaitEvent(
+            stream,
+            static_cast<hipEvent_t>(current->ready_event),
+            0);
+        if (wait_err != hipSuccess)
+        {
+            LOG_ERROR("[" << context
+                          << "] Failed to adopt immutable RoPE publication: "
+                          << hipGetErrorString(wait_err));
+            return false;
+        }
+        adoption_stream = static_cast<void *>(stream);
+        return true;
+    }
+
+    /**
      * @brief Record the production ROCm RoPE route for an MTP row group.
      *
      * Serial M=1 calls are intentionally omitted. A grouped byte proof must
@@ -322,6 +500,24 @@ namespace llaminar2
         // =========================================================================
         // ROCmRoPEKernelT<FP32> Implementation
         // =========================================================================
+
+        bool ROCmRoPEKernelT<ActivationPrecision::FP32>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().rocm_ordinal() : -1);
+            return prepareHIPRoPEInvariantPublication(
+                workspace_,
+                static_cast<hipStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "ROCmRoPEKernelT<FP32>");
+        }
 
         void ROCmRoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
         {
@@ -391,9 +587,12 @@ namespace llaminar2
             // Inverse frequency table - allocated for worst-case head_dim
             reqs.buffers.push_back({
                 RoPEWorkspaceBuffers::INV_FREQ,
-                static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                rope::kInvariantPublicationSlots *
+                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
                 256, // HIP alignment
-                true // Required
+                true, // Required
+                WorkspaceExecutionRegime::Any,
+                WorkspaceContentLifetime::SerialGraphFamily
             });
             // Device params buffer for graph capture
             reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
@@ -411,7 +610,8 @@ namespace llaminar2
             // all pending GPU work (GEMM) completes — causing ~4ms overhead per call.
             if (workspace_ != ws)
             {
-                inv_freq_initialized_ = false;
+                inv_freq_publication_.reset();
+                inv_freq_adoption_stream_ = nullptr;
                 dynamic_pos_device_valid_ = false;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_device_ptr_ = nullptr;
@@ -449,25 +649,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             // Copy position_ids from host to device workspace buffer
             // (position_ids is a host pointer; HIP kernel expects device pointer)
@@ -570,25 +765,20 @@ namespace llaminar2
                 return ok;
             };
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed (GPU-compute, fully async — no pipeline drain)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
             const bool force_device_positions =
@@ -711,6 +901,24 @@ namespace llaminar2
         // ROCmRoPEKernelT<BF16> Implementation
         // =========================================================================
 
+        bool ROCmRoPEKernelT<ActivationPrecision::BF16>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().rocm_ordinal() : -1);
+            return prepareHIPRoPEInvariantPublication(
+                workspace_,
+                static_cast<hipStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "ROCmRoPEKernelT<BF16>");
+        }
+
         void ROCmRoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
         {
             if (!publishHIPRoPEDeviceParams(
@@ -775,9 +983,12 @@ namespace llaminar2
                                     true});
             // Inverse frequency table - allocated for worst-case head_dim
             reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
-                                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                                    rope::kInvariantPublicationSlots *
+                                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
                                     256,
-                                    true});
+                                    true,
+                                    WorkspaceExecutionRegime::Any,
+                                    WorkspaceContentLifetime::SerialGraphFamily});
             // Device params buffer for graph capture
             reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
                                     sizeof(rope::RoPEDeviceParams), 256, true});
@@ -791,7 +1002,8 @@ namespace llaminar2
             // See FP32 bindWorkspace() for detailed explanation.
             if (workspace_ != ws)
             {
-                inv_freq_initialized_ = false;
+                inv_freq_publication_.reset();
+                inv_freq_adoption_stream_ = nullptr;
                 dynamic_pos_device_valid_ = false;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_device_ptr_ = nullptr;
@@ -829,25 +1041,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             // Copy position_ids from host to device workspace buffer
             // (position_ids is a host pointer; HIP kernel expects device pointer)
@@ -949,25 +1156,20 @@ namespace llaminar2
                 return ok;
             };
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
@@ -1087,6 +1289,24 @@ namespace llaminar2
         // ROCmRoPEKernelT<FP16> Implementation
         // =========================================================================
 
+        bool ROCmRoPEKernelT<ActivationPrecision::FP16>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().rocm_ordinal() : -1);
+            return prepareHIPRoPEInvariantPublication(
+                workspace_,
+                static_cast<hipStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "ROCmRoPEKernelT<FP16>");
+        }
+
         void ROCmRoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
         {
             if (!publishHIPRoPEDeviceParams(
@@ -1151,9 +1371,12 @@ namespace llaminar2
                                     true});
             // Inverse frequency table - allocated for worst-case head_dim
             reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
-                                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                                    rope::kInvariantPublicationSlots *
+                                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
                                     256,
-                                    true});
+                                    true,
+                                    WorkspaceExecutionRegime::Any,
+                                    WorkspaceContentLifetime::SerialGraphFamily});
             // Device params buffer for graph capture
             reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
                                     sizeof(rope::RoPEDeviceParams), 256, true});
@@ -1167,7 +1390,8 @@ namespace llaminar2
             // See FP32 bindWorkspace() for detailed explanation.
             if (workspace_ != ws)
             {
-                inv_freq_initialized_ = false;
+                inv_freq_publication_.reset();
+                inv_freq_adoption_stream_ = nullptr;
                 dynamic_pos_device_valid_ = false;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_device_ptr_ = nullptr;
@@ -1205,25 +1429,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             // Copy position_ids from host to device workspace buffer
             // (position_ids is a host pointer; HIP kernel expects device pointer)
@@ -1325,25 +1544,20 @@ namespace llaminar2
                 return ok;
             };
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;

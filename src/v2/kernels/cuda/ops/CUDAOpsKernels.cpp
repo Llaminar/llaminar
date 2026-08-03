@@ -29,6 +29,8 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -149,6 +151,15 @@ extern "C"
 
 namespace
 {
+    constexpr const char *kCudaRoPEInvariantPublicationDomain =
+        "cuda_rope_inverse_frequency_tables";
+
+    /** @brief Return the collision-free FP32 identity used by publications. */
+    std::uint32_t ropeThetaBits(float theta) noexcept
+    {
+        return std::bit_cast<std::uint32_t>(theta);
+    }
+
     bool validateCudaPointerForDevice(const void *ptr,
                                       int expected_device,
                                       const char *ptr_name,
@@ -378,6 +389,173 @@ namespace
 
         device_seq_len = seq_len;
         device_valid = true;
+        return true;
+    }
+
+    /**
+     * @brief Publish or adopt one immutable CUDA RoPE frequency table.
+     *
+     * The registry and event creation are graph-setup work. Once adopted, a
+     * kernel retains the shared publication and subsequent preparations on the
+     * same stream are a pure host-side identity check. A changed stream adopts
+     * the existing table through one event wait; captured replay performs no
+     * registry lookup and records no initialization node.
+     */
+    bool prepareCudaRoPEInvariantPublication(
+        llaminar2::DeviceWorkspaceManager *workspace,
+        cudaStream_t stream,
+        int device_idx,
+        int rotary_dim,
+        float rope_theta,
+        std::shared_ptr<llaminar2::rope::RoPEInvariantWorkspacePublication>
+            &current,
+        void *&adoption_stream,
+        const char *context)
+    {
+        if (!workspace || !stream || device_idx < 0 || rotary_dim <= 0 ||
+            (rotary_dim % 2) != 0 ||
+            rotary_dim / 2 > llaminar2::rope::kMaxInverseFrequencyValues ||
+            !std::isfinite(rope_theta) || rope_theta <= 0.0f)
+        {
+            LOG_ERROR("[" << context << "] Invalid immutable RoPE publication"
+                          << " workspace=" << workspace
+                          << " stream=" << static_cast<void *>(stream)
+                          << " device=" << device_idx
+                          << " rotary_dim=" << rotary_dim
+                          << " theta=" << rope_theta);
+            return false;
+        }
+        if (!workspace->device().is_cuda() ||
+            workspace->device().cuda_ordinal() != device_idx)
+        {
+            LOG_ERROR("[" << context << "] RoPE publication workspace/device mismatch: "
+                          << workspace->device().to_string()
+                          << " requested cuda:" << device_idx);
+            return false;
+        }
+
+        const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+        const bool exact_current =
+            current && current->device_values && current->ready_event &&
+            current->rotary_dim == rotary_dim &&
+            current->theta_bits == theta_bits;
+        if (exact_current && adoption_stream == static_cast<void *>(stream))
+            return true;
+
+        if (isCudaStreamCapturing(stream, context))
+        {
+            LOG_ERROR("[" << context << "] Immutable RoPE state was not adopted "
+                          "on the exact CUDA stream before graph capture");
+            return false;
+        }
+
+        if (!exact_current)
+        {
+            llaminar2::PersistentWorkspacePublicationKey key{
+                .word0 = static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(rotary_dim)),
+                .word1 = static_cast<std::uint64_t>(theta_bits),
+                .word2 = static_cast<std::uint64_t>(
+                    llaminar2::rope::kMaxInverseFrequencyValues),
+                .word3 = 1U,
+            };
+            const auto result = workspace->getOrCreatePersistentPublication(
+                kCudaRoPEInvariantPublicationDomain,
+                key,
+                llaminar2::rope::kInvariantPublicationSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    const std::size_t payload_bytes =
+                        static_cast<std::size_t>(rotary_dim / 2) *
+                        sizeof(float);
+                    auto *device_values = static_cast<float *>(
+                        workspace->getPersistentSlotBuffer(
+                            llaminar2::RoPEWorkspaceBuffers::INV_FREQ,
+                            llaminar2::rope::kInvariantPublicationSlots,
+                            slot,
+                            payload_bytes));
+                    if (!device_values)
+                        return {};
+
+                    cudaEvent_t ready_event = nullptr;
+                    cudaError_t err = cudaEventCreateWithFlags(
+                        &ready_event,
+                        cudaEventDisableTiming);
+                    if (err != cudaSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Failed to create RoPE readiness event: "
+                                      << cudaGetErrorString(err));
+                        return {};
+                    }
+
+                    auto publication = std::shared_ptr<
+                        llaminar2::rope::RoPEInvariantWorkspacePublication>(
+                        new llaminar2::rope::RoPEInvariantWorkspacePublication{
+                            .ready_event = static_cast<void *>(ready_event),
+                            .device_values = device_values,
+                            .rotary_dim = rotary_dim,
+                            .theta_bits = theta_bits,
+                            .workspace_slot = slot,
+                        },
+                        [](llaminar2::rope::RoPEInvariantWorkspacePublication *value)
+                        {
+                            if (value && value->ready_event)
+                            {
+                                (void)cudaEventDestroy(
+                                    static_cast<cudaEvent_t>(
+                                        value->ready_event));
+                            }
+                            delete value;
+                        });
+
+                    if (!cudaOps_rope_populate_inv_freq(
+                            device_values,
+                            rotary_dim,
+                            rope_theta,
+                            device_idx,
+                            stream))
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Device RoPE frequency producer failed");
+                        return {};
+                    }
+                    err = cudaEventRecord(ready_event, stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[" << context
+                                      << "] Cannot publish RoPE readiness: "
+                                      << cudaGetErrorString(err));
+                        // Device work was submitted; rollback without its event
+                        // would expose an unordered slot to a later publisher.
+                        std::terminate();
+                    }
+                    return publication;
+                });
+            if (!result)
+            {
+                LOG_ERROR("[" << context
+                              << "] Failed to publish immutable RoPE table");
+                return false;
+            }
+            current = std::static_pointer_cast<
+                llaminar2::rope::RoPEInvariantWorkspacePublication>(
+                result.publication);
+            adoption_stream = nullptr;
+        }
+
+        const cudaError_t wait_err = cudaStreamWaitEvent(
+            stream,
+            static_cast<cudaEvent_t>(current->ready_event),
+            0);
+        if (wait_err != cudaSuccess)
+        {
+            LOG_ERROR("[" << context
+                          << "] Failed to adopt immutable RoPE publication: "
+                          << cudaGetErrorString(wait_err));
+            return false;
+        }
+        adoption_stream = static_cast<void *>(stream);
         return true;
     }
 
@@ -1042,6 +1220,24 @@ namespace llaminar2
         // CUDARoPEKernelT<FP32> Implementation
         // =========================================================================
 
+        bool CUDARoPEKernelT<ActivationPrecision::FP32>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().cuda_ordinal() : -1);
+            return prepareCudaRoPEInvariantPublication(
+                workspace_,
+                static_cast<cudaStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "CUDARoPEKernelT<FP32>");
+        }
+
         void CUDARoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
         {
             if (!publishCudaRoPEDeviceParams(
@@ -1132,26 +1328,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[CUDARoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed (lazy initialization)
-            // Use eff_rotary for frequency computation: inv_freq[i] = 1/(theta^(2i/eff_rotary))
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[CUDARoPEKernelT<FP32>] Failed to populate inv_freq");
+                    LOG_ERROR("[CUDARoPEKernelT<FP32>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
             const bool force_device_positions =
@@ -1263,6 +1453,24 @@ namespace llaminar2
         // CUDARoPEKernelT<BF16> Implementation
         // =========================================================================
 
+        bool CUDARoPEKernelT<ActivationPrecision::BF16>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().cuda_ordinal() : -1);
+            return prepareCudaRoPEInvariantPublication(
+                workspace_,
+                static_cast<cudaStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "CUDARoPEKernelT<BF16>");
+        }
+
         void CUDARoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
         {
             if (!publishCudaRoPEDeviceParams(
@@ -1352,25 +1560,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[CUDARoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed (lazy initialization)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[CUDARoPEKernelT<BF16>] Failed to populate inv_freq");
+                    LOG_ERROR("[CUDARoPEKernelT<BF16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
             const bool force_device_positions =
@@ -1477,6 +1680,24 @@ namespace llaminar2
         // CUDARoPEKernelT<FP16> Implementation
         // =========================================================================
 
+        bool CUDARoPEKernelT<ActivationPrecision::FP16>::prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            const int dev = device_idx_ >= 0
+                                ? device_idx_
+                                : (workspace_ ? workspace_->device().cuda_ordinal() : -1);
+            return prepareCudaRoPEInvariantPublication(
+                workspace_,
+                static_cast<cudaStream_t>(gpu_stream_),
+                dev,
+                rotary_dim,
+                rope_theta,
+                inv_freq_publication_,
+                inv_freq_adoption_stream_,
+                "CUDARoPEKernelT<FP16>");
+        }
+
         void CUDARoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
         {
             if (!publishCudaRoPEDeviceParams(
@@ -1566,25 +1787,20 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
-            if (!d_inv_freq)
+            const std::uint32_t theta_bits = ropeThetaBits(rope_theta);
+            if (!inv_freq_publication_ ||
+                inv_freq_publication_->rotary_dim != eff_rotary ||
+                inv_freq_publication_->theta_bits != theta_bits)
             {
-                LOG_ERROR("[CUDARoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
-                return false;
-            }
-
-            // Initialize inv_freq if needed (lazy initialization)
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
-            {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, stream))
+                if (isGraphCaptureActive())
                 {
-                    LOG_ERROR("[CUDARoPEKernelT<FP16>] Failed to populate inv_freq");
+                    LOG_ERROR("[CUDARoPEKernelT<FP16>] Immutable RoPE state was not prepared before graph capture");
                     return false;
                 }
-                inv_freq_initialized_ = true;
-                inv_freq_head_dim_ = eff_rotary;
-                inv_freq_theta_ = rope_theta;
+                if (!prepareInvariantDeviceState(eff_rotary, rope_theta))
+                    return false;
             }
+            float *d_inv_freq = inv_freq_publication_->device_values;
 
             const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
             const bool force_device_positions =

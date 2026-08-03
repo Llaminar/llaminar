@@ -16,7 +16,6 @@ namespace llaminar2
         constexpr const char *ROUTE_LOGITS = "moe_route_logits";
         constexpr const char *ROUTE_INDICES = "moe_route_indices";
         constexpr const char *ROUTE_WEIGHTS = "moe_route_weights";
-        constexpr const char *PREFILL_EFFECTIVE_SEQ_LEN = "moe_prefill_effective_seq_len";
 
         constexpr const char *GROUP_INT_INDICES = "moe_group_int_indices";
         constexpr const char *GROUP_OFFSETS = "moe_group_offsets";
@@ -154,7 +153,45 @@ namespace llaminar2
             add(reqs, ROUTE_LOGITS, tokens * static_cast<std::size_t>(num_experts) * sizeof(float));
             add(reqs, ROUTE_INDICES, route_slots * sizeof(int));
             add(reqs, ROUTE_WEIGHTS, route_slots * sizeof(float));
-            add(reqs, PREFILL_EFFECTIVE_SEQ_LEN, sizeof(int));
+            return reqs;
+        }
+
+        /**
+         * @brief Declare every CUDA router-owned persistent capture buffer.
+         *
+         * Decode-equivalent verifier and runtime-decode routing can quantize
+         * FP32 hidden rows and consume an immutable Q8 copy of the router gate.
+         * These buffers belong to routing itself; depending on a neighboring
+         * expert stage to happen to request them makes capture readiness depend
+         * on graph ordering instead of the router's own contract.
+         */
+        inline WorkspaceRequirements cudaRouting(
+            int max_seq_len,
+            int d_model,
+            int num_experts,
+            int top_k)
+        {
+            WorkspaceRequirements reqs =
+                routing(max_seq_len, num_experts, top_k);
+            max_seq_len = std::max(1, max_seq_len);
+            d_model = std::max(1, d_model);
+            num_experts = std::max(1, num_experts);
+
+            const int d_model_blocks = ceilDiv(d_model, 32);
+            add(reqs, DECODE_HIDDEN_INT8,
+                static_cast<std::size_t>(max_seq_len) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, DECODE_HIDDEN_SCALES,
+                static_cast<std::size_t>(max_seq_len) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, CUDA_ROUTER_Q8_GATE_WEIGHTS,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, CUDA_ROUTER_Q8_GATE_SCALES,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             return reqs;
         }
 
@@ -257,11 +294,10 @@ namespace llaminar2
             int num_experts,
             int top_k)
         {
-            WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
+            WorkspaceRequirements reqs =
+                cudaRouting(max_seq_len, d_model, num_experts, top_k);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
-            d_model = std::max(1, d_model);
             num_experts = std::max(1, num_experts);
-            const int d_model_blocks = ceilDiv(d_model, 32);
             const std::size_t table_descs =
                 static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
                 static_cast<std::size_t>(num_experts) *
@@ -282,14 +318,6 @@ namespace llaminar2
             add(reqs, CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);
-            add(reqs, CUDA_ROUTER_Q8_GATE_WEIGHTS,
-                static_cast<std::size_t>(kRouterGateCacheSlots) *
-                    static_cast<std::size_t>(num_experts) *
-                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
-            add(reqs, CUDA_ROUTER_Q8_GATE_SCALES,
-                static_cast<std::size_t>(kRouterGateCacheSlots) *
-                    static_cast<std::size_t>(num_experts) *
-                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             return reqs;
         }
 

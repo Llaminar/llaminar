@@ -893,6 +893,7 @@ namespace llaminar2
         const int *verifier_input_tokens,
         const int *generated_token_counts,
         const MTPGreedyPenaltyPolicy *policy,
+        const int *active_rows,
         float *out_values, int *out_indices,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream, int output_stride);
@@ -901,6 +902,7 @@ namespace llaminar2
         const int *verifier_input_tokens,
         const int *generated_token_counts,
         const MTPGreedyPenaltyPolicy *policy,
+        const int *active_rows,
         int device_idx, void *stream);
     extern "C" bool cudaOps_apply_mtp_branch_penalties_f32_row(
         float *data, int cols,
@@ -944,6 +946,7 @@ namespace llaminar2
         float top_p, float temperature,
         int *out_token_ids, int out_stride, float *out_probs,
         float *scratch_values, int *scratch_indices, int scratch_capacity,
+        const int *active_rows,
         int device_idx, void *stream);
     extern "C" bool cudaOps_topk_topp_processed_logits_f32(
         const float *data, int row_count, int n, int row_stride, int k,
@@ -1251,6 +1254,7 @@ namespace llaminar2
         const int *verify_tokens,
         const int *draft_tokens,
         int compare_row_count,
+        const int *active_verifier_row_count,
         const int *stop_tokens,
         int *out_tokens,
         int out_token_capacity,
@@ -1272,6 +1276,7 @@ namespace llaminar2
     extern "C" bool cudaOps_initialize_device_generation(
         int request_count,
         int max_new_tokens,
+        const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
         int response_token_stride,
         int control_stride,
         int *control,
@@ -1377,10 +1382,25 @@ namespace llaminar2
         const int32_t *base_positions,
         const int32_t *valid_graph_rows,
         int valid_graph_row_count,
+        int *generation_control,
+        int generation_control_stride,
         int request_count,
         int padded_seq_len,
         int32_t *out_position_ids,
         int32_t *out_request_lengths,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_prepare_mtp_verifier_controlled_row(
+        const int32_t *first_token,
+        const int32_t *draft_tokens,
+        const int32_t *base_position,
+        int *generation_control_row,
+        int generation_control_stride,
+        int padded_seq_len,
+        int32_t *out_tokens,
+        int32_t *out_position_ids,
+        int32_t *out_request_length,
+        int32_t *out_base_position_snapshot,
         int device_idx,
         void *stream);
     extern "C" bool cudaOps_initialize_mtp_device_logical_state(
@@ -1710,6 +1730,7 @@ namespace llaminar2
         const void *verifier_input_tokens_device,
         const void *generated_token_counts_device,
         const void *penalty_policy_device,
+        const void *active_rows_device,
         int device_id,
         void *stream,
         void *out_values_device,
@@ -1723,6 +1744,7 @@ namespace llaminar2
             !data_device || rows <= 0 || cols <= 0 ||
             !verifier_input_tokens_device ||
             !generated_token_counts_device || !penalty_policy_device ||
+            !active_rows_device ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -1744,6 +1766,7 @@ namespace llaminar2
             static_cast<const int *>(generated_token_counts_device),
             static_cast<const MTPGreedyPenaltyPolicy *>(
                 penalty_policy_device),
+            static_cast<const int *>(active_rows_device),
             static_cast<float *>(out_values_device),
             static_cast<int *>(out_indices_device),
             static_cast<float *>(partial_vals),
@@ -1763,7 +1786,8 @@ namespace llaminar2
         const void *generated_token_counts_device,
         const void *penalty_policy_device,
         int device_id,
-        void *stream)
+        void *stream,
+        const void *active_rows_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 || row_stride < cols ||
@@ -1787,6 +1811,7 @@ namespace llaminar2
             static_cast<const int *>(generated_token_counts_device),
             static_cast<const MTPGreedyPenaltyPolicy *>(
                 penalty_policy_device),
+            static_cast<const int *>(active_rows_device),
             device_id,
             stream);
     }
@@ -2083,7 +2108,8 @@ namespace llaminar2
         void *out_probs_device,
         void *scratch_values_device,
         void *scratch_indices_device,
-        int scratch_capacity)
+        int scratch_capacity,
+        const void *active_rows_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
@@ -2113,6 +2139,7 @@ namespace llaminar2
             static_cast<float *>(scratch_values_device),
             static_cast<int *>(scratch_indices_device),
             scratch_capacity,
+            static_cast<const int *>(active_rows_device),
             device_id,
             stream);
     }
@@ -3156,6 +3183,7 @@ namespace llaminar2
             const void *verify_tokens_device,
             const void *draft_tokens_device,
             int compare_row_count,
+            const void *active_verifier_row_count_device,
             const void *stop_tokens_device,
             int device_id,
             void *stream,
@@ -3167,7 +3195,8 @@ namespace llaminar2
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !draft_tokens_device ||
-            !stop_tokens_device || !penalty_policy_device || compare_row_count < 0 ||
+            !active_verifier_row_count_device || !stop_tokens_device ||
+            !penalty_policy_device || compare_row_count < 0 ||
             out_token_capacity < compare_row_count + 1 ||
             !stream || !out_tokens_device || !out_meta_device)
         {
@@ -3179,6 +3208,7 @@ namespace llaminar2
             static_cast<const int *>(verify_tokens_device),
             static_cast<const int *>(draft_tokens_device),
             compare_row_count,
+            static_cast<const int *>(active_verifier_row_count_device),
             static_cast<const int *>(stop_tokens_device),
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
@@ -3227,6 +3257,7 @@ namespace llaminar2
     bool CUDABackend::enqueueInitializeDeviceGeneration(
         int request_count,
         int max_new_tokens,
+        const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
         int response_token_stride,
         void *response_tokens_device,
         int control_stride,
@@ -3236,6 +3267,7 @@ namespace llaminar2
     {
         if (device_id < 0 || device_id >= device_count_ ||
             request_count <= 0 || max_new_tokens <= 0 ||
+            !depth_policy.valid() ||
             response_token_stride < max_new_tokens ||
             !response_tokens_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
@@ -3248,6 +3280,7 @@ namespace llaminar2
         return cudaOps_initialize_device_generation(
             request_count,
             max_new_tokens,
+            depth_policy,
             response_token_stride,
             control_stride,
             static_cast<int *>(control_device),
@@ -3578,6 +3611,8 @@ namespace llaminar2
         const void *base_positions_device,
         const void *valid_graph_rows_device,
         int valid_graph_row_count,
+        void *generation_control_device,
+        int generation_control_stride,
         int request_count,
         int padded_seq_len,
         int device_id,
@@ -3585,10 +3620,16 @@ namespace llaminar2
         void *out_position_ids_device,
         void *out_request_lengths_device)
     {
+        const bool has_generation_control =
+            generation_control_device != nullptr;
         if (device_id < 0 || device_id >= device_count_ ||
             !base_positions_device || request_count <= 0 ||
             padded_seq_len <= 0 || !stream || !out_position_ids_device ||
-            !out_request_lengths_device)
+            !out_request_lengths_device ||
+            has_generation_control != (generation_control_stride > 0) ||
+            (has_generation_control &&
+             generation_control_stride <
+                 sampling_math::kDeviceGenerationControlCount))
         {
             return false;
         }
@@ -3598,10 +3639,54 @@ namespace llaminar2
             static_cast<const int32_t *>(base_positions_device),
             static_cast<const int32_t *>(valid_graph_rows_device),
             valid_graph_row_count,
+            static_cast<int *>(generation_control_device),
+            generation_control_stride,
             request_count,
             padded_seq_len,
             static_cast<int32_t *>(out_position_ids_device),
             static_cast<int32_t *>(out_request_lengths_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePrepareMTPVerifierControlledRow(
+        const void *first_token_device,
+        const void *draft_tokens_device,
+        const void *base_position_device,
+        void *generation_control_row_device,
+        int generation_control_stride,
+        int padded_seq_len,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_position_ids_device,
+        void *out_request_length_device,
+        void *out_base_position_snapshot_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !first_token_device || !draft_tokens_device ||
+            !base_position_device || !generation_control_row_device ||
+            generation_control_stride <
+                sampling_math::kDeviceGenerationControlCount ||
+            padded_seq_len <= 1 || !stream || !out_tokens_device ||
+            !out_position_ids_device || !out_request_length_device ||
+            !out_base_position_snapshot_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_prepare_mtp_verifier_controlled_row(
+            static_cast<const int32_t *>(first_token_device),
+            static_cast<const int32_t *>(draft_tokens_device),
+            static_cast<const int32_t *>(base_position_device),
+            static_cast<int *>(generation_control_row_device),
+            generation_control_stride,
+            padded_seq_len,
+            static_cast<int32_t *>(out_tokens_device),
+            static_cast<int32_t *>(out_position_ids_device),
+            static_cast<int32_t *>(out_request_length_device),
+            static_cast<int32_t *>(out_base_position_snapshot_device),
             device_id,
             stream);
     }

@@ -113,6 +113,48 @@ namespace llaminar2::test
                "they never consume the bank-reuse publication.";
     }
 
+    /**
+     * @brief Restrict generation-controller ownership to the exact transaction DAG.
+     *
+     * Admission publishes the controller to verifier preparation. Accepted-state
+     * publication returns the same exclusive token for either the next native
+     * parent iteration, the terminal result bridge, or request reset. The
+     * verifier summary is deliberately absent: allowing it to consume this edge
+     * would recreate the former stochastic-only handoff after preparation had
+     * already read the controller.
+     */
+    TEST(Test__DeviceExecutionTimeline,
+         DeviceGenerationControllerDeclaresExactTransactionFlow)
+    {
+        const auto publication =
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::DeviceGenerationStateReady)
+                .from(DeviceTimelineRole::DeviceGenerationController);
+        ASSERT_TRUE(publication.validForPublication());
+
+        for (const DeviceTimelineRole role : {
+                 DeviceTimelineRole::DeviceGenerationController,
+                 DeviceTimelineRole::AllPositionVerifier,
+                 DeviceTimelineRole::HostResultBridge,
+                 DeviceTimelineRole::RequestStateReset,
+             })
+        {
+            EXPECT_TRUE(publication.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+        }
+
+        for (const DeviceTimelineRole role : {
+                 DeviceTimelineRole::VerifierSummary,
+                 DeviceTimelineRole::MainForwardGraph,
+                 DeviceTimelineRole::RankCollective,
+                 DeviceTimelineRole::Diagnostics,
+             })
+        {
+            EXPECT_FALSE(publication.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+        }
+    }
+
     TEST(Test__DeviceExecutionTimeline, RequestResetMustPrecedeEveryGpuGraphFamily)
     {
         const auto reset =

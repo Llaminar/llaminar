@@ -2695,42 +2695,46 @@ namespace llaminar2::test
                   std::string::npos)
             << "Transfer-backed graph setup must be capture-only so cached and "
                "device-controlled replays require no external host preparation.";
-        EXPECT_NE(stage_header.find("prepareForCapture("), std::string::npos)
-            << "Every multi-stream MoE stage must share one typed pre-capture lane contract.";
-        const size_t prepare_lane =
-            stage_source.find("bool DeviceMoERebalanceTransferState::prepareForCapture");
-        ASSERT_NE(prepare_lane, std::string::npos);
-        const size_t ensure_transfer_state =
-            stage_source.find("ensure(device, name_suffix)", prepare_lane);
-        const size_t precapture_record =
-            stage_source.find("recordEventChecked(",
-                              ensure_transfer_state);
-        const size_t precapture_wait =
-            stage_source.find("waitEventChecked(",
-                              precapture_record);
-        ASSERT_NE(ensure_transfer_state, std::string::npos);
-        ASSERT_NE(precapture_record, std::string::npos)
-            << "Transfer-slot rebalance must publish prior auxiliary-stream work before graph capture.";
-        ASSERT_NE(precapture_wait, std::string::npos)
-            << "The capture stream must wait for the published auxiliary-stream boundary.";
-        EXPECT_LT(ensure_transfer_state, precapture_record)
-            << "The pre-capture event edge must run after transfer stream/event allocation.";
-        EXPECT_LT(precapture_record, precapture_wait)
-            << "The auxiliary stream must record completion before the capture stream waits.";
+        EXPECT_NE(
+            stage_header.find("materializeCaptureResources("),
+            std::string::npos)
+            << "Every multi-stream MoE stage must share one typed resource-materialization contract.";
+        const size_t materialize_lane = stage_source.find(
+            "bool DeviceMoERebalanceTransferState::materializeCaptureResources");
+        const size_t validate_lane = stage_source.find(
+            "bool DeviceMoERebalanceTransferState::isMaterializedFor",
+            materialize_lane);
+        ASSERT_NE(materialize_lane, std::string::npos);
+        ASSERT_NE(validate_lane, std::string::npos);
+        const std::string materialize_body = stage_source.substr(
+            materialize_lane,
+            validate_lane - materialize_lane);
+        EXPECT_NE(
+            materialize_body.find("getOrCreateAuxiliaryStream"),
+            std::string::npos)
+            << "Capture preparation must materialize the persistent auxiliary stream.";
+        EXPECT_NE(materialize_body.find("createEvent("), std::string::npos)
+            << "Capture preparation must materialize persistent event handles.";
+        EXPECT_EQ(materialize_body.find("recordEvent"), std::string::npos)
+            << "Resource materialization must not import a cross-replay event edge into the captured fragment.";
+        EXPECT_EQ(materialize_body.find("waitEvent"), std::string::npos)
+            << "Resource materialization must enqueue no stream dependency.";
+        EXPECT_EQ(materialize_body.find("streamWaitEvent"), std::string::npos)
+            << "Resource materialization must enqueue no backend stream dependency.";
 
         const size_t prepare_launch =
             stage_source.find("bool MoEDeviceRebalanceStage::prepareGraphLaunch");
         ASSERT_NE(prepare_launch, std::string::npos);
         const size_t prepare_lane_call =
-            stage_source.find("transfer_state->prepareForCapture(",
+            stage_source.find("transfer_state->materializeCaptureResources(",
                               prepare_launch);
-        const size_t fence_counter =
-            stage_source.find("device_rebalance_precapture_transfer_stream_event_fence",
-                              prepare_launch);
+        const size_t materialization_counter = stage_source.find(
+            "device_rebalance_capture_resources_materialized",
+            prepare_launch);
         ASSERT_NE(prepare_lane_call, std::string::npos)
-            << "Maintenance capture must use the shared typed transfer-lane preflight.";
-        EXPECT_NE(fence_counter, std::string::npos)
-            << "Perfstats should prove the pre-capture event fence ran in e2e logs.";
+            << "Maintenance capture must use the shared typed transfer-resource preflight.";
+        EXPECT_NE(materialization_counter, std::string::npos)
+            << "PerfStats should prove capture resources were materialized before e2e replay.";
         EXPECT_EQ(stage_source.find("synchronizeStreamChecked(transfer_state->transferStream())"),
                   std::string::npos)
             << "Capture preparation must never block the host on the auxiliary stream.";
@@ -3797,10 +3801,16 @@ namespace llaminar2::test
             dgo.substr(
                 maintenance_scheduler_begin,
                 maintenance_scheduler_end - maintenance_scheduler_begin);
+        const size_t launch_dependency_declaration =
+            maintenance_scheduler.find(
+                "DeviceGraphExecutor::GraphLaunchDependencyHook maintenance_launch_dependency");
+        ASSERT_NE(launch_dependency_declaration, std::string::npos)
+            << "Maintenance must express live-state ordering as a typed "
+               "captured-executable launch dependency.";
         EXPECT_NE(maintenance_scheduler.find(
                       "waitForLiveInferenceStateReadyForObservation(\n"
-                      "                    maintenance_stream,\n"
-                      "                    \"moe_device_rebalance_maintenance_before_capture\",\n"
+                      "                    execution_stream,\n"
+                      "                    \"moe_device_rebalance_maintenance_before_executable_launch\",\n"
                       "                    DeviceTimelineRole::MoERebalanceMaintenance)"),
                   std::string::npos)
             << "Maintenance must observe every committed device-state producer, including "
@@ -3812,20 +3822,27 @@ namespace llaminar2::test
         const size_t live_state_wait =
             maintenance_scheduler.find(
                 "waitForLiveInferenceStateReadyForObservation(\n"
-                "                    maintenance_stream,\n"
-                "                    \"moe_device_rebalance_maintenance_before_capture\",\n"
+                "                    execution_stream,\n"
+                "                    \"moe_device_rebalance_maintenance_before_executable_launch\",\n"
                 "                    DeviceTimelineRole::MoERebalanceMaintenance)");
+        const size_t launch_dependency_install =
+            maintenance_scheduler.find(
+                "policy.launch_dependency = maintenance_launch_dependency;");
         const size_t maintenance_replay =
             maintenance_scheduler.find(
                 "tryLaunchCapturedMoERebalanceMaintenanceGraphDirect");
         ASSERT_NE(live_state_wait, std::string::npos);
+        ASSERT_NE(launch_dependency_install, std::string::npos);
         ASSERT_NE(maintenance_replay, std::string::npos);
-        EXPECT_LT(live_state_wait, maintenance_replay)
-            << "The device event barrier must be queued before maintenance capture or replay begins.";
+        EXPECT_LT(launch_dependency_declaration, live_state_wait);
+        EXPECT_LT(live_state_wait, launch_dependency_install)
+            << "The complete live-state join must belong to the installed typed launch hook.";
+        EXPECT_LT(launch_dependency_install, maintenance_replay)
+            << "The launch hook must be installed before direct replay or first capture can submit work.";
         const std::string steady_dependency_region =
             maintenance_scheduler.substr(
-                live_state_wait,
-                maintenance_replay - live_state_wait);
+                launch_dependency_declaration,
+                maintenance_replay - launch_dependency_declaration);
         EXPECT_EQ(steady_dependency_region.find("synchronizeStream"), std::string::npos)
             << "Steady maintenance ordering must remain device-side; request-reset diagnostics own "
                "the separate checked stream drain.";
@@ -4918,10 +4935,10 @@ namespace llaminar2::test
         for (const std::string &required_reset : {
                  "grouped_gateup_desc_table_id_ = -1",
                  "grouped_down_desc_table_id_ = -1",
-                 "runtime_grouped_decode_warmed_ = false",
+                 "runtime_grouped_decode_launch_state_prepared_ = false",
                  "shared_grouped_gateup_desc_table_id_ = -1",
                  "shared_grouped_down_desc_table_id_ = -1",
-                 "grouped_decode_warmed_ = false",
+                 "grouped_decode_launch_state_prepared_ = false",
              })
         {
             EXPECT_NE(moe_header.find(required_reset), std::string::npos)
@@ -7092,14 +7109,14 @@ namespace llaminar2::test
             expert_stage_source.substr(
                 llep_prepare_begin,
                 llep_prepare_end - llep_prepare_begin);
-        EXPECT_NE(llep_prepare_body.find("prefill_llep_transfer_state->prepareForCapture("),
+        EXPECT_NE(llep_prepare_body.find("prefill_llep_transfer_state->materializeCaptureResources("),
                   std::string::npos)
-            << "Prefill LLEP must preflight its rolling transfer lane before graph capture.";
+            << "Prefill LLEP must materialize its rolling transfer resources before graph capture.";
         EXPECT_NE(
             llep_prepare_body.find(
-                "device_rebalance_llep_prefill_precapture_lane_event_fence"),
+                "device_rebalance_llep_prefill_capture_resources_materialized"),
             std::string::npos)
-            << "PerfStats must prove prefill LLEP used the pre-capture lane fence.";
+            << "PerfStats must prove prefill LLEP materialized capture resources.";
         EXPECT_EQ(llep_prepare_body.find("synchronize"), std::string::npos)
             << "Prefill capture preparation must use event ordering, never a host fence.";
 

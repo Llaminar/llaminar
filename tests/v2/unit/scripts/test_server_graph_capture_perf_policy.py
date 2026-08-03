@@ -440,6 +440,24 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                         f"{backend}:0,{backend}:1;",
                         flags,
                     )
+                    if mode == "llep":
+                        self.assertIn("routed_compute=replicated", flags)
+                        self.assertIn(
+                            "routed_phase="
+                            "prefill-apportioned-decode-replicated",
+                            flags,
+                        )
+                        self.assertIn(
+                            "routed_assignment=least-loaded-resident",
+                            flags,
+                        )
+                    else:
+                        self.assertIn("routed_compute=apportioned", flags)
+                        self.assertIn("routed_phase=uniform", flags)
+                        self.assertIn(
+                            "routed_assignment=static-owner",
+                            flags,
+                        )
                     self.assertIn("prefill-graph-probe", options)
                     self.assertIn(
                         "prefix-cache-rebalance-clear-probe",
@@ -570,10 +588,6 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         records = [
             counter(
                 "decode_graph_phase",
-                tags={"context": "main_decode", "phase": "warmup"},
-            ),
-            counter(
-                "decode_graph_phase",
                 tags={"context": "main_decode", "phase": "capture"},
             ),
             counter(
@@ -611,10 +625,6 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         """Decode capture cannot mask a prefill executable stuck before replay."""
 
         records = [
-            counter(
-                "decode_graph_phase",
-                tags={"context": "main_decode", "phase": "warmup"},
-            ),
             counter(
                 "decode_graph_phase",
                 tags={"context": "main_decode", "phase": "capture"},
@@ -690,18 +700,14 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertTrue(result.prefill_lifecycle_complete)
         self.assertEqual(result.missing_prefill_phases, ())
 
-    def test_helper_executable_cannot_mask_repeated_verifier_warmup(self) -> None:
-        """Context attribution must expose a verifier that never captures."""
+    def test_helper_executable_cannot_mask_legacy_verifier_warmup(self) -> None:
+        """Context attribution must expose a verifier using retired eager warmup."""
 
         records = [
             counter(
                 "decode_graph_phase",
                 value=8.0,
                 tags={"context": "main_verifier", "phase": "warmup"},
-            ),
-            counter(
-                "decode_graph_phase",
-                tags={"context": "mtp_helper", "phase": "warmup"},
             ),
             counter(
                 "decode_graph_phase",
@@ -733,14 +739,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIn("main_verifier", result.error or "")
         self.assertEqual(len(result.incomplete_contexts), 1)
 
-    def test_two_invocations_require_context_matched_capture(self) -> None:
-        """A second invocation must advance warmup to a real capture."""
+    def test_transaction_zero_requires_context_matched_capture(self) -> None:
+        """Transaction-zero capture must own its matching executable."""
 
         records = [
             counter(
                 "decode_graph_phase",
-                value=2.0,
-                tags={"context": "main_decode", "phase": "warmup"},
+                tags={"context": "main_decode", "phase": "capture"},
             ),
             counter(
                 "full_graph_plan_graphs",
@@ -757,7 +762,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
         ]
         result = validate_graph_capture_policy(records, "rocm:0", "")
-        self.assertIn("missing capture", result.error or "")
+        self.assertIn("context-matched executable", result.error or "")
 
     def test_repeated_mtp_sidecar_rebuilds_fail(self) -> None:
         """A sliding source pointer must not masquerade as graph progress."""

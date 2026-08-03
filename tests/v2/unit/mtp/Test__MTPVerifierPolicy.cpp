@@ -5,6 +5,80 @@
 namespace llaminar2
 {
 
+TEST(Test__MTPVerifierPolicy, PhysicalRowBucketsBoundTheCapturedGraphFamily)
+{
+    constexpr int max_rows = 16;
+    constexpr int expected[] = {
+        1, 2, 4, 4, 8, 8, 8, 8,
+        16, 16, 16, 16, 16, 16, 16, 16,
+    };
+
+    for (int logical_rows = 1; logical_rows <= max_rows; ++logical_rows)
+    {
+        EXPECT_EQ(
+            mtpVerifierPhysicalRowBucket(logical_rows, max_rows),
+            expected[logical_rows - 1])
+            << "logical_rows=" << logical_rows;
+    }
+}
+
+TEST(Test__MTPVerifierPolicy, PhysicalRowBucketsRemainTotalForNonPowerOfTwoCaps)
+{
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(1, 15), 1);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(3, 15), 4);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(8, 15), 8);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(9, 15), 15);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(15, 15), 15);
+}
+
+TEST(Test__MTPVerifierPolicy, PhysicalRowBucketsRejectInvalidGeometry)
+{
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(0, 16), 0);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(-1, 16), 0);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(1, 0), 0);
+    EXPECT_EQ(mtpVerifierPhysicalRowBucket(17, 16), 0);
+}
+
+TEST(Test__MTPVerifierPolicy,
+     PhysicalPaddedWidthBucketsOnlyTheScalarGpuLane)
+{
+    constexpr auto bucket =
+        MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 5, 15, bucket), 8);
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 9, 15, bucket), 15);
+
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(2, 5, 15, bucket), 5);
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(8, 9, 15, bucket), 9);
+
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(0, 5, 15, bucket), 0);
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 0, 15, bucket), 0);
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 16, 15, bucket), 0);
+}
+
+TEST(Test__MTPVerifierPolicy,
+     DynamicDeviceEnvelopeIsStableAcrossEveryScalarLogicalWidth)
+{
+    constexpr int max_rows = 16;
+    constexpr auto envelope =
+        MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope;
+    for (int logical_rows = 1; logical_rows <= max_rows; ++logical_rows)
+    {
+        EXPECT_EQ(
+            mtpVerifierPhysicalPaddedSeqLen(
+                /*request_count=*/1,
+                logical_rows,
+                max_rows,
+                envelope),
+            max_rows)
+            << "logical_rows=" << logical_rows;
+    }
+
+    EXPECT_EQ(
+        mtpVerifierPhysicalPaddedSeqLen(2, 5, max_rows, envelope),
+        5)
+        << "Request-batched metadata retains its explicit row stride.";
+}
+
 TEST(Test__MTPVerifierPolicy, GreedyUsesGroupedDecodeEquivalentOutcomeByDefault)
 {
     const MTPVerifierPolicyDecision decision =

@@ -123,6 +123,9 @@ namespace llaminar2
     struct MTPVerifierOutcomeGraphBinding
     {
         const int32_t *verifier_input_tokens_device = nullptr;
+        const int32_t *active_verifier_row_count_device = nullptr;
+        /** Prepared controller budget for the current verifier transaction. */
+        const uint32_t *transaction_commit_budget_device = nullptr;
         const int32_t *stop_tokens_device = nullptr;
         const MTPGreedyPenaltyPolicy *penalty_policy_device = nullptr;
         int32_t *generated_token_counts_device = nullptr;
@@ -145,6 +148,8 @@ namespace llaminar2
         [[nodiscard]] bool validForGreedy() const noexcept
         {
             return verifier_input_tokens_device != nullptr &&
+                   active_verifier_row_count_device != nullptr &&
+                   transaction_commit_budget_device != nullptr &&
                    stop_tokens_device != nullptr &&
                    penalty_policy_device != nullptr &&
                    generated_token_counts_device != nullptr &&

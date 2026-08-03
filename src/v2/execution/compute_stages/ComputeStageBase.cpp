@@ -50,24 +50,7 @@ namespace llaminar2
 
     void StageGPUExecution::requirePreparedOutput(ITensor *tensor) const
     {
-        if (!tensor)
-        {
-            throw std::invalid_argument(
-                "StageGPUExecution::requirePreparedOutput requires a tensor");
-        }
-
-        const auto *base = dynamic_cast<const TensorBase *>(tensor);
-        const auto current_device =
-            base ? base->current_device() : std::optional<DeviceId>{};
-        if (!base ||
-            !base->gpu_data_ptr() ||
-            !current_device.has_value() ||
-            *current_device != device_)
-        {
-            throw std::runtime_error(
-                "Stage output storage was not prepared on executor-bound device " +
-                device_.to_string());
-        }
+        TransferEngine::requireDeviceOutput(tensor, device_, stream_);
     }
 
     void StageGPUExecution::publish(ITensor *tensor) const

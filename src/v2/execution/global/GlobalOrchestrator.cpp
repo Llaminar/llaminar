@@ -393,6 +393,96 @@ namespace llaminar2
         }
     }
 
+    bool StageRunnerRegistry::configureMTPRequestStopTokensAll(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        bool saw_runner = false;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner)
+            {
+                throw std::logic_error(
+                    "Cannot configure MTP request stop tokens on null global "
+                    "stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+            if (!entry.runner->configureMTPRequestStopTokens(stop_tokens))
+            {
+                throw std::runtime_error(
+                    "MTP request stop-token configuration was rejected by "
+                    "global stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+        }
+
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            if (!compatibility_runner_->configureMTPRequestStopTokens(stop_tokens))
+            {
+                throw std::runtime_error(
+                    "MTP request stop-token configuration was rejected by the "
+                    "global compatibility runner");
+            }
+        }
+
+        if (!saw_runner)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request stop tokens without a local "
+                "global stage runner");
+        }
+        return true;
+    }
+
+    bool StageRunnerRegistry::configureMTPRequestPenaltyPolicyAll(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        bool saw_runner = false;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner)
+            {
+                throw std::logic_error(
+                    "Cannot configure MTP request penalty policy on null global "
+                    "stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+            if (!entry.runner->configureMTPRequestPenaltyPolicy(policy))
+            {
+                throw std::runtime_error(
+                    "MTP request penalty-policy configuration was rejected by "
+                    "global stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+        }
+
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            if (!compatibility_runner_->configureMTPRequestPenaltyPolicy(policy))
+            {
+                throw std::runtime_error(
+                    "MTP request penalty-policy configuration was rejected by "
+                    "the global compatibility runner");
+            }
+        }
+
+        if (!saw_runner)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request penalty policy without a local "
+                "global stage runner");
+        }
+        return true;
+    }
+
     void StageRunnerRegistry::setSkipLogitsGatherDecodeAll(bool skip)
     {
         for (auto &entry : entries_)
@@ -1658,6 +1748,18 @@ namespace llaminar2
             return nullptr;
         const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
         return runner ? runner->mtpLogits() : nullptr;
+    }
+
+    bool GlobalOrchestrator::configureMTPRequestStopTokens(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        return stage_runners_.configureMTPRequestStopTokensAll(stop_tokens);
+    }
+
+    bool GlobalOrchestrator::configureMTPRequestPenaltyPolicy(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        return stage_runners_.configureMTPRequestPenaltyPolicyAll(policy);
     }
 
     bool GlobalOrchestrator::setComputeAllPositionLogits(bool enabled)

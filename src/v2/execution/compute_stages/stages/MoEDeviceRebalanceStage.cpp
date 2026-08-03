@@ -84,13 +84,10 @@ namespace llaminar2
         release();
     }
 
-    bool DeviceMoERebalanceTransferState::ensure(
+    bool DeviceMoERebalanceTransferState::materializeCaptureResources(
         DeviceId device,
         const std::string &name_suffix)
     {
-        if (transfer_stream_ && compute_ready_event_ && transfer_done_event_)
-            return true;
-
         IBackend *backend = getBackendFor(device);
         if (!backend)
         {
@@ -111,6 +108,32 @@ namespace llaminar2
             return false;
         }
 
+        const std::string lane_name = suffixFor(name_suffix);
+        const bool has_any_resource =
+            transfer_stream_ || compute_ready_event_ || transfer_done_event_ ||
+            event_backend_ || event_device_ordinal_ >= 0 ||
+            !stream_lane_name_.empty();
+        if (has_any_resource)
+        {
+            const bool exact_existing_binding =
+                transfer_stream_ && compute_ready_event_ &&
+                transfer_done_event_ && event_backend_ == backend &&
+                event_device_ordinal_ == device_ordinal &&
+                stream_lane_name_ == lane_name;
+            if (!exact_existing_binding)
+            {
+                LOG_ERROR("[DeviceMoERebalanceTransferState] Refusing to rebind a partial or foreign capture resource set"
+                          << " requested_device=" << device.to_string()
+                          << " requested_lane=" << lane_name
+                          << " bound_device_ordinal=" << event_device_ordinal_
+                          << " bound_lane="
+                          << (stream_lane_name_.empty()
+                                  ? "<none>"
+                                  : stream_lane_name_));
+            }
+            return exact_existing_binding;
+        }
+
         IWorkerGPUContext *gpu_ctx = nullptr;
         try
         {
@@ -124,7 +147,7 @@ namespace llaminar2
         }
 
         transfer_stream_ = gpu_ctx->getOrCreateAuxiliaryStream(
-            "moe_device_rebalance_transfer:" + suffixFor(name_suffix));
+            "moe_device_rebalance_transfer:" + lane_name);
         if (!transfer_stream_)
         {
             LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to create context-owned transfer stream for "
@@ -134,6 +157,7 @@ namespace llaminar2
 
         event_backend_ = backend;
         event_device_ordinal_ = device_ordinal;
+        stream_lane_name_ = lane_name;
         if (!compute_ready_event_)
             compute_ready_event_ = backend->createEvent(device_ordinal);
         if (!transfer_done_event_)
@@ -150,57 +174,27 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceMoERebalanceTransferState::prepareForCapture(
+    bool DeviceMoERebalanceTransferState::isMaterializedFor(
         DeviceId device,
-        const std::string &name_suffix,
-        void *capture_stream)
+        const std::string &name_suffix) const
     {
-        if (!capture_stream)
-        {
-            LOG_ERROR("[DeviceMoERebalanceTransferState] Graph launch preparation requires an explicit capture stream"
-                      << " device=" << device.to_string()
-                      << " lane=" << suffixFor(name_suffix));
-            return false;
-        }
-        if (!ensure(device, name_suffix))
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
             return false;
 
-        IWorkerGPUContext *gpu_ctx = nullptr;
+        int device_ordinal = -1;
         try
         {
-            gpu_ctx = &GPUDeviceContextPool::instance().getContext(device);
+            device_ordinal = device.gpu_ordinal();
         }
-        catch (const std::exception &e)
+        catch (...)
         {
-            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to resolve GPU context for pre-capture transfer-lane fence"
-                      << " device=" << device.to_string()
-                      << " lane=" << suffixFor(name_suffix)
-                      << ": " << e.what());
             return false;
         }
-        if (!gpu_ctx || !transfer_stream_ || !transfer_done_event_)
-        {
-            LOG_ERROR("[DeviceMoERebalanceTransferState] Pre-capture transfer-lane fence requires initialized resources"
-                      << " device=" << device.to_string()
-                      << " lane=" << suffixFor(name_suffix));
-            return false;
-        }
-
-        /*
-         * Publish all previously submitted auxiliary work before capture begins.
-         * This edge is outside the new graph. The stage's ordinary
-         * computeReady/transferDone event pair then becomes part of the captured
-         * graph and orders each payload transaction during replay.
-         */
-        if (!gpu_ctx->recordEventChecked(transfer_done_event_, transfer_stream_) ||
-            !gpu_ctx->waitEventChecked(transfer_done_event_, capture_stream))
-        {
-            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to queue pre-capture transfer-lane event fence"
-                      << " device=" << device.to_string()
-                      << " lane=" << suffixFor(name_suffix));
-            return false;
-        }
-        return true;
+        return transfer_stream_ && compute_ready_event_ &&
+               transfer_done_event_ && event_backend_ == backend &&
+               event_device_ordinal_ == device_ordinal &&
+               stream_lane_name_ == suffixFor(name_suffix);
     }
 
     void DeviceMoERebalanceTransferState::release()
@@ -220,6 +214,7 @@ namespace llaminar2
         transfer_done_event_ = nullptr;
         event_backend_ = nullptr;
         event_device_ordinal_ = -1;
+        stream_lane_name_.clear();
         /*
          * transfer_stream_ is context-owned via IWorkerGPUContext. It remains
          * valid until the context resets auxiliary streams or shuts down.
@@ -658,7 +653,7 @@ namespace llaminar2
         return params_.transfer_state.get();
     }
 
-    bool MoEDeviceRebalanceStage::ensureAsyncTransferState()
+    bool MoEDeviceRebalanceStage::requireMaterializedAsyncTransferState() const
     {
         if (!usesTransferSlotApply())
             return true;
@@ -669,7 +664,17 @@ namespace llaminar2
                       << " phase=" << phaseName(params_.phase));
             return false;
         }
-        return params_.transfer_state->ensure(params_.device_id, workspaceSuffix());
+        if (!params_.transfer_state->isMaterializedFor(
+                params_.device_id,
+                workspaceSuffix()))
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Transfer resources were not materialized before graph execution"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " phase=" << phaseName(params_.phase)
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+        return true;
     }
 
     bool MoEDeviceRebalanceStage::validateCommon(const char *context) const
@@ -772,7 +777,7 @@ namespace llaminar2
 
         if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
         {
-            if (!ensureAsyncTransferState())
+            if (!requireMaterializedAsyncTransferState())
                 return false;
             auto *transfer_state = transferState();
             if (!transfer_state || !transfer_state->transferDoneEvent())
@@ -1044,7 +1049,7 @@ namespace llaminar2
         MoEKernelLaunchContext transfer_launch{};
         if (usesTransferSlotApply())
         {
-            if (!ensureAsyncTransferState())
+            if (!requireMaterializedAsyncTransferState())
                 return false;
             transfer_state = transferState();
             if (!transfer_state ||
@@ -1843,17 +1848,16 @@ namespace llaminar2
         auto *transfer_state = transferState();
         if (!transfer_state)
         {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence requires shared transfer state"
+            LOG_ERROR("[MoEDeviceRebalanceStage] Capture resource materialization requires shared transfer state"
                       << " stage=" << suffixFor(params_.stage_name)
                       << " device=" << params_.device_id.to_string());
             return false;
         }
-        if (!transfer_state->prepareForCapture(
+        if (!transfer_state->materializeCaptureResources(
                 params_.device_id,
-                workspaceSuffix(),
-                stream))
+                workspaceSuffix()))
         {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream event fence failed"
+            LOG_ERROR("[MoEDeviceRebalanceStage] Capture resource materialization failed"
                       << " stage=" << suffixFor(params_.stage_name)
                       << " phase=" << phaseName(params_.phase)
                       << " device=" << params_.device_id.to_string()
@@ -1862,7 +1866,7 @@ namespace llaminar2
         }
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_rebalance_precapture_transfer_stream_event_fence",
+            "device_rebalance_capture_resources_materialized",
             1.0,
             "decode",
             params_.device_id.to_string(),

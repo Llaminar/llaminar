@@ -539,6 +539,16 @@ namespace llaminar2
         // against coordinator thread work. Used by allreduceMultiWithComputeDeps
         // to bypass the coordinator thread hop for lower latency.
         std::mutex direct_exec_mutex_;
+
+        /**
+         * @brief Serialize the fatal all-rank RCCL abort transaction.
+         *
+         * A participant failure can be observed by several orchestration
+         * threads, but communicator ownership may be detached and aborted only
+         * once. The guarded transaction launches every active local rank before
+         * joining any rank, matching RCCL's collective abort contract.
+         */
+        std::mutex abort_mutex_;
     };
 
 } // namespace llaminar2

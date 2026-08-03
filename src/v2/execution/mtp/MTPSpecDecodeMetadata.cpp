@@ -9,6 +9,7 @@
 #include <cstring>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -1389,11 +1390,40 @@ namespace llaminar2
     {
     }
 
-    void MTPSpecDecodeMetadataWorkspaceBinding::setShape(
-        MTPSpecDecodeMetadataShape shape)
+    void MTPSpecDecodeMetadataWorkspaceBinding::ensureCapacity(
+        MTPSpecDecodeMetadataShape minimum_capacity)
     {
-        shape_ = shape;
+        if (!minimum_capacity.valid())
+        {
+            throw std::invalid_argument(
+                "MTPSpecDecodeMetadataWorkspaceBinding::ensureCapacity requires "
+                "positive request and draft-token capacity");
+        }
+
+        const MTPSpecDecodeMetadataShape expanded{
+            .max_requests = std::max(
+                shape_.max_requests,
+                minimum_capacity.max_requests),
+            .max_draft_tokens = std::max(
+                shape_.max_draft_tokens,
+                minimum_capacity.max_draft_tokens),
+        };
+        if (expanded.max_requests == shape_.max_requests &&
+            expanded.max_draft_tokens == shape_.max_draft_tokens)
+        {
+            return;
+        }
+
+        shape_ = expanded;
         refreshDevicePointers();
+    }
+
+    bool MTPSpecDecodeMetadataWorkspaceBinding::covers(
+        MTPSpecDecodeMetadataShape requested_shape) const
+    {
+        return requested_shape.valid() && shape_.valid() &&
+               shape_.max_requests >= requested_shape.max_requests &&
+               shape_.max_draft_tokens >= requested_shape.max_draft_tokens;
     }
 
     MTPSpecDecodeMetadataShape MTPSpecDecodeMetadataWorkspaceBinding::effectiveShape(
@@ -1617,6 +1647,11 @@ namespace llaminar2
                            binding.bindingError();
             return result;
         }
+        if (!binding.covers(batch.shape))
+        {
+            result.error = "MTP metadata batch exceeds the setup-owned workspace capacity";
+            return result;
+        }
         if (device.is_gpu())
         {
             if (!stream)
@@ -1752,6 +1787,12 @@ namespace llaminar2
                            binding.bindingError();
             return result;
         }
+        if (!binding.covers(plan.shape))
+        {
+            result.error =
+                "MTP verifier input plan exceeds the setup-owned workspace capacity";
+            return result;
+        }
         if (plan.compact_logit_row_count < 0 ||
             plan.compact_logit_row_count >
                 plan.shape.max_requests * plan.shape.maxTargetQueryLen() ||
@@ -1825,9 +1866,9 @@ namespace llaminar2
             result.error = "MTP verifier row upload has an invalid row count";
             return result;
         }
-        const MTPSpecDecodeMetadataShape &shape = binding.shape();
-        if (shape.valid() &&
-            row_count > shape.max_requests * shape.maxTargetQueryLen())
+        const MTPSpecDecodeMetadataShape &capacity = binding.capacity();
+        if (capacity.valid() &&
+            row_count > capacity.max_requests * capacity.maxTargetQueryLen())
         {
             result.error = "MTP verifier row upload exceeds metadata workspace shape";
             return result;

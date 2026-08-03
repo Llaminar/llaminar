@@ -29,6 +29,7 @@
 #pragma once
 
 #include "ComputeGraph.h"
+#include "GraphCaptureGuard.h"
 #include "IGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "StageTimeline.h"
@@ -168,10 +169,11 @@ namespace llaminar2
         /**
          * @brief One immutable, graph-owned GPU snapshot output descriptor.
          *
-         * The graph owner's warmup finalizes both this descriptor and its stable
-         * destination storage. The same owner then consumes it during capture
-         * and replay publication. Identically named stages in another graph
-         * geometry therefore cannot overwrite it.
+         * The graph owner's launch-preparation pass finalizes both this
+         * descriptor and its stable destination storage before native capture
+         * begins. The captured producer records the point-in-time D2D copy;
+         * replay publication consumes the same immutable slot. Identically
+         * named stages in another graph geometry therefore cannot overwrite it.
          */
         struct GraphSnapshotOutputCopy
         {
@@ -185,10 +187,10 @@ namespace llaminar2
             DeviceId device = DeviceId::invalid();
             const void *source_ptr = nullptr;
             /**
-             * True after a real stage execution recorded this descriptor and
-             * its point-in-time D2D copy. Allocation-only pre-capture passes
-             * may inspect stage metadata, but must not replace a warmed source
-             * with a pre-execution fallback view.
+             * True after launch preparation froze the complete source and
+             * destination descriptor. The producer has not executed at that
+             * point; its point-in-time D2D copy is recorded later inside the
+             * native graph. Capture rejects any descriptor drift.
              */
             bool descriptor_finalized = false;
             std::unique_ptr<FP32Tensor> storage;
@@ -532,14 +534,19 @@ namespace llaminar2
             GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         /**
-         * @brief Join every arena input to the exact stream before graph capture.
+         * @brief Prepare the complete arena storage frontier before graph capture.
          *
          * Arena residency and producer ordering are separate contracts. Warmup
          * can leave valid activation storage whose completion event belongs to a
          * different eager stream. CUDA/HIP graph capture cannot import that
-         * external event after `beginCapture()`, so this method walks all graph
-         * reads, deduplicates their backing tensors, and enqueues nonblocking
-         * event waits on @p capture_stream before the capture transaction starts.
+         * external event after `beginCapture()`, so this method walks the graph
+         * in topological order and joins only reads whose producer is outside the
+         * captured graph. Reads produced by an earlier stage are internal native
+         * graph edges and must never be mistaken for stale external inputs.
+         * Every declared output also receives its stable device allocation before
+         * capture begins; allocation does not publish authority or invent output
+         * bytes. Backing tensors are deduplicated before event joins or storage
+         * allocation are performed on @p capture_stream.
          *
          * `TransferEngine::requireDeviceInput()` records each exact
          * `{completion event, capture stream}` pair. Stage-level prepared-input
@@ -550,13 +557,37 @@ namespace llaminar2
          * @param ctx GPU context owning the graph and stream.
          * @param capture_stream Exact non-null stream passed to beginCapture().
          * @param context Optional diagnostic label.
-         * @return true after every unique arena read dependency is joined.
+         * @return true after all external dependencies and output storage are ready.
          */
-        bool prepareInputsForGraphCapture(
+        bool prepareGraphStorageForCapture(
             ComputeGraph &graph,
             IDeviceContext *ctx,
             void *capture_stream,
             const char *context = nullptr);
+
+        /**
+         * @brief Freeze the typed stage dependency sequence for native capture.
+         *
+         * This planner resolves BufferId contracts to canonical tensor storage
+         * owners before beginCapture().  Each internal read records the precise
+         * earlier producer-stage index, while values entering the capture unit
+         * remain strict external inputs.  The returned ledger owns only host-side
+         * identities and booleans; it performs no allocation while recording.
+         *
+         * @param graph Graph containing every named stage.
+         * @param stage_names Exact topological capture unit, in recording order.
+         * @param capture_device GPU owning this native graph transaction.
+         * @param capture_stream Exact non-null stream passed to beginCapture().
+         * @param context Stable diagnostic label.
+         * @return Frozen ledger, or nullptr after a precise planning diagnostic.
+         */
+        std::unique_ptr<GraphCaptureDependencyLedger>
+        planGraphCaptureDependencies(
+            ComputeGraph &graph,
+            std::span<const std::string> stage_names,
+            DeviceId capture_device,
+            void *capture_stream,
+            const char *context);
 
         /**
          * @brief Execute a cached decode graph with GPU graph capture/replay
@@ -621,6 +652,38 @@ namespace llaminar2
 
         using GraphCaptureBoundaryHook =
             std::function<bool(const std::string &, void *capture_stream)>;
+
+        /**
+         * @brief Lifecycle position of one captured-graph executable launch.
+         *
+         * External producer events must be joined after native capture has
+         * closed for transaction zero, but before the executable is launched.
+         * Steady replay can join the same producers immediately before launch
+         * because no capture transaction is active.  Keeping the distinction
+         * typed prevents a caller from accidentally importing a cross-lifetime
+         * event into the graph body.
+         */
+        enum class GraphExecutableLaunchPhase : uint8_t
+        {
+            InitialTransaction,   ///< First launch after capture and instantiation.
+            SteadyReplay,         ///< Ordinary launch of an existing executable.
+            DiagnosticRecapture,  ///< First launch after a diagnostic recapture.
+            DiagnosticVerification ///< Captured launch used by graph verification.
+        };
+
+        /**
+         * @brief Queue an external producer dependency on the exact graph stream.
+         *
+         * The callback may enqueue event waits on @p execution_stream; it must
+         * not synchronize the host/device, allocate resources, transfer payload
+         * data, or launch a substitute implementation.  The controller invokes
+         * it exactly once immediately before each executable launch.  This hook
+         * is legal only for one complete capturable graph and is rejected for
+         * segmented or manual replay plans.
+         */
+        using GraphLaunchDependencyHook =
+            std::function<bool(GraphExecutableLaunchPhase phase,
+                               void *execution_stream)>;
 
         /**
          * @brief Persistent cache of GPU graph replay units.
@@ -874,9 +937,10 @@ namespace llaminar2
              * This is a host ownership fence, not an ordering primitive between
              * GPU streams. Normal producer/consumer ordering must use
              * orderCaptureStreamAfter() or another device-side event wait. The
-             * fence is reserved for native graph-capture entry and resource
+             * fence is reserved for terminal host observation and resource
              * teardown, where the host must know that prior stream work has
-             * completed before changing stream or graph lifetime.
+             * completed before changing stream or graph lifetime. Native graph
+             * capture entry must remain stream-ordered and never call it.
              */
             void waitForCaptureStreamFence();
 
@@ -995,7 +1059,8 @@ namespace llaminar2
                                               bool defer_final_sync = false,
                                               GraphCaptureBoundaryHook capture_boundary = {},
                                               GraphReplayPlanPolicy plan_policy =
-                                                  GraphReplayPlanPolicy::RequireFullGraph);
+                                                  GraphReplayPlanPolicy::RequireFullGraph,
+                                              GraphLaunchDependencyHook launch_dependency = {});
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -1020,6 +1085,13 @@ namespace llaminar2
              * graph because sibling graph instances are recorded independently.
              */
             GraphCaptureBoundaryHook capture_boundary;
+            /**
+             * External event join performed immediately before every captured
+             * executable launch.  Transaction zero runs it only after capture
+             * and instantiation, so the dependency cannot become a root event
+             * in an exported child graph.
+             */
+            GraphLaunchDependencyHook launch_dependency;
         };
 
         /**
@@ -1049,6 +1121,33 @@ namespace llaminar2
         bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
         bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
         uint64_t snapshot_configuration_epoch_ = 1;   ///< Monotonic snapshot graph-topology identity
+
+        /**
+         * @brief Prepare one stage's arena frontier before native capture.
+         *
+         * StageBufferContract is the sole authority: external reads must own
+         * valid device bytes and every overwrite-only output must own stable
+         * device storage. CoherencePolicy cannot suppress either requirement.
+         * The deduplication sets span one capture unit so aliases and repeated
+         * layer scratch bindings do not repeat event joins or allocation checks.
+         *
+         * @param node Stage whose declarative contract is being prepared.
+         * @param external_reads Reads produced outside the current capture unit.
+         * @param capture_device Device that owns the native capture transaction.
+         * @param capture_stream Exact non-null stream used by beginCapture().
+         * @param prepared_inputs Tensor identities already joined in this unit.
+         * @param prepared_outputs Tensor identities already allocated in this unit.
+         * @param context Optional diagnostic label for the owning capture path.
+         * @return true when the stage frontier is capture-ready.
+         */
+        bool prepareStageArenaFrontierForCapture(
+            ComputeNode &node,
+            const std::vector<BufferBinding> &external_reads,
+            DeviceId capture_device,
+            void *capture_stream,
+            std::unordered_set<ITensor *> &prepared_inputs,
+            std::unordered_set<ITensor *> &prepared_outputs,
+            const char *context);
 
         void advanceSnapshotConfigurationEpoch() noexcept
         {
@@ -1115,6 +1214,19 @@ namespace llaminar2
                       bool is_collective,
                       GraphSnapshotManifest *snapshot_manifest = nullptr);
 
+        /**
+         * @brief Execute the stage body after capture-order RAII has been armed.
+         *
+         * Keeping this implementation private ensures every caller enters through
+         * runStage(), which advances GraphCaptureDependencyLedger when native
+         * capture is active.  No graph path may call this implementation directly.
+         */
+        bool runStageImpl(ComputeNode &node,
+                          IDeviceContext *ctx,
+                          const StageRunPolicy &policy,
+                          bool is_collective,
+                          GraphSnapshotManifest *snapshot_manifest);
+
         bool prepareOrRecordGraphSnapshotCopies(ComputeNode &node,
                                                 DeviceId target_device,
                                                 void *producer_stream,
@@ -1123,14 +1235,14 @@ namespace llaminar2
         bool shouldCaptureSnapshotStage(const std::string &node_name) const;
 
         /**
-         * @brief Validate graph-stable snapshot storage finalized by warmup.
+         * @brief Prepare immutable graph-stable snapshot descriptors/storage.
          *
          * GPU graph capture cannot discover or allocate snapshot outputs while
-         * capture is active. Warmup must therefore execute every selected
-         * producer and finalize its exact descriptor/storage first. This method
-         * hard-fails when that manifest is absent; it never substitutes a
-         * pre-execution stage tensor. The captured point-in-time copy is still
-         * recorded after each producer executes.
+         * capture is active. The stage must therefore expose its stable output
+         * descriptor after launch preparation and before model arithmetic.
+         * This method allocates the graph-owned destination and freezes the
+         * exact source descriptor without copying payload bytes. The captured
+         * point-in-time copy is recorded only after the producer executes.
          */
         bool prepareGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,

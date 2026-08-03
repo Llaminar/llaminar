@@ -197,7 +197,7 @@ namespace llaminar2
          * producer stream exists. It performs no copy, records no event, and
          * does not publish the device allocation as authoritative.
          *
-         * Runtime kernels must use prepareDeviceOutput() with their exact
+         * Runtime kernels must use requireDeviceOutput() with their exact
          * producer stream. Keeping allocation separate prevents initialization
          * code from inventing a stream identity merely to obtain a pointer.
          *
@@ -212,9 +212,10 @@ namespace llaminar2
          * @brief Prepare storage for an output-only asynchronous GPU writer.
          *
          * Unlike prepareDeviceInput(), this never uploads stale host bytes.
-         * It allocates or retargets storage on @p target_device and validates
-         * the physical placement before a kernel may write the buffer. The
-         * exact non-null @p stream identifies that upcoming producer.
+         * Placement/admission code may use it to allocate or retarget storage
+         * on @p target_device before execution. Captured and hot-path kernels
+         * must instead use requireDeviceOutput(), which cannot allocate. The
+         * exact non-null @p stream identifies the future producer.
          *
          * @throws std::invalid_argument for a null tensor, non-GPU target, or
          *         null producer stream.
@@ -224,6 +225,29 @@ namespace llaminar2
             ITensor *tensor,
             DeviceId target_device,
             void *stream);
+
+        /**
+         * @brief Require pre-existing output storage on one exact GPU.
+         *
+         * This is the execution-time output counterpart to
+         * requireDeviceInput(). The tensor must already own an allocation on
+         * @p target_device, but its bytes need not be valid because the caller
+         * is about to overwrite them. The method never allocates, migrates,
+         * copies, publishes authority, or records an event.
+         *
+         * @param tensor Tensor whose storage will receive a GPU write.
+         * @param target_device Exact GPU on which the writer will execute.
+         * @param producer_stream Exact non-null stream for the upcoming write.
+         *
+         * @throws std::invalid_argument for a null tensor, non-GPU target, or
+         *         null producer stream.
+         * @throws std::runtime_error when stable storage is absent from the
+         *         exact target device.
+         */
+        static void requireDeviceOutput(
+            ITensor *tensor,
+            DeviceId target_device,
+            void *producer_stream);
 
         // ========================================================================
         // Publication: expose completed work without exposing raw state mutation.

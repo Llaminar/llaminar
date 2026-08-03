@@ -310,6 +310,61 @@ TEST_F(
     EXPECT_EQ(forward.find("shared")->descriptor.size_bytes, 512u);
 }
 
+/**
+ * @brief Initialize-once contents cannot be overlaid by another serial graph.
+ *
+ * Captured kernels retain stable pointers, but an immutable lookup table also
+ * retains live bytes after its own participant completes. A participant that
+ * does not mention the table must therefore be unable to reuse its interval.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerPreservesPersistentContentAcrossParticipants)
+{
+    WorkspaceRequirements first;
+    first.buffers = {
+        {"immutable_table",
+         128,
+         1,
+         true,
+         WorkspaceExecutionRegime::Any,
+         WorkspaceContentLifetime::SerialGraphFamily},
+        {"first_scratch", 256, 1, true},
+    };
+    WorkspaceRequirements second;
+    second.buffers = {
+        {"second_scratch", 384, 1, true},
+    };
+
+    const SerialWorkspaceFamilyPlan plan =
+        DeviceWorkspaceManager::planSerialFamily({first, second});
+    ASSERT_TRUE(plan.valid()) << plan.error;
+    ASSERT_EQ(plan.total_bytes, 512u)
+        << "Persistent bytes should coexist with the larger mutually exclusive scratch interval";
+
+    const auto *table = plan.find("immutable_table");
+    const auto *first_scratch = plan.find("first_scratch");
+    const auto *second_scratch = plan.find("second_scratch");
+    ASSERT_NE(table, nullptr);
+    ASSERT_NE(first_scratch, nullptr);
+    ASSERT_NE(second_scratch, nullptr);
+    EXPECT_EQ(
+        table->descriptor.content_lifetime,
+        WorkspaceContentLifetime::SerialGraphFamily);
+
+    const auto overlaps = [](const SerialWorkspaceBufferPlacement &lhs,
+                             const SerialWorkspaceBufferPlacement &rhs)
+    {
+        const size_t lhs_end = lhs.offset + lhs.descriptor.size_bytes;
+        const size_t rhs_end = rhs.offset + rhs.descriptor.size_bytes;
+        return lhs.offset < rhs_end && rhs.offset < lhs_end;
+    };
+    EXPECT_FALSE(overlaps(*table, *first_scratch));
+    EXPECT_FALSE(overlaps(*table, *second_scratch));
+    EXPECT_TRUE(overlaps(*first_scratch, *second_scratch))
+        << "Ordinary participant-local scratch should remain overlayable";
+}
+
 TEST_F(Test__DeviceWorkspaceManager, EmitsStructuredMemoryCountersForWorkspaceLayout)
 {
     ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");

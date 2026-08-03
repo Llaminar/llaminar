@@ -294,6 +294,18 @@ namespace llaminar2
             const int32_t *absolute_position_ids_device = nullptr;
 
             /**
+             * @brief Device-owned logical row count inside the physical graph width.
+             *
+             * Routing, resident LLEP assignment, grouped expert execution, and
+             * the shared epilogue form one row-geometry transaction. Variable-M
+             * GPU graphs bind the same stable request scalar to every member so
+             * padded suffix rows can never be interpreted as routed work by one
+             * stage after another stage masked them. No host mirror or replay
+             * upload may participate in this contract.
+             */
+            const int32_t *active_row_count_device = nullptr;
+
+            /**
              * @brief Require GPU decode to consume routing tensors on device.
              *
              * Some verifier and overlay M=1 lanes bind routing tensors directly
@@ -454,8 +466,19 @@ namespace llaminar2
         /// published by mutating persistent runtime descriptor tables.
         bool usesGraphStableRuntimeDecodePlacement() const;
 
-        /// True for fixed-topology GPU prefill graphs whose placement can be
-        /// published by mutating descriptor tables and the persistent group mask.
+        /**
+         * @brief Return whether graph preparation owns this grouped-prefill route.
+         *
+         * Both ordinary prefill and forced grouped-verifier execution use the
+         * same persistent MoE kernel, GEMM descriptor tables, expert mask, and
+         * optional runtime-grouping workspace.  Keeping the verifier flag out
+         * of this ownership decision ensures every supported verifier depth is
+         * prepared before capture instead of entering capture with a cold
+         * kernel or unbound descriptor table.
+         *
+         * @return `true` when `prepareGraphLaunch()` must publish the stable
+         * grouped-prefill placement before graph capture begins.
+         */
         bool usesGraphStableFixedTopologyPrefillPlacement() const;
 
         /// True when this stage can consume dynamic MoE placement without a
@@ -671,7 +694,7 @@ namespace llaminar2
          * PerfStats failure records.
          */
         std::string graphCaptureReadinessDebugString() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         /**
@@ -684,7 +707,8 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            return requestsTransferBackedCurrentBatchPrefillLLEP() ||
+            return supportsGraphCaptureAfterLaunchPreparation() ||
+                           requestsTransferBackedCurrentBatchPrefillLLEP() ||
                            params_.prefix_runtime_device_rehydration
                        ? GraphLaunchPreparationPolicy::CaptureOnly
                        : GraphLaunchPreparationPolicy::None;
@@ -699,7 +723,7 @@ namespace llaminar2
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
         }
 
         /**
@@ -743,7 +767,7 @@ namespace llaminar2
             combined_shared_down_desc_table_intermediate_ = 0;
             combined_shared_desc_table_d_model_ = 0;
             combined_shared_desc_table_intermediate_ = 0;
-            runtime_grouped_decode_warmed_ = false;
+            runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
         }
 
@@ -753,7 +777,7 @@ namespace llaminar2
          * The runtime grouped decode path warms descriptor and pointer-table
          * slots before graph capture. A preserved CUDA/HIP graph executable
          * still reads those device slots by address, so request-boundary replay
-         * preservation must not flip runtime_grouped_decode_warmed_ back to
+         * preservation must not flip runtime_grouped_decode_launch_state_prepared_ back to
          * false. True topology changes still use resetSessionState(),
          * invalidate(), or graph rebuild paths.
          */
@@ -867,7 +891,7 @@ namespace llaminar2
             owned_moe_kernel_.reset();
             moe_kernel_ = kernel;
         }
-        void setRuntimeGroupedDecodeWarmedForTesting(bool warmed) { runtime_grouped_decode_warmed_ = warmed; }
+        void setRuntimeGroupedDecodeLaunchStatePreparedForTesting(bool warmed) { runtime_grouped_decode_launch_state_prepared_ = warmed; }
         /**
          * @brief Mark runtime-prefill scratch as prepared without performing GPU work.
          *
@@ -1007,11 +1031,37 @@ namespace llaminar2
          * workspace, descriptor tables, and runtime layer so capture can only
          * start after that exact route has succeeded.
          */
-        mutable bool runtime_grouped_decode_warmed_ = false;
+        mutable bool runtime_grouped_decode_launch_state_prepared_ = false;
 
         /// Explicit publication state for the backend-owned fixed-topology mask.
         FixedTopologyMaskPublicationState fixed_topology_mask_publication_state_ =
             FixedTopologyMaskPublicationState::NotRequired;
+
+        /**
+         * @brief Resolve the sole output owned by this routed-expert producer.
+         *
+         * Ordinary routed execution publishes the final MoE output directly.
+         * LocalTP canonical execution instead publishes one tensor row per
+         * original router slot; a later reducer owns the final output. Keeping
+         * that choice behind one method prevents individual M=1, grouped-M,
+         * runtime-table, and fixed-table exits from publishing the inactive
+         * reducer destination.
+         *
+         * @return Non-null tensor written by the current expert transaction.
+         * @throws std::logic_error if graph construction omitted both output
+         *         contracts.
+         */
+        ITensor *publicationTarget() const;
+
+        /**
+         * @brief Publish the routed-expert producer's exact output event.
+         *
+         * The backend kernel and this stage share the same explicit producer
+         * stream. This method records the stage-level handoff only for the
+         * tensor returned by publicationTarget(); it never allocates storage,
+         * substitutes a stream, or touches the later canonical reducer target.
+         */
+        void publishPublicationTarget() const;
 
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.
@@ -1183,8 +1233,6 @@ namespace llaminar2
         mutable int combined_shared_down_desc_table_id_ = -1;
         mutable int combined_shared_down_desc_table_d_model_ = 0;
         mutable int combined_shared_down_desc_table_intermediate_ = 0;
-        mutable std::shared_ptr<FP32Tensor> combined_shared_gate_inp_fp32_;
-        mutable TensorBase *combined_shared_gate_inp_source_ = nullptr;
         mutable ITensorGemm *combined_shared_gate_gemm_ = nullptr;
         mutable ITensorGemm *combined_shared_up_gemm_ = nullptr;
         mutable ITensorGemm *combined_shared_down_gemm_ = nullptr;
@@ -1274,10 +1322,25 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
         std::string graphCaptureReadinessDebugString() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Bind shared-expert kernels and immutable grouped-decode metadata.
+         *
+         * This preparation replaces the historical eager arithmetic pass. It
+         * resolves persistent GEMM/MoE engines, validates arena-owned scratch,
+         * publishes fixed descriptor/pointer tables, and executes no model math.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return params_.device_id.is_gpu() &&
+                           supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
         /**
          * @brief Drop per-request grouped decode warmup state.
          *
@@ -1288,7 +1351,7 @@ namespace llaminar2
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
-            grouped_decode_warmed_ = false;
+            grouped_decode_launch_state_prepared_ = false;
         }
 
         /**
@@ -1313,7 +1376,7 @@ namespace llaminar2
             shared_grouped_down_desc_table_id_ = -1;
             shared_grouped_down_desc_table_d_model_ = 0;
             shared_grouped_down_desc_table_intermediate_ = 0;
-            grouped_decode_warmed_ = false;
+            grouped_decode_launch_state_prepared_ = false;
         }
 
         /**
@@ -1386,15 +1449,14 @@ namespace llaminar2
         std::shared_ptr<FP32Tensor> owned_cpu_scratch_up_;
         mutable int scratch_seq_len_ = 0;
         /**
-         * @brief True once normal single-token grouped decode has populated
-         * graph-owned runtime pointer arrays for the currently bound workspace.
+         * @brief True once explicit preparation has populated grouped-decode state.
          *
          * The CUDA grouped decode kernels read device-side arrays of scratch
-         * tensor pointers during graph replay.  Those arrays are produced by a
-         * warmup execution outside capture; capture is only safe after that
-         * exact route has succeeded with the current scratch/workspace owner.
+         * tensor pointers during graph replay. prepareGraphLaunch() publishes
+         * those arrays without running expert arithmetic; capture is admitted
+         * only for the exact current scratch/workspace owner.
          */
-        mutable bool grouped_decode_warmed_ = false;
+        mutable bool grouped_decode_launch_state_prepared_ = false;
 
         void ensureGemmEnginesCached() const;
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
@@ -1449,7 +1511,7 @@ namespace llaminar2
             moe_kernel_ = kernel;
         }
         void setScratchSeqLenForTesting(int n) { scratch_seq_len_ = n; }
-        void setGroupedDecodeWarmedForTesting(bool warmed) { grouped_decode_warmed_ = warmed; }
+        void setGroupedDecodeLaunchStatePreparedForTesting(bool warmed) { grouped_decode_launch_state_prepared_ = warmed; }
     };
 
     /**
@@ -1485,6 +1547,15 @@ namespace llaminar2
             TensorBase *combined_output = nullptr;
             int seq_len = 0;
             int d_model = 0;
+            /**
+             * @brief Device-owned logical row count for variable-row GPU graphs.
+             *
+             * Request admission and grouped-verifier preparation publish this
+             * stable scalar before graph consumption. The shared-gate kernel
+             * masks the physical suffix directly from device memory on every
+             * capture and replay; the stage never mirrors or uploads its value.
+             */
+            const int32_t *active_row_count_device = nullptr;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
@@ -1492,8 +1563,13 @@ namespace llaminar2
             BufferId combined_output_buffer_id = BufferId::ATTN_PROJ;
         };
 
+        /**
+         * @brief Construct the shared-expert sigmoid gate stage.
+         * @param params Immutable weights, graph buffers, and device row geometry.
+         * @throws std::invalid_argument if a supplied input gate is not FP32;
+         *         model-weight preparation owns that normalization on every backend.
+         */
         explicit SharedExpertGateStage(Params params);
-        ~SharedExpertGateStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_GATE; }
@@ -1508,24 +1584,16 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;
-        bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
-        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            /*
-             * Multi-row grouped verifier execution is not padded prefill. Its
-             * graph owns a fixed row count and needs no host scalar between
-             * parent-loop launches. The external effective-length publication
-             * contract becomes active only after the prefill replay executor
-             * explicitly supplies replay metadata.
-             */
-            return hasPrefillReplayParams() && prefill_replay_params_set_
-                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+            return params_.device_id.is_gpu() &&
+                           supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
                        : GraphLaunchPreparationPolicy::None;
         }
         StageBufferRequirements getBufferRequirements() const override;
@@ -1538,35 +1606,13 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override;
 
         /**
-         * @brief Clear request-local padded prefill parameters while preserving
-         * kernel handles and warmed model weights.
-         */
-        void resetSessionState() override;
-        /**
-         * @brief Preserve shared-expert effective-length storage for graph replay.
-         *
-         * The standalone shared-expert verifier path uses a workspace-backed
-         * scalar that is refreshed before every padded prefill replay. Request
-         * reset may clear host mirrors, but it must not make the preserved
-         * executable lose the stable scalar identity.
-         */
-        void resetSessionStatePreservingCapturedReplay() override;
-        /**
-         * @brief Preserve warmed shared-expert metadata for capture-from-Initialized.
-         */
-        void resetSessionStatePreservingLazyInitialization() override;
-        /**
          * @brief Reset the private backend object after a hard graph reset.
          */
         void invalidateKernelDynamicState() override;
 
     private:
-        struct GpuEffectiveSeqLenState;
-
         Params params_;
 
-        mutable std::shared_ptr<FP32Tensor> fp32_gate_inp_;
-        mutable TensorBase *fp32_gate_source_ = nullptr;
         TensorBase *effectiveGateInput() const;
         bool gateInputReadyForGraphCapture() const;
 
@@ -1576,15 +1622,7 @@ namespace llaminar2
         mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
-        int prefill_effective_seq_len_ = 0;
-        bool prefill_replay_params_set_ = false;
-        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         IMoEKernel *ensureMoEKernel() const;
-        int effectivePrefillSeqLen() const;
-        void refreshPinnedEffectiveSeqLen();
-        bool ensureGpuEffectiveSeqLenStateInitialized();
-        bool uploadGpuEffectiveSeqLen();
-        void releaseGpuEffectiveSeqLenState();
 
     public:
         // Test accessors
@@ -1592,6 +1630,12 @@ namespace llaminar2
         {
             owned_moe_kernel_.reset();
             moe_kernel_ = kernel;
+        }
+
+        /** @brief Expose the captured device row-count owner to graph tests. */
+        const int32_t *activeRowCountDeviceForTesting() const noexcept
+        {
+            return params_.active_row_count_device;
         }
     };
 
@@ -1643,7 +1687,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
-        bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
         /**
          * @brief Admit cold exact-shape prefill before the reducer owns its kernel wrapper.
          *
@@ -1663,6 +1707,20 @@ namespace llaminar2
          * from the real prompt prefix.
          */
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Resolve the root reducer kernel before native graph capture.
+         *
+         * Non-root participants own no arithmetic. The root binds only the
+         * persistent backend wrapper and exact stream; no tensor value is read or
+         * written by preparation.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         /**

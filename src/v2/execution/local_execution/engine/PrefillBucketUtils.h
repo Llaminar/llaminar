@@ -101,13 +101,29 @@ namespace llaminar2
      * data a graph runner needs: padded token IDs, absolute positions, and the
      * real/bucket shape metadata consumed by dynamic replay callbacks.
      */
+    /**
+     * @brief Authority that supplies token rows to a prepared prefill chunk.
+     *
+     * Host rows are owned and padded by `PrefillChunkExecutionInput`. Device
+     * rows have already crossed the request-admission boundary into a stable,
+     * fully initialized arena bank; the chunk then carries geometry only and
+     * must preserve the exact device pointer from `ForwardInput`.
+     */
+    enum class PrefillChunkTokenAuthority
+    {
+        HostPaddedRows,
+        DeviceAdmissionBank,
+    };
+
     struct PrefillChunkExecutionInput
     {
         bool ok = false;                 ///< True when all buffers were built successfully.
+        PrefillChunkTokenAuthority token_authority =
+            PrefillChunkTokenAuthority::HostPaddedRows; ///< Sole token-row owner.
         int token_offset = 0;            ///< Offset of this chunk in the original prompt.
         int real_count = 0;              ///< Real tokens in this chunk.
         int bucket_seq_len = 0;          ///< Fixed graph execution length for this chunk.
-        std::vector<int> token_ids;      ///< Owned padded token IDs [bucket_seq_len].
+        std::vector<int> token_ids;      ///< Host-owned padded rows; empty for a device admission bank.
         std::vector<int> position_ids;   ///< Owned absolute position IDs [batch_size * bucket_seq_len].
         std::string error;               ///< Human-readable failure reason when ok is false.
 

@@ -69,6 +69,14 @@ namespace
             control[kDeviceGenerationControlErrorCode],
             static_cast<int>(expected_error));
     }
+
+    /**
+     * @brief Construct an explicit fixed-depth admission policy for one test.
+     */
+    DeviceGenerationDepthPolicy fixedDepthPolicy(int depth)
+    {
+        return DeviceGenerationDepthPolicy::fixed(depth);
+    }
 } // namespace
 
 TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiveSizes)
@@ -79,28 +87,36 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
         1, 2, 3, 4, 8, 15, 16, 31, 64, 255, 1024, 4096};
     for (const int response_budget : response_budgets)
     {
-        ControlRow control;
-        control.fill(-1);
-        ASSERT_TRUE(initialize_device_generation_control(
-            response_budget,
-            response_budget + 7,
-            control.data()));
-
-        EXPECT_EQ(control[kDeviceGenerationControlOk], 1);
-        EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 0);
-        EXPECT_EQ(
-            control[kDeviceGenerationControlRemainingTokenCount],
-            response_budget);
-        EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 0);
-        EXPECT_EQ(
-            control[kDeviceGenerationControlPublishedStateCommitCount],
-            0);
-        EXPECT_EQ(
-            control[kDeviceGenerationControlErrorCode],
-            static_cast<int>(DeviceGenerationError::None));
-
-        for (int verifier_rows = 1; verifier_rows <= 16; ++verifier_rows)
+        for (int draft_depth = 1; draft_depth <= 15; ++draft_depth)
         {
+            const int verifier_rows = draft_depth + 1;
+            ControlRow control;
+            control.fill(-1);
+            ASSERT_TRUE(initialize_device_generation_control(
+                response_budget,
+                response_budget + 7,
+                fixedDepthPolicy(draft_depth),
+                control.data()));
+
+            EXPECT_EQ(control[kDeviceGenerationControlOk], 1);
+            EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 0);
+            EXPECT_EQ(
+                control[kDeviceGenerationControlRemainingTokenCount],
+                response_budget);
+            EXPECT_EQ(
+                control[kDeviceGenerationControlCurrentDraftDepth],
+                draft_depth);
+            EXPECT_EQ(
+                control[kDeviceGenerationControlActiveVerifierRowCount],
+                verifier_rows);
+            EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 0);
+            EXPECT_EQ(
+                control[kDeviceGenerationControlPublishedStateCommitCount],
+                0);
+            EXPECT_EQ(
+                control[kDeviceGenerationControlErrorCode],
+                static_cast<int>(DeviceGenerationError::None));
+
             for (int maintenance_rows = 1; maintenance_rows <= 16;
                  ++maintenance_rows)
             {
@@ -124,6 +140,137 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
     }
 }
 
+TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEveryDepth)
+{
+    using namespace llaminar2::sampling_math;
+
+    DeviceGenerationDepthPolicy promote_policy;
+    promote_policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+    promote_policy.initial_depth = 1;
+    promote_policy.minimum_depth = 1;
+    promote_policy.maximum_depth = 15;
+    promote_policy.window_size = 1;
+    promote_policy.minimum_samples = 1;
+    promote_policy.cooldown_steps = 0;
+    promote_policy.promote_consecutive_windows = 1;
+    ASSERT_TRUE(promote_policy.valid());
+
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/4096,
+        /*response_capacity=*/4096,
+        promote_policy,
+        control.data()));
+    for (int depth = 1; depth < 15; ++depth)
+    {
+        ASSERT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], depth);
+        ASSERT_TRUE(record_device_generation_depth_observation(
+            /*accepted_prefix=*/depth,
+            /*rollback=*/false,
+            /*budget_limited=*/false,
+            control.data()));
+        EXPECT_EQ(
+            control[kDeviceGenerationControlCurrentDraftDepth],
+            depth + 1);
+        EXPECT_EQ(
+            control[kDeviceGenerationControlActiveVerifierRowCount],
+            depth + 2);
+    }
+    EXPECT_EQ(control[kDeviceGenerationControlDepthPromotions], 14);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 14);
+
+    DeviceGenerationDepthPolicy demote_policy = promote_policy;
+    demote_policy.initial_depth = 15;
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/4096,
+        /*response_capacity=*/4096,
+        demote_policy,
+        control.data()));
+    for (int depth = 15; depth > 1; --depth)
+    {
+        ASSERT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], depth);
+        ASSERT_TRUE(record_device_generation_depth_observation(
+            /*accepted_prefix=*/0,
+            /*rollback=*/true,
+            /*budget_limited=*/false,
+            control.data()));
+        EXPECT_EQ(
+            control[kDeviceGenerationControlCurrentDraftDepth],
+            depth - 1);
+        EXPECT_EQ(
+            control[kDeviceGenerationControlActiveVerifierRowCount],
+            depth);
+    }
+    EXPECT_EQ(control[kDeviceGenerationControlDepthDemotions], 14);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 14);
+}
+
+TEST(Test__DeviceGenerationController, ObservePolicyCannotMutateActiveGeometry)
+{
+    using namespace llaminar2::sampling_math;
+
+    DeviceGenerationDepthPolicy policy;
+    policy.mode = DeviceGenerationDepthPolicyMode::Observe;
+    policy.initial_depth = 4;
+    policy.minimum_depth = 1;
+    policy.maximum_depth = 15;
+    policy.window_size = 1;
+    policy.minimum_samples = 1;
+    policy.cooldown_steps = 0;
+    policy.promote_consecutive_windows = 1;
+    ASSERT_TRUE(policy.valid());
+
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/64,
+        /*response_capacity=*/64,
+        policy,
+        control.data()));
+    ASSERT_TRUE(record_device_generation_depth_observation(
+        /*accepted_prefix=*/4,
+        /*rollback=*/false,
+        /*budget_limited=*/false,
+        control.data()));
+
+    EXPECT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], 4);
+    EXPECT_EQ(control[kDeviceGenerationControlActiveVerifierRowCount], 5);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthLastRecommendedDepth], 5);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 0);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthPromotions], 0);
+    EXPECT_EQ(control[kDeviceGenerationControlDepthEvaluatedWindows], 1);
+}
+
+TEST(Test__DeviceGenerationController, InvalidPolicyAndSelectorFailHard)
+{
+    using namespace llaminar2::sampling_math;
+
+    ControlRow control{};
+    const DeviceGenerationDepthPolicy invalid_policy =
+        DeviceGenerationDepthPolicy::fixed(0);
+    EXPECT_FALSE(initialize_device_generation_control(
+        /*max_new_tokens=*/8,
+        /*response_capacity=*/8,
+        invalid_policy,
+        control.data()));
+    EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
+    EXPECT_EQ(
+        control[kDeviceGenerationControlErrorCode],
+        static_cast<int>(DeviceGenerationError::InvalidDepthPolicy));
+
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/8,
+        /*response_capacity=*/8,
+        fixedDepthPolicy(4),
+        control.data()));
+    EXPECT_EQ(
+        prepare_device_generation_transaction_budget(
+            /*verifier_row_capacity=*/4,
+            /*maintenance_rows_remaining=*/4,
+            control.data()),
+        0);
+    expectFatal(control, DeviceGenerationError::InvalidDepthSelector);
+}
+
 TEST(Test__DeviceGenerationController, PublicationRejectsBudgetBeyondActiveCapturedRows)
 {
     using namespace llaminar2::sampling_math;
@@ -134,13 +281,16 @@ TEST(Test__DeviceGenerationController, PublicationRejectsBudgetBeyondActiveCaptu
     ASSERT_TRUE(initialize_device_generation_control(
         /*max_new_tokens=*/64,
         /*response_capacity=*/64,
+        fixedDepthPolicy(active_verifier_rows - 1),
         control.data()));
     ASSERT_EQ(
         prepare_device_generation_transaction_budget(
             configured_max_verifier_rows,
             configured_max_verifier_rows,
             control.data()),
-        configured_max_verifier_rows);
+        active_verifier_rows);
+    control[kDeviceGenerationControlTransactionCommitBudget] =
+        configured_max_verifier_rows;
 
     std::array<int32_t, active_verifier_rows> compact_tokens = {
         101, 102, 103, -1, -1};
@@ -191,6 +341,7 @@ TEST(Test__DeviceGenerationController, RejectCarryAndStopMatchSerialResponseByte
     ASSERT_TRUE(initialize_device_generation_control(
         /*max_new_tokens=*/8,
         static_cast<int>(response.size()),
+        fixedDepthPolicy(3),
         control.data()));
 
     const std::array<int32_t, 4> first_tokens = {10, 11, 12, 13};
@@ -300,6 +451,7 @@ TEST(Test__DeviceGenerationController, EveryProductionMTPDepthAppendsByteExactly
         ASSERT_TRUE(initialize_device_generation_control(
             output_count,
             output_count,
+            fixedDepthPolicy(mtp_depth),
             control.data()));
         ASSERT_EQ(
             prepare_device_generation_transaction_budget(
@@ -484,6 +636,7 @@ TEST(Test__DeviceGenerationController, ContinuationTokenIsTotalForEveryDepthAndB
             ASSERT_TRUE(initialize_device_generation_control(
                 mtp_depth + 1,
                 static_cast<int>(response.size()),
+                fixedDepthPolicy(mtp_depth),
                 control.data()));
             ASSERT_EQ(
                 prepare_device_generation_transaction_budget(
@@ -581,6 +734,7 @@ TEST(Test__DeviceGenerationController, SuccessfulTerminalReplayPublishesOnlyIner
     ASSERT_TRUE(initialize_device_generation_control(
         /*max_new_tokens=*/2,
         static_cast<int>(response.size()),
+        fixedDepthPolicy(1),
         control.data()));
     ASSERT_EQ(
         prepare_device_generation_transaction_budget(2, 2, control.data()),
@@ -669,7 +823,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
 
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            4, 4, fixedDepthPolicy(3), control.data()));
         const MetaRow meta = makeMeta(2, 1, 1, 0, 1, false);
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
             tokens.data(), 4, meta.data(), meta.size(), response.data(), 4,
@@ -678,7 +833,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
     }
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(1, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            1, 4, fixedDepthPolicy(3), control.data()));
         const MetaRow meta = makeMeta(2, 0, 1, 0, 1, false);
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
             tokens.data(), 4, meta.data(), meta.size(), response.data(), 4,
@@ -687,7 +843,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
     }
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            4, 4, fixedDepthPolicy(3), control.data()));
         const MetaRow meta = makeMeta(3, 0, 2, 1, 2, false);
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
             tokens.data(), 4, meta.data(), meta.size(), response.data(), 2,
@@ -696,7 +853,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
     }
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            4, 4, fixedDepthPolicy(3), control.data()));
         MetaRow meta = makeMeta(2, 0, 1, 0, 1, false);
         meta[kSpecBatchMetaOk] = 0;
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
@@ -706,7 +864,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
     }
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            4, 4, fixedDepthPolicy(3), control.data()));
         const MetaRow meta = makeMeta(2, 0, 3, 0, 1, false);
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
             tokens.data(), 4, meta.data(), meta.size(), response.data(), 4,
@@ -715,7 +874,8 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
     }
     {
         ControlRow control{};
-        ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+        ASSERT_TRUE(initialize_device_generation_control(
+            4, 4, fixedDepthPolicy(3), control.data()));
         control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 1;
         const MetaRow meta = makeMeta(1, 1, 1, 0, 1, false);
         EXPECT_FALSE(append_speculative_outcome_to_device_generation(
@@ -731,13 +891,15 @@ TEST(Test__DeviceGenerationController, InvalidAdmissionAndMaintenanceFailHard)
 
     ControlRow control;
     control.fill(-1);
-    EXPECT_FALSE(initialize_device_generation_control(0, 4, control.data()));
+    EXPECT_FALSE(initialize_device_generation_control(
+        0, 4, fixedDepthPolicy(3), control.data()));
     EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
     EXPECT_EQ(
         control[kDeviceGenerationControlErrorCode],
         static_cast<int>(DeviceGenerationError::InvalidInitialization));
 
-    ASSERT_TRUE(initialize_device_generation_control(4, 4, control.data()));
+    ASSERT_TRUE(initialize_device_generation_control(
+        4, 4, fixedDepthPolicy(3), control.data()));
     EXPECT_EQ(
         prepare_device_generation_transaction_budget(4, 0, control.data()),
         0);

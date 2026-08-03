@@ -280,21 +280,25 @@ namespace llaminar2
         const T *__restrict__ d_K_new,
         const T *__restrict__ d_V_new,
         const int *__restrict__ d_head,
+        const int *__restrict__ d_row_count,
         int max_seq_len,
         int kv_storage_dim,
         int head_storage_dim,
         int source_verifier_rows,
-        int source_start_row,
-        int rows_to_write,
         bool k_source_head_major,
         bool v_source_head_major)
     {
-        const int token_idx = blockIdx.x;
+        const int source_row = blockIdx.x;
         const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
-        if (token_idx >= rows_to_write || elem_idx >= kv_storage_dim)
+        const int rows_to_write =
+            effective_append_tokens(d_row_count, source_verifier_rows);
+        const int source_start_row = rows_to_write > max_seq_len
+                                         ? rows_to_write - max_seq_len
+                                         : 0;
+        if (source_row < source_start_row || source_row >= rows_to_write ||
+            elem_idx >= kv_storage_dim)
             return;
 
-        const int source_row = source_start_row + token_idx;
         const int head = *d_head;
         const int dst_pos = (head + source_row) % max_seq_len;
         const int dst_offset = dst_pos * kv_storage_dim + elem_idx;
@@ -2201,81 +2205,92 @@ namespace llaminar2
     static void hip_ring_append_verifier_rows_dynamic_typed(
         T *d_K_cache, T *d_V_cache,
         const T *d_K_new, const T *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         hipStream_t stream)
     {
-        if (rows_to_write <= 0 || kv_storage_dim <= 0)
+        if (source_verifier_rows <= 0 || kv_storage_dim <= 0)
             return;
 
-        dim3 grid(rows_to_write, (kv_storage_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 grid(source_verifier_rows,
+                  (kv_storage_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
         dim3 block(BLOCK_SIZE);
         hipLaunchKernelGGL(ring_append_verifier_rows_dynamic_kernel<T>,
                            grid, block, 0, stream,
                            d_K_cache, d_V_cache, d_K_new, d_V_new,
-                           d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-                           source_verifier_rows, source_start_row, rows_to_write,
+                           d_head, d_row_count,
+                           max_seq_len, kv_storage_dim, head_storage_dim,
+                           source_verifier_rows,
                            k_source_head_major, v_source_head_major);
     }
 
     extern "C" void hip_ring_append_verifier_rows_dynamic_fp32(
         float *d_K_cache, float *d_V_cache,
         const float *d_K_new, const float *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         hipStream_t stream)
     {
         hip_ring_append_verifier_rows_dynamic_typed<float>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-            source_verifier_rows, source_start_row, rows_to_write,
+            d_head, d_row_count,
+            max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows,
             k_source_head_major, v_source_head_major, stream);
     }
 
     extern "C" void hip_ring_append_verifier_rows_dynamic_fp16(
         _Float16 *d_K_cache, _Float16 *d_V_cache,
         const _Float16 *d_K_new, const _Float16 *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         hipStream_t stream)
     {
         hip_ring_append_verifier_rows_dynamic_typed<_Float16>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-            source_verifier_rows, source_start_row, rows_to_write,
+            d_head, d_row_count,
+            max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows,
             k_source_head_major, v_source_head_major, stream);
     }
 
     extern "C" void hip_ring_append_verifier_rows_dynamic_bf16(
         hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
         const hip_bfloat16 *d_K_new, const hip_bfloat16 *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         hipStream_t stream)
     {
         hip_ring_append_verifier_rows_dynamic_typed<hip_bfloat16>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-            source_verifier_rows, source_start_row, rows_to_write,
+            d_head, d_row_count,
+            max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows,
             k_source_head_major, v_source_head_major, stream);
     }
 
     extern "C" void hip_ring_append_verifier_rows_dynamic_q8_1(
         Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
         const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
-        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
-        int source_verifier_rows, int source_start_row, int rows_to_write,
+        const int *d_head, const int *d_row_count,
+        int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows,
         bool k_source_head_major, bool v_source_head_major,
         hipStream_t stream)
     {
         hip_ring_append_verifier_rows_dynamic_typed<Q8_1Block>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
-            source_verifier_rows, source_start_row, rows_to_write,
+            d_head, d_row_count,
+            max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows,
             k_source_head_major, v_source_head_major, stream);
     }
 

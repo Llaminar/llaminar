@@ -15991,11 +15991,12 @@ __global__ void rocm_moe_prefill_llep_clear_current_batch_plan_kernel(
 __global__ void rocm_moe_prefill_llep_assign_resident_rows_logical_position_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     const int32_t *__restrict__ absolute_position_ids,
+    const int32_t *__restrict__ active_row_count,
     int current_slots, int max_slots,
     int num_experts, int top_k)
 {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    const int current_rows = current_slots / top_k;
+    const int physical_rows = current_slots / top_k;
 
     if (!runtime)
     {
@@ -16015,6 +16016,7 @@ __global__ void rocm_moe_prefill_llep_assign_resident_rows_logical_position_kern
         runtime->route_expert_ids &&
         runtime->route_participant_ids &&
         absolute_position_ids &&
+        active_row_count &&
         runtime->active_bank <= 1u &&
         runtime->participant_count > 0u &&
         runtime->participant_count <= kDeviceMoEMaxParticipants &&
@@ -16029,7 +16031,15 @@ __global__ void rocm_moe_prefill_llep_assign_resident_rows_logical_position_kern
                 "resident verifier assignment runtime is invalid");
         return;
     }
-    if (row >= current_rows)
+    const int logical_rows = *active_row_count;
+    if (logical_rows < 0 || logical_rows > physical_rows)
+    {
+        if (row == 0)
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier active-row count exceeds physical width");
+        return;
+    }
+    if (row >= logical_rows)
         return;
     const int32_t logical_position = absolute_position_ids[row];
     if (logical_position < 0)
@@ -17336,12 +17346,13 @@ bool hipMoE_assign_prefill_routes_least_loaded_resident(
     void *runtime,
     int current_slots, int max_slots, int num_experts, int top_k,
     const int32_t *absolute_position_ids,
+    const int32_t *active_row_count,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    if (!runtime || !absolute_position_ids || !stream ||
+    if (!runtime || !absolute_position_ids || !active_row_count || !stream ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts ||
@@ -17364,6 +17375,7 @@ bool hipMoE_assign_prefill_routes_least_loaded_resident(
         dim3(assignment_blocks), dim3(assignment_threads), 0, hip_stream,
         runtime_view,
         absolute_position_ids,
+        active_row_count,
         current_slots, max_slots, num_experts, top_k);
 
     const hipError_t err = hipGetLastError();

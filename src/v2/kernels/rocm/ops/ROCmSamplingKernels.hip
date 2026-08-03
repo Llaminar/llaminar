@@ -746,12 +746,20 @@ __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
     int k,
     int partial_blocks,
     float *__restrict__ partial_values,
-    int *__restrict__ partial_indices)
+    int *__restrict__ partial_indices,
+    const int *__restrict__ active_rows_device)
 {
     if (k > K_CAP)
         return;
 
     const int row = blockIdx.y;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.y);
+    if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.y) ||
+        row >= active_rows)
+    {
+        return;
+    }
     const int partial = blockIdx.x;
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
@@ -863,12 +871,20 @@ __global__ void rocm_topk_topp_distribution_batched_from_partials_f32_kernel(
     float temperature,
     int *__restrict__ out_token_ids,
     int out_stride,
-    float *__restrict__ out_probs)
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
 {
     if (k > K_CAP)
         return;
 
     const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.x) ||
+        row >= active_rows)
+    {
+        return;
+    }
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     const int candidate_count = partial_blocks * k;
@@ -3400,9 +3416,43 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
 {
     constexpr int kMaxSampleRows = 16;
     __shared__ int sampled_rows[kMaxSampleRows];
+    __shared__ int active_comparison_rows;
 
     const int sample_row = static_cast<int>(threadIdx.x);
-    const int sample_row_count = row_count + 1;
+    if (sample_row == 0)
+    {
+        const int controller_depth =
+            generation_control[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlCurrentDraftDepth];
+        const int controller_verifier_rows =
+            generation_control[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlActiveVerifierRowCount];
+        const bool valid_depth =
+            generation_control[
+                llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+            controller_depth >= 1 && controller_depth <= row_count &&
+            controller_verifier_rows == controller_depth + 1;
+        active_comparison_rows = valid_depth ? controller_depth : 0;
+        if (!valid_depth)
+        {
+            llaminar2::sampling_math::fail_device_generation_control(
+                const_cast<int *>(generation_control),
+                llaminar2::sampling_math::
+                    DeviceGenerationError::InvalidDepthSelector);
+        }
+    }
+    __syncthreads();
+
+    if (active_comparison_rows == 0)
+    {
+        if (sample_row < kMaxSampleRows)
+            sampled_target_tokens[sample_row] = -1;
+        return;
+    }
+
+    const int sample_row_count = active_comparison_rows + 1;
     const int transaction_count =
         generation_control[
             llaminar2::sampling_math::
@@ -3435,6 +3485,11 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
             sampled_rows[sample_row] = sampled;
             sampled_target_tokens[sample_row] = sampled;
         }
+        else
+        {
+            sampled_rows[sample_row] = -1;
+            sampled_target_tokens[sample_row] = -1;
+        }
         if constexpr (RetainFirstTransactionDiagnostic)
         {
             if (retain_first_transaction)
@@ -3454,7 +3509,7 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
                             : nullptr,
                         top_k,
                         verifier_input_tokens,
-                        row_count,
+                        active_comparison_rows,
                         threshold,
                         sampled);
             }
@@ -3478,10 +3533,10 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
             verifier_input_tokens[0],
             sampled_rows,
             /*row_accepted=*/nullptr,
-            row_count,
+            active_comparison_rows,
             stop_tokens,
             llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
-            sampled_rows[row_count],
+            sampled_rows[active_comparison_rows],
             /*has_bonus_ready_token=*/1,
             commit_budget,
             out_tokens,
@@ -3500,7 +3555,7 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
                     threshold_seed,
                     *threshold_position,
                     threshold_position_offset,
-                    row_count,
+                    active_comparison_rows,
                     top_k,
                     transaction_count,
                     commit_budget,
@@ -3677,6 +3732,7 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
     const int *__restrict__ verify_tokens,
     const int *__restrict__ draft_tokens,
     int compare_row_count,
+    const int *__restrict__ active_verifier_row_count,
     const int *__restrict__ stop_tokens,
     int *__restrict__ out_tokens,
     int out_token_capacity,
@@ -3687,11 +3743,27 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
 
+    const int active_rows = *active_verifier_row_count;
+    if (active_rows <= 0 || active_rows > compare_row_count + 1)
+    {
+        for (int token = 0; token < out_token_capacity; ++token)
+            out_tokens[token] = -1;
+        for (int field = 0;
+             field < llaminar2::sampling_math::kSpeculativeBatchMetaCount;
+             ++field)
+        {
+            out_meta[field] = 0;
+        }
+        return;
+    }
+
+    /* Keep graph geometry physical while request semantics remain logical. */
+    const int active_compare_row_count = active_rows - 1;
     const int commit_budget =
         max_state_commit_rows && *max_state_commit_rows <
-                                     static_cast<uint32_t>(compare_row_count + 1)
+                                     static_cast<uint32_t>(active_rows)
             ? static_cast<int>(*max_state_commit_rows)
-            : compare_row_count + 1;
+            : active_rows;
     const int leading_committed_output_count =
         penalty_policy && penalty_policy->first_token_already_in_history != 0
             ? 1
@@ -3700,7 +3772,7 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
         draft_tokens[0],
         verify_tokens,
         draft_tokens,
-        compare_row_count,
+        active_compare_row_count,
         stop_tokens,
         llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
         commit_budget,
@@ -3781,6 +3853,7 @@ __global__ void rocm_advance_speculative_commit_boundary_kernel(
 __global__ void rocm_initialize_device_generation_kernel(
     int request_count,
     int max_new_tokens,
+    llaminar2::sampling_math::DeviceGenerationDepthPolicy depth_policy,
     int response_token_stride,
     int control_stride,
     int *__restrict__ control)
@@ -3795,6 +3868,7 @@ __global__ void rocm_initialize_device_generation_kernel(
     llaminar2::sampling_math::initialize_device_generation_control(
         max_new_tokens,
         response_token_stride,
+        depth_policy,
         request_control);
 }
 
@@ -4081,6 +4155,8 @@ __global__ void rocm_prepare_mtp_verifier_geometry_kernel(
     const int32_t *__restrict__ base_positions,
     const int32_t *__restrict__ valid_graph_rows,
     int valid_graph_row_count,
+    int *__restrict__ generation_control,
+    int generation_control_stride,
     int request_count,
     int padded_seq_len,
     int32_t *__restrict__ out_position_ids,
@@ -4097,8 +4173,30 @@ __global__ void rocm_prepare_mtp_verifier_geometry_kernel(
 
     if (out_request_lengths && flat_row < request_count)
     {
-        int valid_tokens = padded_seq_len;
-        if (valid_graph_rows)
+        int valid_tokens = valid_graph_row_count / request_count;
+        if (generation_control)
+        {
+            int *const control =
+                generation_control +
+                static_cast<size_t>(flat_row) *
+                    static_cast<size_t>(generation_control_stride);
+            const int depth =
+                control[llaminar2::sampling_math::
+                            kDeviceGenerationControlCurrentDraftDepth];
+            valid_tokens =
+                control[llaminar2::sampling_math::
+                            kDeviceGenerationControlActiveVerifierRowCount];
+            if (depth <= 0 || valid_tokens != depth + 1 ||
+                valid_tokens > padded_seq_len)
+            {
+                llaminar2::sampling_math::fail_device_generation_control(
+                    control,
+                    llaminar2::sampling_math::
+                        DeviceGenerationError::InvalidDepthSelector);
+                valid_tokens = 0;
+            }
+        }
+        else if (valid_graph_rows)
         {
             valid_tokens = 0;
             for (int row = 0; row < valid_graph_row_count; ++row)
@@ -4109,6 +4207,69 @@ __global__ void rocm_prepare_mtp_verifier_geometry_kernel(
             }
         }
         out_request_lengths[flat_row] = valid_tokens;
+    }
+}
+
+/**
+ * @brief Fuse one controller-selected verifier row into graph-stable buffers.
+ *
+ * A single wave owns the bounded scalar request. Lane zero validates and
+ * publishes controller-derived scalars; the wave writes the padded token and
+ * position rows cooperatively without allocation, transfer, or synchronization
+ * beyond its own block.
+ */
+__global__ void rocm_prepare_mtp_verifier_controlled_row_kernel(
+    const int32_t *__restrict__ first_token,
+    const int32_t *__restrict__ draft_tokens,
+    const int32_t *__restrict__ base_position,
+    int *__restrict__ generation_control_row,
+    int padded_seq_len,
+    int32_t *__restrict__ out_tokens,
+    int32_t *__restrict__ out_position_ids,
+    int32_t *__restrict__ out_request_length,
+    int32_t *__restrict__ out_base_position_snapshot)
+{
+    __shared__ int active_rows;
+    if (threadIdx.x == 0)
+    {
+        const bool active_request =
+            generation_control_row[
+                llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+            generation_control_row[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlRequestComplete] == 0;
+        const int depth = generation_control_row[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlCurrentDraftDepth];
+        const int verifier_rows = generation_control_row[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlActiveVerifierRowCount];
+        if (!active_request || depth <= 0 || verifier_rows != depth + 1 ||
+            verifier_rows > padded_seq_len)
+        {
+            llaminar2::sampling_math::fail_device_generation_control(
+                generation_control_row,
+                llaminar2::sampling_math::
+                    DeviceGenerationError::InvalidDepthSelector);
+            active_rows = 0;
+        }
+        else
+        {
+            active_rows = verifier_rows;
+        }
+        *out_request_length = active_rows;
+        *out_base_position_snapshot = *base_position;
+    }
+    __syncthreads();
+
+    const int base = *base_position;
+    for (int row = static_cast<int>(threadIdx.x); row < padded_seq_len;
+         row += static_cast<int>(blockDim.x))
+    {
+        out_position_ids[row] = base + row;
+        out_tokens[row] =
+            row == 0 ? *first_token
+                     : row < active_rows ? draft_tokens[row - 1] : 0;
     }
 }
 
@@ -4453,6 +4614,7 @@ bool rocmOps_topk_topp_distributions_f32(
     float *scratch_values,
     int *scratch_indices,
     int scratch_capacity,
+    const int *active_rows,
     int device_idx,
     void *stream)
 {
@@ -4489,14 +4651,16 @@ bool rocmOps_topk_topp_distributions_f32(
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices);
+                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
+                    active_rows);
             }
             else
             {
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices);
+                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
+                    active_rows);
             }
 
             hipError_t err = hipGetLastError();
@@ -4513,7 +4677,8 @@ bool rocmOps_topk_topp_distributions_f32(
                     HIP_KERNEL_NAME(rocm_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>),
                     dim3(row_count), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     scratch_values, scratch_indices, partial_blocks, k,
-                    top_p, temperature, out_token_ids, out_stride, out_probs);
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
             }
             else
             {
@@ -4521,7 +4686,8 @@ bool rocmOps_topk_topp_distributions_f32(
                     HIP_KERNEL_NAME(rocm_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_SMALL_K_CAP>),
                     dim3(row_count), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     scratch_values, scratch_indices, partial_blocks, k,
-                    top_p, temperature, out_token_ids, out_stride, out_probs);
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
             }
 
             err = hipGetLastError();
@@ -4587,14 +4753,16 @@ bool rocmOps_topk_topp_processed_logits_f32(
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices);
+                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
+                    nullptr);
             }
             else
             {
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices);
+                    data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
+                    nullptr);
             }
 
             hipError_t err = hipGetLastError();
@@ -6104,6 +6272,7 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
     const int *verify_tokens,
     const int *draft_tokens,
     int compare_row_count,
+    const int *active_verifier_row_count,
     const int *stop_tokens,
     int *out_tokens,
     int out_token_capacity,
@@ -6115,7 +6284,8 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
 {
     if (compare_row_count < 0 ||
         out_token_capacity < compare_row_count + 1 ||
-        !verify_tokens || !draft_tokens || !stop_tokens || !penalty_policy ||
+        !verify_tokens || !draft_tokens || !active_verifier_row_count ||
+        !stop_tokens || !penalty_policy ||
         !out_tokens || !out_meta || !stream)
     {
         return false;
@@ -6131,6 +6301,7 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
         verify_tokens,
         draft_tokens,
         compare_row_count,
+        active_verifier_row_count,
         stop_tokens,
         out_tokens,
         out_token_capacity,
@@ -6199,6 +6370,7 @@ bool rocmOps_advance_speculative_commit_boundary(
 bool rocmOps_initialize_device_generation(
     int request_count,
     int max_new_tokens,
+    const llaminar2::sampling_math::DeviceGenerationDepthPolicy &depth_policy,
     int response_token_stride,
     int control_stride,
     int *control,
@@ -6206,6 +6378,7 @@ bool rocmOps_initialize_device_generation(
     void *stream)
 {
     if (request_count <= 0 || max_new_tokens <= 0 ||
+        !depth_policy.valid() ||
         response_token_stride < max_new_tokens ||
         control_stride <
             llaminar2::sampling_math::kDeviceGenerationControlCount ||
@@ -6228,6 +6401,7 @@ bool rocmOps_initialize_device_generation(
         static_cast<hipStream_t>(stream),
         request_count,
         max_new_tokens,
+        depth_policy,
         response_token_stride,
         control_stride,
         control);
@@ -6641,6 +6815,8 @@ bool rocmOps_prepare_mtp_verifier_position_ids(
         base_positions,
         /*valid_graph_rows=*/nullptr,
         /*valid_graph_row_count=*/0,
+        /*generation_control=*/nullptr,
+        /*generation_control_stride=*/0,
         request_count,
         padded_seq_len,
         out_position_ids,
@@ -6664,6 +6840,8 @@ bool rocmOps_prepare_mtp_verifier_geometry(
     const int32_t *base_positions,
     const int32_t *valid_graph_rows,
     int valid_graph_row_count,
+    int *generation_control,
+    int generation_control_stride,
     int request_count,
     int padded_seq_len,
     int32_t *out_position_ids,
@@ -6673,9 +6851,17 @@ bool rocmOps_prepare_mtp_verifier_geometry(
 {
     const int total_rows = request_count * padded_seq_len;
     const bool rectangular = valid_graph_rows == nullptr;
+    const bool device_controlled = generation_control != nullptr;
     if (!base_positions || request_count <= 0 || padded_seq_len <= 0 ||
         !out_position_ids || !out_request_lengths || !stream ||
-        (rectangular && valid_graph_row_count != total_rows) ||
+        (device_controlled != (generation_control_stride > 0)) ||
+        (device_controlled &&
+         generation_control_stride <
+             llaminar2::sampling_math::kDeviceGenerationControlCount) ||
+        (rectangular &&
+         (valid_graph_row_count <= 0 ||
+          valid_graph_row_count > total_rows ||
+          valid_graph_row_count % request_count != 0)) ||
         (!rectangular &&
          (valid_graph_row_count <= 0 || valid_graph_row_count > total_rows)))
     {
@@ -6693,6 +6879,8 @@ bool rocmOps_prepare_mtp_verifier_geometry(
         base_positions,
         valid_graph_rows,
         valid_graph_row_count,
+        generation_control,
+        generation_control_stride,
         request_count,
         padded_seq_len,
         out_position_ids,
@@ -6704,6 +6892,61 @@ bool rocmOps_prepare_mtp_verifier_geometry(
         fprintf(stderr,
                 "ROCm grouped MTP verifier geometry preparation failed: %s\n",
                 hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/** @brief Enqueue one fused controller-owned verifier row publication. */
+bool rocmOps_prepare_mtp_verifier_controlled_row(
+    const int32_t *first_token,
+    const int32_t *draft_tokens,
+    const int32_t *base_position,
+    int *generation_control_row,
+    int generation_control_stride,
+    int padded_seq_len,
+    int32_t *out_tokens,
+    int32_t *out_position_ids,
+    int32_t *out_request_length,
+    int32_t *out_base_position_snapshot,
+    int device_idx,
+    void *stream)
+{
+    if (!first_token || !draft_tokens || !base_position ||
+        !generation_control_row ||
+        generation_control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        padded_seq_len <= 1 || !out_tokens || !out_position_ids ||
+        !out_request_length || !out_base_position_snapshot || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    hipLaunchKernelGGL(
+        rocm_prepare_mtp_verifier_controlled_row_kernel,
+        dim3(1),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        first_token,
+        draft_tokens,
+        base_position,
+        generation_control_row,
+        padded_seq_len,
+        out_tokens,
+        out_position_ids,
+        out_request_length,
+        out_base_position_snapshot);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm controlled MTP verifier row preparation failed: %s\n",
+            hipGetErrorString(err));
         return false;
     }
     return true;

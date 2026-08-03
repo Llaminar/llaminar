@@ -23,22 +23,6 @@ function(target_link_libraries_with_groups target)
     endif()
 endfunction()
 
-set(V2_ENABLE_CUDA_GPU_CONTEXT_TESTS_DEFAULT ON)
-if(HAVE_CUDA AND HAVE_ROCM)
-    # CUDA device-code registration for these context/graph-capture tests can
-    # fault before main() in dual-backend builds. ROCm variants keep coverage in
-    # the default suite; enable this option when debugging CUDA startup itself.
-    set(V2_ENABLE_CUDA_GPU_CONTEXT_TESTS_DEFAULT OFF)
-endif()
-set(V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT
-    "Reconfigure with -DV2_ENABLE_CUDA_GPU_CONTEXT_TESTS=ON to run the _CUDA split tests")
-option(V2_ENABLE_CUDA_GPU_CONTEXT_TESTS
-    "Enable CUDA GPU context/graph-capture split tests in dual-backend builds"
-    ${V2_ENABLE_CUDA_GPU_CONTEXT_TESTS_DEFAULT})
-if(HAVE_CUDA AND NOT V2_ENABLE_CUDA_GPU_CONTEXT_TESTS)
-    message(STATUS "V2 Tests: Macro-generated CUDA GPU context/graph-capture split tests will be built but registered disabled. ${V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT}.")
-endif()
-
 # Build GPU tests as one binary per backend. CUDA and HIP device runtimes can
 # register linked device code before main(), so combined CUDA+ROCm test binaries
 # can fail before gtest skip guards run. Split binaries preserve backend coverage
@@ -98,12 +82,6 @@ function(add_v2_gpu_backend_test TARGET_BASE SOURCE TEST_BASE)
             LABELS ${TEST_LABELS} CUDA
             MPI_PROCS 1
         )
-        if(NOT V2_ENABLE_CUDA_GPU_CONTEXT_TESTS AND TEST ${TEST_BASE}_CUDA)
-            set_tests_properties(${TEST_BASE}_CUDA PROPERTIES
-                DISABLED TRUE
-                DISABLED_REASON "Macro-generated CUDA context/graph-capture split tests are opt-in for dual-backend builds. ${V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT}."
-            )
-        endif()
     endif()
 
     if(NOT HAVE_ROCM AND NOT HAVE_CUDA)
@@ -13420,6 +13398,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_DeviceGenerationSwitch_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*DeviceControlledSwitchWhileSelectsTransactionsAndFailsInvalidDepth*CUDA
+            LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GenerationController;DynamicDepth;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
     endif()

@@ -36,7 +36,8 @@ namespace llaminar2::test::gpu_rope_verifier
     enum class PositionRoute
     {
         ContiguousDeviceScalar,
-        ExplicitDeviceRows,
+        WorkspaceDeviceRows,
+        ExternalDeviceRows,
     };
 
     /** @brief Enable route telemetry without leaking environment state. */
@@ -161,18 +162,27 @@ namespace llaminar2::test::gpu_rope_verifier
         const char *backend_label,
         const char *counter_name,
         const char *format_label,
-        bool include_partial_rope)
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int partial_rotary_dim,
+        float rope_theta,
+        bool include_partial_rope,
+        const char *geometry_label)
     {
-        constexpr int n_heads = 4;
-        constexpr int n_kv_heads = 2;
-        constexpr int head_dim = 128;
-        constexpr int partial_rotary_dim = 64;
-        constexpr float rope_theta = 1000000.0f;
         constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
-        constexpr std::array<PositionRoute, 2> position_routes = {
+        constexpr std::array<PositionRoute, 3> position_routes = {
             PositionRoute::ContiguousDeviceScalar,
-            PositionRoute::ExplicitDeviceRows,
+            PositionRoute::WorkspaceDeviceRows,
+            PositionRoute::ExternalDeviceRows,
         };
+
+        ASSERT_GT(n_heads, 0);
+        ASSERT_GT(n_kv_heads, 0);
+        ASSERT_GT(head_dim, 0);
+        ASSERT_GT(partial_rotary_dim, 0);
+        ASSERT_LE(partial_rotary_dim, head_dim);
+        ASSERT_EQ(partial_rotary_dim % 2, 0);
 
         std::array<int, max_rows> explicit_positions{};
         for (int row = 0; row < max_rows; ++row)
@@ -183,6 +193,29 @@ namespace llaminar2::test::gpu_rope_verifier
             explicit_positions[static_cast<size_t>(row)] =
                 101 + (row / 3) * 5 + (row % 3 == 2 ? 2 : 0);
         }
+
+        void *external_positions_device = nullptr;
+        ASSERT_TRUE(runtime.allocateDevice(
+            &external_positions_device,
+            explicit_positions.size() * sizeof(explicit_positions[0])));
+        ASSERT_NE(external_positions_device, nullptr);
+        struct ExternalPositionOwner
+        {
+            Runtime &runtime;
+            void *pointer;
+
+            ~ExternalPositionOwner()
+            {
+                if (pointer)
+                    runtime.freeDevice(pointer);
+            }
+        } external_position_owner{runtime, external_positions_device};
+        ASSERT_TRUE(runtime.copyHostToDevice(
+            external_positions_device,
+            explicit_positions.data(),
+            explicit_positions.size() * sizeof(explicit_positions[0]),
+            stream));
+        runtime.synchronize(stream);
 
         const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
         const size_t k_cols = static_cast<size_t>(n_kv_heads) * head_dim;
@@ -206,15 +239,24 @@ namespace llaminar2::test::gpu_rope_verifier
             {
                 for (PositionRoute position_route : position_routes)
                 {
-                    const char *position_route_label =
-                        position_route == PositionRoute::ContiguousDeviceScalar
-                            ? "contiguous_device_scalar"
-                            : "explicit_device_rows";
+                    const char *position_owner_label = "contiguous_device_scalar";
+                    const char *kernel_position_route = "contiguous_device_scalar";
+                    if (position_route == PositionRoute::WorkspaceDeviceRows)
+                    {
+                        position_owner_label = "workspace_device_rows";
+                        kernel_position_route = "explicit_device_rows";
+                    }
+                    else if (position_route == PositionRoute::ExternalDeviceRows)
+                    {
+                        position_owner_label = "external_device_rows";
+                        kernel_position_route = "explicit_device_rows";
+                    }
                     SCOPED_TRACE(
                         std::string(backend_label) + " format=" + format_label +
+                        " geometry=" + geometry_label +
                         " M=" + std::to_string(verifier_rows) +
                         " rotary=" + std::to_string(effective_rotary_dim) +
-                        " route=" + position_route_label);
+                        " position_owner=" + position_owner_label);
 
                     Kernel kernel(0);
                     kernel.setGPUStream(stream);
@@ -285,11 +327,16 @@ namespace llaminar2::test::gpu_rope_verifier
                     {
                         kernel.setDynamicPosOffset(101);
                     }
-                    else
+                    else if (position_route == PositionRoute::WorkspaceDeviceRows)
                     {
                         kernel.setDynamicPositionIds(
                             explicit_positions.data(), verifier_rows);
                         grouped_positions = explicit_positions.data();
+                    }
+                    else
+                    {
+                        kernel.setDynamicDevicePositionIds(
+                            external_positions_device, verifier_rows);
                     }
                     runtime.synchronize(stream);
                     PerfStatsCollector::reset();
@@ -321,7 +368,7 @@ namespace llaminar2::test::gpu_rope_verifier
                     EXPECT_EQ(tag(record, "tensor_format"), format_label);
                     EXPECT_EQ(tag(record, "verifier_rows"), std::to_string(verifier_rows));
                     EXPECT_EQ(tag(record, "rotary_dim"), std::to_string(effective_rotary_dim));
-                    EXPECT_EQ(tag(record, "position_route"), position_route_label);
+                    EXPECT_EQ(tag(record, "position_route"), kernel_position_route);
                     EXPECT_EQ(tag(record, "capture_mode"), "direct");
                     EXPECT_EQ(tag(record, "invocation_policy"), "single_grouped_launch");
                 }
@@ -339,14 +386,43 @@ namespace llaminar2::test::gpu_rope_verifier
         const char *counter_name)
     {
         ScopedPerfStats perfstats;
-        runNativeFormat<ActivationPrecision::FP32,
-                        KernelTemplate<ActivationPrecision::FP32>>(
-            runtime, device, stream, backend_label, counter_name, "FP32", true);
-        runNativeFormat<ActivationPrecision::BF16,
-                        KernelTemplate<ActivationPrecision::BF16>>(
-            runtime, device, stream, backend_label, counter_name, "BF16", false);
-        runNativeFormat<ActivationPrecision::FP16,
-                        KernelTemplate<ActivationPrecision::FP16>>(
-            runtime, device, stream, backend_label, counter_name, "FP16", false);
+        auto run_geometry = [&](int n_heads,
+                                int n_kv_heads,
+                                int head_dim,
+                                int partial_rotary_dim,
+                                float rope_theta,
+                                const char *geometry_label)
+        {
+            runNativeFormat<ActivationPrecision::FP32,
+                            KernelTemplate<ActivationPrecision::FP32>>(
+                runtime, device, stream, backend_label, counter_name, "FP32",
+                n_heads, n_kv_heads, head_dim, partial_rotary_dim, rope_theta,
+                true, geometry_label);
+            runNativeFormat<ActivationPrecision::BF16,
+                            KernelTemplate<ActivationPrecision::BF16>>(
+                runtime, device, stream, backend_label, counter_name, "BF16",
+                n_heads, n_kv_heads, head_dim, partial_rotary_dim, rope_theta,
+                true, geometry_label);
+            runNativeFormat<ActivationPrecision::FP16,
+                            KernelTemplate<ActivationPrecision::FP16>>(
+                runtime, device, stream, backend_label, counter_name, "FP16",
+                n_heads, n_kv_heads, head_dim, partial_rotary_dim, rope_theta,
+                true, geometry_label);
+        };
+
+        run_geometry(
+            /*n_heads=*/4,
+            /*n_kv_heads=*/2,
+            /*head_dim=*/128,
+            /*partial_rotary_dim=*/64,
+            /*rope_theta=*/1000000.0f,
+            "generic_hd128");
+        run_geometry(
+            /*n_heads=*/8,
+            /*n_kv_heads=*/1,
+            /*head_dim=*/256,
+            /*partial_rotary_dim=*/64,
+            /*rope_theta=*/10000000.0f,
+            "qwen36_local_tp_hd256");
     }
 } // namespace llaminar2::test::gpu_rope_verifier

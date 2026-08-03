@@ -58,10 +58,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Replicated shared-expert residuals no longer enter an invalid allreduce.
   Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
   contributions and is covered on NCCL and RCCL.
-- CUDA2 phase-split prefill and serial decode match the reference, and fixed-d3
-  stochastic grouped verification matches same-seed serial decode after cache
-  clear/reuse. Final MoE combined outputs are explicitly replicated snapshots;
-  the obsolete post-combine allreduce diagnostic contract has been removed.
+- CUDA2 phase-split prefill and serial decode match the reference. Fixed-d3
+  native-parent replay remains same-seed exact after clear/reuse, with grouped
+  verifier/publication PerfStats intact. Final MoE outputs are replicated.
 
 ## Kernel Economy
 
@@ -74,9 +73,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
   40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
   32 SGPR, zero scratch, and 90.6% VALU utilization.
-- Current CUDA2 LLEP d3 stochastic baseline is `80.34 tok/s` decode and
-  `90.84 tok/s` prefill at 65.87% acceptance. This predates the resident
-  generation lifecycle and is the control to remeasure before kernel tuning.
+- Current Release CUDA2 LLEP d3 fixed-prompt baseline is `77.45 tok/s` decode
+  and `179.70 tok/s` prefill. Parent reuse improved decode from `65.56 tok/s`
+  (`+18.1%`); one native WHILE is built per GPU and reused across requests.
 - Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
   `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
   communication baseline; the dynamic depth controller is a later tuning lane.

@@ -100,10 +100,17 @@ namespace llaminar2
         /**
          * @brief Persistent device bindings and immutable verifier geometry.
          *
-         * `valid_graph_rows_device` is null only for a dense rectangular verifier;
-         * in that case `valid_graph_row_count` equals the complete physical matrix
-         * size. Ragged graphs point at the same resident row-index array consumed
-         * by the compact LM-head selector.
+         * `valid_graph_rows_device` is null for a dense prefix in every request
+         * row. In that case `valid_graph_row_count / request_count` is the
+         * logical width and may be smaller than `padded_seq_len`; this is the
+         * scalar fixed-bucket verifier contract. Ragged graphs point at the same
+         * resident row-index array consumed by the compact LM-head selector.
+         * `generation_control_device` replaces that static logical width only
+         * for a resident generation parent; the backend validates the depth/row
+         * relation and publishes a fatal controller error on corruption. In that
+         * mode `draft_token_count` and `valid_graph_row_count` are setup evidence,
+         * not capture identity: one fused kernel reads the live depth and reuses
+         * the same physical bucket for every logical width it can contain.
          */
         struct Params
         {
@@ -116,7 +123,11 @@ namespace llaminar2
 
             const int32_t *base_cached_tokens_device = nullptr;
             const int32_t *valid_graph_rows_device = nullptr;
-            int valid_graph_row_count = 0;
+            int valid_graph_row_count = 0; ///< Total logical rows across requests.
+            int *generation_control_device = nullptr;
+            int generation_control_stride = 0;
+            /** Optional resident MoE boundary used to clip this transaction. */
+            const uint32_t *maintenance_rows_remaining_device = nullptr;
             int32_t *position_ids_device = nullptr;
             int32_t *request_lengths_device = nullptr;
             int32_t *base_cached_tokens_snapshot_device = nullptr;

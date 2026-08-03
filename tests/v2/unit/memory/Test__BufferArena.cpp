@@ -766,6 +766,45 @@ TEST(Test__StageBufferContract, AllWritesGathersOutputsInouts)
     EXPECT_EQ(writes.size(), 2u); // output + inout
 }
 
+TEST(Test__StageBufferContract,
+     GraphDependencyTrackerExcludesProducedEmbeddingFromCaptureInputs)
+{
+    GraphArenaDependencyTracker tracker;
+
+    const auto embedding = StageBufferContract::build()
+                               .addOutput(BufferId::MTP_EMBEDDING);
+    EXPECT_TRUE(tracker.observeStage(embedding).empty());
+
+    const auto embedding_allreduce = StageBufferContract::build()
+                                         .addPreallocatedInOut(
+                                             BufferId::MTP_EMBEDDING);
+    EXPECT_TRUE(tracker.observeStage(embedding_allreduce).empty())
+        << "An in-place collective consumes the embedding produced inside the same graph";
+
+    const auto norm_embedding = StageBufferContract::build()
+                                    .addInput(BufferId::MTP_EMBEDDING)
+                                    .addInput(BufferId::HIDDEN_STATE)
+                                    .addOutput(BufferId::MTP_NORM_EMBEDDING);
+    const auto external_reads = tracker.observeStage(norm_embedding);
+    ASSERT_EQ(external_reads.size(), 1u);
+    EXPECT_EQ(external_reads.front().id, BufferId::HIDDEN_STATE)
+        << "Only the graph-external hidden state requires a pre-capture event join";
+}
+
+TEST(Test__StageBufferContract,
+     GraphDependencyTrackerTreatsUnproducedInOutAsExternal)
+{
+    GraphArenaDependencyTracker tracker;
+    const auto external_allreduce = StageBufferContract::build()
+                                        .addPreallocatedInOut(
+                                            BufferId::MTP_EMBEDDING);
+
+    const auto external_reads = tracker.observeStage(external_allreduce);
+    ASSERT_EQ(external_reads.size(), 1u);
+    EXPECT_EQ(external_reads.front().id, BufferId::MTP_EMBEDDING)
+        << "A capture unit beginning with an in-place consumer must join its prior segment";
+}
+
 // ============================================================================
 // StageBoundBuffers Tests
 // ============================================================================
