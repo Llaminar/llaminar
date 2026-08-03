@@ -1412,6 +1412,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
+    execution/compute_stages/stages/MTPVerifierPreparationStage.cpp
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
     execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp
     execution/compute_stages/stages/MTPStochasticTargetDistributionStage.cpp

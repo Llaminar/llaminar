@@ -266,6 +266,47 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Report whether a fast-policy stage still needs output storage.
+         *
+         * Fast decode deliberately skips the full coherence walk after graph
+         * addresses have stabilized.  That optimization is legal only after
+         * every declared write already owns storage on the stage's target GPU.
+         * A read-resident stage may still have a cold output, especially for a
+         * graph family materialized before its first execution.  Checking both
+         * the pointer and its device owner makes that first-write allocation an
+         * explicit contract condition without adding prepareForWrite calls to
+         * steady-state replay.
+         */
+        bool contractWritesNeedStorage(
+            BufferArena *arena,
+            const StageBufferContract &contract,
+            DeviceId target_device)
+        {
+            if (!arena || contract.empty() || !target_device.is_gpu())
+                return false;
+
+            for (const auto &binding : contract.writesRequiringPrepare())
+            {
+                if (!arena->isRegistered(binding.id))
+                    continue;
+
+                auto *tensor =
+                    dynamic_cast<TensorBase *>(arena->getTensor(binding.id));
+                if (!tensor)
+                    continue;
+
+                const auto resident_device = tensor->current_device();
+                if (!tensor->gpu_data_ptr() || !resident_device ||
+                    *resident_device != target_device)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         bool fastPolicyRequiresContractCoherence(
             const StageRunPolicy &policy,
             BufferArena *arena,
@@ -278,9 +319,12 @@ namespace llaminar2
             // Host-staged graph-native collectives must always honor arena
             // contracts in decode: they are exactly the CPU bridges between
             // device-resident graph stages. GPU stages also need coherence when
-            // a prior host bridge made one of their inputs CPU-authoritative.
+            // a prior host bridge made an input CPU-authoritative or when a
+            // newly materialized graph-family output has not received its
+            // stable target-device allocation yet.
             return target_device.is_cpu() ||
-                   contractReadsNeedTransfer(arena, contract, target_device);
+                   contractReadsNeedTransfer(arena, contract, target_device) ||
+                   contractWritesNeedStorage(arena, contract, target_device);
         }
     }
 

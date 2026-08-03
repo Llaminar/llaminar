@@ -695,7 +695,7 @@ namespace llaminar2
          * @param has_request_sequence_lengths Whether the active graph has a
          *        device-resident request-length row.
          * @return RequestTerminalLengths for compact prefill, otherwise
-         *         ExternalDeviceIndices for explicit verifier metadata.
+         *         WorkspaceBoundDeviceIndices for explicit verifier metadata.
          */
         HiddenStateRowsSelectStage::DeviceRowIndexSource
         resolveLMHeadDeviceRowIndexSource(
@@ -908,6 +908,35 @@ namespace llaminar2
             const std::string &dependency,
             const std::string &wo_node_suffix = "wo_proj",
             const std::string &allreduce_node_suffix = "wo_allreduce");
+
+        /**
+         * @brief Optionally retain exact embedding rows inside the forward DAG.
+         *
+         * The base implementation is a topology-preserving no-op. A derived
+         * architecture may use this hook for opt-in device diagnostics, but it
+         * must chain every checkpoint into the returned dependency so graph
+         * completion proves that the observation belongs to this invocation.
+         *
+         * @param graph Forward graph under construction.
+         * @param source Complete embedding output matrix.
+         * @param dependency Embedding or embedding-collective producer node.
+         * @param total_tokens Exact physical row count in @p source.
+         * @param device Device that owns source and checkpoint destinations.
+         * @return @p dependency or the final diagnostic checkpoint node.
+         */
+        virtual std::string maybeAddEmbeddingDiagnosticCheckpoints(
+            ComputeGraph &graph,
+            TensorBase *source,
+            const std::string &dependency,
+            int total_tokens,
+            DeviceId device)
+        {
+            (void)graph;
+            (void)source;
+            (void)total_tokens;
+            (void)device;
+            return dependency;
+        }
 
         /**
          * @brief Optionally insert a graph-owned checkpoint around final norm.

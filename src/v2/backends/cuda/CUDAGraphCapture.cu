@@ -3,6 +3,8 @@
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 
+#include <stdexcept>
+
 namespace llaminar2
 {
 
@@ -71,15 +73,26 @@ namespace llaminar2
         }                                                                                   \
     } while (0)
 
-    CUDAGraphCapture::CUDAGraphCapture(cudaStream_t stream) : stream_(stream) {}
+    CUDAGraphCapture::CUDAGraphCapture(
+        cudaStream_t stream,
+        int device_ordinal)
+        : stream_(stream), device_ordinal_(device_ordinal)
+    {
+        if (!stream_ || device_ordinal_ < 0)
+        {
+            throw std::invalid_argument(
+                "CUDAGraphCapture requires an explicit stream and CUDA ordinal");
+        }
+    }
 
     CUDAGraphCapture::~CUDAGraphCapture() { reset(); }
 
     CUDAGraphCapture::CUDAGraphCapture(CUDAGraphCapture &&other) noexcept
-        : stream_(other.stream_), graph_(other.graph_), exec_(other.exec_),
-          node_count_(other.node_count_)
+        : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
+          graph_(other.graph_), exec_(other.exec_), node_count_(other.node_count_)
     {
         other.stream_ = nullptr;
+        other.device_ordinal_ = -1;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
@@ -91,10 +104,12 @@ namespace llaminar2
         {
             reset();
             stream_ = other.stream_;
+            device_ordinal_ = other.device_ordinal_;
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
             other.stream_ = nullptr;
+            other.device_ordinal_ = -1;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -102,8 +117,35 @@ namespace llaminar2
         return *this;
     }
 
+    bool CUDAGraphCapture::activateOwner(const char *operation) const noexcept
+    {
+        if (!stream_ || device_ordinal_ < 0)
+        {
+            LOG_ERROR("[CUDAGraphCapture] "
+                      << (operation ? operation : "graph operation")
+                      << " has no valid CUDA owner"
+                      << " stream=" << static_cast<void *>(stream_)
+                      << " device=" << device_ordinal_);
+            return false;
+        }
+
+        const cudaError_t error = cudaSetDevice(device_ordinal_);
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAGraphCapture] cudaSetDevice(" << device_ordinal_
+                      << ") failed before "
+                      << (operation ? operation : "graph operation") << ": "
+                      << cudaGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
     bool CUDAGraphCapture::beginCapture()
     {
+        if (!activateOwner("beginCapture"))
+            return false;
+
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
@@ -130,6 +172,9 @@ namespace llaminar2
 
     bool CUDAGraphCapture::endCapture()
     {
+        if (!activateOwner("endCapture"))
+            return false;
+
         cudaError_t err = cudaStreamEndCapture(stream_, &graph_);
         if (err != cudaSuccess)
         {
@@ -156,6 +201,9 @@ namespace llaminar2
 
     bool CUDAGraphCapture::instantiate()
     {
+        if (!activateOwner("instantiate"))
+            return false;
+
         if (!graph_)
         {
             LOG_ERROR("[CUDAGraphCapture] Cannot instantiate: no captured graph");
@@ -189,6 +237,9 @@ namespace llaminar2
 
     bool CUDAGraphCapture::launch()
     {
+        if (!activateOwner("launch"))
+            return false;
+
         if (!exec_)
         {
             LOG_ERROR("[CUDAGraphCapture] Cannot launch: no instantiated executable");
@@ -213,6 +264,9 @@ namespace llaminar2
         LOG_ERROR("[CUDAGraphCapture] Device-controlled graph loops require CUDA 12.3 or newer");
         return false;
 #else
+        if (!activateOwner("buildDeviceControlledWhileLoop"))
+            return false;
+
         if (ordered_body_fragments.empty() || !predicate.valid())
         {
             LOG_ERROR("[CUDAGraphCapture] Invalid device-controlled loop contract"
@@ -231,6 +285,7 @@ namespace llaminar2
             const auto *cuda_fragment =
                 dynamic_cast<const CUDAGraphCapture *>(fragment);
             if (!cuda_fragment || cuda_fragment == this ||
+                cuda_fragment->deviceOrdinal() != device_ordinal_ ||
                 !cuda_fragment->graph() || cuda_fragment->nodeCount() == 0)
             {
                 LOG_ERROR(
@@ -239,7 +294,10 @@ namespace llaminar2
                     << " backend="
                     << (fragment ? fragment->backendName() : "<null>")
                     << " nodes=" << (fragment ? fragment->nodeCount() : 0)
-                    << " self=" << (cuda_fragment == this));
+                    << " self=" << (cuda_fragment == this)
+                    << " parent_device=" << device_ordinal_
+                    << " fragment_device="
+                    << (cuda_fragment ? cuda_fragment->deviceOrdinal() : -1));
                 return false;
             }
             transaction_node_count += cuda_fragment->nodeCount();
@@ -267,10 +325,51 @@ namespace llaminar2
         error = cudaGraphConditionalHandleCreate(
             &condition,
             graph_,
-            /*defaultLaunchValue=*/1,
+            /*defaultLaunchValue=*/0,
             cudaGraphCondAssignDefault);
         if (error != cudaSuccess)
             return fail("cudaGraphConditionalHandleCreate", error);
+
+        /*
+         * A reusable parent graph can be launched after its controller became
+         * terminal (for example when the capture/materialization transaction
+         * consumed the final response budget). Evaluate the live device rows
+         * before entering the WHILE node so terminal input executes zero body
+         * iterations. A default-true conditional would append one stale extra
+         * transaction on every such launch.
+         */
+        cudaGraphConditionalHandle condition_arg = condition;
+        const int *control_rows_arg = predicate.control_rows_device;
+        int control_stride_arg = predicate.control_stride;
+        int request_count_arg = predicate.request_count;
+        int healthy_index_arg = predicate.healthy_index;
+        int complete_index_arg = predicate.complete_index;
+        void *kernel_args[] = {
+            &condition_arg,
+            &control_rows_arg,
+            &control_stride_arg,
+            &request_count_arg,
+            &healthy_index_arg,
+            &complete_index_arg};
+
+        cudaKernelNodeParams predicate_params{};
+        predicate_params.func =
+            reinterpret_cast<void *>(updateDeviceControlledLoopCondition);
+        predicate_params.gridDim = dim3(1, 1, 1);
+        predicate_params.blockDim = dim3(1, 1, 1);
+        predicate_params.sharedMemBytes = 0;
+        predicate_params.kernelParams = kernel_args;
+        predicate_params.extra = nullptr;
+
+        cudaGraphNode_t initial_predicate_node = nullptr;
+        error = cudaGraphAddKernelNode(
+            &initial_predicate_node,
+            graph_,
+            /*dependencies=*/nullptr,
+            /*numDependencies=*/0,
+            &predicate_params);
+        if (error != cudaSuccess)
+            return fail("cudaGraphAddKernelNode(initial loop predicate)", error);
 
         cudaGraphNodeParams conditional_params{};
         conditional_params.type = cudaGraphNodeTypeConditional;
@@ -282,9 +381,9 @@ namespace llaminar2
         error = cudaGraphAddNode(
             &conditional_node,
             graph_,
-            /*dependencies=*/nullptr,
+            &initial_predicate_node,
             /*dependencyData=*/nullptr,
-            /*numDependencies=*/0,
+            /*numDependencies=*/1,
             &conditional_params);
         if (error != cudaSuccess)
             return fail("cudaGraphAddNode(WHILE)", error);
@@ -316,29 +415,6 @@ namespace llaminar2
             transaction_tail = fragment_node;
         }
 
-        cudaGraphConditionalHandle condition_arg = condition;
-        const int *control_rows_arg = predicate.control_rows_device;
-        int control_stride_arg = predicate.control_stride;
-        int request_count_arg = predicate.request_count;
-        int healthy_index_arg = predicate.healthy_index;
-        int complete_index_arg = predicate.complete_index;
-        void *kernel_args[] = {
-            &condition_arg,
-            &control_rows_arg,
-            &control_stride_arg,
-            &request_count_arg,
-            &healthy_index_arg,
-            &complete_index_arg};
-
-        cudaKernelNodeParams predicate_params{};
-        predicate_params.func =
-            reinterpret_cast<void *>(updateDeviceControlledLoopCondition);
-        predicate_params.gridDim = dim3(1, 1, 1);
-        predicate_params.blockDim = dim3(1, 1, 1);
-        predicate_params.sharedMemBytes = 0;
-        predicate_params.kernelParams = kernel_args;
-        predicate_params.extra = nullptr;
-
         cudaGraphNode_t predicate_node = nullptr;
         error = cudaGraphAddKernelNode(
             &predicate_node,
@@ -365,6 +441,9 @@ namespace llaminar2
 
     GraphUpdateResult CUDAGraphCapture::tryUpdate()
     {
+        if (!activateOwner("tryUpdate"))
+            return GraphUpdateResult::Failed;
+
         if (!exec_ || !graph_)
         {
             return GraphUpdateResult::Failed;
@@ -406,6 +485,10 @@ namespace llaminar2
 
     void CUDAGraphCapture::reset()
     {
+        if ((exec_ || graph_) && device_ordinal_ >= 0)
+        {
+            CUDA_WARN_IF_FAIL(cudaSetDevice(device_ordinal_));
+        }
         if (exec_)
         {
             CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));

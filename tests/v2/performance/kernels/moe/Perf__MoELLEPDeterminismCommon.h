@@ -446,6 +446,36 @@ namespace llaminar2::test::moe_llep_perf
         return config;
     }
 
+    /**
+     * @brief Create independent controller transactions due on their next edge.
+     *
+     * A maintenance controller owns persistent request state and may leave its
+     * command wave busy for the transfer graph. Reusing one state object in a
+     * tight microbenchmark would therefore measure the not-ready guard rather
+     * than planning. The perf harness prebuilds one valid transaction per timed
+     * launch so the measured region contains controller kernels only, with no
+     * reset kernel, host transfer, allocation, or synchronization between
+     * launches.
+     */
+    inline std::vector<DeviceMoERebalanceGraphControllerState>
+    makeDueControllerTransactions(
+        const DeviceMoERebalanceConfig &config,
+        int count)
+    {
+        std::vector<DeviceMoERebalanceGraphControllerState> states(
+            static_cast<size_t>(std::max(count, 1)));
+        for (auto &state : states)
+        {
+            state.participant_id = config.participant_id;
+            state.participant_count = config.participant_count;
+            state.decode_rounds_until_maintenance = 1u;
+            state.maintenance_period_rounds = config.maintenance_period_tokens;
+            state.maintenance_due = 0u;
+            state.decode_boundary_advanced = 0u;
+        }
+        return states;
+    }
+
     inline void installSkewedDynamicHistogram(DeviceMoELayerRuntime &runtime,
                                               const Shape &shape)
     {

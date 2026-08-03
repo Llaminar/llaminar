@@ -1509,6 +1509,24 @@ namespace llaminar2
             tl_last_cuda_device_for_allgather = ordinal;
         }
 
+        /*
+         * CUDA launch errors are thread-local and sticky.  Consume producer
+         * state before entering NCCL, then consume NCCL's own CUDA launch
+         * state immediately after enqueue.  Without both boundaries, an
+         * allocation or capture error from the collective is misreported by
+         * whichever ordinary kernel happens to call cudaGetLastError next.
+         * This is a fatal attribution contract; it does not retry, synchronize,
+         * or select another collective implementation.
+         */
+        const cudaError_t producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            last_error_ =
+                std::string("CUDA producer launch state failed before ncclAllGather(on-stream): ") +
+                cudaGetErrorString(producer_error);
+            return false;
+        }
+
         nccl::ncclResult_t r = nccl::ncclAllGather(
             send_buf,
             recv_buf,
@@ -1520,6 +1538,15 @@ namespace llaminar2
         {
             last_error_ = std::string("ncclAllGather(on-stream) failed: ") +
                           nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        const cudaError_t collective_launch_error = cudaGetLastError();
+        if (collective_launch_error != cudaSuccess)
+        {
+            last_error_ =
+                std::string("CUDA runtime rejected ncclAllGather(on-stream) enqueue: ") +
+                cudaGetErrorString(collective_launch_error);
             return false;
         }
 

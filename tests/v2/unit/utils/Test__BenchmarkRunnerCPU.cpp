@@ -636,6 +636,24 @@ namespace
         bool previous_ = false;
     };
 
+    class ScopedPrefillGraphMinimumSequenceSetting
+    {
+    public:
+        explicit ScopedPrefillGraphMinimumSequenceSetting(int minimum)
+            : previous_(mutableDebugEnv().execution.prefill_graph_min_seq)
+        {
+            mutableDebugEnv().execution.prefill_graph_min_seq = minimum;
+        }
+
+        ~ScopedPrefillGraphMinimumSequenceSetting()
+        {
+            mutableDebugEnv().execution.prefill_graph_min_seq = previous_;
+        }
+
+    private:
+        int previous_ = 0;
+    };
+
     std::filesystem::path uniqueBenchmarkPromptPath()
     {
         static std::atomic<uint64_t> sequence{0};
@@ -844,6 +862,7 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureFailsWhenProbeNeverCap
 {
     ScopedGpuGraphsSetting force_gpu_graphs(true);
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
     auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
@@ -865,6 +884,7 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
 {
     ScopedGpuGraphsSetting force_gpu_graphs(true);
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     PrefixRuntimeStateSnapshot snapshot;
     PrefillGraphRuntimeProbe graph;

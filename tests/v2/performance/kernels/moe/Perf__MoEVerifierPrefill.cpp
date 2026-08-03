@@ -1244,7 +1244,7 @@ namespace
          * a benchmark launch throws, preventing one failed cell from leaving
          * the CUDA stream in capture mode and poisoning every later cell.
          */
-        llaminar2::CUDAGraphCapture graph(stream);
+        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,
@@ -1500,7 +1500,7 @@ namespace
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        llaminar2::CUDAGraphCapture graph(stream);
+        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,

@@ -19,6 +19,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../kernels/common/SamplingMath.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -73,7 +74,7 @@ namespace llaminar2
             int *generation_control_device = nullptr;
             int generation_control_stride = 0;
             const uint32_t *maintenance_rows_remaining_device = nullptr;
-            int verifier_row_capacity = 0;
+            int verifier_row_capacity = 0; ///< Exact captured rows per request, including the first condition row.
 
             int32_t *sampled_target_tokens_device = nullptr;
             int sampled_target_token_stride = 0;
@@ -81,6 +82,15 @@ namespace llaminar2
             int output_token_stride = 0;
             int *output_meta_device = nullptr;
             int output_meta_stride = 0;
+
+            /**
+             * Optional graph-stable transaction-zero evidence destination.
+             * A null pointer selects the zero-overhead production kernel
+             * specialization; a non-null pointer is written only while the
+             * resident generation controller still reports transaction zero.
+             */
+            sampling_math::MTPFirstTransactionDiagnosticRecord *
+                first_transaction_diagnostic_device = nullptr;
 
             int request_count = 0;
             int comparison_rows_per_request = 0;

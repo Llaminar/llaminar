@@ -3024,6 +3024,7 @@ namespace llaminar2
                       << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                       << " backend=" << collectiveBackendTypeToString(backend_)
                       << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
             return false;
         }
 

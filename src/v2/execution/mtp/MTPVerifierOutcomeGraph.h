@@ -23,14 +23,41 @@
 namespace llaminar2
 {
     /**
+     * @brief Immutable presence/frequency policy admitted once per request.
+     *
+     * These values originate in the serving request and may therefore cross the
+     * host/device boundary at request admission.  They must never be rebuilt or
+     * republished from a speculative transaction: doing so would make captured
+     * graph identity depend on mutable host control flow.
+     *
+     * The device-only `first_token_already_in_history` state is intentionally
+     * absent.  It is produced by accepted-state publication and lives in
+     * @ref MTPGreedyPenaltyPolicy behind a graph-stable arena address.
+     */
+    struct MTPRequestPenaltyPolicy
+    {
+        float presence_penalty = 0.0f;
+        float frequency_penalty = 0.0f;
+
+        /** @return Whether serial decode applies either history penalty. */
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return presence_penalty != 0.0f || frequency_penalty != 0.0f;
+        }
+
+        bool operator==(const MTPRequestPenaltyPolicy &) const = default;
+    };
+
+    /**
      * @brief Request policy consumed by graph-owned grouped greedy sampling.
      *
      * Presence and frequency penalties are part of the decode algorithm, not a
-     * post-processing step.  The policy is therefore published into persistent
-     * device storage before verifier graph replay and read by the grouped
-     * argmax itself.  `first_token_already_in_history` distinguishes a newly
-     * sampled first target from a rejected correction that was emitted by the
-     * preceding transaction and is now being consumed as its pending condition.
+     * post-processing step.  Immutable magnitudes are copied from
+     * @ref MTPRequestPenaltyPolicy once at request admission.  The
+     * `first_token_already_in_history` member is different: accepted-state
+     * publication updates it on device after every compact outcome.  Captured
+     * proposal and verifier kernels only read this resident structure; no graph
+     * node accepts a host-authored transaction bit.
      */
     struct alignas(16) MTPGreedyPenaltyPolicy
     {

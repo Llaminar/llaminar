@@ -818,8 +818,6 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
     params.selected_row_indices = {0, 1, 2};
     params.device_row_index_source =
         HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
-    params.workspace_buffer_name = kExternalRows;
-    HiddenStateRowsSelectStage stage(params);
 
     WorkspaceRequirements reqs;
     reqs.buffers.push_back({
@@ -829,7 +827,10 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
         true});
     DeviceWorkspaceManager workspace(device, 1024);
     ASSERT_TRUE(workspace.allocate(reqs));
-    stage.bindWorkspace(&workspace);
+    params.external_device_row_indices =
+        static_cast<const int32_t *>(workspace.getBuffer(kExternalRows));
+    ASSERT_NE(params.external_device_row_indices, nullptr);
+    HiddenStateRowsSelectStage stage(params);
     stage.setGPUStream(stream);
 
     auto upload_rows = [&](const std::vector<int> &rows)

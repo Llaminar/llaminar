@@ -78,19 +78,11 @@ namespace llaminar2
         if (params_.apply_penalties)
         {
             /*
-             * Configure and consume the policy on one ordered graph stream.
-             * Re-publishing these few scalars is intentional: the generated
-             * graph is self-contained and never depends on a host-side policy
-             * upload having happened before a later parent-loop replay.
+             * The graph consumes request-admitted policy and the history bit
+             * published by the previous accepted-state transaction. Mutation is
+             * forbidden here: this stage owns logits/distribution bytes only.
              */
-            if (!params_.backend->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
-                    params_.penalty_policy_device,
-                    params_.presence_penalty,
-                    params_.frequency_penalty,
-                    params_.first_token_already_in_history,
-                    params_.device_id.gpu_ordinal(),
-                    stream) ||
-                !params_.backend->enqueueApplyMTPPenaltiesToF32RowsDevice(
+            if (!params_.backend->enqueueApplyMTPPenaltiesToF32RowsDevice(
                     params_.logits_device,
                     params_.row_count,
                     params_.vocab_size,
@@ -165,11 +157,6 @@ namespace llaminar2
         info.addScalar("top_p", params_.top_p);
         info.addScalar("temperature", params_.temperature);
         info.addScalarBool("apply_penalties", params_.apply_penalties);
-        info.addScalar("presence_penalty", params_.presence_penalty);
-        info.addScalar("frequency_penalty", params_.frequency_penalty);
-        info.addScalarBool(
-            "first_token_already_in_history",
-            params_.first_token_already_in_history);
         return info;
     }
 
@@ -185,7 +172,6 @@ namespace llaminar2
             contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
             contract.addInput(BufferId::MTP_GENERATED_TOKEN_COUNTS);
             contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
-            contract.addOutput(BufferId::MTP_GREEDY_PENALTY_POLICY);
         }
         contract.addOutput(BufferId::ALL_POSITION_LOGITS);
         contract.addOutput(BufferId::STOCHASTIC_TARGET_TOKEN_IDS);
@@ -211,10 +197,6 @@ namespace llaminar2
                params_.generated_token_counts_device ==
                    other.generated_token_counts_device &&
                params_.penalty_policy_device == other.penalty_policy_device &&
-               params_.presence_penalty == other.presence_penalty &&
-               params_.frequency_penalty == other.frequency_penalty &&
-               params_.first_token_already_in_history ==
-                   other.first_token_already_in_history &&
                params_.top_k == other.top_k &&
                params_.top_p == other.top_p &&
                params_.temperature == other.temperature &&

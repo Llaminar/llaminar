@@ -1517,7 +1517,14 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            return hasPrefillReplayParams()
+            /*
+             * Multi-row grouped verifier execution is not padded prefill. Its
+             * graph owns a fixed row count and needs no host scalar between
+             * parent-loop launches. The external effective-length publication
+             * contract becomes active only after the prefill replay executor
+             * explicitly supplies replay metadata.
+             */
+            return hasPrefillReplayParams() && prefill_replay_params_set_
                        ? GraphLaunchPreparationPolicy::CaptureAndReplay
                        : GraphLaunchPreparationPolicy::None;
         }

@@ -362,6 +362,12 @@ namespace llaminar2
         MTP_DRAFT_TOKEN_PUBLICATION,
 
         /**
+         * Captured verifier prelude: resident token composition, device geometry,
+         * base-count snapshot, and opaque pre-verifier KV checkpoint capture.
+         */
+        MTP_VERIFIER_PREPARATION,
+
+        /**
          * Captured target-verifier transaction: optional device-history
          * penalties followed by compact top-k/top-p row construction.
          */

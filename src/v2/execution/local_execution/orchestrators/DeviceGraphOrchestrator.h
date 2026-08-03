@@ -510,6 +510,7 @@ namespace llaminar2
         uint64_t hash = 0;      ///< FNV-1a digest of the copied device bytes.
         size_t byte_count = 0;  ///< Number of bytes included in @ref hash.
         bool available = false; ///< True when the device-to-host diagnostic copy succeeded.
+        std::string value_preview; ///< Optional bounded scalar values for control metadata.
     };
 
     /**
@@ -2177,12 +2178,14 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override;
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
             int stop_token_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy =
-                MTPGreedyPenaltyPolicy{}) override;
+            const MTPRequestPenaltyPolicy &penalty_policy =
+                MTPRequestPenaltyPolicy{}) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,
@@ -2565,10 +2568,10 @@ namespace llaminar2
         bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
             int row_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
             int prior_draft_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
         bool supportsDeviceStochasticMTPVerification() const override;
         bool buildStochasticDistributionOnDevice(
@@ -2589,7 +2592,7 @@ namespace llaminar2
         bool buildCapturedStochasticVerifierTargetDistributions(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size) override;
         bool buildStochasticProcessedLogitRowsOnDevice(
             DeviceLogitsSource source,
@@ -2609,7 +2612,7 @@ namespace llaminar2
         bool publishCapturedMTPDraftToken(
             int row,
             int slot,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool sampleStochasticDraftProposalOnDeviceDeferred(
             DeviceLogitsSource source,
             int row,
@@ -2723,6 +2726,10 @@ namespace llaminar2
         bool beginDeviceResidentStochasticGeneration(
             int request_count,
             int max_new_tokens) override;
+        bool materializeDeviceResidentStochasticGeneration(
+            int request_count,
+            int draft_depth) override;
+        bool launchDeviceResidentStochasticGeneration() override;
         bool finishDeviceResidentStochasticGeneration(
             DeviceGenerationTerminalResult *out_result) override;
 
@@ -2762,6 +2769,48 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
         mtpDraftTokenPublicationDeviceLoopGraphTemplate(
             int slot,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow the exact grouped-verifier preparation graph that just ran.
+         *
+         * Preparation capture is a bounded family because request count, padded
+         * verifier width, and pointer topology are immutable graph identity.  This
+         * API deliberately exports only the family member retained by the most
+         * recent successful preparation transaction.  Looking up another member by
+         * geometry would allow a stale token/KV checkpoint producer to be cloned
+         * into the parent generation loop.
+         *
+         * @param request_count Exact logical request count of the parent loop.
+         * @param padded_seq_len Exact grouped-verifier width of the parent loop.
+         * @param error Optional first violated identity or capture invariant.
+         * @return Borrowed monolithic capture owned by the bounded graph family.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        mtpVerifierPreparationDeviceLoopGraphTemplate(
+            int request_count,
+            int padded_seq_len,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Borrow the all-position forward paired with active preparation.
+         *
+         * This is intentionally not a general forwarding wrapper around
+         * ForwardExecutionEngine.  The active preparation identity must validate
+         * first, and the retained forward signature must consume that exact
+         * request geometry and compact row count through persistent device token,
+         * position, and length inputs.
+         *
+         * @param request_count Exact logical request count of the parent loop.
+         * @param padded_seq_len Exact grouped-verifier width of the parent loop.
+         * @param error Optional first violated paired-graph invariant.
+         * @return Borrowed monolithic all-position verifier capture.
+         */
+        std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>
+        mtpAllPositionVerifierDeviceLoopGraphTemplate(
+            int request_count,
+            int padded_seq_len,
             std::string *error = nullptr) const;
 
         /**
@@ -6041,6 +6090,7 @@ namespace llaminar2
             const int32_t *shifted_cached_tokens_device = nullptr;
             int request_index = -1;
             std::string row_buffer_name;
+            const int32_t *external_device_row_indices = nullptr;
             HiddenStateRowsSelectStage::DeviceRowIndexSource row_index_source =
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
                     StageOwnedIndices;
@@ -6091,6 +6141,7 @@ namespace llaminar2
                 shifted_cached_tokens_device = nullptr;
                 request_index = -1;
                 row_buffer_name.clear();
+                external_device_row_indices = nullptr;
                 row_index_source =
                     HiddenStateRowsSelectStage::DeviceRowIndexSource::
                         StageOwnedIndices;
@@ -6184,6 +6235,128 @@ namespace llaminar2
                 stage = nullptr;
                 workspace_generation = 0;
                 valid = false;
+            }
+        };
+
+        /**
+         * @brief Capture owner for one immutable grouped-verifier preparation geometry.
+         *
+         * Dynamic token values and KV metadata remain behind persistent device
+         * addresses.  The graph identity contains only pointer topology,
+         * request geometry, and request-constant policy.  A bounded family is
+         * preallocated with the MTP workspace so decode never allocates a cache
+         * owner while selecting a previously captured depth or batch shape.
+         */
+        struct MTPVerifierPreparationGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MTPVerifierPreparationStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage
+                            ->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Identity of the verifier preparation that completed this transaction.
+         *
+         * A family index by itself is insufficient: an invalidated owner can be
+         * repopulated at the same index.  Retaining the exact stage address and
+         * workspace generation makes replacement, arena rebinding, and stale
+         * geometry observable without reading any device value on host.
+         */
+        struct ActiveMTPVerifierPreparationGraph
+        {
+            size_t family_index = 0;
+            const MTPVerifierPreparationStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            int request_count = 0;
+            int padded_seq_len = 0;
+
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return stage != nullptr && workspace_generation != 0 &&
+                       request_count > 0 && padded_seq_len > 0;
+            }
+
+            void clear() noexcept
+            {
+                family_index = 0;
+                stage = nullptr;
+                workspace_generation = 0;
+                request_count = 0;
+                padded_seq_len = 0;
+            }
+        };
+
+        /**
+         * @brief Persistent owner for one fixed-depth device generation loop.
+         *
+         * The stream is allocated with runner workspace setup. The graph object
+         * is retained across request boundaries and rebuilt from exact child
+         * captures only during the first transaction's graph-materialization
+         * phase. Replay never creates a stream, graph owner, or fragment list.
+         * Member order is intentional: C++ destroys `capture` before `stream`.
+         */
+        struct MTPDeviceGenerationLoopGraphCache
+        {
+            std::shared_ptr<void> stream;
+            std::unique_ptr<IGPUGraphCapture> capture;
+            /** Exact child-capture identities cloned into the executable. */
+            std::vector<const IGPUGraphCapture *> source_fragments;
+            uint64_t workspace_generation = 0;
+            int request_count = 0;
+            int draft_depth = 0;
+            int verifier_rows_per_request = 0;
+            size_t fragment_count = 0;
+            bool valid = false;
+            bool launched = false;
+
+            void invalidateGraph() noexcept
+            {
+                if (capture)
+                    capture->reset();
+                workspace_generation = 0;
+                request_count = 0;
+                draft_depth = 0;
+                verifier_rows_per_request = 0;
+                fragment_count = 0;
+                valid = false;
+                launched = false;
+                source_fragments.clear();
+            }
+
+            void release() noexcept
+            {
+                invalidateGraph();
+                capture.reset();
+                stream.reset();
             }
         };
 
@@ -6322,6 +6495,34 @@ namespace llaminar2
         /// One immutable proposal publication graph for every legal draft slot.
         std::vector<std::unique_ptr<MTPDraftTokenPublicationGraphCache>>
             mtp_draft_token_publication_graphs_;
+
+        /// Bounded immutable graph family for resident verifier preparation.
+        std::vector<std::unique_ptr<MTPVerifierPreparationGraphCache>>
+            mtp_verifier_preparation_graphs_;
+
+        /// Exact preparation capture admitted for the current verifier transaction.
+        ActiveMTPVerifierPreparationGraph
+            active_mtp_verifier_preparation_graph_;
+
+        /// CUDA conditional parent assembled from the exact active MTP fragments.
+        MTPDeviceGenerationLoopGraphCache mtp_device_generation_loop_graph_;
+
+        /// Allocation-free ordered child-capture scratch for parent construction.
+        std::vector<const IGPUGraphCapture *>
+            mtp_device_generation_loop_fragment_scratch_;
+
+        /**
+         * @brief Allocation-free identity scratch for verifier graph selection.
+         *
+         * Capacity is reserved with the persistent MTP arena. The spans passed
+         * to materializeMTPVerifierPreparationGraph() are valid for that call;
+         * a newly constructed stage takes its own immutable copy, while cache
+         * hits only compare against these rows.
+         */
+        std::vector<MTPVerifierPreparationStage::TokenRowBinding>
+            mtp_verifier_preparation_token_row_scratch_;
+        std::vector<MTPVerifierPreparationStage::MainKVCheckpointBinding>
+            mtp_verifier_preparation_checkpoint_scratch_;
 
         /// Active seeded stochastic outcome fragment used by fixed-depth tuning.
         MTPStochasticSerialOutcomeGraphCache
@@ -6733,6 +6934,8 @@ namespace llaminar2
         void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, stochastic_target_row_capacity_]
         void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, stochastic_batch_output_token_stride_]
         void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
+        sampling_math::MTPFirstTransactionDiagnosticRecord *
+            mtp_first_transaction_diagnostic_dev_ = nullptr; ///< Optional transaction-zero evidence retained entirely on device until a fatal mirrored mismatch.
         std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
         std::unique_ptr<PinnedHostScratch> device_generation_terminal_host_scratch_;
 
@@ -8115,7 +8318,7 @@ namespace llaminar2
                 GreedyVerifierOutcomeGraphState::Idle;
             int verifier_token_count = 0;
             int stop_token_count = 0;
-            MTPGreedyPenaltyPolicy penalty_policy;
+            MTPRequestPenaltyPolicy penalty_policy;
         };
 
         MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode_ =
@@ -8138,6 +8341,18 @@ namespace llaminar2
         int mtp_request_stop_token_count_ = 0;
         std::optional<uint64_t>
             mtp_request_stop_tokens_published_session_epoch_;
+
+        /**
+         * @brief Immutable host policy staged for one admission-time GPU write.
+         *
+         * This object never contains transaction state.  The corresponding
+         * device buffer's history predicate is mutated only by captured
+         * accepted-state publication after this session marker is established.
+         */
+        MTPRequestPenaltyPolicy mtp_request_penalty_policy_;
+        MTPRequestPenaltyPolicy mtp_published_request_penalty_policy_;
+        std::optional<uint64_t>
+            mtp_request_penalty_policy_published_session_epoch_;
 
         /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
         MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{
@@ -8285,12 +8500,11 @@ namespace llaminar2
         /// Execute a cached hidden-row select whose row indices are device-produced metadata.
         bool executeMTPHiddenRowsSelectFromDeviceMetadata(
             TensorBase *input,
-            BufferId input_buffer_id,
             TensorBase *output,
-            BufferId output_buffer_id,
             MTPTerminalHiddenRowsSelectGraphCache &cache,
             const char *node_name,
             const char *row_buffer_name,
+            const int32_t *row_indices_device,
             int row_count,
             int seq_len,
             void *stream = nullptr);
@@ -8330,7 +8544,8 @@ namespace llaminar2
          * @param row_index_source Fixed contiguous or external-device source policy.
          * @param selected_row_count Immutable output row capacity.
          * @param fixed_contiguous_row_start Immutable first row for fixed-range mode.
-         * @param row_buffer_name Workspace row-index buffer for external mode.
+         * @param row_buffer_name Stable producer-field name used only for diagnostics and cache identity.
+         * @param external_device_row_indices Exact producer-owned row-index address for external mode.
          */
         bool materializeMTPTerminalHiddenRowsSelectGraph(
             MTPTerminalHiddenRowsSelectGraphCache &cache,
@@ -8339,6 +8554,7 @@ namespace llaminar2
             int selected_row_count,
             int fixed_contiguous_row_start = 0,
             const char *row_buffer_name = nullptr,
+            const int32_t *external_device_row_indices = nullptr,
             int request_index = -1);
 
         /**
@@ -8431,7 +8647,7 @@ namespace llaminar2
         bool materializeMTPDraftTokenPublicationGraph(
             int row,
             int slot,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             std::string *error = nullptr);
 
         /**
@@ -8445,6 +8661,43 @@ namespace llaminar2
             void *producer_stream,
             int row,
             int slot,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Find or capture the exact resident grouped-verifier prelude.
+         *
+         * The returned family index is stable until execution caches or the
+         * workspace generation are invalidated. No live token or KV value is
+         * inspected on host while selecting the graph.
+         */
+        bool materializeMTPVerifierPreparationGraph(
+            const MTPVerifierPreparationStage::Params &params,
+            size_t *family_index,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Replay one verifier-preparation graph between explicit events.
+         *
+         * @p producer_stream already carries every sample, shifted-KV, logical
+         * state, and row-plan dependency. Completion is returned to that exact
+         * stream before the main verifier graph may consume the prepared rows.
+         */
+        bool executeMTPVerifierPreparationCaptured(
+            void *producer_stream,
+            size_t family_index,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Assemble one fixed-depth stochastic transaction into a CUDA WHILE graph.
+         *
+         * Every fragment must already be replay-ready and must match the active
+         * request/workspace identity. The method clones them in semantic producer
+         * order and instantiates one persistent parent executable; it never launches
+         * the graph or reads the generation controller on host.
+         */
+        bool materializeMTPDeviceGenerationLoopGraph(
+            int request_count,
+            int draft_depth,
             std::string *error = nullptr);
 
         /**
@@ -8482,7 +8735,7 @@ namespace llaminar2
         bool materializeMTPStochasticTargetDistributionGraph(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size,
             std::string *error = nullptr);
 
@@ -8706,6 +8959,31 @@ namespace llaminar2
         bool publishMTPRequestStopTokensOnDevice(
             void *producer_stream,
             const char *producer);
+
+        /**
+         * @brief Publish immutable request penalty controls after request reset.
+         *
+         * Presence/frequency magnitudes are admitted once.  The publication
+         * initializes the mutable history predicate to false; accepted-state
+         * publication owns every subsequent device-side transition of that bit.
+         * Repeated calls in one session only establish an event-ordered read and
+         * never overwrite device-produced state.
+         */
+        bool publishMTPRequestPenaltyPolicyOnDevice(
+            void *producer_stream,
+            const char *producer);
+
+        /**
+         * @brief Order a consumer after the current resident penalty policy.
+         *
+         * The expected policy contains request constants only.  Dynamic history
+         * state is never compared on host; BufferArena orders the consumer after
+         * whichever device transaction most recently published that state.
+         */
+        bool consumeMTPRequestPenaltyPolicyOnDevice(
+            const MTPRequestPenaltyPolicy &expected_policy,
+            void *consumer_stream,
+            const char *consumer);
 
         /**
          * @brief Queue the current graph stream behind external request admission.

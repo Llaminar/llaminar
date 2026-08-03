@@ -20,7 +20,9 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../kernels/common/SamplingMath.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -65,16 +67,38 @@ namespace llaminar2
             int prior_draft_count = 0;
             const int32_t *generated_token_counts_device = nullptr;
             void *penalty_policy_device = nullptr;
-            float presence_penalty = 0.0F;
-            float frequency_penalty = 0.0F;
-            bool first_token_already_in_history = false;
 
             float *draft_values_device = nullptr;
             int32_t *draft_tokens_device = nullptr;
             int destination_slot = 0;
+            int32_t *next_chain_condition_token_device = nullptr;
+            int32_t *next_chain_position_id_device = nullptr;
+            int chain_position_increment = 1;
             float *argmax_partial_values_device = nullptr;
             int32_t *argmax_partial_indices_device = nullptr;
             int argmax_partial_capacity = 0;
+
+            /*
+             * Optional transaction-zero evidence.  These bindings are all
+             * model-lifetime device addresses and are absent together in the
+             * production specialization.  One publication graph owns exactly
+             * one destination slot, so its captured diagnostic identity is
+             * immutable.
+             */
+            const int32_t *diagnostic_condition_token_device = nullptr;
+            const int32_t *diagnostic_position_id_device = nullptr;
+            const int32_t *diagnostic_generation_control_device = nullptr;
+            int diagnostic_generation_control_stride = 0;
+            sampling_math::MTPFirstTransactionDiagnosticRecord
+                *first_transaction_diagnostic_device = nullptr;
+            std::array<
+                const void *,
+                sampling_math::kMTPFirstTransactionDraftBoundaryCount>
+                diagnostic_boundary_words_device{};
+            std::array<
+                int,
+                sampling_math::kMTPFirstTransactionDraftBoundaryCount>
+                diagnostic_boundary_word_counts{};
 
             std::string stage_name = "mtp_draft_token_publication";
         };

@@ -56,6 +56,17 @@ namespace llaminar2
             int layer_idx = -1;
             DecodeExpertHistogram *decode_histogram = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            /**
+             * @brief Graph-lowered ownership of each selected routed row.
+             *
+             * This must match the paired MoEExpertComputeStage. A physically
+             * replicated placement can either distribute rows for LLEP economy
+             * or execute every row independently for a mirrored MTP sidecar;
+             * routing owns that distinction because it publishes the runtime
+             * expert IDs consumed by the expert kernel.
+             */
+            RoutedExpertRowExecutionPolicy routed_row_execution_policy =
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned;
             bool force_grouped_verifier_prefill_for_decode = false;
             /**
              * @brief Device-owned absolute position row shared with RoPE.
@@ -138,7 +149,15 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            return hasPrefillReplayParams()
+            /*
+             * `seq_len > 1` alone does not imply padded prefill. Grouped MTP
+             * verifier graphs deliberately route several serial-equivalent
+             * rows in one captured invocation and never publish a host-owned
+             * effective-length scalar. Only updatePrefillReplayParams() arms
+             * that mutable prefill contract, so only an armed stage requires
+             * launcher work before capture and replay.
+             */
+            return hasPrefillReplayParams() && prefill_replay_params_set_
                        ? GraphLaunchPreparationPolicy::CaptureAndReplay
                        : GraphLaunchPreparationPolicy::None;
         }
@@ -187,6 +206,20 @@ namespace llaminar2
             params_.routed_pipeline_kernel_owner.reset();
             owned_moe_kernel_.reset();
             moe_kernel_ = kernel;
+        }
+
+        /**
+         * @brief Expose the graph-lowered row ownership policy to graph tests.
+         *
+         * Routing publishes the runtime expert IDs consumed by the paired
+         * expert stage.  A graph-construction regression must therefore prove
+         * both stages received the same typed policy rather than inspecting
+         * only the downstream stage and assuming the router agreed.
+         */
+        RoutedExpertRowExecutionPolicy
+        routedExpertRowExecutionPolicyForTesting() const noexcept
+        {
+            return params_.routed_row_execution_policy;
         }
 
     private:

@@ -209,6 +209,7 @@ namespace llaminar2
         static constexpr const char *WS_TRANSFER_PLAN_COUNT = "moe_rebalance_transfer_plan_count";
         static constexpr const char *WS_COMMAND_HEADER = "moe_rebalance_command_header";
         static constexpr const char *WS_CONTROLLER_STATE = "moe_rebalance_controller_state";
+        static constexpr const char *WS_LLEP_LAYER_PLANS = "moe_rebalance_llep_layer_plans";
         static constexpr const char *WS_GATHERED_TRANSFER_PLAN = "moe_rebalance_gathered_transfer_plan";
         static constexpr const char *WS_GATHERED_COMMAND_HEADER = "moe_rebalance_gathered_command_header";
         static constexpr const char *WS_WAVE_STATE = "moe_rebalance_wave_state";
@@ -348,6 +349,7 @@ namespace llaminar2
         std::string transferPlanCountBufferName() const;
         std::string commandHeaderBufferName() const;
         std::string controllerStateBufferName() const;
+        std::string llepLayerPlansBufferName() const;
         std::string gatheredTransferPlanBufferName() const;
         std::string gatheredCommandHeaderBufferName() const;
         std::string waveStateBufferName() const;
@@ -363,6 +365,7 @@ namespace llaminar2
         size_t localHistogramEntries() const;
         size_t gatheredHistogramEntries() const;
         size_t histogramLayerCount() const;
+        size_t llepPlannerScratchCount() const;
         size_t localDirectoryEntries() const;
         size_t localSourceDescriptorEntries() const;
         size_t transferPlanEntries() const;
@@ -380,6 +383,7 @@ namespace llaminar2
         bool collectsState() const;
         bool gathersStateInline() const;
         bool runsController() const;
+        bool usesParallelLLEPPlanning() const;
         bool runsPlanning() const;
         bool runsApply() const;
         bool validateCommon(const char *context) const;

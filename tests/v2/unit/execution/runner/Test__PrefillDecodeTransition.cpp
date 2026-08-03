@@ -349,6 +349,7 @@ namespace
             int total_verifier_input_tokens) override
         {
             ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            ++prepare_mtp_verifier_input_tokens_host_first_count_;
             last_prepare_mtp_verifier_first_token_ = first_token;
             last_prepare_mtp_verifier_first_draft_slot_ = first_draft_slot;
             last_prepare_mtp_verifier_draft_token_count_ = draft_token_count;
@@ -382,6 +383,7 @@ namespace
         {
             execution_events_.push_back("prepare_verifier_token_batch");
             ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            ++prepare_mtp_verifier_input_token_batch_on_device_count_;
             last_prepare_mtp_verifier_total_tokens_ = padded_seq_len;
             if (!supports_mtp_device_draft_token_input_ ||
                 !requests ||
@@ -392,6 +394,14 @@ namespace
             {
                 return nullptr;
             }
+            last_prepare_mtp_verifier_first_token_ =
+                requests[0].first_token;
+            last_prepare_mtp_verifier_first_target_sample_slot_ =
+                requests[0].first_target_sample_slot;
+            last_prepare_mtp_verifier_first_draft_slot_ =
+                requests[0].first_draft_slot;
+            last_prepare_mtp_verifier_draft_token_count_ =
+                requests[0].draft_token_count;
 
             std::fill(device_verifier_input_tokens_.begin(),
                       device_verifier_input_tokens_.end(),
@@ -401,7 +411,9 @@ namespace
             {
                 const DeviceMTPVerifierInputBatchRequest &row =
                     requests[request];
-                if (row.draft_token_count < 0 ||
+                if ((primary_device_.is_gpu() &&
+                     !row.first_token_from_device) ||
+                    row.draft_token_count < 0 ||
                     row.total_verifier_input_tokens !=
                         row.draft_token_count + 1 ||
                     row.total_verifier_input_tokens > padded_seq_len ||
@@ -417,46 +429,15 @@ namespace
                     static_cast<size_t>(padded_seq_len);
                 if (row.first_token_from_device)
                 {
-                    const bool has_resident_state =
-                        row.first_token_logical_state.valid();
-                    const bool has_resident_index =
-                        row.first_token_request_index >= 0;
-                    if (has_resident_state != has_resident_index)
-                        return nullptr;
-                    const bool uses_target_sample_slot =
-                        row.first_target_sample_slot >= 0;
-                    if (has_resident_state == uses_target_sample_slot)
-                        return nullptr;
-
-                    if (has_resident_state)
-                    {
-                        const DeviceResidentLogicalSequenceStateHandle
-                            current_state =
-                                deviceResidentLogicalSequenceState();
-                        if (!row.first_token_logical_state.sameMailboxAs(
-                                current_state) ||
-                            !row.first_token_logical_state.coversRequest(
-                                row.first_token_request_index))
-                        {
-                            return nullptr;
-                        }
-                        device_verifier_input_tokens_[row_base] =
-                            *row.first_token_logical_state
-                                 .nextConditionTokenDeviceForRequest(
-                                     row.first_token_request_index);
-                    }
-                    else if (row.first_target_sample_slot >= 0 &&
-                             row.first_target_sample_slot <
-                                 static_cast<int>(device_target_sample_tokens_.size()))
-                    {
-                        device_verifier_input_tokens_[row_base] =
-                            device_target_sample_tokens_[
-                                static_cast<size_t>(row.first_target_sample_slot)];
-                    }
-                    else
+                    if (row.first_target_sample_slot < 0 ||
+                        row.first_target_sample_slot >=
+                            static_cast<int>(device_target_sample_tokens_.size()))
                     {
                         return nullptr;
                     }
+                    device_verifier_input_tokens_[row_base] =
+                        device_target_sample_tokens_[
+                            static_cast<size_t>(row.first_target_sample_slot)];
                 }
                 else
                 {
@@ -1242,6 +1223,8 @@ namespace
                 }
                 resident_next_condition_tokens_[static_cast<size_t>(request_index)] =
                     next_condition_token;
+                device_target_sample_tokens_[static_cast<size_t>(request_index)] =
+                    next_condition_token;
                 resident_all_drafts_accepted_flags_[static_cast<size_t>(request_index)] =
                     all_drafts_accepted != 0 ? 1 : 0;
                 resident_stopped_flags_[static_cast<size_t>(request_index)] =
@@ -1253,27 +1236,44 @@ namespace
                         shiftedTargetForMainTokens(target_cached_tokens);
                 }
             }
-            if (request.commit_penalty_history)
+            if (request.request_count == 1)
             {
                 const int output_count =
                     request.outcome.meta_device[
                         sampling_math::kSpecBatchMetaOutputCount];
-                const int begin =
-                    request.penalty_policy.first_token_already_in_history != 0
-                        ? 1
-                        : 0;
-                for (int output_index = begin;
-                     output_index < output_count &&
-                     output_index < request.outcome.output_token_stride;
-                     ++output_index)
+                if (request.penalty_policy.enabled())
                 {
-                    const int token =
-                        request.outcome.output_tokens_device[output_index];
-                    if (token >= 0 && token < VOCAB_SIZE)
+                    const int begin =
+                        mock_device_penalty_policy_
+                                    .first_token_already_in_history != 0
+                            ? 1
+                            : 0;
+                    for (int output_index = begin;
+                         output_index < output_count &&
+                         output_index < request.outcome.output_token_stride;
+                         ++output_index)
                     {
-                        ++mock_device_generated_token_counts_[
-                            static_cast<size_t>(token)];
+                        const int token =
+                            request.outcome.output_tokens_device[output_index];
+                        if (token >= 0 && token < VOCAB_SIZE)
+                        {
+                            ++mock_device_generated_token_counts_[
+                                static_cast<size_t>(token)];
+                        }
                     }
+                    const int accepted_state_count =
+                        resident_accepted_state_counts_[0];
+                    mock_device_penalty_policy_
+                        .first_token_already_in_history =
+                        resident_stopped_flags_[0] == 0 &&
+                                output_count > accepted_state_count
+                            ? 1
+                            : 0;
+                }
+                else
+                {
+                    mock_device_penalty_policy_
+                        .first_token_already_in_history = 0;
                 }
             }
             resident_logical_state_request_count_ = request.request_count;
@@ -2200,6 +2200,19 @@ namespace
             return true;
         }
 
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override
+        {
+            request_penalty_policy_ = policy;
+            mock_device_penalty_policy_ = MTPGreedyPenaltyPolicy{
+                .presence_penalty = policy.presence_penalty,
+                .frequency_penalty = policy.frequency_penalty,
+                .first_token_already_in_history = 0,
+                .enabled = policy.enabled() ? 1 : 0,
+            };
+            return true;
+        }
+
         /**
          * @brief Arm one mock graph-owned greedy outcome transaction.
          *
@@ -2213,8 +2226,8 @@ namespace
             int verifier_token_count,
             const int32_t *stop_tokens,
             int stop_token_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy =
-                MTPGreedyPenaltyPolicy{}) override
+            const MTPRequestPenaltyPolicy &penalty_policy =
+                MTPRequestPenaltyPolicy{}) override
         {
             using namespace sampling_math;
             if (!primary_device_.is_gpu() ||
@@ -2227,6 +2240,7 @@ namespace
                 stop_token_count > kSpeculativeBatchMaxStopTokens ||
                 (stop_token_count > 0 && !stop_tokens) ||
                 stop_token_count != request_stop_token_count_ ||
+                penalty_policy != request_penalty_policy_ ||
                 greedy_outcome_graph_armed_ ||
                 greedy_outcome_graph_produced_)
             {
@@ -2787,7 +2801,7 @@ namespace
         bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
             int row_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override
+            const MTPRequestPenaltyPolicy &penalty_policy) override
         {
             ++apply_device_owned_mtp_penalty_rows_count_;
             return applyDeviceOwnedMTPPenaltyRowsMath(
@@ -2798,13 +2812,13 @@ namespace
 
         bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
             int prior_draft_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override
+            const MTPRequestPenaltyPolicy &penalty_policy) override
         {
             ++apply_device_owned_mtp_branch_penalties_count_;
             if (prior_draft_count < 0 ||
                 prior_draft_count >
                     static_cast<int>(device_draft_sample_tokens_.size()) ||
-                penalty_policy.enabled == 0 ||
+                !penalty_policy.enabled() ||
                 last_mtp_condition_token_ < 0 ||
                 mtp_logits_.size() != VOCAB_SIZE)
             {
@@ -2813,7 +2827,8 @@ namespace
 
             std::array<int, VOCAB_SIZE> branch_counts =
                 mock_device_generated_token_counts_;
-            if (penalty_policy.first_token_already_in_history == 0)
+            if (mock_device_penalty_policy_
+                    .first_token_already_in_history == 0)
             {
                 ++branch_counts[static_cast<size_t>(
                     last_mtp_condition_token_)];
@@ -2947,7 +2962,7 @@ namespace
         bool buildCapturedStochasticVerifierTargetDistributions(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size) override
         {
             ++captured_stochastic_verifier_target_distribution_count_;
@@ -2956,7 +2971,7 @@ namespace
             {
                 return false;
             }
-            if (penalty_policy.enabled != 0 &&
+            if (penalty_policy.enabled() &&
                 !applyDeviceOwnedMTPPenaltyRowsMath(
                     DeviceLogitsSource::AllPosition,
                     row_count,
@@ -3896,6 +3911,7 @@ namespace
             DeviceSpeculativeOutcomeHandle *out_handle) override
         {
             ++device_distribution_request_batch_outcome_count_;
+            device_generation_lifecycle_events_.push_back("resident_verifier");
             last_request_batch_outcome_request_ids_.clear();
             last_request_batch_outcome_row_counts_.clear();
             last_request_batch_outcome_first_target_slots_.clear();
@@ -4609,6 +4625,17 @@ namespace
             return true;
         }
 
+        bool beginDeviceResidentStochasticGeneration(
+            int request_count,
+            int max_new_tokens) override
+        {
+            ++device_generation_admission_count_;
+            last_device_generation_request_count_ = request_count;
+            last_device_generation_max_new_tokens_ = max_new_tokens;
+            device_generation_lifecycle_events_.push_back("admission");
+            return request_count > 0 && max_new_tokens > 0;
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -4622,6 +4649,14 @@ namespace
         int prepareMTPVerifierInputTokensHostRowCount() const
         {
             return prepare_mtp_verifier_input_tokens_host_row_count_;
+        }
+        int prepareMTPVerifierInputTokensHostFirstCount() const
+        {
+            return prepare_mtp_verifier_input_tokens_host_first_count_;
+        }
+        int prepareMTPVerifierInputTokenBatchOnDeviceCount() const
+        {
+            return prepare_mtp_verifier_input_token_batch_on_device_count_;
         }
         int lastPrepareMTPVerifierFirstToken() const { return last_prepare_mtp_verifier_first_token_; }
         int lastPrepareMTPVerifierFirstDraftSlot() const
@@ -5036,7 +5071,7 @@ namespace
         {
             return verify_greedy_all_position_batch_outcome_count_;
         }
-        const MTPGreedyPenaltyPolicy &greedyOutcomeGraphPenaltyPolicy() const
+        const MTPRequestPenaltyPolicy &greedyOutcomeGraphPenaltyPolicy() const
         {
             return greedy_outcome_graph_penalty_policy_;
         }
@@ -5541,15 +5576,31 @@ namespace
         {
             return device_moe_maintenance_count_;
         }
+        int deviceGenerationAdmissionCount() const
+        {
+            return device_generation_admission_count_;
+        }
+        int lastDeviceGenerationRequestCount() const
+        {
+            return last_device_generation_request_count_;
+        }
+        int lastDeviceGenerationMaxNewTokens() const
+        {
+            return last_device_generation_max_new_tokens_;
+        }
+        const std::vector<std::string> &deviceGenerationLifecycleEvents() const
+        {
+            return device_generation_lifecycle_events_;
+        }
 
     private:
         bool applyDeviceOwnedMTPPenaltyRowsMath(
             DeviceLogitsSource source,
             int row_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy)
+            const MTPRequestPenaltyPolicy &penalty_policy)
         {
-            if (row_count <= 0 || penalty_policy.enabled == 0)
-                return penalty_policy.enabled == 0;
+            if (row_count <= 0 || !penalty_policy.enabled())
+                return !penalty_policy.enabled();
 
             std::vector<float> *logits = nullptr;
             const bool verifier_rows =
@@ -5567,7 +5618,10 @@ namespace
             }
 
             const int prefix_begin =
-                penalty_policy.first_token_already_in_history != 0 ? 1 : 0;
+                mock_device_penalty_policy_
+                            .first_token_already_in_history != 0
+                    ? 1
+                    : 0;
             for (int row = 0; row < row_count; ++row)
             {
                 for (int token = 0; token < VOCAB_SIZE; ++token)
@@ -6131,6 +6185,8 @@ namespace
         int forward_call_count_{0};
         int forward_grouped_mtp_verifier_with_device_token_ids_count_{0};
         int prepare_mtp_verifier_input_tokens_on_device_count_{0};
+        int prepare_mtp_verifier_input_tokens_host_first_count_{0};
+        int prepare_mtp_verifier_input_token_batch_on_device_count_{0};
         int forward_mtp_count_{0};
         int forward_mtp_from_last_draft_count_{0};
         int forward_mtp_for_device_sampling_count_{0};
@@ -6219,6 +6275,9 @@ namespace
         int forward_mtp_from_resident_logical_state_for_device_sampling_count_{0};
         int resident_sidecar_count_at_last_host_bridge_{-1};
         int device_moe_maintenance_count_{0};
+        int device_generation_admission_count_{0};
+        int last_device_generation_request_count_{0};
+        int last_device_generation_max_new_tokens_{0};
         int all_position_verifier_sync_deferral_set_count_{0};
         int all_position_verifier_sync_deferral_enable_count_{0};
         int all_position_verifier_sync_deferral_disable_count_{0};
@@ -6338,6 +6397,7 @@ namespace
         std::vector<std::vector<float>> last_request_batch_outcome_sample_thresholds_;
         std::vector<std::string> publication_events_;
         std::vector<std::string> execution_events_;
+        std::vector<std::string> device_generation_lifecycle_events_;
         std::vector<std::pair<int, int>> forced_request_batch_rejections_;
         std::vector<int> verifier_accepted_prefix_script_;
         std::vector<int> verifier_reject_token_script_;
@@ -6369,7 +6429,9 @@ namespace
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxStopTokens>
             request_stop_tokens_{};
-        MTPGreedyPenaltyPolicy greedy_outcome_graph_penalty_policy_{};
+        MTPRequestPenaltyPolicy greedy_outcome_graph_penalty_policy_{};
+        MTPRequestPenaltyPolicy request_penalty_policy_{};
+        MTPGreedyPenaltyPolicy mock_device_penalty_policy_{};
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxOutputTokens *
                        kMockResidentOutcomeRequestCapacity>
@@ -6949,9 +7011,7 @@ namespace
             row.first_token =
                 MockInferenceRunner::PREFILL_ARGMAX_TOKEN + request;
             row.first_token_from_device = true;
-            row.first_token_logical_state = rank_mailbox;
-            row.first_token_request_index = request;
-            row.first_target_sample_slot = -1;
+            row.first_target_sample_slot = request;
             row.first_draft_slot = request * 2;
             row.draft_token_count = 2;
             row.total_verifier_input_tokens = 3;
@@ -6962,7 +7022,7 @@ namespace
                 /*request_count=*/2,
                 /*padded_seq_len=*/3),
             nullptr)
-            << "The rank must translate its opaque aggregate identity into each child's real device mailbox.";
+            << "The rank must preserve participant-local canonical target-slot geometry.";
 
         for (MockInferenceRunner *child : {harness.child0, harness.child1})
         {
@@ -9787,11 +9847,7 @@ namespace
             EXPECT_FLOAT_EQ(
                 mock->greedyOutcomeGraphPenaltyPolicy().frequency_penalty,
                 sampling.frequency_penalty);
-            EXPECT_EQ(mock->greedyOutcomeGraphPenaltyPolicy().enabled, 1);
-            EXPECT_EQ(
-                mock->greedyOutcomeGraphPenaltyPolicy()
-                    .first_token_already_in_history,
-                0);
+            EXPECT_TRUE(mock->greedyOutcomeGraphPenaltyPolicy().enabled());
             EXPECT_EQ(
                 mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
                 1)
@@ -9891,7 +9947,8 @@ namespace
             EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1)
                 << "The all-position verifier should consume the same "
                    "device-resident draft slots produced by sidecar sampling.";
-            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
             EXPECT_EQ(mock->lastPrepareMTPVerifierFirstDraftSlot(), 0);
             EXPECT_EQ(mock->lastPrepareMTPVerifierDraftTokenCount(), 2);
             EXPECT_EQ(mock->lastPrepareMTPVerifierTotalTokens(), 3);
@@ -9999,7 +10056,8 @@ namespace
             EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 2);
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
-            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
             EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
@@ -10992,8 +11050,7 @@ namespace
             EXPECT_EQ(publication_request.request_count, 1);
             EXPECT_EQ(publication_request.max_draft_tokens, 2);
             EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
-            EXPECT_TRUE(publication_request.commit_penalty_history);
-            EXPECT_EQ(publication_request.penalty_policy.enabled, 1);
+            EXPECT_TRUE(publication_request.penalty_policy.enabled());
             EXPECT_EQ(mock->deviceGeneratedTokenCount(
                           MockInferenceRunner::PREFILL_ARGMAX_TOKEN),
                       1);
@@ -11344,7 +11401,8 @@ namespace
         EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 1);
         EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
             << "The grouped sidecar must consume the device target slot, not a host token.";
-        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
         EXPECT_EQ(mock->lastPrepareMTPVerifierFirstDraftSlot(), 0);
         EXPECT_EQ(mock->lastPrepareMTPVerifierDraftTokenCount(), 1);
         EXPECT_EQ(mock->lastPrepareMTPVerifierTotalTokens(), 2);
@@ -11389,6 +11447,97 @@ namespace
                        {"resident_state_kind", "device_publication_mailbox"},
                        {"prelaunch_timing", "pre_bridge"}}),
                   nullptr);
+
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Reuse a published ready token through the canonical target slot.
+     *
+     * The first transaction samples row zero into target slot zero. Its compact
+     * outcome then publishes the next ready token into both the logical-state
+     * mailbox and canonical target slot zero. The second transaction is the
+     * lifecycle boundary that the CUDAx2 long-context E2E exposed: its grouped
+     * verifier must consume the stable target-slot address through the typed
+     * RB=1 descriptor, never a host scalar or transaction-varying mailbox row.
+     */
+    TEST_F(
+        Test__PrefillDecodeTransition,
+        GroupedOutcomeSecondTransactionConsumesReadyTokenFromCanonicalTargetSlot)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_outcome_resident_ready_token_unit.json";
+        ScopedEnv enable(
+            "LLAMINAR_PERF_STATS_JSON",
+            export_path.string().c_str());
+        PerfStatsCollector::reset();
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult first = runner->decodeStep();
+        ASSERT_TRUE(first.success()) << first.error;
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostFirstCount(), 0);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostRowCount(), 0);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
+
+        GenerationResult second = runner->decodeStep();
+        ASSERT_TRUE(second.success()) << second.error;
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 2)
+            << "Both transactions must use the same canonical target-slot batch API.";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostFirstCount(), 0)
+            << "A host response shadow must never become verifier row zero.";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostRowCount(), 0);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0)
+            << "The legacy scalar target-slot composer is retired from production runner wiring.";
+        EXPECT_THAT(
+            mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+            ElementsAre(true));
+        EXPECT_GE(
+            mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+            1)
+            << "The next sidecar and verifier must share the published logical-state mailbox.";
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_NE(
+            findPerfRecordWithTags(
+                records,
+                PerfStatRecord::Kind::Counter,
+                "grouped_verifier_first_token_device_sources",
+                {{"source", "canonical_target_slot"},
+                 {"consumer", "grouped_stochastic_verifier"}}),
+            nullptr);
 
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -12317,7 +12466,8 @@ namespace
             EXPECT_EQ(mock->forwardGroupedMTPVerifierWithDeviceTokenIdsCount(), 1)
                 << "the verifier embedding graph should consume the prepared "
                    "device token row while host tokens remain a metadata shadow";
-            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
             EXPECT_EQ(mock->lastPrepareMTPVerifierFirstDraftSlot(), 0);
             EXPECT_EQ(mock->lastPrepareMTPVerifierDraftTokenCount(), 2);
             EXPECT_EQ(mock->lastPrepareMTPVerifierTotalTokens(), 3);
@@ -12602,8 +12752,7 @@ namespace
             EXPECT_EQ(publication_request.request_count, 1);
             EXPECT_EQ(publication_request.max_draft_tokens, 2);
             EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
-            EXPECT_TRUE(publication_request.commit_penalty_history);
-            EXPECT_EQ(publication_request.penalty_policy.enabled, 1);
+            EXPECT_TRUE(publication_request.penalty_policy.enabled());
             EXPECT_FLOAT_EQ(publication_request.penalty_policy.presence_penalty,
                             sampling.presence_penalty);
             EXPECT_FLOAT_EQ(publication_request.penalty_policy.frequency_penalty,
@@ -13518,7 +13667,9 @@ namespace
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
+        runner->setDecodeStepTokenBudget(32);
         GenerationResult step1 = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
         ASSERT_TRUE(step1.success()) << step1.error;
         EXPECT_THAT(step1.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
@@ -13549,6 +13700,11 @@ namespace
             mock->capturedStochasticVerifierTargetDistributionCount(),
             1);
         EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 1);
+        EXPECT_EQ(mock->lastDeviceGenerationRequestCount(), 1);
+        EXPECT_EQ(mock->lastDeviceGenerationMaxNewTokens(), 32);
+        EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
+                    ElementsAre("admission", "resident_verifier"));
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
@@ -14375,11 +14531,6 @@ namespace
                     ->greedyOutcomeGraphPenaltyPolicy()
                     .presence_penalty,
                 1.0f);
-            EXPECT_EQ(
-                harness.child0
-                    ->greedyOutcomeGraphPenaltyPolicy()
-                    .first_token_already_in_history,
-                0);
             EXPECT_EQ(harness.child0->applyAllPositionPenaltiesCount(), 0);
             EXPECT_EQ(harness.child1->applyAllPositionPenaltiesCount(), 0);
             EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 1);
@@ -15377,8 +15528,9 @@ namespace
             EXPECT_EQ(child->residentConditionTokenTargetPublicationCount(), 1);
             EXPECT_EQ(child->residentLogicalStateShiftedCommitCount(), 1);
             EXPECT_EQ(child->deviceTargetShiftedCommitCount(), 0);
-            EXPECT_EQ(child->prepareMTPVerifierInputTokensDeviceFirstCount(), 1)
+            EXPECT_EQ(child->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1)
                 << "Only grouped verification uses verifier token staging.";
+            EXPECT_EQ(child->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
             EXPECT_EQ(child->forwardGroupedMTPVerifierWithDeviceTokenIdsCount(), 1)
                 << "Only grouped verification uses the generic device-token forward.";
             EXPECT_EQ(child->targetSampleMainConditionAdvanceCount(), 1)

@@ -743,7 +743,8 @@ namespace llaminar2
                         ? params_.layer_idx
                         : params_.device_rebalance_apply_layer_idx,
                     params_.device_rebalance_command_buffer_count,
-                    params_.absolute_position_ids_device);
+                    params_.absolute_position_ids_device,
+                    params_.routed_row_execution_policy);
             }
             else
             {
@@ -761,7 +762,8 @@ namespace llaminar2
                     params_.output_weights,
                     /*write_legacy_outputs=*/true,
                     /*update_runtime_histogram=*/true,
-                    params_.absolute_position_ids_device);
+                    params_.absolute_position_ids_device,
+                    params_.routed_row_execution_policy);
             }
 
             if (!routed)
@@ -983,6 +985,9 @@ namespace llaminar2
             << " d_model=" << params_.d_model
             << " num_experts=" << params_.num_experts
             << " top_k=" << params_.top_k
+            << " row_execution_policy="
+            << routedExpertRowExecutionPolicyToString(
+                   params_.routed_row_execution_policy)
             << " force_grouped_verifier="
             << (params_.force_grouped_verifier_prefill_for_decode ? "true" : "false")
             << " force_decode_equivalent="

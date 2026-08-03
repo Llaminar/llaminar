@@ -2506,9 +2506,10 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRe
         source.substr(build_input_pos, pp_mode_pos - build_input_pos);
 
     const auto position_offset_pos =
-        build_input_body.find("input.position_offset = state_.positions[0]");
+        build_input_body.find(
+            "input.position_offset = live_request_batch_condition");
     const auto token_offset_pos =
-        build_input_body.find("input.token_offset = state_.positions[0]");
+        build_input_body.find("input.token_offset = input.position_offset");
 
     ASSERT_NE(position_offset_pos, std::string::npos)
         << "The runner-owned logical cursor must remain visible to RoPE/decode.";

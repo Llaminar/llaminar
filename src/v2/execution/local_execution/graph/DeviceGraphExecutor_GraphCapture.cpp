@@ -880,8 +880,9 @@ namespace llaminar2
          *
          * Re-enter Phase 1 explicitly. This is the ordinary capture lifecycle,
          * not eager recovery after a failed graph launch: the old executable is
-         * retired before any work is submitted under the new topology, warmup
-         * finalizes the new manifest, and the next invocation captures it.
+         * retired before any work is submitted under the new topology. One
+         * initialization transaction warms the new manifest and materializes its
+         * replacement executable before returning to the caller.
          */
         if (segment_cache.snapshot_configuration_epoch !=
             snapshot_configuration_epoch_)
@@ -1213,10 +1214,13 @@ namespace llaminar2
             return true;
         }
 
-        // ===== Phase 1: Warmup (first call) — build segments, execute normally =====
-        // We do NOT capture on the first call. Some kernels lazily initialize workspace
-        // buffers (hipMalloc), which isn't compatible with stream capture.
-        // First call builds the segment list and runs via executeFastDecode.
+        // ===== Phase 1: Warmup + replay materialization (first call) =====
+        // Warmup executes the logical transaction exactly once and initializes
+        // stage-owned launch metadata. The same initialization transaction then
+        // records and instantiates the future replay graph without launching it.
+        // Consequently a successful first call always leaves a replay-ready cache;
+        // there is no second-invocation window in which a parent graph can observe
+        // initialized-but-uncaptured state.
         //
         // CRITICAL: Run warmup on the CAPTURE stream (not default stream). CK and
         // ROCm kernel dispatch may cache per-stream state (dispatch tables, workspace
@@ -1321,49 +1325,77 @@ namespace llaminar2
                 }
             }
 
-            // Warmup executes all stages normally (no capture) to ensure lazy
-            // kernel initialization and workspace allocation complete on the
-            // capture stream.  Preserve the capture-stream assignment above:
+            // Warmup executes all stages normally (no capture) to ensure launch
+            // metadata and prebound workspace state are complete on the capture
+            // stream. Preserve the capture-stream assignment above:
             // the generic fast-decode entry point intentionally rebinds eager
             // eager passes to the worker stream to avoid stale stream
             // ownership of live device state.
             auto warmup_policy = StageRunPolicy::fastDecode();
             warmup_policy.preserve_gpu_streams = true;
-            return runStages(
-                graph,
-                ctx,
-                warmup_policy,
-                collective_nodes,
-                &segment_cache.snapshot_manifest);
-        }
-
-        // ===== Phase 2: Capture (second call) — record capturable segments =====
-        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Capture)
-        {
-            const auto capture_result = DeviceGraphCaptureController::executeCapturePhase(
-                graph,
-                segment_cache,
-                ctx,
-                gpu_ctx,
-                has_collective_nodes,
-                current_step,
-                capture_hooks);
-
-            if (capture_result.reset_cache)
-            {
-                segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
-            }
-
-            if (!capture_result.success)
+            if (!runStages(
+                    graph,
+                    ctx,
+                    warmup_policy,
+                    collective_nodes,
+                    &segment_cache.snapshot_manifest))
             {
                 return false;
             }
 
+            /*
+             * Recording a native graph does not execute its captured kernels.
+             * Materialize immediately after warmup, but explicitly suppress the
+             * capture finalizer's launch/manual-execution semantics. This keeps
+             * the user-visible transaction byte-for-byte identical to the single
+             * warmup execution while making the cache composable before control
+             * returns to its caller.
+             */
+            graph.reset();
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_graph_phase",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"context", segment_cache.perf_context},
+                 {"phase", DeviceGraphCaptureController::phaseName(
+                               DeviceGraphCaptureController::Phase::Capture)},
+                 {"initialization_transaction", "warmup_then_materialize"}});
+            const auto capture_result =
+                DeviceGraphCaptureController::executeCapturePhase(
+                    graph,
+                    segment_cache,
+                    ctx,
+                    gpu_ctx,
+                    has_collective_nodes,
+                    current_step,
+                    capture_hooks,
+                    DeviceGraphCaptureController::CapturePublicationPolicy::
+                        MaterializeOnly);
+            if (capture_result.reset_cache)
+            {
+                segment_cache.reset(
+                    GraphSegmentCache::StreamResetPolicy::Preserve);
+            }
+            if (!capture_result.success)
+            {
+                return false;
+            }
+            segment_cache.needs_capture = false;
             return true;
         }
 
-        // Phase 3 is handled by the fast path above; this point is unreachable
-        // after Phase 1 and Phase 2 both early-return.
+        // ===== Invalid externally visible capture state =====
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Capture)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] GPU graph cache exposed a partial "
+                "warmup-without-capture state; first-use materialization is atomic");
+            return false;
+        }
+
+        // Replay is handled by the fast path above; this point is unreachable.
         LOG_ERROR("[DeviceGraphExecutor] Unexpected phase in GPU graph capture/replay");
         return false;
     }

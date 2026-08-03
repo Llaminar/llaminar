@@ -274,8 +274,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip", "rocmGDN_deinterleave_qkv", "raw_stream", 1),
         ("src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip", "rocmGDN_recurrent_step", "raw_stream", 1),
         ("src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip", "rocmGDN_recurrent_step_effective_row", "raw_stream", 1),
-        ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp", "ROCmRingKVCacheBase::publishSequenceStateFromDeviceMetadata", "raw_stream", 1),
-        ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheBase.cpp", "CUDARingKVCacheBase::publishSequenceStateFromDeviceMetadata", "raw_stream", 1),
         ("src/v2/kernels/rocm/ops/ROCmEmbeddingKernelT.cpp", "ROCmEmbeddingKernelT::apply_tensor", "raw_stream", 4),
     ),
     *reviewed(

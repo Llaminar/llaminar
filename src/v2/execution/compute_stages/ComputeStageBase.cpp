@@ -217,6 +217,8 @@ namespace llaminar2
             return "MTP_CONCAT";
         case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
             return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MTP_VERIFIER_PREPARATION:
+            return "MTP_VERIFIER_PREPARATION";
         case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:
             return "MTP_STOCHASTIC_TARGET_DISTRIBUTION";
         case ComputeStageType::MTP_VERIFIER_OUTCOME:

@@ -1818,7 +1818,7 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_EQ(
         builder.resolveLMHeadDeviceRowIndexSource(
             /*has_request_sequence_lengths=*/true),
-        RowSource::ExternalDeviceIndices)
+        RowSource::WorkspaceBoundDeviceIndices)
         << "A live request-length arena must not reinterpret explicit grouped-verifier query rows as request terminals.";
 
     ASSERT_TRUE(builder.setRowIndexedAllPositionLogitRows({}));
@@ -1829,7 +1829,7 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_EQ(
         builder.resolveLMHeadDeviceRowIndexSource(
             /*has_request_sequence_lengths=*/false),
-        RowSource::ExternalDeviceIndices);
+        RowSource::WorkspaceBoundDeviceIndices);
 }
 
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
@@ -3580,7 +3580,7 @@ TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestS
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse)
+TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainExecutionAcrossBuildAndReuse)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -3619,16 +3619,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
     ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{
-            {"context", "mtp_decode_sidecar"},
-            {"depth", "0"},
-            {"device_tokens", "false"},
-            {"graph_context", "mtp_decode_sidecar"},
-            {"kv_cache_only", "false"},
-            {"path", "plain_after_build"},
-            {"seq_len", "1"}};
-    const auto plain_reuse_tags =
+    const auto plain_tags =
         PerfStatsCollector::Tags{
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
@@ -3649,21 +3640,13 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
     const auto dense_collective_scan_tags =
         PerfStatsCollector::Tags{{"depth", "0"}, {"has_collectives", "false"}, {"node_count", "0"}, {"seq_len", "1"}};
 
-    const PerfStatRecord *plain_after_build = findMTPRecord(
+    const PerfStatRecord *plain = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_capture_path",
-        plain_after_build_tags);
-    ASSERT_NE(plain_after_build, nullptr);
-    EXPECT_DOUBLE_EQ(plain_after_build->value, 1.0);
-
-    const PerfStatRecord *plain_reuse = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_graph_capture_path",
-        plain_reuse_tags);
-    ASSERT_NE(plain_reuse, nullptr);
-    EXPECT_DOUBLE_EQ(plain_reuse->value, 1.0);
+        plain_tags);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_DOUBLE_EQ(plain->value, 2.0);
 
     const PerfStatRecord *cache_misses = findMTPRecord(
         records,
@@ -3744,16 +3727,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
-    const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{
-            {"context", "mtp_decode_sidecar"},
-            {"depth", "0"},
-            {"device_tokens", "false"},
-            {"graph_context", "mtp_decode_sidecar"},
-            {"kv_cache_only", "false"},
-            {"path", "plain_after_build"},
-            {"seq_len", "1"}};
-    const auto plain_reuse_tags =
+    const auto plain_tags =
         PerfStatsCollector::Tags{
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
@@ -3779,21 +3753,13 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     ASSERT_NE(cache_hits, nullptr);
     EXPECT_DOUBLE_EQ(cache_hits->value, 1.0);
 
-    const PerfStatRecord *plain_after_build = findMTPRecord(
+    const PerfStatRecord *plain = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_capture_path",
-        plain_after_build_tags);
-    ASSERT_NE(plain_after_build, nullptr);
-    EXPECT_DOUBLE_EQ(plain_after_build->value, 1.0);
-
-    const PerfStatRecord *plain_reuse = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_graph_capture_path",
-        plain_reuse_tags);
-    ASSERT_NE(plain_reuse, nullptr);
-    EXPECT_DOUBLE_EQ(plain_reuse->value, 1.0);
+        plain_tags);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_DOUBLE_EQ(plain->value, 2.0);
 
     PerfStatsCollector::reset();
 }
@@ -4006,7 +3972,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphReplay)
+TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGraphFromFirstInvocation)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -4064,14 +4030,6 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
     EXPECT_GT(abs_sum, 0.0f);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto plain_tags = PerfStatsCollector::Tags{
-        {"context", "mtp_decode_sidecar"},
-        {"depth", "0"},
-        {"device_tokens", "false"},
-        {"graph_context", "mtp_decode_sidecar"},
-        {"kv_cache_only", "false"},
-        {"path", "plain_after_build"},
-        {"seq_len", "1"}};
     const auto full_graph_tags = PerfStatsCollector::Tags{
         {"context", "mtp_decode_sidecar"},
         {"depth", "0"},
@@ -4081,21 +4039,13 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
         {"path", "full_graph"},
         {"seq_len", "1"}};
 
-    const PerfStatRecord *plain_path = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_graph_capture_path",
-        plain_tags);
-    ASSERT_NE(plain_path, nullptr);
-    EXPECT_DOUBLE_EQ(plain_path->value, 1.0);
-
     const PerfStatRecord *full_graph_path = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_capture_path",
         full_graph_tags);
     ASSERT_NE(full_graph_path, nullptr);
-    EXPECT_GE(full_graph_path->value, 3.0);
+    EXPECT_GE(full_graph_path->value, 4.0);
 
     const auto policy_tags = PerfStatsCollector::Tags{
         {"allow_graph_replay", "true"},
@@ -4210,36 +4160,21 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
             {"seq_len", "1"}};
     };
 
-    const auto host_plain_tags = capture_tags("mtp_decode_sidecar", "false", "plain_after_build");
     const auto host_full_graph_tags = capture_tags("mtp_decode_sidecar", "false", "full_graph");
-    const auto device_plain_tags = capture_tags(
-        "mtp_decode_sidecar_device_target_token_live_position",
-        "true",
-        "plain_after_build");
     const auto device_full_graph_tags = capture_tags(
         "mtp_decode_sidecar_device_target_token_live_position",
         "true",
         "full_graph");
 
-    const PerfStatRecord *host_plain = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_plain_tags);
-    ASSERT_NE(host_plain, nullptr);
-    EXPECT_DOUBLE_EQ(host_plain->value, 1.0);
-
     const PerfStatRecord *host_full_graph = findMTPRecord(
         records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_full_graph_tags);
     ASSERT_NE(host_full_graph, nullptr);
-    EXPECT_GE(host_full_graph->value, 3.0);
-
-    const PerfStatRecord *device_plain = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_plain_tags);
-    ASSERT_NE(device_plain, nullptr);
-    EXPECT_DOUBLE_EQ(device_plain->value, 1.0);
+    EXPECT_GE(host_full_graph->value, 4.0);
 
     const PerfStatRecord *device_full_graph = findMTPRecord(
         records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_full_graph_tags);
     ASSERT_NE(device_full_graph, nullptr);
-    EXPECT_GE(device_full_graph->value, 3.0);
+    EXPECT_GE(device_full_graph->value, 4.0);
 
     const PerfStatRecord *host_misses = findMTPRecord(
         records,
@@ -4258,50 +4193,6 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
             "true"));
     ASSERT_NE(device_misses, nullptr);
     EXPECT_DOUBLE_EQ(device_misses->value, 1.0);
-
-    auto plain_handoff_tags = [](const char *context)
-    {
-        return PerfStatsCollector::Tags{
-            {"context", context},
-            {"seq_len", "1"}};
-    };
-    auto explicit_completion_tags = [](const char *context)
-    {
-        return PerfStatsCollector::Tags{
-            {"context", context},
-            {"kv_cache_only", "false"},
-            {"path", "plain"},
-            {"seq_len", "1"}};
-    };
-
-    const PerfStatRecord *host_plain_handoff = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_plain_stream_handoffs",
-        plain_handoff_tags("mtp_decode_sidecar"));
-    ASSERT_NE(host_plain_handoff, nullptr);
-    EXPECT_DOUBLE_EQ(host_plain_handoff->value, 1.0);
-
-    const PerfStatRecord *device_plain_handoff = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_plain_stream_handoffs",
-        plain_handoff_tags("mtp_decode_sidecar_device_target_token"));
-    ASSERT_NE(device_plain_handoff, nullptr);
-    EXPECT_DOUBLE_EQ(device_plain_handoff->value, 1.0);
-
-    EXPECT_EQ(findMTPRecord(
-                  records,
-                  PerfStatRecord::Kind::Counter,
-                  "sidecar_explicit_stream_completions",
-                  explicit_completion_tags("mtp_decode_sidecar")),
-              nullptr);
-    EXPECT_EQ(findMTPRecord(
-                  records,
-                  PerfStatRecord::Kind::Counter,
-                  "sidecar_explicit_stream_completions",
-                  explicit_completion_tags("mtp_decode_sidecar_device_target_token")),
-              nullptr);
 
     PerfStatsCollector::reset();
 }
@@ -5358,7 +5249,7 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
     }
 }
 
-TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState)
+TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEPlacementWithoutFabricatingReplayState)
 {
     DeviceManager::instance().initialize(-1, false);
     ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
@@ -5387,34 +5278,25 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
     EXPECT_EQ(after_restore.last_live_state_mutation_operation, "restore_logical_checkpoint");
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto preserve_tags = PerfStatsCollector::Tags{
+    const auto reset_tags = PerfStatsCollector::Tags{
         {"model", "moe"},
         {"moe_placement_epoch", "0"},
         {"operation", "restore_logical_checkpoint"},
         {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
-        {"replay_state", "preserved"},
-        {"sidecar_replay_state", "preserved"}};
+        {"replay_state", "not_initialized"},
+        {"sidecar_replay_state", "not_initialized"}};
     EXPECT_DOUBLE_EQ(
         sumMTPRecordValuesContaining(
             records,
             PerfStatRecord::Kind::Counter,
             "live_prefix_replay_state_after_mutation",
-            preserve_tags),
+            reset_tags),
         1.0);
     const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
     EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", legacy_reset_tags),
-              nullptr);
-    const auto structured_reset_tags = PerfStatsCollector::Tags{
-        {"model", "moe"},
-        {"moe_placement_epoch", "0"},
-        {"operation", "restore_logical_checkpoint"},
-        {"kernel_dynamic_state", "reset"},
-        {"replay_state", "reset"},
-        {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }

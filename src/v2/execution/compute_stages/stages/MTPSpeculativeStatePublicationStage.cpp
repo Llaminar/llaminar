@@ -48,7 +48,8 @@ namespace llaminar2
             !params_.publication_ok_flags_device ||
             !params_.next_condition_tokens_device ||
             !params_.all_drafts_accepted_flags_device ||
-            !params_.stopped_flags_device)
+            !params_.stopped_flags_device ||
+            !params_.next_verifier_condition_tokens_device)
         {
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Incomplete compact-outcome or publication metadata binding");
             return false;
@@ -70,9 +71,11 @@ namespace llaminar2
             (!params_.generation_response_tokens_device ||
              params_.generation_response_token_stride <= 0 ||
              !params_.generation_control_device ||
-             params_.generation_control_stride <= 0))
+             params_.generation_control_stride <= 0 ||
+             !params_.next_sidecar_condition_tokens_device ||
+             !params_.next_sidecar_position_ids_device))
         {
-            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Controller-owned publication has no persistent response ledger");
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Controller-owned publication has no persistent response ledger or next-sidecar mailbox");
             return false;
         }
         if (params_.publish_shifted_kv &&
@@ -90,9 +93,8 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Shifted-KV publication has incomplete persistent bindings");
             return false;
         }
-        if (params_.commit_penalty_history &&
-            (params_.request_count != 1 ||
-             !params_.penalty_policy_device ||
+        if (params_.request_count == 1 &&
+            (!params_.penalty_policy_device ||
              !params_.generated_token_counts_device ||
              params_.vocab_size <= 0))
         {
@@ -243,20 +245,23 @@ namespace llaminar2
     bool MTPSpeculativeStatePublicationStage::publishPenaltyHistory(
         void *stream) const
     {
-        if (!params_.commit_penalty_history)
+        /*
+         * Request-batched publication has no shared token-history owner. Its
+         * geometry is already a distinct capture identity. Every canonical
+         * single-request graph, however, contains this node regardless of
+         * whether penalties are enabled. The resident policy makes disabled
+         * publication a deterministic device no-op and keeps policy values out
+         * of graph topology.
+         */
+        if (params_.request_count != 1)
             return true;
 
-        if (!params_.backend->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
-                params_.penalty_policy_device,
-                params_.presence_penalty,
-                params_.frequency_penalty,
-                params_.first_token_already_in_history,
-                params_.device_id.gpu_ordinal(),
-                stream) ||
-            !params_.backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
+        if (!params_.backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
                 params_.outcome_tokens_device,
                 params_.outcome_meta_device,
                 params_.penalty_policy_device,
+                params_.accepted_state_counts_device,
+                params_.stopped_flags_device,
                 params_.outcome_token_stride,
                 params_.vocab_size,
                 params_.generated_token_counts_device,
@@ -350,7 +355,10 @@ namespace llaminar2
                           params_.publication_ok_flags_device,
                           params_.next_condition_tokens_device,
                           params_.all_drafts_accepted_flags_device,
-                          params_.stopped_flags_device)
+                          params_.stopped_flags_device,
+                          params_.next_sidecar_condition_tokens_device,
+                          params_.next_sidecar_position_ids_device,
+                          params_.next_verifier_condition_tokens_device)
                 : params_.backend
                       ->enqueueDeriveSpeculativePublicationMetadata(
                           params_.outcome_meta_device,
@@ -369,7 +377,8 @@ namespace llaminar2
                           params_.outcome_tokens_device,
                           params_.outcome_token_stride,
                           params_.all_drafts_accepted_flags_device,
-                          params_.stopped_flags_device);
+                          params_.stopped_flags_device,
+                          params_.next_verifier_condition_tokens_device);
         if (!metadata_enqueued)
         {
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Response/state metadata transaction failed to enqueue");
@@ -440,9 +449,6 @@ namespace llaminar2
         info.addScalarBool(
             "publish_shifted_kv",
             params_.publish_shifted_kv);
-        info.addScalarBool(
-            "commit_penalty_history",
-            params_.commit_penalty_history);
         return info;
     }
 
@@ -456,6 +462,9 @@ namespace llaminar2
         contract.addInOut(
             BufferId::STOCHASTIC_BATCH_OUTPUT_META,
             "INT32");
+        contract.addPreallocatedInOut(
+            BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,
+            "INT32");
         if (params_.generation_controller_owned)
         {
             contract.addPreallocatedInOut(
@@ -464,8 +473,14 @@ namespace llaminar2
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_CONTROL,
                 "INT32");
+            contract.addPreallocatedInOut(
+                BufferId::MTP_CONDITION_TOKEN,
+                "INT32");
+            contract.addPreallocatedInOut(
+                BufferId::MTP_POSITION_IDS,
+                "INT32");
         }
-        if (params_.commit_penalty_history)
+        if (params_.request_count == 1)
         {
             contract.addPreallocatedInOut(
                 BufferId::MTP_GREEDY_PENALTY_POLICY,
@@ -503,6 +518,12 @@ namespace llaminar2
                self.all_drafts_accepted_flags_device ==
                    other.all_drafts_accepted_flags_device &&
                self.stopped_flags_device == other.stopped_flags_device &&
+               self.next_verifier_condition_tokens_device ==
+                   other.next_verifier_condition_tokens_device &&
+               self.next_sidecar_condition_tokens_device ==
+                   other.next_sidecar_condition_tokens_device &&
+               self.next_sidecar_position_ids_device ==
+                   other.next_sidecar_position_ids_device &&
                self.generation_controller_owned ==
                    other.generation_controller_owned &&
                self.generation_response_tokens_device ==
@@ -526,16 +547,10 @@ namespace llaminar2
                    other.shifted_target_cached_tokens_device &&
                self.shifted_accepted_state_counts_device ==
                    other.shifted_accepted_state_counts_device &&
-               self.commit_penalty_history ==
-                   other.commit_penalty_history &&
                self.penalty_policy_device == other.penalty_policy_device &&
                self.generated_token_counts_device ==
                    other.generated_token_counts_device &&
                self.vocab_size == other.vocab_size &&
-               self.presence_penalty == other.presence_penalty &&
-               self.frequency_penalty == other.frequency_penalty &&
-               self.first_token_already_in_history ==
-                   other.first_token_already_in_history &&
                self.verifier_state_stages ==
                    other.verifier_state_stages &&
                self.require_captured_verifier_state ==

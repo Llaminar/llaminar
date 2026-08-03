@@ -40,6 +40,272 @@ namespace llaminar2::sampling_math
     constexpr uint64_t kMTPSpecDrawPurposesPerToken = 8;
 
     /**
+     * @brief ABI version for the retained first-transaction MTP diagnostic.
+     *
+     * The record is copied byte-for-byte from device storage only after a
+     * mirrored participant mismatch has already made inference fatal. Keeping
+     * an explicit version in the payload prevents a stale host formatter from
+     * silently interpreting a changed device layout.
+     */
+    constexpr uint32_t kMTPFirstTransactionDiagnosticVersion = 2;
+
+    /**
+     * @brief Ordered MTP-sidecar boundaries retained for transaction zero.
+     *
+     * The proposal graph reuses one activation workspace for every draft and
+     * every device-controlled transaction.  A terminal failure therefore sees
+     * only the last sidecar that happened to execute.  These stable boundary
+     * identifiers let the captured draft-publication stage preserve a compact
+     * digest immediately after each sidecar, before the shared workspace is
+     * overwritten by the next proposal.
+     */
+    enum class MTPFirstTransactionDraftBoundary : int32_t
+    {
+        TerminalHiddenInput = 0,
+        Embedding,
+        NormalizedTerminalHidden,
+        NormalizedEmbedding,
+        ConcatenatedInput,
+        ProjectedInput,
+        AttentionQuery,
+        AttentionKey,
+        AttentionValue,
+        AttentionOutput,
+        AttentionProjection,
+        MoEExpertIndices,
+        MoEExpertWeights,
+        MoERoutedOutput,
+        MoESharedOutput,
+        FFNOutput,
+        FinalHidden,
+        ScoredLogits,
+        Count,
+    };
+    constexpr int kMTPFirstTransactionDraftBoundaryCount =
+        static_cast<int>(MTPFirstTransactionDraftBoundary::Count);
+
+    /**
+     * @brief Device-resident evidence from the first stochastic MTP transaction.
+     *
+     * A device-controlled generation graph may execute several verifier
+     * transactions before its single terminal host observation. Ordinary
+     * scratch buffers therefore contain the final transaction, which is too
+     * late to diagnose a participant divergence that happened in transaction
+     * zero. The fused serial-equivalent outcome kernel optionally records this
+     * fixed-size payload before publication advances the device controller.
+     *
+     * The payload deliberately retains hashes rather than complete Top-K rows.
+     * Each hash covers the exact token-id and FP32 probability bits in canonical
+     * scan order. Together with the seed, logical position, thresholds, sampled
+     * tokens, verifier inputs, and compact result, this distinguishes four
+     * boundaries without perturbing the production graph topology:
+     *
+     *  - unequal target-distribution hashes identify grouped-forward drift;
+     *  - equal hashes with unequal thresholds identify RNG-position drift;
+     *  - equal hashes/thresholds with unequal samples identify kernel drift;
+     *  - equal samples with unequal compact results identify reducer drift.
+     *
+     * No pointer is stored in the record. It is a trivially copyable shared ABI
+     * consumed by CUDA, ROCm, and exceptional-path host diagnostics.
+     */
+    struct alignas(8) MTPFirstTransactionDiagnosticRecord
+    {
+        uint32_t valid = 0; ///< Written last by lane zero after the record is complete.
+        uint32_t version = kMTPFirstTransactionDiagnosticVersion;
+        uint64_t threshold_seed = 0;
+        int32_t threshold_base_position = -1;
+        int32_t threshold_position_offset = 0;
+        int32_t comparison_row_count = 0;
+        int32_t top_k = 0;
+        int32_t transaction_count = -1;
+        int32_t transaction_commit_budget = 0;
+        int32_t leading_committed_output_count = 0;
+        int32_t verifier_input_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t sampled_target_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t sampled_matches_verifier_input[kSpeculativeBatchMaxOutputTokens] = {};
+        uint32_t threshold_bits[kSpeculativeBatchMaxOutputTokens] = {};
+        uint64_t target_distribution_hashes[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t output_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t output_meta[kSpeculativeBatchMetaCount] = {};
+
+        /*
+         * Proposal-side evidence is written by the captured draft publication
+         * fragments before the verifier runs.  Each digest covers the exact
+         * 32-bit words of one current sidecar row.  The word count is retained
+         * beside the hash so absent model-specific boundaries cannot compare
+         * equal to a real zero-filled tensor by accident.
+         */
+        int32_t draft_diagnostic_depth = 0;
+        int32_t draft_condition_tokens[kSpeculativeBatchMaxRows] = {};
+        int32_t draft_position_ids[kSpeculativeBatchMaxRows] = {};
+        uint32_t
+            draft_boundary_word_counts[kSpeculativeBatchMaxRows]
+                                      [kMTPFirstTransactionDraftBoundaryCount] = {};
+        uint64_t
+            draft_boundary_hashes[kSpeculativeBatchMaxRows]
+                                  [kMTPFirstTransactionDraftBoundaryCount] = {};
+    };
+    static_assert(
+        sizeof(MTPFirstTransactionDiagnosticRecord) % sizeof(int32_t) == 0,
+        "The arena stores the first-transaction diagnostic as whole INT32 words");
+
+    /**
+     * @brief Return the exact IEEE-754 bit pattern used by sampling math.
+     *
+     * CUDA and HIP both support this scalar union representation in device
+     * code. Recording bits rather than formatting floats on-device preserves
+     * byte equality and leaves presentation to the fatal host diagnostic.
+     */
+    LLAMINAR_SAMPLING_HD uint32_t sampling_float_bits(float value)
+    {
+        union FloatBits
+        {
+            float fp32;
+            uint32_t bits;
+        } converted{};
+        converted.fp32 = value;
+        return converted.bits;
+    }
+
+    /**
+     * @brief Append one 32-bit word to a byte-ordered FNV-1a diagnostic hash.
+     */
+    LLAMINAR_SAMPLING_HD uint64_t append_diagnostic_u32_fnv1a(
+        uint64_t hash,
+        uint32_t value)
+    {
+        constexpr uint64_t kFNVPrime = 1099511628211ULL;
+        for (unsigned int byte = 0; byte < sizeof(value); ++byte)
+        {
+            hash ^= static_cast<uint8_t>(value >> (byte * 8U));
+            hash *= kFNVPrime;
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Hash one compact target row in its serial sampling scan order.
+     */
+    LLAMINAR_SAMPLING_HD uint64_t hash_compact_distribution_exact(
+        const int32_t *token_ids,
+        const float *probabilities,
+        int top_k)
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        for (int column = 0; column < top_k; ++column)
+        {
+            hash = append_diagnostic_u32_fnv1a(
+                hash,
+                static_cast<uint32_t>(token_ids[column]));
+            hash = append_diagnostic_u32_fnv1a(
+                hash,
+                sampling_float_bits(probabilities[column]));
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Populate one deterministic row of transaction-zero evidence.
+     *
+     * Every physical diagnostic row is initialized, including rows outside the
+     * active depth. This prevents stale bytes from an earlier request from
+     * creating a false mirrored mismatch when two participants previously ran
+     * different verifier depths.
+     */
+    LLAMINAR_SAMPLING_HD void record_mtp_first_transaction_sample_row(
+        MTPFirstTransactionDiagnosticRecord *record,
+        int row,
+        bool active,
+        const int32_t *target_token_ids,
+        const float *target_probabilities,
+        int top_k,
+        const int32_t *verifier_input_tokens,
+        int comparison_row_count,
+        float threshold,
+        int32_t sampled_token)
+    {
+        if (!record || row < 0 ||
+            row >= kSpeculativeBatchMaxOutputTokens)
+        {
+            return;
+        }
+
+        record->verifier_input_tokens[row] =
+            active && verifier_input_tokens
+                ? verifier_input_tokens[row]
+                : -1;
+        record->sampled_target_tokens[row] =
+            active ? sampled_token : -1;
+        record->sampled_matches_verifier_input[row] =
+            active && row < comparison_row_count && verifier_input_tokens
+                ? (sampled_token == verifier_input_tokens[row + 1] ? 1 : 0)
+                : -1;
+        record->threshold_bits[row] =
+            active ? sampling_float_bits(threshold) : 0u;
+        record->target_distribution_hashes[row] =
+            active && target_token_ids && target_probabilities
+                ? hash_compact_distribution_exact(
+                      target_token_ids,
+                      target_probabilities,
+                      top_k)
+                : 0ULL;
+    }
+
+    /**
+     * @brief Complete transaction-zero evidence after compact reduction.
+     *
+     * This function is called by lane zero only, after the workgroup barrier
+     * and after the ordinary serial-equivalent reducer has populated its output
+     * rows. `valid` is written last so an event-ordered observer can reject an
+     * incomplete or ABI-incompatible record without guessing.
+     */
+    LLAMINAR_SAMPLING_HD void finalize_mtp_first_transaction_diagnostic(
+        MTPFirstTransactionDiagnosticRecord *record,
+        uint64_t threshold_seed,
+        int threshold_base_position,
+        int threshold_position_offset,
+        int comparison_row_count,
+        int top_k,
+        int transaction_count,
+        int transaction_commit_budget,
+        int leading_committed_output_count,
+        const int32_t *output_tokens,
+        int output_token_capacity,
+        const int32_t *output_meta)
+    {
+        if (!record)
+            return;
+
+        record->valid = 0;
+        record->version = kMTPFirstTransactionDiagnosticVersion;
+        record->threshold_seed = threshold_seed;
+        record->threshold_base_position = threshold_base_position;
+        record->threshold_position_offset = threshold_position_offset;
+        record->comparison_row_count = comparison_row_count;
+        record->top_k = top_k;
+        record->transaction_count = transaction_count;
+        record->transaction_commit_budget = transaction_commit_budget;
+        record->leading_committed_output_count =
+            leading_committed_output_count;
+
+        for (int slot = 0;
+             slot < kSpeculativeBatchMaxOutputTokens;
+             ++slot)
+        {
+            record->output_tokens[slot] =
+                output_tokens && slot < output_token_capacity
+                    ? output_tokens[slot]
+                    : -1;
+        }
+        for (int field = 0; field < kSpeculativeBatchMetaCount; ++field)
+        {
+            record->output_meta[field] =
+                output_meta ? output_meta[field] : 0;
+        }
+        record->valid = 1;
+    }
+
+    /**
      * @brief Value-owned explicit thresholds captured with one GPU launch.
      *
      * Production seeded MTP derives these values from device-owned logical
@@ -121,7 +387,9 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlRejectedTransactionCount = 9,
         kDeviceGenerationControlConsumedVerifierRowCount = 10,
         kDeviceGenerationControlErrorCode = 11,
-        kDeviceGenerationControlCount = 12,
+        /** Total main-graph state rows committed across every transaction. */
+        kDeviceGenerationControlPublishedStateCommitCount = 12,
+        kDeviceGenerationControlCount = 13,
     };
 
     /**
@@ -412,6 +680,8 @@ namespace llaminar2::sampling_math
             rejected_transaction ? 1 : 0;
         control[kDeviceGenerationControlConsumedVerifierRowCount] +=
             consumed_rows;
+        control[kDeviceGenerationControlPublishedStateCommitCount] +=
+            verifier_state_count;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
         return true;

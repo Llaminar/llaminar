@@ -1809,6 +1809,22 @@ namespace llaminar2
                      << " comm=" << comm);
         }
 
+        /*
+         * HIP launch errors are thread-local and sticky.  Attribute producer
+         * and RCCL enqueue failures at this primitive instead of allowing the
+         * next unrelated kernel wrapper to consume and mislabel them.  This
+         * check is fail-fast only: no retry, synchronization, or alternate
+         * transport is permitted.
+         */
+        const hipError_t producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            last_error_ =
+                std::string("HIP producer launch state failed before rcclAllGather(on-stream): ") +
+                hipGetErrorString(producer_error);
+            return false;
+        }
+
         rccl::ncclResult_t r = rccl::ncclAllGather(
             send_buf,
             recv_buf,
@@ -1820,6 +1836,14 @@ namespace llaminar2
         {
             last_error_ = std::string("rcclAllGather(on-stream) failed: ") +
                           rccl::ncclGetErrorString(r);
+            return false;
+        }
+        const hipError_t collective_launch_error = hipGetLastError();
+        if (collective_launch_error != hipSuccess)
+        {
+            last_error_ =
+                std::string("HIP runtime rejected rcclAllGather(on-stream) enqueue: ") +
+                hipGetErrorString(collective_launch_error);
             return false;
         }
 

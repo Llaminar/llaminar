@@ -162,25 +162,6 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Each participant advances its own mirrored history immediately after
-         * producing the compact outcome. A single thread owns this short update,
-         * so repeated output tokens require no atomics or inter-device handoff.
-         */
-        if (!backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
-                params_.binding.output_tokens_device,
-                params_.binding.output_meta_device,
-                params_.binding.penalty_policy_device,
-                params_.binding.output_token_capacity,
-                params_.vocab_size,
-                params_.binding.generated_token_counts_device,
-                params_.device_id.gpu_ordinal(),
-                stream))
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] Device-owned generated-token history commit failed");
-            return false;
-        }
-
         PerfStatsCollector::addCounter(
             "mtp",
             "graph_owned_greedy_outcome_stage_enqueues",
@@ -238,7 +219,7 @@ namespace llaminar2
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
         contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
-        contract.addInOut(
+        contract.addInput(
             BufferId::MTP_GENERATED_TOKEN_COUNTS,
             "INT32");
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS);

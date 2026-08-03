@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "../execution/config/RoutedExpertPolicy.h"
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
 
@@ -311,6 +312,11 @@ namespace llaminar2
          * placement contains a replicated expert: the logical position is the
          * stable tie-break key that makes serial and grouped route partitions
          * independent of speculative workload history.
+         *
+         * `row_execution_policy` is mandatory because physical replication
+         * alone does not specify whether one participant or every participant
+         * executes a selected row. Fully replicated local routing must preserve
+         * every locally resident route and must never apply LLEP assignment.
          */
         virtual bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
@@ -320,7 +326,8 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             bool write_legacy_outputs,
             bool update_runtime_histogram,
-            const int32_t *absolute_position_ids_device = nullptr)
+            const int32_t *absolute_position_ids_device,
+            RoutedExpertRowExecutionPolicy row_execution_policy)
         {
             (void)runtime_layer;
             (void)hidden;
@@ -334,6 +341,7 @@ namespace llaminar2
             (void)write_legacy_outputs;
             (void)update_runtime_histogram;
             (void)absolute_position_ids_device;
+            (void)row_execution_policy;
             return false;
         }
 
@@ -360,7 +368,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
             int rebalance_target_layer,
             uint32_t rebalance_command_buffer_count,
-            const int32_t *absolute_position_ids_device = nullptr)
+            const int32_t *absolute_position_ids_device,
+            RoutedExpertRowExecutionPolicy row_execution_policy)
         {
             (void)runtime_layers;
             (void)runtime_layer;
@@ -385,6 +394,7 @@ namespace llaminar2
             (void)rebalance_target_layer;
             (void)rebalance_command_buffer_count;
             (void)absolute_position_ids_device;
+            (void)row_execution_policy;
             return false;
         }
 
@@ -947,7 +957,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
-            uint32_t local_transfer_slot_count = 0)
+            uint32_t local_transfer_slot_count = 0,
+            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr)
         {
             (void)launch;
             (void)runtime_layers;
@@ -964,6 +975,7 @@ namespace llaminar2
             (void)command_buffer_count;
             (void)local_transfer_slots;
             (void)local_transfer_slot_count;
+            (void)llep_layer_plans;
             return false;
         }
 

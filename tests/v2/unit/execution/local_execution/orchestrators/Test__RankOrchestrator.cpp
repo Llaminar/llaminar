@@ -4094,7 +4094,9 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
     const std::string stable_predicate_body =
         dgo_source.substr(stable_predicate_pos, stable_predicate_end - stable_predicate_pos);
     EXPECT_NE(stable_predicate_body.find("ExecutionDomainScope::LOCAL"), std::string::npos);
-    EXPECT_NE(stable_predicate_body.find("RoutedExpertComputePolicy::Apportioned"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("domain.usesParticipantAssignedPrefill()"), std::string::npos)
+        << "Graph-stable dynamic MoE must follow the routed domain's typed "
+           "participant-assigned prefill policy rather than a retired enum name.";
     EXPECT_NE(stable_predicate_body.find("domain.participants.size() < 2"), std::string::npos);
     EXPECT_NE(stable_predicate_body.find("participant.isGPU()"), std::string::npos);
     EXPECT_NE(stable_predicate_body.find("participant.device_type != participant_type"), std::string::npos);
@@ -8654,7 +8656,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_RuntimeGQAOverrideTreatsKVCacheAsRepli
               (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
 }
 
-TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputRowParallel)
+TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputReplicated)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
@@ -8662,7 +8664,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutput
         "layer0_MOE_COMBINED_OUTPUT",
         1,
         4,
-        {1.0f, 2.0f, 3.0f, 4.0f});
+        {11.0f, 22.0f, 33.0f, 44.0f});
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
@@ -8670,7 +8672,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutput
         "layer0_MOE_COMBINED_OUTPUT",
         1,
         4,
-        {10.0f, 20.0f, 30.0f, 40.0f});
+        {11.0f, 22.0f, 33.0f, 44.0f});
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::move(runner0));
@@ -8705,7 +8707,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutput
     ASSERT_TRUE(orchestrator->forward(&token, 1));
 
     auto snapshot = orchestrator->getTPSnapshot("layer0_MOE_COMBINED_OUTPUT");
-    EXPECT_EQ(snapshot.mode, SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
     ASSERT_TRUE(snapshot.computeCombined());
     EXPECT_EQ(snapshot.combined_rows, 1);
     EXPECT_EQ(snapshot.combined_cols, 4);

@@ -47,6 +47,7 @@
 #include "stages/QGateSplitStage.h"
 #include "stages/FusedAddAllreduceStage.h"
 #include "stages/MTPConcatStage.h"
+#include "stages/MTPVerifierPreparationStage.h"
 #include "stages/MTPVerifierOutcomeStage.h"
 
 namespace llaminar2
@@ -304,6 +305,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMTPVerifierOutcome(
             const MTPVerifierOutcomeStage::Params &params);
+
+        /**
+         * @brief Create the captured device-owned MTP verifier prelude.
+         */
+        static std::unique_ptr<IComputeStage> createMTPVerifierPreparation(
+            const MTPVerifierPreparationStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

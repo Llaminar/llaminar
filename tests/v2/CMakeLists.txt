@@ -5794,6 +5794,14 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA2_MoEReplicatedMTP
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByteIdentical
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;CUDA2;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;LocalTP;FullyReplicated;DeviceResident;GraphCapture;BatchInvariant;Regression"
+    MPI_PROCS 1
+    TIMEOUT 60
+)
 message(STATUS "V2 Tests: Added CUDA MoE kernel integration tests")
 endif()
 
@@ -12323,6 +12331,14 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;RealModel;Regression"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm2_MoEReplicatedMTP
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteIdentical
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;ROCm2;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;LocalTP;FullyReplicated;DeviceResident;GraphCapture;BatchInvariant;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 60
+    )
     if(TEST V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths)
         set_tests_properties(
             V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
@@ -13349,6 +13365,9 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_gpu_sampling_kernels
         integration/backends/Test__GPUSamplingKernels.cpp
     )
+    target_include_directories(v2_integration_gpu_sampling_kernels PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
     if(LLAMINAR_SHARED_CORE)
         target_link_libraries(v2_integration_gpu_sampling_kernels PRIVATE
             llaminar2_core
@@ -13387,7 +13406,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*CUDA:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*CUDA
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*CUDA:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*CUDA:*DynamicDepthActiveGeometryCommitsFusedOutcomeByteExactly*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
@@ -13413,7 +13432,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*ROCm:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*ROCm
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm:*FusedSerialEquivalentOutcomeIsByteExactForEverySupportedMTPDepth*ROCm:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*ROCm:*DynamicDepthActiveGeometryCommitsFusedOutcomeByteExactly*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )

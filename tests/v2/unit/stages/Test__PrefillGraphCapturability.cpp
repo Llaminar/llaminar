@@ -428,6 +428,33 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
 #endif
 }
 
+/**
+ * @brief Multi-row verifier routing must remain exportable to a parent graph.
+ *
+ * A fixed grouped verifier row count is decode geometry, not evidence that a
+ * padded-prefill effective-length scalar exists. The launcher-preparation
+ * policy becomes mutable only when the prefill executor explicitly arms it.
+ */
+TEST_F(MoERoutingPrefillGraphCapture, GroupedVerifierDoesNotAdvertisePaddedPrefillPreparation)
+{
+    auto params = makeValidPrefillParams();
+    params.force_decode_equivalent_verifier_prefill = true;
+    MoERoutingStage stage(params);
+
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
+
+    stage.updatePrefillReplayParams({
+        .real_seq_len = SEQ_LEN / 2,
+        .bucket_seq_len = SEQ_LEN,
+        .token_offset = 0,
+    });
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
+}
+
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
@@ -2057,6 +2084,38 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWit
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
 #endif
+}
+
+/**
+ * @brief Grouped verifier shared gating has no external pre-launch scalar.
+ *
+ * The same stage class also serves padded prefill, but only explicit replay
+ * metadata activates its effective-length upload. This keeps a fixed-M
+ * verifier capture composable inside the device-generation parent graph.
+ */
+TEST_F(SharedExpertGatePrefillGraphCapture, GroupedVerifierDoesNotAdvertisePaddedPrefillPreparation)
+{
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.input = input_.get();
+    params.gate_inp = gate_inp_.get();
+    params.shared_output = shared_output_.get();
+    SharedExpertGateStage stage(params);
+
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
+
+    stage.updatePrefillReplayParams({
+        .real_seq_len = SEQ_LEN / 2,
+        .bucket_seq_len = SEQ_LEN,
+        .token_offset = 0,
+    });
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)

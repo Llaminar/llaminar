@@ -7,6 +7,7 @@
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
@@ -923,15 +924,24 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
     ASSERT_NE(
         prefill_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
         nullptr);
+    ASSERT_NE(prefill_graph.getNode("layer0_moe_routing"), nullptr);
+    const auto *prefill_routing_stage =
+        dynamic_cast<const MoERoutingStage *>(
+            prefill_graph.getNode("layer0_moe_routing")->stage.get());
     const auto *prefill_expert_stage =
         dynamic_cast<const MoEExpertComputeStage *>(
             prefill_graph
                 .getNode("layer0_moe_expert_ffn_overlay_fast")
                 ->stage.get());
+    ASSERT_NE(prefill_routing_stage, nullptr);
     ASSERT_NE(prefill_expert_stage, nullptr);
     EXPECT_EQ(
         prefill_expert_stage->routedExpertRowExecutionPolicyForTesting(),
         RoutedExpertRowExecutionPolicy::ParticipantAssigned);
+    EXPECT_EQ(
+        prefill_routing_stage->routedExpertRowExecutionPolicyForTesting(),
+        prefill_expert_stage->routedExpertRowExecutionPolicyForTesting())
+        << "participant-assigned LLEP routing and expert execution must share one policy";
     ASSERT_NE(
         prefill_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
         nullptr)
@@ -960,15 +970,24 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
     ASSERT_NE(
         verifier_graph.getNode("layer0_moe_expert_ffn_overlay_fast"),
         nullptr);
+    ASSERT_NE(verifier_graph.getNode("layer0_moe_routing"), nullptr);
+    const auto *verifier_routing_stage =
+        dynamic_cast<const MoERoutingStage *>(
+            verifier_graph.getNode("layer0_moe_routing")->stage.get());
     const auto *verifier_expert_stage =
         dynamic_cast<const MoEExpertComputeStage *>(
             verifier_graph
                 .getNode("layer0_moe_expert_ffn_overlay_fast")
                 ->stage.get());
+    ASSERT_NE(verifier_routing_stage, nullptr);
     ASSERT_NE(verifier_expert_stage, nullptr);
     EXPECT_EQ(
         verifier_expert_stage->routedExpertRowExecutionPolicyForTesting(),
         RoutedExpertRowExecutionPolicy::FullyReplicatedLocal);
+    EXPECT_EQ(
+        verifier_routing_stage->routedExpertRowExecutionPolicyForTesting(),
+        verifier_expert_stage->routedExpertRowExecutionPolicyForTesting())
+        << "mirrored MTP routing and expert execution must share one policy";
     EXPECT_EQ(
         verifier_expert_stage->routedExpertAssignmentPolicyForTesting(),
         RoutedExpertAssignmentPolicy::LeastLoadedResident)
@@ -2527,14 +2546,17 @@ TEST(Test__Qwen35MoEGraph, PaddedPrefillCheckpointRejectsMissingResidentLength)
 }
 
 /**
- * @brief Exact grouped-verifier checkpoints remain immutable fixed rows.
+ * @brief Budget-truncated grouped checkpoints use their resident logical M.
  *
- * Grouped verifier rows are logical work rather than prefill padding. This
- * complementary assertion prevents the padded-prefill fix from accidentally
- * binding verifier checkpoints to unrelated request-length metadata.
+ * A depth-three verifier can execute only two rows when the response budget is
+ * nearly exhausted. The captured M=3 graph must select row `length - 1` from
+ * its persistent device metadata instead of observing padded physical row 2.
  */
-TEST(Test__Qwen35MoEGraph, GroupedVerifierCheckpointsKeepFixedDeviceRows)
+TEST(Test__Qwen35MoEGraph, GroupedVerifierCheckpointsUseResidentRequestLength)
 {
+    constexpr uintptr_t kOpaqueDeviceAddress = 0x3000;
+    const auto *request_length_device =
+        reinterpret_cast<const int32_t *>(kOpaqueDeviceAddress);
     GraphConfig config = makeMoEConfig();
     config.grouped_mtp_verifier = true;
     config.compute_all_position_logits = true;
@@ -2543,12 +2565,31 @@ TEST(Test__Qwen35MoEGraph, GroupedVerifierCheckpointsKeepFixedDeviceRows)
         graph_builder.mirroredCheckpointRowParamsForTesting(
             /*total_tokens=*/4,
             DeviceId::cuda(0),
-            /*sequence_lengths_device=*/nullptr);
+            request_length_device);
 
     EXPECT_EQ(
         params.selection_policy,
-        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow);
-    EXPECT_EQ(params.request_sequence_length_device, nullptr);
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength);
+    EXPECT_EQ(params.request_sequence_length_device, request_length_device);
+}
+
+/**
+ * @brief Refuse grouped diagnostics without the device owner of logical M.
+ */
+TEST(Test__Qwen35MoEGraph, GroupedVerifierCheckpointRejectsMissingResidentLength)
+{
+    GraphConfig config = makeMoEConfig();
+    config.grouped_mtp_verifier = true;
+    config.compute_all_position_logits = true;
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+
+    EXPECT_THROW(
+        (void)graph_builder.mirroredCheckpointRowParamsForTesting(
+            /*total_tokens=*/3,
+            DeviceId::cuda(0),
+            /*sequence_lengths_device=*/nullptr),
+        std::runtime_error);
 }
 
 TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)

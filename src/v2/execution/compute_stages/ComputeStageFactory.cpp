@@ -303,6 +303,13 @@ namespace llaminar2
         return std::make_unique<MTPVerifierOutcomeStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMTPVerifierPreparation(
+        const MTPVerifierPreparationStage::Params &params)
+    {
+        return std::make_unique<MTPVerifierPreparationStage>(params);
+    }
+
     // =============================================================================
     // Model-Level Stage Factories
     // =============================================================================

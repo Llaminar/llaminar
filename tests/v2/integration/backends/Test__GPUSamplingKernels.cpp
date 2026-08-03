@@ -39,8 +39,15 @@
 #include "execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "execution/compute_stages/stages/MTPDraftTokenPublicationStage.h"
 #include "execution/compute_stages/stages/MTPStochasticTargetDistributionStage.h"
+#include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/IKVCache.h"
+#include "kernels/KernelFactory.h"
 #include "kernels/common/SamplingMath.h"
+#include "transfer/TransferEngine.h"
 #include "utils/Sampler.h"
+#include "utils/TestTensorFactory.h"
 
 #include <vector>
 #include <cmath>
@@ -741,8 +748,14 @@ namespace
         void *d_accepted_state_counts = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_publication_ok = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_next_condition_tokens = backend_->allocate(request_count * sizeof(int32_t), device_id_);
+        void *d_next_verifier_condition_tokens =
+            backend_->allocate(request_count * sizeof(int32_t), device_id_);
         void *d_all_drafts_accepted = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_stopped = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_next_sidecar_condition_tokens =
+            backend_->allocate(request_count * sizeof(int32_t), device_id_);
+        void *d_next_sidecar_position_ids =
+            backend_->allocate(request_count * sizeof(int32_t), device_id_);
         void *d_shifted_target_cached_tokens =
             backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_shifted_accepted_state_counts =
@@ -768,8 +781,11 @@ namespace
                 d_accepted_state_counts,
                 d_publication_ok,
                 d_next_condition_tokens,
+                d_next_verifier_condition_tokens,
                 d_all_drafts_accepted,
                 d_stopped,
+                d_next_sidecar_condition_tokens,
+                d_next_sidecar_position_ids,
                 d_shifted_target_cached_tokens,
                 d_shifted_accepted_state_counts,
                 d_shifted_ok};
@@ -795,8 +811,11 @@ namespace
         ASSERT_NE(d_accepted_state_counts, nullptr);
         ASSERT_NE(d_publication_ok, nullptr);
         ASSERT_NE(d_next_condition_tokens, nullptr);
+        ASSERT_NE(d_next_verifier_condition_tokens, nullptr);
         ASSERT_NE(d_all_drafts_accepted, nullptr);
         ASSERT_NE(d_stopped, nullptr);
+        ASSERT_NE(d_next_sidecar_condition_tokens, nullptr);
+        ASSERT_NE(d_next_sidecar_position_ids, nullptr);
         ASSERT_NE(d_shifted_target_cached_tokens, nullptr);
         ASSERT_NE(d_shifted_accepted_state_counts, nullptr);
         ASSERT_NE(d_shifted_ok, nullptr);
@@ -860,7 +879,10 @@ namespace
                         device_id_, nullptr, d_restore_rows,
                         d_target_cached_tokens, d_accepted_state_counts,
                         d_publication_ok, d_next_condition_tokens,
-                        d_all_drafts_accepted, d_stopped));
+                        d_all_drafts_accepted, d_stopped,
+                        d_next_sidecar_condition_tokens,
+                        d_next_sidecar_position_ids,
+                        d_next_verifier_condition_tokens));
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -881,7 +903,10 @@ namespace
                         device_id_, stream, d_restore_rows,
                         d_target_cached_tokens, d_accepted_state_counts,
                         d_publication_ok, d_next_condition_tokens,
-                        d_all_drafts_accepted, d_stopped));
+                        d_all_drafts_accepted, d_stopped,
+                        d_next_sidecar_condition_tokens,
+                        d_next_sidecar_position_ids,
+                        d_next_verifier_condition_tokens));
                 ASSERT_TRUE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
@@ -895,7 +920,10 @@ namespace
                         device_id_, stream, d_restore_rows,
                         d_target_cached_tokens, d_accepted_state_counts,
                         d_publication_ok, d_next_condition_tokens,
-                        d_all_drafts_accepted, d_stopped));
+                        d_all_drafts_accepted, d_stopped,
+                        d_next_sidecar_condition_tokens,
+                        d_next_sidecar_position_ids,
+                        d_next_verifier_condition_tokens));
                 /*
                  * A statically captured resident loop may reach one more body
                  * after its controller becomes terminal.  Feed stale compact
@@ -915,7 +943,10 @@ namespace
                         device_id_, stream, d_restore_rows,
                         d_target_cached_tokens, d_accepted_state_counts,
                         d_publication_ok, d_next_condition_tokens,
-                        d_all_drafts_accepted, d_stopped));
+                        d_all_drafts_accepted, d_stopped,
+                        d_next_sidecar_condition_tokens,
+                        d_next_sidecar_position_ids,
+                        d_next_verifier_condition_tokens));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
 
@@ -947,8 +978,13 @@ namespace
         std::array<int, request_count> actual_accepted_state_counts{};
         std::array<int, request_count> actual_publication_ok{};
         std::array<int32_t, request_count> actual_next_condition_tokens{};
+        std::array<int32_t, request_count>
+            actual_next_verifier_condition_tokens{};
         std::array<int, request_count> actual_all_drafts_accepted{};
         std::array<int, request_count> actual_stopped{};
+        std::array<int32_t, request_count>
+            actual_next_sidecar_condition_tokens{};
+        std::array<int32_t, request_count> actual_next_sidecar_position_ids{};
         ASSERT_TRUE(copyDeviceToHost(
             actual_response.data(), d_response,
             actual_response.size() * sizeof(int32_t), device_id_));
@@ -971,11 +1007,26 @@ namespace
             actual_next_condition_tokens.data(), d_next_condition_tokens,
             actual_next_condition_tokens.size() * sizeof(int32_t), device_id_));
         ASSERT_TRUE(copyDeviceToHost(
+            actual_next_verifier_condition_tokens.data(),
+            d_next_verifier_condition_tokens,
+            actual_next_verifier_condition_tokens.size() * sizeof(int32_t),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
             actual_all_drafts_accepted.data(), d_all_drafts_accepted,
             actual_all_drafts_accepted.size() * sizeof(int), device_id_));
         ASSERT_TRUE(copyDeviceToHost(
             actual_stopped.data(), d_stopped,
             actual_stopped.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_next_sidecar_condition_tokens.data(),
+            d_next_sidecar_condition_tokens,
+            actual_next_sidecar_condition_tokens.size() * sizeof(int32_t),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_next_sidecar_position_ids.data(),
+            d_next_sidecar_position_ids,
+            actual_next_sidecar_position_ids.size() * sizeof(int32_t),
+            device_id_));
 
         EXPECT_EQ(actual_response, expected_response);
         EXPECT_EQ(actual_control, expected_control);
@@ -984,8 +1035,21 @@ namespace
         EXPECT_EQ(actual_accepted_state_counts, expected_accepted_state_counts);
         EXPECT_EQ(actual_publication_ok, expected_publication_ok);
         EXPECT_EQ(actual_next_condition_tokens, expected_next_condition_tokens);
+        EXPECT_EQ(
+            actual_next_verifier_condition_tokens,
+            expected_next_condition_tokens)
+            << "The canonical verifier-condition bank must match the sidecar "
+               "condition derived by the same fused publication kernel.";
         EXPECT_EQ(actual_all_drafts_accepted, expected_all_drafts_accepted);
         EXPECT_EQ(actual_stopped, expected_stopped);
+        EXPECT_EQ(
+            actual_next_sidecar_condition_tokens,
+            expected_next_condition_tokens);
+        EXPECT_TRUE(std::equal(
+            actual_next_sidecar_position_ids.begin(),
+            actual_next_sidecar_position_ids.end(),
+            expected_target_cached_tokens.begin(),
+            expected_target_cached_tokens.end()));
         for (int request = 0; request < request_count; ++request)
         {
             const int *control =
@@ -996,9 +1060,301 @@ namespace
             EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
             EXPECT_EQ(control[kDeviceGenerationControlTransactionCount], 2);
             EXPECT_EQ(
+                control[
+                    kDeviceGenerationControlPublishedStateCommitCount],
+                4);
+            EXPECT_EQ(
                 control[kDeviceGenerationControlErrorCode],
                 static_cast<int>(DeviceGenerationError::None));
         }
+
+        cleanup();
+    }
+
+    /**
+     * @brief Regress dynamic-depth budget composition through the real GPU kernels.
+     *
+     * Production may configure a maximum MTP depth of fifteen while selecting
+     * depth four for the current transaction.  The five-row active verifier
+     * graph, not that larger policy ceiling, owns the response-controller
+     * budget.  This test composes initialization, active-geometry budget
+     * publication, fused serial-equivalent reduction, and response/state commit
+     * in one captured CUDA/ROCm graph.  The chosen rows reproduce a rejection
+     * after one accepted draft, including the compact metadata shape that first
+     * exposed the stale max-depth budget in the server E2E lane.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DynamicDepthActiveGeometryCommitsFusedOutcomeByteExactly)
+    {
+        using namespace sampling_math;
+
+        constexpr int comparison_rows = 4;
+        constexpr int active_verifier_rows = comparison_rows + 1;
+        constexpr int configured_max_comparison_rows = 15;
+        constexpr int top_k = 1;
+        constexpr int output_token_stride =
+            kSpeculativeBatchMaxOutputTokens;
+        constexpr int response_token_stride = 64;
+        constexpr int meta_stride = kSpeculativeBatchMetaCount;
+        constexpr int control_stride = kDeviceGenerationControlCount;
+        constexpr uint64_t seed = 0xA57E5EED1234ull;
+
+        static_assert(active_verifier_rows < configured_max_comparison_rows);
+        const std::array<int32_t, active_verifier_rows> target_ids = {
+            101, 102, 103, 104, 105};
+        const std::array<float, active_verifier_rows> target_probs = {
+            1.0F, 1.0F, 1.0F, 1.0F, 1.0F};
+        const std::array<int32_t, active_verifier_rows> verifier_input = {
+            10, 101, 999, 1000, 1001};
+        std::array<int32_t, kSpeculativeBatchMaxStopTokens> stop_tokens{};
+        stop_tokens.fill(-1);
+        const int base_position = 23;
+        const std::array<int, 1> base_cached_tokens = {base_position};
+        const uint32_t maintenance_rows = active_verifier_rows;
+
+        const size_t output_bytes =
+            static_cast<size_t>(output_token_stride) * sizeof(int32_t);
+        const size_t meta_bytes =
+            static_cast<size_t>(meta_stride) * sizeof(int);
+        const size_t response_bytes =
+            static_cast<size_t>(response_token_stride) * sizeof(int32_t);
+        const size_t control_bytes =
+            static_cast<size_t>(control_stride) * sizeof(int);
+
+        void *d_target_ids = backend_->allocate(sizeof(target_ids), device_id_);
+        void *d_target_probs = backend_->allocate(sizeof(target_probs), device_id_);
+        void *d_verifier_input = backend_->allocate(sizeof(verifier_input), device_id_);
+        void *d_stop_tokens = backend_->allocate(sizeof(stop_tokens), device_id_);
+        void *d_base_position = backend_->allocate(sizeof(base_position), device_id_);
+        void *d_base_cached_tokens = backend_->allocate(sizeof(base_cached_tokens), device_id_);
+        void *d_maintenance_rows = backend_->allocate(sizeof(maintenance_rows), device_id_);
+        void *d_sampled = backend_->allocate(output_bytes, device_id_);
+        void *d_output = backend_->allocate(output_bytes, device_id_);
+        void *d_meta = backend_->allocate(meta_bytes, device_id_);
+        void *d_response = backend_->allocate(response_bytes, device_id_);
+        void *d_control = backend_->allocate(control_bytes, device_id_);
+        void *d_restore_row = backend_->allocate(sizeof(int), device_id_);
+        void *d_target_cached_tokens = backend_->allocate(sizeof(int), device_id_);
+        void *d_accepted_state_count = backend_->allocate(sizeof(int), device_id_);
+        void *d_publication_ok = backend_->allocate(sizeof(int), device_id_);
+        void *d_next_condition_token = backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_next_verifier_condition_token =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_all_drafts_accepted = backend_->allocate(sizeof(int), device_id_);
+        void *d_stopped = backend_->allocate(sizeof(int), device_id_);
+        void *d_next_sidecar_condition_token =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_next_sidecar_position_id =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        const std::array<void *, 22> allocations = {
+            d_target_ids,
+            d_target_probs,
+            d_verifier_input,
+            d_stop_tokens,
+            d_base_position,
+            d_base_cached_tokens,
+            d_maintenance_rows,
+            d_sampled,
+            d_output,
+            d_meta,
+            d_response,
+            d_control,
+            d_restore_row,
+            d_target_cached_tokens,
+            d_accepted_state_count,
+            d_publication_ok,
+            d_next_condition_token,
+            d_next_verifier_condition_token,
+            d_all_drafts_accepted,
+            d_stopped,
+            d_next_sidecar_condition_token,
+            d_next_sidecar_position_id};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        auto cleanup = [&]()
+        {
+            for (void *allocation : allocations)
+                backend_->free(allocation, device_id_);
+        };
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *const stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                std::array<int32_t, response_token_stride> initial_response{};
+                initial_response.fill(-1);
+                ASSERT_TRUE(copyHostToDevice(
+                    d_target_ids, target_ids.data(), sizeof(target_ids),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_target_probs, target_probs.data(), sizeof(target_probs),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_verifier_input, verifier_input.data(),
+                    sizeof(verifier_input), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_stop_tokens, stop_tokens.data(), sizeof(stop_tokens),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_base_position, &base_position, sizeof(base_position),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_base_cached_tokens, base_cached_tokens.data(),
+                    sizeof(base_cached_tokens), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_maintenance_rows, &maintenance_rows,
+                    sizeof(maintenance_rows), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_response, initial_response.data(), response_bytes,
+                    device_id_, stream));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
+                    /*request_count=*/1,
+                    /*max_new_tokens=*/response_token_stride,
+                    response_token_stride,
+                    d_response,
+                    control_stride,
+                    d_control,
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(
+                    backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                        d_control,
+                        control_stride,
+                        /*request_count=*/1,
+                        active_verifier_rows,
+                        d_maintenance_rows,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(
+                    backend_->enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
+                        d_target_ids,
+                        d_target_probs,
+                        /*target_row_stride=*/top_k,
+                        top_k,
+                        comparison_rows,
+                        seed,
+                        d_base_position,
+                        /*threshold_position_offset=*/1,
+                        d_verifier_input,
+                        d_stop_tokens,
+                        d_control,
+                        device_id_,
+                        stream,
+                        output_token_stride,
+                        d_sampled,
+                        d_output,
+                        d_meta,
+                        /*first_transaction_diagnostic=*/nullptr));
+                ASSERT_TRUE(
+                    backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+                        d_output,
+                        output_token_stride,
+                        d_meta,
+                        meta_stride,
+                        d_base_cached_tokens,
+                        /*request_count=*/1,
+                        active_verifier_rows,
+                        d_response,
+                        response_token_stride,
+                        d_control,
+                        control_stride,
+                        device_id_,
+                        stream,
+                        d_restore_row,
+                        d_target_cached_tokens,
+                        d_accepted_state_count,
+                        d_publication_ok,
+                        d_next_condition_token,
+                        d_all_drafts_accepted,
+                        d_stopped,
+                        d_next_sidecar_condition_token,
+                        d_next_sidecar_position_id,
+                        d_next_verifier_condition_token));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx =
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx =
+                GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::array<int32_t, output_token_stride> actual_output{};
+        std::array<int, meta_stride> actual_meta{};
+        std::array<int32_t, response_token_stride> actual_response{};
+        std::array<int, control_stride> actual_control{};
+        int publication_ok = 0;
+        int next_condition_token = -1;
+        int next_verifier_condition_token = -1;
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_output.data(), d_output, sizeof(actual_output), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_meta.data(), d_meta, sizeof(actual_meta), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_response.data(), d_response, sizeof(actual_response),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_control.data(), d_control, sizeof(actual_control),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            &publication_ok, d_publication_ok, sizeof(publication_ok),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            &next_condition_token, d_next_condition_token,
+            sizeof(next_condition_token), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            &next_verifier_condition_token,
+            d_next_verifier_condition_token,
+            sizeof(next_verifier_condition_token),
+            device_id_));
+
+        EXPECT_EQ(actual_meta[kSpecBatchMetaOk], 1);
+        EXPECT_EQ(actual_meta[kSpecBatchMetaOutputCount], 3);
+        EXPECT_EQ(
+            actual_meta[kSpecBatchMetaAcceptedSpeculativePrefix], 1);
+        EXPECT_EQ(
+            actual_meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+        EXPECT_EQ(actual_meta[kSpecBatchMetaReadyToken], -1);
+        EXPECT_EQ(actual_output[0], 10);
+        EXPECT_EQ(actual_output[1], 101);
+        EXPECT_EQ(actual_output[2], 102);
+        EXPECT_EQ(actual_response[0], 10);
+        EXPECT_EQ(actual_response[1], 101);
+        EXPECT_EQ(actual_response[2], 102);
+        EXPECT_EQ(publication_ok, 1);
+        EXPECT_EQ(next_condition_token, 102);
+        EXPECT_EQ(next_verifier_condition_token, next_condition_token);
+        EXPECT_EQ(actual_control[kDeviceGenerationControlOk], 1);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlTransactionCount], 1);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlResponseTokenCount], 3);
+        EXPECT_EQ(
+            actual_control[
+                kDeviceGenerationControlPublishedStateCommitCount],
+            2);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlErrorCode],
+            static_cast<int>(DeviceGenerationError::None));
 
         cleanup();
     }
@@ -1064,8 +1420,14 @@ namespace
         void *d_next_condition_token = backend_->allocate(sizeof(int32_t), device_id_);
         void *d_all_drafts_accepted = backend_->allocate(sizeof(int), device_id_);
         void *d_stopped = backend_->allocate(sizeof(int), device_id_);
+        void *d_next_sidecar_condition_token =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_next_sidecar_position_id =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_next_verifier_condition_token =
+            backend_->allocate(sizeof(int32_t), device_id_);
 
-        const std::array<void *, 12> allocations = {
+        const std::array<void *, 15> allocations = {
             d_compact_tokens,
             d_compact_meta,
             d_base_cached_tokens,
@@ -1077,12 +1439,18 @@ namespace
             d_publication_ok,
             d_next_condition_token,
             d_all_drafts_accepted,
-            d_stopped};
+            d_stopped,
+            d_next_sidecar_condition_token,
+            d_next_sidecar_position_id,
+            d_next_verifier_condition_token};
         for (void *allocation : allocations)
             ASSERT_NE(allocation, nullptr);
 
         std::array<int32_t, response_token_stride> actual_response{};
         std::array<int, control_stride> actual_control{};
+        int32_t actual_next_sidecar_condition_token = -1;
+        int32_t actual_next_sidecar_position_id = -1;
+        int32_t actual_next_verifier_condition_token = -1;
         auto &cuda_context =
             GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
         cuda_context.submitAndWait([&]()
@@ -1160,7 +1528,10 @@ namespace
                     d_publication_ok,
                     d_next_condition_token,
                     d_all_drafts_accepted,
-                    d_stopped));
+                    d_stopped,
+                    d_next_sidecar_condition_token,
+                    d_next_sidecar_position_id,
+                    d_next_verifier_condition_token));
             ASSERT_TRUE(commit->endCapture());
             ASSERT_GT(commit->nodeCount(), 0u);
 
@@ -1180,8 +1551,12 @@ namespace
                     .healthy_index = kDeviceGenerationControlOk,
                     .complete_index =
                         kDeviceGenerationControlRequestComplete}));
+            ASSERT_GE(generation->nodeCount(), 2U)
+                << "The parent must contain an entry predicate before its WHILE node";
             ASSERT_TRUE(generation->instantiate());
             ASSERT_TRUE(generation->launch());
+            ASSERT_TRUE(generation->launch())
+                << "A terminal controller must make a later parent launch execute zero body iterations";
 
             ASSERT_TRUE(copyDeviceToHost(
                 actual_response.data(),
@@ -1193,6 +1568,24 @@ namespace
                 actual_control.data(),
                 d_control,
                 actual_control.size() * sizeof(int),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyDeviceToHost(
+                &actual_next_sidecar_condition_token,
+                d_next_sidecar_condition_token,
+                sizeof(actual_next_sidecar_condition_token),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyDeviceToHost(
+                &actual_next_sidecar_position_id,
+                d_next_sidecar_position_id,
+                sizeof(actual_next_sidecar_position_id),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyDeviceToHost(
+                &actual_next_verifier_condition_token,
+                d_next_verifier_condition_token,
+                sizeof(actual_next_verifier_condition_token),
                 device_id_,
                 stream));
             ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -1228,6 +1621,14 @@ namespace
         EXPECT_EQ(
             actual_control[kDeviceGenerationControlErrorCode],
             static_cast<int>(DeviceGenerationError::None));
+        EXPECT_EQ(actual_next_sidecar_condition_token, emitted_token);
+        EXPECT_EQ(
+            actual_next_verifier_condition_token,
+            actual_next_sidecar_condition_token);
+        EXPECT_EQ(
+            actual_next_sidecar_position_id,
+            base_cached_tokens.front() +
+                compact_meta[kSpecBatchMetaTargetVerifierStateCommitCount]);
 
         for (void *allocation : allocations)
             backend_->free(allocation, device_id_);
@@ -1561,6 +1962,440 @@ namespace
         backend_->free(d_verifier_positions, device_id_);
         backend_->free(d_valid_rows, device_id_);
         backend_->free(d_live_positions, device_id_);
+    }
+
+    /**
+     * @brief Prove the complete captured verifier prelude is replay-correct for M=1..16.
+     *
+     * This is intentionally an integration test rather than a mocked stage
+     * test.  It binds a production FP16 ring cache, captures the exact typed
+     * preparation stage, and then changes both token bytes and canonical cache
+     * metadata behind graph-stable device addresses.  The unchanged graph must
+     * publish the new token row, absolute positions, request width, immutable
+     * base-count snapshot, and opaque all-layer KV checkpoint.  The request
+     * penalty policy is published separately and must remain untouched by this
+     * graph across both capture and replay.
+     *
+     * Covering every supported speculative width prevents a future M=2/M=16
+     * specialization from leaving holes at intermediate depths.  CUDA and ROCm
+     * run the same test body so the lifecycle contract cannot drift by backend.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        CapturedMTPVerifierPreparationTracksResidentTokensAndKVAcrossAllWidths)
+    {
+        constexpr int max_verifier_width = 16;
+        constexpr int initial_cached_tokens = 3;
+        constexpr int num_layers = 1;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 16;
+        constexpr int max_seq_len = 64;
+        constexpr float presence_penalty = 0.25F;
+        constexpr float frequency_penalty = 0.125F;
+
+        const DeviceId execution_device =
+            GetParam() == "CUDA"
+                ? DeviceId::cuda(device_id_)
+                : DeviceId::rocm(device_id_);
+        auto execution_context = IDeviceContext::create(execution_device);
+        ASSERT_NE(execution_context, nullptr);
+
+        llaminar::v2::kernels::KVCacheConfig cache_config;
+        cache_config.precision = ActivationPrecision::FP16;
+        cache_config.device = execution_device;
+        cache_config.num_layers = num_layers;
+        cache_config.batch_size = 1;
+        cache_config.max_seq_len = max_seq_len;
+        cache_config.n_kv_heads = n_kv_heads;
+        cache_config.head_dim = head_dim;
+        auto cache =
+            llaminar::v2::kernels::KernelFactory::createKVCache(cache_config);
+        ASSERT_NE(cache, nullptr);
+
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(cache.get());
+        ASSERT_NE(workspace_consumer, nullptr)
+            << "GPU KV cache must declare its complete persistent workspace";
+        const WorkspaceRequirements cache_requirements =
+            workspace_consumer->getWorkspaceRequirements(
+                max_seq_len,
+                /*n=*/1,
+                head_dim);
+        DeviceWorkspaceManager cache_workspace(
+            execution_device,
+            cache_requirements.total_bytes_with_alignment() + 4096U);
+        ASSERT_TRUE(cache_workspace.allocate(cache_requirements));
+        workspace_consumer->bindWorkspace(&cache_workspace);
+
+        const size_t checkpoint_bytes =
+            cache->deviceSequenceStateCheckpointBytes();
+        ASSERT_GT(checkpoint_bytes, 0U)
+            << "GPU MTP requires a complete device-resident KV checkpoint";
+        ASSERT_NE(cache->deviceSequenceCachedTokenCountPtr(0), nullptr);
+
+        auto initial_k = test::TestTensorFactory::createFP16Random(
+            {initial_cached_tokens,
+             static_cast<size_t>(n_kv_heads),
+             static_cast<size_t>(head_dim)},
+            -1.0F,
+            1.0F,
+            20260801U);
+        auto initial_v = test::TestTensorFactory::createFP16Random(
+            {initial_cached_tokens,
+             static_cast<size_t>(n_kv_heads),
+             static_cast<size_t>(head_dim)},
+            -1.0F,
+            1.0F,
+            20260802U);
+        auto continuation_k = test::TestTensorFactory::createFP16Random(
+            {1U,
+             static_cast<size_t>(n_kv_heads),
+             static_cast<size_t>(head_dim)},
+            -1.0F,
+            1.0F,
+            20260803U);
+        auto continuation_v = test::TestTensorFactory::createFP16Random(
+            {1U,
+             static_cast<size_t>(n_kv_heads),
+             static_cast<size_t>(head_dim)},
+            -1.0F,
+            1.0F,
+            20260804U);
+
+        void *d_first_token = backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_draft_tokens = backend_->allocate(
+            (max_verifier_width - 1) * sizeof(int32_t), device_id_);
+        void *d_verifier_tokens = backend_->allocate(
+            max_verifier_width * sizeof(int32_t), device_id_);
+        void *d_position_ids = backend_->allocate(
+            max_verifier_width * sizeof(int32_t), device_id_);
+        void *d_request_length = backend_->allocate(
+            sizeof(int32_t), device_id_);
+        void *d_base_snapshot = backend_->allocate(
+            sizeof(int32_t), device_id_);
+        void *d_checkpoint = backend_->allocate(
+            checkpoint_bytes, device_id_);
+        void *d_penalty_policy = backend_->allocate(
+            sizeof(MTPGreedyPenaltyPolicy), device_id_);
+        const std::array<void *, 8> allocations = {
+            d_first_token,
+            d_draft_tokens,
+            d_verifier_tokens,
+            d_position_ids,
+            d_request_length,
+            d_base_snapshot,
+            d_checkpoint,
+            d_penalty_policy,
+        };
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        std::array<int32_t, max_verifier_width - 1> draft_tokens{};
+        std::array<int32_t, max_verifier_width> observed_tokens{};
+        std::array<int32_t, max_verifier_width> observed_positions{};
+        std::vector<uint8_t> checkpoint_before(checkpoint_bytes);
+        std::vector<uint8_t> checkpoint_after(checkpoint_bytes);
+
+        auto run = [&](IWorkerGPUContext &worker_context)
+        {
+            worker_context.submitAndWait([&]()
+            {
+                void *const stream = worker_context.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                auto &transfer = TransferEngine::instance();
+                ASSERT_TRUE(
+                    transfer.uploadFull(
+                        initial_k.get(), execution_device, stream)
+                        .success);
+                ASSERT_TRUE(
+                    transfer.uploadFull(
+                        initial_v.get(), execution_device, stream)
+                        .success);
+                ASSERT_TRUE(
+                    transfer.uploadFull(
+                        continuation_k.get(), execution_device, stream)
+                        .success);
+                ASSERT_TRUE(
+                    transfer.uploadFull(
+                        continuation_v.get(), execution_device, stream)
+                        .success);
+                ASSERT_TRUE(cache->appendWithStream(
+                    0,
+                    0,
+                    initial_k.get(),
+                    initial_v.get(),
+                    initial_cached_tokens,
+                    stream));
+                ASSERT_TRUE(
+                    backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+                        d_penalty_policy,
+                        presence_penalty,
+                        frequency_penalty,
+                        /*first_token_already_in_history=*/true,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                int expected_base = initial_cached_tokens;
+                for (int width = 1; width <= max_verifier_width; ++width)
+                {
+                    SCOPED_TRACE(::testing::Message()
+                                 << GetParam() << " verifier_width=" << width);
+                    int32_t first_token = 1000 + width;
+                    for (int slot = 0; slot < max_verifier_width - 1; ++slot)
+                    {
+                        draft_tokens[static_cast<size_t>(slot)] =
+                            2000 + width * 100 + slot;
+                    }
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_first_token,
+                        &first_token,
+                        sizeof(first_token),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_draft_tokens,
+                        draft_tokens.data(),
+                        draft_tokens.size() * sizeof(int32_t),
+                        device_id_,
+                        stream));
+
+                    const MTPVerifierPreparationStage::TokenRowBinding token_row{
+                        .first_token_device =
+                            static_cast<const int32_t *>(d_first_token),
+                        .draft_tokens_device =
+                            static_cast<const int32_t *>(d_draft_tokens),
+                        .destination_device =
+                            static_cast<int32_t *>(d_verifier_tokens),
+                        .draft_token_count = width - 1,
+                    };
+                    const MTPVerifierPreparationStage::MainKVCheckpointBinding
+                        checkpoint_binding{
+                            .cache = cache.get(),
+                            .sequence_index = 0,
+                            .checkpoint_device = d_checkpoint,
+                            .checkpoint_bytes = checkpoint_bytes,
+                        };
+                    const std::array token_rows{token_row};
+                    const std::array checkpoint_bindings{checkpoint_binding};
+
+                    MTPVerifierPreparationStage::Params stage_params;
+                    stage_params.device_id = execution_device;
+                    stage_params.backend = backend_;
+                    stage_params.token_rows = token_rows;
+                    stage_params.request_count = 1;
+                    stage_params.padded_seq_len = width;
+                    stage_params.base_cached_tokens_device =
+                        cache->deviceSequenceCachedTokenCountPtr(0);
+                    stage_params.valid_graph_rows_device = nullptr;
+                    stage_params.valid_graph_row_count = width;
+                    stage_params.position_ids_device =
+                        static_cast<int32_t *>(d_position_ids);
+                    stage_params.request_lengths_device =
+                        static_cast<int32_t *>(d_request_length);
+                    stage_params.base_cached_tokens_snapshot_device =
+                        static_cast<int32_t *>(d_base_snapshot);
+                    stage_params.main_kv_checkpoints = checkpoint_bindings;
+                    MTPVerifierPreparationStage stage(stage_params);
+                    EXPECT_THROW(
+                        stage.execute(execution_context.get()),
+                        std::logic_error)
+                        << "captured verifier preparation must reject a null stream";
+                    stage.setGPUStream(stream);
+
+                    auto capture = worker_context.createGraphCapture(stream);
+                    ASSERT_NE(capture, nullptr);
+                    ASSERT_TRUE(capture->beginCapture());
+                    const bool stage_enqueued =
+                        stage.execute(execution_context.get());
+                    ASSERT_TRUE(capture->endCapture());
+                    ASSERT_TRUE(stage_enqueued);
+                    ASSERT_GE(capture->nodeCount(), 4U)
+                        << "complete verifier preparation was not captured";
+                    ASSERT_TRUE(capture->instantiate());
+                    ASSERT_TRUE(capture->launch());
+
+                    int32_t observed_length = -1;
+                    int32_t observed_base = -1;
+                    MTPGreedyPenaltyPolicy observed_policy{};
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_tokens.data(),
+                        d_verifier_tokens,
+                        static_cast<size_t>(width) * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_positions.data(),
+                        d_position_ids,
+                        static_cast<size_t>(width) * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_length,
+                        d_request_length,
+                        sizeof(observed_length),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_base,
+                        d_base_snapshot,
+                        sizeof(observed_base),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_policy,
+                        d_penalty_policy,
+                        sizeof(observed_policy),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        checkpoint_before.data(),
+                        d_checkpoint,
+                        checkpoint_bytes,
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                    EXPECT_EQ(observed_tokens[0], first_token);
+                    for (int slot = 1; slot < width; ++slot)
+                    {
+                        EXPECT_EQ(
+                            observed_tokens[static_cast<size_t>(slot)],
+                            draft_tokens[static_cast<size_t>(slot - 1)]);
+                    }
+                    for (int row = 0; row < width; ++row)
+                    {
+                        EXPECT_EQ(
+                            observed_positions[static_cast<size_t>(row)],
+                            expected_base + row);
+                    }
+                    EXPECT_EQ(observed_length, width);
+                    EXPECT_EQ(observed_base, expected_base);
+                    EXPECT_FLOAT_EQ(
+                        observed_policy.presence_penalty,
+                        presence_penalty);
+                    EXPECT_FLOAT_EQ(
+                        observed_policy.frequency_penalty,
+                        frequency_penalty);
+                    EXPECT_EQ(
+                        observed_policy.first_token_already_in_history,
+                        1);
+                    EXPECT_EQ(observed_policy.enabled, 1);
+
+                    ASSERT_TRUE(cache->appendWithStream(
+                        0,
+                        0,
+                        continuation_k.get(),
+                        continuation_v.get(),
+                        1,
+                        stream));
+                    ++expected_base;
+                    first_token = 3000 + width;
+                    for (int slot = 0; slot < max_verifier_width - 1; ++slot)
+                    {
+                        draft_tokens[static_cast<size_t>(slot)] =
+                            4000 + width * 100 + slot;
+                    }
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_first_token,
+                        &first_token,
+                        sizeof(first_token),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_draft_tokens,
+                        draft_tokens.data(),
+                        draft_tokens.size() * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(capture->launch());
+
+                    observed_length = -1;
+                    observed_base = -1;
+                    observed_policy = {};
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_tokens.data(),
+                        d_verifier_tokens,
+                        static_cast<size_t>(width) * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        observed_positions.data(),
+                        d_position_ids,
+                        static_cast<size_t>(width) * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_length,
+                        d_request_length,
+                        sizeof(observed_length),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_base,
+                        d_base_snapshot,
+                        sizeof(observed_base),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &observed_policy,
+                        d_penalty_policy,
+                        sizeof(observed_policy),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        checkpoint_after.data(),
+                        d_checkpoint,
+                        checkpoint_bytes,
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                    EXPECT_EQ(observed_tokens[0], first_token);
+                    for (int slot = 1; slot < width; ++slot)
+                    {
+                        EXPECT_EQ(
+                            observed_tokens[static_cast<size_t>(slot)],
+                            draft_tokens[static_cast<size_t>(slot - 1)]);
+                    }
+                    for (int row = 0; row < width; ++row)
+                    {
+                        EXPECT_EQ(
+                            observed_positions[static_cast<size_t>(row)],
+                            expected_base + row);
+                    }
+                    EXPECT_EQ(observed_length, width);
+                    EXPECT_EQ(observed_base, expected_base);
+                    EXPECT_FLOAT_EQ(
+                        observed_policy.presence_penalty,
+                        presence_penalty);
+                    EXPECT_FLOAT_EQ(
+                        observed_policy.frequency_penalty,
+                        frequency_penalty);
+                    EXPECT_EQ(
+                        observed_policy.first_token_already_in_history,
+                        1);
+                    EXPECT_EQ(observed_policy.enabled, 1);
+                    EXPECT_NE(checkpoint_after, checkpoint_before)
+                        << "replayed checkpoint ignored the advanced live cache";
+                }
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        }
+        else
+        {
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+        }
+
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
+        workspace_consumer->unbindWorkspace();
+        cache.reset();
     }
 
     /**
@@ -3137,6 +3972,14 @@ namespace
                 first_token_already_in_history ? 1 : 0;
             const int output_count =
                 expected_output_meta[kSpecBatchMetaOutputCount];
+            ASSERT_GT(output_count, 0);
+            const int accepted_state_count =
+                first_token_already_in_history
+                    ? output_count
+                    : output_count - 1;
+            constexpr int stopped_flag = 0;
+            const int expected_next_pending_condition =
+                output_count > accepted_state_count ? 1 : 0;
             for (int index = commit_begin; index < output_count; ++index)
             {
                 const int token =
@@ -3156,6 +3999,8 @@ namespace
             void *d_output_meta = nullptr;
             void *d_policy = nullptr;
             void *d_counts = nullptr;
+            void *d_accepted_state_count = nullptr;
+            void *d_stopped_flag = nullptr;
             auto cleanup = [&]()
             {
                 void *ptrs[] = {
@@ -3168,7 +4013,9 @@ namespace
                     d_output_tokens,
                     d_output_meta,
                     d_policy,
-                    d_counts};
+                    d_counts,
+                    d_accepted_state_count,
+                    d_stopped_flag};
                 for (void *ptr : ptrs)
                 {
                     if (ptr)
@@ -3206,6 +4053,12 @@ namespace
             d_counts = backend_->allocate(
                 initial_counts.size() * sizeof(int),
                 device_id_);
+            d_accepted_state_count = backend_->allocate(
+                sizeof(int),
+                device_id_);
+            d_stopped_flag = backend_->allocate(
+                sizeof(int),
+                device_id_);
 
             ASSERT_NE(d_logits, nullptr);
             ASSERT_NE(d_argmax_values, nullptr);
@@ -3217,6 +4070,8 @@ namespace
             ASSERT_NE(d_output_meta, nullptr);
             ASSERT_NE(d_policy, nullptr);
             ASSERT_NE(d_counts, nullptr);
+            ASSERT_NE(d_accepted_state_count, nullptr);
+            ASSERT_NE(d_stopped_flag, nullptr);
 
             ctx.submitAndWait([&]()
             {
@@ -3239,6 +4094,18 @@ namespace
                     d_counts,
                     initial_counts.data(),
                     initial_counts.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_accepted_state_count,
+                    &accepted_state_count,
+                    sizeof(accepted_state_count),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_stopped_flag,
+                    &stopped_flag,
+                    sizeof(stopped_flag),
                     device_id_,
                     stream));
                 ASSERT_TRUE(
@@ -3290,6 +4157,8 @@ namespace
                         d_output_tokens,
                         d_output_meta,
                         d_policy,
+                        d_accepted_state_count,
+                        d_stopped_flag,
                         static_cast<int>(expected_output_tokens.size()),
                         vocab_size,
                         d_counts,
@@ -3311,6 +4180,7 @@ namespace
             std::vector<int> actual_counts(
                 static_cast<size_t>(vocab_size),
                 -1);
+            MTPGreedyPenaltyPolicy actual_policy{};
             ASSERT_TRUE(copyDeviceToHost(
                 actual_values.data(),
                 d_argmax_values,
@@ -3336,6 +4206,11 @@ namespace
                 d_counts,
                 actual_counts.size() * sizeof(int),
                 device_id_));
+            ASSERT_TRUE(copyDeviceToHost(
+                &actual_policy,
+                d_policy,
+                sizeof(actual_policy),
+                device_id_));
 
             EXPECT_EQ(
                 std::memcmp(
@@ -3356,6 +4231,14 @@ namespace
                 0)
                 << "persistent history bytes diverged for rows=" << rows
                 << " pending_first=" << first_token_already_in_history;
+            EXPECT_EQ(
+                actual_policy.first_token_already_in_history,
+                expected_next_pending_condition)
+                << "accepted-state publication did not publish the next "
+                   "pending-condition predicate for rows="
+                << rows
+                << " previous_pending="
+                << first_token_already_in_history;
 
             cleanup();
         };
@@ -3784,6 +4667,14 @@ namespace
                         device_id_,
                         stream));
                 ASSERT_TRUE(
+                    backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+                        d_captured_policy,
+                        presence_penalty,
+                        frequency_penalty,
+                        first_token_already_in_history,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(
                     backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
                         d_reference_logits,
                         rows,
@@ -3828,10 +4719,6 @@ namespace
                 stage_params.generated_token_counts_device =
                     static_cast<const int32_t *>(d_counts);
                 stage_params.penalty_policy_device = d_captured_policy;
-                stage_params.presence_penalty = presence_penalty;
-                stage_params.frequency_penalty = frequency_penalty;
-                stage_params.first_token_already_in_history =
-                    first_token_already_in_history;
                 stage_params.top_k = top_k;
                 stage_params.top_p = top_p;
                 stage_params.temperature = temperature;
@@ -3864,7 +4751,7 @@ namespace
                     stage.execute(execution_context.get());
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(stage_enqueued);
-                ASSERT_GE(capture->nodeCount(), 4U)
+                ASSERT_GE(capture->nodeCount(), 3U)
                     << "target preparation capture omitted required kernels";
                 ASSERT_TRUE(capture->instantiate());
                 ASSERT_TRUE(capture->launch());
@@ -4163,8 +5050,16 @@ namespace
                 scratch_capacity * sizeof(int32_t), device_id_);
             void *d_captured_partial_indices = backend_->allocate(
                 scratch_capacity * sizeof(int32_t), device_id_);
+            void *d_reference_chain_token = backend_->allocate(
+                sizeof(int32_t), device_id_);
+            void *d_captured_chain_token = backend_->allocate(
+                sizeof(int32_t), device_id_);
+            void *d_reference_chain_position = backend_->allocate(
+                sizeof(int32_t), device_id_);
+            void *d_captured_chain_position = backend_->allocate(
+                sizeof(int32_t), device_id_);
 
-            const std::array<void *, 15> allocations = {
+            const std::array<void *, 19> allocations = {
                 d_reference_logits,
                 d_captured_logits,
                 d_condition,
@@ -4179,7 +5074,11 @@ namespace
                 d_reference_partial_values,
                 d_captured_partial_values,
                 d_reference_partial_indices,
-                d_captured_partial_indices};
+                d_captured_partial_indices,
+                d_reference_chain_token,
+                d_captured_chain_token,
+                d_reference_chain_position,
+                d_captured_chain_position};
             for (void *allocation : allocations)
                 ASSERT_NE(allocation, nullptr);
 
@@ -4196,6 +5095,8 @@ namespace
             std::vector<int32_t> token_sentinel(
                 static_cast<size_t>(slot_capacity),
                 -777);
+            int32_t chain_token_sentinel = -901;
+            int32_t chain_position = 409 + depth;
 
             ctx.submitAndWait([&]()
             {
@@ -4258,6 +5159,30 @@ namespace
                         token_sentinel.size() * sizeof(int32_t),
                         device_id_,
                         stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_reference_chain_token,
+                        &chain_token_sentinel,
+                        sizeof(chain_token_sentinel),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_captured_chain_token,
+                        &chain_token_sentinel,
+                        sizeof(chain_token_sentinel),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_reference_chain_position,
+                        &chain_position,
+                        sizeof(chain_position),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_captured_chain_position,
+                        &chain_position,
+                        sizeof(chain_position),
+                        device_id_,
+                        stream));
                 };
 
                 auto enqueue_reference = [&]()
@@ -4284,7 +5209,8 @@ namespace
                                 device_id_,
                                 stream));
                     }
-                    ASSERT_TRUE(backend_->enqueueArgmaxF32BatchedRowsDevice(
+                    ASSERT_TRUE(backend_
+                        ->enqueueArgmaxF32BatchedRowsAndPublishMTPChainDevice(
                         d_reference_logits,
                         /*rows=*/1,
                         vocab_size,
@@ -4292,6 +5218,9 @@ namespace
                         stream,
                         static_cast<float *>(d_reference_values) + depth,
                         static_cast<int32_t *>(d_reference_tokens) + depth,
+                        d_reference_chain_token,
+                        d_reference_chain_position,
+                        /*chain_position_increment=*/1,
                         d_reference_partial_values,
                         d_reference_partial_indices,
                         scratch_capacity,
@@ -4314,15 +5243,16 @@ namespace
                 stage_params.generated_token_counts_device =
                     static_cast<const int32_t *>(d_counts);
                 stage_params.penalty_policy_device = d_captured_policy;
-                stage_params.presence_penalty = presence_penalty;
-                stage_params.frequency_penalty = frequency_penalty;
-                stage_params.first_token_already_in_history =
-                    first_token_already_in_history;
                 stage_params.draft_values_device =
                     static_cast<float *>(d_captured_values);
                 stage_params.draft_tokens_device =
                     static_cast<int32_t *>(d_captured_tokens);
                 stage_params.destination_slot = depth;
+                stage_params.next_chain_condition_token_device =
+                    static_cast<int32_t *>(d_captured_chain_token);
+                stage_params.next_chain_position_id_device =
+                    static_cast<int32_t *>(d_captured_chain_position);
+                stage_params.chain_position_increment = 1;
                 stage_params.argmax_partial_values_device =
                     static_cast<float *>(d_captured_partial_values);
                 stage_params.argmax_partial_indices_device =
@@ -4336,6 +5266,17 @@ namespace
                 stage.setGPUStream(stream);
 
                 reset_inputs();
+                if (apply_penalties)
+                {
+                    ASSERT_TRUE(backend_
+                        ->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+                            d_captured_policy,
+                            presence_penalty,
+                            frequency_penalty,
+                            first_token_already_in_history,
+                            device_id_,
+                            stream));
+                }
                 enqueue_reference();
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
                 auto capture = ctx.createGraphCapture(stream);
@@ -4347,7 +5288,7 @@ namespace
                 ASSERT_TRUE(stage_enqueued);
                 ASSERT_GE(
                     capture->nodeCount(),
-                    apply_penalties ? 4U : 2U);
+                    apply_penalties ? 3U : 2U);
                 ASSERT_TRUE(capture->instantiate());
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -4402,6 +5343,10 @@ namespace
             std::vector<float> captured_values(value_sentinel.size());
             std::vector<int32_t> reference_tokens(token_sentinel.size());
             std::vector<int32_t> captured_tokens(token_sentinel.size());
+            int32_t reference_chain_token = -1;
+            int32_t captured_chain_token = -1;
+            int32_t reference_chain_position = -1;
+            int32_t captured_chain_position = -1;
             ASSERT_TRUE(copyDeviceToHost(
                 reference_logits.data(),
                 d_reference_logits,
@@ -4432,6 +5377,26 @@ namespace
                 d_captured_tokens,
                 captured_tokens.size() * sizeof(int32_t),
                 device_id_));
+            ASSERT_TRUE(copyDeviceToHost(
+                &reference_chain_token,
+                d_reference_chain_token,
+                sizeof(reference_chain_token),
+                device_id_));
+            ASSERT_TRUE(copyDeviceToHost(
+                &captured_chain_token,
+                d_captured_chain_token,
+                sizeof(captured_chain_token),
+                device_id_));
+            ASSERT_TRUE(copyDeviceToHost(
+                &reference_chain_position,
+                d_reference_chain_position,
+                sizeof(reference_chain_position),
+                device_id_));
+            ASSERT_TRUE(copyDeviceToHost(
+                &captured_chain_position,
+                d_captured_chain_position,
+                sizeof(captured_chain_position),
+                device_id_));
 
             EXPECT_EQ(
                 std::memcmp(
@@ -4455,6 +5420,10 @@ namespace
                     reference_tokens.size() * sizeof(int32_t)),
                 0)
                 << "proposal token bytes diverged at depth=" << depth;
+            EXPECT_EQ(captured_chain_token, reference_chain_token);
+            EXPECT_EQ(captured_chain_token, captured_tokens[depth]);
+            EXPECT_EQ(captured_chain_position, reference_chain_position);
+            EXPECT_EQ(captured_chain_position, chain_position + 1);
 
             if (apply_penalties)
             {
@@ -4502,6 +5471,302 @@ namespace
                 /*apply_penalties=*/false,
                 /*first_token_already_in_history=*/false);
         }
+    }
+
+    /**
+     * @brief Prove sidecar evidence is replay-live and transaction-zero owned.
+     *
+     * The model parent graph may execute several WHILE iterations before its
+     * terminal observation.  This test captures the exact production
+     * diagnostic primitive, mutates all resident inputs, and proves a later
+     * transaction cannot overwrite the first record.  Re-admitting transaction
+     * zero then proves the same executable reads current device bytes rather
+     * than captured host values.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        CapturedMTPDraftBoundaryDiagnosticRetainsOnlyTransactionZero)
+    {
+        using namespace sampling_math;
+        constexpr int first_word_count = 4096;
+        constexpr int second_word_count = 257;
+        constexpr int first_boundary = static_cast<int>(
+            MTPFirstTransactionDraftBoundary::TerminalHiddenInput);
+        constexpr int second_boundary = static_cast<int>(
+            MTPFirstTransactionDraftBoundary::Embedding);
+
+        auto expected_hash = [](const std::vector<uint32_t> &words)
+        {
+            constexpr int kThreads = 256;
+            std::array<uint64_t, kThreads> lane_hashes{};
+            for (int lane = 0; lane < kThreads; ++lane)
+            {
+                uint64_t hash = 1469598103934665603ULL ^
+                                static_cast<uint64_t>(lane + 1);
+                for (size_t index = static_cast<size_t>(lane);
+                     index < words.size();
+                     index += kThreads)
+                {
+                    hash = append_diagnostic_u32_fnv1a(
+                        hash,
+                        static_cast<uint32_t>(index));
+                    hash = append_diagnostic_u32_fnv1a(
+                        hash,
+                        words[index]);
+                }
+                lane_hashes[static_cast<size_t>(lane)] = hash;
+            }
+
+            uint64_t folded = 1469598103934665603ULL;
+            for (uint64_t lane_hash : lane_hashes)
+            {
+                folded = append_diagnostic_u32_fnv1a(
+                    folded,
+                    static_cast<uint32_t>(lane_hash));
+                folded = append_diagnostic_u32_fnv1a(
+                    folded,
+                    static_cast<uint32_t>(lane_hash >> 32U));
+            }
+            return folded;
+        };
+
+        std::vector<uint32_t> first_words(first_word_count);
+        std::vector<uint32_t> second_words(second_word_count);
+        for (size_t index = 0; index < first_words.size(); ++index)
+            first_words[index] = static_cast<uint32_t>(index * 17U + 11U);
+        for (size_t index = 0; index < second_words.size(); ++index)
+            second_words[index] = static_cast<uint32_t>(index * 29U + 7U);
+
+        std::array<int32_t, kDeviceGenerationControlCount> control{};
+        control[kDeviceGenerationControlTransactionCount] = 0;
+        int32_t condition_token = 271;
+        int32_t position_id = 409;
+        MTPFirstTransactionDiagnosticRecord initial_record{};
+
+        void *d_first_words = backend_->allocate(
+            first_words.size() * sizeof(uint32_t), device_id_);
+        void *d_second_words = backend_->allocate(
+            second_words.size() * sizeof(uint32_t), device_id_);
+        void *d_control = backend_->allocate(sizeof(control), device_id_);
+        void *d_condition = backend_->allocate(
+            sizeof(condition_token), device_id_);
+        void *d_position = backend_->allocate(
+            sizeof(position_id), device_id_);
+        void *d_record = backend_->allocate(
+            sizeof(initial_record), device_id_);
+        const std::array<void *, 6> allocations = {
+            d_first_words,
+            d_second_words,
+            d_control,
+            d_condition,
+            d_position,
+            d_record,
+        };
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        IWorkerGPUContext &ctx =
+            GetParam() == "CUDA"
+                ? GPUDeviceContextPool::instance().getNvidiaContext(device_id_)
+                : GPUDeviceContextPool::instance().getAMDContext(device_id_);
+        std::unique_ptr<IGPUGraphCapture> capture;
+        ctx.submitAndWait([&]()
+        {
+            void *const stream = ctx.defaultStream();
+            ASSERT_NE(stream, nullptr);
+            ASSERT_TRUE(copyHostToDevice(
+                d_first_words,
+                first_words.data(),
+                first_words.size() * sizeof(uint32_t),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_second_words,
+                second_words.data(),
+                second_words.size() * sizeof(uint32_t),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_control,
+                control.data(),
+                sizeof(control),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_condition,
+                &condition_token,
+                sizeof(condition_token),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_position,
+                &position_id,
+                sizeof(position_id),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_record,
+                &initial_record,
+                sizeof(initial_record),
+                device_id_,
+                stream));
+
+            capture = ctx.createGraphCapture(stream);
+            ASSERT_NE(capture, nullptr);
+            ASSERT_TRUE(capture->beginCapture());
+            const bool first_enqueued =
+                backend_->enqueueRetainMTPFirstTransactionDraftBoundaryDevice(
+                    d_first_words,
+                    first_word_count,
+                    first_boundary,
+                    /*draft_slot=*/0,
+                    d_condition,
+                    d_position,
+                    d_control,
+                    static_cast<int>(control.size()),
+                    d_record,
+                    device_id_,
+                    stream);
+            const bool second_enqueued =
+                backend_->enqueueRetainMTPFirstTransactionDraftBoundaryDevice(
+                    d_second_words,
+                    second_word_count,
+                    second_boundary,
+                    /*draft_slot=*/0,
+                    d_condition,
+                    d_position,
+                    d_control,
+                    static_cast<int>(control.size()),
+                    d_record,
+                    device_id_,
+                    stream);
+            ASSERT_TRUE(capture->endCapture());
+            ASSERT_TRUE(first_enqueued);
+            ASSERT_TRUE(second_enqueued);
+            ASSERT_EQ(capture->nodeCount(), 2U);
+            ASSERT_TRUE(capture->instantiate());
+            ASSERT_TRUE(capture->launch());
+            ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+        });
+
+        MTPFirstTransactionDiagnosticRecord transaction_zero{};
+        ASSERT_TRUE(copyDeviceToHost(
+            &transaction_zero,
+            d_record,
+            sizeof(transaction_zero),
+            device_id_));
+        EXPECT_EQ(transaction_zero.draft_diagnostic_depth, 1);
+        EXPECT_EQ(transaction_zero.draft_condition_tokens[0], condition_token);
+        EXPECT_EQ(transaction_zero.draft_position_ids[0], position_id);
+        EXPECT_EQ(
+            transaction_zero.draft_boundary_word_counts[0][first_boundary],
+            first_word_count);
+        EXPECT_EQ(
+            transaction_zero.draft_boundary_word_counts[0][second_boundary],
+            second_word_count);
+        EXPECT_EQ(
+            transaction_zero.draft_boundary_hashes[0][first_boundary],
+            expected_hash(first_words));
+        EXPECT_EQ(
+            transaction_zero.draft_boundary_hashes[0][second_boundary],
+            expected_hash(second_words));
+
+        for (size_t index = 0; index < first_words.size(); ++index)
+            first_words[index] ^= static_cast<uint32_t>(index * 13U + 3U);
+        for (size_t index = 0; index < second_words.size(); ++index)
+            second_words[index] ^= static_cast<uint32_t>(index * 5U + 19U);
+        condition_token = 999;
+        position_id = 777;
+        control[kDeviceGenerationControlTransactionCount] = 1;
+        ctx.submitAndWait([&]()
+        {
+            void *const stream = ctx.defaultStream();
+            ASSERT_TRUE(copyHostToDevice(
+                d_first_words,
+                first_words.data(),
+                first_words.size() * sizeof(uint32_t),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_second_words,
+                second_words.data(),
+                second_words.size() * sizeof(uint32_t),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_control,
+                control.data(),
+                sizeof(control),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_condition,
+                &condition_token,
+                sizeof(condition_token),
+                device_id_,
+                stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_position,
+                &position_id,
+                sizeof(position_id),
+                device_id_,
+                stream));
+            ASSERT_TRUE(capture->launch());
+            ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+        });
+
+        MTPFirstTransactionDiagnosticRecord retained{};
+        ASSERT_TRUE(copyDeviceToHost(
+            &retained,
+            d_record,
+            sizeof(retained),
+            device_id_));
+        EXPECT_EQ(
+            std::memcmp(
+                &retained,
+                &transaction_zero,
+                sizeof(retained)),
+            0)
+            << "transaction one overwrote transaction-zero sidecar evidence";
+
+        control[kDeviceGenerationControlTransactionCount] = 0;
+        ctx.submitAndWait([&]()
+        {
+            void *const stream = ctx.defaultStream();
+            ASSERT_TRUE(copyHostToDevice(
+                d_control,
+                control.data(),
+                sizeof(control),
+                device_id_,
+                stream));
+            ASSERT_TRUE(capture->launch());
+            ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+        });
+        MTPFirstTransactionDiagnosticRecord replay_live{};
+        ASSERT_TRUE(copyDeviceToHost(
+            &replay_live,
+            d_record,
+            sizeof(replay_live),
+            device_id_));
+        EXPECT_EQ(replay_live.draft_condition_tokens[0], condition_token);
+        EXPECT_EQ(replay_live.draft_position_ids[0], position_id);
+        EXPECT_EQ(
+            replay_live.draft_boundary_hashes[0][first_boundary],
+            expected_hash(first_words));
+        EXPECT_EQ(
+            replay_live.draft_boundary_hashes[0][second_boundary],
+            expected_hash(second_words));
+        EXPECT_NE(
+            std::memcmp(
+                &replay_live,
+                &transaction_zero,
+                sizeof(replay_live)),
+            0)
+            << "captured diagnostics did not observe changed resident bytes";
+
+        capture.reset();
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
     }
 
     /**
@@ -4916,6 +6181,8 @@ namespace
         void *d_accepted_state_counts = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_ok = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_next_condition_tokens = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_next_verifier_condition_tokens =
+            backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_all_drafts_accepted = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_stopped = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_shifted_target_cached_tokens =
@@ -4936,6 +6203,7 @@ namespace
                 d_accepted_state_counts,
                 d_ok,
                 d_next_condition_tokens,
+                d_next_verifier_condition_tokens,
                 d_all_drafts_accepted,
                 d_stopped,
                 d_shifted_target_cached_tokens,
@@ -4956,6 +6224,7 @@ namespace
         ASSERT_NE(d_accepted_state_counts, nullptr);
         ASSERT_NE(d_ok, nullptr);
         ASSERT_NE(d_next_condition_tokens, nullptr);
+        ASSERT_NE(d_next_verifier_condition_tokens, nullptr);
         ASSERT_NE(d_all_drafts_accepted, nullptr);
         ASSERT_NE(d_stopped, nullptr);
         ASSERT_NE(d_shifted_target_cached_tokens, nullptr);
@@ -5006,7 +6275,8 @@ namespace
                     d_output_tokens,
                     kSpeculativeBatchMaxOutputTokens,
                     d_all_drafts_accepted,
-                    d_stopped))
+                    d_stopped,
+                    d_next_verifier_condition_tokens))
                     << "publication metadata derivation must reject the legacy default/null stream";
                 EXPECT_FALSE(
                     backend_
@@ -5043,7 +6313,8 @@ namespace
                     d_output_tokens,
                     kSpeculativeBatchMaxOutputTokens,
                     d_all_drafts_accepted,
-                    d_stopped));
+                    d_stopped,
+                    d_next_verifier_condition_tokens));
                 ASSERT_TRUE(
                     backend_
                         ->enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
@@ -5080,6 +6351,7 @@ namespace
         std::array<int, request_count> accepted_state_counts{};
         std::array<int, request_count> ok{};
         std::array<int, request_count> next_condition_tokens{};
+        std::array<int, request_count> next_verifier_condition_tokens{};
         std::array<int, request_count> all_drafts_accepted{};
         std::array<int, request_count> stopped{};
         std::array<int, request_count> shifted_target_cached_tokens{};
@@ -5100,6 +6372,11 @@ namespace
         ASSERT_TRUE(copyDeviceToHost(
             next_condition_tokens.data(), d_next_condition_tokens,
             next_condition_tokens.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            next_verifier_condition_tokens.data(),
+            d_next_verifier_condition_tokens,
+            next_verifier_condition_tokens.size() * sizeof(int),
+            device_id_));
         ASSERT_TRUE(copyDeviceToHost(
             all_drafts_accepted.data(), d_all_drafts_accepted,
             all_drafts_accepted.size() * sizeof(int), device_id_));
@@ -5153,6 +6430,10 @@ namespace
         EXPECT_EQ(next_condition_tokens[3], -1);
         EXPECT_EQ(all_drafts_accepted[3], 0);
         EXPECT_EQ(stopped[3], 0);
+
+        EXPECT_EQ(next_verifier_condition_tokens, next_condition_tokens)
+            << "Every request row must publish the next verifier condition to "
+               "the canonical target bank in the same captured kernel.";
 
         const std::array<int, request_count> expected_shifted_targets = {
             102, 200, 302, 0};
@@ -12179,6 +13460,8 @@ namespace
         using SampleRow = std::array<int32_t, kMaxSampleRows>;
         using OutputRow = std::array<int32_t, kOutputCapacity>;
         using MetaRow = std::array<int, kSpeculativeBatchMetaCount>;
+        using DiagnosticRecord =
+            MTPFirstTransactionDiagnosticRecord;
         struct ExpectedOutcome
         {
             SampleRow sampled{};
@@ -12209,7 +13492,10 @@ namespace
         void *d_output = backend_->allocate(
             sizeof(OutputRow), device_id_);
         void *d_meta = backend_->allocate(sizeof(MetaRow), device_id_);
-        const std::array<void *, 9> allocations = {
+        void *d_first_transaction_diagnostic = backend_->allocate(
+            sizeof(DiagnosticRecord),
+            device_id_);
+        const std::array<void *, 10> allocations = {
             d_target_ids,
             d_target_probs,
             d_verifier_input,
@@ -12218,7 +13504,8 @@ namespace
             d_base_position,
             d_sampled,
             d_output,
-            d_meta};
+            d_meta,
+            d_first_transaction_diagnostic};
         for (void *allocation : allocations)
             ASSERT_NE(allocation, nullptr);
 
@@ -12402,7 +13689,8 @@ namespace
                             kOutputCapacity,
                             d_sampled,
                             d_output,
-                            d_meta))
+                            d_meta,
+                            d_first_transaction_diagnostic))
                         << "depth=" << depth << " top_k=" << top_k;
 
                     auto capture = ctx.createGraphCapture(stream);
@@ -12426,16 +13714,19 @@ namespace
                             kOutputCapacity,
                             d_sampled,
                             d_output,
-                            d_meta));
+                            d_meta,
+                            d_first_transaction_diagnostic));
                     ASSERT_TRUE(capture->endCapture());
                     ASSERT_TRUE(capture->instantiate());
 
                     SampleRow sampled_a{};
                     OutputRow output_a{};
                     MetaRow meta_a{};
+                    DiagnosticRecord diagnostic_a{};
                     SampleRow sampled_b{};
                     OutputRow output_b{};
                     MetaRow meta_b{};
+                    DiagnosticRecord diagnostic_b{};
                     ASSERT_TRUE(capture->launch());
                     ASSERT_TRUE(copyDeviceToHost(
                         sampled_a.data(), d_sampled, sizeof(sampled_a),
@@ -12446,11 +13737,25 @@ namespace
                     ASSERT_TRUE(copyDeviceToHost(
                         meta_a.data(), d_meta, sizeof(meta_a),
                         device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &diagnostic_a,
+                        d_first_transaction_diagnostic,
+                        sizeof(diagnostic_a),
+                        device_id_,
+                        stream));
 
                     ASSERT_TRUE(copyHostToDevice(
                         d_base_position,
                         &base_b,
                         sizeof(base_b),
+                        device_id_,
+                        stream));
+                    generation_control[
+                        kDeviceGenerationControlTransactionCount] = 1;
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_generation_control,
+                        generation_control.data(),
+                        sizeof(generation_control),
                         device_id_,
                         stream));
                     ASSERT_TRUE(capture->launch());
@@ -12463,6 +13768,12 @@ namespace
                     ASSERT_TRUE(copyDeviceToHost(
                         meta_b.data(), d_meta, sizeof(meta_b),
                         device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(
+                        &diagnostic_b,
+                        d_first_transaction_diagnostic,
+                        sizeof(diagnostic_b),
+                        device_id_,
+                        stream));
                     ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                     EXPECT_EQ(
@@ -12515,6 +13826,97 @@ namespace
                         0)
                         << "metadata B depth=" << depth
                         << " top_k=" << top_k;
+
+                    EXPECT_EQ(diagnostic_a.valid, 1u);
+                    EXPECT_EQ(
+                        diagnostic_a.version,
+                        kMTPFirstTransactionDiagnosticVersion);
+                    EXPECT_EQ(diagnostic_a.threshold_seed, kSeed);
+                    EXPECT_EQ(
+                        diagnostic_a.threshold_base_position,
+                        base_a);
+                    EXPECT_EQ(diagnostic_a.threshold_position_offset, 1);
+                    EXPECT_EQ(diagnostic_a.comparison_row_count, depth);
+                    EXPECT_EQ(diagnostic_a.top_k, top_k);
+                    EXPECT_EQ(diagnostic_a.transaction_count, 0);
+                    EXPECT_EQ(
+                        diagnostic_a.transaction_commit_budget,
+                        depth + 1);
+                    EXPECT_EQ(
+                        diagnostic_a.leading_committed_output_count,
+                        0);
+                    for (int row = 0; row < depth + 1; ++row)
+                    {
+                        const size_t row_index =
+                            static_cast<size_t>(row);
+                        const float threshold =
+                            mtp_spec_threshold_from_seed(
+                                kSeed,
+                                base_a + 1 + row,
+                                0 /* MTPSpecStochasticDrawPurpose::Sample */);
+                        EXPECT_EQ(
+                            diagnostic_a.verifier_input_tokens[row_index],
+                            verifier_input[row_index]);
+                        EXPECT_EQ(
+                            diagnostic_a.sampled_target_tokens[row_index],
+                            expected_a.sampled[row_index]);
+                        EXPECT_EQ(
+                            diagnostic_a.threshold_bits[row_index],
+                            sampling_float_bits(threshold));
+                        EXPECT_EQ(
+                            diagnostic_a.target_distribution_hashes[row_index],
+                            hash_compact_distribution_exact(
+                                target_ids.data() +
+                                    row_index * kMaxTopK,
+                                target_probs.data() +
+                                    row_index * kMaxTopK,
+                                top_k));
+                        if (row < depth)
+                        {
+                            EXPECT_EQ(
+                                diagnostic_a
+                                    .sampled_matches_verifier_input[row_index],
+                                expected_a.sampled[row_index] ==
+                                        verifier_input[row_index + 1]
+                                    ? 1
+                                    : 0);
+                        }
+                        else
+                        {
+                            EXPECT_EQ(
+                                diagnostic_a
+                                    .sampled_matches_verifier_input[row_index],
+                                -1);
+                        }
+                    }
+                    EXPECT_EQ(
+                        std::memcmp(
+                            diagnostic_a.output_tokens,
+                            expected_a.output.data(),
+                            sizeof(expected_a.output)),
+                        0);
+                    EXPECT_EQ(
+                        std::memcmp(
+                            diagnostic_a.output_meta,
+                            expected_a.meta.data(),
+                            sizeof(expected_a.meta)),
+                        0);
+
+                    /*
+                     * Replay with a non-zero resident transaction index must
+                     * update ordinary outputs while preserving transaction-zero
+                     * evidence byte-for-byte. This is the exact lifetime needed
+                     * by a device-controlled WHILE graph whose fatal host
+                     * observation happens only after all iterations complete.
+                     */
+                    EXPECT_EQ(
+                        std::memcmp(
+                            &diagnostic_a,
+                            &diagnostic_b,
+                            sizeof(DiagnosticRecord)),
+                        0)
+                        << "first transaction diagnostic was overwritten by replay"
+                        << " depth=" << depth << " top_k=" << top_k;
                 }
             });
         };

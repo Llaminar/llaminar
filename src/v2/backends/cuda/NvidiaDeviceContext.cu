@@ -894,12 +894,16 @@ namespace llaminar2
 
     std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture()
     {
-        return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(defaultStream()));
+        return std::make_unique<CUDAGraphCapture>(
+            static_cast<cudaStream_t>(defaultStream()),
+            device_ordinal_);
     }
 
     std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture(void *stream)
     {
-        return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(stream));
+        return std::make_unique<CUDAGraphCapture>(
+            static_cast<cudaStream_t>(stream),
+            device_ordinal_);
     }
 
     PointerValidationResult NvidiaDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)

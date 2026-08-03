@@ -288,10 +288,28 @@ namespace llaminar2
         }
         if (params_.device_id.is_gpu() &&
             params_.device_row_index_source ==
-                DeviceRowIndexSource::ExternalDeviceIndices &&
-            params_.workspace_buffer_name.empty())
+                DeviceRowIndexSource::WorkspaceBoundDeviceIndices &&
+            (params_.workspace_buffer_name.empty() ||
+             params_.external_device_row_indices != nullptr))
         {
-            LOG_ERROR("[HiddenStateRowsSelectStage] External device row indices require a named workspace buffer");
+            LOG_ERROR("[HiddenStateRowsSelectStage] Workspace-bound device row indices require exactly one named workspace owner");
+            return false;
+        }
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ExternalDeviceIndices &&
+            (!params_.external_device_row_indices ||
+             !params_.workspace_buffer_name.empty()))
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] External device row indices require exactly one explicit producer-owned device pointer");
+            return false;
+        }
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source !=
+                DeviceRowIndexSource::ExternalDeviceIndices &&
+            params_.external_device_row_indices != nullptr)
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] A producer-owned row-index pointer is valid only for ExternalDeviceIndices");
             return false;
         }
 
@@ -379,6 +397,25 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::ExternalDeviceIndices)
+        {
+            if (!params_.external_device_row_indices)
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] External row-index owner published a null device pointer on "
+                          << params_.device_id.toString());
+                return false;
+            }
+
+            if (!gpu_state_)
+                gpu_state_ = std::make_unique<GpuParamState>();
+            gpu_state_->device = params_.device_id;
+            gpu_state_->device_selected_rows =
+                const_cast<int *>(params_.external_device_row_indices);
+            gpu_state_->device_value_uploaded = true;
+            return true;
+        }
+
         const std::string rows_buffer = selectedRowsBufferName();
         const size_t expected_bytes = static_cast<size_t>(selected_row_count_) * sizeof(int);
         if (!bound_workspace_ ||
@@ -413,11 +450,11 @@ namespace llaminar2
         state->device = params_.device_id;
         state->device_selected_rows = device_selected_rows;
         if (params_.device_row_index_source ==
-            DeviceRowIndexSource::ExternalDeviceIndices)
+            DeviceRowIndexSource::WorkspaceBoundDeviceIndices)
         {
-            // External metadata mode is the vLLM-style path: another workspace
-            // consumer owns and updates the row-index array. This stage only
-            // reads the stable device pointer during graph replay.
+            // The graph-family metadata producer owns and updates this named
+            // row-index array. This stage only reads the pointer resolved from
+            // the same explicitly shared workspace during graph capture.
             state->device_value_uploaded = true;
             gpu_state_ = std::move(state);
             return true;
@@ -471,7 +508,9 @@ namespace llaminar2
         if (!ensureGpuParamStateInitialized())
             return false;
         if (params_.device_row_index_source ==
-            DeviceRowIndexSource::ExternalDeviceIndices)
+                DeviceRowIndexSource::ExternalDeviceIndices ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::WorkspaceBoundDeviceIndices)
         {
             gpu_state_->device_value_uploaded = true;
             return true;
@@ -565,7 +604,18 @@ namespace llaminar2
         if (!input_device || !output_device)
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Missing GPU data pointers"
-                      << (graph_managed ? " after graph-managed arena coherence" : " after direct tensor preparation"));
+                      << (graph_managed ? " after graph-managed arena coherence" : " after direct tensor preparation")
+                      << " device=" << params_.device_id.toString()
+                      << " input=" << static_cast<const void *>(input_device)
+                      << " output=" << static_cast<void *>(output_device)
+                      << " input_buffer="
+                      << (params_.input_buffer_id
+                              ? bufferIdName(*params_.input_buffer_id)
+                              : "<direct>")
+                      << " output_buffer="
+                      << (params_.output_buffer_id
+                              ? bufferIdName(*params_.output_buffer_id)
+                              : "<direct>"));
             return false;
         }
 

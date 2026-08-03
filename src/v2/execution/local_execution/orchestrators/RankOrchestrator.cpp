@@ -56,7 +56,9 @@
 #include <limits>
 #include <numeric>
 #include <cstdlib>
+#include <exception>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -68,6 +70,186 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Compute a stable diagnostic hash for one terminal token row.
+         *
+         * The hash is never used for correctness decisions; exact vector
+         * equality remains mandatory. It lets production diagnostics compare
+         * long responses without printing hundreds of tokens while still
+         * reporting the first byte-level disagreement separately.
+         */
+        uint64_t terminalTokenHash(std::span<const int32_t> tokens) noexcept
+        {
+            uint64_t hash = 1469598103934665603ULL;
+            for (const int32_t token : tokens)
+            {
+                const uint32_t bits = static_cast<uint32_t>(token);
+                for (unsigned int byte = 0; byte < sizeof(bits); ++byte)
+                {
+                    hash ^= static_cast<uint8_t>(bits >> (byte * 8U));
+                    hash *= 1099511628211ULL;
+                }
+            }
+            return hash;
+        }
+
+        /**
+         * @brief Describe every byte-level boundary that differs by participant.
+         *
+         * Mirrored-state capture is an exceptional-path diagnostic performed
+         * only after production has already rejected divergent participant
+         * results. Keeping comparison and formatting here gives both the
+         * immediate draft sampler and the fully captured terminal parent the
+         * same ordered interpretation of device state.
+         */
+        std::string describeMirroredDigestMismatch(
+            const std::vector<std::vector<MTPMirroredTensorDigest>> &participant_digests)
+        {
+            std::ostringstream summary;
+            summary << " Mirrored MTP device-state digest comparison:";
+            const size_t boundary_count =
+                participant_digests.empty()
+                    ? 0
+                    : participant_digests.front().size();
+            for (size_t boundary = 0; boundary < boundary_count; ++boundary)
+            {
+                const auto &reference =
+                    participant_digests.front()[boundary];
+                bool differs = !reference.available;
+                for (size_t participant = 1;
+                     participant < participant_digests.size();
+                     ++participant)
+                {
+                    if (boundary >= participant_digests[participant].size())
+                    {
+                        differs = true;
+                        continue;
+                    }
+                    const auto &candidate =
+                        participant_digests[participant][boundary];
+                    differs =
+                        differs ||
+                        !candidate.available ||
+                        candidate.name != reference.name ||
+                        candidate.byte_count != reference.byte_count ||
+                        candidate.hash != reference.hash;
+                }
+                if (!differs)
+                    continue;
+
+                summary << " [" << reference.name;
+                for (size_t participant = 0;
+                     participant < participant_digests.size();
+                     ++participant)
+                {
+                    summary << " p" << participant << "=";
+                    if (boundary >= participant_digests[participant].size() ||
+                        !participant_digests[participant][boundary].available)
+                    {
+                        summary << "unavailable";
+                        continue;
+                    }
+                    const auto &digest =
+                        participant_digests[participant][boundary];
+                    summary << "0x" << std::hex << digest.hash << std::dec
+                            << "/" << digest.byte_count << "B";
+                    if (!digest.value_preview.empty())
+                        summary << digest.value_preview;
+                }
+                summary << "]";
+            }
+            return summary.str();
+        }
+
+        /**
+         * @brief Describe the first exact mismatch between mirrored ledgers.
+         *
+         * Mirrored LocalTP participants must produce byte-identical terminal
+         * responses. A generic operator== failure does not reveal whether the
+         * divergence originated in sampling, stop handling, or controller
+         * accounting, so this helper reports the first token mismatch and all
+         * controller fields for the affected request.
+         */
+        std::string describeTerminalLedgerMismatch(
+            const std::vector<DeviceGenerationTerminalRequestResult> &primary,
+            const std::vector<DeviceGenerationTerminalRequestResult> &participant)
+        {
+            std::ostringstream detail;
+            detail << " primary_requests=" << primary.size()
+                   << " participant_requests=" << participant.size();
+            const size_t shared_requests =
+                std::min(primary.size(), participant.size());
+            for (size_t request = 0; request < shared_requests; ++request)
+            {
+                const auto &lhs = primary[request];
+                const auto &rhs = participant[request];
+                if (lhs == rhs)
+                    continue;
+
+                const size_t shared_tokens =
+                    std::min(lhs.tokens.size(), rhs.tokens.size());
+                size_t first_token_mismatch = shared_tokens;
+                for (size_t token = 0; token < shared_tokens; ++token)
+                {
+                    if (lhs.tokens[token] != rhs.tokens[token])
+                    {
+                        first_token_mismatch = token;
+                        break;
+                    }
+                }
+
+                detail << " request=" << request
+                       << " primary_token_count=" << lhs.tokens.size()
+                       << " participant_token_count=" << rhs.tokens.size()
+                       << " primary_token_hash="
+                       << terminalTokenHash(lhs.tokens)
+                       << " participant_token_hash="
+                       << terminalTokenHash(rhs.tokens)
+                       << " first_token_mismatch=";
+                if (first_token_mismatch < shared_tokens)
+                {
+                    detail << first_token_mismatch
+                           << " primary_token="
+                           << lhs.tokens[first_token_mismatch]
+                           << " participant_token="
+                           << rhs.tokens[first_token_mismatch];
+                }
+                else if (lhs.tokens.size() != rhs.tokens.size())
+                {
+                    detail << shared_tokens << " value=missing";
+                }
+                else
+                {
+                    detail << "none";
+                }
+
+                detail << " primary_control={remaining="
+                       << lhs.remaining_token_count
+                       << ",stopped=" << lhs.model_stopped
+                       << ",transactions=" << lhs.transaction_count
+                       << ",accepted="
+                       << lhs.accepted_speculative_token_count
+                       << ",rejected=" << lhs.rejected_transaction_count
+                       << ",verifier_rows="
+                       << lhs.consumed_verifier_row_count
+                       << ",state_commits="
+                       << lhs.published_state_commit_count << "}"
+                       << " participant_control={remaining="
+                       << rhs.remaining_token_count
+                       << ",stopped=" << rhs.model_stopped
+                       << ",transactions=" << rhs.transaction_count
+                       << ",accepted="
+                       << rhs.accepted_speculative_token_count
+                       << ",rejected=" << rhs.rejected_transaction_count
+                       << ",verifier_rows="
+                       << rhs.consumed_verifier_row_count
+                       << ",state_commits="
+                       << rhs.published_state_commit_count << "}";
+                return detail.str();
+            }
+            return detail.str();
+        }
+
         /**
          * @brief Test-factory resolver that prevents unit tests from touching GPU backends.
          *
@@ -6848,72 +7030,11 @@ namespace llaminar2
                                     : std::vector<MTPMirroredTensorDigest>{});
                         }
 
-                        std::ostringstream digest_summary;
-                        digest_summary
-                            << " Mirrored MTP device-state digest comparison:";
-                        const size_t boundary_count =
-                            participant_digests.empty()
-                                ? 0
-                                : participant_digests.front().size();
-                        for (size_t boundary = 0;
-                             boundary < boundary_count;
-                             ++boundary)
-                        {
-                            const auto &reference =
-                                participant_digests.front()[boundary];
-                            bool differs = !reference.available;
-                            for (size_t participant = 1;
-                                 participant < participant_digests.size();
-                                 ++participant)
-                            {
-                                if (boundary >=
-                                    participant_digests[participant].size())
-                                {
-                                    differs = true;
-                                    continue;
-                                }
-                                const auto &candidate =
-                                    participant_digests[participant][boundary];
-                                differs =
-                                    differs ||
-                                    !candidate.available ||
-                                    candidate.name != reference.name ||
-                                    candidate.byte_count !=
-                                        reference.byte_count ||
-                                    candidate.hash != reference.hash;
-                            }
-                            if (!differs)
-                                continue;
-
-                            digest_summary
-                                << " [" << reference.name;
-                            for (size_t participant = 0;
-                                 participant < participant_digests.size();
-                                 ++participant)
-                            {
-                                digest_summary << " p" << participant << "=";
-                                if (boundary >=
-                                        participant_digests[participant]
-                                            .size() ||
-                                    !participant_digests[participant][boundary]
-                                         .available)
-                                {
-                                    digest_summary << "unavailable";
-                                    continue;
-                                }
-                                const auto &digest =
-                                    participant_digests[participant][boundary];
-                                digest_summary
-                                    << "0x" << std::hex << digest.hash
-                                    << std::dec << "/" << digest.byte_count
-                                    << "B";
-                            }
-                            digest_summary << "]";
-                        }
                         LOG_ERROR("RankOrchestrator::sampleGreedyFromMTPLogitsToDeviceDraftSlot: "
                                   "mirrored children sampled different draft tokens "
                                   << rank_token << " and " << child_token
-                                  << digest_summary.str());
+                                  << describeMirroredDigestMismatch(
+                                         participant_digests));
                         return false;
                     }
                 }
@@ -7389,7 +7510,7 @@ namespace llaminar2
         int verifier_token_count,
         const int32_t *stop_tokens,
         int stop_token_count,
-        const MTPGreedyPenaltyPolicy &penalty_policy)
+        const MTPRequestPenaltyPolicy &penalty_policy)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -7477,6 +7598,38 @@ namespace llaminar2
                     throw std::runtime_error(
                         std::string{"MTP request stop-token configuration was "
                                     "rejected by "} +
+                        group + " participant " + std::to_string(i));
+                }
+            }
+        };
+
+        configure_runners(device_runners_, "device");
+        configure_runners(pp_stage_runners_, "pipeline");
+        return true;
+    }
+
+    bool RankOrchestrator::configureMTPRequestPenaltyPolicy(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        auto configure_runners =
+            [&policy](
+                std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+                const char *group)
+        {
+            for (size_t i = 0; i < runners.size(); ++i)
+            {
+                if (!runners[i])
+                {
+                    throw std::logic_error(
+                        std::string{"Cannot configure MTP request penalty policy "
+                                    "on a null "} +
+                        group + " participant");
+                }
+                if (!runners[i]->configureMTPRequestPenaltyPolicy(policy))
+                {
+                    throw std::runtime_error(
+                        std::string{"MTP request penalty-policy configuration "
+                                    "was rejected by "} +
                         group + " participant " + std::to_string(i));
                 }
             }
@@ -9364,7 +9517,7 @@ namespace llaminar2
         buildCapturedStochasticVerifierTargetDistributions(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -9460,7 +9613,7 @@ namespace llaminar2
     bool RankOrchestrator::publishCapturedMTPDraftToken(
         int row,
         int slot,
-        const MTPGreedyPenaltyPolicy &penalty_policy)
+        const MTPRequestPenaltyPolicy &penalty_policy)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -10197,59 +10350,22 @@ namespace llaminar2
             return nullptr;
         }
 
-        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
-            deviceResidentLogicalSequenceState();
-        if (!current_rank_state.valid() ||
-            rank_resident_child_logical_state_handles_.size() !=
-                device_runners_.size())
-        {
-            LOG_ERROR("[RankOrchestrator] Request-batched verifier token preparation requires a current aggregate and one child logical-state mailbox per participant");
-            return nullptr;
-        }
-
         /*
-         * A caller of the rank API carries the opaque rank aggregate, never a
-         * child device pointer. Validate that identity once before translating
-         * each resident source to the corresponding child mailbox below. This
-         * prevents host marker addresses from leaking into a child graph while
-         * preserving a fully device-owned token source on every participant.
+         * Verifier conditions use participant-local canonical target slots.
+         * Initial sampling and accepted-state publication both refresh those
+         * slots, so rank orchestration forwards immutable slot indices and
+         * never translates aggregate logical-mailbox pointers into child state.
          */
         for (int row_index = 0; row_index < request_count; ++row_index)
         {
             const DeviceMTPVerifierInputBatchRequest &row =
                 requests[row_index];
-            if (!row.first_token_from_device)
-                continue;
-
-            const bool has_resident_state =
-                row.first_token_logical_state.valid();
-            const bool has_resident_index =
-                row.first_token_request_index >= 0;
-            const bool uses_resident_state =
-                has_resident_state && has_resident_index;
-            const bool uses_target_slot =
-                row.first_target_sample_slot >= 0;
-            if (has_resident_state != has_resident_index ||
-                uses_resident_state == uses_target_slot)
+            if (!row.first_token_from_device ||
+                row.first_target_sample_slot < 0)
             {
-                LOG_ERROR("[RankOrchestrator] Request-batched verifier token row "
+                LOG_ERROR("[RankOrchestrator] Request-batched GPU verifier token row "
                           << row_index
-                          << " must name exactly one complete device first-token source");
-                return nullptr;
-            }
-            if (uses_resident_state &&
-                (!row.first_token_logical_state.sameMailboxAs(
-                     current_rank_state) ||
-                 !row.first_token_logical_state.coversRequest(
-                     row.first_token_request_index) ||
-                 row.request_id != row.first_token_request_index))
-            {
-                LOG_ERROR("[RankOrchestrator] Request-batched verifier token row "
-                          << row_index
-                          << " carries a stale, foreign, or mismatched rank logical-state identity"
-                          << " request_id=" << row.request_id
-                          << " resident_request_index="
-                          << row.first_token_request_index);
+                          << " does not name its canonical device target slot");
                 return nullptr;
             }
         }
@@ -10263,33 +10379,9 @@ namespace llaminar2
             if (!device_runners_[i])
                 return nullptr;
 
-            const DeviceResidentLogicalSequenceStateHandle &child_state =
-                rank_resident_child_logical_state_handles_[i];
-            if (!child_state.valid() ||
-                child_state.request_count != current_rank_state.request_count ||
-                child_state.device != device_runners_[i]->primaryDeviceId())
-            {
-                LOG_ERROR("[RankOrchestrator] Request-batched verifier token preparation found a stale or foreign mailbox on participant "
-                          << i);
-                rank_mtp_verifier_child_token_inputs_.clear();
-                rank_mtp_verifier_child_token_count_ = 0;
-                return nullptr;
-            }
-
-            std::vector<DeviceMTPVerifierInputBatchRequest> child_requests(
-                requests,
-                requests + request_count);
-            for (DeviceMTPVerifierInputBatchRequest &row : child_requests)
-            {
-                if (row.first_token_from_device &&
-                    row.first_token_logical_state.valid())
-                {
-                    row.first_token_logical_state = child_state;
-                }
-            }
             rank_mtp_verifier_child_token_inputs_[i] =
                 device_runners_[i]->prepareMTPVerifierInputTokenBatchOnDevice(
-                    child_requests.data(),
+                    requests,
                     request_count,
                     padded_seq_len);
             if (!rank_mtp_verifier_child_token_inputs_[i])
@@ -10662,6 +10754,182 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::materializeDeviceResidentStochasticGeneration(
+        int request_count,
+        int draft_depth)
+    {
+        if (request_count <= 0 || draft_depth <= 0)
+        {
+            LOG_ERROR("[RankOrchestrator] Invalid device-generation parent preparation geometry"
+                      << " requests=" << request_count
+                      << " draft_depth=" << draft_depth);
+            return false;
+        }
+
+        const bool use_pp_participants = !pp_stage_runners_.empty();
+        auto &participants =
+            use_pp_participants ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation parent preparation has no participants");
+            return false;
+        }
+        if (participants.size() == 1)
+        {
+            return participants.front() &&
+                   participants.front()
+                       ->materializeDeviceResidentStochasticGeneration(
+                           request_count,
+                           draft_depth);
+        }
+
+        /*
+         * Parent composition calls backend graph-cloning/instantiation APIs and
+         * therefore belongs to each participant's persistent worker context.
+         * Complete every composition before launchDeviceResident... submits any
+         * graph: a rejected child on participant N must never be discovered
+         * after participant zero has entered a collective-bearing WHILE body.
+         */
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(participants.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback(
+                    [this]()
+                    {
+                        LOG_WARN("[TPWorkerPool] Device-generation parent preparation failure detected - aborting collective backend");
+                        tp_ctx_->requestAbort();
+                    });
+            }
+        }
+        if (tp_worker_pool_->numWorkers() != participants.size())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation parent preparation participant count does not match the persistent TP worker pool");
+            return false;
+        }
+
+        const auto kernel_phase = KernelProfiler::getCurrentPhase();
+        const auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        const auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        const auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        const auto executor_phase = GraphExecutorStats::currentPhase();
+        tp_worker_pool_->dispatch(
+            [this, use_pp_participants, request_count, draft_depth,
+             kernel_phase, rocm_phase, cuda_phase, kv_phase,
+             executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                auto &worker_participants =
+                    use_pp_participants
+                        ? pp_stage_runners_
+                        : device_runners_;
+                if (i >= worker_participants.size() ||
+                    !worker_participants[i])
+                {
+                    return false;
+                }
+
+                const DeviceId device =
+                    worker_participants[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device.ordinal);
+                return worker_participants[i]
+                    ->materializeDeviceResidentStochasticGeneration(
+                        request_count,
+                        draft_depth);
+            });
+
+        const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        bool all_success = true;
+        bool worker_timeout = false;
+        std::exception_ptr first_exception;
+        size_t first_exception_device = 0;
+        auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
+        for (auto &result : results)
+        {
+            if (!result.completed)
+            {
+                worker_timeout = true;
+                all_success = false;
+            }
+            if (!result.success)
+                all_success = false;
+            if (result.exception && !first_exception)
+            {
+                first_exception = result.exception;
+                first_exception_device = result.worker_index;
+                all_success = false;
+            }
+        }
+        if (worker_timeout && collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "materializeDeviceResidentStochasticGeneration",
+                collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation parent preparation re-throwing primary exception from participant "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        return all_success;
+    }
+
+    bool RankOrchestrator::launchDeviceResidentStochasticGeneration()
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation parent launch has no participants");
+            return false;
+        }
+
+        /*
+         * Enqueue every participant before waiting for any terminal result.
+         * Captured NCCL/RCCL nodes may rendezvous across these graphs, so
+         * synchronizing participant zero before participant one is launched
+         * would deadlock the domain. A failure after any earlier launch leaves
+         * a partially submitted distributed transaction and is therefore
+         * process-fatal rather than recoverable.
+         */
+        for (size_t participant_index = 0;
+             participant_index < participants.size();
+             ++participant_index)
+        {
+            if (!participants[participant_index] ||
+                !participants[participant_index]
+                     ->launchDeviceResidentStochasticGeneration())
+            {
+                LOG_ERROR("[RankOrchestrator] Device-generation parent launch failed on participant "
+                          << participant_index);
+                if (participant_index != 0)
+                    std::terminate();
+                return false;
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_device_generation_parent_launches",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(participants.size())},
+             {"launch_order", "all_participants_before_terminal_wait"}});
+        return true;
+    }
+
     bool RankOrchestrator::finishDeviceResidentStochasticGeneration(
         DeviceGenerationTerminalResult *out_result)
     {
@@ -10711,13 +10979,33 @@ namespace llaminar2
             if (participant_results[participant_index].requests !=
                 authoritative_requests)
             {
+                std::vector<std::vector<MTPMirroredTensorDigest>>
+                    participant_digests;
+                participant_digests.reserve(participants.size());
+                for (const auto &participant : participants)
+                {
+                    auto *device_orchestrator =
+                        dynamic_cast<DeviceGraphOrchestrator *>(
+                            participant.get());
+                    participant_digests.push_back(
+                        device_orchestrator
+                            ? device_orchestrator
+                                  ->captureFailedMirroredMTPDigests()
+                            : std::vector<MTPMirroredTensorDigest>{});
+                }
                 LOG_ERROR("[RankOrchestrator] Mirrored terminal device-generation ledgers disagree"
                           << " primary="
                           << participant_results.front().device.toString()
                           << " participant="
                           << participant_results[participant_index]
                                  .device.toString()
-                          << " participant_index=" << participant_index);
+                          << " participant_index=" << participant_index
+                          << describeTerminalLedgerMismatch(
+                                 authoritative_requests,
+                                 participant_results[participant_index]
+                                     .requests)
+                          << describeMirroredDigestMismatch(
+                                 participant_digests));
                 return false;
             }
         }
@@ -12679,7 +12967,7 @@ namespace llaminar2
     bool RankOrchestrator::applyDeviceOwnedMTPPenaltiesToLogitRows(
         DeviceLogitsSource source,
         int row_count,
-        const MTPGreedyPenaltyPolicy &penalty_policy)
+        const MTPRequestPenaltyPolicy &penalty_policy)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -12736,7 +13024,7 @@ namespace llaminar2
 
     bool RankOrchestrator::applyDeviceOwnedMTPBranchPenaltiesToLogits(
         int prior_draft_count,
-        const MTPGreedyPenaltyPolicy &penalty_policy)
+        const MTPRequestPenaltyPolicy &penalty_policy)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {

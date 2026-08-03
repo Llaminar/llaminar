@@ -700,7 +700,9 @@ __global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
 __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
     const int *__restrict__ output_tokens,
     const int *__restrict__ output_meta,
-    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ accepted_state_counts,
+    const int *__restrict__ stopped_flags,
     int output_token_capacity,
     int vocab_size,
     int *__restrict__ generated_token_counts)
@@ -710,12 +712,21 @@ __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
     if (output_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
         return;
 
+    if (policy->enabled == 0)
+    {
+        policy->first_token_already_in_history = 0;
+        return;
+    }
+
     int output_count =
         output_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount];
     if (output_count < 0)
         output_count = 0;
     if (output_count > output_token_capacity)
         output_count = output_token_capacity;
+    const int accepted_state_count = accepted_state_counts[0];
+    if (accepted_state_count < 0 || accepted_state_count > output_count)
+        return;
     const int begin =
         policy->first_token_already_in_history != 0 ? 1 : 0;
     for (int i = begin; i < output_count; ++i)
@@ -724,8 +735,12 @@ __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
         if (token >= 0 && token < vocab_size)
             ++generated_token_counts[token];
     }
+
+    policy->first_token_already_in_history =
+        stopped_flags[0] == 0 && output_count > accepted_state_count ? 1 : 0;
 }
 
+template <bool PUBLISH_MTP_CHAIN>
 __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     const float *__restrict__ partial_vals,
     const int *__restrict__ partial_idxs,
@@ -733,7 +748,10 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     int row_partial_capacity,
     float *__restrict__ out_values,
     int *__restrict__ out_indices,
-    int output_stride)
+    int output_stride,
+    int *__restrict__ chain_condition_tokens,
+    int *__restrict__ chain_position_ids,
+    int chain_position_increment)
 {
     extern __shared__ char shared_mem[];
     const int wave_count = static_cast<int>(blockDim.x) / warpSize;
@@ -768,6 +786,11 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
         const int out_row = row * output_stride;
         out_values[out_row] = block_max.value;
         out_indices[out_row] = block_max.index;
+        if constexpr (PUBLISH_MTP_CHAIN)
+        {
+            chain_condition_tokens[row] = block_max.index;
+            chain_position_ids[row] += chain_position_increment;
+        }
     }
 }
 
@@ -807,14 +830,23 @@ static bool launchROCmArgmaxF32BatchedRowsGeometry(
     int output_stride,
     int reduce_threads,
     int elements_per_thread,
-    int finalize_threads)
+    int finalize_threads,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment)
 {
+    const bool publish_mtp_chain =
+        chain_condition_tokens != nullptr || chain_position_ids != nullptr ||
+        chain_position_increment != 0;
     if (rows <= 0 || cols <= 0 || row_stride < cols ||
         !data || !out_values || !out_indices ||
         !partial_vals || !partial_idxs || partial_capacity < rows ||
         !stream || output_stride <= 0 || elements_per_thread <= 0 ||
         !validROCmArgmaxThreadCount(reduce_threads) ||
-        !validROCmArgmaxThreadCount(finalize_threads))
+        !validROCmArgmaxThreadCount(finalize_threads) ||
+        (publish_mtp_chain &&
+         (!chain_condition_tokens || !chain_position_ids ||
+          chain_position_increment <= 0)))
     {
         return false;
     }
@@ -854,19 +886,44 @@ static bool launchROCmArgmaxF32BatchedRowsGeometry(
     const size_t finalize_shared_bytes =
         static_cast<size_t>(finalize_threads / 32) *
         (sizeof(float) + sizeof(int));
-    hipLaunchKernelGGL(
-        rocm_argmax_finalize_f32_batched_rows_kernel,
-        dim3(rows),
-        dim3(finalize_threads),
-        finalize_shared_bytes,
-        s,
-        partial_vals,
-        partial_idxs,
-        num_blocks,
-        row_partial_capacity,
-        out_values,
-        out_indices,
-        output_stride);
+    if (publish_mtp_chain)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<true>),
+            dim3(rows),
+            dim3(finalize_threads),
+            finalize_shared_bytes,
+            s,
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            chain_condition_tokens,
+            chain_position_ids,
+            chain_position_increment);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<false>),
+            dim3(rows),
+            dim3(finalize_threads),
+            finalize_shared_bytes,
+            s,
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            nullptr,
+            nullptr,
+            0);
+    }
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -1000,7 +1057,48 @@ bool rocmOps_argmax_f32_batched_rows(
         output_stride,
         ARGMAX_REDUCE_THREADS,
         ARGMAX_ELEMS_PER_THREAD,
-        ARGMAX_FINALIZE_THREADS);
+        ARGMAX_FINALIZE_THREADS,
+        nullptr,
+        nullptr,
+        0);
+}
+
+bool rocmOps_argmax_f32_batched_rows_publish_mtp_chain(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        ARGMAX_REDUCE_THREADS,
+        ARGMAX_ELEMS_PER_THREAD,
+        ARGMAX_FINALIZE_THREADS,
+        chain_condition_tokens,
+        chain_position_ids,
+        chain_position_increment);
 }
 
 /**
@@ -1038,7 +1136,58 @@ bool rocmOps_argmax_f32_batched_rows_geometry(
         output_stride,
         reduce_threads,
         elements_per_thread,
-        finalize_threads);
+        finalize_threads,
+        nullptr,
+        nullptr,
+        0);
+}
+
+/**
+ * @brief Perf__ entry point for producer-owned MTP-chain publication.
+ *
+ * This invokes the exact production template specialization while exposing only
+ * launch geometry to the performance harness. Inference remains bound to one
+ * stable capture-time geometry and never autotunes on the hot path.
+ */
+bool rocmOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        reduce_threads,
+        elements_per_thread,
+        finalize_threads,
+        chain_condition_tokens,
+        chain_position_ids,
+        chain_position_increment);
 }
 
 bool rocmOps_configure_mtp_greedy_penalty_policy(
@@ -1135,7 +1284,7 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         partial_idxs,
         row_partial_capacity);
     hipLaunchKernelGGL(
-        rocm_argmax_finalize_f32_batched_rows_kernel,
+        HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<false>),
         dim3(rows),
         dim3(ARGMAX_FINALIZE_THREADS),
         static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
@@ -1147,7 +1296,10 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         row_partial_capacity,
         out_values,
         out_indices,
-        output_stride);
+        output_stride,
+        nullptr,
+        nullptr,
+        0);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
@@ -1276,7 +1428,9 @@ bool rocmOps_apply_mtp_branch_penalties_f32_row(
 bool rocmOps_commit_mtp_greedy_penalty_history(
     const int *output_tokens,
     const int *output_meta,
-    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *accepted_state_counts,
+    const int *stopped_flags,
     int output_token_capacity,
     int vocab_size,
     int *generated_token_counts,
@@ -1284,6 +1438,7 @@ bool rocmOps_commit_mtp_greedy_penalty_history(
     void *stream)
 {
     if (!output_tokens || !output_meta || !policy ||
+        !accepted_state_counts || !stopped_flags ||
         output_token_capacity <= 0 || vocab_size <= 0 ||
         !generated_token_counts || !stream)
     {
@@ -1300,6 +1455,8 @@ bool rocmOps_commit_mtp_greedy_penalty_history(
         output_tokens,
         output_meta,
         policy,
+        accepted_state_counts,
+        stopped_flags,
         output_token_capacity,
         vocab_size,
         generated_token_counts);

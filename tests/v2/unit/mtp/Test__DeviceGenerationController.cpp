@@ -93,6 +93,9 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
             response_budget);
         EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 0);
         EXPECT_EQ(
+            control[kDeviceGenerationControlPublishedStateCommitCount],
+            0);
+        EXPECT_EQ(
             control[kDeviceGenerationControlErrorCode],
             static_cast<int>(DeviceGenerationError::None));
 
@@ -119,6 +122,63 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
             }
         }
     }
+}
+
+TEST(Test__DeviceGenerationController, PublicationRejectsBudgetBeyondActiveCapturedRows)
+{
+    using namespace llaminar2::sampling_math;
+
+    constexpr int active_verifier_rows = 5;
+    constexpr int configured_max_verifier_rows = 15;
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/64,
+        /*response_capacity=*/64,
+        control.data()));
+    ASSERT_EQ(
+        prepare_device_generation_transaction_budget(
+            configured_max_verifier_rows,
+            configured_max_verifier_rows,
+            control.data()),
+        configured_max_verifier_rows);
+
+    std::array<int32_t, active_verifier_rows> compact_tokens = {
+        101, 102, 103, -1, -1};
+    MetaRow meta = makeMeta(
+        /*output_count=*/3,
+        /*leading_count=*/0,
+        /*verifier_state_count=*/2,
+        /*accepted_prefix=*/1,
+        /*consumed_rows=*/2,
+        /*all_accepted=*/false);
+    std::array<int32_t, 64> response{};
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int publication_ok = -1;
+    int32_t next_condition_token = -1;
+
+    EXPECT_FALSE(
+        commit_device_generation_and_derive_speculative_publication_metadata(
+            compact_tokens.data(),
+            static_cast<int>(compact_tokens.size()),
+            meta.data(),
+            static_cast<int>(meta.size()),
+            /*request_index=*/0,
+            /*padded_state_rows_per_request=*/active_verifier_rows,
+            /*base_cached_tokens=*/23,
+            response.data(),
+            static_cast<int>(response.size()),
+            control.data(),
+            &restore_row,
+            &target_cached_tokens,
+            &accepted_state_count,
+            &publication_ok,
+            &next_condition_token));
+
+    expectFatal(control, DeviceGenerationError::InvalidPublicationMetadata);
+    EXPECT_EQ(meta[kSpecBatchMetaOk], 0);
+    EXPECT_EQ(publication_ok, 0);
 }
 
 TEST(Test__DeviceGenerationController, RejectCarryAndStopMatchSerialResponseBytes)
@@ -199,6 +259,9 @@ TEST(Test__DeviceGenerationController, RejectCarryAndStopMatchSerialResponseByte
     EXPECT_EQ(control[kDeviceGenerationControlAcceptedSpeculativeTokenCount], 4);
     EXPECT_EQ(control[kDeviceGenerationControlRejectedTransactionCount], 1);
     EXPECT_EQ(control[kDeviceGenerationControlConsumedVerifierRowCount], 6);
+    EXPECT_EQ(
+        control[kDeviceGenerationControlPublishedStateCommitCount],
+        6);
 
     const ControlRow terminal_control = control;
     const auto terminal_response = response;
@@ -259,6 +322,9 @@ TEST(Test__DeviceGenerationController, EveryProductionMTPDepthAppendsByteExactly
         EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
         EXPECT_EQ(
             control[kDeviceGenerationControlAcceptedSpeculativeTokenCount],
+            mtp_depth);
+        EXPECT_EQ(
+            control[kDeviceGenerationControlPublishedStateCommitCount],
             mtp_depth);
     }
 }

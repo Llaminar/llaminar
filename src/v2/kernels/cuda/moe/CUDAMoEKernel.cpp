@@ -735,6 +735,7 @@ extern "C"
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool normalize_weights,
         bool write_legacy_outputs, bool update_runtime_histogram,
+        bool fully_replicated_local_rows,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -768,6 +769,7 @@ extern "C"
         void *command_header,
         void *wave_state,
         void *controller_state,
+        void *llep_layer_plans,
         uint32_t command_buffer_count,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
@@ -3541,7 +3543,8 @@ namespace llaminar2
                                           ITensor *output_indices, ITensor *output_weights,
                                           bool write_legacy_outputs,
                                           bool update_runtime_histogram,
-                                          const int32_t *absolute_position_ids_device)
+                                          const int32_t *absolute_position_ids_device,
+                                          RoutedExpertRowExecutionPolicy row_execution_policy)
     {
         void *stream = requireStream("CUDAMoEKernel::decodeRouteSelect");
         const DeviceId device = deviceId();
@@ -3632,6 +3635,8 @@ namespace llaminar2
                                                  legacy_indices, legacy_weights,
                                                  num_experts, top_k, normalize_weights,
                                                  write_legacy_outputs, update_runtime_histogram,
+                                                 row_execution_policy ==
+                                                     RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
                                                  nullptr,
                                                  nullptr,
                                                  0u,
@@ -3674,7 +3679,8 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
-        const int32_t *absolute_position_ids_device)
+        const int32_t *absolute_position_ids_device,
+        RoutedExpertRowExecutionPolicy row_execution_policy)
     {
         void *stream = requireStream("CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply");
         const DeviceId device = deviceId();
@@ -3774,6 +3780,8 @@ namespace llaminar2
                 legacy_indices, legacy_weights,
                 num_experts, top_k, normalize_weights,
                 write_legacy_outputs, update_runtime_histogram,
+                row_execution_policy ==
+                    RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -3812,21 +3820,27 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count,
         const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
-        uint32_t local_transfer_slot_count)
+        uint32_t local_transfer_slot_count,
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans)
     {
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
             return false;
         }
-        if (!runtime_layers || !gathered_histograms || !status)
+        if (!runtime_layers || !gathered_histograms || !status || !controller_state)
         {
-            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, and status must be non-null");
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, and persistent controller state must be non-null");
+            return false;
+        }
+        if (config.routed_assignment_policy ==
+                kDeviceMoERebalanceAssignmentLeastLoadedResident &&
+            !llep_layer_plans)
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] LLEP requires graph-lifetime parallel planner scratch");
             return false;
         }
         void *stream = explicitMoELaunchStream(launch, "runDeviceRebalanceController");
-        if (!stream)
-            return false;
         if (!stream)
             return false;
         if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
@@ -3844,6 +3858,7 @@ namespace llaminar2
             command_header,
             wave_state,
             controller_state,
+            llep_layer_plans,
             command_buffer_count,
             local_transfer_slots,
             local_transfer_slot_count,

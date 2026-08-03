@@ -731,7 +731,7 @@ namespace llaminar2
              */
             GraphSnapshotManifest snapshot_manifest;
             bool initialized = false;                 ///< Whether segments have been built
-            bool needs_capture = false;               ///< True after warmup, before capture
+            bool needs_capture = false;               ///< Transient true only within atomic first-use materialization
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
             uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes

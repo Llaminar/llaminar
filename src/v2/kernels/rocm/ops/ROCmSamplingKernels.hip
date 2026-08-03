@@ -3377,6 +3377,7 @@ rocm_summarize_speculative_verify_batch_device_generation_controls_kernel(
  * temporary storage, and a second launch while covering depths one through
  * fifteen plus the terminal bonus row.
  */
+template <bool RetainFirstTransactionDiagnostic>
 __global__ __launch_bounds__(64, 1) void
 rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
     const int *__restrict__ target_token_ids,
@@ -3393,28 +3394,71 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
     int *__restrict__ sampled_target_tokens,
     int *__restrict__ out_tokens,
     int out_token_capacity,
-    int *__restrict__ out_meta)
+    int *__restrict__ out_meta,
+    llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord
+        *__restrict__ first_transaction_diagnostic)
 {
     constexpr int kMaxSampleRows = 16;
     __shared__ int sampled_rows[kMaxSampleRows];
 
     const int sample_row = static_cast<int>(threadIdx.x);
     const int sample_row_count = row_count + 1;
-    if (sample_row < sample_row_count)
+    const int transaction_count =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlTransactionCount];
+    const bool retain_first_transaction =
+        RetainFirstTransactionDiagnostic &&
+        first_transaction_diagnostic &&
+        transaction_count == 0;
+    if (sample_row < kMaxSampleRows)
     {
-        const float threshold =
-            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
-                threshold_seed,
-                *threshold_position + threshold_position_offset + sample_row,
-                0 /* MTPSpecStochasticDrawPurpose::Sample */);
-        const int sampled =
-            llaminar2::sampling_math::sample_distribution_with_threshold(
-                target_token_ids + sample_row * target_row_stride,
-                target_probs + sample_row * target_row_stride,
-                top_k,
-                threshold);
-        sampled_rows[sample_row] = sampled;
-        sampled_target_tokens[sample_row] = sampled;
+        const bool active = sample_row < sample_row_count;
+        float threshold = 0.0f;
+        int sampled = -1;
+        if (active)
+        {
+            threshold =
+                llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                    threshold_seed,
+                    *threshold_position + threshold_position_offset +
+                        sample_row,
+                    0 /* MTPSpecStochasticDrawPurpose::Sample */);
+            sampled =
+                llaminar2::sampling_math::
+                    sample_distribution_with_threshold(
+                        target_token_ids +
+                            sample_row * target_row_stride,
+                        target_probs + sample_row * target_row_stride,
+                        top_k,
+                        threshold);
+            sampled_rows[sample_row] = sampled;
+            sampled_target_tokens[sample_row] = sampled;
+        }
+        if constexpr (RetainFirstTransactionDiagnostic)
+        {
+            if (retain_first_transaction)
+            {
+                llaminar2::sampling_math::
+                    record_mtp_first_transaction_sample_row(
+                        first_transaction_diagnostic,
+                        sample_row,
+                        active,
+                        active
+                            ? target_token_ids +
+                                  sample_row * target_row_stride
+                            : nullptr,
+                        active
+                            ? target_probs +
+                                  sample_row * target_row_stride
+                            : nullptr,
+                        top_k,
+                        verifier_input_tokens,
+                        row_count,
+                        threshold,
+                        sampled);
+            }
+        }
     }
     __syncthreads();
 
@@ -3445,6 +3489,125 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
             out_meta,
             verifier_input_tokens,
             leading_committed_output_count);
+
+    if constexpr (RetainFirstTransactionDiagnostic)
+    {
+        if (retain_first_transaction)
+        {
+            llaminar2::sampling_math::
+                finalize_mtp_first_transaction_diagnostic(
+                    first_transaction_diagnostic,
+                    threshold_seed,
+                    *threshold_position,
+                    threshold_position_offset,
+                    row_count,
+                    top_k,
+                    transaction_count,
+                    commit_budget,
+                    leading_committed_output_count,
+                    out_tokens,
+                    out_token_capacity,
+                    out_meta);
+        }
+    }
+}
+
+/**
+ * @brief Retain one transaction-zero sidecar boundary on the exact graph stream.
+ *
+ * The fixed-order lane fold is the HIP counterpart of the CUDA diagnostic.
+ * It intentionally exists only in opt-in diagnostic graph topology; ordinary
+ * MTP publication pays no branch, launch, transfer, or storage traffic.
+ */
+__global__ __launch_bounds__(256, 1) void
+rocm_retain_mtp_first_transaction_draft_boundary_kernel(
+    const uint32_t *__restrict__ data_words,
+    int word_count,
+    int boundary,
+    int draft_slot,
+    const int *__restrict__ condition_token,
+    const int *__restrict__ position_id,
+    const int *__restrict__ generation_control,
+    int generation_control_stride,
+    llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord
+        *__restrict__ diagnostic)
+{
+    using namespace llaminar2::sampling_math;
+    constexpr int kThreads = 256;
+    __shared__ unsigned long long lane_hashes[kThreads];
+
+    if (!generation_control || !diagnostic || generation_control_stride <
+            kDeviceGenerationControlCount ||
+        generation_control[kDeviceGenerationControlTransactionCount] != 0)
+    {
+        return;
+    }
+
+    const int lane = static_cast<int>(threadIdx.x);
+    uint64_t hash = 1469598103934665603ULL ^
+                    static_cast<uint64_t>(lane + 1);
+    for (int index = lane; index < word_count; index += kThreads)
+    {
+        hash = append_diagnostic_u32_fnv1a(
+            hash,
+            static_cast<uint32_t>(index));
+        hash = append_diagnostic_u32_fnv1a(hash, data_words[index]);
+    }
+    lane_hashes[lane] = hash;
+    __syncthreads();
+
+    if (lane != 0)
+        return;
+
+    if (draft_slot == 0 && boundary == 0)
+    {
+        diagnostic->valid = 0;
+        diagnostic->version = kMTPFirstTransactionDiagnosticVersion;
+        diagnostic->draft_diagnostic_depth = 0;
+        for (int slot = 0; slot < kSpeculativeBatchMaxRows; ++slot)
+        {
+            diagnostic->draft_condition_tokens[slot] = -1;
+            diagnostic->draft_position_ids[slot] = -1;
+            for (int retained_boundary = 0;
+                 retained_boundary < kMTPFirstTransactionDraftBoundaryCount;
+                 ++retained_boundary)
+            {
+                diagnostic->draft_boundary_word_counts[slot]
+                                                       [retained_boundary] = 0;
+                diagnostic->draft_boundary_hashes[slot]
+                                                   [retained_boundary] = 0;
+            }
+        }
+    }
+
+    if (boundary == 0)
+    {
+        diagnostic->draft_condition_tokens[draft_slot] = *condition_token;
+        diagnostic->draft_position_ids[draft_slot] = *position_id;
+        diagnostic->draft_diagnostic_depth = draft_slot + 1;
+    }
+
+    uint64_t folded = 1469598103934665603ULL;
+    if (word_count > 0)
+    {
+        for (int source_lane = 0; source_lane < kThreads; ++source_lane)
+        {
+            const uint64_t lane_hash = lane_hashes[source_lane];
+            folded = append_diagnostic_u32_fnv1a(
+                folded,
+                static_cast<uint32_t>(lane_hash));
+            folded = append_diagnostic_u32_fnv1a(
+                folded,
+                static_cast<uint32_t>(lane_hash >> 32U));
+        }
+    }
+    else
+    {
+        folded = 0;
+    }
+    diagnostic->draft_boundary_word_counts[draft_slot][boundary] =
+        static_cast<uint32_t>(word_count);
+    diagnostic->draft_boundary_hashes[draft_slot][boundary] = folded;
 }
 
 /**
@@ -3687,7 +3850,10 @@ rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel
     int *__restrict__ out_ok,
     int32_t *__restrict__ out_next_condition_tokens,
     int *__restrict__ out_all_drafts_accepted_flags,
-    int *__restrict__ out_stopped_flags)
+    int *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_next_sidecar_condition_tokens,
+    int32_t *__restrict__ out_next_sidecar_position_ids,
+    int32_t *__restrict__ out_next_verifier_condition_tokens)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -3728,6 +3894,20 @@ rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel
             ? out_all_drafts_accepted_flags + request_index
             : nullptr,
         out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+
+    if (out_next_sidecar_condition_tokens &&
+        out_next_sidecar_position_ids)
+    {
+        out_next_sidecar_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+        out_next_sidecar_position_ids[request_index] =
+            out_target_cached_tokens[request_index];
+    }
+    if (out_next_verifier_condition_tokens)
+    {
+        out_next_verifier_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+    }
 }
 
 /**
@@ -3752,7 +3932,8 @@ __global__ void rocm_derive_speculative_publication_metadata_kernel(
     const int32_t *__restrict__ output_tokens,
     int output_token_stride,
     int *__restrict__ out_all_drafts_accepted_flags,
-    int *__restrict__ out_stopped_flags)
+    int *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_next_verifier_condition_tokens)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -3776,6 +3957,11 @@ __global__ void rocm_derive_speculative_publication_metadata_kernel(
         out_next_condition_tokens ? out_next_condition_tokens + request_index : nullptr,
         out_all_drafts_accepted_flags ? out_all_drafts_accepted_flags + request_index : nullptr,
         out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+    if (out_next_verifier_condition_tokens)
+    {
+        out_next_verifier_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+    }
 }
 
 /**
@@ -5715,6 +5901,7 @@ rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generati
     int *out_tokens,
     int out_token_capacity,
     int *out_meta,
+    void *first_transaction_diagnostic,
     int device_idx,
     void *stream)
 {
@@ -5731,24 +5918,56 @@ rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generati
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel,
-        dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream),
-        target_token_ids,
-        target_probs,
-        target_row_stride,
-        top_k,
-        row_count,
-        threshold_seed,
-        threshold_position,
-        threshold_position_offset,
-        verifier_input_tokens,
-        stop_tokens,
-        generation_control,
-        sampled_target_tokens,
-        out_tokens,
-        out_token_capacity,
-        out_meta);
+    using DiagnosticRecord =
+        llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord;
+    auto *diagnostic =
+        static_cast<DiagnosticRecord *>(first_transaction_diagnostic);
+    if (diagnostic)
+    {
+        hipLaunchKernelGGL(
+            (rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel<
+                true>),
+            dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream),
+            target_token_ids,
+            target_probs,
+            target_row_stride,
+            top_k,
+            row_count,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
+            verifier_input_tokens,
+            stop_tokens,
+            generation_control,
+            sampled_target_tokens,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            diagnostic);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            (rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel<
+                false>),
+            dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream),
+            target_token_ids,
+            target_probs,
+            target_row_stride,
+            top_k,
+            row_count,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
+            verifier_input_tokens,
+            stop_tokens,
+            generation_control,
+            sampled_target_tokens,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            nullptr);
+    }
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -5756,6 +5975,58 @@ rocmOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generati
         fprintf(
             stderr,
             "ROCm fused serial-equivalent speculative outcome launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_retain_mtp_first_transaction_draft_boundary(
+    const uint32_t *data_words,
+    int word_count,
+    int boundary,
+    int draft_slot,
+    const int *condition_token,
+    const int *position_id,
+    const int *generation_control,
+    int generation_control_stride,
+    void *diagnostic_record,
+    int device_idx,
+    void *stream)
+{
+    using namespace llaminar2::sampling_math;
+    if (word_count < 0 || (word_count > 0 && !data_words) ||
+        boundary < 0 ||
+        boundary >= kMTPFirstTransactionDraftBoundaryCount ||
+        draft_slot < 0 || draft_slot >= kSpeculativeBatchMaxRows ||
+        !condition_token || !position_id || !generation_control ||
+        generation_control_stride < kDeviceGenerationControlCount ||
+        !diagnostic_record || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_retain_mtp_first_transaction_draft_boundary_kernel,
+        dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream),
+        data_words,
+        word_count,
+        boundary,
+        draft_slot,
+        condition_token,
+        position_id,
+        generation_control,
+        generation_control_stride,
+        static_cast<MTPFirstTransactionDiagnosticRecord *>(
+            diagnostic_record));
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm first-transaction MTP draft-boundary diagnostic launch failed: %s\n",
             hipGetErrorString(err));
         return false;
     }
@@ -6033,6 +6304,9 @@ rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
     int *out_next_condition_tokens,
     int *out_all_drafts_accepted_flags,
     int *out_stopped_flags,
+    int *out_next_sidecar_condition_tokens,
+    int *out_next_sidecar_position_ids,
+    int *out_next_verifier_condition_tokens,
     int device_idx,
     void *stream)
 {
@@ -6046,6 +6320,13 @@ rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
             llaminar2::sampling_math::kDeviceGenerationControlCount ||
         !out_restore_rows || !out_target_cached_tokens ||
         !out_accepted_state_counts || !out_ok ||
+        ((out_next_sidecar_condition_tokens ||
+          out_next_sidecar_position_ids) &&
+         (!out_next_sidecar_condition_tokens ||
+          !out_next_sidecar_position_ids ||
+          !out_next_condition_tokens)) ||
+        (out_next_verifier_condition_tokens &&
+         !out_next_condition_tokens) ||
         !stream)
     {
         return false;
@@ -6080,7 +6361,11 @@ rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
         out_ok,
         reinterpret_cast<int32_t *>(out_next_condition_tokens),
         out_all_drafts_accepted_flags,
-        out_stopped_flags);
+        out_stopped_flags,
+        reinterpret_cast<int32_t *>(out_next_sidecar_condition_tokens),
+        reinterpret_cast<int32_t *>(out_next_sidecar_position_ids),
+        reinterpret_cast<int32_t *>(
+            out_next_verifier_condition_tokens));
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
@@ -6107,6 +6392,7 @@ bool rocmOps_derive_speculative_publication_metadata(
     int output_token_stride,
     int *out_all_drafts_accepted_flags,
     int *out_stopped_flags,
+    int *out_next_verifier_condition_tokens,
     int device_idx,
     void *stream)
 {
@@ -6115,6 +6401,8 @@ bool rocmOps_derive_speculative_publication_metadata(
         !out_accepted_state_counts || !out_ok || !stream ||
         ((out_next_condition_tokens || output_tokens) &&
          (!out_next_condition_tokens || !output_tokens || output_token_stride <= 0)) ||
+        (out_next_verifier_condition_tokens &&
+         !out_next_condition_tokens) ||
         meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
         request_count <= 0 ||
         padded_state_rows_per_request <= 0 ||
@@ -6146,7 +6434,9 @@ bool rocmOps_derive_speculative_publication_metadata(
         output_tokens,
         output_token_stride,
         out_all_drafts_accepted_flags,
-        out_stopped_flags);
+        out_stopped_flags,
+        reinterpret_cast<int32_t *>(
+            out_next_verifier_condition_tokens));
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

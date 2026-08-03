@@ -38,6 +38,26 @@ extern "C" bool cudaOps_argmax_f32_batched_rows_geometry(
     int reduce_threads,
     int elements_per_thread,
     int finalize_threads);
+
+extern "C" bool cudaOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads);
 #endif
 
 #ifdef HAVE_ROCM
@@ -48,6 +68,26 @@ extern "C" bool rocmOps_argmax_f32_batched_rows_geometry(
     int row_stride,
     float *out_values,
     int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads);
+
+extern "C" bool rocmOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
     float *partial_vals,
     int *partial_idxs,
     int partial_capacity,
@@ -128,7 +168,8 @@ namespace
     void runArgmaxGeometrySweep(
         const std::string &backend_name,
         IBackend *backend,
-        DeviceId device)
+        DeviceId device,
+        bool publish_mtp_chain)
     {
         if (!backend)
             GTEST_SKIP() << backend_name << " backend unavailable";
@@ -166,11 +207,21 @@ namespace
             backend,
             device_id,
             static_cast<size_t>(kPartialCapacity) * sizeof(int));
+        DeviceAllocation d_chain_condition_token(
+            backend,
+            device_id,
+            sizeof(int));
+        DeviceAllocation d_chain_position_id(
+            backend,
+            device_id,
+            sizeof(int));
         ASSERT_TRUE(d_logits);
         ASSERT_TRUE(d_value);
         ASSERT_TRUE(d_index);
         ASSERT_TRUE(d_partial_values);
         ASSERT_TRUE(d_partial_indices);
+        ASSERT_TRUE(d_chain_condition_token);
+        ASSERT_TRUE(d_chain_position_id);
         ASSERT_TRUE(backend->hostToDeviceOnStream(
             d_logits.get(),
             logits.data(),
@@ -217,6 +268,28 @@ namespace
 #ifdef HAVE_CUDA
             if (backend_name == "CUDA")
             {
+                if (publish_mtp_chain)
+                {
+                    return cudaOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+                        static_cast<const float *>(d_logits.get()),
+                        /*rows=*/1,
+                        kQwen36Vocab,
+                        kQwen36Vocab,
+                        static_cast<float *>(d_value.get()),
+                        static_cast<int *>(d_index.get()),
+                        static_cast<int *>(d_chain_condition_token.get()),
+                        static_cast<int *>(d_chain_position_id.get()),
+                        /*chain_position_increment=*/1,
+                        static_cast<float *>(d_partial_values.get()),
+                        static_cast<int *>(d_partial_indices.get()),
+                        kPartialCapacity,
+                        device_id,
+                        stream,
+                        /*output_stride=*/1,
+                        reduce,
+                        elements,
+                        finalize);
+                }
                 return cudaOps_argmax_f32_batched_rows_geometry(
                     static_cast<const float *>(d_logits.get()),
                     /*rows=*/1,
@@ -238,6 +311,28 @@ namespace
 #ifdef HAVE_ROCM
             if (backend_name == "ROCm")
             {
+                if (publish_mtp_chain)
+                {
+                    return rocmOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+                        static_cast<const float *>(d_logits.get()),
+                        /*rows=*/1,
+                        kQwen36Vocab,
+                        kQwen36Vocab,
+                        static_cast<float *>(d_value.get()),
+                        static_cast<int *>(d_index.get()),
+                        static_cast<int *>(d_chain_condition_token.get()),
+                        static_cast<int *>(d_chain_position_id.get()),
+                        /*chain_position_increment=*/1,
+                        static_cast<float *>(d_partial_values.get()),
+                        static_cast<int *>(d_partial_indices.get()),
+                        kPartialCapacity,
+                        device_id,
+                        stream,
+                        /*output_stride=*/1,
+                        reduce,
+                        elements,
+                        finalize);
+                }
                 return rocmOps_argmax_f32_batched_rows_geometry(
                     static_cast<const float *>(d_logits.get()),
                     /*rows=*/1,
@@ -266,12 +361,32 @@ namespace
         std::cout
             << "backend,case,cols,reduce_threads,elements_per_thread,"
                "finalize_threads,iterations,avg_us\n";
+        constexpr int kInitialChainToken = -1;
+        constexpr int kInitialChainPosition = 409;
+        const char *const case_name = publish_mtp_chain
+            ? "mtp_chain_argmax_geometry"
+            : "argmax_geometry";
         for (const int reduce : reduce_threads)
         {
             for (const int elements : elements_per_thread)
             {
                 for (const int finalize : finalize_threads)
                 {
+                    if (publish_mtp_chain)
+                    {
+                        ASSERT_TRUE(backend->hostToDeviceOnStream(
+                            d_chain_condition_token.get(),
+                            &kInitialChainToken,
+                            sizeof(kInitialChainToken),
+                            device_id,
+                            stream));
+                        ASSERT_TRUE(backend->hostToDeviceOnStream(
+                            d_chain_position_id.get(),
+                            &kInitialChainPosition,
+                            sizeof(kInitialChainPosition),
+                            device_id,
+                            stream));
+                    }
                     for (int i = 0; i < warmup; ++i)
                         ASSERT_TRUE(launch(reduce, elements, finalize));
                     ASSERT_TRUE(backend->synchronizeStream(stream, device_id));
@@ -314,9 +429,34 @@ namespace
                     ASSERT_EQ(actual_index, kExpectedToken)
                         << "geometry=" << reduce << 'x' << elements
                         << '/' << finalize;
+                    if (publish_mtp_chain)
+                    {
+                        int actual_chain_token = -1;
+                        int actual_chain_position = -1;
+                        ASSERT_TRUE(backend->deviceToHostFast(
+                            &actual_chain_token,
+                            d_chain_condition_token.get(),
+                            sizeof(actual_chain_token),
+                            device_id,
+                            stream));
+                        ASSERT_TRUE(backend->deviceToHostFast(
+                            &actual_chain_position,
+                            d_chain_position_id.get(),
+                            sizeof(actual_chain_position),
+                            device_id,
+                            stream));
+                        ASSERT_EQ(actual_chain_token, kExpectedToken)
+                            << "geometry=" << reduce << 'x' << elements
+                            << '/' << finalize;
+                        ASSERT_EQ(
+                            actual_chain_position,
+                            kInitialChainPosition + warmup + iterations)
+                            << "geometry=" << reduce << 'x' << elements
+                            << '/' << finalize;
+                    }
 
                     std::cout << backend_name
-                              << ",argmax_geometry," << kQwen36Vocab
+                              << ',' << case_name << ',' << kQwen36Vocab
                               << ',' << reduce
                               << ',' << elements
                               << ',' << finalize
@@ -336,7 +476,7 @@ namespace
 
         ASSERT_GT(best_reduce, 0);
         std::cout << backend_name
-                  << ",argmax_geometry_winner," << kQwen36Vocab
+                  << ',' << case_name << "_winner," << kQwen36Vocab
                   << ',' << best_reduce
                   << ',' << best_elements
                   << ',' << best_finalize
@@ -2127,11 +2267,26 @@ TEST(Perf__GPUSpeculativeSummary, ArgmaxGeometryQwen36SingleRow)
 {
 #ifdef HAVE_CUDA
     runArgmaxGeometrySweep(
-        "CUDA", getCUDABackend(), DeviceId::cuda(0));
+        "CUDA", getCUDABackend(), DeviceId::cuda(0), false);
 #endif
 #ifdef HAVE_ROCM
     runArgmaxGeometrySweep(
-        "ROCm", getROCmBackend(), DeviceId::rocm(0));
+        "ROCm", getROCmBackend(), DeviceId::rocm(0), false);
+#endif
+#if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+    GTEST_SKIP() << "No GPU backend enabled";
+#endif
+}
+
+TEST(Perf__GPUSpeculativeSummary, MTPChainArgmaxGeometryQwen36SingleRow)
+{
+#ifdef HAVE_CUDA
+    runArgmaxGeometrySweep(
+        "CUDA", getCUDABackend(), DeviceId::cuda(0), true);
+#endif
+#ifdef HAVE_ROCM
+    runArgmaxGeometrySweep(
+        "ROCm", getROCmBackend(), DeviceId::rocm(0), true);
 #endif
 #if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
     GTEST_SKIP() << "No GPU backend enabled";

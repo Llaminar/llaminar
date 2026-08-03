@@ -512,6 +512,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        bool fully_replicated_local_rows,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -535,6 +536,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        bool fully_replicated_local_rows,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -566,6 +568,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        bool fully_replicated_local_rows,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -603,6 +606,7 @@ extern "C"
         void *command_header,
         void *wave_state,
         void *controller_state,
+        void *llep_layer_plans,
         uint32_t command_buffer_count,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
@@ -4106,7 +4110,8 @@ namespace llaminar2
         ITensor *output_indices, ITensor *output_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
-        const int32_t *absolute_position_ids_device)
+        const int32_t *absolute_position_ids_device,
+        RoutedExpertRowExecutionPolicy row_execution_policy)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -4166,6 +4171,9 @@ namespace llaminar2
 
         bool logits_ready = false;
         bool runtime_ready = false;
+        const bool fully_replicated_local_rows =
+            row_execution_policy ==
+            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         invalidateRouterQ8HiddenPublication();
@@ -4239,6 +4247,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
+                fully_replicated_local_rows,
                 nullptr,
                 nullptr,
                 0u,
@@ -4305,6 +4314,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
+                fully_replicated_local_rows,
                 nullptr,
                 nullptr,
                 0u,
@@ -4336,6 +4346,7 @@ namespace llaminar2
                                   normalize_weights,
                                   write_legacy_outputs,
                                   update_runtime_histogram,
+                                  fully_replicated_local_rows,
                                   nullptr,
                                   nullptr,
                                   0u,
@@ -4384,7 +4395,8 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
-        const int32_t *absolute_position_ids_device)
+        const int32_t *absolute_position_ids_device,
+        RoutedExpertRowExecutionPolicy row_execution_policy)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -4451,6 +4463,9 @@ namespace llaminar2
 
         bool logits_ready = false;
         bool runtime_ready = false;
+        const bool fully_replicated_local_rows =
+            row_execution_policy ==
+            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         invalidateRouterQ8HiddenPublication();
@@ -4524,6 +4539,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
+                fully_replicated_local_rows,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -4590,6 +4606,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
+                fully_replicated_local_rows,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -4621,6 +4638,7 @@ namespace llaminar2
                                   normalize_weights,
                                   write_legacy_outputs,
                                   update_runtime_histogram,
+                                  fully_replicated_local_rows,
                                   runtime_layers,
                                   rebalance_plan_entries,
                                   rebalance_plan_capacity,
@@ -4664,16 +4682,24 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count,
         const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
-        uint32_t local_transfer_slot_count)
+        uint32_t local_transfer_slot_count,
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans)
     {
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
             return false;
         }
-        if (!runtime_layers || !gathered_histograms || !status)
+        if (!runtime_layers || !gathered_histograms || !status || !controller_state)
         {
-            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, and status must be non-null");
+            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, and persistent controller state must be non-null");
+            return false;
+        }
+        if (config.routed_assignment_policy ==
+                kDeviceMoERebalanceAssignmentLeastLoadedResident &&
+            !llep_layer_plans)
+        {
+            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] LLEP requires graph-lifetime parallel planner scratch");
             return false;
         }
         void *stream = explicitMoELaunchStream(launch, "runDeviceRebalanceController");
@@ -4697,6 +4723,7 @@ namespace llaminar2
             command_header,
             wave_state,
             controller_state,
+            llep_layer_plans,
             command_buffer_count,
             local_transfer_slots,
             local_transfer_slot_count,
@@ -7134,6 +7161,13 @@ namespace llaminar2
         const bool reuse_router_q8_hidden =
             allow_router_q8_reuse &&
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "rocm_moe_gateup_reused_router_q8_hidden_calls", 1.0, {}, {},
+                {{"top_k", std::to_string(top_k)},
+                 {"d_model", std::to_string(d_model)}});
+        }
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         /*

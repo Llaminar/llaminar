@@ -573,6 +573,9 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
     DeviceMoERebalanceStatus *d_status = nullptr;
     DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
     DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    DeviceMoERebalanceGraphControllerState *d_controller_states = nullptr;
+    const auto controller_states = makeDueControllerTransactions(
+        config, warmups + iterations);
     ASSERT_EQ(cudaMalloc(&d_local_histograms,
                          static_cast<size_t>(local_histogram_count) * sizeof(uint64_t)),
               cudaSuccess);
@@ -584,13 +587,28 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
     ASSERT_EQ(cudaMalloc(&d_status, sizeof(DeviceMoERebalanceStatus)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)), cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            &d_controller_states,
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState)),
+        cudaSuccess);
     ASSERT_EQ(cudaMemsetAsync(d_gathered_histograms,
                               0,
                               static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t),
                               harness.stream_),
               cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_controller_states,
+            controller_states.data(),
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState),
+            cudaMemcpyHostToDevice,
+            harness.stream_),
+        cudaSuccess);
 
-    auto run_maintenance = [&]()
+    auto run_maintenance = [&](int transaction_index)
     {
         ASSERT_TRUE(harness.kernel_->packDeviceRebalanceHistograms(
             harness.launchContext(),
@@ -614,17 +632,18 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
             plan_capacity,
             plan_capacity,
             d_header,
-            d_wave_state));
+            d_wave_state,
+            d_controller_states + transaction_index));
     };
 
     for (int i = 0; i < warmups; ++i)
-        run_maintenance();
+        run_maintenance(i);
     ASSERT_EQ(cudaStreamSynchronize(harness.stream_), cudaSuccess);
 
     CudaEvents events;
     ASSERT_EQ(cudaEventRecord(events.start, harness.stream_), cudaSuccess);
     for (int i = 0; i < iterations; ++i)
-        run_maintenance();
+        run_maintenance(warmups + i);
     ASSERT_EQ(cudaEventRecord(events.stop, harness.stream_), cudaSuccess);
     ASSERT_EQ(cudaEventSynchronize(events.stop), cudaSuccess);
     float elapsed_ms = 0.0f;
@@ -668,6 +687,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
 
     if (d_wave_state)
         cudaFree(d_wave_state);
+    if (d_controller_states)
+        cudaFree(d_controller_states);
     if (d_header)
         cudaFree(d_header);
     if (d_status)
@@ -680,6 +701,263 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
         cudaFree(d_gathered_histograms);
     if (d_local_histograms)
         cudaFree(d_local_histograms);
+#endif
+}
+
+/**
+ * @brief Time the exact Qwen3.6 LLEP decode-maintenance controller geometry.
+ *
+ * Runtime state, histogram evidence, controller transactions, and output
+ * buffers are materialized before timing. Each launch receives an independent
+ * request transaction that is due on its next decode edge, so the timed region
+ * measures the production LLEP planner rather than a busy-wave or invalid-state
+ * guard. One event synchronization follows the complete launch batch.
+ */
+TEST(Perf__MoELLEPDeterminism, CUDA_Qwen36LLEPMaintenanceControllerEconomy)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    Shape shape{};
+    shape.participant_count = 2;
+    constexpr uint32_t num_layers = 40u;
+    constexpr uint32_t plan_capacity = 42u;
+    DeviceMoELLEPLayerPlanScratch *d_llep_layer_plans = nullptr;
+    const uint32_t layer_wave_count = static_cast<uint32_t>(
+        std::min(
+            4,
+            envInt("LLAMINAR_MOE_LLEP_MAINT_LAYER_WAVE", 4)));
+    const DeviceMoERebalanceConfig config =
+        llepMaintenanceConfig(shape, num_layers, layer_wave_count);
+    const uint32_t gathered_histogram_count =
+        config.participant_count * config.layer_wave_count * config.num_experts;
+    const int warmups =
+        envInt("LLAMINAR_MOE_LLEP_MAINT_WARMUPS", 2);
+    const int iterations =
+        envInt("LLAMINAR_MOE_LLEP_MAINT_ITERS", 20);
+
+    CudaHarness harness(shape);
+    harness.prepare(/*all_participants_resident=*/false,
+                    makeSourceZeroTransferRouteExperts(shape),
+                    makeRouteWeights(shape));
+    ASSERT_EQ(
+        cudaMalloc(
+            &d_llep_layer_plans,
+            static_cast<size_t>(
+                std::max(1u, config.layer_window_count)) *
+                sizeof(DeviceMoELLEPLayerPlanScratch)),
+        cudaSuccess);
+
+    DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = harness.device_;
+    runtime_config.num_layers = static_cast<int>(num_layers);
+    runtime_config.num_experts = shape.num_experts;
+    runtime_config.top_k = shape.top_k;
+    runtime_config.mirror_to_device = true;
+    MoERuntimeTable runtime_table(runtime_config);
+    for (uint32_t layer = 0; layer < num_layers; ++layer)
+    {
+        auto runtime = runtime_table.hostLayerState(static_cast<int>(layer));
+        configureRuntimeLayer(
+            runtime,
+            shape,
+            /*all_participants_resident=*/false,
+            /*participant_id=*/0);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                runtime_table.deviceLayerState(static_cast<int>(layer)),
+                &runtime,
+                sizeof(runtime),
+                cudaMemcpyHostToDevice,
+                harness.stream_),
+            cudaSuccess);
+    }
+
+    std::vector<uint64_t> gathered(
+        static_cast<size_t>(gathered_histogram_count),
+        0ULL);
+    const uint32_t participant_stride =
+        config.layer_wave_count * config.num_experts;
+    for (uint32_t participant = 0;
+         participant < config.participant_count;
+         ++participant)
+    {
+        for (uint32_t wave_layer = 0;
+             wave_layer < config.layer_wave_count;
+             ++wave_layer)
+        {
+            for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+            {
+                const uint32_t owner =
+                    expert % config.participant_count;
+                const uint64_t count =
+                    owner == 0u
+                        ? (expert == 0u ? 4096ULL : 64ULL)
+                        : 1ULL;
+                const size_t index =
+                    static_cast<size_t>(participant) * participant_stride +
+                    static_cast<size_t>(wave_layer) * config.num_experts +
+                    expert;
+                gathered[index] =
+                    moe_rebalance_policy::packCollectedState(
+                        participant == owner ? count : 0ULL,
+                        /*active_transfer_slots=*/0u,
+                        /*physically_resident=*/participant == owner,
+                        /*transfer_backed=*/false);
+            }
+        }
+    }
+
+    uint64_t *d_gathered_histograms = nullptr;
+    DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
+    DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    DeviceMoERebalanceGraphControllerState *d_controller_states = nullptr;
+    const auto controller_states = makeDueControllerTransactions(
+        config, warmups + iterations);
+    ASSERT_EQ(
+        cudaMalloc(
+            &d_gathered_histograms,
+            static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            &d_plan,
+            static_cast<size_t>(plan_capacity) *
+                sizeof(DeviceMoERebalancePlanEntry)),
+        cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_plan_count, sizeof(uint32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_status, sizeof(DeviceMoERebalanceStatus)), cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            &d_controller_states,
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_gathered_histograms,
+            gathered.data(),
+            gathered.size() * sizeof(uint64_t),
+            cudaMemcpyHostToDevice,
+            harness.stream_),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            d_wave_state,
+            0,
+            sizeof(*d_wave_state),
+            harness.stream_),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_controller_states,
+            controller_states.data(),
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState),
+            cudaMemcpyHostToDevice,
+            harness.stream_),
+        cudaSuccess);
+
+    auto run_controller = [&](int transaction_index)
+    {
+        ASSERT_TRUE(harness.kernel_->runDeviceRebalanceController(
+            harness.launchContext(),
+            runtime_table.deviceLayerState(0),
+            d_gathered_histograms,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            plan_capacity,
+            d_header,
+            d_wave_state,
+            d_controller_states + transaction_index,
+            1u,
+            nullptr,
+            0u,
+            d_llep_layer_plans));
+    };
+
+    for (int i = 0; i < warmups; ++i)
+        run_controller(i);
+    ASSERT_EQ(cudaStreamSynchronize(harness.stream_), cudaSuccess);
+
+    CudaEvents events;
+    ASSERT_EQ(cudaEventRecord(events.start, harness.stream_), cudaSuccess);
+    for (int i = 0; i < iterations; ++i)
+        run_controller(warmups + i);
+    ASSERT_EQ(cudaEventRecord(events.stop, harness.stream_), cudaSuccess);
+    ASSERT_EQ(cudaEventSynchronize(events.stop), cudaSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(
+        cudaEventElapsedTime(&elapsed_ms, events.start, events.stop),
+        cudaSuccess);
+
+    uint32_t plan_count = 0;
+    DeviceMoERebalanceStatus status{};
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            &plan_count,
+            d_plan_count,
+            sizeof(plan_count),
+            cudaMemcpyDeviceToHost,
+            harness.stream_),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            &status,
+            d_status,
+            sizeof(status),
+            cudaMemcpyDeviceToHost,
+            harness.stream_),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(harness.stream_), cudaSuccess);
+    ASSERT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+    ASSERT_LE(plan_count, plan_capacity);
+    ASSERT_EQ(status.payload_bucket_overflow, 0u);
+
+    const auto plan = harness.copyPlan(d_plan, plan_count);
+    printTiming(
+        "cuda",
+        "qwen36_llep_maintenance_controller",
+        shape,
+        iterations,
+        elapsed_ms * 1000.0f / static_cast<float>(iterations),
+        fnv1a64Plan(plan.data(), plan.size()),
+        status.llep_assignment_span_count,
+        plan_count);
+
+    if (d_llep_layer_plans)
+        cudaFree(d_llep_layer_plans);
+    if (d_controller_states)
+        cudaFree(d_controller_states);
+    if (d_wave_state)
+        cudaFree(d_wave_state);
+    if (d_header)
+        cudaFree(d_header);
+    if (d_status)
+        cudaFree(d_status);
+    if (d_plan_count)
+        cudaFree(d_plan_count);
+    if (d_plan)
+        cudaFree(d_plan);
+    if (d_gathered_histograms)
+        cudaFree(d_gathered_histograms);
 #endif
 }
 

@@ -292,6 +292,7 @@ namespace llaminar2
         int accepted_speculative_token_count = 0; ///< Accepted draft-token total.
         int rejected_transaction_count = 0; ///< Transactions that emitted a rejection correction.
         int consumed_verifier_row_count = 0; ///< Total verifier rows consumed by committed transactions.
+        int published_state_commit_count = 0; ///< Total main-graph state rows committed by the device.
 
         bool operator==(
             const DeviceGenerationTerminalRequestResult &) const = default;
@@ -340,15 +341,15 @@ namespace llaminar2
         int max_state_commit_rows = -1;
         bool publish_mtp_shifted_kv = true;
         /**
-         * @brief Count-penalty policy for this compact outcome transaction.
+         * @brief Immutable request policy validated at the publication edge.
          *
-         * Stochastic outcomes are reduced after the verifier graph, so their
-         * generated-token histogram commit belongs to accepted-state
-         * publication. Greedy graph-owned outcomes already commit inside the
-         * captured terminal stage and leave @ref commit_penalty_history false.
+         * Accepted-state publication is the sole owner of generated-token
+         * histogram advancement for both greedy and stochastic outcomes.  The
+         * evolving pending-condition predicate is deliberately absent from
+         * this host request: the publication kernel derives and stores it from
+         * final device metadata on the same stream as the state commit.
          */
-        MTPGreedyPenaltyPolicy penalty_policy{};
-        bool commit_penalty_history = false;
+        MTPRequestPenaltyPolicy penalty_policy{};
 
         bool valid() const
         {
@@ -359,8 +360,7 @@ namespace llaminar2
                    max_draft_tokens > 0 &&
                    max_state_commit_rows >= 0 &&
                    max_state_commit_rows <= max_draft_tokens &&
-                   (!commit_penalty_history ||
-                    (request_count == 1 && penalty_policy.enabled != 0));
+                   (!penalty_policy.enabled() || request_count == 1);
         }
     };
 
@@ -709,9 +709,10 @@ namespace llaminar2
      * laid out as `[request_count, padded_seq_len]`.  Each descriptor tells the
      * runner how to compose one logical row on the graph replay stream:
      *
-     * - entry 0 is either a host-owned condition-token shadow, a row in a
-     *   value-owned resident logical-state mailbox, or a device target sample
-     *   slot;
+     * - entry 0 is a canonical device target-sample slot. The initial target
+     *   sampler writes it directly and accepted-state publication refreshes it
+     *   in the same captured kernel that publishes the logical-state mailbox;
+     *   the host scalar is diagnostic metadata only and is never a GPU input;
      * - entries 1..N are copied from runner-owned draft sample slots;
      * - the returned matrix pointer is the only token source used by the verifier
      *   embedding graph.
@@ -719,11 +720,9 @@ namespace llaminar2
     struct DeviceMTPVerifierInputBatchRequest
     {
         int request_id = -1; ///< Logical request id for diagnostics.
-        int32_t first_token = -1; ///< Host shadow for row entry 0.
-        bool first_token_from_device = false; ///< Read row entry 0 from device memory.
-        DeviceResidentLogicalSequenceStateHandle first_token_logical_state; ///< Mailbox owning row entry 0.
-        int first_token_request_index = -1; ///< Row in first_token_logical_state.
-        int first_target_sample_slot = -1; ///< Device target-sample slot for row entry 0.
+        int32_t first_token = -1; ///< Optional host shadow for diagnostics only.
+        bool first_token_from_device = false; ///< Must be true for every GPU verifier row.
+        int first_target_sample_slot = -1; ///< Canonical target slot for row entry 0.
         int first_draft_slot = -1; ///< First device draft slot copied into row entry 1.
         int draft_token_count = 0; ///< Number of draft tokens copied after entry 0.
         int total_verifier_input_tokens = 0; ///< Valid row width before padding.
@@ -2479,6 +2478,32 @@ namespace llaminar2
         }
 
         /**
+         * @brief Admit immutable MTP penalty magnitudes for the next request.
+         *
+         * GPU implementations publish this policy exactly once after the
+         * request-state reset (or prefix-restore reset) and before any sampling
+         * graph consumes it.  The evolving "first condition is already in
+         * history" predicate is deliberately not an argument: accepted-state
+         * publication owns that device-resident transition.
+         *
+         * Reconfiguring the policy after a verifier transaction has started is a
+         * lifecycle violation.  Implementations must fail rather than patching a
+         * captured graph or silently retaining the previous request's policy.
+         */
+        virtual bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy)
+        {
+            (void)policy;
+            if (primaryDeviceId().is_gpu())
+            {
+                throw std::logic_error(
+                    "GPU inference runner does not implement device-owned MTP "
+                    "request penalty-policy publication");
+            }
+            return true;
+        }
+
+        /**
          * @brief Arm the terminal greedy outcome stage before verifier replay.
          *
          * Stop-token controls must already be device-resident from explicit
@@ -2491,8 +2516,8 @@ namespace llaminar2
             int verifier_token_count,
             const int32_t *stop_tokens,
             int stop_token_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy =
-                MTPGreedyPenaltyPolicy{})
+            const MTPRequestPenaltyPolicy &penalty_policy =
+                MTPRequestPenaltyPolicy{})
         {
             (void)verifier_token_count;
             (void)stop_tokens;
@@ -2977,7 +3002,7 @@ namespace llaminar2
         virtual bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
             int row_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy)
+            const MTPRequestPenaltyPolicy &penalty_policy)
         {
             (void)source;
             (void)row_count;
@@ -2996,7 +3021,7 @@ namespace llaminar2
          */
         virtual bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
             int prior_draft_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy)
+            const MTPRequestPenaltyPolicy &penalty_policy)
         {
             (void)prior_draft_count;
             (void)penalty_policy;
@@ -3096,7 +3121,7 @@ namespace llaminar2
         virtual bool buildCapturedStochasticVerifierTargetDistributions(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size)
         {
             (void)row_count;
@@ -3199,7 +3224,7 @@ namespace llaminar2
         virtual bool publishCapturedMTPDraftToken(
             int row,
             int slot,
-            const MTPGreedyPenaltyPolicy &penalty_policy)
+            const MTPRequestPenaltyPolicy &penalty_policy)
         {
             (void)row;
             (void)slot;
@@ -3956,6 +3981,52 @@ namespace llaminar2
             (void)request_count;
             (void)max_new_tokens;
             return true;
+        }
+
+        /**
+         * @brief Compose the exact fixed-depth stochastic generation parent.
+         *
+         * The first externally orchestrated transaction must already have
+         * committed its resident response/state rows, and every child graph in
+         * the family must already own a strict monolithic executable. In MoE
+         * domains this includes one completed maintenance boundary: its first
+         * execution both consumes the committed transaction and atomically
+         * materializes the reusable maintenance child before this method clones
+         * it into the parent.
+         *
+         * Rank implementations must complete this preparation for every local
+         * participant before any participant launches. The method performs
+         * graph composition only; it must not launch the parent, synchronize a
+         * stream/device, materialize live state on the host, or recover through
+         * segmented/eager execution.
+         *
+         * @param request_count Number of admitted resident controller rows.
+         * @param draft_depth Exact immutable draft depth captured by the child
+         *        graph family. The verifier child owns `draft_depth + 1` rows.
+         * @return true when the complete parent executable is ready to launch.
+         */
+        virtual bool materializeDeviceResidentStochasticGeneration(
+            int request_count,
+            int draft_depth)
+        {
+            (void)request_count;
+            (void)draft_depth;
+            return false;
+        }
+
+        /**
+         * @brief Launch the complete graph-owned stochastic generation loop.
+         *
+         * The first transaction has already committed its compact outcome and
+         * materialized the exact fixed-depth child graph family. GPU runners
+         * consume that controller publication on the parent graph's own stream,
+         * enqueue one native device-controlled loop, and republish readiness
+         * after the terminal iteration. The method is asynchronous and may be
+         * called exactly once for an admitted request.
+         */
+        virtual bool launchDeviceResidentStochasticGeneration()
+        {
+            return false;
         }
 
         /**

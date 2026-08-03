@@ -273,6 +273,11 @@ namespace llaminar2
         return std::string(WS_CONTROLLER_STATE) + "_" + workspaceSuffix();
     }
 
+    std::string MoEDeviceRebalanceStage::llepLayerPlansBufferName() const
+    {
+        return std::string(WS_LLEP_LAYER_PLANS) + "_" + workspaceSuffix();
+    }
+
     std::string MoEDeviceRebalanceStage::gatheredTransferPlanBufferName() const
     {
         return std::string(WS_GATHERED_TRANSFER_PLAN) + "_" + workspaceSuffix();
@@ -370,6 +375,16 @@ namespace llaminar2
                 ? window_count
                 : std::min(params_.config.layer_wave_count, window_count);
         return static_cast<size_t>(std::max<uint32_t>(1u, wave_count));
+    }
+
+    size_t MoEDeviceRebalanceStage::llepPlannerScratchCount() const
+    {
+        const uint32_t window_count =
+            params_.config.layer_window_count == 0u
+                ? params_.config.num_layers
+                : std::min(params_.config.layer_window_count,
+                           params_.config.num_layers);
+        return static_cast<size_t>(std::max<uint32_t>(1u, window_count));
     }
 
     size_t MoEDeviceRebalanceStage::transferPlanEntries() const
@@ -474,6 +489,13 @@ namespace llaminar2
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband;
+    }
+
+    bool MoEDeviceRebalanceStage::usesParallelLLEPPlanning() const
+    {
+        return runsController() &&
+               params_.config.routed_assignment_policy ==
+                   kDeviceMoERebalanceAssignmentLeastLoadedResident;
     }
 
     bool MoEDeviceRebalanceStage::ownsRequestTransactionState() const noexcept
@@ -797,6 +819,13 @@ namespace llaminar2
             bound_workspace_->getBuffer(controllerStateBufferName()));
         auto *wave_state = static_cast<DeviceMoERebalanceWaveState *>(
             bound_workspace_->getBuffer(waveStateBufferName()));
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr;
+        if (usesParallelLLEPPlanning())
+        {
+            llep_layer_plans =
+                static_cast<DeviceMoELLEPLayerPlanScratch *>(
+                    bound_workspace_->getBuffer(llepLayerPlansBufferName()));
+        }
         if (!plan_entries || !plan_count || !command_header || !controller_state || !wave_state)
         {
             LOG_ERROR("[MoEDeviceRebalanceStage] Missing workspace buffers"
@@ -805,6 +834,12 @@ namespace llaminar2
                       << " command_header=" << static_cast<void *>(command_header)
                       << " controller_state=" << static_cast<void *>(controller_state)
                       << " wave_state=" << static_cast<void *>(wave_state)
+                      << " phase=" << phaseName(params_.phase));
+            return false;
+        }
+        if (usesParallelLLEPPlanning() && !llep_layer_plans)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Missing graph-lifetime parallel LLEP planner scratch"
                       << " phase=" << phaseName(params_.phase));
             return false;
         }
@@ -1551,7 +1586,8 @@ namespace llaminar2
                         controller_state,
                         static_cast<uint32_t>(commandBufferCount()),
                         params_.local_transfer_slots,
-                        params_.local_transfer_slot_count))
+                        params_.local_transfer_slot_count,
+                        llep_layer_plans))
                 {
                     LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance controller failed");
                     return false;
@@ -1920,6 +1956,15 @@ namespace llaminar2
                                 sizeof(DeviceMoERebalanceGraphControllerState),
                                 256,
                                 true});
+        if (usesParallelLLEPPlanning())
+        {
+            reqs.buffers.push_back({
+                llepLayerPlansBufferName(),
+                llepPlannerScratchCount() *
+                    sizeof(DeviceMoELLEPLayerPlanScratch),
+                256,
+                true});
+        }
         reqs.buffers.push_back({waveStateBufferName(),
                                 commandBufferCount() * sizeof(DeviceMoERebalanceWaveState),
                                 256,

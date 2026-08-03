@@ -63,6 +63,23 @@ namespace llaminar2
         };
 
         /**
+         * @brief Decide whether Phase-2 capture also executes the new graph.
+         *
+         * `ExecuteCapturedWork` is used when capture itself is the logical
+         * invocation. `MaterializeOnly` is used immediately after a successful
+         * warmup in the same initialization transaction: warmup already produced
+         * the user-visible result, so Phase 2 may record and instantiate the
+         * future replay executable but must not launch or manually re-execute any
+         * stage. This closed policy prevents first-use graph setup from mutating
+         * KV or recurrent state twice.
+         */
+        enum class CapturePublicationPolicy : uint8_t
+        {
+            ExecuteCapturedWork,
+            MaterializeOnly,
+        };
+
+        /**
          * @brief Result for the full replay phase.
          */
         struct ReplayPhaseResult
@@ -124,7 +141,7 @@ namespace llaminar2
         {
             /// First graph-replay pass: execute normally and build replay metadata.
             Warmup,
-            /// Second graph-replay pass: capture graph replay units.
+            /// Explicit capture of a caller-supplied initialized cache state.
             Capture,
             /// Steady state: replay captured graph units.
             Replay
@@ -336,6 +353,8 @@ namespace llaminar2
          *        admitted heterogeneous collective plan.
          * @param perf_context Stable graph-owner context attached to the
          *        executable-node PerfStats evidence.
+         * @param publication_policy Whether the captured executable represents
+         *        this invocation or is only being materialized for future replay.
          */
         static bool finalizeCapturePhaseCapturableSegment(
             ComputeGraph &graph,
@@ -347,6 +366,7 @@ namespace llaminar2
             bool full_graph_capture,
             const std::string &perf_context,
             uint64_t current_step,
+            CapturePublicationPolicy publication_policy,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
@@ -421,6 +441,10 @@ namespace llaminar2
 
         /**
          * @brief Execute full Phase-2 capture over all segments.
+         *
+         * Materialization-only capture requires one complete capturable graph;
+         * a manual unit would necessarily execute host-orchestrated work and is
+         * therefore rejected rather than silently changing semantics.
          */
         static CapturePhaseResult executeCapturePhase(
             ComputeGraph &graph,
@@ -429,7 +453,9 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
             uint64_t current_step,
-            const ReplayHooks &hooks);
+            const ReplayHooks &hooks,
+            CapturePublicationPolicy publication_policy =
+                CapturePublicationPolicy::ExecuteCapturedWork);
 
         /**
          * @brief Execute full replay phase over all segments.

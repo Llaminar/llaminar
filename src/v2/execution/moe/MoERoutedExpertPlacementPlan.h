@@ -153,15 +153,28 @@ namespace llaminar2
             return !participants.empty();
         }
 
+        /**
+         * @brief Return whether ordinary prefill assigns complete experts to participants.
+         *
+         * A uniformly apportioned domain uses participant-assigned routed
+         * experts in every phase.  LLEP's phase-split policy deliberately uses
+         * the same whole-expert assignment during prefill while retaining a
+         * complete local replica for grouped decode.  Callers that reason about
+         * prefill graph topology must use this semantic predicate instead of
+         * inspecting `routed_compute_policy` alone, otherwise the phase-split
+         * policy is incorrectly treated as replicated prefill.
+         */
+        bool usesParticipantAssignedPrefill() const
+        {
+            return routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
+                   (routed_compute_policy == RoutedExpertComputePolicy::Replicated &&
+                    routed_phase_policy ==
+                        RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated);
+        }
+
         bool supportsLeastLoadedResidentAssignment() const
         {
-            const bool apportioned_execution =
-                routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
-                (routed_compute_policy == RoutedExpertComputePolicy::Replicated &&
-                 routed_phase_policy ==
-                     RoutedExpertPhasePolicy::
-                         PrefillApportionedDecodeReplicated);
-            return apportioned_execution &&
+            return usesParticipantAssignedPrefill() &&
                    isCollectiveDomain() &&
                    hasMultipleParticipants();
         }

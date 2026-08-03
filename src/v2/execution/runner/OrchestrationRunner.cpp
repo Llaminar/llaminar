@@ -1751,6 +1751,18 @@ namespace llaminar2
                 "Inference runner rejected request stop-token policy at "
                 "request admission");
         }
+        if (!runner_->configureMTPRequestPenaltyPolicy(
+                MTPRequestPenaltyPolicy{
+                    .presence_penalty =
+                        active_sampling_params_.presence_penalty,
+                    .frequency_penalty =
+                        active_sampling_params_.frequency_penalty,
+                }))
+        {
+            return setError(
+                "Inference runner rejected request penalty policy at "
+                "request admission");
+        }
 
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
@@ -3543,13 +3555,8 @@ namespace llaminar2
                         if (use_request_batch_resident_condition_tokens)
                         {
                             descriptor.first_token_from_device = true;
-                            descriptor.first_token_logical_state =
-                                resident_batch_state;
-                            descriptor.first_token_request_index = request_id;
-                            descriptor.first_target_sample_slot = -1;
-                            if (!descriptor.first_token_logical_state
-                                     .coversRequest(
-                                         descriptor.first_token_request_index))
+                            descriptor.first_target_sample_slot = request_id;
+                            if (!resident_batch_state.coversRequest(request_id))
                             {
                                 return set_producer_error(
                                     "greedy request-batch verifier has no resident condition-token row for request");
@@ -3558,8 +3565,6 @@ namespace llaminar2
                         else
                         {
                             descriptor.first_token_from_device = false;
-                            descriptor.first_token_logical_state = {};
-                            descriptor.first_token_request_index = -1;
                             descriptor.first_target_sample_slot = -1;
                         }
                         descriptor.first_draft_slot =
@@ -4026,13 +4031,8 @@ namespace llaminar2
                         if (use_request_batch_resident_condition_tokens)
                         {
                             descriptor.first_token_from_device = true;
-                            descriptor.first_token_logical_state =
-                                resident_batch_state;
-                            descriptor.first_token_request_index = request_id;
-                            descriptor.first_target_sample_slot = -1;
-                            if (!descriptor.first_token_logical_state
-                                     .coversRequest(
-                                         descriptor.first_token_request_index))
+                            descriptor.first_target_sample_slot = request_id;
+                            if (!resident_batch_state.coversRequest(request_id))
                             {
                                 return set_producer_error(
                                     "stochastic request-batch verifier has no resident condition-token row for request");
@@ -4041,8 +4041,6 @@ namespace llaminar2
                         else
                         {
                             descriptor.first_token_from_device = false;
-                            descriptor.first_token_logical_state = {};
-                            descriptor.first_token_request_index = -1;
                             descriptor.first_target_sample_slot = -1;
                         }
                         descriptor.first_draft_slot =
@@ -4965,6 +4963,7 @@ namespace llaminar2
         if (!runner_ || !runner_->primaryDeviceId().is_gpu())
         {
             decode_transaction_planning_position_.reset();
+            device_generation_admission_pending_ = false;
             return true;
         }
         if (committed_tokens < 0)
@@ -4981,8 +4980,17 @@ namespace llaminar2
          * successful prefill boundary gives the first speculative graph the
          * same position that later device publications advance from compact
          * accepted-count metadata.
-         */
+        */
         decode_transaction_planning_position_ = committed_tokens;
+        /*
+         * Admission is a property of the successful GPU prefill boundary, not
+         * of whichever decode policy happens to consume that boundary. The
+         * first decode path closes or consumes it; stochastic MTP additionally
+         * publishes the resident generation budget. Keeping MTP policy out of
+         * this initializer preserves one transaction-position lifecycle for
+         * ordinary, greedy-MTP, and stochastic-MTP decode.
+         */
+        device_generation_admission_pending_ = true;
         PerfStatsCollector::addCounter(
             "mtp",
             "gpu_decode_transaction_position_initializations",
@@ -4992,6 +5000,55 @@ namespace llaminar2
             {{"position", std::to_string(committed_tokens)},
              {"source", source && source[0] != '\0' ? source : "unknown"},
              {"position_owner", "request_scheduler"}});
+        return true;
+    }
+
+    bool OrchestrationRunner::admitScalarDeviceResidentStochasticGeneration(
+        bool stochastic_device_verify)
+    {
+        if (!stochastic_device_verify || !device_generation_admission_pending_)
+            return true;
+        if (!runner_ || !decode_transaction_planning_position_.has_value() ||
+            *decode_transaction_planning_position_ < 0)
+        {
+            return setError(
+                "GPU stochastic MTP generation admission has no initialized prefill boundary");
+        }
+
+        int response_budget = decode_step_token_budget_;
+        if (response_budget <= 0)
+        {
+            const int configured_context =
+                plan_.runtime.max_seq_len > 0
+                    ? plan_.runtime.max_seq_len
+                    : config_.max_seq_len;
+            response_budget =
+                configured_context - *decode_transaction_planning_position_;
+        }
+        if (response_budget <= 0)
+        {
+            return setError(
+                "GPU stochastic MTP generation admission has no positive response capacity");
+        }
+
+        if (!runner_->beginDeviceResidentStochasticGeneration(
+                /*request_count=*/1,
+                response_budget))
+        {
+            return setError(
+                "Failed to admit the device-resident stochastic generation response ledger");
+        }
+
+        device_generation_admission_pending_ = false;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_admission_boundaries",
+            1.0,
+            "decode",
+            {},
+            {{"request_count", "1"},
+             {"response_budget", std::to_string(response_budget)},
+             {"boundary", "first_scalar_stochastic_mtp_decode"}});
         return true;
     }
 
@@ -5508,6 +5565,14 @@ namespace llaminar2
         const bool use_serial_sample_equivalent_host_stochastic =
             stochastic_host_verify &&
             active_sampling_params_.seed != 0;
+        if (!admitScalarDeviceResidentStochasticGeneration(
+                stochastic_device_verify))
+        {
+            return fail_without_checkpoint(
+                last_error_.empty()
+                    ? "GPU stochastic MTP generation admission failed"
+                    : last_error_);
+        }
         const bool use_sampling_penalties =
             active_sampling_params_.has_penalties() && !stochastic_verify;
         if (stochastic_device_verify &&
@@ -6638,13 +6703,11 @@ namespace llaminar2
                         !runner_->applyDeviceOwnedMTPPenaltiesToLogitRows(
                             DeviceLogitsSource::Main,
                             /*row_count=*/1,
-                            MTPGreedyPenaltyPolicy{
+                            MTPRequestPenaltyPolicy{
                                 .presence_penalty =
                                     active_sampling_params_.presence_penalty,
                                 .frequency_penalty =
                                     active_sampling_params_.frequency_penalty,
-                                .first_token_already_in_history = 0,
-                                .enabled = 1,
                             }))
                     {
                         return fail_after_checkpoint(
@@ -6773,13 +6836,11 @@ namespace llaminar2
                             ? runner_->applyDeviceOwnedMTPPenaltiesToLogitRows(
                                   DeviceLogitsSource::Main,
                                   /*row_count=*/1,
-                                  MTPGreedyPenaltyPolicy{
+                                  MTPRequestPenaltyPolicy{
                                       .presence_penalty =
                                           active_sampling_params_.presence_penalty,
                                       .frequency_penalty =
                                           active_sampling_params_.frequency_penalty,
-                                      .first_token_already_in_history = 0,
-                                      .enabled = 1,
                                   })
                             : runner_->applyPenaltiesOnDevice(
                                   sampler_.compute_penalty_map(
@@ -6889,6 +6950,87 @@ namespace llaminar2
                 }
             }
         }
+
+        /**
+         * Compose one grouped-verifier token row from device-owned producers.
+         *
+         * Target sample slot zero is the canonical verifier condition mailbox.
+         * The initial sampler writes it directly; accepted-state publication
+         * refreshes it in the same captured kernel that publishes a ready bonus
+         * or rejected correction token. The verifier therefore has one stable
+         * pointer topology across every transaction and cannot reconstruct row
+         * zero from a host response shadow. Draft rows always come from the
+         * resident draft sample bank beginning at slot zero.
+         */
+        auto prepare_grouped_gpu_verifier_input_tokens =
+            [&](const MTPSpecDecodeVerifierInputPlan &input_plan,
+                const char *consumer,
+                std::string *error) -> const void *
+        {
+            auto fail = [&](std::string message) -> const void *
+            {
+                if (error)
+                    *error = std::move(message);
+                return nullptr;
+            };
+
+            if (!runner_->primaryDeviceId().is_gpu())
+            {
+                return fail(
+                    "Device-resident grouped-verifier token composition requires a GPU runner");
+            }
+            if (!input_plan.ok ||
+                input_plan.total_verifier_input_tokens <= 1)
+            {
+                return fail(
+                    "Device-resident grouped-verifier token composition requires a valid grouped row plan");
+            }
+
+            DeviceMTPVerifierInputBatchRequest request{
+                .request_id = 0,
+                .first_token = -1,
+                .first_token_from_device = true,
+                .first_target_sample_slot = 0,
+                .first_draft_slot = 0,
+                .draft_token_count =
+                    input_plan.total_verifier_input_tokens - 1,
+                .total_verifier_input_tokens =
+                    input_plan.total_verifier_input_tokens,
+            };
+
+            if (!first_token_device_target_slot_available &&
+                (!first_token_resident_state.has_value() ||
+                 !first_token_resident_state->valid() ||
+                 !first_token_resident_state->coversRequest(0)))
+            {
+                return fail(
+                    "GPU grouped verifier has no device-owned condition transaction for canonical target slot zero");
+            }
+
+            const void *tokens =
+                runner_->prepareMTPVerifierInputTokenBatchOnDevice(
+                    &request,
+                    /*request_count=*/1,
+                    input_plan.total_verifier_input_tokens);
+            if (!tokens)
+            {
+                return fail(
+                    "GPU grouped verifier rejected canonical device target slot zero");
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "grouped_verifier_first_token_device_sources",
+                1.0,
+                "decode",
+                {},
+                {{"source", "canonical_target_slot"},
+                 {"consumer", consumer ? consumer : "unknown"},
+                 {"total_tokens",
+                  std::to_string(
+                      input_plan.total_verifier_input_tokens)}});
+            return tokens;
+        };
 
         int speculative_draft_count = requested_speculative_draft_count;
         bool draft_count_budget_limited = false;
@@ -7294,14 +7436,11 @@ namespace llaminar2
                     runner_->primaryDeviceId().is_gpu()
                         ? runner_->applyDeviceOwnedMTPBranchPenaltiesToLogits(
                               draft_idx,
-                              MTPGreedyPenaltyPolicy{
+                              MTPRequestPenaltyPolicy{
                                   .presence_penalty =
                                       active_sampling_params_.presence_penalty,
                                   .frequency_penalty =
                                       active_sampling_params_.frequency_penalty,
-                                  .first_token_already_in_history =
-                                      first_token_is_pending_condition ? 1 : 0,
-                                  .enabled = 1,
                               })
                         : runner_->applyPenaltiesToMTPLogitsOnDevice(
                               draft_sampler.compute_penalty_map(
@@ -8023,38 +8162,18 @@ namespace llaminar2
                      * position row unpublished and no longer represents a legal
                      * GPU verifier invocation.
                      */
-                    const int verifier_token_count =
-                        verifier_input_plan.total_verifier_input_tokens;
-                    const int draft_token_count =
-                        std::max(0, verifier_token_count - 1);
-                    if (use_greedy_device_draft_slots &&
-                        draft_token_count > 0)
-                    {
-                        verifier_input_tokens_device =
-                            first_token == kDeferredMTPFirstTokenShadow
-                                ? runner_
-                                      ->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
-                                          /*first_target_sample_slot=*/0,
-                                          /*first_draft_slot=*/0,
-                                          draft_token_count,
-                                          verifier_token_count)
-                                : runner_->prepareMTPVerifierInputTokensOnDevice(
-                                      first_token,
-                                      /*first_draft_slot=*/0,
-                                      draft_token_count,
-                                      verifier_token_count);
-                    }
-                    else
-                    {
-                        verifier_input_tokens_device =
-                            runner_
-                                ->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                                    draft_tokens.data(),
-                                    verifier_token_count,
-                                    draft_token_count);
-                    }
+                    std::string preparation_error;
+                    verifier_input_tokens_device =
+                        prepare_grouped_gpu_verifier_input_tokens(
+                            verifier_input_plan,
+                            "sidecar_preservation_probe",
+                            &preparation_error);
                     if (!verifier_input_tokens_device)
+                    {
+                        LOG_ERROR("[OrchestrationRunner] "
+                                  << preparation_error);
                         return std::nullopt;
+                    }
                 }
                 if (!runner_->setComputeRowIndexedAllPositionLogits(true, verifier_row_count))
                     return std::nullopt;
@@ -9500,11 +9619,6 @@ namespace llaminar2
                 stop_tokens_.size() <=
                     static_cast<size_t>(
                         sampling_math::kSpeculativeBatchMaxStopTokens);
-            const bool can_prepare_greedy_device_verifier_tokens =
-                !stochastic_verify &&
-                use_greedy_device_draft_slots &&
-                draft_tokens.size() > 1 &&
-                !first_token_is_stop;
             const bool use_greedy_device_batch_outcome =
                 !stochastic_verify &&
                 runner_->primaryDeviceId().is_gpu() &&
@@ -9574,8 +9688,7 @@ namespace llaminar2
                         "All-position MTP verifier could not enable all-position logits");
                 }
                 const void *verifier_input_tokens_device = nullptr;
-                if (can_defer_stochastic_batch_verifier_sync ||
-                    can_prepare_greedy_device_verifier_tokens)
+                if (runner_->primaryDeviceId().is_gpu())
                 {
                     /*
                      * Penalty-free stochastic verification already stores the
@@ -9585,24 +9698,18 @@ namespace llaminar2
                      * so the embedding graph and compact reducer read the same
                      * device-resident token row.
                      */
+                    std::string preparation_error;
                     verifier_input_tokens_device =
-                        first_token == kDeferredMTPFirstTokenShadow
-                            ? runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
-                                  /*first_target_sample_slot=*/0,
-                                  /*first_draft_slot=*/0,
-                                  verifier_input_plan.total_verifier_input_tokens - 1,
-                                  verifier_input_plan.total_verifier_input_tokens)
-                            : runner_->prepareMTPVerifierInputTokensOnDevice(
-                                  first_token,
-                                  /*first_draft_slot=*/0,
-                                  verifier_input_plan.total_verifier_input_tokens - 1,
-                                  verifier_input_plan.total_verifier_input_tokens);
+                        prepare_grouped_gpu_verifier_input_tokens(
+                            verifier_input_plan,
+                            "all_position_verifier",
+                            &preparation_error);
                     if (!verifier_input_tokens_device)
                     {
                         runner_->setComputeAllPositionLogits(false);
                         runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                         return fail_after_checkpoint(
-                            "All-position MTP verifier could not prepare device token input");
+                            preparation_error);
                     }
                     PerfStatsCollector::addCounter(
                         "mtp",
@@ -9636,19 +9743,13 @@ namespace llaminar2
                                  stop_tokens_.data(),
                                  static_cast<int>(
                                      stop_tokens_.size()),
-                                 MTPGreedyPenaltyPolicy{
+                                 MTPRequestPenaltyPolicy{
                                      .presence_penalty =
                                          active_sampling_params_
                                              .presence_penalty,
                                      .frequency_penalty =
                                          active_sampling_params_
                                              .frequency_penalty,
-                                     .first_token_already_in_history =
-                                         first_token_is_pending_condition
-                                             ? 1
-                                             : 0,
-                                     .enabled =
-                                         use_sampling_penalties ? 1 : 0,
                                  }))
                     {
                         runner_->setComputeAllPositionLogits(false);
@@ -9881,16 +9982,11 @@ namespace llaminar2
                     batched_residual_thresholds.reserve(static_cast<size_t>(compare_rows));
 
                     const int bonus_row = compare_rows;
-                    const MTPGreedyPenaltyPolicy verifier_penalty_policy{
+                    const MTPRequestPenaltyPolicy verifier_penalty_policy{
                         .presence_penalty =
                             active_sampling_params_.presence_penalty,
                         .frequency_penalty =
                             active_sampling_params_.frequency_penalty,
-                        .first_token_already_in_history =
-                            first_token_is_pending_condition ? 1 : 0,
-                        .enabled = active_sampling_params_.has_penalties()
-                                       ? 1
-                                       : 0,
                     };
                     if (!runner_
                              ->buildCapturedStochasticVerifierTargetDistributions(
@@ -10005,20 +10101,12 @@ namespace llaminar2
                             visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
                         publication_request.penalty_policy =
-                            MTPGreedyPenaltyPolicy{
+                            MTPRequestPenaltyPolicy{
                                 .presence_penalty =
                                     active_sampling_params_.presence_penalty,
                                 .frequency_penalty =
                                     active_sampling_params_.frequency_penalty,
-                                .first_token_already_in_history =
-                                    first_token_is_pending_condition ? 1 : 0,
-                                .enabled =
-                                    active_sampling_params_.has_penalties()
-                                        ? 1
-                                        : 0,
                             };
-                        publication_request.commit_penalty_history =
-                            active_sampling_params_.has_penalties();
 
                         std::string publication_error;
                         PerfStatsCollector::ScopedTimer direct_publish_timer(
@@ -10522,6 +10610,13 @@ namespace llaminar2
                         publication_request.max_state_commit_rows =
                             visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
+                        publication_request.penalty_policy =
+                            MTPRequestPenaltyPolicy{
+                                .presence_penalty =
+                                    active_sampling_params_.presence_penalty,
+                                .frequency_penalty =
+                                    active_sampling_params_.frequency_penalty,
+                            };
 
                         std::string publication_error;
                         PerfStatsCollector::ScopedTimer direct_publish_timer(
@@ -11579,10 +11674,6 @@ namespace llaminar2
 
                 const int verifier_row_count =
                     verifier_input_plan.compact_logit_row_count;
-                const bool needs_device_verifier_tokens =
-                    first_token_deferred ||
-                    has_deferred_draft_token ||
-                    use_serial_sample_equivalent_stochastic;
                 const bool can_defer_grouped_verifier_sync =
                     !first_token_is_stop;
                 ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
@@ -11605,41 +11696,26 @@ namespace llaminar2
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"},
                          {"rows", std::to_string(verifier_row_count)}});
-                    if (needs_device_verifier_tokens)
+                    std::string preparation_error;
+                    verifier_input_tokens_device =
+                        prepare_grouped_gpu_verifier_input_tokens(
+                            verifier_input_plan,
+                            "grouped_stochastic_verifier",
+                            &preparation_error);
+                    if (!verifier_input_tokens_device)
                     {
-                        if (first_token_deferred)
-                        {
-                            verifier_input_tokens_device =
-                                runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
-                                    /*first_target_sample_slot=*/0,
-                                    /*first_draft_slot=*/0,
-                                    verifier_input_plan.total_verifier_input_tokens - 1,
-                                    verifier_input_plan.total_verifier_input_tokens);
-                        }
-                        else
-                        {
-                            verifier_input_tokens_device =
-                                runner_->prepareMTPVerifierInputTokensOnDevice(
-                                    first_token,
-                                    /*first_draft_slot=*/0,
-                                    verifier_input_plan.total_verifier_input_tokens - 1,
-                                    verifier_input_plan.total_verifier_input_tokens);
-                        }
-                        if (!verifier_input_tokens_device)
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome MTP verifier could not prepare device token input");
-                        }
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "grouped_outcome_verifier_device_token_inputs",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"total_tokens",
-                              std::to_string(
-                                  verifier_input_plan.total_verifier_input_tokens)}});
+                        return fail_after_checkpoint(
+                            preparation_error);
                     }
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "grouped_outcome_verifier_device_token_inputs",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"total_tokens",
+                          std::to_string(
+                              verifier_input_plan.total_verifier_input_tokens)}});
 
                     MTPVerifierForwardExecutionOptions verifier_forward_options;
                     verifier_forward_options.device_token_ids =
@@ -11678,16 +11754,11 @@ namespace llaminar2
                 };
 
                 const int bonus_row = compare_rows;
-                const MTPGreedyPenaltyPolicy verifier_penalty_policy{
+                const MTPRequestPenaltyPolicy verifier_penalty_policy{
                     .presence_penalty =
                         active_sampling_params_.presence_penalty,
                     .frequency_penalty =
                         active_sampling_params_.frequency_penalty,
-                    .first_token_already_in_history =
-                        first_token_is_pending_condition ? 1 : 0,
-                    .enabled = active_sampling_params_.has_penalties()
-                                   ? 1
-                                   : 0,
                 };
                 if (!runner_
                          ->buildCapturedStochasticVerifierTargetDistributions(
@@ -11755,17 +11826,18 @@ namespace llaminar2
                         request.first_target_slot = 0;
                         request.first_draft_slot = 0;
                         request.row_count = compare_rows;
-                        request.first_token = first_token_deferred ? -1 : first_token;
-                        request.first_token_from_device = first_token_deferred;
+                        request.first_token = -1;
+                        request.first_token_from_device = true;
                         /*
-                         * prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken()
-                         * has already copied the deferred target sample into entry
-                         * zero of the verifier token row. From this point onward
-                         * that materialized row is the sole owner of the first
-                         * token consumed by the serial-equivalent summary kernel.
-                         * Keeping the original target-sample slot named here would
-                         * advertise two resident sources for one logical token and
-                         * make stream/lifetime ownership ambiguous.
+                         * Captured verifier preparation has already copied the
+                         * selected target-slot or resident-mailbox token into
+                         * entry zero of the verifier token row. From this point
+                         * onward that materialized row is the sole owner of the
+                         * condition token consumed by the serial-equivalent
+                         * summary kernel. Keeping either original producer named
+                         * here would advertise two resident sources for one
+                         * logical token and make stream/lifetime ownership
+                         * ambiguous.
                          */
                         request.first_target_sample_slot = -1;
                         request.token_row_offset = 0;
@@ -11956,18 +12028,12 @@ namespace llaminar2
                     visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
                 publication_request.penalty_policy =
-                    MTPGreedyPenaltyPolicy{
+                    MTPRequestPenaltyPolicy{
                         .presence_penalty =
                             active_sampling_params_.presence_penalty,
                         .frequency_penalty =
                             active_sampling_params_.frequency_penalty,
-                        .first_token_already_in_history =
-                            first_token_is_pending_condition ? 1 : 0,
-                        .enabled =
-                            active_sampling_params_.has_penalties() ? 1 : 0,
                     };
-                publication_request.commit_penalty_history =
-                    active_sampling_params_.has_penalties();
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "grouped_outcome_device_resident_publication_uses",
@@ -12012,6 +12078,218 @@ namespace llaminar2
                       std::to_string(publication_request.max_draft_tokens)},
                      {"shifted_commits",
                       std::to_string(shifted_publication_commit_count)}});
+
+                /*
+                 * Fixed-depth stochastic generation is now one native GPU
+                 * graph launch. The first transaction above establishes and
+                 * captures every exact child binding; the parent consumes its
+                 * controller publication, repeats complete transactions until
+                 * the device-owned response budget is terminal, and exposes
+                 * only the final ledger. Dynamic depth remains a distinct
+                 * controller architecture because changing graph depth inside
+                 * this fixed child family would violate capture identity.
+                 */
+                if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed &&
+                    publication_request.outcome
+                        .device_generation_controller_owned)
+                {
+                    /*
+                     * The externally orchestrated transaction and every parent
+                     * iteration share one exact tail lifecycle. Execute its
+                     * maintenance boundary first; on the first request this
+                     * atomically warms and captures the reusable maintenance
+                     * child, while later requests replay that same child. Only
+                     * after every rank participant has crossed this boundary may
+                     * the fixed parent clone all child executables.
+                     */
+                    if (!publishDeviceMoEMaintenanceBeforeMTPConsumer(
+                            "fixed_depth_device_generation_parent"))
+                    {
+                        return fail_after_checkpoint(
+                            "Fixed-depth stochastic MTP could not publish first-transaction device maintenance");
+                    }
+
+                    const int parent_draft_depth =
+                        publication_request.max_draft_tokens - 1;
+                    if (parent_draft_depth <= 0 ||
+                        !runner_
+                             ->materializeDeviceResidentStochasticGeneration(
+                                 publication_request.request_count,
+                                 parent_draft_depth))
+                    {
+                        return fail_after_checkpoint(
+                            "Fixed-depth stochastic MTP could not materialize its complete native device-generation graph family");
+                    }
+
+                    if (!runner_
+                             ->launchDeviceResidentStochasticGeneration())
+                    {
+                        return fail_after_checkpoint(
+                            "Fixed-depth stochastic MTP could not launch its native device-generation graph");
+                    }
+
+                    DeviceGenerationTerminalResult terminal;
+                    if (!runner_
+                             ->finishDeviceResidentStochasticGeneration(
+                                 &terminal) ||
+                        !terminal.valid() || terminal.requests.size() != 1u)
+                    {
+                        return fail_after_checkpoint(
+                            "Fixed-depth stochastic MTP could not materialize one valid terminal device ledger");
+                    }
+
+                    const DeviceGenerationTerminalRequestResult &request_result =
+                        terminal.requests.front();
+                    const int response_count =
+                        static_cast<int>(request_result.tokens.size());
+                    if (response_count <= 0 ||
+                        request_result.remaining_token_count < 0 ||
+                        response_count +
+                                request_result.remaining_token_count !=
+                            decode_step_token_budget_ ||
+                        request_result.transaction_count <= 0 ||
+                        request_result.published_state_commit_count < 0 ||
+                        request_result.published_state_commit_count >
+                            response_count + 1)
+                    {
+                        return fail_after_checkpoint(
+                            "Fixed-depth stochastic MTP terminal ledger disagrees with the admitted response/state budget");
+                    }
+                    if (!publishDecodeTransactionPlanningPositionAfterMTPCommit(
+                            transaction_base_cached_tokens,
+                            request_result.published_state_commit_count,
+                            "native_device_generation_parent"))
+                    {
+                        return fail_after_checkpoint(
+                            last_error_.empty()
+                                ? "Fixed-depth stochastic MTP could not publish its terminal scheduler position"
+                                : last_error_);
+                    }
+
+                    pending_mtp_condition_token_.reset();
+                    pending_mtp_condition_params_.reset();
+                    pending_mtp_condition_resident_state_.reset();
+                    prelaunched_mtp_first_sidecar_resident_state_.reset();
+                    prelaunched_mtp_first_sidecar_params_.reset();
+                    prefill_logits_ready_ = false;
+                    ready_sampled_token_.reset();
+                    ready_sampled_params_.reset();
+                    ready_sampled_resident_state_.reset();
+
+                    for (const int32_t token : request_result.tokens)
+                    {
+                        sampler_.record_token(token);
+                        result.tokens.push_back(token);
+                    }
+                    last_token_ = request_result.tokens.back();
+                    result.is_complete = request_result.model_stopped;
+
+                    const uint64_t transactions =
+                        static_cast<uint64_t>(
+                            request_result.transaction_count);
+                    const uint64_t accepted =
+                        static_cast<uint64_t>(
+                            request_result
+                                .accepted_speculative_token_count);
+                    const uint64_t rejected =
+                        static_cast<uint64_t>(
+                            request_result.rejected_transaction_count);
+                    const uint64_t consumed_rows =
+                        static_cast<uint64_t>(
+                            request_result.consumed_verifier_row_count);
+                    const uint64_t additional_transactions =
+                        transactions > 0 ? transactions - 1u : 0u;
+                    mtp_stats_.draft_steps +=
+                        additional_transactions *
+                        static_cast<uint64_t>(
+                            requested_speculative_draft_count);
+                    mtp_stats_.verifier_runs += transactions;
+                    mtp_stats_.verifier_token_count +=
+                        transactions *
+                        static_cast<uint64_t>(
+                            publication_request.max_draft_tokens);
+                    mtp_stats_.accepted_tokens += accepted;
+                    mtp_stats_.rejected_tokens += rejected;
+                    mtp_stats_.rollbacks += rejected;
+                    mtp_stats_.stochastic_accept_tests += consumed_rows;
+                    mtp_stats_.stochastic_accepts += accepted;
+                    mtp_stats_.stochastic_residual_samples += rejected;
+                    mtp_stats_.transaction_commits += transactions;
+                    mtp_stats_.transaction_rollbacks += rejected;
+
+                    const PerfStatsCollector::Tags terminal_tags{
+                        {"path", "native_device_generation_parent"},
+                        {"depth",
+                         std::to_string(
+                             requested_speculative_draft_count)},
+                        {"transactions",
+                         std::to_string(
+                             request_result.transaction_count)},
+                        {"state_commits",
+                         std::to_string(
+                             request_result
+                                 .published_state_commit_count)}};
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "native_device_generation_requests",
+                        1.0,
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "output_tokens",
+                        static_cast<double>(response_count),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "verifier_runs",
+                        static_cast<double>(transactions),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "verifier_tokens",
+                        static_cast<double>(
+                            transactions *
+                            static_cast<uint64_t>(
+                                publication_request.max_draft_tokens)),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_accept_tests",
+                        static_cast<double>(consumed_rows),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_accepts",
+                        static_cast<double>(accepted),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "accepted_tokens",
+                        static_cast<double>(accepted),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "rejected_tokens",
+                        static_cast<double>(rejected),
+                        "decode",
+                        {},
+                        terminal_tags);
+                    return result;
+                }
 
                 /*
                  * Device publication derives next-condition rows into the
@@ -12773,10 +13051,6 @@ namespace llaminar2
 
                 const int verifier_row_count =
                     verifier_input_plan.compact_logit_row_count;
-                const bool needs_device_verifier_tokens =
-                    first_token_deferred || has_deferred_draft_token ||
-                    use_greedy_device_draft_slots ||
-                    runner_->primaryDeviceId().is_gpu();
                 ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
                     runner_.get(),
                     true);
@@ -12810,67 +13084,29 @@ namespace llaminar2
                         return fail_after_checkpoint(
                             "Grouped-outcome greedy MTP verifier could not enable all-position logits");
                     }
-                    if (needs_device_verifier_tokens)
+                    std::string preparation_error;
+                    verifier_input_tokens_device =
+                        prepare_grouped_gpu_verifier_input_tokens(
+                            verifier_input_plan,
+                            "grouped_greedy_verifier",
+                            &preparation_error);
+                    if (!verifier_input_tokens_device)
                     {
-                        if (first_token_deferred ||
-                            first_token_device_target_slot_available)
-                        {
-                            verifier_input_tokens_device =
-                                runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
-                                    /*first_target_sample_slot=*/0,
-                                    /*first_draft_slot=*/0,
-                                    verifier_input_plan.total_verifier_input_tokens - 1,
-                                    verifier_input_plan.total_verifier_input_tokens);
-                        }
-                        else if (use_greedy_device_draft_slots ||
-                                 has_deferred_draft_token)
-                        {
-                            verifier_input_tokens_device =
-                                runner_->prepareMTPVerifierInputTokensOnDevice(
-                                    first_token,
-                                    /*first_draft_slot=*/0,
-                                    verifier_input_plan.total_verifier_input_tokens - 1,
-                                    verifier_input_plan.total_verifier_input_tokens);
-                        }
-                        else
-                        {
-                            /*
-                             * Host-visible warmup rows still feed the compact
-                             * resident reducer.  Stage the complete row once on
-                             * the verifier stream so the forward graph and the
-                             * outcome reducer consume one coherent device row.
-                             */
-                            if (runner_->primaryDeviceId().is_gpu())
-                            {
-                                runner_->setComputeAllPositionLogits(false);
-                                runner_->setComputeRowIndexedAllPositionLogits(false, 0);
-                                return fail_after_checkpoint(
-                                    "Grouped-outcome greedy GPU MTP cannot upload host verifier rows");
-                            }
-                            verifier_input_tokens_device =
-                                runner_->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                                    verifier_input_plan.verifier_input_tokens.data(),
-                                    verifier_input_plan.total_verifier_input_tokens,
-                                    verifier_input_plan.total_verifier_input_tokens - 1);
-                        }
-                        if (!verifier_input_tokens_device)
-                        {
-                            runner_->setComputeAllPositionLogits(false);
-                            runner_->setComputeRowIndexedAllPositionLogits(false, 0);
-                            return fail_after_checkpoint(
-                                "Grouped-outcome greedy MTP verifier could not prepare device token input");
-                        }
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "grouped_outcome_verifier_device_token_inputs",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"total_tokens",
-                              std::to_string(
-                                  verifier_input_plan.total_verifier_input_tokens)},
-                             {"sampling", "greedy"}});
+                        runner_->setComputeAllPositionLogits(false);
+                        runner_->setComputeRowIndexedAllPositionLogits(false, 0);
+                        return fail_after_checkpoint(
+                            preparation_error);
                     }
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "grouped_outcome_verifier_device_token_inputs",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"total_tokens",
+                          std::to_string(
+                              verifier_input_plan.total_verifier_input_tokens)},
+                         {"sampling", "greedy"}});
 
                     MTPVerifierForwardExecutionOptions verifier_forward_options;
                     verifier_forward_options.device_token_ids =
@@ -12882,19 +13118,13 @@ namespace llaminar2
                                  stop_tokens_.data(),
                                  static_cast<int>(
                                      stop_tokens_.size()),
-                                 MTPGreedyPenaltyPolicy{
+                                 MTPRequestPenaltyPolicy{
                                      .presence_penalty =
                                          active_sampling_params_
                                              .presence_penalty,
                                      .frequency_penalty =
                                          active_sampling_params_
                                              .frequency_penalty,
-                                     .first_token_already_in_history =
-                                         first_token_is_pending_condition
-                                             ? 1
-                                             : 0,
-                                     .enabled =
-                                         use_sampling_penalties ? 1 : 0,
                                  }))
                     {
                         runner_->setComputeAllPositionLogits(false);
@@ -13074,6 +13304,13 @@ namespace llaminar2
                 publication_request.max_state_commit_rows =
                     visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
+                publication_request.penalty_policy =
+                    MTPRequestPenaltyPolicy{
+                        .presence_penalty =
+                            active_sampling_params_.presence_penalty,
+                        .frequency_penalty =
+                            active_sampling_params_.frequency_penalty,
+                    };
 
                 std::string publication_error;
                 {
@@ -14380,6 +14617,14 @@ namespace llaminar2
             return result;
         }
 
+        /*
+         * Sampling policy is request admission state. Install it before prefill
+         * so GPU request-input or prefix-restore publication can initialize the
+         * graph-stable penalty policy on its exact reset-ordered stream.
+         */
+        active_sampling_params_ = sampling;
+        sampler_ = Sampler(sampling.seed);
+
         // Prefill
         // After prefill, the first decodeStep() samples from the prefill logits
         // directly (via prefill_logits_ready_ flag) instead of re-feeding the
@@ -14389,20 +14634,6 @@ namespace llaminar2
         if (!prefill(prompt_tokens))
         {
             result.error = last_error_;
-            return result;
-        }
-
-        // Store sampling params for decodeStep() and configure GPU-side decode
-        active_sampling_params_ = sampling;
-        sampler_ = Sampler(sampling.seed);
-
-        if (!sampling.is_greedy() && max_new_tokens > 0 &&
-            !runner_->beginDeviceResidentStochasticGeneration(
-                /*request_count=*/1,
-                max_new_tokens))
-        {
-            result.error =
-                "Failed to admit the device-resident stochastic generation response ledger";
             return result;
         }
 
@@ -14740,6 +14971,7 @@ namespace llaminar2
         prelaunched_mtp_first_sidecar_params_.reset();
         device_moe_maintenance_published_in_decode_step_ = false;
         decode_transaction_planning_position_.reset();
+        device_generation_admission_pending_ = false;
         clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);
         mtp_bypassed_ = false;
@@ -16946,17 +17178,29 @@ namespace llaminar2
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
         {
             broadcastCommand(MPICommand::SET_SAMPLING);
-            float params_buf[4] = {
+            float params_buf[6] = {
                 params.temperature,
                 params.top_p,
                 static_cast<float>(params.top_k),
-                static_cast<float>(params.seed)};
-            mpi_ctx_->broadcast(params_buf, 4, 0);
+                static_cast<float>(params.seed),
+                params.presence_penalty,
+                params.frequency_penalty};
+            mpi_ctx_->broadcast(params_buf, 6, 0);
         }
 
         active_sampling_params_ = params;
         // Reset token history and deterministic RNG for a new conversation/request.
         sampler_ = Sampler(params.seed);
+        if (runner_ &&
+            !runner_->configureMTPRequestPenaltyPolicy(
+                MTPRequestPenaltyPolicy{
+                    .presence_penalty = params.presence_penalty,
+                    .frequency_penalty = params.frequency_penalty,
+                }))
+        {
+            throw std::runtime_error(
+                "Inference runner rejected request penalty policy");
+        }
     }
 
     SamplingParams OrchestrationRunner::getRecommendedSamplingParams() const
@@ -17030,13 +17274,15 @@ namespace llaminar2
             case MPICommand::SET_SAMPLING:
             {
                 // Receive sampling params
-                float params_buf[4]; // temperature, top_p, top_k, seed
-                mpi_ctx_->broadcast(params_buf, 4, 0);
+                float params_buf[6]; // temperature, top_p, top_k, seed, penalties
+                mpi_ctx_->broadcast(params_buf, 6, 0);
                 SamplingParams sp;
                 sp.temperature = params_buf[0];
                 sp.top_p = params_buf[1];
                 sp.top_k = static_cast<int>(params_buf[2]);
                 sp.seed = static_cast<uint64_t>(params_buf[3]);
+                sp.presence_penalty = params_buf[4];
+                sp.frequency_penalty = params_buf[5];
                 setSamplingParams(sp);
                 break;
             }

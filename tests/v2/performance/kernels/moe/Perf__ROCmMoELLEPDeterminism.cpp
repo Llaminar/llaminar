@@ -573,6 +573,9 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
     DeviceMoERebalanceStatus *d_status = nullptr;
     DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
     DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    DeviceMoERebalanceGraphControllerState *d_controller_states = nullptr;
+    const auto controller_states = makeDueControllerTransactions(
+        config, warmups + iterations);
     ASSERT_EQ(hipMalloc(&d_local_histograms,
                         static_cast<size_t>(local_histogram_count) * sizeof(uint64_t)),
               hipSuccess);
@@ -584,13 +587,28 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
     ASSERT_EQ(hipMalloc(&d_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            &d_controller_states,
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState)),
+        hipSuccess);
     ASSERT_EQ(hipMemsetAsync(d_gathered_histograms,
                              0,
                              static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t),
                              harness.stream_),
               hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_controller_states,
+            controller_states.data(),
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState),
+            hipMemcpyHostToDevice,
+            harness.stream_),
+        hipSuccess);
 
-    auto run_maintenance = [&]()
+    auto run_maintenance = [&](int transaction_index)
     {
         ASSERT_TRUE(harness.kernel_->packDeviceRebalanceHistograms(
             harness.launchContext(),
@@ -614,17 +632,18 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
             plan_capacity,
             plan_capacity,
             d_header,
-            d_wave_state));
+            d_wave_state,
+            d_controller_states + transaction_index));
     };
 
     for (int i = 0; i < warmups; ++i)
-        run_maintenance();
+        run_maintenance(i);
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
 
     HipEvents events;
     ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
     for (int i = 0; i < iterations; ++i)
-        run_maintenance();
+        run_maintenance(warmups + i);
     ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
     ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
     float elapsed_ms = 0.0f;
@@ -668,6 +687,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
 
     if (d_wave_state)
         (void)hipFree(d_wave_state);
+    if (d_controller_states)
+        (void)hipFree(d_controller_states);
     if (d_header)
         (void)hipFree(d_header);
     if (d_status)
@@ -708,6 +729,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     shape.participant_count = 2;
     constexpr uint32_t num_layers = 40u;
     constexpr uint32_t plan_capacity = 42u;
+    DeviceMoELLEPLayerPlanScratch *d_llep_layer_plans = nullptr;
     const uint32_t layer_wave_count = static_cast<uint32_t>(
         std::min(
             4,
@@ -725,6 +747,13 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     harness.prepare(/*all_participants_resident=*/false,
                     makeSourceZeroTransferRouteExperts(shape),
                     makeRouteWeights(shape));
+    ASSERT_EQ(
+        hipMalloc(
+            &d_llep_layer_plans,
+            static_cast<size_t>(
+                std::max(1u, config.layer_window_count)) *
+                sizeof(DeviceMoELLEPLayerPlanScratch)),
+        hipSuccess);
 
     DeviceMoERuntimeTable::Config runtime_config;
     runtime_config.device_id = harness.device_;
@@ -792,6 +821,9 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     DeviceMoERebalanceStatus *d_status = nullptr;
     DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
     DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    DeviceMoERebalanceGraphControllerState *d_controller_states = nullptr;
+    const auto controller_states = makeDueControllerTransactions(
+        config, warmups + iterations);
     ASSERT_EQ(
         hipMalloc(
             &d_gathered_histograms,
@@ -812,6 +844,12 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
         hipMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)),
         hipSuccess);
     ASSERT_EQ(
+        hipMalloc(
+            &d_controller_states,
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState)),
+        hipSuccess);
+    ASSERT_EQ(
         hipMemcpyAsync(
             d_gathered_histograms,
             gathered.data(),
@@ -822,8 +860,17 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     ASSERT_EQ(
         hipMemsetAsync(d_wave_state, 0, sizeof(*d_wave_state), harness.stream_),
         hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_controller_states,
+            controller_states.data(),
+            controller_states.size() *
+                sizeof(DeviceMoERebalanceGraphControllerState),
+            hipMemcpyHostToDevice,
+            harness.stream_),
+        hipSuccess);
 
-    auto run_controller = [&]()
+    auto run_controller = [&](int transaction_index)
     {
         ASSERT_TRUE(harness.kernel_->runDeviceRebalanceController(
             harness.launchContext(),
@@ -836,17 +883,22 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
             plan_capacity,
             plan_capacity,
             d_header,
-            d_wave_state));
+            d_wave_state,
+            d_controller_states + transaction_index,
+            1u,
+            nullptr,
+            0u,
+            d_llep_layer_plans));
     };
 
     for (int i = 0; i < warmups; ++i)
-        run_controller();
+        run_controller(i);
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
 
     HipEvents events;
     ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
     for (int i = 0; i < iterations; ++i)
-        run_controller();
+        run_controller(warmups + i);
     ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
     ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
     float elapsed_ms = 0.0f;
@@ -890,6 +942,10 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
         status.llep_assignment_span_count,
         plan_count);
 
+    if (d_llep_layer_plans)
+        (void)hipFree(d_llep_layer_plans);
+    if (d_controller_states)
+        (void)hipFree(d_controller_states);
     if (d_wave_state)
         (void)hipFree(d_wave_state);
     if (d_header)

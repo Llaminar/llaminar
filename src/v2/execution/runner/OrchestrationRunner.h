@@ -480,6 +480,27 @@ namespace llaminar2
             int committed_tokens,
             const char *source);
         /**
+         * @brief Admit the scalar GPU stochastic-generation ledger exactly once.
+         *
+         * Every public inference surface ultimately enters MTP through
+         * decodeStepMTP(), whereas only the convenience generate() API owns an
+         * outer generation loop.  Keeping admission at this shared
+         * prefill-to-decode boundary prevents benchmark, HTTP, completion, and
+         * chat callers from reaching the first resident verifier without an
+         * initialized device controller.
+         *
+         * The boolean tracked by OrchestrationRunner is control-plane lifecycle
+         * state only.  Once admitted, transaction budgets, response progress,
+         * stop state, and producer/consumer ordering remain exclusively in the
+         * persistent device controller and its event-published handoffs.
+         *
+         * @param stochastic_device_verify Whether this decode transaction uses
+         *        the production GPU stochastic verifier.
+         * @return true when admission is unnecessary or has completed.
+         */
+        bool admitScalarDeviceResidentStochasticGeneration(
+            bool stochastic_device_verify);
+        /**
          * @brief Advance the scheduler position after one committed decode row.
          *
          * A normal decode forward consumes the previous response token and
@@ -793,6 +814,15 @@ namespace llaminar2
          * hidden state, and publication metadata remain device-owned.
          */
         std::optional<int> decode_transaction_planning_position_;
+        /**
+         * @brief Whether successful prefill still needs one GPU ledger admission.
+         *
+         * Prefill establishes a new request lifecycle, but it does not know the
+         * caller's response budget.  The first scalar stochastic MTP decode owns
+         * that budget and clears this marker only after every device participant
+         * has initialized and event-published its resident controller.
+         */
+        bool device_generation_admission_pending_{false};
         /**
          * @brief Per-request state initialized by prefillBatch().
          *

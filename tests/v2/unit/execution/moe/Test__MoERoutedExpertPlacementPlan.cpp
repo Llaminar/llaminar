@@ -122,6 +122,29 @@ namespace llaminar2::test
         EXPECT_TRUE(result.ok()) << (result.errors.empty() ? "" : result.errors.front());
     }
 
+    TEST(Test__MoERoutedExpertPlacementPlan, PhaseSplitReplicasUseParticipantAssignedPrefill)
+    {
+        auto domain = localGpuTPDomain("gpu_hot");
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+        domain.routed_phase_policy =
+            RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+        domain.routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        EXPECT_TRUE(domain.usesParticipantAssignedPrefill());
+        EXPECT_TRUE(domain.supportsLeastLoadedResidentAssignment());
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlan, UniformReplicasDoNotClaimParticipantAssignedPrefill)
+    {
+        auto domain = localGpuTPDomain("gpu_hot");
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+
+        EXPECT_FALSE(domain.usesParticipantAssignedPrefill());
+        EXPECT_FALSE(domain.supportsLeastLoadedResidentAssignment());
+    }
+
     TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedAssignmentOnSingleParticipantDomains)
     {
         auto plan = validTwoTierPlan();

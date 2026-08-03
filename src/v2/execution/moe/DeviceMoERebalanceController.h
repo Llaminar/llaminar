@@ -7,6 +7,7 @@
 
 #include "DeviceMoERebalanceABI.h"
 #include "DeviceMoERebalancePolicyShared.h"
+#include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
 
 #include <algorithm>
@@ -18,6 +19,12 @@
 
 namespace llaminar2
 {
+    static_assert(
+        kDeviceMoELLEPPlannerMaxExperts == kDeviceMoEMaxExperts);
+    static_assert(
+        kDeviceMoELLEPPlannerMaxParticipants ==
+        kDeviceMoEMaxParticipants);
+
     inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
     inline constexpr uint32_t kDeviceMoERebalanceVersion =
         moe_rebalance_abi::kVersion;
@@ -703,34 +710,9 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDirectoryEntry>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceApplyStatus>);
 
-    /**
-     * @brief Device-runtime summary of active transfer-slot ownership.
-     *
-     * The summary is intentionally reducible to a small fixed-width status
-     * object. GPU implementations compute the same fields in their captured
-     * controller kernels, while this host implementation keeps controller
-     * tests and CPU diagnostics ABI-identical.
-     */
-    struct DeviceMoETransferSlotClaimSummary
-    {
-        uint32_t active_claims = 0;
-        uint32_t unique_claims = 0;
-        uint32_t duplicate_claims = 0;
-        uint32_t invalid_claims = 0;
-        uint32_t max_slot = 0;
-        uint32_t max_slot_layer = 0;
-        uint32_t max_slot_expert = 0;
-        uint32_t first_duplicate_slot = 0;
-        uint32_t first_duplicate_layer = 0;
-        uint32_t first_duplicate_expert = 0;
-        uint32_t first_invalid_slot = kDeviceMoEInvalidSlot;
-        uint32_t first_invalid_layer = kDeviceMoEInvalidSlot;
-        uint32_t first_invalid_expert = kDeviceMoEInvalidSlot;
-        uint32_t first_invalid_reasons = 0;
-        uint32_t first_invalid_flags = 0;
-        uint32_t first_invalid_resident_mask = 0;
-        int32_t first_invalid_owner = -1;
-    };
+    static_assert(
+        std::is_trivially_copyable_v<DeviceMoETransferSlotClaimSummary>,
+        "transfer-slot authentication must remain a fixed-width publication");
 
     /**
      * @brief Audit active placement banks for aliased transfer-slot IDs.

@@ -1463,6 +1463,17 @@ namespace llaminar2
         const bool success = executeCacheMiss(build_input, output, forward_signature, build_cache,
                                               should_cache_after_build, host, is_decode,
                                               has_unified_pp, start);
+        if (!success && forward_cache_eligible)
+        {
+            /*
+             * First-use materialization is transactional. Leaving an invalid
+             * entry behind would preserve graph-owned streams, events, and
+             * pointers from a failed capture and make the next invocation look
+             * like a reusable cache object. Erase the entire half-built entry;
+             * a later request must construct a fresh ownership lifetime.
+             */
+            cache_.erase(forward_signature);
+        }
         if (live_mtp_request_batch_condition &&
             debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
         {
@@ -3536,6 +3547,74 @@ namespace llaminar2
         {
             first_graph_ready_fired_ = true;
             host.onFirstGraphReady();
+        }
+
+        /*
+         * A cacheable GPU decode graph has one lifecycle, including its first
+         * invocation. Install the fully built graph into its stable cache
+         * before submitting any kernels, then enter executeCacheHit(), whose
+         * Warmup -> Materialize transaction executes the logical payload once
+         * and returns with a complete native graph executable.
+         *
+         * Keeping a separate eager cache-miss execution here used to expose a
+         * valid ComputeGraph with no replay-ready GraphSegmentCache. The MTP
+         * parent graph could observe that half-state immediately after the
+         * grouped verifier produced its rows. Delegating first use through the
+         * ordinary cached path makes that state structurally impossible and
+         * also guarantees that cache misses and hits share identical stream,
+         * dynamic-parameter, collective, snapshot, and publication ordering.
+         */
+        if (should_cache && build_cache && is_decode &&
+            effective_input.device.is_gpu())
+        {
+            build_cache->graph =
+                std::make_unique<ComputeGraph>(std::move(graph));
+            build_cache->output = output;
+            build_cache->workspace_generation = workspace_generation;
+            build_cache->snapshot_configuration_epoch =
+                executor_.snapshotConfigurationEpoch();
+            build_cache->collective_nodes = std::move(collective_nodes);
+            build_cache->valid = true;
+
+            /*
+             * The initial PP handoff already ran before graph construction.
+             * Publish its immutable cache bindings now, but arm repetition only
+             * after first-use execution so that invocation does not copy the
+             * same activation twice.
+             */
+            if (initial_pp_copy.needs_copy)
+            {
+                build_cache->pp_external_hidden_state =
+                    initial_pp_copy.external_hidden;
+                build_cache->pp_working_buffer =
+                    initial_pp_copy.working_buffer;
+                build_cache->pp_copy_bytes = initial_pp_copy.copy_bytes;
+                build_cache->pp_device = initial_pp_copy.device;
+            }
+
+            const bool first_use_success = executeCacheHit(
+                effective_input,
+                output,
+                *build_cache,
+                host,
+                is_decode,
+                start);
+            if (!first_use_success)
+            {
+                build_cache->invalidate();
+                return false;
+            }
+
+            build_cache->pp_needs_copy = initial_pp_copy.needs_copy;
+            LOG_DEBUG(
+                "[ForwardExecutionEngine] Atomically materialized first-use "
+                "GPU decode graph [seq_len="
+                << signature.seq_len
+                << ", batch_size=" << signature.batch_size
+                << ", device=" << signature.device.to_string()
+                << ", all_position_logits="
+                << signature.all_position_logits << "]");
+            return true;
         }
 
         bool success = false;

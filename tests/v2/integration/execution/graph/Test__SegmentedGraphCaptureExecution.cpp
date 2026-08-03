@@ -8,7 +8,7 @@
  * into a successful gtest skip.
  *
  * Coverage:
- * 1. Warmup -> capture -> replay lifecycle executes successfully.
+ * 1. First-use warmup atomically materializes a replay-ready full graph.
  * 2. Collective-marked segmented mode remains functional.
  * 3. Graph-stable snapshot slots preserve point-in-time outputs when a later
  *    stage overwrites the producer's arena storage.
@@ -32,6 +32,7 @@
 #include "tensors/Tensors.h"
 
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/GraphArenaTestHarness.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -69,7 +70,9 @@ class CachedGraphReplayExecutionTest : public ::testing::Test
 protected:
     IWorkerGPUContext *gpu_ctx_ = nullptr;
     std::unique_ptr<IDeviceContext> device_ctx_;
+    GraphArenaTestHarness graph_arena_;
     std::vector<std::unique_ptr<TensorBase>> tensor_storage_;
+    std::vector<TensorBase *> arena_tensors_;
 
     void SetUp() override
     {
@@ -94,6 +97,16 @@ protected:
         auto *ptr = tensor.get();
         tensor_storage_.push_back(std::move(tensor));
         return static_cast<FP32Tensor *>(ptr);
+    }
+
+    FP32Tensor *createArenaFP32Tensor(
+        BufferId id,
+        const std::vector<size_t> &shape)
+    {
+        auto *tensor =
+            graph_arena_.createPersistentTensor<FP32Tensor>(id, shape);
+        arena_tensors_.push_back(tensor);
+        return tensor;
     }
 
     /**
@@ -125,6 +138,11 @@ protected:
             if (!tensor || !tensor->ensureOnDevice(device, upload_stream))
                 return false;
         }
+        for (auto *tensor : arena_tensors_)
+        {
+            if (!tensor || !tensor->ensureOnDevice(device, upload_stream))
+                return false;
+        }
 
         return gpu_ctx_->synchronizeStreamChecked(upload_stream);
     }
@@ -135,11 +153,15 @@ protected:
                                         FP32Tensor *&result_output)
     {
         const DeviceId device = device_ctx_->deviceId();
-        norm_input = createFP32Tensor({seq_len, d_model});
-        auto *norm_output = createFP32Tensor({seq_len, d_model});
+        norm_input = createArenaFP32Tensor(
+            BufferId::HIDDEN_STATE, {seq_len, d_model});
+        auto *norm_output = createArenaFP32Tensor(
+            BufferId::NORMALIZED, {seq_len, d_model});
         auto *gamma = createFP32Tensor({d_model});
-        residual = createFP32Tensor({seq_len, d_model});
-        result_output = createFP32Tensor({seq_len, d_model});
+        residual = createArenaFP32Tensor(
+            BufferId::RESIDUAL, {seq_len, d_model});
+        result_output = createArenaFP32Tensor(
+            BufferId::ATTN_OUTPUT, {seq_len, d_model});
 
         const size_t num_elements = seq_len * d_model;
         for (size_t i = 0; i < num_elements; ++i)
@@ -156,6 +178,8 @@ protected:
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
         norm_params.device_id = device;
+        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
@@ -163,6 +187,9 @@ protected:
         res_params.output = result_output;
         res_params.num_elements = num_elements;
         res_params.device_id = device;
+        res_params.input_buffer_id = BufferId::NORMALIZED;
+        res_params.residual_buffer_id = BufferId::RESIDUAL;
+        res_params.output_buffer_id = BufferId::ATTN_OUTPUT;
 
         ComputeGraph graph;
         graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device);
@@ -176,10 +203,13 @@ protected:
                                              FP32Tensor *&scratch)
     {
         const DeviceId device = device_ctx_->deviceId();
-        norm_input = createFP32Tensor({seq_len, d_model});
-        scratch = createFP32Tensor({seq_len, d_model});
+        norm_input = createArenaFP32Tensor(
+            BufferId::HIDDEN_STATE, {seq_len, d_model});
+        scratch = createArenaFP32Tensor(
+            BufferId::NORMALIZED, {seq_len, d_model});
         auto *gamma = createFP32Tensor({d_model});
-        auto *residual = createFP32Tensor({seq_len, d_model});
+        auto *residual = createArenaFP32Tensor(
+            BufferId::RESIDUAL, {seq_len, d_model});
 
         const size_t num_elements = seq_len * d_model;
         for (size_t i = 0; i < num_elements; ++i)
@@ -197,6 +227,8 @@ protected:
         norm_params.gamma = gamma;
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
+        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         ResidualAddStage::Params overwrite_params;
         overwrite_params.device_id = device;
@@ -204,6 +236,9 @@ protected:
         overwrite_params.residual = scratch;
         overwrite_params.output = scratch;
         overwrite_params.num_elements = num_elements;
+        overwrite_params.input_buffer_id = BufferId::RESIDUAL;
+        overwrite_params.residual_buffer_id = BufferId::NORMALIZED;
+        overwrite_params.output_buffer_id = BufferId::NORMALIZED;
 
         ComputeGraph graph;
         graph.addNode("stage1_norm", ComputeStageFactory::createRMSNorm(norm_params), device);
@@ -238,6 +273,18 @@ protected:
             }
         }
         EXPECT_TRUE(has_nonzero) << "Output tensor is all zeros";
+    }
+
+    static void assertTensorFiniteAndNonZero(
+        FP32Tensor *tensor,
+        size_t count,
+        void *producer_stream)
+    {
+        ASSERT_NE(tensor, nullptr);
+        ASSERT_NE(producer_stream, nullptr);
+        ASSERT_TRUE(tensor->ensureOnHost(producer_stream))
+            << "The test's explicit host observation must consume the exact graph producer stream.";
+        assertFiniteAndNonZero(tensor->data(), count);
     }
 
     static void assertGraphStagesUseStream(ComputeGraph &graph, void *stream)
@@ -293,7 +340,7 @@ protected:
     }
 };
 
-TEST_F(CachedGraphReplayExecutionTest, WarmupCaptureReplay_LifecycleStable)
+TEST_F(CachedGraphReplayExecutionTest, FirstUseMaterializesReplayWithoutSecondMutation)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
@@ -312,6 +359,7 @@ TEST_F(CachedGraphReplayExecutionTest, WarmupCaptureReplay_LifecycleStable)
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *stream = gpu_ctx_->defaultStream();
     ASSERT_NE(stream, nullptr);
@@ -319,34 +367,38 @@ TEST_F(CachedGraphReplayExecutionTest, WarmupCaptureReplay_LifecycleStable)
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
     EXPECT_TRUE(segment_cache.initialized);
-    EXPECT_TRUE(segment_cache.needs_capture);
-    assertFiniteAndNonZero(result->data(), num_elements);
+    EXPECT_FALSE(segment_cache.needs_capture)
+        << "A successful first use must not expose initialized-but-uncaptured state.";
+    assertTensorFiniteAndNonZero(
+        result, num_elements, segment_cache.capture_stream);
 
-    std::vector<float> warmup_output(num_elements);
-    std::memcpy(warmup_output.data(), result->data(), num_elements * sizeof(float));
+    std::string export_error;
+    const auto replay_template =
+        segment_cache.deviceLoopGraphTemplate(graph, &export_error);
+    ASSERT_TRUE(replay_template.has_value()) << export_error;
+    ASSERT_NE(replay_template->capture, nullptr);
+    EXPECT_EQ(replay_template->stage_count, graph.getExecutionOrder().size());
+    EXPECT_EQ(replay_template->stream, segment_cache.capture_stream);
+
+    std::vector<float> first_use_output(num_elements);
+    std::memcpy(
+        first_use_output.data(),
+        result->data(),
+        num_elements * sizeof(float));
 
     graph.reset();
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
     EXPECT_TRUE(segment_cache.initialized);
     EXPECT_FALSE(segment_cache.needs_capture);
-    assertFiniteAndNonZero(result->data(), num_elements);
-
-    std::vector<float> capture_output(num_elements);
-    std::memcpy(capture_output.data(), result->data(), num_elements * sizeof(float));
-
-    graph.reset();
-    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
-        graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(
+        result, num_elements, segment_cache.capture_stream);
 
     const float *replay = result->data();
     for (size_t i = 0; i < num_elements; ++i)
     {
-        EXPECT_NEAR(replay[i], capture_output[i], 1e-5f)
-            << "Replay output differs from capture output at index " << i;
-        EXPECT_NEAR(replay[i], warmup_output[i], 1e-5f)
-            << "Replay output differs from warmup output at index " << i;
+        EXPECT_NEAR(replay[i], first_use_output[i], 1e-5f)
+            << "Replay output differs from the single first-use execution at index " << i;
     }
 }
 
@@ -369,6 +421,7 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *stream = gpu_ctx_->defaultStream();
     ASSERT_NE(stream, nullptr);
@@ -394,7 +447,8 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
         }
     }
     EXPECT_TRUE(has_manual_segment);
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(
+        result, num_elements, segment_cache.capture_stream);
 
     graph.reset();
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
@@ -403,7 +457,8 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
     graph.reset();
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, &collective_nodes));
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(
+        result, num_elements, segment_cache.capture_stream);
 }
 
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
@@ -425,12 +480,14 @@ TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamFo
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *dispatch_stream = gpu_ctx_->defaultStream();
     ASSERT_NE(dispatch_stream, nullptr);
 
-    // First warmup creates the dedicated cached-replay stream and binds all
-    // stages to it. This stream must not be replaced by retry/reset plumbing.
+    // First use creates the dedicated cached-replay stream, executes warmup,
+    // and atomically materializes the replay graph. This stream must not be
+    // replaced by retry/reset plumbing.
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     void *capture_stream = segment_cache.capture_stream;
@@ -438,7 +495,7 @@ TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamFo
     EXPECT_NE(capture_stream, dispatch_stream)
         << "Cached graph replay should use a dedicated explicit stream, not the dispatch/default stream";
     assertGraphStagesUseStream(graph, capture_stream);
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(result, num_elements, capture_stream);
 
     // Reset with Preserve simulates capture retry/replay failure handling. The
     // next warmup must reuse the same live stream so cached stages never observe
@@ -451,7 +508,7 @@ TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamFo
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     EXPECT_EQ(segment_cache.capture_stream, capture_stream);
     assertGraphStagesUseStream(graph, capture_stream);
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(result, num_elements, capture_stream);
 
     // The recapture pass should continue using that same explicit stream.
     graph.reset();
@@ -459,7 +516,7 @@ TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamFo
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     EXPECT_EQ(segment_cache.capture_stream, capture_stream);
     assertGraphStagesUseStream(graph, capture_stream);
-    assertFiniteAndNonZero(result->data(), num_elements);
+    assertTensorFiniteAndNonZero(result, num_elements, capture_stream);
 }
 
 TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutputsAcrossBufferReuse)
@@ -492,6 +549,7 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     };
 
     DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *dispatch_stream = gpu_ctx_->defaultStream();
     ASSERT_NE(dispatch_stream, nullptr);
@@ -501,10 +559,14 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     ASSERT_NE(segment_cache.capture_stream, nullptr);
     snapshots.clear();
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
-        graph, segment_cache.capture_stream, "snapshot-overwrite-warmup"));
+        graph,
+        segment_cache.capture_stream,
+        "snapshot-overwrite-first-use",
+        &segment_cache.snapshot_manifest));
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     const auto warmup_snapshots = snapshots;
-    assertFiniteAndNonZero(scratch->data(), num_elements);
+    assertTensorFiniteAndNonZero(
+        scratch, num_elements, segment_cache.capture_stream);
 
     fillSnapshotInput(norm_input, 3.0f);
     ASSERT_TRUE(norm_input->ensureOnDevice(device_ctx_->deviceId(), segment_cache.capture_stream));
@@ -513,7 +575,10 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     snapshots.clear();
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
-        graph, segment_cache.capture_stream, "snapshot-overwrite-capture"));
+        graph,
+        segment_cache.capture_stream,
+        "snapshot-overwrite-replay-1",
+        &segment_cache.snapshot_manifest));
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     assertSnapshotsDiffer(warmup_snapshots, snapshots, "stage1_norm");
     const auto capture_snapshots = snapshots;
@@ -525,7 +590,10 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     snapshots.clear();
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
-        graph, segment_cache.capture_stream, "snapshot-overwrite-replay"));
+        graph,
+        segment_cache.capture_stream,
+        "snapshot-overwrite-replay-2",
+        &segment_cache.snapshot_manifest));
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     assertSnapshotsDiffer(capture_snapshots, snapshots, "stage1_norm");
 }

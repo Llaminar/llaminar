@@ -144,6 +144,21 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Retain every grouped-verifier embedding row on device.
+         *
+         * This opt-in diagnostic establishes the first data boundary after
+         * verifier token publication. It is built only for exact grouped
+         * verifier graphs, and every row-copy node is chained before layer zero
+         * so a terminal mismatch cannot report stale checkpoint bytes.
+         */
+        std::string maybeAddEmbeddingDiagnosticCheckpoints(
+            ComputeGraph &graph,
+            TensorBase *source,
+            const std::string &dependency,
+            int total_tokens,
+            DeviceId device) override;
+
+        /**
          * @brief Retain terminal rows immediately before and after final norm.
          *
          * This override is active only for the opt-in mirrored-layer
@@ -163,11 +178,11 @@ namespace llaminar2
         /**
          * @brief Resolve checkpoint row ownership from immutable graph policy.
          *
-         * Ordinary multi-row GPU prefill may be padded and must use resident
-         * request-length metadata. Grouped verifier, request-condition, and
-         * serial-decode graphs are exact by construction and use their fixed
-         * final physical row. The method throws when an ordinary prefill lacks
-         * the device owner required to make terminal-row selection unambiguous.
+         * Ordinary multi-row GPU prefill and grouped verification may both have
+         * fewer logical rows than their captured physical M and therefore use
+         * resident request-length metadata. Scalar and request-condition graphs
+         * retain fixed-row ownership. The method throws when a resident-length
+         * graph lacks the device owner needed to select its terminal row.
          */
         HiddenStateRowSelectStage::SelectionPolicy
         mirroredCheckpointSelectionPolicy(
@@ -243,8 +258,16 @@ namespace llaminar2
             GraphSideRebalanceBindingRole role =
                 GraphSideRebalanceBindingRole::DecodeMaintenance;
             DeviceId device_id = DeviceId::invalid();
-            ILocalTPContext *decode_tp_ctx = nullptr;
-            ILocalTPContext *maintenance_tp_ctx = nullptr;
+            /**
+             * @brief Domain collective context shared with the enclosing graph.
+             *
+             * Rebalance work is ordered against forward/MTP work through
+             * explicit producer and consumer events.  It must therefore reuse
+             * the already initialized NCCL/RCCL domain instead of creating a
+             * second communicator whose resources would be allocated lazily
+             * after model placement.
+             */
+            ILocalTPContext *collective_tp_ctx = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
             int tp_device_idx = -1;
             DeviceMoERebalanceConfig config;
@@ -264,9 +287,6 @@ namespace llaminar2
                                                    const std::string &key_suffix = {},
                                                    int num_layers_override = -1,
                                                    bool register_decode_histogram = true);
-        ILocalTPContext *maintenanceTPContextForDomain(
-            const std::string &domain_key,
-            ILocalTPContext &decode_tp_ctx);
         /**
          * @brief Return the device-local decode maintenance binding for async
          * graph-side rebalance.
@@ -303,7 +323,6 @@ namespace llaminar2
         std::unordered_map<std::string, std::shared_ptr<DeviceMoETransferSlotDirectory>> moe_transfer_slot_directories_;
         std::unordered_map<std::string, std::shared_ptr<DeviceMoERebalanceTransferState>> moe_rebalance_transfer_states_;
         std::unordered_map<std::string, GraphSideRebalanceBinding> moe_graph_rebalance_bindings_;
-        std::unordered_map<std::string, std::shared_ptr<ILocalTPContext>> moe_maintenance_tp_contexts_;
         std::unordered_set<std::string> moe_runtime_histogram_sync_keys_;
         /**
          * @brief One-shot graph regime requested by portable prefix restoration.

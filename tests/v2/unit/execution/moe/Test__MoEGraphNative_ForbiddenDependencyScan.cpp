@@ -1529,8 +1529,12 @@ namespace llaminar2::test
                 source.find("int default_load[kDeviceMoEMaxParticipants]", helper_pos);
             ASSERT_NE(helper_end, std::string::npos) << label;
             const std::string prefix = source.substr(helper_pos, helper_end - helper_pos);
-            EXPECT_NE(prefix.find("if (!has_multi_resident_experts)"), std::string::npos)
-                << label << " must return before hot-cache load simulation when the layer has no replicas.";
+            EXPECT_NE(
+                prefix.find(
+                    "if (fully_replicated_local_rows || !has_multi_resident_experts)"),
+                std::string::npos)
+                << label
+                << " must return before hot-cache load simulation for fully replicated verifier rows and layers without replicas.";
             EXPECT_NE(prefix.find("const bool track_balance"), std::string::npos)
                 << label << " must keep hot-cache balance accounting behind an explicit gate.";
             EXPECT_NE(prefix.find("runtime_multi_resident_expert_count(bank) != 0u"),
@@ -3657,6 +3661,9 @@ namespace llaminar2::test
         EXPECT_NE(stable_predicate.find("config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC"),
                   std::string::npos)
             << "Graph-stable GPU MoE rebalance must be disabled for --moe-rebalance off/static configs.";
+        EXPECT_NE(stable_predicate.find("domain.usesParticipantAssignedPrefill()"),
+                  std::string::npos)
+            << "Prefill graph admission must consume the routed domain's typed phase policy instead of reinterpreting raw compute-policy enums.";
 
         const size_t device_controller_start =
             dgo.find("bool DeviceGraphOrchestrator::usesDeviceSideMoERebalanceController() const");
@@ -5173,6 +5180,110 @@ namespace llaminar2::test
 
         expect_backend(cuda_contents, "CUDA");
         expect_backend(rocm_contents, "ROCm");
+    }
+
+    /**
+     * @brief Keep LLEP planning parallel, graph-owned, and backend symmetric.
+     *
+     * The old publisher embedded owner, residency, and transfer tables in one
+     * leader thread. CUDA consequently reserved hundreds of MiB of stack
+     * backing, while both backends serialized policy work inside the command
+     * mutator. The production contract now requires explicit graph-lifetime
+     * scratch, parallel claim/router preflights, one planner workgroup per wave
+     * layer, and a publisher that only consumes immutable plans.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         DeviceRebalanceLLEPPlannerUsesSharedScratchSymmetrically)
+    {
+        const fs::path root = findRepoRoot();
+        const std::array<std::pair<fs::path, const char *>, 2> backends = {{
+            {root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu", "CUDA"},
+            {root / "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip", "ROCm"},
+        }};
+
+        for (const auto &[path, backend] : backends)
+        {
+            const std::string contents = readFile(path);
+            ASSERT_FALSE(contents.empty()) << path;
+            EXPECT_NE(
+                contents.find(
+                    "execution/moe/DeviceMoELLEPPlannerScratch.h"),
+                std::string::npos)
+                << backend << " must consume the common planner scratch ABI";
+
+            const size_t preplan_begin = contents.find(
+                "device_rebalance_llep_preplan_kernel(");
+            ASSERT_NE(preplan_begin, std::string::npos) << path;
+            const size_t publisher_begin = contents.find(
+                "void device_rebalance_controller_kernel(", preplan_begin);
+            ASSERT_NE(publisher_begin, std::string::npos) << path;
+            const std::string preplan = contents.substr(
+                preplan_begin, publisher_begin - preplan_begin);
+            const size_t publisher_end = contents.find(
+                "__global__ void device_rebalance_dynamic_ownership_controller_kernel(",
+                publisher_begin);
+            ASSERT_NE(publisher_end, std::string::npos) << path;
+            const std::string publisher = contents.substr(
+                publisher_begin, publisher_end - publisher_begin);
+
+            EXPECT_NE(
+                preplan.find("shared_owner_participants"),
+                std::string::npos)
+                << backend << " must allocate one owner table per planner workgroup";
+            EXPECT_NE(
+                preplan.find("shared_resident_participant_masks"),
+                std::string::npos)
+                << backend << " must allocate one residency table per planner workgroup";
+            EXPECT_NE(
+                preplan.find("shared_transfer_storage"),
+                std::string::npos)
+                << backend << " must allocate one aligned transfer table per planner workgroup";
+            EXPECT_NE(
+                preplan.find("rebalance_sort_llep_experts_parallel("),
+                std::string::npos)
+                << backend << " must sort the planner order cooperatively";
+            EXPECT_NE(
+                preplan.find("/*workspace_experts_are_sorted=*/true"),
+                std::string::npos)
+                << backend << " must not repeat the scalar insertion sort on the leader lane";
+            EXPECT_EQ(
+                publisher.find("planLeastLoadedExpertWeightTransfers("),
+                std::string::npos)
+                << backend << " publisher must not recompute immutable LLEP plans";
+            EXPECT_EQ(
+                publisher.find("rebalance_sort_llep_experts_parallel("),
+                std::string::npos)
+                << backend << " publisher must not repeat planner sorting";
+            EXPECT_EQ(
+                publisher.find("weight_transfers[kDeviceMoEMaxExperts]"),
+                std::string::npos)
+                << backend << " must not restore the per-thread transfer-table stack allocation";
+            EXPECT_NE(
+                publisher.find("layer_plan->planner_status"),
+                std::string::npos)
+                << backend << " publisher must consume typed planner status";
+            EXPECT_NE(
+                publisher.find("layer_plan->transfers[transfer_index]"),
+                std::string::npos)
+                << backend << " publisher must consume immutable transfer records";
+
+            EXPECT_NE(
+                contents.find("device_rebalance_llep_claim_preflight_kernel"),
+                std::string::npos)
+                << backend << " must authenticate transfer slots in parallel";
+            EXPECT_NE(
+                contents.find("device_rebalance_llep_router_collect_kernel"),
+                std::string::npos)
+                << backend << " must collect router evidence per layer";
+            EXPECT_NE(
+                contents.find("device_rebalance_llep_router_reduce_kernel"),
+                std::string::npos)
+                << backend << " must reduce router evidence deterministically";
+            EXPECT_NE(
+                contents.find("rebalance_maintenance_due_on_next_controller_edge"),
+                std::string::npos)
+                << backend << " preflights must avoid ordinary decode work without mutating lifecycle state";
+        }
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, RebalanceApplyKernelKeepsChunkyWorkBlockParallel)
@@ -7143,6 +7254,8 @@ namespace llaminar2::test
         const fs::path interface_path = root / "src/v2/kernels/IMoEKernel.h";
         const fs::path stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path publication_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp";
         const fs::path orchestrator_path =
             root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         const fs::path cuda_path =
@@ -7152,6 +7265,7 @@ namespace llaminar2::test
         for (const auto &path :
              {interface_path,
               stage_path,
+              publication_stage_path,
               orchestrator_path,
               cuda_path,
               rocm_path})
@@ -7161,6 +7275,8 @@ namespace llaminar2::test
 
         const std::string interface_source = readFile(interface_path);
         const std::string stage_source = readFile(stage_path);
+        const std::string publication_stage_source =
+            readFile(publication_stage_path);
         const std::string orchestrator_source =
             readFile(orchestrator_path);
         const std::string cuda_source = readFile(cuda_path);
@@ -7200,20 +7316,58 @@ namespace llaminar2::test
                 "kernel->commitGroupedVerifierHistograms("),
             std::string::npos);
 
+        const size_t stage_execute =
+            publication_stage_source.find(
+                "bool MTPSpeculativeStatePublicationStage::execute(");
+        const size_t accepted_metadata =
+            publication_stage_source.find(
+                "const bool metadata_enqueued =",
+                stage_execute);
         const size_t commit_call =
+            publication_stage_source.find(
+                "!publishMoEHistograms(stream)",
+                accepted_metadata);
+        ASSERT_NE(stage_execute, std::string::npos);
+        ASSERT_NE(accepted_metadata, std::string::npos);
+        ASSERT_NE(commit_call, std::string::npos);
+        EXPECT_LT(accepted_metadata, commit_call)
+            << "Committed routing history must consume the accepted-state "
+               "metadata produced by the publication transaction.";
+
+        const size_t publication_entry =
             orchestrator_source.find(
-                "publishCommittedMoEVerifierHistograms(",
-                orchestrator_source.find(
-                    "publishAcceptedMTPSpecStateBatchFromDeviceOutcome("));
+                "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
+        const size_t captured_publication =
+            orchestrator_source.find(
+                "executeMTPSpeculativeStatePublicationCaptured(",
+                publication_entry);
+        const size_t publication_finalize =
+            orchestrator_source.find(
+                "finalizeMTPSpeculativeStatePublicationLaunch(",
+                captured_publication);
+        const size_t finalize_definition =
+            orchestrator_source.find(
+                "bool DeviceGraphOrchestrator::finalizeMTPSpeculativeStatePublicationLaunch(");
+        const size_t logical_state_commit =
+            orchestrator_source.find(
+                "recordDeviceResidentLogicalSequenceStateMailbox(",
+                finalize_definition);
         const size_t ready_event =
             orchestrator_source.find(
                 "recordAcceptedSpecPublicationReady(",
-                commit_call);
-        ASSERT_NE(commit_call, std::string::npos);
+                finalize_definition);
+        ASSERT_NE(publication_entry, std::string::npos);
+        ASSERT_NE(captured_publication, std::string::npos);
+        ASSERT_NE(publication_finalize, std::string::npos);
+        ASSERT_NE(finalize_definition, std::string::npos);
+        ASSERT_NE(logical_state_commit, std::string::npos);
         ASSERT_NE(ready_event, std::string::npos);
-        EXPECT_LT(commit_call, ready_event)
-            << "Committed routing history must be ordered before the "
-               "accepted-publication ready event.";
+        EXPECT_LT(captured_publication, publication_finalize)
+            << "The accepted-state lifecycle may finalize only after the "
+               "captured publication graph commits routing history.";
+        EXPECT_LT(logical_state_commit, ready_event)
+            << "The accepted-publication ready event must cover the complete "
+               "logical-state commit.";
 
         for (const auto &[backend, source] :
              std::array<std::pair<const char *, const std::string *>, 2>{
@@ -7395,8 +7549,10 @@ namespace llaminar2::test
                 "        void *execution_stream)");
         ASSERT_NE(prefix_reset_start, std::string::npos);
         const size_t prefix_reset_end =
-            graph.find("ILocalTPContext *Qwen35MoEGraph::maintenanceTPContextForDomain",
-                       prefix_reset_start);
+            graph.find(
+                "const Qwen35MoEGraph::GraphSideRebalanceBinding *\n"
+                "    Qwen35MoEGraph::findDeviceMoERebalanceMaintenanceBinding",
+                prefix_reset_start);
         ASSERT_NE(prefix_reset_end, std::string::npos);
         const std::string prefix_reset_body =
             graph.substr(prefix_reset_start, prefix_reset_end - prefix_reset_start);
@@ -8108,6 +8264,54 @@ namespace llaminar2::test
             source.find(
                 "{\"graph_context\", sidecar_cache.capture_perf_context}"),
             std::string::npos);
+    }
+
+    /**
+     * @brief Keep dynamic-depth response authority inside active graph geometry.
+     *
+     * A dynamic controller may be configured for depth fifteen while replaying
+     * a depth-four verifier. The reducer's transaction budget must describe the
+     * latter graph, including its condition row; otherwise accepted-state
+     * publication is asked to expose rows that were never produced.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         MTPTransactionBudgetUsesExactCapturedVerifierRows)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path orchestrator_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        const fs::path stage_path =
+            root / "src/v2/execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp";
+        ASSERT_TRUE(fs::exists(orchestrator_path));
+        ASSERT_TRUE(fs::exists(stage_path));
+
+        const std::string orchestrator = readFile(orchestrator_path);
+        const std::string stage = readFile(stage_path);
+        const size_t materialize = orchestrator.find(
+            "bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(");
+        const size_t execute = orchestrator.find(
+            "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured(",
+            materialize);
+        ASSERT_NE(materialize, std::string::npos);
+        ASSERT_NE(execute, std::string::npos);
+        const std::string materialize_body =
+            orchestrator.substr(materialize, execute - materialize);
+
+        EXPECT_NE(
+            materialize_body.find(
+                "params.verifier_row_capacity = verifier_rows;"),
+            std::string::npos)
+            << "The resident transaction budget must use the exact active verifier graph row count.";
+        EXPECT_EQ(
+            materialize_body.find(
+                "params.verifier_row_capacity = mtp_max_draft_depth_;"),
+            std::string::npos)
+            << "The configured dynamic-depth ceiling is not an active graph geometry.";
+        EXPECT_NE(
+            stage.find(
+                "params_.comparison_rows_per_request + 1"),
+            std::string::npos)
+            << "Stage validation must include the first condition row in captured verifier capacity.";
     }
 
 } // namespace llaminar2::test

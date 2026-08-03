@@ -222,16 +222,6 @@ namespace
         }
 
         bool isGraphCapturable() const override { return true; }
-        bool needsOnGraphReplayed() const override { return true; }
-
-        void onGraphReplayed() override
-        {
-            ++replay_callback_count_;
-            if (output_)
-            {
-                TransferEngine::publishDeviceWrite(output_, device(), gpuStream());
-            }
-        }
 
         size_t estimatedFlops() const override
         {
@@ -244,7 +234,6 @@ namespace
         }
 
         int executeCount() const { return execute_count_; }
-        int replayCallbackCount() const { return replay_callback_count_; }
 
     private:
         StageDumpInfo buildDumpInfoImpl() const override
@@ -263,7 +252,6 @@ namespace
         int rows_ = 0;
         int cols_ = 0;
         int execute_count_ = 0;
-        int replay_callback_count_ = 0;
     };
 
     /**
@@ -1392,8 +1380,6 @@ namespace
         ASSERT_NE(host_->stage(), nullptr);
         EXPECT_GE(host_->stage()->executeCount(), 2)
             << "Normal build/warmup and capture recording execute the stage directly.";
-        EXPECT_GE(host_->stage()->replayCallbackCount(), 2)
-            << "Capture launch and Ready replay both run post-graph callbacks.";
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, SessionResetDropsCapturedPrefillExecutable)

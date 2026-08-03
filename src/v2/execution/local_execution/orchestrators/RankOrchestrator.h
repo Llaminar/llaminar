@@ -786,10 +786,10 @@ namespace llaminar2
         bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
             int row_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
             int prior_draft_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
         /**
          * @brief Sample compact request-batched prefill rows on every LocalTP child.
@@ -840,12 +840,14 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override;
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
             int stop_token_count,
-            const MTPGreedyPenaltyPolicy &penalty_policy =
-                MTPGreedyPenaltyPolicy{}) override;
+            const MTPRequestPenaltyPolicy &penalty_policy =
+                MTPRequestPenaltyPolicy{}) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,
@@ -881,7 +883,7 @@ namespace llaminar2
         bool buildCapturedStochasticVerifierTargetDistributions(
             int row_count,
             const SamplingParams &params,
-            const MTPGreedyPenaltyPolicy &penalty_policy,
+            const MTPRequestPenaltyPolicy &penalty_policy,
             int vocab_size) override;
         bool buildStochasticProcessedLogitRowsOnDevice(
             DeviceLogitsSource source,
@@ -901,7 +903,7 @@ namespace llaminar2
         bool publishCapturedMTPDraftToken(
             int row,
             int slot,
-            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool sampleStochasticDraftProposalOnDeviceDeferred(
             DeviceLogitsSource source,
             int row,
@@ -1000,6 +1002,10 @@ namespace llaminar2
         bool beginDeviceResidentStochasticGeneration(
             int request_count,
             int max_new_tokens) override;
+        bool materializeDeviceResidentStochasticGeneration(
+            int request_count,
+            int draft_depth) override;
+        bool launchDeviceResidentStochasticGeneration() override;
         bool finishDeviceResidentStochasticGeneration(
             DeviceGenerationTerminalResult *out_result) override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;

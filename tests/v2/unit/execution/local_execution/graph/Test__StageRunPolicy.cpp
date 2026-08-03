@@ -61,8 +61,22 @@ namespace
             return true;
         }
 
+        bool allocateOnDevice(
+            DeviceId target_device,
+            void *stream = nullptr) override
+        {
+            (void)stream;
+            ++allocate_on_device_calls;
+            last_allocate_device = target_device;
+            gpu_data_ptr_ = &fake_device_storage_;
+            gpu_device_ = target_device;
+            return true;
+        }
+
         int ensure_on_device_calls = 0;
+        int allocate_on_device_calls = 0;
         DeviceId last_ensure_device;
+        DeviceId last_allocate_device;
 
     private:
         int fake_device_storage_ = 0;
@@ -280,6 +294,60 @@ TEST_F(Test__UnifiedExecution, FastDecodeCollectiveCoheresGpuInputAfterCpuContra
     ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get(), &collective_nodes));
     EXPECT_EQ(tensor->ensure_on_device_calls, 1);
     EXPECT_EQ(tensor->last_ensure_device, DeviceId::cuda(0));
+}
+
+TEST_F(Test__UnifiedExecution, FastDecodePreparesColdGpuOutputExactlyOnce)
+{
+    auto tensor =
+        std::make_unique<CountingFP32Tensor>(std::vector<size_t>{4, 8});
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerExternalBuffer(
+        BufferId::PREFIX_TERMINAL_HIDDEN,
+        tensor.get()));
+    executor_->setArena(&arena);
+
+    ComputeGraph graph;
+    auto gpu_writer = std::make_unique<MockComputeStage>(
+        ComputeStageType::ROW_SELECT,
+        "cold_gpu_output_writer",
+        DeviceId::cuda(0));
+    gpu_writer->setBufferContract(
+        StageBufferContract::build().addOutput(
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            "FP32"));
+    graph.addNode(
+        "cold_gpu_output_writer",
+        std::move(gpu_writer),
+        DeviceId::cuda(0));
+
+    /*
+     * Keep the fake GPU writer non-terminal. Terminal GPU outputs publish a
+     * physical backend event, which correctly requires a real stream and is an
+     * integration-test concern; this unit test exercises allocation policy only.
+     */
+    auto cpu_terminal = std::make_unique<MockComputeStage>(
+        ComputeStageType::GEMM,
+        "cpu_terminal",
+        DeviceId::cpu());
+    graph.addNode(
+        "cpu_terminal",
+        std::move(cpu_terminal),
+        DeviceId::cpu());
+    graph.addDependency("cpu_terminal", "cold_gpu_output_writer");
+    graph.buildFastSchedule();
+
+    ASSERT_EQ(tensor->gpu_data_ptr(), nullptr);
+    ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get()));
+    EXPECT_EQ(tensor->allocate_on_device_calls, 1);
+    EXPECT_EQ(tensor->last_allocate_device, DeviceId::cuda(0));
+    EXPECT_NE(tensor->gpu_data_ptr(), nullptr);
+
+    // Once the graph-family address is stable, fast replay must remain free of
+    // redundant output preparation and its associated hot-path bookkeeping.
+    graph.reset();
+    ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get()));
+    EXPECT_EQ(tensor->allocate_on_device_calls, 1);
 }
 
 TEST_F(Test__UnifiedExecution, StageFailure_StopsExecution)

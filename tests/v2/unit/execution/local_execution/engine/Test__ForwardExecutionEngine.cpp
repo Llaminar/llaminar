@@ -1876,10 +1876,22 @@ TEST_F(
         DeviceId::cuda(0),
         tokens.data(),
         positions.data());
+    input.token_ids_device = tokens.data();
+    input.position_ids_device = positions.data();
     input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
 
     ForwardOutput output{};
     ASSERT_TRUE(engine.execute(input, output, host));
+
+    std::string template_error;
+    const auto first_use_template =
+        engine.lastAllPositionVerifierDeviceLoopGraphTemplate(
+            &template_error);
+    ASSERT_TRUE(first_use_template.has_value()) << template_error;
+    EXPECT_NE(first_use_template->capture, nullptr);
+    EXPECT_EQ(first_use_template->signature.seq_len, 15);
+    EXPECT_EQ(first_use_template->signature.batch_size, 1);
+
     ASSERT_TRUE(engine.execute(input, output, host));
     EXPECT_EQ(host.build_forward_graph_calls, 1);
     EXPECT_GT(host.build_decode_policy_calls, 0)
@@ -1889,9 +1901,9 @@ TEST_F(
 /**
  * @brief A GPU MTP graph must never fall through to eager execution.
  *
- * The first invocation builds and warms the exact graph. On reuse, an absent
- * capture policy is an architectural error: silently executing stages eagerly
- * would violate device-owned publication and graph-complete PerfStats evidence.
+ * The first invocation is one atomic build/capture/materialize transaction. An
+ * absent capture policy is therefore an immediate architectural error: no
+ * eager first-use execution may escape before the failure is reported.
  */
 TEST_F(
     Test__ForwardExecutionEngine,
@@ -1916,9 +1928,10 @@ TEST_F(
     input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
 
     ForwardOutput output{};
-    ASSERT_TRUE(engine.execute(input, output, host));
     EXPECT_FALSE(engine.execute(input, output, host));
     EXPECT_GT(host.build_decode_policy_calls, 0);
+    EXPECT_TRUE(engine.cacheEmpty())
+        << "A failed first-use capture must invalidate the half-built graph.";
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketGpuWithoutGpuGraphs_FallsThrough)
@@ -2329,6 +2342,8 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
         host.graph_stage_count = 1;
         host.mock_compute_all_position_logits = true;
         host.mock_defer_all_position_verifier_sync = true;
+        host.mock_capture_policy.allow_fast_decode = true;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
 
         auto input =
             makeTestInput(1, 1, DeviceId::cuda(0), &token, &position);
@@ -2337,9 +2352,11 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
 
         EXPECT_EQ(host.sync_logits_calls, 0);
         EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 1);
+        EXPECT_NE(host.pending_all_position_verifier_stream, nullptr);
         EXPECT_EQ(
             host.pending_all_position_verifier_stream,
-            llaminar2::testing::sharedMockWorkerGPUContext().defaultStream());
+            output.execution.stream)
+            << "The verifier consumer must inherit the exact first-use capture stream.";
         EXPECT_EQ(host.pending_main_decode_stream_calls, 0);
     }
 
@@ -2348,6 +2365,8 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
         MockForwardExecutionHost host(&gpu_ctx);
         host.graph_stage_count = 1;
         host.mock_defer_main_decode_sync = true;
+        host.mock_capture_policy.allow_fast_decode = true;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
 
         auto input =
             makeTestInput(1, 1, DeviceId::cuda(0), &token, &position);
@@ -2356,9 +2375,11 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
 
         EXPECT_EQ(host.sync_logits_calls, 0);
         EXPECT_EQ(host.pending_main_decode_stream_calls, 1);
+        EXPECT_NE(host.pending_main_decode_stream, nullptr);
         EXPECT_EQ(
             host.pending_main_decode_stream,
-            llaminar2::testing::sharedMockWorkerGPUContext().defaultStream());
+            output.execution.stream)
+            << "The decode consumer must inherit the exact first-use capture stream.";
         EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 0);
     }
 }
@@ -2540,9 +2561,10 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
         {"defer_final_sync", "true"},
         {"has_collectives", "true"},
         {"replay_plan_policy", "require_full_graph"}};
-    EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 1.0)
-        << "Captured collective decode graphs must ask the replay controller to defer "
-           "final sync when the explicit diagnostic opt-in is enabled.";
+    EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 2.0)
+        << "First-use materialization and steady-state replay must both ask the "
+           "replay controller to defer final sync when the explicit diagnostic "
+           "opt-in is enabled.";
 
     PerfStatsCollector::reset();
 }

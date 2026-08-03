@@ -49,8 +49,14 @@ namespace llaminar2
          * fallback. `StageOwnedIndices` is a CPU/direct-fixture policy and is
          * forbidden for production GPU execution because it requires a pinned
          * host upload. `FixedContiguousRange` encodes an immutable verifier
-         * suffix directly in a captured D2D node. `ExternalDeviceIndices` lets a
-         * preceding device metadata kernel publish arbitrary verifier rows.
+         * suffix directly in a captured D2D node.
+         * `WorkspaceBoundDeviceIndices` reads a named row array from the graph
+         * family's shared workspace when both producer and consumer are members
+         * of that family. `ExternalDeviceIndices` instead records the exact,
+         * stable device address owned by an external producer. These are
+         * deliberately separate policies: a stage may never discover an
+         * external producer by looking up a coincidentally equal buffer name in
+         * whichever workspace the executor bound most recently.
          * `RequestTerminalLengths` computes one terminal row per padded request
          * directly in the copy kernel. `ShiftedPrefillKVProgress` computes the
          * next contiguous shifted-prefill range from canonical device KV counts
@@ -61,6 +67,7 @@ namespace llaminar2
         {
             StageOwnedIndices,
             FixedContiguousRange,
+            WorkspaceBoundDeviceIndices,
             ExternalDeviceIndices,
             RequestTerminalLengths,
             ShiftedPrefillKVProgress,
@@ -98,7 +105,8 @@ namespace llaminar2
             DeviceRowIndexSource device_row_index_source =
                 DeviceRowIndexSource::StageOwnedIndices; ///< Authoritative GPU row-index policy.
             int fixed_contiguous_row_start = 0; ///< First immutable source row for FixedContiguousRange.
-            std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or external-device plans.
+            std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or workspace-bound plans.
+            const int32_t *external_device_row_indices = nullptr; ///< Exact producer-owned row-index address for ExternalDeviceIndices.
             const int32_t *request_sequence_lengths_device = nullptr; ///< Resident request lengths for RequestTerminalLengths.
             int request_row_stride = 0; ///< Padded source-row stride between requests.
             RequestRowStrideSource request_row_stride_source =

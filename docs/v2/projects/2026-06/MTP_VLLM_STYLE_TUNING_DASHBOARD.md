@@ -46,16 +46,15 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   all 256 experts, and 20 repeated exact launches per cell.
 - CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
   byte-equal continuation and complete live state.
-- Release CUDA2 and ROCm2 each pass all eight Dynamic/LLEP cells and `166/166`
-  checks through 2048 tokens. PerfStats prove full capture, device verification,
-  movement, clean shutdown, and VRAM release.
+- Release CUDA2/ROCm2 pass all eight Dynamic/LLEP cells and `166/166` checks
+  through 2048 tokens with full capture, movement, and clean VRAM release.
 - Captured stochastic target preparation and draft publication are byte-exact
   across every fixed depth/policy on CUDA and ROCm. Both are strict device
   graphs with exact producer streams and no eager production route.
-- Canonical Release CUDA2 LLEP stochastic d4..15 plus RAM-prefix E2E is
-  `23/23` green at 4096 context/1024 output tokens. PerfStats proves complete
-  capture, no segmentation, device verification, real movement, prefix reuse,
-  and no host transfer beyond compact response publication and cache tiers.
+- Latest Release CUDA2 Dynamic stochastic d4..15 + RAM-prefix E2E is `23/23`
+  green at 4096 context and 2048 output tokens; LLEP covers 1024.
+- Penalty magnitudes are immutable admission state. Captured accepted-state
+  publication solely owns history, so mutable state cannot multiply graphs.
 - Replicated shared-expert residuals no longer enter an invalid allreduce.
   Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
   contributions and is covered on NCCL and RCCL.
@@ -76,8 +75,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
   32 SGPR, zero scratch, and 90.6% VALU utilization.
 - Current CUDA2 LLEP d3 stochastic baseline is `80.34 tok/s` decode and
-  `90.84 tok/s` prefill at 65.87% acceptance. Per-transaction host outcome
-  observation is 62% of decode wall and is the active removal target.
+  `90.84 tok/s` prefill at 65.87% acceptance. This predates the resident
+  generation lifecycle and is the control to remeasure before kernel tuning.
 - Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
   `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
   communication baseline; the dynamic depth controller is a later tuning lane.

@@ -1198,7 +1198,7 @@ namespace llaminar2
                    ? HiddenStateRowsSelectStage::DeviceRowIndexSource::
                          RequestTerminalLengths
                    : HiddenStateRowsSelectStage::DeviceRowIndexSource::
-                         ExternalDeviceIndices;
+                         WorkspaceBoundDeviceIndices;
     }
 
     TensorBase *QwenGraphBase::maybeAddLMHeadRowSelect(
@@ -1669,6 +1669,12 @@ namespace llaminar2
         std::string prev_node = embedding_allreduce_added
                                     ? "embedding_allreduce"
                                     : "embedding";
+        prev_node = maybeAddEmbeddingDiagnosticCheckpoints(
+            graph,
+            embed_output,
+            prev_node,
+            total_tokens,
+            device);
 
         const int *position_ids =
             validatedHostPositionRows(input, "Qwen standard forward graph");
@@ -2896,7 +2902,7 @@ namespace llaminar2
                 {
                     row_params.device_row_index_source =
                         HiddenStateRowsSelectStage::DeviceRowIndexSource::
-                            ExternalDeviceIndices;
+                            WorkspaceBoundDeviceIndices;
                     row_params.workspace_buffer_name =
                         MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
                 }

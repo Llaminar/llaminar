@@ -1407,6 +1407,8 @@ TEST(Test__GraphSegmentCache, WarmupInvokesBoundaryAfterEventHandoff)
     addFakeSegmentStage(graph, "collective_graph_stage", true);
 
     DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "main_decode";
     FakeReplayGPUContext gpu_ctx;
@@ -1419,8 +1421,7 @@ TEST(Test__GraphSegmentCache, WarmupInvokesBoundaryAfterEventHandoff)
         DeviceId::cuda(0),
         ComputeBackendType::GPU_CUDA);
 
-    int boundary_calls = 0;
-    std::string observed_boundary;
+    std::vector<std::pair<std::string, void *>> observed_boundaries;
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
@@ -1433,21 +1434,25 @@ TEST(Test__GraphSegmentCache, WarmupInvokesBoundaryAfterEventHandoff)
         /*defer_final_sync=*/false,
         [&](const std::string &boundary_name, void *capture_stream)
         {
-            ++boundary_calls;
-            observed_boundary = boundary_name;
-            EXPECT_EQ(capture_stream, gpu_ctx.defaultStream());
-            EXPECT_EQ(gpu_ctx.events_recorded_, 1);
-            EXPECT_EQ(gpu_ctx.events_waited_, 1);
+            observed_boundaries.emplace_back(boundary_name, capture_stream);
             return true;
         }));
 
-    EXPECT_EQ(boundary_calls, 1);
-    EXPECT_NE(observed_boundary.find("phase=warmup"), std::string::npos);
-    EXPECT_NE(observed_boundary.find("scope=full_graph"), std::string::npos);
-    EXPECT_NE(observed_boundary.find("context=main_decode"), std::string::npos);
+    ASSERT_EQ(observed_boundaries.size(), 3u)
+        << "Atomic first use requires warmup, capture-begin, and capture-end rendezvous.";
+    EXPECT_NE(observed_boundaries[0].first.find("phase=warmup"), std::string::npos);
+    EXPECT_NE(observed_boundaries[0].first.find("scope=full_graph"), std::string::npos);
+    EXPECT_NE(observed_boundaries[0].first.find("context=main_decode"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[0].second, gpu_ctx.defaultStream());
+    EXPECT_NE(observed_boundaries[1].first.find("capture_begin"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[1].second, cache.capture_stream);
+    EXPECT_NE(observed_boundaries[2].first.find("capture_end"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[2].second, cache.capture_stream);
+    EXPECT_GE(gpu_ctx.events_recorded_, 1);
+    EXPECT_GE(gpu_ctx.events_waited_, 1);
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
     EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.needs_capture);
 }
 
 TEST(Test__GraphSegmentCache, GraphLifecyclePhaseNamesAreCanonical)
@@ -3525,7 +3530,7 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         gpu_ctx.defaultStream(),
         &gpu_ctx));
     EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.needs_capture);
     EXPECT_EQ(cache.decode_step, 1u);
     const uint64_t first_signature = cache.capture_variant_signature;
     ASSERT_NE(first_signature, 0u);
@@ -3551,8 +3556,8 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         &gpu_ctx));
 
     EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture)
-        << "variant changes must go through warmup/capture instead of stale replay";
+    EXPECT_FALSE(cache.needs_capture)
+        << "Variant recapture must atomically install the replacement executable.";
     EXPECT_EQ(cache.decode_step, 1u);
     EXPECT_EQ(cache.variant_recapture_count, 1u);
     EXPECT_NE(cache.capture_variant_signature, first_signature);

@@ -39,7 +39,6 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1985,68 +1984,6 @@ namespace llaminar2
         }
     }
 
-    ILocalTPContext *Qwen35MoEGraph::maintenanceTPContextForDomain(
-        const std::string &domain_key,
-        ILocalTPContext &decode_tp_ctx)
-    {
-        auto &maintenance_ctx = moe_maintenance_tp_contexts_[domain_key];
-        if (maintenance_ctx)
-            return maintenance_ctx.get();
-
-        static std::mutex registry_mutex;
-        static std::unordered_map<std::string, std::weak_ptr<ILocalTPContext>>
-            registry;
-
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        if (auto existing = registry[domain_key].lock())
-        {
-            if (existing->degree() != decode_tp_ctx.degree() ||
-                existing->backend() != decode_tp_ctx.backend())
-            {
-                throw std::runtime_error(
-                    "Qwen35 MoE graph-side rebalance reused an incompatible maintenance lane for " +
-                    domain_key);
-            }
-            maintenance_ctx = std::move(existing);
-            LOG_INFO("[Qwen35MoEGraph] Reusing dedicated MoE rebalance maintenance collective lane"
-                     << " domain=" << domain_key
-                     << " degree=" << maintenance_ctx->degree()
-                     << " backend=" << collectiveBackendTypeToString(maintenance_ctx->backend())
-                     << " decode_ctx=" << static_cast<const void *>(&decode_tp_ctx)
-                     << " maintenance_ctx=" << static_cast<const void *>(maintenance_ctx.get()));
-            return maintenance_ctx.get();
-        }
-
-        auto created =
-            createLocalTPContext(
-                decode_tp_ctx.devices(),
-                decode_tp_ctx.weights(),
-                decode_tp_ctx.backend());
-        if (!created)
-        {
-            throw std::runtime_error(
-                "Qwen35 MoE graph-side rebalance could not create maintenance collective lane for " +
-                domain_key);
-        }
-        if (created->degree() != decode_tp_ctx.degree() ||
-            created->backend() != decode_tp_ctx.backend())
-        {
-            throw std::runtime_error(
-                "Qwen35 MoE graph-side rebalance maintenance lane does not match decode lane for " +
-                domain_key);
-        }
-
-        maintenance_ctx = std::shared_ptr<ILocalTPContext>(std::move(created));
-        registry[domain_key] = maintenance_ctx;
-        LOG_INFO("[Qwen35MoEGraph] Created dedicated MoE rebalance maintenance collective lane"
-                 << " domain=" << domain_key
-                 << " degree=" << maintenance_ctx->degree()
-                 << " backend=" << collectiveBackendTypeToString(maintenance_ctx->backend())
-                 << " decode_ctx=" << static_cast<const void *>(&decode_tp_ctx)
-                 << " maintenance_ctx=" << static_cast<const void *>(maintenance_ctx.get()));
-        return maintenance_ctx.get();
-    }
-
     /**
      * @brief Locate the domain-wide decode maintenance binding for a device.
      *
@@ -2106,8 +2043,7 @@ namespace llaminar2
         const GraphSideRebalanceBinding &binding = *selected_binding;
         const bool transfer_slot_mode_enabled =
             deviceMoERebalanceModeUsesTransferSlots(binding.transfer_mode);
-        if (!binding.decode_tp_ctx ||
-            !binding.maintenance_tp_ctx ||
+        if (!binding.collective_tp_ctx ||
             !binding.moe_runtime_table ||
             (transfer_slot_mode_enabled &&
              (!binding.local_transfer_slots ||
@@ -2129,7 +2065,7 @@ namespace llaminar2
          */
         MoEDeviceRebalanceStage::Params params;
         params.device_id = binding.device_id;
-        params.tp_ctx = binding.maintenance_tp_ctx;
+        params.tp_ctx = binding.collective_tp_ctx;
         params.moe_runtime_table = binding.moe_runtime_table;
         params.tp_device_idx = binding.tp_device_idx;
         params.config = binding.config;
@@ -3888,22 +3824,21 @@ namespace llaminar2
                     256u);
 
             moe_graph_rebalance_bindings_[binding_key] = GraphSideRebalanceBinding{
-                transfer_key,
-                rebalance_workspace,
-                GraphSideRebalanceBindingRole::PrefillLLEPTransfer,
-                device,
-                local_tp_ctx,
-                local_tp_ctx,
-                moe_runtime_table,
-                config_.tp_device_idx,
-                rebalance_config,
-                transfer_directory->deviceEntries(),
-                transfer_directory->slotCount(),
-                graph_rebalance_transfer_mode.value(),
-                collective_payload_slot_bytes,
-                collective_payload_slot_capacity,
-                state_ref,
-                layer_idx};
+                .transfer_key = transfer_key,
+                .workspace_name = rebalance_workspace,
+                .role = GraphSideRebalanceBindingRole::PrefillLLEPTransfer,
+                .device_id = device,
+                .collective_tp_ctx = local_tp_ctx,
+                .moe_runtime_table = moe_runtime_table,
+                .tp_device_idx = config_.tp_device_idx,
+                .config = rebalance_config,
+                .local_transfer_slots = transfer_directory->deviceEntries(),
+                .local_transfer_slot_count = transfer_directory->slotCount(),
+                .transfer_mode = graph_rebalance_transfer_mode.value(),
+                .collective_payload_slot_bytes = collective_payload_slot_bytes,
+                .collective_payload_slot_capacity = collective_payload_slot_capacity,
+                .transfer_state = state_ref,
+                .producer_layer_idx = layer_idx};
 
             return &moe_graph_rebalance_bindings_.find(binding_key)->second;
         };
@@ -3923,7 +3858,7 @@ namespace llaminar2
                     "Qwen35 MoE LLEP prefill could not create transfer binding for layer " +
                     std::to_string(layer_idx) + " on " + device.to_string());
             }
-            expert_params.prefill_llep_tp_ctx = binding->decode_tp_ctx;
+            expert_params.prefill_llep_tp_ctx = binding->collective_tp_ctx;
             expert_params.prefill_llep_transfer_slots =
                 binding->local_transfer_slots;
             expert_params.prefill_llep_transfer_slot_count =
@@ -3967,8 +3902,8 @@ namespace llaminar2
             -> std::vector<TPAllreduceSidebandWorkspaceBinding>
         {
             std::vector<TPAllreduceSidebandWorkspaceBinding> sidebands;
-            if (!binding.decode_tp_ctx ||
-                !binding.decode_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture())
+            if (!binding.collective_tp_ctx ||
+                !binding.collective_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture())
             {
                 return sidebands;
             }
@@ -4044,7 +3979,7 @@ namespace llaminar2
         {
             MoEDeviceRebalanceStage::Params params;
             params.device_id = device;
-            params.tp_ctx = binding.decode_tp_ctx;
+            params.tp_ctx = binding.collective_tp_ctx;
             params.moe_runtime_table = binding.moe_runtime_table;
             params.tp_device_idx = config_.tp_device_idx;
             params.config = binding.config;
@@ -4067,8 +4002,8 @@ namespace llaminar2
             if (binding_it == moe_graph_rebalance_bindings_.end())
                 return {};
             const auto &binding = binding_it->second;
-            if (!binding.decode_tp_ctx ||
-                !binding.decode_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture() ||
+            if (!binding.collective_tp_ctx ||
+                !binding.collective_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture() ||
                 binding.transfer_mode != DeviceMoERebalanceTransferMode::CollectiveSidebandPayload ||
                 binding.local_transfer_slot_count == 0 ||
                 binding.collective_payload_slot_bytes == 0 ||
@@ -4366,32 +4301,22 @@ namespace llaminar2
                             256u);
                 }
 
-                ILocalTPContext *maintenance_tp_ctx = local_tp_ctx;
-                if (env.moe_rebalance.device_rebalance_maintenance_graph)
-                {
-                    const std::string maintenance_lane_key =
-                        graphRebalanceCollectiveKey();
-                    maintenance_tp_ctx =
-                        maintenanceTPContextForDomain(maintenance_lane_key, *local_tp_ctx);
-                }
-
                 moe_graph_rebalance_bindings_[domain_key] = GraphSideRebalanceBinding{
-                    transfer_key,
-                    rebalance_workspace,
-                    GraphSideRebalanceBindingRole::DecodeMaintenance,
-                    device,
-                    local_tp_ctx,
-                    maintenance_tp_ctx,
-                    moe_runtime_table,
-                    config_.tp_device_idx,
-                    rebalance_config,
-                    local_transfer_slots,
-                    local_transfer_slot_count,
-                    graph_rebalance_transfer_mode.value(),
-                    collective_payload_slot_bytes,
-                    collective_payload_slot_capacity,
-                    transfer_state,
-                    layer_idx};
+                    .transfer_key = transfer_key,
+                    .workspace_name = rebalance_workspace,
+                    .role = GraphSideRebalanceBindingRole::DecodeMaintenance,
+                    .device_id = device,
+                    .collective_tp_ctx = local_tp_ctx,
+                    .moe_runtime_table = moe_runtime_table,
+                    .tp_device_idx = config_.tp_device_idx,
+                    .config = rebalance_config,
+                    .local_transfer_slots = local_transfer_slots,
+                    .local_transfer_slot_count = local_transfer_slot_count,
+                    .transfer_mode = graph_rebalance_transfer_mode.value(),
+                    .collective_payload_slot_bytes = collective_payload_slot_bytes,
+                    .collective_payload_slot_capacity = collective_payload_slot_capacity,
+                    .transfer_state = transfer_state,
+                    .producer_layer_idx = layer_idx};
                 graph_rebalance_plan_inserted = true;
 
                 const bool producer_runs_in_maintenance_graph =
@@ -4657,6 +4582,8 @@ namespace llaminar2
             route_params.layer_idx = layer_idx;
             route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram;
             route_params.moe_runtime_table = moe_runtime_table;
+            route_params.routed_row_execution_policy =
+                routed_row_execution_policy;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceGroupedMoEVerifierPrefill(device);
             route_params.absolute_position_ids_device =
@@ -6542,6 +6469,74 @@ namespace llaminar2
         return checkpoints;
     }
 
+    std::string Qwen35MoEGraph::maybeAddEmbeddingDiagnosticCheckpoints(
+        ComputeGraph &graph,
+        TensorBase *source,
+        const std::string &dependency,
+        int total_tokens,
+        DeviceId device)
+    {
+        if (mtp_graph_context_active_ ||
+            !device.is_gpu() ||
+            !config_.grouped_mtp_verifier ||
+            !mirroredLayerDiagnosticsEnabled())
+        {
+            return dependency;
+        }
+        if (!source || dependency.empty() || total_tokens <= 0)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE grouped-verifier embedding diagnostics require "
+                "an exact source, producer, and positive row count");
+        }
+
+        const std::string graph_shape =
+            "grouped_verifier_m" + std::to_string(total_tokens);
+        std::string checkpoint_dependency = dependency;
+        for (int row = 0; row < total_tokens; ++row)
+        {
+            const std::string checkpoint_name =
+                graph_shape + "_embedding_row" + std::to_string(row);
+            auto &checkpoint =
+                mirrored_layer_checkpoints_[checkpoint_name];
+            if (!checkpoint)
+            {
+                checkpoint = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{
+                        1u,
+                        static_cast<size_t>(config_.d_model)},
+                    device);
+                if (!checkpoint->allocateOnDevice(device))
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE could not allocate grouped-verifier "
+                        "embedding checkpoint " +
+                        checkpoint_name + " on " + device.to_string());
+                }
+            }
+
+            const std::string node_name =
+                "mirror_checkpoint_" + checkpoint_name;
+            HiddenStateRowSelectStage::Params params;
+            params.device_id = device;
+            params.input = source;
+            params.output = checkpoint.get();
+            params.seq_len = total_tokens;
+            params.d_model = config_.d_model;
+            params.selected_row_idx = row;
+            params.selection_policy =
+                HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+
+            graph.addNode(
+                node_name,
+                ComputeStageFactory::createHiddenStateRowSelect(params),
+                device);
+            graph.addDependency(node_name, checkpoint_dependency);
+            checkpoint_dependency = node_name;
+        }
+        return checkpoint_dependency;
+    }
+
     std::string Qwen35MoEGraph::maybeAddGDNDiagnosticCheckpoint(
         ComputeGraph &graph,
         const std::string &boundary,
@@ -6647,9 +6642,30 @@ namespace llaminar2
          * still identifies the exact logical final row.
          */
         const auto selected_layer = mirroredGDNDiagnosticLayer();
-        if (graph_regime == "prefill" &&
-            selected_layer &&
-            *selected_layer == layer_idx)
+        if (selected_layer && *selected_layer == layer_idx &&
+            graph_regime == "grouped_verifier")
+        {
+            /*
+             * A grouped verifier graph is captured at its physical M, but the
+             * final response budget may make only a strict prefix logical work.
+             * Retain every physical row for the selected layer so diagnostics
+             * can compare all valid rows and can also expose writes into padded
+             * rows. The unsuffixed checkpoint above remains the authoritative
+             * logical terminal row selected by resident request length.
+             */
+            for (int row = 0; row < total_tokens; ++row)
+            {
+                checkpoint_dependency = add_checkpoint(
+                    "_row" + std::to_string(row),
+                    row,
+                    HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow,
+                    nullptr,
+                    checkpoint_dependency);
+            }
+        }
+        else if (graph_regime == "prefill" &&
+                 selected_layer &&
+                 *selected_layer == layer_idx)
         {
             static constexpr int kSampleRows[] = {
                 0, 1, 2, 7, 31, 127, 511,
@@ -6758,21 +6774,20 @@ namespace llaminar2
         const int32_t *sequence_lengths_device) const
     {
         /*
-         * Exact grouped-verifier, request-condition, and serial-decode graphs
-         * have no padding, so their final physical row is also their final
-         * logical row. Ordinary GPU prefill may reuse a larger captured bucket;
-         * its checkpoint must therefore read the persistent device request
-         * length. Refusing to build a prefill checkpoint without that pointer
-         * makes selection of a padded row structurally impossible instead of
-         * relying on a caller to remember whether this particular shape was
-         * exact.
+         * Both ordinary prefill and grouped verification may execute a strict
+         * logical prefix of their captured physical M. Prefill does so through
+         * bucket reuse; a grouped verifier does so when the remaining response
+         * budget is smaller than the configured proposal depth. In either case,
+         * the persistent device request length is the sole terminal-row owner.
+         * Refusing to construct a multi-row GPU checkpoint without that owner
+         * makes padded-row selection structurally impossible.
          */
-        const bool ordinary_prefill =
+        const bool resident_length_owned =
             device.is_gpu() &&
             total_tokens > 1 &&
-            !config_.grouped_mtp_verifier &&
-            !config_.live_mtp_request_batch_condition;
-        if (!ordinary_prefill)
+            (config_.grouped_mtp_verifier ||
+             !config_.live_mtp_request_batch_condition);
+        if (!resident_length_owned)
         {
             return HiddenStateRowSelectStage::SelectionPolicy::
                 FixedDeviceRow;
@@ -6780,7 +6795,7 @@ namespace llaminar2
         if (!sequence_lengths_device)
         {
             throw std::runtime_error(
-                "Qwen35 MoE mirrored prefill checkpoint requires a "
+                "Qwen35 MoE mirrored multi-row checkpoint requires a "
                 "device-resident request length");
         }
         return HiddenStateRowSelectStage::SelectionPolicy::

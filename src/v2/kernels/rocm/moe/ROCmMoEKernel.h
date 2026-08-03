@@ -130,7 +130,8 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             bool write_legacy_outputs,
             bool update_runtime_histogram,
-            const int32_t *absolute_position_ids_device = nullptr) override;
+            const int32_t *absolute_position_ids_device,
+            RoutedExpertRowExecutionPolicy row_execution_policy) override;
 
         bool decodeRouteSelectWithReadyRebalanceApply(
             DeviceMoELayerRuntime *runtime_layers,
@@ -151,7 +152,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
             int rebalance_target_layer,
             uint32_t rebalance_command_buffer_count,
-            const int32_t *absolute_position_ids_device = nullptr) override;
+            const int32_t *absolute_position_ids_device,
+            RoutedExpertRowExecutionPolicy row_execution_policy) override;
 
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
@@ -362,7 +364,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
-            uint32_t local_transfer_slot_count = 0) override;
+            uint32_t local_transfer_slot_count = 0,
+            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr) override;
 
         bool packDeviceRebalanceHistograms(
             const MoEKernelLaunchContext &launch,

@@ -97,6 +97,13 @@ namespace llaminar2
             int32_t *all_drafts_accepted_flags_device = nullptr;
             int32_t *stopped_flags_device = nullptr;
 
+            /** Canonical first-token bank consumed by the next verifier. */
+            int32_t *next_verifier_condition_tokens_device = nullptr;
+
+            /** Next-transaction inputs consumed directly by the full sidecar. */
+            int32_t *next_sidecar_condition_tokens_device = nullptr;
+            int32_t *next_sidecar_position_ids_device = nullptr;
+
             bool generation_controller_owned = false;
             int32_t *generation_response_tokens_device = nullptr;
             int generation_response_token_stride = 0;
@@ -115,13 +122,9 @@ namespace llaminar2
             int32_t *shifted_target_cached_tokens_device = nullptr;
             int32_t *shifted_accepted_state_counts_device = nullptr;
 
-            bool commit_penalty_history = false;
             void *penalty_policy_device = nullptr;
             int32_t *generated_token_counts_device = nullptr;
             int vocab_size = 0;
-            float presence_penalty = 0.0F;
-            float frequency_penalty = 0.0F;
-            bool first_token_already_in_history = false;
 
             std::vector<IComputeStage *> verifier_state_stages;
             bool require_captured_verifier_state = false;
@@ -156,8 +159,10 @@ namespace llaminar2
          * @brief Compare every value embedded in the captured launch sequence.
          *
          * Device contents are intentionally excluded: they are replay inputs.
-         * Pointers, vector membership/order, policy scalars, and geometry are
-         * included because CUDA/HIP graph nodes retain them by value.
+         * Pointers, vector membership/order, and geometry are included because
+         * CUDA/HIP graph nodes retain them by value. Request penalty values and
+         * the evolving pending-condition predicate live only in the pointed-to
+         * device policy, so changing either never creates another graph family.
          */
         [[nodiscard]] bool hasSameCaptureIdentity(
             const Params &other) const noexcept;

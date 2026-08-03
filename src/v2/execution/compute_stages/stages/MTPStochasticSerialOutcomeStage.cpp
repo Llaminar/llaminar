@@ -36,7 +36,7 @@ namespace llaminar2
             params_.comparison_rows_per_request <= 0 ||
             params_.comparison_rows_per_request > kMaxComparisonRows ||
             params_.verifier_row_capacity <
-                params_.comparison_rows_per_request ||
+                params_.comparison_rows_per_request + 1 ||
             static_cast<int>(params_.threshold_seeds.size()) !=
                 params_.request_count ||
             std::any_of(
@@ -102,9 +102,12 @@ namespace llaminar2
 
         /*
          * The generation controller is the sole authority for transaction
-         * clipping.  Preparing its budget inside this captured stage prevents a
-         * host depth shadow from selecting a different commit boundary than the
-         * fused reducer that consumes it.
+         * clipping. `verifier_row_capacity` is the exact row geometry of this
+         * captured verifier, including the first condition row; it is never the
+         * larger configured dynamic-depth ceiling. Preparing that exact budget
+         * inside this stage prevents both a host depth shadow and a max-depth
+         * shadow from authorizing state rows that the active graph did not
+         * produce.
          */
         if (!params_.backend->enqueuePrepareDeviceGenerationTransactionBudget(
                 params_.generation_control_device,
@@ -157,7 +160,10 @@ namespace llaminar2
                                  params_.output_token_stride,
                          params_.output_meta_device +
                              static_cast<size_t>(request) *
-                                 params_.output_meta_stride))
+                                 params_.output_meta_stride,
+                         request == 0
+                             ? params_.first_transaction_diagnostic_device
+                             : nullptr))
             {
                 LOG_ERROR("[MTPStochasticSerialOutcomeStage] Fused request outcome launch failed for request "
                           << request);
@@ -194,7 +200,11 @@ namespace llaminar2
                static_cast<size_t>(params_.request_count) *
                    static_cast<size_t>(params_.output_token_stride +
                                        params_.output_meta_stride) *
-                   sizeof(int32_t);
+                   sizeof(int32_t) +
+               (params_.first_transaction_diagnostic_device
+                    ? sizeof(
+                          sampling_math::MTPFirstTransactionDiagnosticRecord)
+                    : 0u);
     }
 
     bool MTPStochasticSerialOutcomeStage::supportsBackend(
@@ -234,6 +244,11 @@ namespace llaminar2
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_META);
+        if (params_.first_transaction_diagnostic_device)
+        {
+            contract.addOutput(
+                BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC);
+        }
         return contract;
     }
 
@@ -275,6 +290,8 @@ namespace llaminar2
                params_.output_token_stride == other.output_token_stride &&
                params_.output_meta_device == other.output_meta_device &&
                params_.output_meta_stride == other.output_meta_stride &&
+               params_.first_transaction_diagnostic_device ==
+                   other.first_transaction_diagnostic_device &&
                params_.request_count == other.request_count &&
                params_.comparison_rows_per_request ==
                    other.comparison_rows_per_request &&

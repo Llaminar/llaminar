@@ -1986,6 +1986,7 @@ namespace llaminar2
         bool full_graph_capture,
         const std::string &perf_context,
         uint64_t current_step,
+        CapturePublicationPolicy publication_policy,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -2086,7 +2087,28 @@ namespace llaminar2
                     {{"stage_type", stage_type},
                      {"type", "captured_executable"}},
                     perf_context,
-                    capture_mode));
+                capture_mode));
+        }
+
+        /*
+         * A successful warmup has already executed this logical transaction.
+         * Native stream capture above records launch topology but does not run
+         * the recorded work. Stop after instantiation so first-use setup cannot
+         * advance KV, GDN, convolution, sampler, or controller state twice. The
+         * warmup's ordinary stage lifecycle remains the sole output publication
+         * for this invocation; the new executable is owned only by future replay
+         * or by a composed parent graph.
+         */
+        if (publication_policy ==
+            CapturePublicationPolicy::MaterializeOnly)
+        {
+            segment.last_executed_step = current_step;
+            LOG_DEBUG(
+                "[DeviceGraphCaptureController] Segment captured and instantiated "
+                "without a second logical execution: "
+                << segment.capture->nodeCount() << " nodes, "
+                << segment.stage_names.size() << " stages");
+            return true;
         }
 
         if (has_collective_nodes)
@@ -2455,7 +2477,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         bool has_collective_nodes,
         uint64_t current_step,
-        const ReplayHooks &hooks)
+        const ReplayHooks &hooks,
+        CapturePublicationPolicy publication_policy)
     {
         CapturePhaseResult result{};
 
@@ -2476,6 +2499,15 @@ namespace llaminar2
 
         const bool full_graph_capture =
             captureModeForCache(segment_cache) == GraphReplayCaptureMode::FullGraph;
+        if (publication_policy == CapturePublicationPolicy::MaterializeOnly &&
+            !full_graph_capture)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Materialization-only capture "
+                "requires one complete graph; manual or segmented execution is forbidden");
+            result.reset_cache = true;
+            return result;
+        }
 
         /*
          * Some MoE stages only know whether their graph-capturable fast path is
@@ -2750,6 +2782,7 @@ namespace llaminar2
                     full_graph_capture,
                     segment_cache.perf_context,
                     current_step,
+                    publication_policy,
                     hooks.execute_node,
                     hooks.record_snapshot_copies,
                     hooks.post_launch);

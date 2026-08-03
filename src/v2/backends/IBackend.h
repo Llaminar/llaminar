@@ -631,6 +631,95 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue deterministic argmax and publish the next MTP sidecar inputs.
+         *
+         * This is the producer-owned form used by a captured MTP proposal graph.
+         * The final reduction writes the ordinary row-local value/token outputs,
+         * mirrors each winning token into the chained-sidecar condition mailbox,
+         * and advances that row's resident position in the same kernel. Keeping
+         * these stores in the argmax finalizer makes the proposal-to-sidecar edge
+         * indivisible and removes a separate copy/position kernel from every draft.
+         *
+         * Implementations must preserve the exact reduction and lowest-token tie
+         * semantics of enqueueArgmaxF32BatchedRowsDevice(). No allocation,
+         * transfer, host observation, event operation, or synchronization is
+         * permitted. All pointers are device-resident and @p stream is mandatory.
+         */
+        virtual bool enqueueArgmaxF32BatchedRowsAndPublishMTPChainDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *chain_condition_tokens_device,
+            void *chain_position_ids_device,
+            int chain_position_increment,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1)
+        {
+            (void)data_device;
+            (void)rows;
+            (void)cols;
+            (void)device_id;
+            (void)stream;
+            (void)out_values_device;
+            (void)out_indices_device;
+            (void)chain_condition_tokens_device;
+            (void)chain_position_ids_device;
+            (void)chain_position_increment;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
+            (void)output_stride;
+            return false;
+        }
+
+        /**
+         * @brief Retain one transaction-zero MTP sidecar boundary on device.
+         *
+         * This diagnostic-only primitive hashes an exact array of 32-bit words
+         * into the arena-owned first-transaction record.  The device generation
+         * controller gates the write, so later iterations of a captured WHILE
+         * graph cannot overwrite the first proposal sequence.  A null data
+         * pointer with zero words records an explicitly absent model boundary.
+         *
+         * Implementations must enqueue on @p stream without allocation,
+         * transfer, host observation, event operations, or synchronization.
+         * Production graphs never call this method unless first-transaction
+         * diagnostics were enabled before graph construction.
+         */
+        virtual bool enqueueRetainMTPFirstTransactionDraftBoundaryDevice(
+            const void *data_words_device,
+            int word_count,
+            int boundary,
+            int draft_slot,
+            const void *condition_token_device,
+            const void *position_id_device,
+            const void *generation_control_device,
+            int generation_control_stride,
+            void *diagnostic_record_device,
+            int device_id,
+            void *stream)
+        {
+            (void)data_words_device;
+            (void)word_count;
+            (void)boundary;
+            (void)draft_slot;
+            (void)condition_token_device;
+            (void)position_id_device;
+            (void)generation_control_device;
+            (void)generation_control_stride;
+            (void)diagnostic_record_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Publish grouped-greedy penalty controls with a device kernel.
          *
          * The policy values are launch arguments, while @p controls_device is a
@@ -773,15 +862,22 @@ namespace llaminar2
         /**
          * @brief Commit newly emitted compact outcome tokens to device history.
          *
-         * This operation runs after compact LocalTP publication so every
-         * participant advances an identical mirrored histogram.  It is a
-         * graph-capturable in-place update with no atomics, allocation, copy,
-         * or synchronization.
+         * Accepted-state publication is the sole owner of this transition. It
+         * advances the mirrored histogram in compact-output order, then derives
+         * `first_token_already_in_history` from the final accepted-state count
+         * and stopped flag on the same stream.  The mutable policy pointer is a
+         * persistent device binding; no host-authored transaction bit is
+         * accepted by this interface.
+         *
+         * Implementations must be graph capturable and use no atomics,
+         * allocation, transfer, or synchronization.
          */
         virtual bool enqueueCommitMTPGreedyPenaltyHistoryDevice(
             const void *output_tokens_device,
             const void *output_meta_device,
-            const void *penalty_policy_device,
+            void *penalty_policy_device,
+            const void *accepted_state_counts_device,
+            const void *stopped_flags_device,
             int output_token_capacity,
             int vocab_size,
             void *generated_token_counts_device,
@@ -791,6 +887,8 @@ namespace llaminar2
             (void)output_tokens_device;
             (void)output_meta_device;
             (void)penalty_policy_device;
+            (void)accepted_state_counts_device;
+            (void)stopped_flags_device;
             (void)output_token_capacity;
             (void)vocab_size;
             (void)generated_token_counts_device;
@@ -1959,6 +2057,11 @@ namespace llaminar2
          * @param sampled_target_tokens_device Persistent sampled-row destination.
          * @param out_tokens_device Compact committed-token destination.
          * @param out_meta_device Compact speculative metadata destination.
+         * @param first_transaction_diagnostic_device Optional backend-neutral
+         *        pointer to a graph-stable
+         *        `MTPFirstTransactionDiagnosticRecord`. A non-null pointer
+         *        selects the diagnostic kernel specialization; production
+         *        callers leave it null and pay no row-hash/copy cost.
          */
         virtual bool
         enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
@@ -1978,7 +2081,8 @@ namespace llaminar2
             int out_token_capacity,
             void *sampled_target_tokens_device,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            void *first_transaction_diagnostic_device = nullptr)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -1997,6 +2101,7 @@ namespace llaminar2
             (void)sampled_target_tokens_device;
             (void)out_tokens_device;
             (void)out_meta_device;
+            (void)first_transaction_diagnostic_device;
             return false;
         }
 
@@ -2225,7 +2330,10 @@ namespace llaminar2
             void *out_ok_device,
             void *out_next_condition_tokens_device = nullptr,
             void *out_all_drafts_accepted_flags_device = nullptr,
-            void *out_stopped_flags_device = nullptr)
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_sidecar_condition_tokens_device = nullptr,
+            void *out_next_sidecar_position_ids_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr)
         {
             (void)output_tokens_device;
             (void)output_token_stride;
@@ -2247,6 +2355,9 @@ namespace llaminar2
             (void)out_next_condition_tokens_device;
             (void)out_all_drafts_accepted_flags_device;
             (void)out_stopped_flags_device;
+            (void)out_next_sidecar_condition_tokens_device;
+            (void)out_next_sidecar_position_ids_device;
+            (void)out_next_verifier_condition_tokens_device;
             return false;
         }
 
@@ -2289,7 +2400,8 @@ namespace llaminar2
             const void *output_tokens_device = nullptr,
             int output_token_stride = 0,
             void *out_all_drafts_accepted_flags_device = nullptr,
-            void *out_stopped_flags_device = nullptr)
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr)
         {
             (void)meta_device;
             (void)meta_stride;
@@ -2308,6 +2420,7 @@ namespace llaminar2
             (void)output_token_stride;
             (void)out_all_drafts_accepted_flags_device;
             (void)out_stopped_flags_device;
+            (void)out_next_verifier_condition_tokens_device;
             return false;
         }
 

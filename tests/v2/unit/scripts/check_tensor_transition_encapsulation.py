@@ -84,9 +84,16 @@ def scan_file(repo_root: pathlib.Path, path: pathlib.Path) -> list[str]:
     if relative_path in ALLOWED_FILES:
         return []
 
-    source = strip_comments_and_literals(
-        path.read_text(encoding="utf-8", errors="replace")
-    )
+    source = path.read_text(encoding="utf-8", errors="replace")
+    if RAW_COHERENCE_MUTATION_PATTERN.search(source) is None:
+        return []
+
+    # Most translation units contain none of the guarded API names. Keep that
+    # overwhelmingly common path inside the C regex engine and run the exact
+    # comment/string lexer only for candidate files. This preserves identical
+    # diagnostics while avoiding a Python character-by-character pass over the
+    # complete source tree during every unit gate.
+    source = strip_comments_and_literals(source)
     return [
         (
             f"{relative_path}:{line_number(source, match.start())}: direct "

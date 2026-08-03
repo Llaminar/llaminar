@@ -43,10 +43,10 @@ namespace llaminar2
         /**
          * @brief Immutable bindings and launch policy retained by graph nodes.
          *
-         * Every pointer names model- or arena-lifetime device memory.  Scalar
-         * sampling and penalty values are capture identity: changing request
-         * policy selects a different graph executable rather than patching a
-         * live graph from the host.
+         * Every pointer names model- or arena-lifetime device memory. Sampling
+         * geometry is capture identity. Penalty values and their evolving
+         * history predicate live behind `penalty_policy_device` and remain replay
+         * data, so request policy cannot multiply graph families.
          */
         struct Params
         {
@@ -64,9 +64,6 @@ namespace llaminar2
             const int32_t *verifier_input_tokens_device = nullptr;
             const int32_t *generated_token_counts_device = nullptr;
             void *penalty_policy_device = nullptr;
-            float presence_penalty = 0.0F;
-            float frequency_penalty = 0.0F;
-            bool first_token_already_in_history = false;
 
             int top_k = 0;
             float top_p = 1.0F;
@@ -111,8 +108,8 @@ namespace llaminar2
          * @brief Compare every address and scalar embedded in captured nodes.
          *
          * Device contents are replay inputs and are intentionally excluded.
-         * Pointer identity, row geometry, scratch capacity, and policy scalars
-         * must all match before an existing executable can be reused.
+         * Pointer identity, row geometry, scratch capacity, and sampling-policy
+         * scalars must all match before an existing executable can be reused.
          */
         [[nodiscard]] bool hasSameCaptureIdentity(
             const Params &other) const noexcept;

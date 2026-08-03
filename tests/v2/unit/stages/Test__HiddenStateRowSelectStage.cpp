@@ -624,7 +624,7 @@ TEST(Test__HiddenStateRowSelectStage, ReplayMutatorsDoNotTouchGpuWorkspace)
     }
 }
 
-TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateWorkspace)
+TEST(Test__HiddenStateRowSelectStage, WorkspaceBoundRowMetadataDoesNotDeclareOrMutateProducerBuffer)
 {
     HiddenStateRowsSelectStage::Params params;
     params.device_id = DeviceId::cuda(0);
@@ -633,14 +633,35 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateW
     params.selected_row_count = 3;
     params.selected_row_indices = {1, 2, 3};
     params.device_row_index_source =
-        HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::WorkspaceBoundDeviceIndices;
     params.workspace_buffer_name = "mtp_spec_decode_verifier_rows";
     HiddenStateRowsSelectStage stage(params);
 
     EXPECT_TRUE(stage.getWorkspaceRequirements(8, 32, 0).buffers.empty())
-        << "External metadata mode must let the metadata owner declare the row-index buffer";
+        << "Workspace-bound metadata mode must let the producer declare the row-index buffer";
     EXPECT_FALSE(stage.setSelectedRowsForReplay({5, 0, 7}))
-        << "External metadata mode must not silently update a stale stage-local row list";
+        << "Workspace-bound metadata mode must not silently update a stale stage-local row list";
+    EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
+}
+
+TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataUsesOnlyTheExactProducerPointer)
+{
+    const int32_t producer_owned_rows[] = {1, 2, 3};
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 8;
+    params.d_model = 32;
+    params.selected_row_count = 3;
+    params.selected_row_indices = {1, 2, 3};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+    params.external_device_row_indices = producer_owned_rows;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(8, 32, 0).buffers.empty())
+        << "An exact external producer pointer must never declare or discover a graph workspace buffer";
+    EXPECT_FALSE(stage.setSelectedRowsForReplay({5, 0, 7}))
+        << "External metadata mode must not silently adopt stage-owned host rows";
     EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
 }
 

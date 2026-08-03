@@ -781,6 +781,74 @@ TEST_F(Test__LocalTPContext, RawAllgatherUsesParticipantProducerStreams)
            "collective on the exact producer stream.";
 }
 
+TEST_F(Test__LocalTPContext, RawAllgatherAttributesLaunchErrorsAndAbortsTheDomain)
+{
+    const std::string local_tp = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    const std::string nccl = readTextFile(LLAMINAR_NCCL_COORDINATOR_SOURCE);
+    const std::string rccl = readTextFile(LLAMINAR_RCCL_COORDINATOR_SOURCE);
+    ASSERT_FALSE(local_tp.empty());
+    ASSERT_FALSE(nccl.empty());
+    ASSERT_FALSE(rccl.empty());
+
+    auto require_attribution = [](const std::string &source,
+                                  const std::string &signature,
+                                  const std::string &clear_call,
+                                  const std::string &collective_call,
+                                  const std::string &producer_error,
+                                  const std::string &collective_error,
+                                  const char *backend)
+    {
+        const size_t begin = source.find(signature);
+        ASSERT_NE(begin, std::string::npos) << backend;
+        const size_t end = source.find("\n    bool ", begin + signature.size());
+        const std::string body = source.substr(
+            begin,
+            end == std::string::npos ? std::string::npos : end - begin);
+
+        const size_t pre_clear = body.find(clear_call);
+        const size_t collective = body.find(collective_call, pre_clear);
+        const size_t post_clear = body.find(clear_call, pre_clear + clear_call.size());
+        ASSERT_NE(pre_clear, std::string::npos) << backend;
+        ASSERT_NE(collective, std::string::npos) << backend;
+        ASSERT_NE(post_clear, std::string::npos) << backend;
+        EXPECT_LT(pre_clear, collective) << backend;
+        EXPECT_LT(collective, post_clear) << backend;
+        EXPECT_NE(body.find(producer_error), std::string::npos) << backend;
+        EXPECT_NE(body.find(collective_error), std::string::npos) << backend;
+    };
+
+    require_attribution(
+        nccl,
+        "bool NCCLCoordinator::allgatherSingleDeviceOnStream(",
+        "cudaGetLastError()",
+        "nccl::ncclAllGather(",
+        "CUDA producer launch state failed before ncclAllGather(on-stream)",
+        "CUDA runtime rejected ncclAllGather(on-stream) enqueue",
+        "NCCL");
+    require_attribution(
+        rccl,
+        "bool RCCLCoordinator::allgatherSingleDeviceOnStream(",
+        "hipGetLastError()",
+        "rccl::ncclAllGather(",
+        "HIP producer launch state failed before rcclAllGather(on-stream)",
+        "HIP runtime rejected rcclAllGather(on-stream) enqueue",
+        "RCCL");
+
+    const size_t begin = local_tp.find("bool LocalTPContext::allgatherRawOnStream(");
+    ASSERT_NE(begin, std::string::npos);
+    const size_t end = local_tp.find(
+        "bool LocalTPContext::groupedP2PRawOnStream(", begin);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = local_tp.substr(begin, end - begin);
+    const size_t backend_call = body.find(
+        "backend_impl_->allgatherSingleDeviceOnStream(");
+    const size_t abort = body.find("requestAbort();", backend_call);
+    ASSERT_NE(backend_call, std::string::npos);
+    ASSERT_NE(abort, std::string::npos);
+    EXPECT_GT(abort, backend_call)
+        << "A failed native collective must poison the complete LocalTP domain";
+}
+
 /**
  * @test Construct with empty devices throws
  */

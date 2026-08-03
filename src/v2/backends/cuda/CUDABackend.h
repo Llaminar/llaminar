@@ -92,6 +92,33 @@ namespace llaminar2
             void *partial_idxs = nullptr,
             int partial_capacity = 0,
             int output_stride = 1) override;
+        bool enqueueArgmaxF32BatchedRowsAndPublishMTPChainDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *chain_condition_tokens_device,
+            void *chain_position_ids_device,
+            int chain_position_increment,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1) override;
+        bool enqueueRetainMTPFirstTransactionDraftBoundaryDevice(
+            const void *data_words_device,
+            int word_count,
+            int boundary,
+            int draft_slot,
+            const void *condition_token_device,
+            const void *position_id_device,
+            const void *generation_control_device,
+            int generation_control_stride,
+            void *diagnostic_record_device,
+            int device_id,
+            void *stream) override;
         bool enqueueConfigureMTPGreedyPenaltyPolicyDevice(
             void *controls_device,
             float presence_penalty,
@@ -137,7 +164,9 @@ namespace llaminar2
         bool enqueueCommitMTPGreedyPenaltyHistoryDevice(
             const void *output_tokens_device,
             const void *output_meta_device,
-            const void *penalty_policy_device,
+            void *penalty_policy_device,
+            const void *accepted_state_counts_device,
+            const void *stopped_flags_device,
             int output_token_capacity,
             int vocab_size,
             void *generated_token_counts_device,
@@ -492,7 +521,8 @@ namespace llaminar2
             int out_token_capacity,
             void *sampled_target_tokens_device,
             void *out_tokens_device,
-            void *out_meta_device) override;
+            void *out_meta_device,
+            void *first_transaction_diagnostic_device = nullptr) override;
         bool enqueueSummarizeGreedySpeculativeVerifyBatch(
             const void *verify_tokens_device,
             const void *draft_tokens_device,
@@ -566,7 +596,10 @@ namespace llaminar2
             void *out_ok_device,
             void *out_next_condition_tokens_device = nullptr,
             void *out_all_drafts_accepted_flags_device = nullptr,
-            void *out_stopped_flags_device = nullptr) override;
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_sidecar_condition_tokens_device = nullptr,
+            void *out_next_sidecar_position_ids_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,
@@ -584,7 +617,8 @@ namespace llaminar2
             const void *output_tokens_device = nullptr,
             int output_token_stride = 0,
             void *out_all_drafts_accepted_flags_device = nullptr,
-            void *out_stopped_flags_device = nullptr) override;
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr) override;
         bool enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
             const void *base_cached_tokens_device,
             const void *main_target_cached_tokens_device,
