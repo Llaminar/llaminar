@@ -1599,10 +1599,10 @@ namespace llaminar2::test
             methods = {{
                 {"src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
                  "bool CUDAMoEKernel::executeGroupedPrefillPipeline(",
-                 "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime("},
+                 "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan("},
                 {"src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
                  "bool ROCmMoEKernel::executeGroupedPrefillPipeline(",
-                 "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime("},
+                 "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan("},
             }};
 
         for (const auto &[relative_path, method, next_method] : methods)
@@ -1623,6 +1623,126 @@ namespace llaminar2::test
             EXPECT_EQ(body.find("host_output"), std::string::npos)
                 << relative_path << " must keep grouped output device-owned";
         }
+    }
+
+    /**
+     * @brief Keep route-only regrouping outside production orchestration.
+     *
+     * Backend integration tests may isolate stable grouping through the
+     * concrete diagnostic method. Production must cross the stronger complete
+     * publication boundary so descriptors, active ids, and inverse mapping can
+     * never be stale relative to grouped rows.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ProductionCannotCallRouteOnlyRegroupDiagnostics)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path execution_root = root / "src/v2/execution";
+        ASSERT_TRUE(fs::exists(execution_root));
+
+        for (const auto &entry :
+             fs::recursive_directory_iterator(execution_root))
+        {
+            if (!entry.is_regular_file())
+                continue;
+            const auto extension = entry.path().extension();
+            if (extension != ".cpp" && extension != ".h" &&
+                extension != ".hpp")
+            {
+                continue;
+            }
+
+            const std::string source = readFile(entry.path());
+            EXPECT_EQ(
+                source.find("regroupPrefillRoutesForDiagnostics("),
+                std::string::npos)
+                << fs::relative(entry.path(), root)
+                << " must publish the complete grouped runtime plan";
+        }
+    }
+
+    /**
+     * @brief Keep runtime-plan publication out of the grouped compute consumer.
+     *
+     * The stage owns one explicit publication boundary. That transaction
+     * writes grouped rows, the inverse route map, active expert ids, and all
+     * runtime descriptor tables before compute begins. Reconstructing any
+     * member of that plan from the compute consumer would permit the members
+     * to drift to different stream-ordered generations and would restore the
+     * extra launches removed by the fused publication kernels.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GroupedRuntimeComputeConsumesOneCompletePublishedPlan)
+    {
+        const fs::path root = findRepoRoot();
+        struct BackendMethod
+        {
+            fs::path path;
+            std::string method;
+            std::string next_method;
+        };
+        const std::array<BackendMethod, 2> backends = {{
+            {
+                "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
+                "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+                "bool CUDAMoEKernel::reduceCanonicalRouteContributions(",
+            },
+            {
+                "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
+                "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+                "bool ROCmMoEKernel::reduceCanonicalRouteContributions(",
+            },
+        }};
+        const std::array<std::string, 5> forbidden_consumer_tokens = {{
+            "materialize_runtime_prefill_plan",
+            "materialize_runtime_prefill_descriptor_tables",
+            "build_runtime_original_to_grouped",
+            "group_prefill_routes_runtime",
+            "regroup_prefill_routes_runtime_assignments",
+        }};
+
+        for (const auto &backend : backends)
+        {
+            const fs::path path = root / backend.path;
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string source = readFile(path);
+            ASSERT_FALSE(source.empty()) << path;
+
+            const size_t begin = source.find(backend.method);
+            ASSERT_NE(begin, std::string::npos) << backend.path;
+            const size_t end = source.find(backend.next_method, begin);
+            ASSERT_NE(end, std::string::npos) << backend.path;
+            const std::string consumer = source.substr(begin, end - begin);
+
+            for (const auto &token : forbidden_consumer_tokens)
+            {
+                EXPECT_EQ(consumer.find(token), std::string::npos)
+                    << backend.path
+                    << " must consume the complete published plan without "
+                       "launching a hidden publication operation: "
+                    << token;
+            }
+        }
+
+        const fs::path stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+        const std::string stage = readFile(stage_path);
+        ASSERT_FALSE(stage.empty()) << stage_path;
+
+        const size_t router_publication = stage.find(
+            "kernel->publishCompleteGroupedPrefillPlanFromRouter(");
+        const size_t assignment_publication = stage.find(
+            "kernel->publishCompleteGroupedPrefillPlanFromRuntimeAssignments(");
+        const size_t consumer = stage.find(
+            "kernel->executeGroupedPrefillPipelineFromPublishedRuntimePlan(");
+        ASSERT_NE(router_publication, std::string::npos);
+        ASSERT_NE(assignment_publication, std::string::npos);
+        ASSERT_NE(consumer, std::string::npos);
+        EXPECT_LT(router_publication, consumer)
+            << "Static and mirrored execution must publish before compute.";
+        EXPECT_LT(assignment_publication, consumer)
+            << "Least-loaded execution must publish its final assignment before compute.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -6017,6 +6137,118 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Require grouped KV integration graphs to use production ownership.
+     *
+     * The shared lifecycle harness captures grouped publication, converted
+     * reads, and reusable adversarial graph bodies. Hand-written backend
+     * begin/end pairs let an assertion or rejected enqueue strand the native
+     * stream in capture mode, after which teardown or a later test can block
+     * inside the driver. Both backend adapters must use the same indivisible
+     * capture transaction as production at every capture site.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GroupedKVIntegrationCaptureUsesProductionTransactions)
+    {
+        const fs::path root = findRepoRoot();
+        const std::array<std::tuple<fs::path, std::string, std::string>, 2> cases{{
+            {
+                root / "tests/v2/integration/kernels/cuda/Test__CUDAKVCacheGroupedVerifier.cpp",
+                "CUDAGraphCapture",
+                "cudaStream",
+            },
+            {
+                root / "tests/v2/integration/kernels/rocm/Test__ROCmKVCacheGroupedVerifier.cpp",
+                "HIPGraphCapture",
+                "hipStream",
+            },
+        }};
+
+        for (const auto &[path, capture_type, raw_stream_prefix] : cases)
+        {
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string source = readFile(path);
+            ASSERT_FALSE(source.empty());
+            EXPECT_NE(source.find(capture_type), std::string::npos) << path;
+            EXPECT_EQ(
+                countOccurrences(
+                    source,
+                    "ScopedBackendGraphCapture capture_transaction("),
+                3u)
+                << path
+                << " must structurally own all three graph-capture sites";
+            EXPECT_EQ(
+                source.find(raw_stream_prefix + "BeginCapture("),
+                std::string::npos)
+                << path << " must not open a native capture directly";
+            EXPECT_EQ(
+                source.find(raw_stream_prefix + "EndCapture("),
+                std::string::npos)
+                << path << " must not close a native capture directly";
+        }
+    }
+
+    /**
+     * @brief Keep TurboQuant codebook publication in cache initialization only.
+     *
+     * Constant memory is per device. A process-global uploaded flag both skips
+     * initialization on later participants and tempts launch wrappers to do
+     * host-side readiness work during graph capture. Every cache therefore
+     * publishes its identical immutable tables on its own construction stream;
+     * the constructor's one lifecycle fence establishes readiness, and kernel
+     * launchers contain no upload, synchronization, or host publication branch.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         TurboQuantCodebooksArePerDeviceInitializationOnly)
+    {
+        const fs::path root = findRepoRoot();
+        struct BackendCase
+        {
+            fs::path kernel;
+            fs::path cache;
+            std::string upload_function;
+            std::string launch_call;
+            std::string constructor_call;
+            std::string global_flag;
+        };
+        const std::array<BackendCase, 2> cases{{
+            {
+                "src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu",
+                "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu",
+                "bool cuda_tq_upload_codebooks(cudaStream_t stream)",
+                "cuda_tq_upload_codebooks(stream)",
+                "if (!cuda_tq_upload_codebooks(init_stream))",
+                "s_codebooks_uploaded",
+            },
+            {
+                "src/v2/kernels/rocm/kvcache/ROCmTurboQuantKernels.hip",
+                "src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip",
+                "bool hip_tq_upload_codebooks(hipStream_t stream)",
+                "hip_tq_upload_codebooks(stream)",
+                "if (!hip_tq_upload_codebooks(init_stream))",
+                "s_hip_codebooks_uploaded",
+            },
+        }};
+
+        for (const auto &backend : cases)
+        {
+            const std::string kernels = readFile(root / backend.kernel);
+            const std::string cache = readFile(root / backend.cache);
+            ASSERT_FALSE(kernels.empty()) << backend.kernel;
+            ASSERT_FALSE(cache.empty()) << backend.cache;
+            EXPECT_NE(kernels.find(backend.upload_function), std::string::npos)
+                << backend.kernel;
+            EXPECT_EQ(kernels.find(backend.launch_call), std::string::npos)
+                << backend.kernel
+                << " must consume construction-published constant memory";
+            EXPECT_EQ(kernels.find(backend.global_flag), std::string::npos)
+                << backend.kernel
+                << " must not alias constant-memory readiness across devices";
+            EXPECT_NE(cache.find(backend.constructor_call), std::string::npos)
+                << backend.cache;
+        }
+    }
+
+    /**
      * @brief Keep monolithic prefill capture inside the same structural owner.
      *
      * Prefill historically exposed separate begin, abort, and end methods. Any
@@ -7496,11 +7728,17 @@ namespace llaminar2::test
         EXPECT_NE(
             stage_source.find("retain_routes_during_initial_grouping"),
             std::string::npos);
+        const size_t complete_assignment_publication = stage_source.find(
+            "kernel->publishCompleteGroupedPrefillPlanFromRuntimeAssignments(");
+        ASSERT_NE(complete_assignment_publication, std::string::npos)
+            << "Least-loaded assignment must cross one complete plan boundary.";
         EXPECT_NE(
             stage_source.find(
-                "top_k,\n                    retain_routes_for_deferred_commit)"),
+                "retain_routes_for_deferred_commit);",
+                complete_assignment_publication),
             std::string::npos)
-            << "Least-loaded assignment must retain only after final regroup.";
+            << "Least-loaded assignment must retain routes only while its final "
+               "grouping, inverse map, descriptors, and active ids are published.";
         EXPECT_NE(
             stage_source.find(
                 "publishCommittedGroupedVerifierHistograms("),
@@ -7616,6 +7854,13 @@ namespace llaminar2::test
 
             const std::string committed_publication =
                 source->substr(commit_begin, 5000);
+            EXPECT_NE(
+                committed_publication.find(
+                    "FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT("),
+                std::string::npos)
+                << backend
+                << " must fail fatally rather than silently discard accepted "
+                   "history when its deferred route ledger is incomplete.";
             EXPECT_NE(
                 committed_publication.find(
                     "accepted_state_counts[request]"),

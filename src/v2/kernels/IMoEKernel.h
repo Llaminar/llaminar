@@ -1698,27 +1698,57 @@ namespace llaminar2
         }
 
         /**
-         * @brief Rebuild runtime prefill groups from device-owned route assignments.
+         * @brief Publish a complete grouped plan directly from router outputs.
          *
-         * LLEP/device-side assignment kernels may rewrite
-         * DeviceMoELayerRuntime::route_participant_ids after routing while
-         * preserving the original route_expert_ids and route_weights. This
-         * method clears only counts/offsets/grouped scratch, then groups rows
-         * assigned to runtime_layer->participant_id. It must not read route
-         * metadata back to host and must be graph-capturable.
-         *
-         * When @p retain_routes_for_deferred_commit is true, the regrouping
-         * kernel must retain the final route and participant assignment in the
-         * per-layer device ledger without launching a separate copy kernel.
-         *
-         * Like initial grouping, regrouping must not mutate persistent decode
-         * history. It may run before the verifier outcome exists and therefore
-         * cannot distinguish committed rows from rejected speculative rows.
+         * Static-owner and fully replicated execution have no intervening
+         * participant assignment phase. Their final publication therefore owns
+         * route conversion, deterministic grouping, inverse-map construction,
+         * compact descriptor materialization, and stable active-expert ids as
+         * one stream-ordered transaction. Implementations may mode-shift by
+         * geometry, but the method must publish every product before returning.
          */
-        virtual bool regroupPrefillRoutesFromRuntimeAssignments(
+        virtual bool publishCompleteGroupedPrefillPlanFromRouter(
             DeviceMoELayerRuntime *runtime_layer,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            bool filter_to_local_runtime_experts,
+            bool retain_routes_for_deferred_commit = false)
+        {
+            (void)runtime_layer;
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)current_tokens;
+            (void)max_tokens;
+            (void)num_experts;
+            (void)top_k;
+            (void)gateup_desc_table_id;
+            (void)down_desc_table_id;
+            (void)filter_to_local_runtime_experts;
+            (void)retain_routes_for_deferred_commit;
+            return false;
+        }
+
+        /**
+         * @brief Publish a complete grouped plan from final device assignments.
+         *
+         * LLEP rewrites participant ids after route-only grouping. This method
+         * consumes that final device ledger and atomically defines the grouped
+         * rows, inverse map, compact descriptor tables, active ids, and optional
+         * deferred verifier ledger consumed by the following grouped compute.
+         * No host observation or separate descriptor side effect is permitted.
+         */
+        virtual bool publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens,
+            int max_tokens,
+            int num_experts,
+            int top_k,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
             bool retain_routes_for_deferred_commit = false)
         {
             (void)runtime_layer;
@@ -1726,6 +1756,8 @@ namespace llaminar2
             (void)max_tokens;
             (void)num_experts;
             (void)top_k;
+            (void)gateup_desc_table_id;
+            (void)down_desc_table_id;
             (void)retain_routes_for_deferred_commit;
             return false;
         }
@@ -1742,13 +1774,13 @@ namespace llaminar2
          * publication source because later layers intentionally reuse it.
          *
          * The accepted-state commit is intentionally separate from route
-         * retention in groupPrefillRoutes() and
-         * regroupPrefillRoutesFromRuntimeAssignments(). Grouping runs before
-         * acceptance is known and may only retain immutable route evidence; it
-         * must not mutate routing history. Callers must enqueue this commit on
-         * the exact stream that owns accepted-state publication. The default
-         * hard failure keeps an unimplemented backend from silently losing or
-         * overcounting decode evidence.
+         * retention in groupPrefillRoutes() and complete-plan publication from
+         * final runtime assignments. Grouping runs before acceptance is known
+         * and may only retain immutable route evidence; it must not mutate
+         * routing history. Callers must enqueue this commit on the exact stream
+         * that owns accepted-state publication. The default hard failure keeps
+         * an unimplemented backend from silently losing or overcounting decode
+         * evidence.
          *
          * @param launch Explicit producer stream and persistent workspace.
          * @param runtime_layer Device-resident per-layer routing scratch.
@@ -2092,7 +2124,7 @@ namespace llaminar2
          * @p output belongs to the later canonical reducer and may not yet
          * have device storage.
          */
-        virtual bool executeGroupedPrefillPipelineFromRuntime(
+        virtual bool executeGroupedPrefillPipelineFromPublishedRuntimePlan(
             DeviceMoELayerRuntime *device_runtime_layer,
             const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,

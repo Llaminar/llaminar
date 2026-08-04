@@ -5829,16 +5829,45 @@ namespace llaminar2
                 (fully_replicated_local_rows ||
                  params_.routed_assignment_policy ==
                      RoutedExpertAssignmentPolicy::StaticOwner);
-            groups_prepared = kernel->groupPrefillRoutes(
-                moe_runtime_layer_,
-                params_.routing_indices,
-                params_.routing_weights,
-                seq_len,
-                seq_len,
-                num_experts,
-                top_k,
-                filter_runtime_grouping_to_local_experts,
-                retain_routes_during_initial_grouping);
+            const bool requires_participant_assignment =
+                !fully_replicated_local_rows &&
+                params_.routed_assignment_policy ==
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            if (requires_participant_assignment)
+            {
+                /*
+                 * LLEP planning consumes global route counts before it can
+                 * assign participants. This first publication is deliberately
+                 * route-only; the final assignment boundary below publishes
+                 * the complete grouped execution plan exactly once.
+                 */
+                groups_prepared = kernel->groupPrefillRoutes(
+                    moe_runtime_layer_,
+                    params_.routing_indices,
+                    params_.routing_weights,
+                    seq_len,
+                    seq_len,
+                    num_experts,
+                    top_k,
+                    filter_runtime_grouping_to_local_experts,
+                    /*retain_routes_for_deferred_commit=*/false);
+            }
+            else
+            {
+                groups_prepared =
+                    kernel->publishCompleteGroupedPrefillPlanFromRouter(
+                        moe_runtime_layer_,
+                        params_.routing_indices,
+                        params_.routing_weights,
+                        seq_len,
+                        seq_len,
+                        num_experts,
+                        top_k,
+                        grouped_gateup_desc_table_id_,
+                        grouped_down_desc_table_id_,
+                        filter_runtime_grouping_to_local_experts,
+                        retain_routes_during_initial_grouping);
+            }
             if (groups_prepared && fully_replicated_local_rows)
             {
                 /*
@@ -6093,13 +6122,16 @@ namespace llaminar2
                 }
                 if (!trace_runtime_assignment("after_llep_assign"))
                     return false;
-                groups_prepared = kernel->regroupPrefillRoutesFromRuntimeAssignments(
-                    moe_runtime_layer_,
-                    seq_len,
-                    seq_len,
-                    num_experts,
-                    top_k,
-                    retain_routes_for_deferred_commit);
+                groups_prepared =
+                    kernel->publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+                        moe_runtime_layer_,
+                        seq_len,
+                        seq_len,
+                        num_experts,
+                        top_k,
+                        grouped_gateup_desc_table_id_,
+                        grouped_down_desc_table_id_,
+                        retain_routes_for_deferred_commit);
                 if (groups_prepared &&
                     !trace_runtime_assignment("after_llep_regroup"))
                 {
@@ -6153,7 +6185,7 @@ namespace llaminar2
             if (!trace_runtime_assignment("before_runtime_pipeline"))
                 return false;
             const auto &runtime_state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-            pipeline_ok = kernel->executeGroupedPrefillPipelineFromRuntime(
+            pipeline_ok = kernel->executeGroupedPrefillPipelineFromPublishedRuntimePlan(
                 moe_runtime_layer_,
                 runtime_state,
                 params_.input,

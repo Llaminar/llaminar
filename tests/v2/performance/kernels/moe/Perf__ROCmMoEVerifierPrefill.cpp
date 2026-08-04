@@ -18,6 +18,8 @@
 #include "../../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
+#include "backends/rocm/HIPGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 
@@ -880,24 +882,48 @@ namespace
         }
     }
 
-    class HipGraphOwner
+    /**
+     * @brief Own one production-shaped HIP graph-capture transaction.
+     *
+     * Perf cells exercise the same TensorBase publication protocol as model
+     * execution. The scoped backend transaction makes provisional writes part
+     * of the graph instead of attempting to publish external completion events
+     * while HIP is recording. It also guarantees that an exception closes an
+     * opened capture before tensors and workspaces begin destruction.
+     */
+    class ScopedHipPerfGraph
     {
     public:
-        ~HipGraphOwner()
+        ScopedHipPerfGraph(hipStream_t stream, std::string operation)
+            : graph_(stream),
+              transaction_(graph_, std::move(operation))
         {
-            if (exec_)
-                (void)hipGraphExecDestroy(exec_);
-            if (graph_)
-                (void)hipGraphDestroy(graph_);
+            if (!stream || !transaction_.begin())
+            {
+                throw std::runtime_error(
+                    "ScopedHipPerfGraph failed to begin HIP graph capture");
+            }
         }
 
-        hipGraph_t *graphPtr() { return &graph_; }
-        hipGraphExec_t *execPtr() { return &exec_; }
-        hipGraphExec_t execHandle() const { return exec_; }
+        ScopedHipPerfGraph(const ScopedHipPerfGraph &) = delete;
+        ScopedHipPerfGraph &operator=(const ScopedHipPerfGraph &) = delete;
+
+        /** @brief Finish capture and instantiate its immutable executable. */
+        bool finishAndInstantiate()
+        {
+            transaction_.finish();
+            return graph_.instantiate();
+        }
+
+        /** @brief Enqueue one replay on the captured non-null stream. */
+        bool launch()
+        {
+            return graph_.launch();
+        }
 
     private:
-        hipGraph_t graph_ = nullptr;
-        hipGraphExec_t exec_ = nullptr;
+        llaminar2::HIPGraphCapture graph_;
+        llaminar2::ScopedBackendGraphCapture transaction_;
     };
 
     /**
@@ -1149,41 +1175,24 @@ namespace
         const double pipeline_ms = timeHipEvents(stream, iterations, run_pipeline);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        HipGraphOwner graph;
-        const hipError_t begin_status =
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal);
-        if (begin_status != hipSuccess)
+        ScopedHipPerfGraph graph(
+            stream,
+            "ROCm MoE routed verifier perf capture");
+        requireHipBenchBody(run_grouped(), "graph capture");
+        if (!graph.finishAndInstantiate())
         {
             throw std::runtime_error(
-                std::string("ROCm MoE verifier graph capture begin failed: ") +
-                hipGetErrorString(begin_status));
-        }
-        const bool captured = run_grouped();
-        const hipError_t end_status = hipStreamEndCapture(stream, graph.graphPtr());
-        if (!captured || end_status != hipSuccess || *graph.graphPtr() == nullptr)
-        {
-            throw std::runtime_error(
-                std::string("ROCm MoE verifier graph capture body failed: ") +
-                hipGetErrorString(end_status));
-        }
-        const hipError_t instantiate_status =
-            hipGraphInstantiate(
-                graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0);
-        if (instantiate_status != hipSuccess)
-        {
-            throw std::runtime_error(
-                std::string("ROCm MoE verifier graph instantiate failed: ") +
-                hipGetErrorString(instantiate_status));
+                "ROCm MoE verifier graph instantiate failed");
         }
         for (int i = 0; i < warmups; ++i)
-            EXPECT_EQ(hipGraphLaunch(graph.execHandle(), stream), hipSuccess);
+            requireHipBenchBody(graph.launch(), "graph warmup replay");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         const double graph_ms = timeHipEvents(
             stream,
             iterations,
             [&]()
             {
-                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+                return graph.launch();
             });
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -1397,23 +1406,22 @@ namespace
         const double eager_ms = timeHipEvents(stream, iterations, run_grouped);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        HipGraphOwner graph;
-        EXPECT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-        const bool captured = run_grouped();
-        const hipError_t end_status = hipStreamEndCapture(stream, graph.graphPtr());
-        EXPECT_TRUE(captured);
-        EXPECT_EQ(end_status, hipSuccess) << hipGetErrorString(end_status);
-        EXPECT_NE(*graph.graphPtr(), nullptr);
-        EXPECT_EQ(hipGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0), hipSuccess);
+        ScopedHipPerfGraph graph(
+            stream,
+            "ROCm MoE shared-expert verifier perf capture");
+        requireHipBenchBody(run_grouped(), "shared graph capture");
+        requireHipBenchBody(
+            graph.finishAndInstantiate(),
+            "shared graph instantiate");
         for (int i = 0; i < warmups; ++i)
-            EXPECT_EQ(hipGraphLaunch(graph.execHandle(), stream), hipSuccess);
+            requireHipBenchBody(graph.launch(), "shared graph warmup replay");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         const double graph_ms = timeHipEvents(
             stream,
             iterations,
             [&]()
             {
-                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+                return graph.launch();
             });
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -1842,26 +1850,22 @@ namespace
         EXPECT_TRUE(run_grouped());
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        HipGraphOwner graph;
-        EXPECT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-        const bool captured = run_grouped();
-        const hipError_t capture_status =
-            hipStreamEndCapture(stream, graph.graphPtr());
-        EXPECT_TRUE(captured);
-        EXPECT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
-        EXPECT_NE(*graph.graphPtr(), nullptr);
-        EXPECT_EQ(
-            hipGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0),
-            hipSuccess);
+        ScopedHipPerfGraph graph(
+            stream,
+            "ROCm MoE router verifier perf capture");
+        requireHipBenchBody(run_grouped(), "router graph capture");
+        requireHipBenchBody(
+            graph.finishAndInstantiate(),
+            "router graph instantiate");
         for (int i = 0; i < 3; ++i)
-            EXPECT_EQ(hipGraphLaunch(graph.execHandle(), stream), hipSuccess);
+            requireHipBenchBody(graph.launch(), "router graph warmup replay");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         const double graph_ms = timeHipEvents(
             stream,
             iterations,
             [&]()
             {
-                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+                return graph.launch();
             });
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -2410,23 +2414,13 @@ namespace
                         down_tile_n_text.c_str());
 
                     llaminar2::PerfStatsCollector::reset();
-                    HipGraphOwner graph;
-                    ASSERT_EQ(
-                        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-                        hipSuccess);
-                    const bool captured = run_pipeline();
-                    const hipError_t capture_status =
-                        hipStreamEndCapture(stream, graph.graphPtr());
-                    ASSERT_TRUE(captured)
+                    ScopedHipPerfGraph graph(
+                        stream,
+                        "ROCm MoE grouped-prefill candidate capture");
+                    ASSERT_TRUE(run_pipeline())
                         << format.label << ' ' << shape.name << " M=" << rows
                         << ' ' << role << ' ' << candidate_name;
-                    ASSERT_EQ(capture_status, hipSuccess)
-                        << hipGetErrorString(capture_status);
-                    ASSERT_NE(*graph.graphPtr(), nullptr);
-                    ASSERT_EQ(
-                        hipGraphInstantiate(
-                            graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0),
-                        hipSuccess);
+                    ASSERT_TRUE(graph.finishAndInstantiate());
 
                     const auto route_records =
                         llaminar2::PerfStatsCollector::snapshot(
@@ -2471,9 +2465,7 @@ namespace
 
                     for (int warmup = 0; warmup < warmups; ++warmup)
                     {
-                        ASSERT_EQ(
-                            hipGraphLaunch(graph.execHandle(), stream),
-                            hipSuccess);
+                        ASSERT_TRUE(graph.launch());
                     }
                     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -2492,9 +2484,7 @@ namespace
                     };
                     const std::vector<float> repeated_output_a =
                         download_grouped_output();
-                    ASSERT_EQ(
-                        hipGraphLaunch(graph.execHandle(), stream),
-                        hipSuccess);
+                    ASSERT_TRUE(graph.launch());
                     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
                     const std::vector<float> repeated_output_b =
                         download_grouped_output();
@@ -2516,7 +2506,7 @@ namespace
                             iterations,
                             [&]()
                             {
-                                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+                                return graph.launch();
                             }));
                     }
                     std::sort(trial_ms.begin(), trial_ms.end());

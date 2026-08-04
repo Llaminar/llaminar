@@ -252,7 +252,9 @@ namespace llaminar2
         if (!init_stream)
             throw std::runtime_error("ROCmRingKVCacheTQ: explicit initialization stream unavailable");
 
-        hip_tq_upload_codebooks(init_stream);
+        if (!hip_tq_upload_codebooks(init_stream))
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: failed to enqueue constant codebook publication");
         rotations_ = hip_tq_create_rotations(n_layers_, local_n_kv_heads_, head_dim_,
                                               rotation_seed, device_id_, init_stream, kv_head_start_);
 

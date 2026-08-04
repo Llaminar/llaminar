@@ -33,10 +33,16 @@ namespace llaminar2
 
     /**
      * @brief Upload TQ4 and TQ8 codebooks to CUDA constant memory.
-     * Must be called once before any TQ kernel launch.
-     * Thread-safe (uses internal flag to skip redundant uploads).
+     *
+     * Cache construction calls this on its explicit initialization stream and
+     * fences that stream once after all model-lifetime storage is published.
+     * Kernel launchers must never invoke this method: constant-memory upload is
+     * topology initialization, not graph work.
+     *
+     * @param stream Non-null cache-initialization stream on the active device.
+     * @return true when every upload was enqueued successfully.
      */
-    void cuda_tq_upload_codebooks(cudaStream_t stream);
+    [[nodiscard]] bool cuda_tq_upload_codebooks(cudaStream_t stream);
 
     // =========================================================================
     // Rotation Matrix Management

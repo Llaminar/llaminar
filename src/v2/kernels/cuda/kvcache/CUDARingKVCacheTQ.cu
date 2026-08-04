@@ -252,7 +252,9 @@ namespace llaminar2
         // Upload persistent codebooks and shard-specific rotations on one
         // explicit stream.  The constructor fences that stream before return,
         // so the first graph capture cannot race partially initialized state.
-        cuda_tq_upload_codebooks(init_stream);
+        if (!cuda_tq_upload_codebooks(init_stream))
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: failed to enqueue constant codebook publication");
 
         // Create GPU rotation matrices from TurboQuantContext
         if (tq_ctx)

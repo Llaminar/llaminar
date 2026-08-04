@@ -1099,6 +1099,25 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
         int *original_to_grouped,
@@ -1106,6 +1125,22 @@ extern "C"
         int max_slots,
         int num_experts,
         int top_k,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
         int retain_routes_for_deferred_commit,
         int device_idx,
         void *stream);
@@ -1180,17 +1215,6 @@ extern "C"
         llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
         llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_materialize_runtime_prefill_plan(
-        const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
-        int *active_expert_ids,
-        int num_experts,
-        int max_active_experts,
         int device_idx,
         void *stream);
 
@@ -4967,7 +4991,7 @@ namespace llaminar2
             stream);
     }
 
-    bool CUDAMoEKernel::regroupPrefillRoutesFromRuntimeAssignments(
+    bool CUDAMoEKernel::regroupPrefillRoutesForDiagnostics(
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens,
         int max_tokens,
@@ -4975,20 +4999,18 @@ namespace llaminar2
         int top_k,
         bool retain_routes_for_deferred_commit)
     {
-        if (!runtime_layer)
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 ||
+            current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
         {
-            LOG_ERROR("[CUDAMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] null runtime");
+            LOG_ERROR(
+                "[CUDAMoEKernel::regroupPrefillRoutesForDiagnostics] "
+                "invalid route-only diagnostic contract");
             return false;
         }
-        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
-            num_experts <= 0 || top_k <= 0)
-        {
-            LOG_ERROR("[CUDAMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] invalid dimensions current_tokens="
-                      << current_tokens << " max_tokens=" << max_tokens
-                      << " num_experts=" << num_experts << " top_k=" << top_k);
-            return false;
-        }
-        void *stream = requireStream("CUDAMoEKernel::regroupPrefillRoutesFromRuntimeAssignments");
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::regroupPrefillRoutesForDiagnostics");
         const int max_slots = max_tokens * top_k;
         if (!ensureGroupingBufferCapacity(max_slots, num_experts))
             return false;
@@ -4999,6 +5021,187 @@ namespace llaminar2
             max_slots,
             num_experts,
             top_k,
+            retain_routes_for_deferred_commit ? 1 : 0,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool filter_to_local_runtime_experts,
+        bool retain_routes_for_deferred_commit)
+    {
+        if (!runtime_layer || !routing_indices || !routing_weights ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !down_table.valid ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter] "
+                      "descriptor table does not match the expert domain");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter");
+        const DeviceId device = deviceId();
+        const int max_slots = max_tokens * top_k;
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(max_slots, num_experts))
+        {
+            return false;
+        }
+
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "CUDA complete runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "CUDA complete runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "CUDA complete runtime prefill down descriptors"))
+        {
+            return false;
+        }
+
+        const auto *device_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const auto *device_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        const int max_active_experts = std::min(max_slots, num_experts);
+        return device_indices && device_weights &&
+               cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+                   device_indices,
+                   device_weights,
+                   static_cast<void *>(runtime_layer),
+                   d_group_original_to_grouped_,
+                   runtime_gate_descs,
+                   runtime_up_descs,
+                   runtime_down_descs,
+                   d_group_active_expert_ids_,
+                   current_tokens * top_k,
+                   max_slots,
+                   num_experts,
+                   top_k,
+                   max_active_experts,
+                   filter_to_local_runtime_experts ? 1 : 0,
+                   retain_routes_for_deferred_commit ? 1 : 0,
+                   device_ordinal_,
+                   stream);
+    }
+
+    bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool retain_routes_for_deferred_commit)
+    {
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !down_table.valid ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments] "
+                      "descriptor table does not match the expert domain");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments");
+        const int max_slots = max_tokens * top_k;
+        if (!ensureGroupingBufferCapacity(max_slots, num_experts))
+            return false;
+
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "CUDA assigned runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "CUDA assigned runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "CUDA assigned runtime prefill down descriptors"))
+        {
+            return false;
+        }
+
+        return cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+            static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
+            runtime_gate_descs,
+            runtime_up_descs,
+            runtime_down_descs,
+            d_group_active_expert_ids_,
+            current_tokens * top_k,
+            max_slots,
+            num_experts,
+            top_k,
+            std::min(max_slots, num_experts),
             retain_routes_for_deferred_commit ? 1 : 0,
             device_ordinal_,
             stream);
@@ -6393,7 +6596,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime(
+    bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(
         DeviceMoELayerRuntime *device_runtime_layer,
         const DeviceMoELayerRuntime &runtime_host_layer,
         ITensor *hidden, ITensor *output,
@@ -6416,7 +6619,7 @@ namespace llaminar2
             !runtime_host_layer.grouped_token_ids ||
             !runtime_host_layer.grouped_route_weights)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid runtime scratch contract"
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid runtime scratch contract"
                       << " expert_count=" << runtime_host_layer.expert_count
                       << " expected_experts=" << num_experts
                       << " top_k=" << runtime_host_layer.top_k
@@ -6432,7 +6635,7 @@ namespace llaminar2
             down_desc_table_id < 0 ||
             down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid descriptor table id");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid descriptor table id");
             return false;
         }
 
@@ -6446,11 +6649,12 @@ namespace llaminar2
             gateup_table.intermediate != intermediate ||
             down_table.intermediate != intermediate)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] descriptor table shape mismatch");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] descriptor table shape mismatch");
             return false;
         }
 
-        void *stream = requireStream("CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime");
+        void *stream = requireStream(
+            "CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan");
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
@@ -6474,7 +6678,7 @@ namespace llaminar2
                 debugEnv().gemm.cuda_moe_gateup_kparts,
                 intermediate))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
@@ -6484,7 +6688,7 @@ namespace llaminar2
         if ((use_gateup_kpart || use_down_ordered_kpart) &&
             !runtime_host_layer.route_expert_ids)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "verifier grouped down split-K requires runtime route expert ids");
             return false;
         }
@@ -6494,7 +6698,7 @@ namespace llaminar2
                 d_model,
                 splitk_route_slots))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "verifier grouped down split-K scratch allocation failed");
             return false;
         }
@@ -6517,11 +6721,9 @@ namespace llaminar2
         }
 
         /*
-         * The materialized pointers are mutable graph inputs, so they must
-         * inherit the persistent ownership identity of the immutable table
-         * that describes the same experts.  Slot resolution is pure pointer
-         * arithmetic over the preallocated workspace: no lease registry,
-         * allocation, or host synchronization occurs in this hot path.
+         * Complete plan publication has already written these graph-owned
+         * descriptor slots. The compute consumer resolves the same immutable
+         * slot identities without launching a hidden materialization step.
          */
         DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
         DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
@@ -6545,24 +6747,8 @@ namespace llaminar2
                 &runtime_down_descs,
                 "CUDA runtime prefill down descriptors"))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "failed to bind graph-owned runtime descriptor slots");
-            return false;
-        }
-
-        if (!cudaMoE_materialize_runtime_prefill_plan(
-                device_runtime_layer,
-                runtime_gate_descs,
-                runtime_up_descs,
-                runtime_down_descs,
-                d_group_active_expert_ids_,
-                num_experts,
-                active_expert_slots,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
-                      "failed to materialize runtime descriptors and active experts");
             return false;
         }
 
@@ -6660,7 +6846,7 @@ namespace llaminar2
             stream);
         if (!ok)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] grouped CUDA pipeline failed");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] grouped CUDA pipeline failed");
             return false;
         }
 

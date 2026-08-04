@@ -49,6 +49,16 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   This includes deterministic prefix replay, forced movement, long recall,
   prefill replay, no segmented execution, clean shutdown, and PerfStats path
   assertions.
+- The 2026-08-04 canonical grouped-verifier gate passed `89/89` explicit CPU,
+  CUDA, CUDA2, ROCm, and ROCm2 cells. CUDA/ROCm KV publication is isolated by
+  all 14 cache/source format pairs plus converted-read, logical-restore,
+  adversarial, and TurboQuant lifecycle cells; each process uses the production
+  graph-capture transaction and exact stream/event ownership.
+- TurboQuant codebooks are uploaded once per cache/device on its construction
+  stream and covered by the cache constructor's initialization fence. Launch
+  wrappers cannot perform codebook upload, and no process-global ready flag can
+  incorrectly alias initialization across devices. The complete Integration
+  tree rebuilt cleanly and the device-free unit/source gate passed `585/585`.
 
 ## CUDA LLEP Economy
 

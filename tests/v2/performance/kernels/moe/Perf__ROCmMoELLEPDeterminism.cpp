@@ -27,6 +27,29 @@ namespace
     using namespace llaminar2::test::moe_llep_perf;
 
 #ifdef HAVE_ROCM
+    extern "C" bool hipMoE_group_prefill_routes_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    extern "C" bool hipMoE_build_runtime_original_to_grouped(
+        const void *runtime,
+        int *original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream);
+
     extern "C" bool hipMoE_materialize_runtime_prefill_plan(
         const void *runtime,
         llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
@@ -35,6 +58,51 @@ namespace
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
+        int device_idx,
+        void *stream);
+
+    extern "C" bool hipMoE_group_prefill_routes_and_materialize_plan_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    extern "C" bool hipMoE_regroup_prefill_routes_runtime_assignments(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    extern "C" bool hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int retain_routes_for_deferred_commit,
         int device_idx,
         void *stream);
 
@@ -472,6 +540,378 @@ TEST(Perf__MoELLEPDeterminism, ROCm_RuntimePrefillPlanPublication)
     ASSERT_EQ(hipFree(up_descs), hipSuccess);
     ASSERT_EQ(hipFree(gate_descs), hipSuccess);
     ASSERT_EQ(hipFree(active_expert_ids), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Prove and time complete verifier-plan fusion on HIP.
+ *
+ * The baseline deliberately invokes the former route grouping, inverse-map
+ * publication, and descriptor/active-list publications separately. The fused
+ * candidate must reproduce every byte of runtime route state and every
+ * compute-plan product before its timing can be considered. Allocations and
+ * host copies remain outside the timed interval.
+ */
+TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    Shape shape{};
+    shape.seq_len = envInt("LLAMINAR_MOE_COMPLETE_PLAN_ROWS", 4);
+    const int current_slots = shape.seq_len * shape.top_k;
+    constexpr int verifier_plan_max_slots = 256;
+    ASSERT_GT(current_slots, 0);
+    ASSERT_LE(current_slots, verifier_plan_max_slots);
+    const int max_active_experts =
+        std::min(current_slots, shape.num_experts);
+    const int warmups = envInt("LLAMINAR_MOE_COMPLETE_PLAN_WARMUPS", 100);
+    const int iterations = envInt("LLAMINAR_MOE_COMPLETE_PLAN_ITERS", 5000);
+
+    ROCmHarness harness(shape);
+    harness.prepare(
+        /*all_participants_resident=*/true,
+        makeResidentAssignmentRouteExperts(shape),
+        makeRouteWeights(shape));
+    const auto runtime = harness.copyRuntime();
+    const auto *route_indices = static_cast<const float *>(
+        harness.route_indices_tensor_->gpu_data_ptr());
+    const auto *route_weights = static_cast<const float *>(
+        harness.route_weights_tensor_->gpu_data_ptr());
+    ASSERT_NE(route_indices, nullptr);
+    ASSERT_NE(route_weights, nullptr);
+
+    const std::size_t descriptor_bytes =
+        static_cast<std::size_t>(shape.num_experts) *
+        sizeof(DeviceNativeVNNIMatrixDesc);
+    const std::size_t route_int_bytes =
+        static_cast<std::size_t>(current_slots) * sizeof(int32_t);
+    const std::size_t route_float_bytes =
+        static_cast<std::size_t>(current_slots) * sizeof(float);
+    const std::size_t expert_int_bytes =
+        static_cast<std::size_t>(shape.num_experts) * sizeof(int32_t);
+    const std::size_t active_bytes =
+        static_cast<std::size_t>(max_active_experts) * sizeof(int32_t);
+
+    DeviceNativeVNNIMatrixDesc *baseline_gate = nullptr;
+    DeviceNativeVNNIMatrixDesc *baseline_up = nullptr;
+    DeviceNativeVNNIMatrixDesc *baseline_down = nullptr;
+    DeviceNativeVNNIMatrixDesc *fused_gate = nullptr;
+    DeviceNativeVNNIMatrixDesc *fused_up = nullptr;
+    DeviceNativeVNNIMatrixDesc *fused_down = nullptr;
+    int32_t *baseline_active = nullptr;
+    int32_t *fused_active = nullptr;
+    int32_t *baseline_inverse = nullptr;
+    int32_t *fused_inverse = nullptr;
+    ASSERT_EQ(hipMalloc(&baseline_gate, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&baseline_up, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&baseline_down, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&fused_gate, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&fused_up, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&fused_down, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&baseline_active, active_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&fused_active, active_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&baseline_inverse, route_int_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&fused_inverse, route_int_bytes), hipSuccess);
+
+    const auto launch_baseline = [&]()
+    {
+        return hipMoE_group_prefill_routes_runtime(
+                   route_indices,
+                   route_weights,
+                   harness.runtime_table_->deviceLayerState(0),
+                   current_slots,
+                   current_slots,
+                   shape.num_experts,
+                   shape.top_k,
+                   /*filter_to_local_runtime_experts=*/0,
+                   /*retain_routes_for_deferred_commit=*/0,
+                   /*device_idx=*/0,
+                   harness.stream_) &&
+               hipMoE_build_runtime_original_to_grouped(
+                   harness.runtime_table_->deviceLayerState(0),
+                   baseline_inverse,
+                   current_slots,
+                   current_slots,
+                   shape.num_experts,
+                   shape.top_k,
+                   /*device_idx=*/0,
+                   harness.stream_) &&
+               hipMoE_materialize_runtime_prefill_plan(
+                   harness.runtime_table_->deviceLayerState(0),
+                   baseline_gate,
+                   baseline_up,
+                   baseline_down,
+                   baseline_active,
+                   shape.num_experts,
+                   max_active_experts,
+                   /*device_idx=*/0,
+                   harness.stream_);
+    };
+    const auto launch_fused = [&]()
+    {
+        return hipMoE_group_prefill_routes_and_materialize_plan_runtime(
+            route_indices,
+            route_weights,
+            harness.runtime_table_->deviceLayerState(0),
+            fused_inverse,
+            fused_gate,
+            fused_up,
+            fused_down,
+            fused_active,
+            current_slots,
+            current_slots,
+            shape.num_experts,
+            shape.top_k,
+            max_active_experts,
+            /*filter_to_local_runtime_experts=*/0,
+            /*retain_routes_for_deferred_commit=*/0,
+            /*device_idx=*/0,
+            harness.stream_);
+    };
+
+    ASSERT_TRUE(launch_baseline());
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    const auto copy_bytes = [](const void *device_ptr, std::size_t bytes)
+    {
+        std::vector<uint8_t> result(bytes);
+        EXPECT_EQ(
+            hipMemcpy(
+                result.data(),
+                device_ptr,
+                bytes,
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+        return result;
+    };
+    const auto baseline_gate_bytes = copy_bytes(baseline_gate, descriptor_bytes);
+    const auto baseline_up_bytes = copy_bytes(baseline_up, descriptor_bytes);
+    const auto baseline_down_bytes = copy_bytes(baseline_down, descriptor_bytes);
+    const auto baseline_active_bytes = copy_bytes(baseline_active, active_bytes);
+    const auto baseline_inverse_bytes = copy_bytes(baseline_inverse, route_int_bytes);
+    const auto baseline_counts = copy_bytes(runtime.expert_counts, expert_int_bytes);
+    const auto baseline_offsets = copy_bytes(runtime.expert_offsets, expert_int_bytes);
+    const auto baseline_route_ids = copy_bytes(runtime.route_expert_ids, route_int_bytes);
+    const auto baseline_route_weights = copy_bytes(runtime.route_weights, route_float_bytes);
+    const auto baseline_participants = copy_bytes(runtime.route_participant_ids, route_int_bytes);
+    const auto baseline_grouped_ids = copy_bytes(runtime.grouped_token_ids, route_int_bytes);
+    const auto baseline_grouped_weights =
+        copy_bytes(runtime.grouped_route_weights, route_float_bytes);
+
+    ASSERT_TRUE(launch_fused());
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    EXPECT_EQ(copy_bytes(fused_gate, descriptor_bytes), baseline_gate_bytes);
+    EXPECT_EQ(copy_bytes(fused_up, descriptor_bytes), baseline_up_bytes);
+    EXPECT_EQ(copy_bytes(fused_down, descriptor_bytes), baseline_down_bytes);
+    EXPECT_EQ(copy_bytes(fused_active, active_bytes), baseline_active_bytes);
+    EXPECT_EQ(copy_bytes(fused_inverse, route_int_bytes), baseline_inverse_bytes);
+    EXPECT_EQ(copy_bytes(runtime.expert_counts, expert_int_bytes), baseline_counts);
+    EXPECT_EQ(copy_bytes(runtime.expert_offsets, expert_int_bytes), baseline_offsets);
+    EXPECT_EQ(copy_bytes(runtime.route_expert_ids, route_int_bytes), baseline_route_ids);
+    EXPECT_EQ(copy_bytes(runtime.route_weights, route_float_bytes), baseline_route_weights);
+    EXPECT_EQ(copy_bytes(runtime.route_participant_ids, route_int_bytes), baseline_participants);
+    EXPECT_EQ(copy_bytes(runtime.grouped_token_ids, route_int_bytes), baseline_grouped_ids);
+    EXPECT_EQ(
+        copy_bytes(runtime.grouped_route_weights, route_float_bytes),
+        baseline_grouped_weights);
+
+    for (int i = 0; i < warmups; ++i)
+    {
+        ASSERT_TRUE(launch_baseline());
+        ASSERT_TRUE(launch_fused());
+    }
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    const auto measure = [&](const auto &launch)
+    {
+        HipEvents events;
+        EXPECT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+        for (int i = 0; i < iterations; ++i)
+            EXPECT_TRUE(launch());
+        EXPECT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+        EXPECT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+        float elapsed_ms = 0.0f;
+        EXPECT_EQ(
+            hipEventElapsedTime(&elapsed_ms, events.start, events.stop),
+            hipSuccess);
+        return elapsed_ms * 1000.0f / static_cast<float>(iterations);
+    };
+
+    const float baseline_us = measure(launch_baseline);
+    const float fused_us = measure(launch_fused);
+    std::cout << "backend,case,rows,slots,iters,baseline_us,fused_us,speedup\n"
+              << "rocm,complete_runtime_prefill_plan_fusion,"
+              << shape.seq_len << ',' << current_slots << ',' << iterations << ','
+              << baseline_us << ',' << fused_us << ','
+              << baseline_us / fused_us << '\n';
+    EXPECT_LT(fused_us, baseline_us)
+        << "one-workgroup complete plan publication must beat separate launches";
+
+    /*
+     * Model the post-planner LLEP ledger with both local and remote routes.
+     * The publication kernel must preserve all assignments while compacting
+     * only participant zero's rows into the local grouped compute plan.
+     */
+    std::vector<int32_t> assigned_participants(
+        static_cast<std::size_t>(current_slots));
+    for (int route_slot = 0; route_slot < current_slots; ++route_slot)
+    {
+        assigned_participants[static_cast<std::size_t>(route_slot)] =
+            route_slot % 2;
+    }
+    ASSERT_GT(
+        std::count(assigned_participants.begin(),
+                   assigned_participants.end(),
+                   0),
+        0);
+    ASSERT_GT(
+        std::count(assigned_participants.begin(),
+                   assigned_participants.end(),
+                   1),
+        0);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            runtime.route_participant_ids,
+            assigned_participants.data(),
+            route_int_bytes,
+            hipMemcpyHostToDevice,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    const auto launch_assigned_baseline = [&]()
+    {
+        return hipMoE_regroup_prefill_routes_runtime_assignments(
+                   harness.runtime_table_->deviceLayerState(0),
+                   current_slots,
+                   current_slots,
+                   shape.num_experts,
+                   shape.top_k,
+                   /*retain_routes_for_deferred_commit=*/0,
+                   /*device_idx=*/0,
+                   harness.stream_) &&
+               hipMoE_build_runtime_original_to_grouped(
+                   harness.runtime_table_->deviceLayerState(0),
+                   baseline_inverse,
+                   current_slots,
+                   current_slots,
+                   shape.num_experts,
+                   shape.top_k,
+                   /*device_idx=*/0,
+                   harness.stream_) &&
+               hipMoE_materialize_runtime_prefill_plan(
+                   harness.runtime_table_->deviceLayerState(0),
+                   baseline_gate,
+                   baseline_up,
+                   baseline_down,
+                   baseline_active,
+                   shape.num_experts,
+                   max_active_experts,
+                   /*device_idx=*/0,
+                   harness.stream_);
+    };
+    const auto launch_assigned_fused = [&]()
+    {
+        return hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+            harness.runtime_table_->deviceLayerState(0),
+            fused_inverse,
+            fused_gate,
+            fused_up,
+            fused_down,
+            fused_active,
+            current_slots,
+            current_slots,
+            shape.num_experts,
+            shape.top_k,
+            max_active_experts,
+            /*retain_routes_for_deferred_commit=*/0,
+            /*device_idx=*/0,
+            harness.stream_);
+    };
+
+    ASSERT_TRUE(launch_assigned_baseline());
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    const auto assigned_baseline_gate_bytes =
+        copy_bytes(baseline_gate, descriptor_bytes);
+    const auto assigned_baseline_up_bytes =
+        copy_bytes(baseline_up, descriptor_bytes);
+    const auto assigned_baseline_down_bytes =
+        copy_bytes(baseline_down, descriptor_bytes);
+    const auto assigned_baseline_active_bytes =
+        copy_bytes(baseline_active, active_bytes);
+    const auto assigned_baseline_inverse_bytes =
+        copy_bytes(baseline_inverse, route_int_bytes);
+    const auto assigned_baseline_counts =
+        copy_bytes(runtime.expert_counts, expert_int_bytes);
+    const auto assigned_baseline_offsets =
+        copy_bytes(runtime.expert_offsets, expert_int_bytes);
+    const auto assigned_baseline_route_ids =
+        copy_bytes(runtime.route_expert_ids, route_int_bytes);
+    const auto assigned_baseline_route_weights =
+        copy_bytes(runtime.route_weights, route_float_bytes);
+    const auto assigned_baseline_participants =
+        copy_bytes(runtime.route_participant_ids, route_int_bytes);
+    const auto assigned_baseline_grouped_ids =
+        copy_bytes(runtime.grouped_token_ids, route_int_bytes);
+    const auto assigned_baseline_grouped_weights =
+        copy_bytes(runtime.grouped_route_weights, route_float_bytes);
+
+    ASSERT_TRUE(launch_assigned_fused());
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    EXPECT_EQ(copy_bytes(fused_gate, descriptor_bytes),
+              assigned_baseline_gate_bytes);
+    EXPECT_EQ(copy_bytes(fused_up, descriptor_bytes),
+              assigned_baseline_up_bytes);
+    EXPECT_EQ(copy_bytes(fused_down, descriptor_bytes),
+              assigned_baseline_down_bytes);
+    EXPECT_EQ(copy_bytes(fused_active, active_bytes),
+              assigned_baseline_active_bytes);
+    EXPECT_EQ(copy_bytes(fused_inverse, route_int_bytes),
+              assigned_baseline_inverse_bytes);
+    EXPECT_EQ(copy_bytes(runtime.expert_counts, expert_int_bytes),
+              assigned_baseline_counts);
+    EXPECT_EQ(copy_bytes(runtime.expert_offsets, expert_int_bytes),
+              assigned_baseline_offsets);
+    EXPECT_EQ(copy_bytes(runtime.route_expert_ids, route_int_bytes),
+              assigned_baseline_route_ids);
+    EXPECT_EQ(copy_bytes(runtime.route_weights, route_float_bytes),
+              assigned_baseline_route_weights);
+    EXPECT_EQ(copy_bytes(runtime.route_participant_ids, route_int_bytes),
+              assigned_baseline_participants);
+    EXPECT_EQ(copy_bytes(runtime.grouped_token_ids, route_int_bytes),
+              assigned_baseline_grouped_ids);
+    EXPECT_EQ(copy_bytes(runtime.grouped_route_weights, route_float_bytes),
+              assigned_baseline_grouped_weights);
+
+    for (int i = 0; i < warmups; ++i)
+    {
+        ASSERT_TRUE(launch_assigned_baseline());
+        ASSERT_TRUE(launch_assigned_fused());
+    }
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    const float assigned_baseline_us = measure(launch_assigned_baseline);
+    const float assigned_fused_us = measure(launch_assigned_fused);
+    std::cout << "rocm,complete_runtime_assigned_plan_fusion,"
+              << shape.seq_len << ',' << current_slots << ',' << iterations << ','
+              << assigned_baseline_us << ',' << assigned_fused_us << ','
+              << assigned_baseline_us / assigned_fused_us << '\n';
+    EXPECT_LT(assigned_fused_us, assigned_baseline_us)
+        << "one-workgroup assigned-plan publication must beat separate launches";
+
+    EXPECT_EQ(hipFree(fused_inverse), hipSuccess);
+    EXPECT_EQ(hipFree(baseline_inverse), hipSuccess);
+    EXPECT_EQ(hipFree(fused_active), hipSuccess);
+    EXPECT_EQ(hipFree(baseline_active), hipSuccess);
+    EXPECT_EQ(hipFree(fused_down), hipSuccess);
+    EXPECT_EQ(hipFree(fused_up), hipSuccess);
+    EXPECT_EQ(hipFree(fused_gate), hipSuccess);
+    EXPECT_EQ(hipFree(baseline_down), hipSuccess);
+    EXPECT_EQ(hipFree(baseline_up), hipSuccess);
+    EXPECT_EQ(hipFree(baseline_gate), hipSuccess);
 #endif
 }
 

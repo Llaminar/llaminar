@@ -949,6 +949,41 @@ extern "C"
         int retain_routes_for_deferred_commit,
         int device_idx, void *stream);
 
+    bool hipMoE_group_prefill_routes_and_materialize_plan_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
     bool hipMoE_commit_grouped_verifier_histograms(
         void *runtime,
         const int32_t *accepted_state_counts,
@@ -1002,27 +1037,6 @@ extern "C"
         llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
         llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
-        int device_idx,
-        void *stream);
-
-    bool hipMoE_materialize_runtime_prefill_plan(
-        const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
-        int *active_expert_ids,
-        int num_experts,
-        int max_active_experts,
-        int device_idx,
-        void *stream);
-
-    bool hipMoE_build_runtime_original_to_grouped(
-        const void *runtime,
-        int *original_to_grouped,
-        int current_slots,
-        int max_slots,
-        int num_experts,
-        int top_k,
         int device_idx,
         void *stream);
 
@@ -8219,29 +8233,32 @@ namespace llaminar2
             getStream());
     }
 
-    bool ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments(
+    bool ROCmMoEKernel::regroupPrefillRoutesForDiagnostics(
         DeviceMoELayerRuntime *runtime_layer,
-        int current_tokens, int max_tokens,
-        int num_experts, int top_k,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
         bool retain_routes_for_deferred_commit)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (!runtime_layer)
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(getStream()));
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 ||
+            current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
         {
-            LOG_ERROR("[ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] null runtime");
+            LOG_ERROR(
+                "[ROCmMoEKernel::regroupPrefillRoutesForDiagnostics] "
+                "invalid route-only diagnostic contract");
             return false;
         }
-        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
-            num_experts <= 0 || top_k <= 0)
+        if (!setMoEDevice(
+                device_ordinal_,
+                "regroupPrefillRoutesForDiagnostics"))
         {
-            LOG_ERROR("[ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] invalid dimensions current_tokens="
-                      << current_tokens << " max_tokens=" << max_tokens
-                      << " num_experts=" << num_experts << " top_k=" << top_k);
             return false;
         }
-        if (!setMoEDevice(device_ordinal_, "regroupPrefillRoutesFromRuntimeAssignments"))
-            return false;
 
         return hipMoE_regroup_prefill_routes_runtime_assignments(
             static_cast<void *>(runtime_layer),
@@ -8252,6 +8269,227 @@ namespace llaminar2
             retain_routes_for_deferred_commit ? 1 : 0,
             device_ordinal_,
             getStream());
+    }
+
+    bool ROCmMoEKernel::publishCompleteGroupedPrefillPlanFromRouter(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool filter_to_local_runtime_experts,
+        bool retain_routes_for_deferred_commit)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(getStream()));
+        if (!runtime_layer || !routing_indices || !routing_weights ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::publishCompleteGroupedPrefillPlanFromRouter] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "publishCompleteGroupedPrefillPlanFromRouter"))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !down_table.valid ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            return false;
+        }
+
+        const int max_slots = max_tokens * top_k;
+        if (max_slots > group_slots_cap_ ||
+            !d_group_active_expert_ids_ ||
+            !d_group_original_to_grouped_)
+        {
+            if (!bindWorkspaceBuffer(
+                    reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                    MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                    static_cast<size_t>(num_experts) * sizeof(int),
+                    "publishCompleteGroupedPrefillPlanFromRouter(active_ids)") ||
+                !bindWorkspaceBuffer(
+                    reinterpret_cast<void **>(&d_group_original_to_grouped_),
+                    MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
+                    static_cast<size_t>(max_slots) * sizeof(int),
+                    "publishCompleteGroupedPrefillPlanFromRouter(inverse_map)"))
+            {
+                return false;
+            }
+            group_slots_cap_ = max_slots;
+        }
+
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "ROCm complete runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "ROCm complete runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "ROCm complete runtime prefill down descriptors"))
+        {
+            return false;
+        }
+
+        const auto *device_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const auto *device_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        const int active_expert_slots = std::min(max_slots, num_experts);
+        return device_indices && device_weights &&
+               hipMoE_group_prefill_routes_and_materialize_plan_runtime(
+                   device_indices,
+                   device_weights,
+                   static_cast<void *>(runtime_layer),
+                   d_group_original_to_grouped_,
+                   runtime_gate_descs,
+                   runtime_up_descs,
+                   runtime_down_descs,
+                   d_group_active_expert_ids_,
+                   current_tokens * top_k,
+                   max_slots,
+                   num_experts,
+                   top_k,
+                   active_expert_slots,
+                   filter_to_local_runtime_experts ? 1 : 0,
+                   retain_routes_for_deferred_commit ? 1 : 0,
+                   device_ordinal_,
+                   getStream());
+    }
+
+    bool ROCmMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool retain_routes_for_deferred_commit)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "publishCompleteGroupedPrefillPlanFromRuntimeAssignments"))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !down_table.valid ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            return false;
+        }
+
+        const int max_slots = max_tokens * top_k;
+        if (max_slots > group_slots_cap_ ||
+            !d_group_active_expert_ids_ ||
+            !d_group_original_to_grouped_)
+        {
+            if (!bindWorkspaceBuffer(
+                    reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                    MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                    static_cast<size_t>(num_experts) * sizeof(int),
+                    "publishCompleteGroupedPrefillPlanFromRuntimeAssignments(active_ids)") ||
+                !bindWorkspaceBuffer(
+                    reinterpret_cast<void **>(&d_group_original_to_grouped_),
+                    MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
+                    static_cast<size_t>(max_slots) * sizeof(int),
+                    "publishCompleteGroupedPrefillPlanFromRuntimeAssignments(inverse_map)"))
+            {
+                return false;
+            }
+            group_slots_cap_ = max_slots;
+        }
+
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "ROCm assigned runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "ROCm assigned runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "ROCm assigned runtime prefill down descriptors"))
+        {
+            return false;
+        }
+
+        const int active_expert_slots = std::min(max_slots, num_experts);
+
+        return hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+                   static_cast<void *>(runtime_layer),
+                   d_group_original_to_grouped_,
+                   runtime_gate_descs,
+                   runtime_up_descs,
+                   runtime_down_descs,
+                   d_group_active_expert_ids_,
+                   current_tokens * top_k,
+                   max_slots,
+                   num_experts,
+                   top_k,
+                   active_expert_slots,
+                   retain_routes_for_deferred_commit ? 1 : 0,
+                   device_ordinal_,
+                   getStream());
     }
 
     bool ROCmMoEKernel::commitGroupedVerifierHistograms(
@@ -9549,7 +9787,7 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime(
+    bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(
         DeviceMoELayerRuntime *device_runtime_layer,
         const DeviceMoELayerRuntime &runtime_host_layer,
         ITensor *hidden, ITensor *output,
@@ -9566,7 +9804,9 @@ namespace llaminar2
         {
             return false;
         }
-        if (!setMoEDevice(device_ordinal_, "executeGroupedPrefillPipelineFromRuntime"))
+        if (!setMoEDevice(
+                device_ordinal_,
+                "executeGroupedPrefillPipelineFromPublishedRuntimePlan"))
             return false;
         if (runtime_host_layer.expert_count != static_cast<uint32_t>(num_experts) ||
             runtime_host_layer.top_k != static_cast<uint32_t>(top_k) ||
@@ -9578,7 +9818,7 @@ namespace llaminar2
             !runtime_host_layer.grouped_route_weights ||
             !runtime_host_layer.route_expert_ids)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid runtime scratch contract"
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid runtime scratch contract"
                       << " expert_count=" << runtime_host_layer.expert_count
                       << " expected_experts=" << num_experts
                       << " top_k=" << runtime_host_layer.top_k
@@ -9594,7 +9834,7 @@ namespace llaminar2
             down_desc_table_id < 0 ||
             down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid descriptor table id");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid descriptor table id");
             return false;
         }
 
@@ -9608,7 +9848,7 @@ namespace llaminar2
             gateup_table.intermediate != intermediate ||
             down_table.intermediate != intermediate)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] descriptor table shape mismatch");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] descriptor table shape mismatch");
             return false;
         }
 
@@ -9630,15 +9870,15 @@ namespace llaminar2
             if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
                                      MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
                                      static_cast<size_t>(num_experts) * sizeof(int),
-                                     "executeGroupedPrefillPipelineFromRuntime(group_active_expert_ids)") ||
+                                     "executeGroupedPrefillPipelineFromPublishedRuntimePlan(group_active_expert_ids)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
                                      MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
                                      static_cast<size_t>(total_slots) * sizeof(int),
-                                     "executeGroupedPrefillPipelineFromRuntime(group_original_to_grouped)"))
+                                     "executeGroupedPrefillPipelineFromPublishedRuntimePlan(group_original_to_grouped)"))
             {
                 d_group_active_expert_ids_ = nullptr;
                 d_group_original_to_grouped_ = nullptr;
-                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] runtime grouping workspace is required");
+                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] runtime grouping workspace is required");
                 return false;
             }
             group_slots_cap_ = total_slots;
@@ -9646,11 +9886,10 @@ namespace llaminar2
         const int active_expert_slots = std::min(total_slots, num_experts);
 
         /*
-         * Runtime placement changes descriptor values without changing the
-         * graph's descriptor identity.  Resolve the mutable destination from
-         * that retained identity so main-verifier, MTP-sidecar, and rebalance
-         * graphs never publish through the same device address.  This performs
-         * only validated pointer arithmetic over persistent workspace.
+         * Complete plan publication has already written these graph-owned
+         * descriptor slots and the ordered inverse map. The compute consumer
+         * resolves the same persistent addresses without hidden publication
+         * kernels of its own.
          */
         DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
         DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
@@ -9674,24 +9913,8 @@ namespace llaminar2
                 &runtime_down_descs,
                 "ROCm runtime prefill down descriptors"))
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "failed to bind graph-owned runtime descriptor slots");
-            return false;
-        }
-
-        if (!hipMoE_materialize_runtime_prefill_plan(
-                device_runtime_layer,
-                runtime_gate_descs,
-                runtime_up_descs,
-                runtime_down_descs,
-                d_group_active_expert_ids_,
-                num_experts,
-                active_expert_slots,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
-                      "failed to materialize runtime descriptors and active experts");
             return false;
         }
 
@@ -9706,13 +9929,13 @@ namespace llaminar2
                 device,
                 stream,
                 "hidden",
-                "executeGroupedPrefillPipelineFromRuntime") ||
+                "executeGroupedPrefillPipelineFromPublishedRuntimePlan") ||
             !requireOutputOnDevice(
                 publication_output,
                 device,
                 stream,
                 publication_output_name,
-                "executeGroupedPrefillPipelineFromRuntime"))
+                "executeGroupedPrefillPipelineFromPublishedRuntimePlan"))
         {
             return false;
         }
@@ -9729,30 +9952,11 @@ namespace llaminar2
         if (!d_hidden ||
             (!d_output && !d_canonical_route_contributions))
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] null device pointers");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] null device pointers");
             return false;
         }
 
         group_active_expert_slots_ = active_expert_slots;
-
-        /*
-         * Runtime LLEP grouped prefill stores route slots in grouped_token_ids.
-         * Rebuilding the inverse map lets one token/column lane publish in
-         * original top-k order for every M bucket.
-         */
-        if (!hipMoE_build_runtime_original_to_grouped(
-                device_runtime_layer,
-                d_group_original_to_grouped_,
-                total_slots,
-                total_slots,
-                num_experts,
-                top_k,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build runtime ordered-scatter map");
-            return false;
-        }
 
         const bool reuse_router_q8_hidden =
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
@@ -9790,7 +9994,7 @@ namespace llaminar2
             getStream());
         if (!ok)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] grouped ROCm pipeline failed");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] grouped ROCm pipeline failed");
             return false;
         }
 

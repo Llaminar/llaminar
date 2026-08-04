@@ -23,7 +23,17 @@ namespace llaminar2
     // Constant Memory Codebook Upload
     // =========================================================================
 
-    void hip_tq_upload_codebooks(hipStream_t stream);
+    /**
+     * @brief Enqueue model-lifetime TQ codebooks on one HIP initialization stream.
+     *
+     * The owning cache performs the sole lifecycle fence after all persistent
+     * allocations and uploads. Production kernel launchers consume the already
+     * initialized constants and may not perform upload or synchronization.
+     *
+     * @param stream Non-null cache-initialization stream on the active device.
+     * @return true when every constant-memory copy was accepted by HIP.
+     */
+    [[nodiscard]] bool hip_tq_upload_codebooks(hipStream_t stream);
 
     // =========================================================================
     // Rotation Matrix Management

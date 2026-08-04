@@ -444,6 +444,31 @@ namespace
 #define FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(INVARIANT) \
     fail_fast_incomplete_llep_transfer((INVARIANT), __func__, __LINE__)
 
+    /**
+     * @brief Terminate CUDA execution when accepted verifier history has no ledger.
+     *
+     * The grouped verifier retains its speculative routes in a per-layer,
+     * immutable-address ledger and consumes that ledger only after acceptance
+     * is known.  Treating a missing or undersized ledger as an empty history
+     * update would silently corrupt later LLEP routing evidence while the host
+     * still observes a successful kernel enqueue.  A device assertion makes
+     * that impossible and preserves the violated contract in CUDA diagnostics.
+     *
+     * @param invariant Stable description of the violated device contract.
+     * @param function  Device function that detected the violation.
+     * @param line      Source line at which the violation was detected.
+     */
+    __device__ __forceinline__ void fail_fast_invalid_grouped_verifier_commit(
+        const char *invariant,
+        const char *function,
+        unsigned int line)
+    {
+        __assert_fail(invariant, __FILE__, line, function);
+    }
+
+#define FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT(INVARIANT) \
+    fail_fast_invalid_grouped_verifier_commit((INVARIANT), __func__, __LINE__)
+
     __device__ __forceinline__ bool prefill_llep_transfer_status_complete(
         const DeviceMoERebalanceStatusView *__restrict__ status,
         uint64_t expected_transfer_count,
@@ -12203,6 +12228,140 @@ namespace
     }
 
     /**
+     * @brief Shared state for one complete runtime grouped-plan publication.
+     *
+     * Descriptor readiness and active-list compaction are collective block
+     * operations. Keeping their shared state in one explicit object lets both
+     * the descriptor-only decode publisher and the fused verifier grouping
+     * publisher invoke exactly the same device implementation.
+     */
+    struct RuntimePrefillPlanPublicationScratch
+    {
+        int first_invalid_expert;
+        ActiveExpertCompactionScratch active_experts;
+    };
+
+    /**
+     * @brief Materialize descriptor tables and the stable local active list.
+     *
+     * Every lane in the block must call this function. Descriptor publication
+     * reads one immutable placement-bank entry per expert, while active-list
+     * publication consumes the grouped counts produced earlier on the same
+     * stream or, in the fused small-M kernel, earlier in the same block. An
+     * active expert without a ready local descriptor is a fatal lifecycle
+     * violation because the immediately following grouped GEMM cannot execute
+     * that row economically or correctly.
+     */
+    __device__ __forceinline__ void publish_runtime_prefill_plan_block(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        int num_experts,
+        int *__restrict__ active_expert_ids,
+        int max_active_experts,
+        RuntimePrefillPlanPublicationScratch &scratch)
+    {
+        const bool publish_active_experts = active_expert_ids != nullptr;
+        if (!runtime || !gate_descs || !up_descs || !down_descs ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            runtime->active_bank > 1u ||
+            (publish_active_experts &&
+             (!runtime->expert_counts || max_active_experts <= 0 ||
+              max_active_experts > num_experts)))
+        {
+            if (threadIdx.x == 0)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime descriptor publication has an invalid device contract");
+            }
+            return;
+        }
+
+        const int expert = static_cast<int>(threadIdx.x);
+        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const uint32_t local_bit =
+            runtime_participant_bit(static_cast<int>(runtime->participant_id));
+        bool local_ready = false;
+        if (expert < num_experts)
+        {
+            const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+            local_ready =
+                bank.local_compute_mask[expert] != 0u &&
+                (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+                desc.local_slot >= 0 &&
+                rebalance_expert_desc_ready(desc);
+            if (local_ready)
+            {
+                gate_descs[expert] = desc.gate;
+                up_descs[expert] = desc.up;
+                down_descs[expert] = desc.down;
+            }
+            else
+            {
+                gate_descs[expert] = DeviceNativeVNNIMatrixDesc{};
+                up_descs[expert] = DeviceNativeVNNIMatrixDesc{};
+                down_descs[expert] = DeviceNativeVNNIMatrixDesc{};
+            }
+        }
+
+        // Descriptor-only decode publication is complete at this point. This
+        // branch is uniform and cannot strand a lane at a collective barrier.
+        if (!publish_active_experts)
+            return;
+
+        const int count = expert < num_experts
+                              ? runtime->expert_counts[expert]
+                              : 0;
+        const bool is_active = count > 0;
+        if (threadIdx.x == 0)
+            scratch.first_invalid_expert = num_experts;
+        __syncthreads();
+        if (is_active && !local_ready)
+            atomicMin(&scratch.first_invalid_expert, expert);
+        __syncthreads();
+
+        if (scratch.first_invalid_expert < num_experts)
+        {
+            if (threadIdx.x == 0)
+            {
+                const int invalid_expert = scratch.first_invalid_expert;
+                const DeviceMoEExpertDescriptorView &desc =
+                    bank.experts[invalid_expert];
+                printf("runtime_prefill_active_expert_not_ready "
+                       "participant=%u expert=%d count=%d active_bank=%u "
+                       "local_mask=%u resident_mask=%u local_bit=%u "
+                       "local_slot=%d logical=%d owner=%d\\n",
+                       runtime->participant_id,
+                       invalid_expert,
+                       runtime->expert_counts[invalid_expert],
+                       runtime->active_bank,
+                       bank.local_compute_mask[invalid_expert],
+                       bank.resident_participant_mask[invalid_expert],
+                       local_bit,
+                       desc.local_slot,
+                       desc.logical_expert_id,
+                       desc.owner_participant);
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime active expert is not locally resident and compute-ready");
+            }
+            return;
+        }
+
+        initialize_active_expert_compaction(scratch.active_experts);
+        compact_active_expert_chunk(
+            is_active,
+            expert,
+            max_active_experts,
+            active_expert_ids,
+            scratch.active_experts);
+        pad_active_expert_list(
+            active_expert_ids,
+            max_active_experts,
+            scratch.active_experts);
+    }
+
+    /**
      * @brief Build a stable compact list from precomputed expert counts.
      *
      * One block processes the expert domain in ascending 256-id chunks.  The
@@ -12497,7 +12656,7 @@ namespace
      * @tparam PublishRouterInputs Whether this launch owns initial router-output
      *         conversion (`true`) or post-LLEP regrouping (`false`).
      */
-    template <bool PublishRouterInputs>
+    template <bool PublishRouterInputs, bool PublishCompletePlan = false>
     __global__ void prefill_group_small_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         const float *__restrict__ routing_indices,
@@ -12508,7 +12667,12 @@ namespace
         int num_experts,
         int top_k,
         int filter_to_local_runtime_experts,
-        int retain_routes_for_deferred_commit)
+        int retain_routes_for_deferred_commit,
+        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        int *__restrict__ active_expert_ids,
+        int max_active_experts)
     {
         __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
         __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
@@ -12529,6 +12693,10 @@ namespace
             !runtime->route_participant_ids || !runtime->expert_counts ||
             !runtime->expert_offsets || !runtime->grouped_token_ids ||
             !runtime->grouped_route_weights ||
+            (PublishCompletePlan &&
+             (!gate_descs || !up_descs || !down_descs ||
+              !active_expert_ids || max_active_experts <= 0 ||
+              max_active_experts > num_experts)) ||
             (retain_routes_for_deferred_commit != 0 &&
              (!runtime->deferred_verifier_route_expert_ids ||
               !runtime->deferred_verifier_route_participant_ids ||
@@ -12716,6 +12884,26 @@ namespace
                     "runtime grouped route row does not match its original route slot");
             }
         }
+
+        if constexpr (PublishCompletePlan)
+        {
+            /*
+             * Grouping and descriptor publication are one execution-plan
+             * transaction. This barrier completes every inverse-map check
+             * before the block reuses its lanes for descriptor publication.
+             */
+            __syncthreads();
+            __shared__ RuntimePrefillPlanPublicationScratch plan_scratch;
+            publish_runtime_prefill_plan_block(
+                runtime,
+                gate_descs,
+                up_descs,
+                down_descs,
+                num_experts,
+                active_expert_ids,
+                max_active_experts,
+                plan_scratch);
+        }
     }
 
     __global__ void prefill_group_cast_count_runtime_kernel(
@@ -12856,16 +13044,26 @@ namespace
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         const int total_slots = total_rows * top_k;
-        if (!runtime || slot >= total_slots)
-            return;
-        if (!runtime->deferred_verifier_route_expert_ids ||
-            !runtime->deferred_verifier_route_participant_ids)
-            return;
-        if (runtime->deferred_verifier_route_capacity <
-            static_cast<uint32_t>(total_slots))
+        const bool ledger_is_complete =
+            runtime != nullptr &&
+            accepted_state_counts != nullptr &&
+            publication_ok_flags != nullptr &&
+            runtime->deferred_verifier_route_expert_ids != nullptr &&
+            runtime->deferred_verifier_route_participant_ids != nullptr &&
+            runtime->deferred_verifier_route_capacity >=
+                static_cast<uint32_t>(total_slots);
+        if (!ledger_is_complete)
         {
+            if (slot == 0)
+            {
+                FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT(
+                    "accepted grouped-verifier history requires a complete "
+                    "per-layer deferred route ledger");
+            }
             return;
         }
+        if (slot >= total_slots)
+            return;
 
         const int token_row = slot / top_k;
         const int request = token_row / rows_per_request;
@@ -13913,103 +14111,13 @@ namespace
         int *__restrict__ active_expert_ids,
         int max_active_experts)
     {
-        const bool publish_active_experts = active_expert_ids != nullptr;
-        if (!runtime || !gate_descs || !up_descs || !down_descs ||
-            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-            runtime->active_bank > 1u ||
-            (publish_active_experts &&
-             (!runtime->expert_counts || max_active_experts <= 0 ||
-              max_active_experts > num_experts)))
-        {
-            if (threadIdx.x == 0)
-            {
-                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                    "runtime descriptor publication has an invalid device contract");
-            }
-            return;
-        }
-
-        const int expert = static_cast<int>(threadIdx.x);
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(runtime->participant_id));
-        bool local_ready = false;
-        if (expert < num_experts)
-        {
-            const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
-            local_ready =
-                bank.local_compute_mask[expert] != 0u &&
-                (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-                desc.local_slot >= 0 &&
-                rebalance_expert_desc_ready(desc);
-            if (local_ready)
-            {
-                gate_descs[expert] = desc.gate;
-                up_descs[expert] = desc.up;
-                down_descs[expert] = desc.down;
-            }
-            else
-            {
-                gate_descs[expert] = DeviceNativeVNNIMatrixDesc{};
-                up_descs[expert] = DeviceNativeVNNIMatrixDesc{};
-                down_descs[expert] = DeviceNativeVNNIMatrixDesc{};
-            }
-        }
-
-        // Descriptor-only decode publication is complete at this point.  This
-        // branch is uniform for the block and therefore cannot strand a lane at
-        // one of the collective barriers used by prefill compaction below.
-        if (!publish_active_experts)
-            return;
-
-        const int count = expert < num_experts
-                              ? runtime->expert_counts[expert]
-                              : 0;
-        const bool is_active = count > 0;
-        __shared__ int first_invalid_expert;
-        if (threadIdx.x == 0)
-            first_invalid_expert = num_experts;
-        __syncthreads();
-        if (is_active && !local_ready)
-            atomicMin(&first_invalid_expert, expert);
-        __syncthreads();
-
-        if (first_invalid_expert < num_experts)
-        {
-            if (threadIdx.x == 0)
-            {
-                const int invalid_expert = first_invalid_expert;
-                const DeviceMoEExpertDescriptorView &desc =
-                    bank.experts[invalid_expert];
-                printf("runtime_prefill_active_expert_not_ready "
-                       "participant=%u expert=%d count=%d active_bank=%u "
-                       "local_mask=%u resident_mask=%u local_bit=%u "
-                       "local_slot=%d logical=%d owner=%d\\n",
-                       runtime->participant_id,
-                       invalid_expert,
-                       runtime->expert_counts[invalid_expert],
-                       runtime->active_bank,
-                       bank.local_compute_mask[invalid_expert],
-                       bank.resident_participant_mask[invalid_expert],
-                       local_bit,
-                       desc.local_slot,
-                       desc.logical_expert_id,
-                       desc.owner_participant);
-                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                    "runtime active expert is not locally resident and compute-ready");
-            }
-            return;
-        }
-
-        __shared__ ActiveExpertCompactionScratch scratch;
-        initialize_active_expert_compaction(scratch);
-        compact_active_expert_chunk(
-            is_active,
-            expert,
-            max_active_experts,
-            active_expert_ids,
-            scratch);
-        pad_active_expert_list(
+        __shared__ RuntimePrefillPlanPublicationScratch scratch;
+        publish_runtime_prefill_plan_block(
+            runtime,
+            gate_descs,
+            up_descs,
+            down_descs,
+            num_experts,
             active_expert_ids,
             max_active_experts,
             scratch);
@@ -17584,7 +17692,12 @@ extern "C"
                 num_experts,
                 top_k,
                 filter_to_local_runtime_experts,
-                retain_routes_for_deferred_commit);
+                retain_routes_for_deferred_commit,
+                /*gate_descs=*/nullptr,
+                /*up_descs=*/nullptr,
+                /*down_descs=*/nullptr,
+                /*active_expert_ids=*/nullptr,
+                /*max_active_experts=*/0);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_small_runtime", cuda_stream);
         }
@@ -17609,6 +17722,103 @@ extern "C"
             current_slots, max_slots, num_experts, top_k);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_group_scan_scatter_runtime", cuda_stream);
+    }
+
+    /**
+     * @brief Publish router grouping, descriptor tables, and active ids as one plan.
+     *
+     * Verifier-sized route sets execute as one block and therefore publish the
+     * complete grouped execution plan in one kernel. Larger prefill shapes keep
+     * the scalable deterministic grouping geometry, then materialize descriptors
+     * on the same stream. These are explicit geometry regimes of one total API;
+     * neither path changes arithmetic or transfers state through the host.
+     */
+    __attribute__((visibility("default"))) bool
+    cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        DeviceNativeVNNIMatrixDesc *gate_descs,
+        DeviceNativeVNNIMatrixDesc *up_descs,
+        DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime || !routing_indices || !routing_weights ||
+            !original_to_grouped || !gate_descs || !up_descs || !down_descs ||
+            !active_expert_ids || !stream ||
+            current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            max_active_experts <= 0 || max_active_experts > num_experts)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
+
+        if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+        {
+            prefill_group_small_runtime_kernel<true, true><<<
+                1, kThreads, 0, cuda_stream>>>(
+                runtime_view,
+                routing_indices,
+                routing_weights,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                filter_to_local_runtime_experts,
+                retain_routes_for_deferred_commit,
+                gate_descs,
+                up_descs,
+                down_descs,
+                active_expert_ids,
+                max_active_experts);
+            return finishGroupedPrefillLaunch(
+                "cudaMoE_prefill_group_and_plan_small_runtime", cuda_stream);
+        }
+
+        if (!cudaMoE_group_prefill_routes_runtime(
+                routing_indices,
+                routing_weights,
+                runtime,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                filter_to_local_runtime_experts,
+                retain_routes_for_deferred_commit,
+                device_idx,
+                stream))
+        {
+            return false;
+        }
+
+        materialize_runtime_prefill_descriptor_tables_kernel<<<
+            1, kThreads, 0, cuda_stream>>>(
+            runtime_view,
+            gate_descs,
+            up_descs,
+            down_descs,
+            num_experts,
+            active_expert_ids,
+            max_active_experts);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_prefill_group_and_plan_scalable_runtime", cuda_stream);
     }
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
@@ -17647,7 +17857,12 @@ extern "C"
                 num_experts,
                 top_k,
                 /*filter_to_local_runtime_experts=*/0,
-                retain_routes_for_deferred_commit);
+                retain_routes_for_deferred_commit,
+                /*gate_descs=*/nullptr,
+                /*up_descs=*/nullptr,
+                /*down_descs=*/nullptr,
+                /*active_expert_ids=*/nullptr,
+                /*max_active_experts=*/0);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
         }
@@ -17670,6 +17885,97 @@ extern "C"
             current_slots, max_slots, num_experts, top_k);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_regroup_scan_scatter_runtime", cuda_stream);
+    }
+
+    /**
+     * @brief Publish an assigned-route grouping and its complete execution plan.
+     *
+     * LLEP updates participant ids before this boundary. The verifier-sized
+     * specialization consumes those final assignments and publishes grouped
+     * rows, descriptors, and active ids in one block; scalable prefill retains
+     * its multi-block deterministic grouping followed by one ordered descriptor
+     * publication on the same stream.
+     */
+    __attribute__((visibility("default"))) bool
+    cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        void *runtime,
+        int *original_to_grouped,
+        DeviceNativeVNNIMatrixDesc *gate_descs,
+        DeviceNativeVNNIMatrixDesc *up_descs,
+        DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime || !original_to_grouped ||
+            !gate_descs || !up_descs || !down_descs ||
+            !active_expert_ids || !stream ||
+            current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            max_active_experts <= 0 || max_active_experts > num_experts)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
+
+        if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+        {
+            prefill_group_small_runtime_kernel<false, true><<<
+                1, kThreads, 0, cuda_stream>>>(
+                runtime_view,
+                /*routing_indices=*/nullptr,
+                /*routing_weights=*/nullptr,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                /*filter_to_local_runtime_experts=*/0,
+                retain_routes_for_deferred_commit,
+                gate_descs,
+                up_descs,
+                down_descs,
+                active_expert_ids,
+                max_active_experts);
+            return finishGroupedPrefillLaunch(
+                "cudaMoE_prefill_regroup_and_plan_small_runtime", cuda_stream);
+        }
+
+        if (!cudaMoE_regroup_prefill_routes_runtime_assignments(
+                runtime,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                retain_routes_for_deferred_commit,
+                device_idx,
+                stream))
+        {
+            return false;
+        }
+
+        materialize_runtime_prefill_descriptor_tables_kernel<<<
+            1, kThreads, 0, cuda_stream>>>(
+            runtime_view,
+            gate_descs,
+            up_descs,
+            down_descs,
+            num_experts,
+            active_expert_ids,
+            max_active_experts);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_prefill_regroup_and_plan_scalable_runtime", cuda_stream);
     }
 
     bool cudaMoE_commit_grouped_verifier_histograms(

@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
+#include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/GpuKVCacheGroupedVerifierHarness.h"
 
@@ -154,78 +155,37 @@ namespace
             hipEvent_t event_ = nullptr;
         };
 
-        /** @brief Own one captured HIP graph and executable. */
+        /** @brief Own one production HIP graph capture and its executable. */
         class Graph
         {
         public:
             Graph() = default;
 
-            Graph(
-                hipGraph_t graph,
-                hipGraphExec_t executable)
-                : graph_(graph),
-                  executable_(executable)
+            explicit Graph(
+                std::unique_ptr<HIPGraphCapture> capture)
+                : capture_(std::move(capture))
             {
-            }
-
-            ~Graph()
-            {
-                if (executable_)
-                    (void)hipGraphExecDestroy(
-                        executable_);
-                if (graph_)
-                    (void)hipGraphDestroy(graph_);
             }
 
             Graph(const Graph &) = delete;
             Graph &operator=(const Graph &) = delete;
-
-            Graph(Graph &&other) noexcept
-                : graph_(
-                      std::exchange(
-                          other.graph_,
-                          nullptr)),
-                  executable_(
-                      std::exchange(
-                          other.executable_,
-                          nullptr))
-            {
-            }
-
-            Graph &operator=(Graph &&other) noexcept
-            {
-                if (this == &other)
-                    return *this;
-                if (executable_)
-                    (void)hipGraphExecDestroy(
-                        executable_);
-                if (graph_)
-                    (void)hipGraphDestroy(graph_);
-                graph_ =
-                    std::exchange(
-                        other.graph_,
-                        nullptr);
-                executable_ =
-                    std::exchange(
-                        other.executable_,
-                        nullptr);
-                return *this;
-            }
+            Graph(Graph &&) noexcept = default;
+            Graph &operator=(Graph &&) noexcept = default;
 
             bool valid() const
             {
-                return graph_ != nullptr &&
-                       executable_ != nullptr;
+                return capture_ && capture_->hasExecutable();
             }
 
-            hipGraphExec_t executable() const
+            bool launch(void *opaque_stream)
             {
-                return executable_;
+                return valid() && opaque_stream &&
+                       capture_->executionStream() == opaque_stream &&
+                       capture_->launch();
             }
 
         private:
-            hipGraph_t graph_ = nullptr;
-            hipGraphExec_t executable_ = nullptr;
+            std::unique_ptr<HIPGraphCapture> capture_;
         };
 
         DeviceBuffer allocateDeviceBuffer(size_t bytes)
@@ -322,58 +282,26 @@ namespace
             const auto stream =
                 static_cast<hipStream_t>(
                     opaque_stream);
-            if (hipStreamBeginCapture(
-                    stream,
-                    hipStreamCaptureModeGlobal) !=
-                hipSuccess)
-            {
+            auto capture =
+                std::make_unique<HIPGraphCapture>(stream);
+            ScopedBackendGraphCapture capture_transaction(
+                *capture,
+                "ROCm grouped KV lifecycle graph");
+            if (!capture_transaction.begin())
                 return {};
-            }
 
-            bool enqueue_ok = false;
-            {
-                GraphCaptureGuard guard;
-                enqueue_ok = enqueue();
-            }
-            hipGraph_t graph = nullptr;
-            const hipError_t end_status =
-                hipStreamEndCapture(
-                    stream,
-                    &graph);
-            if (!enqueue_ok ||
-                end_status != hipSuccess ||
-                !graph)
-            {
-                if (graph)
-                    (void)hipGraphDestroy(graph);
+            const bool enqueue_ok = enqueue();
+            capture_transaction.finish();
+            if (!enqueue_ok || !capture->instantiate())
                 return {};
-            }
-
-            hipGraphExec_t executable = nullptr;
-            if (hipGraphInstantiate(
-                    &executable,
-                    graph,
-                    nullptr,
-                    nullptr,
-                    0) != hipSuccess ||
-                !executable)
-            {
-                (void)hipGraphDestroy(graph);
-                return {};
-            }
-            return Graph(graph, executable);
+            return Graph(std::move(capture));
         }
 
         bool launchGraph(
-            const Graph &graph,
+            Graph &graph,
             void *opaque_stream)
         {
-            return graph.valid() && opaque_stream &&
-                   hipGraphLaunch(
-                       graph.executable(),
-                       static_cast<hipStream_t>(
-                           opaque_stream)) ==
-                       hipSuccess;
+            return graph.launch(opaque_stream);
         }
 
         bool synchronizeStream(void *opaque_stream)
@@ -430,43 +358,29 @@ namespace
             }
         }
 
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t executable = nullptr;
-        if (hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal) != hipSuccess)
+        HIPGraphCapture graph(stream);
+        ScopedBackendGraphCapture capture_transaction(
+            graph,
+            "ROCm grouped KV append");
+        if (!capture_transaction.begin())
         {
             if (device_logical_rows)
                 (void)hipFree(device_logical_rows);
             return false;
         }
-        bool append_ok = false;
+        const bool append_ok = cache.appendVerifierRowsDecodeEquivalent(
+            0, 0, k, v, verifier_rows, opaque_stream);
+        capture_transaction.finish();
+        if (!append_ok || !graph.instantiate())
         {
-            GraphCaptureGuard guard;
-            append_ok = cache.appendVerifierRowsDecodeEquivalent(
-                0, 0, k, v, verifier_rows, opaque_stream);
-        }
-        const hipError_t end_status = hipStreamEndCapture(stream, &graph);
-        if (!append_ok || end_status != hipSuccess || !graph)
-        {
-            if (graph)
-                (void)hipGraphDestroy(graph);
-            if (device_logical_rows)
-                (void)hipFree(device_logical_rows);
-            return false;
-        }
-        if (hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != hipSuccess ||
-            !executable)
-        {
-            (void)hipGraphDestroy(graph);
             if (device_logical_rows)
                 (void)hipFree(device_logical_rows);
             return false;
         }
 
         const bool replay_ok =
-            hipGraphLaunch(executable, stream) == hipSuccess &&
+            graph.launch() &&
             hipStreamSynchronize(stream) == hipSuccess;
-        (void)hipGraphExecDestroy(executable);
-        (void)hipGraphDestroy(graph);
         if (device_logical_rows)
         {
             const bool unbound = cache.bindGraphAppendCountSource(
@@ -524,36 +438,26 @@ namespace
         void *opaque_stream)
     {
         const auto stream = static_cast<hipStream_t>(opaque_stream);
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t executable = nullptr;
-        if (!stream ||
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal) != hipSuccess)
-        {
+        if (!stream)
             return false;
-        }
-        bool read_ok = false;
-        {
-            GraphCaptureGuard guard;
-            read_ok = cache.get_kv_batched_converted_device_view(
-                0, 0, request_count,
-                ActivationPrecision::FP16, out_k, out_v, read);
-        }
-        const hipError_t end_status = hipStreamEndCapture(stream, &graph);
-        if (!read_ok || end_status != hipSuccess || !graph ||
-            hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != hipSuccess ||
-            !executable)
-        {
-            if (executable)
-                (void)hipGraphExecDestroy(executable);
-            if (graph)
-                (void)hipGraphDestroy(graph);
+
+        HIPGraphCapture graph(stream);
+        ScopedBackendGraphCapture capture_transaction(
+            graph,
+            "ROCm grouped KV converted read");
+        if (!capture_transaction.begin())
             return false;
-        }
+
+        const bool read_ok = cache.get_kv_batched_converted_device_view(
+            0, 0, request_count,
+            ActivationPrecision::FP16, out_k, out_v, read);
+        capture_transaction.finish();
+        if (!read_ok || !graph.instantiate())
+            return false;
+
         const bool replay_ok =
-            hipGraphLaunch(executable, stream) == hipSuccess &&
+            graph.launch() &&
             hipStreamSynchronize(stream) == hipSuccess;
-        (void)hipGraphExecDestroy(executable);
-        (void)hipGraphDestroy(graph);
         return replay_ok;
     }
 
@@ -597,9 +501,17 @@ namespace
     }
 } // namespace
 
-TEST(Test__ROCmKVCacheGroupedVerifier,
-     AllFormatsRuntimeMGraphCapturedReplicatedAndLocalTPMatchSerialDecodeBytes)
+/**
+ * @brief Run one independently process-isolated cache/source format matrix.
+ *
+ * A non-retiring HIP kernel can wedge its KFD process beyond ordinary signal
+ * recovery. Process isolation therefore belongs at the format boundary: CTest
+ * names the exact cache/source conversion before launch, and the shared
+ * harness still proves every D/M/layout/topology cell for that format.
+ */
+void runRuntimePublicationFormat(size_t format_index)
 {
+    ASSERT_LT(format_index, kFormatCases.size());
     int device_count = 0;
     if (hipGetDeviceCount(&device_count) != hipSuccess || device_count < 1)
         GTEST_SKIP() << "ROCm device unavailable";
@@ -607,14 +519,38 @@ TEST(Test__ROCmKVCacheGroupedVerifier,
 
     ScopedHipStream stream;
     ASSERT_NE(stream.get(), nullptr);
-    runAllFormatGroupedVerifierSweep(
+    runFormatGroupedVerifierSweep(
         DeviceId::rocm(0),
         "ROCm",
         "rocm_kv_cache_grouped_verifier_append_calls",
+        kFormatCases[format_index],
         stream.opaque(),
         appendGrouped,
         observeDeviceState);
 }
+
+#define LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(suffix, index)                     \
+    TEST(Test__ROCmKVCacheGroupedVerifier, RuntimePublication_##suffix)         \
+    {                                                                            \
+        runRuntimePublicationFormat(index);                                      \
+    }
+
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP32_From_FP32, 0)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(BF16_From_BF16, 1)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_FP32, 2)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_FP16, 3)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_BF16, 4)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_Q8_1, 5)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP32, 6)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP16, 7)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_BF16, 8)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_Q8_1, 9)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_FP32, 10)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_TQ8_TQ4, 11)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_FP32, 12)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_TQ8, 13)
+
+#undef LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST
 
 TEST(Test__ROCmKVCacheGroupedVerifier,
      AllFormatsCapturedConvertedBatchReadMatchesSerialBytes)

@@ -45,8 +45,6 @@ namespace llaminar2
     static float s_rope_theta_cached = 0.0f;
     static int s_rope_head_dim_cached = 0;
 
-    static std::atomic<bool> s_codebooks_uploaded{false};
-
     void cuda_tq_upload_rope_freqs(float rope_theta, int head_dim, cudaStream_t stream)
     {
         // Only recompute if theta or head_dim changed
@@ -70,25 +68,30 @@ namespace llaminar2
         }
     }
 
-    void cuda_tq_upload_codebooks(cudaStream_t stream)
+    bool cuda_tq_upload_codebooks(cudaStream_t stream)
     {
-        if (s_codebooks_uploaded.load(std::memory_order_acquire))
-            return;
+        if (!stream)
+            return false;
 
-        cudaMemcpyToSymbolAsync(d_TQ8_CENTROIDS, TQ8_CENTROIDS.data(),
-                                256 * sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyToSymbolAsync(d_TQ8_THRESHOLDS, TQ8_THRESHOLDS.data(),
-                                255 * sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyToSymbolAsync(d_TQ4_CENTROIDS, TQ4_CENTROIDS.data(),
-                                16 * sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyToSymbolAsync(d_TQ4_THRESHOLDS, TQ4_THRESHOLDS.data(),
-                                15 * sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);
-
-        if (cudaGetLastError() == cudaSuccess)
-        {
-            s_codebooks_uploaded.store(true, std::memory_order_release);
-        }
+        /*
+         * Constant memory is device-local. Publishing these small immutable
+         * tables for every cache construction avoids a process-global bit that
+         * incorrectly aliases multiple CUDA devices. Concurrent identical
+         * writes are harmless; the cache's construction fence establishes
+         * completion before any production launch or graph capture.
+         */
+        return cudaMemcpyToSymbolAsync(
+                   d_TQ8_CENTROIDS, TQ8_CENTROIDS.data(),
+                   256 * sizeof(float), 0, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+               cudaMemcpyToSymbolAsync(
+                   d_TQ8_THRESHOLDS, TQ8_THRESHOLDS.data(),
+                   255 * sizeof(float), 0, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+               cudaMemcpyToSymbolAsync(
+                   d_TQ4_CENTROIDS, TQ4_CENTROIDS.data(),
+                   16 * sizeof(float), 0, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+               cudaMemcpyToSymbolAsync(
+                   d_TQ4_THRESHOLDS, TQ4_THRESHOLDS.data(),
+                   15 * sizeof(float), 0, cudaMemcpyHostToDevice, stream) == cudaSuccess;
     }
 
     // =========================================================================
@@ -1995,8 +1998,6 @@ namespace llaminar2
         if (!d_input || !d_rotations || !d_output || num_tokens <= 0)
             return false;
 
-        cuda_tq_upload_codebooks(stream);
-
         const dim3 grid(num_tokens, n_kv_heads);
 
         if (head_dim == 64)
@@ -2028,8 +2029,6 @@ namespace llaminar2
     {
         if (!d_input || !d_rotations || !d_output || num_tokens <= 0)
             return false;
-
-        cuda_tq_upload_codebooks(stream);
 
         const dim3 grid(num_tokens, n_kv_heads);
 
@@ -2070,7 +2069,6 @@ namespace llaminar2
             return false;
         }
 
-        cuda_tq_upload_codebooks(stream);
         const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
@@ -2141,7 +2139,6 @@ namespace llaminar2
             return false;
         }
 
-        cuda_tq_upload_codebooks(stream);
         const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
@@ -2279,7 +2276,6 @@ namespace llaminar2
         if (!d_tq8_blocks || !d_rotations_t || !d_output || count <= 0)
             return false;
 
-        cuda_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
@@ -2317,8 +2313,6 @@ namespace llaminar2
         if (!d_tq4_blocks || !d_rotations_t || !d_output || count <= 0)
             return false;
 
-        cuda_tq_upload_codebooks(stream);
-
         const dim3 grid(count, n_kv_heads);
 
         if (head_dim == 64)
@@ -2355,8 +2349,6 @@ namespace llaminar2
     {
         if (count <= 0)
             return true;
-
-        cuda_tq_upload_codebooks(stream);
 
         // Tiled kernels use R (non-transposed, row-major) for coalesced access:
         // R[j][tid] at offset j*D + tid → consecutive threads read consecutive addresses.
@@ -2409,7 +2401,6 @@ namespace llaminar2
         if (count <= 0)
             return true;
 
-        cuda_tq_upload_codebooks(stream);
         constexpr int TILE = 16;
 
         if (head_dim == 64)
@@ -2583,7 +2574,6 @@ namespace llaminar2
         float rope_theta, int rope_position,
         cudaStream_t stream)
     {
-        cuda_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
@@ -2638,7 +2628,6 @@ namespace llaminar2
         {
             return false;
         }
-        cuda_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
@@ -2688,7 +2677,6 @@ namespace llaminar2
         if (n_layers <= 0)
             return true;
 
-        cuda_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 

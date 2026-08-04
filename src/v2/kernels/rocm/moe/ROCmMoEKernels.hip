@@ -38,6 +38,7 @@ namespace
     constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
     constexpr int kDeviceMoEMaxTopK = 16;
     constexpr int kDeviceMoESmallGroupMaxSlots = 64;
+    constexpr int kDeviceMoERuntimeSmallGroupMaxSlots = 256;
     constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kGateLogitsExpertsPerBlock = 4;
     constexpr int kGateLogitsGroupedThreads = 256;
@@ -405,6 +406,28 @@ namespace
     {                                                 \
         (void)sizeof(INVARIANT);                       \
         fail_fast_incomplete_llep_transfer();          \
+    } while (false)
+
+    /**
+     * @brief Terminate ROCm execution when verifier history has no route ledger.
+     *
+     * A grouped verifier may publish routing history only from the per-layer
+     * route ledger retained before transient grouping scratch is reused.  A
+     * missing or undersized ledger is therefore an invalid lifecycle, not an
+     * empty update.  One deterministic witness lane traps so the graph fails
+     * fatally instead of silently losing accepted routing evidence.
+     */
+    __device__ __forceinline__ void
+    fail_fast_invalid_grouped_verifier_commit()
+    {
+        __builtin_trap();
+    }
+
+#define FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT(INVARIANT) \
+    do                                                       \
+    {                                                        \
+        (void)sizeof(INVARIANT);                              \
+        fail_fast_invalid_grouped_verifier_commit();          \
     } while (false)
 
     __device__ __forceinline__ bool prefill_llep_transfer_status_complete(
@@ -15240,6 +15263,133 @@ __device__ __forceinline__ void rocm_pad_active_expert_list(
 }
 
 /**
+ * @brief Shared state for one complete runtime grouped-plan publication.
+ *
+ * Descriptor readiness and active-list compaction are collective workgroup
+ * operations. Keeping their state in one object lets descriptor-only decode
+ * publication and fused verifier grouping share one exact implementation.
+ */
+struct RuntimePrefillPlanPublicationScratch
+{
+    int first_invalid_expert;
+    ActiveExpertCompactionScratch active_experts;
+};
+
+/**
+ * @brief Publish runtime descriptors and the stable local active-expert list.
+ *
+ * Every lane in the workgroup must call this function. Descriptor publication
+ * reads the immutable active placement bank, while active-list publication
+ * consumes grouped counts authored earlier on the same stream or earlier in
+ * the same fused workgroup. An active expert without a locally resident,
+ * compute-ready descriptor is a fatal lifecycle violation.
+ */
+__device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
+    int num_experts,
+    int *__restrict__ active_expert_ids,
+    int max_active_experts,
+    RuntimePrefillPlanPublicationScratch &scratch)
+{
+    const bool publish_active_experts = active_expert_ids != nullptr;
+    if (!runtime || !gate_descs || !up_descs || !down_descs ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        runtime->active_bank > 1u ||
+        (publish_active_experts &&
+         (!runtime->expert_counts || max_active_experts <= 0 ||
+          max_active_experts > num_experts)))
+    {
+        if (threadIdx.x == 0)
+            fail_fast_incomplete_llep_transfer();
+        return;
+    }
+
+    const int expert = static_cast<int>(threadIdx.x);
+    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+    const uint32_t local_bit =
+        runtime_participant_bit(static_cast<int>(runtime->participant_id));
+    bool local_ready = false;
+    if (expert < num_experts)
+    {
+        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        local_ready =
+            bank.local_compute_mask[expert] != 0u &&
+            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+            desc.local_slot >= 0 &&
+            rebalance_expert_desc_ready(desc);
+        if (local_ready)
+        {
+            gate_descs[expert] = desc.gate;
+            up_descs[expert] = desc.up;
+            down_descs[expert] = desc.down;
+        }
+        else
+        {
+            gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+            up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+            down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+        }
+    }
+
+    // Descriptor-only decode publication is complete. This branch is uniform
+    // across the workgroup and cannot strand a lane at a later barrier.
+    if (!publish_active_experts)
+        return;
+
+    const int count = expert < num_experts
+                          ? runtime->expert_counts[expert]
+                          : 0;
+    const bool is_active = count > 0;
+    if (threadIdx.x == 0)
+        scratch.first_invalid_expert = num_experts;
+    __syncthreads();
+    if (is_active && !local_ready)
+        atomicMin(&scratch.first_invalid_expert, expert);
+    __syncthreads();
+
+    if (scratch.first_invalid_expert < num_experts)
+    {
+        if (threadIdx.x == 0)
+        {
+            const int invalid_expert = scratch.first_invalid_expert;
+            const DeviceMoEExpertDescriptorView &desc =
+                bank.experts[invalid_expert];
+            printf("runtime_prefill_active_expert_not_ready "
+                   "participant=%u expert=%d count=%d active_bank=%u "
+                   "local_mask=%u resident_mask=%u local_bit=%u "
+                   "local_slot=%d logical=%d owner=%d\\n",
+                   runtime->participant_id,
+                   invalid_expert,
+                   runtime->expert_counts[invalid_expert],
+                   runtime->active_bank,
+                   bank.local_compute_mask[invalid_expert],
+                   bank.resident_participant_mask[invalid_expert],
+                   local_bit,
+                   desc.local_slot,
+                   desc.logical_expert_id,
+                   desc.owner_participant);
+            fail_fast_incomplete_llep_transfer();
+        }
+        return;
+    }
+
+    rocm_initialize_active_expert_compaction(scratch.active_experts);
+    rocm_compact_active_expert_chunk(
+        is_active,
+        expert,
+        max_active_experts,
+        active_expert_ids,
+        scratch.active_experts);
+    rocm_pad_active_expert_list(
+        active_expert_ids,
+        max_active_experts,
+        scratch.active_experts);
+}
+
+/**
  * @brief Build a stable compact list from precomputed expert counts.
  *
  * One block processes ascending 256-id chunks, retaining byte identity with
@@ -15549,6 +15699,7 @@ __global__ void rocm_moe_prepare_shared_expert_group_kernel(
 
 __global__ void rocm_moe_prefill_group_clear_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int *__restrict__ original_to_grouped,
     int max_slots, int num_experts, int clear_route_metadata)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -15567,6 +15718,7 @@ __global__ void rocm_moe_prefill_group_clear_kernel(
         if (clear_route_metadata && runtime->route_participant_ids) runtime->route_participant_ids[idx] = -1;
         if (runtime->grouped_token_ids) runtime->grouped_token_ids[idx] = 0;
         if (runtime->grouped_route_weights) runtime->grouped_route_weights[idx] = 0.0f;
+        if (original_to_grouped) original_to_grouped[idx] = -1;
     }
 }
 
@@ -15601,6 +15753,285 @@ __device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
            (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
            desc.local_slot >= 0 &&
            rebalance_expert_desc_ready(desc);
+}
+
+/**
+ * @brief Publish one verifier-sized runtime grouping transaction.
+ *
+ * One 256-thread workgroup owns every route slot and every expert. The router
+ * specialization converts FP32 router outputs into the device runtime ledger;
+ * the regroup specialization consumes participant assignments already written
+ * by the LLEP planner. Both derive exact counts, ascending expert offsets,
+ * stable grouped rows, and the inverse route map without an order-dependent
+ * atomic or a serial coordinator.
+ *
+ * Stable route order is part of grouped-verifier correctness. Each route lane
+ * counts earlier local routes to the same expert, reproducing serial traversal
+ * exactly, and every output location has one deterministic writer.
+ *
+ * @tparam PublishRouterInputs True for initial router publication; false for
+ *         regrouping after device-resident participant assignment.
+ * @tparam PublishCompletePlan True when this launch also owns descriptor and
+ *         active-expert publication for the immediately following compute.
+ */
+template <bool PublishRouterInputs, bool PublishCompletePlan = false>
+__global__ void rocm_moe_prefill_group_small_runtime_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const float *__restrict__ routing_indices,
+    const float *__restrict__ routing_weights,
+    int *__restrict__ original_to_grouped,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int filter_to_local_runtime_experts,
+    int retain_routes_for_deferred_commit,
+    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
+    int *__restrict__ active_expert_ids,
+    int max_active_experts)
+{
+    __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
+    __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
+    __shared__ float shared_route_weights[kDeviceMoERuntimeSmallGroupMaxSlots];
+    __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const bool invalid_contract =
+        !runtime ||
+        current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+        max_slots > kDeviceMoERuntimeSmallGroupMaxSlots ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
+        (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
+        runtime->active_bank > 1u ||
+        runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
+        !runtime->route_expert_ids || !runtime->route_weights ||
+        !runtime->route_participant_ids || !runtime->expert_counts ||
+        !runtime->expert_offsets || !runtime->grouped_token_ids ||
+        !runtime->grouped_route_weights ||
+        (PublishCompletePlan &&
+         (!original_to_grouped || !gate_descs || !up_descs || !down_descs ||
+          !active_expert_ids || max_active_experts <= 0 ||
+          max_active_experts > num_experts)) ||
+        (retain_routes_for_deferred_commit != 0 &&
+         (!runtime->deferred_verifier_route_expert_ids ||
+          !runtime->deferred_verifier_route_participant_ids ||
+          runtime->deferred_verifier_route_capacity <
+              static_cast<uint32_t>(current_slots)));
+    if (invalid_contract)
+    {
+        if (tid == 0)
+        {
+            printf("rocm_runtime_small_group_invalid_contract "
+                   "publish_inputs=%d current_slots=%d max_slots=%d "
+                   "num_experts=%d top_k=%d route_capacity=%u deferred_capacity=%u\\n",
+                   PublishRouterInputs ? 1 : 0,
+                   current_slots,
+                   max_slots,
+                   num_experts,
+                   top_k,
+                   runtime ? runtime->prefill_route_capacity : 0u,
+                   runtime ? runtime->deferred_verifier_route_capacity : 0u);
+            fail_fast_incomplete_llep_transfer();
+        }
+        return;
+    }
+
+    if (tid < num_experts)
+    {
+        shared_expert_counts[tid] = 0;
+        runtime->expert_counts[tid] = 0;
+        runtime->expert_offsets[tid] = 0;
+    }
+
+    if (tid < max_slots)
+    {
+        runtime->grouped_token_ids[tid] = 0;
+        runtime->grouped_route_weights[tid] = 0.0f;
+        if (original_to_grouped)
+            original_to_grouped[tid] = -1;
+
+        int expert_id = -1;
+        float route_weight = 0.0f;
+        int participant_id = -1;
+        if (tid < current_slots)
+        {
+            if constexpr (PublishRouterInputs)
+            {
+                expert_id = static_cast<int>(routing_indices[tid]);
+                route_weight = routing_weights[tid];
+                if (expert_id < 0 || expert_id >= num_experts)
+                {
+                    expert_id = -1;
+                    route_weight = 0.0f;
+                }
+                else if (filter_to_local_runtime_experts != 0 &&
+                         !rocm_moe_prefill_static_local_ready(
+                             runtime,
+                             expert_id,
+                             num_experts))
+                {
+                    // Preserve selected identity while excluding local work.
+                    route_weight = 0.0f;
+                }
+                else
+                {
+                    participant_id = static_cast<int>(runtime->participant_id);
+                }
+
+                runtime->route_expert_ids[tid] = expert_id;
+                runtime->route_weights[tid] = route_weight;
+                runtime->route_participant_ids[tid] = participant_id;
+            }
+            else
+            {
+                expert_id = runtime->route_expert_ids[tid];
+                route_weight = runtime->route_weights[tid];
+                participant_id = runtime->route_participant_ids[tid];
+            }
+
+            if (retain_routes_for_deferred_commit != 0)
+            {
+                runtime->deferred_verifier_route_expert_ids[tid] = expert_id;
+                runtime->deferred_verifier_route_participant_ids[tid] =
+                    participant_id;
+            }
+        }
+        else if constexpr (PublishRouterInputs)
+        {
+            runtime->route_expert_ids[tid] = -1;
+            runtime->route_weights[tid] = 0.0f;
+            runtime->route_participant_ids[tid] = -1;
+        }
+
+        shared_route_experts[tid] = expert_id;
+        shared_route_weights[tid] = route_weight;
+        shared_route_participants[tid] = participant_id;
+    }
+    __syncthreads();
+
+    const int local_participant = static_cast<int>(runtime->participant_id);
+    if (tid < num_experts)
+    {
+        int count = 0;
+        for (int slot = 0; slot < current_slots; ++slot)
+        {
+            count += shared_route_experts[slot] == tid &&
+                             shared_route_participants[slot] == local_participant
+                         ? 1
+                         : 0;
+        }
+        shared_expert_counts[tid] = count;
+    }
+    __syncthreads();
+
+    if (tid < num_experts)
+    {
+        int offset = 0;
+        for (int expert = 0; expert < tid; ++expert)
+            offset += shared_expert_counts[expert];
+        runtime->expert_counts[tid] = shared_expert_counts[tid];
+        runtime->expert_offsets[tid] = offset;
+    }
+    __syncthreads();
+
+    if (tid < current_slots)
+    {
+        const int expert_id = shared_route_experts[tid];
+        if (expert_id >= 0 && expert_id < num_experts &&
+            shared_route_participants[tid] == local_participant)
+        {
+            int stable_local_rank = 0;
+            for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+            {
+                stable_local_rank +=
+                    shared_route_experts[previous_slot] == expert_id &&
+                            shared_route_participants[previous_slot] == local_participant
+                        ? 1
+                        : 0;
+            }
+            const int destination =
+                runtime->expert_offsets[expert_id] + stable_local_rank;
+            runtime->grouped_token_ids[destination] = tid;
+            runtime->grouped_route_weights[destination] =
+                shared_route_weights[tid];
+            if (original_to_grouped)
+                original_to_grouped[tid] = destination;
+        }
+    }
+    __syncthreads();
+
+    /*
+     * Validate the grouped/original bijection inside the publication launch.
+     * This retains the former standalone inverse-map fatal contract without a
+     * second kernel or any host observation.
+     */
+    if (tid < current_slots)
+    {
+        const int expert_id = shared_route_experts[tid];
+        const int participant_id = shared_route_participants[tid];
+        const bool should_be_local =
+            expert_id >= 0 && expert_id < num_experts &&
+            participant_id == local_participant;
+        int expected_grouped_slot = -1;
+        if (should_be_local)
+        {
+            int stable_local_rank = 0;
+            for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+            {
+                stable_local_rank +=
+                    shared_route_experts[previous_slot] == expert_id &&
+                            shared_route_participants[previous_slot] == local_participant
+                        ? 1
+                        : 0;
+            }
+            expected_grouped_slot =
+                runtime->expert_offsets[expert_id] + stable_local_rank;
+        }
+        const int published_grouped_slot = original_to_grouped
+                                               ? original_to_grouped[tid]
+                                               : expected_grouped_slot;
+        const bool valid_mapping =
+            should_be_local
+                ? published_grouped_slot == expected_grouped_slot &&
+                      expected_grouped_slot >= 0 &&
+                      expected_grouped_slot < max_slots &&
+                      runtime->grouped_token_ids[expected_grouped_slot] == tid &&
+                      runtime->route_expert_ids[tid] == expert_id &&
+                      runtime->route_participant_ids[tid] == local_participant
+                : !original_to_grouped || published_grouped_slot == -1;
+        if (!valid_mapping)
+        {
+            printf("rocm_runtime_small_group_invalid_row "
+                   "participant=%d route_slot=%d grouped_slot=%d expert=%d "
+                   "route_participant=%d expected_grouped_slot=%d\\n",
+                   local_participant,
+                   tid,
+                   published_grouped_slot,
+                   expert_id,
+                   participant_id,
+                   expected_grouped_slot);
+            fail_fast_incomplete_llep_transfer();
+            return;
+        }
+    }
+
+    if constexpr (PublishCompletePlan)
+    {
+        __syncthreads();
+        __shared__ RuntimePrefillPlanPublicationScratch plan_scratch;
+        rocm_publish_runtime_prefill_plan_block(
+            runtime,
+            gate_descs,
+            up_descs,
+            down_descs,
+            num_experts,
+            active_expert_ids,
+            max_active_experts,
+            plan_scratch);
+    }
 }
 
 __global__ void rocm_moe_prefill_group_cast_count_kernel(
@@ -15660,6 +16091,18 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
         runtime->deferred_verifier_route_participant_ids[slot] =
             participant_id;
     }
+    /*
+     * Counts are exact integers, so atomic arrival order cannot alter either
+     * their value or the stable route order constructed by the later scatter.
+     * Folding this publication into conversion removes a full graph node from
+     * scalable initial grouping.
+     */
+    if (expert_id >= 0 &&
+        expert_id < num_experts &&
+        participant_id == static_cast<int>(runtime->participant_id))
+    {
+        atomicAdd(&runtime->expert_counts[expert_id], 1);
+    }
 }
 
 __global__ void rocm_moe_prefill_group_count_assigned_kernel(
@@ -15713,11 +16156,25 @@ __global__ void rocm_moe_commit_grouped_verifier_histograms_kernel(
 {
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_slots = total_rows * top_k;
-    if (!runtime || slot >= total_slots) return;
-    if (!runtime->deferred_verifier_route_expert_ids ||
-        !runtime->deferred_verifier_route_participant_ids) return;
-    if (runtime->deferred_verifier_route_capacity <
-        static_cast<uint32_t>(total_slots)) return;
+    const bool ledger_is_complete =
+        runtime != nullptr &&
+        accepted_state_counts != nullptr &&
+        publication_ok_flags != nullptr &&
+        runtime->deferred_verifier_route_expert_ids != nullptr &&
+        runtime->deferred_verifier_route_participant_ids != nullptr &&
+        runtime->deferred_verifier_route_capacity >=
+            static_cast<uint32_t>(total_slots);
+    if (!ledger_is_complete)
+    {
+        if (slot == 0)
+        {
+            FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT(
+                "accepted grouped-verifier history requires a complete "
+                "per-layer deferred route ledger");
+        }
+        return;
+    }
+    if (slot >= total_slots) return;
 
     const int token_row = slot / top_k;
     const int request = token_row / rows_per_request;
@@ -15754,24 +16211,9 @@ __global__ void rocm_moe_commit_grouped_verifier_histograms_kernel(
     }
 }
 
-__global__ void rocm_moe_prefill_group_exclusive_scan_kernel(
-    DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int num_experts)
-{
-    if (!runtime || threadIdx.x != 0) return;
-    if (!runtime->expert_counts || !runtime->expert_offsets) return;
-
-    int running = 0;
-    for (int expert = 0; expert < num_experts; ++expert)
-    {
-        const int count = runtime->expert_counts[expert];
-        runtime->expert_offsets[expert] = running;
-        running += count;
-    }
-}
-
 __global__ void rocm_moe_prefill_group_scatter_deterministic_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int *__restrict__ original_to_grouped,
     int current_slots, int max_slots, int num_experts, int top_k)
 {
     const int expert = blockIdx.x;
@@ -15791,8 +16233,29 @@ __global__ void rocm_moe_prefill_group_scatter_deterministic_kernel(
     if (threadIdx.x == 0)
     {
         running_count = 0;
-        expert_offset = runtime->expert_offsets[expert];
-        expert_end = runtime->expert_offsets[expert] + runtime->expert_counts[expert];
+        int prefix = 0;
+        for (int preceding_expert = 0;
+             preceding_expert < expert;
+             ++preceding_expert)
+        {
+            prefix += runtime->expert_counts[preceding_expert];
+        }
+        const int count = runtime->expert_counts[expert];
+        if (prefix < 0 || count < 0 || prefix + count > max_slots)
+        {
+            printf("rocm_runtime_group_scan_scatter_invalid_range "
+                   "participant=%u expert=%d prefix=%d count=%d max_slots=%d\\n",
+                   runtime->participant_id,
+                   expert,
+                   prefix,
+                   count,
+                   max_slots);
+            fail_fast_incomplete_llep_transfer();
+            return;
+        }
+        runtime->expert_offsets[expert] = prefix;
+        expert_offset = prefix;
+        expert_end = prefix + count;
         participant_id = static_cast<int>(runtime->participant_id);
     }
     __syncthreads();
@@ -15828,6 +16291,8 @@ __global__ void rocm_moe_prefill_group_scatter_deterministic_kernel(
             {
                 runtime->grouped_token_ids[dest] = slot;
                 runtime->grouped_route_weights[dest] = runtime->route_weights[slot];
+                if (original_to_grouped)
+                    original_to_grouped[slot] = dest;
             }
         }
         __syncthreads();
@@ -16643,98 +17108,13 @@ __global__ void rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel(
     int *__restrict__ active_expert_ids,
     int max_active_experts)
 {
-    const bool publish_active_experts = active_expert_ids != nullptr;
-    if (!runtime || !gate_descs || !up_descs || !down_descs ||
-        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-        runtime->active_bank > 1u ||
-        (publish_active_experts &&
-         (!runtime->expert_counts || max_active_experts <= 0 ||
-          max_active_experts > num_experts)))
-    {
-        if (threadIdx.x == 0)
-            fail_fast_incomplete_llep_transfer();
-        return;
-    }
-
-    const int expert = static_cast<int>(threadIdx.x);
-    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-    const uint32_t local_bit =
-        runtime_participant_bit(static_cast<int>(runtime->participant_id));
-    bool local_ready = false;
-    if (expert < num_experts)
-    {
-        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
-        local_ready =
-            bank.local_compute_mask[expert] != 0u &&
-            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-            desc.local_slot >= 0 &&
-            rebalance_expert_desc_ready(desc);
-        if (local_ready)
-        {
-            gate_descs[expert] = desc.gate;
-            up_descs[expert] = desc.up;
-            down_descs[expert] = desc.down;
-        }
-        else
-        {
-            gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-            up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-            down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-        }
-    }
-
-    // The branch is uniform for the workgroup, so descriptor-only decode does
-    // not strand any lane at a prefill compaction barrier.
-    if (!publish_active_experts)
-        return;
-
-    const int count = expert < num_experts
-                          ? runtime->expert_counts[expert]
-                          : 0;
-    const bool is_active = count > 0;
-    __shared__ int first_invalid_expert;
-    if (threadIdx.x == 0)
-        first_invalid_expert = num_experts;
-    __syncthreads();
-    if (is_active && !local_ready)
-        atomicMin(&first_invalid_expert, expert);
-    __syncthreads();
-
-    if (first_invalid_expert < num_experts)
-    {
-        if (threadIdx.x == 0)
-        {
-            const int invalid_expert = first_invalid_expert;
-            const DeviceMoEExpertDescriptorView &desc =
-                bank.experts[invalid_expert];
-            printf("runtime_prefill_active_expert_not_ready "
-                   "participant=%u expert=%d count=%d active_bank=%u "
-                   "local_mask=%u resident_mask=%u local_bit=%u "
-                   "local_slot=%d logical=%d owner=%d\\n",
-                   runtime->participant_id,
-                   invalid_expert,
-                   runtime->expert_counts[invalid_expert],
-                   runtime->active_bank,
-                   bank.local_compute_mask[invalid_expert],
-                   bank.resident_participant_mask[invalid_expert],
-                   local_bit,
-                   desc.local_slot,
-                   desc.logical_expert_id,
-                   desc.owner_participant);
-            fail_fast_incomplete_llep_transfer();
-        }
-        return;
-    }
-
-    __shared__ ActiveExpertCompactionScratch scratch;
-    rocm_initialize_active_expert_compaction(scratch);
-    rocm_compact_active_expert_chunk(
-        is_active,
-        expert,
-        max_active_experts,
-        active_expert_ids,
-        scratch);
-    rocm_pad_active_expert_list(
+    __shared__ RuntimePrefillPlanPublicationScratch scratch;
+    rocm_publish_runtime_prefill_plan_block(
+        runtime,
+        gate_descs,
+        up_descs,
+        down_descs,
+        num_experts,
         active_expert_ids,
         max_active_experts,
         scratch);
@@ -17091,7 +17471,8 @@ bool hipMoE_group_prefill_routes_runtime(
 
     if (!runtime || !routing_indices || !routing_weights || !stream ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
     {
         fprintf(stderr, "HIP MoE group_prefill_routes invalid arguments\n");
         return false;
@@ -17100,12 +17481,45 @@ bool hipMoE_group_prefill_routes_runtime(
     auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     const int threads = 256;
+
+    if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_moe_prefill_group_small_runtime_kernel<true>),
+            dim3(1), dim3(threads), 0, hip_stream,
+            runtime_view,
+            routing_indices,
+            routing_weights,
+            /*original_to_grouped=*/nullptr,
+            current_slots,
+            max_slots,
+            num_experts,
+            top_k,
+            filter_to_local_runtime_experts,
+            retain_routes_for_deferred_commit,
+            /*gate_descs=*/nullptr,
+            /*up_descs=*/nullptr,
+            /*down_descs=*/nullptr,
+            /*active_expert_ids=*/nullptr,
+            /*max_active_experts=*/0);
+        const hipError_t small_err = hipGetLastError();
+        if (small_err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "HIP MoE verifier-sized prefill grouping launch failed: %s\n",
+                    hipGetErrorString(small_err));
+            return false;
+        }
+        return true;
+    }
+
     const int clear_items = (max_slots > num_experts) ? max_slots : num_experts;
     const int clear_blocks = (clear_items + threads - 1) / threads;
 
     hipLaunchKernelGGL(rocm_moe_prefill_group_clear_kernel,
         dim3(clear_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, max_slots, num_experts, 1);
+        runtime_view, /*original_to_grouped=*/nullptr,
+        max_slots, num_experts, 1);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17129,32 +17543,10 @@ bool hipMoE_group_prefill_routes_runtime(
         return false;
     }
 
-    hipLaunchKernelGGL(rocm_moe_prefill_group_count_assigned_kernel,
-        dim3(slot_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts,
-        /*retain_routes_for_deferred_commit=*/0);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill group assigned-count kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
-    hipLaunchKernelGGL(rocm_moe_prefill_group_exclusive_scan_kernel,
-        dim3(1), dim3(1), 0, hip_stream,
-        runtime_view, num_experts);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill group scan kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
     hipLaunchKernelGGL(rocm_moe_prefill_group_scatter_deterministic_kernel,
         dim3(num_experts), dim3(threads), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts, top_k);
+        runtime_view, /*original_to_grouped=*/nullptr,
+        current_slots, max_slots, num_experts, top_k);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -17177,7 +17569,8 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
 
     if (!runtime || !stream ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
     {
         fprintf(stderr, "HIP MoE regroup_prefill_routes invalid arguments\n");
         return false;
@@ -17186,6 +17579,38 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
     auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     const int threads = 256;
+
+    if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_moe_prefill_group_small_runtime_kernel<false>),
+            dim3(1), dim3(threads), 0, hip_stream,
+            runtime_view,
+            /*routing_indices=*/nullptr,
+            /*routing_weights=*/nullptr,
+            /*original_to_grouped=*/nullptr,
+            current_slots,
+            max_slots,
+            num_experts,
+            top_k,
+            /*filter_to_local_runtime_experts=*/0,
+            retain_routes_for_deferred_commit,
+            /*gate_descs=*/nullptr,
+            /*up_descs=*/nullptr,
+            /*down_descs=*/nullptr,
+            /*active_expert_ids=*/nullptr,
+            /*max_active_experts=*/0);
+        const hipError_t small_err = hipGetLastError();
+        if (small_err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "HIP MoE verifier-sized prefill regrouping launch failed: %s\n",
+                    hipGetErrorString(small_err));
+            return false;
+        }
+        return true;
+    }
+
     const int split_items = num_experts * static_cast<int>(kDeviceMoEMaxParticipants);
     int clear_items = (max_slots > num_experts) ? max_slots : num_experts;
     clear_items = (clear_items > split_items) ? clear_items : split_items;
@@ -17194,7 +17619,8 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
 
     hipLaunchKernelGGL(rocm_moe_prefill_group_clear_kernel,
         dim3(clear_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, max_slots, num_experts, 0);
+        runtime_view, /*original_to_grouped=*/nullptr,
+        max_slots, num_experts, 0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17215,20 +17641,10 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
         return false;
     }
 
-    hipLaunchKernelGGL(rocm_moe_prefill_group_exclusive_scan_kernel,
-        dim3(1), dim3(1), 0, hip_stream,
-        runtime_view, num_experts);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill regroup scan kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
     hipLaunchKernelGGL(rocm_moe_prefill_group_scatter_deterministic_kernel,
         dim3(num_experts), dim3(threads), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts, top_k);
+        runtime_view, /*original_to_grouped=*/nullptr,
+        current_slots, max_slots, num_experts, top_k);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -17237,6 +17653,305 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
         return false;
     }
 
+    return true;
+}
+
+/**
+ * @brief Publish router grouping and every runtime compute descriptor.
+ *
+ * Verifier-sized route sets execute as one workgroup and publish the complete
+ * grouped execution plan in one launch. Larger prefills retain deterministic
+ * scalable grouping, but author the inverse route map during scatter and then
+ * publish descriptors on the same explicit stream. Both regimes expose one
+ * total, graph-capturable API and never observe intermediate state on host.
+ */
+__attribute__((visibility("default"))) bool
+hipMoE_group_prefill_routes_and_materialize_plan_runtime(
+    const float *routing_indices,
+    const float *routing_weights,
+    void *runtime,
+    int *original_to_grouped,
+    DeviceNativeVNNIMatrixDescView *gate_descs,
+    DeviceNativeVNNIMatrixDescView *up_descs,
+    DeviceNativeVNNIMatrixDescView *down_descs,
+    int *active_expert_ids,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int max_active_experts,
+    int filter_to_local_runtime_experts,
+    int retain_routes_for_deferred_commit,
+    int device_idx,
+    void *stream)
+{
+    if (!runtime || !routing_indices || !routing_weights ||
+        !original_to_grouped || !gate_descs || !up_descs || !down_descs ||
+        !active_expert_ids || !stream ||
+        current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
+        max_active_experts <= 0 || max_active_experts > num_experts)
+    {
+        fprintf(stderr, "HIP MoE complete router-plan publication invalid arguments\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
+    auto hip_stream = static_cast<hipStream_t>(stream);
+    constexpr int threads = 256;
+
+    if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_moe_prefill_group_small_runtime_kernel<true, true>),
+            dim3(1), dim3(threads), 0, hip_stream,
+            runtime_view,
+            routing_indices,
+            routing_weights,
+            original_to_grouped,
+            current_slots,
+            max_slots,
+            num_experts,
+            top_k,
+            filter_to_local_runtime_experts,
+            retain_routes_for_deferred_commit,
+            gate_descs,
+            up_descs,
+            down_descs,
+            active_expert_ids,
+            max_active_experts);
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "HIP MoE complete verifier router-plan launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    const int clear_items = max_slots > num_experts ? max_slots : num_experts;
+    const int clear_blocks = (clear_items + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_clear_kernel,
+        dim3(clear_blocks), dim3(threads), 0, hip_stream,
+        runtime_view,
+        original_to_grouped,
+        max_slots,
+        num_experts,
+        /*clear_route_metadata=*/1);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete router-plan clear launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    const int slot_blocks = (max_slots + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_cast_count_kernel,
+        dim3(slot_blocks), dim3(threads), 0, hip_stream,
+        runtime_view,
+        routing_indices,
+        routing_weights,
+        current_slots,
+        max_slots,
+        num_experts,
+        filter_to_local_runtime_experts,
+        retain_routes_for_deferred_commit);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete router-plan conversion launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_scatter_deterministic_kernel,
+        dim3(num_experts), dim3(threads), 0, hip_stream,
+        runtime_view,
+        original_to_grouped,
+        current_slots,
+        max_slots,
+        num_experts,
+        top_k);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete router-plan scatter launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel,
+        dim3(1), dim3(threads), 0, hip_stream,
+        runtime_view,
+        gate_descs,
+        up_descs,
+        down_descs,
+        num_experts,
+        active_expert_ids,
+        max_active_experts);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete router-plan descriptor launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Publish final LLEP assignments as one complete grouped compute plan.
+ *
+ * Device-side assignment has already finalized participant ids. The bounded
+ * verifier specialization groups and publishes every compute product in one
+ * launch; scalable prefill uses deterministic count/scatter plus one ordered
+ * descriptor launch without rebuilding the inverse map afterward.
+ */
+__attribute__((visibility("default"))) bool
+hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+    void *runtime,
+    int *original_to_grouped,
+    DeviceNativeVNNIMatrixDescView *gate_descs,
+    DeviceNativeVNNIMatrixDescView *up_descs,
+    DeviceNativeVNNIMatrixDescView *down_descs,
+    int *active_expert_ids,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int max_active_experts,
+    int retain_routes_for_deferred_commit,
+    int device_idx,
+    void *stream)
+{
+    if (!runtime || !original_to_grouped ||
+        !gate_descs || !up_descs || !down_descs ||
+        !active_expert_ids || !stream ||
+        current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
+        max_active_experts <= 0 || max_active_experts > num_experts)
+    {
+        fprintf(stderr, "HIP MoE complete assigned-plan publication invalid arguments\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
+    auto hip_stream = static_cast<hipStream_t>(stream);
+    constexpr int threads = 256;
+
+    if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_moe_prefill_group_small_runtime_kernel<false, true>),
+            dim3(1), dim3(threads), 0, hip_stream,
+            runtime_view,
+            /*routing_indices=*/nullptr,
+            /*routing_weights=*/nullptr,
+            original_to_grouped,
+            current_slots,
+            max_slots,
+            num_experts,
+            top_k,
+            /*filter_to_local_runtime_experts=*/0,
+            retain_routes_for_deferred_commit,
+            gate_descs,
+            up_descs,
+            down_descs,
+            active_expert_ids,
+            max_active_experts);
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "HIP MoE complete verifier assigned-plan launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    const int clear_items = max_slots > num_experts ? max_slots : num_experts;
+    const int clear_blocks = (clear_items + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_clear_kernel,
+        dim3(clear_blocks), dim3(threads), 0, hip_stream,
+        runtime_view,
+        original_to_grouped,
+        max_slots,
+        num_experts,
+        /*clear_route_metadata=*/0);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete assigned-plan clear launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    const int slot_blocks = (max_slots + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_count_assigned_kernel,
+        dim3(slot_blocks), dim3(threads), 0, hip_stream,
+        runtime_view,
+        current_slots,
+        max_slots,
+        num_experts,
+        retain_routes_for_deferred_commit);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete assigned-plan count launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_group_scatter_deterministic_kernel,
+        dim3(num_experts), dim3(threads), 0, hip_stream,
+        runtime_view,
+        original_to_grouped,
+        current_slots,
+        max_slots,
+        num_experts,
+        top_k);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete assigned-plan scatter launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel,
+        dim3(1), dim3(threads), 0, hip_stream,
+        runtime_view,
+        gate_descs,
+        up_descs,
+        down_descs,
+        num_experts,
+        active_expert_ids,
+        max_active_experts);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE complete assigned-plan descriptor launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
     return true;
 }
 

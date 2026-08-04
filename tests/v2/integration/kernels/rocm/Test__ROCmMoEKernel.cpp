@@ -1991,7 +1991,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticipan
                              hipMemcpyHostToDevice,
                              stream),
               hipSuccess);
-    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
@@ -2219,7 +2219,7 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramCommitIsAcceptedPrefixExact)
                       hipMemcpyHostToDevice,
                       stream),
                   hipSuccess);
-        ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
+        ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesForDiagnostics(
             runtime_table.deviceLayerState(0),
             seq_len,
             seq_len,
@@ -2360,6 +2360,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
     runtime_config.top_k = top_k;
     runtime_config.mirror_to_device = true;
     runtime_config.prefill_token_capacity = seq_len;
+    runtime_config.deferred_verifier_token_capacity = seq_len;
     MoERuntimeTable runtime_table(runtime_config);
 
     auto runtime_state = runtime_table.hostLayerState(0);
@@ -2404,7 +2405,15 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
         seq_len,
         num_experts,
         top_k,
-        /*filter_to_local_runtime_experts=*/true));
+        /*filter_to_local_runtime_experts=*/true,
+        /*retain_routes_for_deferred_commit=*/true));
+
+    /*
+     * Static-owner grouping retains the final filtered route identities in the
+     * same launch without mutating serial-visible history. The accepted-state
+     * commit below must consume that per-layer ledger rather than transient
+     * grouping scratch, which later MoE layers are free to reuse.
+     */
     HipAllocation accepted_count_device(sizeof(int32_t));
     HipAllocation publication_ok_device(sizeof(int32_t));
     const int32_t accepted_count = seq_len;
@@ -2596,7 +2605,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
         top_k,
         device_positions,
         static_cast<const int32_t *>(active_row_count_device.get())));
-    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
@@ -2892,7 +2901,7 @@ TEST(Test__ROCmMoEKernel,
         device_positions,
         static_cast<const int32_t *>(
             accepted_count_device.get())));
-    ASSERT_TRUE(kernel.regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(kernel.regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         max_m,
         max_m,
@@ -4074,7 +4083,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedStandardPlanAssignsOwnerRoute
     EXPECT_EQ(route_participants[2], 1);
     EXPECT_EQ(route_participants[3], 1);
 
-    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
@@ -22578,16 +22587,19 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
 
             if (!masked_local_tp)
             {
-                ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+                ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
                     runtime_table.deviceLayerState(0),
                     routing_indices.get(),
                     routing_weights.get(),
                     seq_len,
                     runtime_config.prefill_token_capacity,
                     num_experts,
-                    top_k))
-                    << format_name << " runtime route grouping M=" << seq_len;
-                ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+                    top_k,
+                    gateup_table,
+                    down_table,
+                    /*filter_to_local_runtime_experts=*/false))
+                    << format_name << " complete runtime plan M=" << seq_len;
+                ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
                     runtime_table.deviceLayerState(0),
                     runtime_host_state,
                     hidden.get(),
@@ -23844,15 +23856,18 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_Ru
         auto runtime_grouped_output = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
         ASSERT_TRUE(runtime_grouped_output->ensureOnDevice(device, stream));
-        ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+        ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
             prefill_runtime_table.deviceLayerState(0),
             routing_indices.get(),
             routing_weights.get(),
             seq_len,
             runtime_config.prefill_token_capacity,
             num_experts,
-            top_k));
-        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+            top_k,
+            gateup_table,
+            down_table,
+            /*filter_to_local_runtime_experts=*/false));
+        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
             prefill_runtime_table.deviceLayerState(0),
             runtime_prefill_state,
             hidden.get(),
@@ -24272,15 +24287,18 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(grouped_before_serial->ensureOnDevice(device, stream));
     ASSERT_TRUE(publish_grouped_router_q8());
-    ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+    ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
         prefill_runtime_table.deviceLayerState(0),
         routing_indices.get(),
         routing_weights.get(),
         seq_len,
         runtime_config.prefill_token_capacity,
         num_experts,
-        top_k));
-    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+        top_k,
+        gateup_table,
+        down_table,
+        /*filter_to_local_runtime_experts=*/false));
+    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
         prefill_runtime_table.deviceLayerState(0),
         runtime_prefill_state,
         hidden.get(),
@@ -24415,15 +24433,18 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(runtime_grouped_output->ensureOnDevice(device, stream));
     ASSERT_TRUE(publish_grouped_router_q8());
-    ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+    ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
         prefill_runtime_table.deviceLayerState(0),
         routing_indices.get(),
         routing_weights.get(),
         seq_len,
         runtime_config.prefill_token_capacity,
         num_experts,
-        top_k));
-    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+        top_k,
+        gateup_table,
+        down_table,
+        /*filter_to_local_runtime_experts=*/false));
+    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
         prefill_runtime_table.deviceLayerState(0),
         runtime_prefill_state,
         hidden.get(),
@@ -24449,21 +24470,26 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
     auto captured_runtime_output = TestTensorFactory::createFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(captured_runtime_output->ensureOnDevice(device, stream));
-    hipGraph_t graph = nullptr;
-    ASSERT_EQ(
-        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-        hipSuccess);
+    HIPGraphCapture capture(stream);
+    ScopedBackendGraphCapture capture_transaction(
+        capture,
+        "ROCm real-weight routed verifier complete-plan capture");
+    ASSERT_TRUE(capture_transaction.begin());
     const bool captured_routing = publish_grouped_router_q8();
-    const bool captured_grouping = moe_kernel.groupPrefillRoutes(
-        prefill_runtime_table.deviceLayerState(0),
-        routing_indices.get(),
-        routing_weights.get(),
-        seq_len,
-        runtime_config.prefill_token_capacity,
-        num_experts,
-        top_k);
+    const bool captured_plan_publication =
+        moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
+            prefill_runtime_table.deviceLayerState(0),
+            routing_indices.get(),
+            routing_weights.get(),
+            seq_len,
+            runtime_config.prefill_token_capacity,
+            num_experts,
+            top_k,
+            gateup_table,
+            down_table,
+            /*filter_to_local_runtime_experts=*/false);
     const bool captured_pipeline =
-        moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+        moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
             prefill_runtime_table.deviceLayerState(0),
             runtime_prefill_state,
             hidden.get(),
@@ -24475,18 +24501,12 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
             intermediate,
             num_experts,
             top_k);
-    const hipError_t capture_status = hipStreamEndCapture(stream, &graph);
     ASSERT_TRUE(captured_routing);
-    ASSERT_TRUE(captured_grouping);
+    ASSERT_TRUE(captured_plan_publication);
     ASSERT_TRUE(captured_pipeline);
-    ASSERT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    hipGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(
-        hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
-        hipSuccess);
-    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    capture_transaction.finish();
+    ASSERT_TRUE(capture.instantiate());
+    ASSERT_TRUE(capture.launch());
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_TRUE(captured_runtime_output->ensureOnHost(stream));
 
@@ -24497,9 +24517,6 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         router_reuse_decode_expected.data(),
         captured_runtime_output->numel(),
         static_cast<size_t>(d_model));
-
-    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
-    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
 
     EXPECT_EQ(hipFree(device_runtime), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);

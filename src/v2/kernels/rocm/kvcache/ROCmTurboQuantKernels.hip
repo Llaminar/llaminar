@@ -33,29 +33,33 @@ namespace llaminar2
     __constant__ float d_TQ4_CENTROIDS_HIP[16];
     __constant__ float d_TQ4_THRESHOLDS_HIP[15];
 
-    static std::atomic<bool> s_hip_codebooks_uploaded{false};
-
     // Precomputed RoPE frequencies: freq[i] = 1/theta^(2i/D) for i in [0, D/2)
     __constant__ float d_HIP_ROPE_FREQS[64]; // max head_dim/2 = 128/2 = 64
     static std::atomic<int> s_hip_rope_freqs_head_dim{0};
 
-    void hip_tq_upload_codebooks(hipStream_t stream)
+    bool hip_tq_upload_codebooks(hipStream_t stream)
     {
-        if (s_hip_codebooks_uploaded.load(std::memory_order_acquire))
-            return;
+        if (!stream)
+            return false;
 
-        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_CENTROIDS_HIP), TQ8_CENTROIDS.data(),
-                               256 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_THRESHOLDS_HIP), TQ8_THRESHOLDS.data(),
-                               255 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_CENTROIDS_HIP), TQ4_CENTROIDS.data(),
-                               16 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_THRESHOLDS_HIP), TQ4_THRESHOLDS.data(),
-                               15 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        (void)hipStreamSynchronize(stream);
-
-        if (hipGetLastError() == hipSuccess)
-            s_hip_codebooks_uploaded.store(true, std::memory_order_release);
+        /*
+         * HIP constant memory belongs to the active device. Each cache queues
+         * these immutable tables on its own initialization stream so a global
+         * host flag cannot suppress publication on another ROCm participant.
+         * The cache's final construction fence establishes readiness.
+         */
+        return hipMemcpyToSymbolAsync(
+                   HIP_SYMBOL(d_TQ8_CENTROIDS_HIP), TQ8_CENTROIDS.data(),
+                   256 * sizeof(float), 0, hipMemcpyHostToDevice, stream) == hipSuccess &&
+               hipMemcpyToSymbolAsync(
+                   HIP_SYMBOL(d_TQ8_THRESHOLDS_HIP), TQ8_THRESHOLDS.data(),
+                   255 * sizeof(float), 0, hipMemcpyHostToDevice, stream) == hipSuccess &&
+               hipMemcpyToSymbolAsync(
+                   HIP_SYMBOL(d_TQ4_CENTROIDS_HIP), TQ4_CENTROIDS.data(),
+                   16 * sizeof(float), 0, hipMemcpyHostToDevice, stream) == hipSuccess &&
+               hipMemcpyToSymbolAsync(
+                   HIP_SYMBOL(d_TQ4_THRESHOLDS_HIP), TQ4_THRESHOLDS.data(),
+                   15 * sizeof(float), 0, hipMemcpyHostToDevice, stream) == hipSuccess;
     }
 
     void hip_tq_upload_rope_freqs(float rope_theta, int head_dim, hipStream_t stream)
@@ -1683,8 +1687,6 @@ namespace llaminar2
         if (!d_input || !d_rotations || !d_output || num_tokens <= 0)
             return false;
 
-        hip_tq_upload_codebooks(stream);
-
         const dim3 grid(num_tokens, n_kv_heads);
 
         if (head_dim == 64)
@@ -1709,8 +1711,6 @@ namespace llaminar2
     {
         if (!d_input || !d_rotations || !d_output || num_tokens <= 0)
             return false;
-
-        hip_tq_upload_codebooks(stream);
 
         const dim3 grid(num_tokens, n_kv_heads);
 
@@ -1752,7 +1752,6 @@ namespace llaminar2
                 return false;
             }
 
-            hip_tq_upload_codebooks(stream);
             const dim3 grid(n_kv_heads, 2, verifier_rows);
             if (head_dim == 64)
             {
@@ -1938,8 +1937,6 @@ namespace llaminar2
         if (!d_tq8_blocks || !d_rotations_t || !d_output || count <= 0)
             return false;
 
-        hip_tq_upload_codebooks(stream);
-
         const dim3 grid(count, n_kv_heads);
 
         if (head_dim == 64)
@@ -1967,8 +1964,6 @@ namespace llaminar2
     {
         if (!d_tq4_blocks || !d_rotations_t || !d_output || count <= 0)
             return false;
-
-        hip_tq_upload_codebooks(stream);
 
         const dim3 grid(count, n_kv_heads);
 
@@ -2002,7 +1997,6 @@ namespace llaminar2
         if (count <= 0)
             return true;
 
-        hip_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             hip_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
@@ -2166,7 +2160,6 @@ namespace llaminar2
         if (count <= 0)
             return true;
 
-        hip_tq_upload_codebooks(stream);
         constexpr int TILE = 16;
 
         if (head_dim == 64)
@@ -2351,7 +2344,6 @@ namespace llaminar2
         if (!d_K_out || !d_V_out || !d_K_cache || !d_V_cache)
             return false;
 
-        hip_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             hip_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
@@ -2401,7 +2393,6 @@ namespace llaminar2
             max_seq_len <= 0 || kv_dim <= 0 || n_kv_heads <= 0)
             return false;
 
-        hip_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             hip_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 

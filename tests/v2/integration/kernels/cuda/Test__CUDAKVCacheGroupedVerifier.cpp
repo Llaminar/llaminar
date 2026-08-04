@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
 
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/GpuKVCacheGroupedVerifierHarness.h"
 
@@ -155,78 +156,37 @@ namespace
             cudaEvent_t event_ = nullptr;
         };
 
-        /** @brief Own one captured CUDA graph and executable. */
+        /** @brief Own one production CUDA graph capture and its executable. */
         class Graph
         {
         public:
             Graph() = default;
 
-            Graph(
-                cudaGraph_t graph,
-                cudaGraphExec_t executable)
-                : graph_(graph),
-                  executable_(executable)
+            explicit Graph(
+                std::unique_ptr<CUDAGraphCapture> capture)
+                : capture_(std::move(capture))
             {
-            }
-
-            ~Graph()
-            {
-                if (executable_)
-                    (void)cudaGraphExecDestroy(
-                        executable_);
-                if (graph_)
-                    (void)cudaGraphDestroy(graph_);
             }
 
             Graph(const Graph &) = delete;
             Graph &operator=(const Graph &) = delete;
-
-            Graph(Graph &&other) noexcept
-                : graph_(
-                      std::exchange(
-                          other.graph_,
-                          nullptr)),
-                  executable_(
-                      std::exchange(
-                          other.executable_,
-                          nullptr))
-            {
-            }
-
-            Graph &operator=(Graph &&other) noexcept
-            {
-                if (this == &other)
-                    return *this;
-                if (executable_)
-                    (void)cudaGraphExecDestroy(
-                        executable_);
-                if (graph_)
-                    (void)cudaGraphDestroy(graph_);
-                graph_ =
-                    std::exchange(
-                        other.graph_,
-                        nullptr);
-                executable_ =
-                    std::exchange(
-                        other.executable_,
-                        nullptr);
-                return *this;
-            }
+            Graph(Graph &&) noexcept = default;
+            Graph &operator=(Graph &&) noexcept = default;
 
             bool valid() const
             {
-                return graph_ != nullptr &&
-                       executable_ != nullptr;
+                return capture_ && capture_->hasExecutable();
             }
 
-            cudaGraphExec_t executable() const
+            bool launch(void *opaque_stream)
             {
-                return executable_;
+                return valid() && opaque_stream &&
+                       capture_->executionStream() == opaque_stream &&
+                       capture_->launch();
             }
 
         private:
-            cudaGraph_t graph_ = nullptr;
-            cudaGraphExec_t executable_ = nullptr;
+            std::unique_ptr<CUDAGraphCapture> capture_;
         };
 
         DeviceBuffer allocateDeviceBuffer(size_t bytes)
@@ -323,58 +283,26 @@ namespace
             const auto stream =
                 static_cast<cudaStream_t>(
                     opaque_stream);
-            if (cudaStreamBeginCapture(
-                    stream,
-                    cudaStreamCaptureModeGlobal) !=
-                cudaSuccess)
-            {
+            auto capture =
+                std::make_unique<CUDAGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *capture,
+                "CUDA grouped KV lifecycle graph");
+            if (!capture_transaction.begin())
                 return {};
-            }
 
-            bool enqueue_ok = false;
-            {
-                GraphCaptureGuard guard;
-                enqueue_ok = enqueue();
-            }
-            cudaGraph_t graph = nullptr;
-            const cudaError_t end_status =
-                cudaStreamEndCapture(
-                    stream,
-                    &graph);
-            if (!enqueue_ok ||
-                end_status != cudaSuccess ||
-                !graph)
-            {
-                if (graph)
-                    (void)cudaGraphDestroy(graph);
+            const bool enqueue_ok = enqueue();
+            capture_transaction.finish();
+            if (!enqueue_ok || !capture->instantiate())
                 return {};
-            }
-
-            cudaGraphExec_t executable = nullptr;
-            if (cudaGraphInstantiate(
-                    &executable,
-                    graph,
-                    nullptr,
-                    nullptr,
-                    0) != cudaSuccess ||
-                !executable)
-            {
-                (void)cudaGraphDestroy(graph);
-                return {};
-            }
-            return Graph(graph, executable);
+            return Graph(std::move(capture));
         }
 
         bool launchGraph(
-            const Graph &graph,
+            Graph &graph,
             void *opaque_stream)
         {
-            return graph.valid() && opaque_stream &&
-                   cudaGraphLaunch(
-                       graph.executable(),
-                       static_cast<cudaStream_t>(
-                           opaque_stream)) ==
-                       cudaSuccess;
+            return graph.launch(opaque_stream);
         }
 
         bool synchronizeStream(void *opaque_stream)
@@ -432,43 +360,29 @@ namespace
             }
         }
 
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess)
+        CUDAGraphCapture graph(stream, 0);
+        ScopedBackendGraphCapture capture_transaction(
+            graph,
+            "CUDA grouped KV append");
+        if (!capture_transaction.begin())
         {
             if (device_logical_rows)
                 (void)cudaFree(device_logical_rows);
             return false;
         }
-        bool append_ok = false;
+        const bool append_ok = cache.appendVerifierRowsDecodeEquivalent(
+            0, 0, k, v, verifier_rows, opaque_stream);
+        capture_transaction.finish();
+        if (!append_ok || !graph.instantiate())
         {
-            GraphCaptureGuard guard;
-            append_ok = cache.appendVerifierRowsDecodeEquivalent(
-                0, 0, k, v, verifier_rows, opaque_stream);
-        }
-        const cudaError_t end_status = cudaStreamEndCapture(stream, &graph);
-        if (!append_ok || end_status != cudaSuccess || !graph)
-        {
-            if (graph)
-                (void)cudaGraphDestroy(graph);
-            if (device_logical_rows)
-                (void)cudaFree(device_logical_rows);
-            return false;
-        }
-        if (cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess ||
-            !executable)
-        {
-            (void)cudaGraphDestroy(graph);
             if (device_logical_rows)
                 (void)cudaFree(device_logical_rows);
             return false;
         }
 
         const bool replay_ok =
-            cudaGraphLaunch(executable, stream) == cudaSuccess &&
+            graph.launch() &&
             cudaStreamSynchronize(stream) == cudaSuccess;
-        (void)cudaGraphExecDestroy(executable);
-        (void)cudaGraphDestroy(graph);
         if (device_logical_rows)
         {
             const bool unbound = cache.bindGraphAppendCountSource(
@@ -527,36 +441,26 @@ namespace
         void *opaque_stream)
     {
         const auto stream = static_cast<cudaStream_t>(opaque_stream);
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        if (!stream ||
-            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess)
-        {
+        if (!stream)
             return false;
-        }
-        bool read_ok = false;
-        {
-            GraphCaptureGuard guard;
-            read_ok = cache.get_kv_batched_converted_device_view(
-                0, 0, request_count,
-                ActivationPrecision::FP16, out_k, out_v, read);
-        }
-        const cudaError_t end_status = cudaStreamEndCapture(stream, &graph);
-        if (!read_ok || end_status != cudaSuccess || !graph ||
-            cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess ||
-            !executable)
-        {
-            if (executable)
-                (void)cudaGraphExecDestroy(executable);
-            if (graph)
-                (void)cudaGraphDestroy(graph);
+
+        CUDAGraphCapture graph(stream, 0);
+        ScopedBackendGraphCapture capture_transaction(
+            graph,
+            "CUDA grouped KV converted read");
+        if (!capture_transaction.begin())
             return false;
-        }
+
+        const bool read_ok = cache.get_kv_batched_converted_device_view(
+            0, 0, request_count,
+            ActivationPrecision::FP16, out_k, out_v, read);
+        capture_transaction.finish();
+        if (!read_ok || !graph.instantiate())
+            return false;
+
         const bool replay_ok =
-            cudaGraphLaunch(executable, stream) == cudaSuccess &&
+            graph.launch() &&
             cudaStreamSynchronize(stream) == cudaSuccess;
-        (void)cudaGraphExecDestroy(executable);
-        (void)cudaGraphDestroy(graph);
         return replay_ok;
     }
 
@@ -600,9 +504,17 @@ namespace
     }
 } // namespace
 
-TEST(Test__CUDAKVCacheGroupedVerifier,
-     AllFormatsRuntimeMGraphCapturedReplicatedAndLocalTPMatchSerialDecodeBytes)
+/**
+ * @brief Run one independently process-isolated cache/source format matrix.
+ *
+ * A backend kernel fault can leave a GPU context unable to retire. Keeping
+ * each format in a distinct GTest lets CTest identify that format before the
+ * process reaches any later matrix cell, while the shared harness still owns
+ * the complete D/M/layout/topology proof for the selected format.
+ */
+void runRuntimePublicationFormat(size_t format_index)
 {
+    ASSERT_LT(format_index, kFormatCases.size());
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1)
         GTEST_SKIP() << "CUDA device unavailable";
@@ -610,14 +522,38 @@ TEST(Test__CUDAKVCacheGroupedVerifier,
 
     ScopedCudaStream stream;
     ASSERT_NE(stream.get(), nullptr);
-    runAllFormatGroupedVerifierSweep(
+    runFormatGroupedVerifierSweep(
         DeviceId::cuda(0),
         "CUDA",
         "cuda_kv_cache_grouped_verifier_append_calls",
+        kFormatCases[format_index],
         stream.opaque(),
         appendGrouped,
         observeDeviceState);
 }
+
+#define LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(suffix, index)                     \
+    TEST(Test__CUDAKVCacheGroupedVerifier, RuntimePublication_##suffix)         \
+    {                                                                            \
+        runRuntimePublicationFormat(index);                                      \
+    }
+
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(FP32_From_FP32, 0)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(BF16_From_BF16, 1)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(FP16_From_FP32, 2)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(FP16_From_FP16, 3)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(FP16_From_BF16, 4)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(FP16_From_Q8_1, 5)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP32, 6)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP16, 7)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(Q8_1_From_BF16, 8)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(Q8_1_From_Q8_1, 9)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_FP32, 10)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_TQ8_TQ4, 11)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_FP32, 12)
+LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_TQ8, 13)
+
+#undef LLAMINAR_CUDA_KV_RUNTIME_FORMAT_TEST
 
 TEST(Test__CUDAKVCacheGroupedVerifier,
      AllFormatsCapturedConvertedBatchReadMatchesSerialBytes)

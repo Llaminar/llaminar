@@ -2515,12 +2515,27 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
-        ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+        const DeviceId device = DeviceId::rocm(0);
+
+        /*
+         * Admission owns every placement operation.  The grouped verifier and
+         * the serial-row oracle below both exercise production kernels, whose
+         * contract is to join already-published inputs and write into stable
+         * device storage.  Bias is a real kernel input just like activation;
+         * leaving it host-only would test an obsolete implicit-upload path.
+         */
+        TransferEngine::prepareDeviceInput(input.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_q.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_k.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_v.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_q.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_k.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_v.get(), device, stream);
 #else
         ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(bias_q->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(bias_k->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(bias_v->ensureOnDevice(DeviceId::rocm(0)));
         ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
         ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
         ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
@@ -2560,7 +2575,7 @@ namespace
                       input->data() + static_cast<size_t>(row + 1) * static_cast<size_t>(K),
                       row_input->mutable_data());
 #ifdef HAVE_ROCM
-            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0), stream));
+            TransferEngine::prepareDeviceInput(row_input.get(), device, stream);
 #else
             ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0)));
 #endif
@@ -2568,7 +2583,11 @@ namespace
             for (const ProjectionCase &projection : projection_cases)
             {
                 auto serial = TestTensorFactory::createFP32({1u, static_cast<size_t>(projection.n)});
+#ifdef HAVE_ROCM
+                TransferEngine::prepareDeviceOutput(serial.get(), device, stream);
+#else
                 ASSERT_TRUE(serial->allocateOnDevice(DeviceId::rocm(0)));
+#endif
                 ASSERT_TRUE(projection.kernel->multiply_tensor(
                     row_input.get(),
                     serial.get(),

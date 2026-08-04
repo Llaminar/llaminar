@@ -910,11 +910,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RuntimePrefillDescriptorsUseRetainedGra
 
     const auto cuda_runtime_execution = sliceBetween(
         cuda_source,
-        "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime(",
+        "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
         "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(");
     const auto rocm_runtime_execution = sliceBetween(
         rocm_source,
-        "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime(",
+        "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
         "\n} // namespace llaminar2");
 
     for (const auto &[backend, execution] : {
@@ -12185,6 +12185,44 @@ TEST(Test__GpuWorkspaceAllocationPolicy, EveryNativeCapturePathPreparesStorageBe
         "ScopedBackendGraphCapture capture_transaction(",
         "The direct single-graph API must enforce the same pre-capture event "
         "contract as cached decode capture.");
+}
+
+/**
+ * @brief Require ROCm verifier perf cells to use the production capture owner.
+ *
+ * Tensor publication during capture is provisional graph state. A raw HIP
+ * begin/end pair does not install the backend transaction that validates that
+ * state, and an exception can leave the stream capturing while fixture
+ * destructors free device storage. Every perf cell therefore uses the same
+ * exception-safe capture lifecycle as production graph execution.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ROCmMoEVerifierPerfHarnessUsesProductionCaptureTransactions)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "tests/v2/performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp");
+    const auto executable = stripCommentsAndStringLiterals(source);
+
+    EXPECT_NE(source.find("class ScopedHipPerfGraph"), std::string::npos);
+    EXPECT_NE(source.find("llaminar2::HIPGraphCapture graph_"), std::string::npos);
+    EXPECT_NE(
+        source.find("llaminar2::ScopedBackendGraphCapture transaction_"),
+        std::string::npos);
+    EXPECT_EQ(countOccurrences(source, "ScopedHipPerfGraph graph("), 4u)
+        << "Every ROCm verifier perf capture family must share one typed owner.";
+
+    for (const auto &forbidden : {
+             "hipStreamBeginCapture(",
+             "hipStreamEndCapture(",
+             "hipGraphInstantiate(",
+             "hipGraphLaunch(",
+         })
+    {
+        EXPECT_EQ(executable.find(forbidden), std::string::npos)
+            << "The verifier perf harness must not bypass its capture transaction with "
+            << forbidden;
+    }
 }
 
 /**

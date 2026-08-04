@@ -1821,7 +1821,8 @@ namespace
                 cudaSuccess);
             cuda_kernel_owner_ = KernelFactory::createMoEKernel(llaminar2::DeviceId::cuda(0));
             cpu_kernel_owner_ = KernelFactory::createMoEKernel(llaminar2::DeviceId::cpu());
-            cuda_kernel_ = cuda_kernel_owner_.get();
+            cuda_kernel_ = dynamic_cast<llaminar2::CUDAMoEKernel *>(
+                cuda_kernel_owner_.get());
             cpu_kernel_ = cpu_kernel_owner_.get();
             ASSERT_NE(cuda_kernel_, nullptr);
             ASSERT_NE(cpu_kernel_, nullptr);
@@ -1927,7 +1928,7 @@ namespace
 #endif
         std::unique_ptr<llaminar2::IMoEKernel> cuda_kernel_owner_;
         std::unique_ptr<llaminar2::IMoEKernel> cpu_kernel_owner_;
-        llaminar2::IMoEKernel *cuda_kernel_ = nullptr;
+        llaminar2::CUDAMoEKernel *cuda_kernel_ = nullptr;
         llaminar2::IMoEKernel *cpu_kernel_ = nullptr;
     };
 }
@@ -2615,7 +2616,7 @@ TEST_F(Test__CUDAMoEKernel, GroupedVerifierHistogramCommitIsAcceptedPrefixExact)
                       cudaMemcpyHostToDevice,
                       stream_),
                   cudaSuccess);
-        ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+        ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesForDiagnostics(
             runtime_table.deviceLayerState(0),
             seq_len,
             seq_len,
@@ -2797,23 +2798,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
         seq_len,
         num_experts,
         top_k,
-        /*filter_to_local_runtime_experts=*/true));
+        /*filter_to_local_runtime_experts=*/true,
+        /*retain_routes_for_deferred_commit=*/true));
 
     /*
      * Grouping is speculative: it must not mutate serial-visible decode
-     * history before the verifier accepts rows.  Production therefore copies
-     * the selected expert and participant identities into the deferred ledger
-     * while rebuilding the local grouped spans.  The later commit kernel reads
-     * only that ledger, so another layer may safely reuse the transient route
-     * arena before acceptance publication.
+     * history before the verifier accepts rows. The same fused grouping launch
+     * therefore copies final expert and participant identities into the
+     * deferred ledger. The later commit reads only that ledger, so another
+     * layer may safely reuse transient route scratch before publication.
      */
-    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
-        runtime_table.deviceLayerState(0),
-        seq_len,
-        seq_len,
-        num_experts,
-        top_k,
-        /*retain_routes_for_deferred_commit=*/true));
     CudaAllocation accepted_count_device(sizeof(int32_t));
     CudaAllocation publication_ok_device(sizeof(int32_t));
     const int32_t accepted_count = seq_len;
@@ -3002,7 +2996,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesH
         top_k,
         device_positions,
         static_cast<const int32_t *>(active_row_count_device.get())));
-    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
@@ -3295,7 +3289,7 @@ TEST_F(Test__CUDAMoEKernel,
             static_cast<const int32_t *>(
                 accepted_count_device.get())));
     ASSERT_TRUE(
-        cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+        cuda_kernel_->regroupPrefillRoutesForDiagnostics(
             runtime_table.deviceLayerState(0),
             max_m,
             max_m,
@@ -4609,7 +4603,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedStandardPlanAssignsOwnerRou
     EXPECT_EQ(route_participants[2], 1);
     EXPECT_EQ(route_participants[3], 1);
 
-    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesForDiagnostics(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
@@ -20341,16 +20335,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 routing_indices.get(),
                 routing_weights.get()))
                 << format.label << " production grouped router M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+            ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
                 runtime_table.deviceLayerState(0),
                 routing_indices.get(),
                 routing_weights.get(),
                 seq_len,
                 seq_len,
                 num_experts,
-                top_k))
-                << format.label << " runtime route grouping M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+                top_k,
+                gateup_table,
+                down_table,
+                /*filter_to_local_runtime_experts=*/false))
+                << format.label << " complete runtime plan M=" << seq_len;
+            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
                 runtime_table.deviceLayerState(0),
                 runtime_table.hostLayerState(0),
                 hidden.get(),
@@ -21282,18 +21279,21 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
         if (!output->ensureOnDevice(device, stream_))
             return false;
 
-        if (!cuda_kernel_->groupPrefillRoutes(
+        if (!cuda_kernel_->publishCompleteGroupedPrefillPlanFromRouter(
                 runtime_table.deviceLayerState(0),
                 routing_indices.get(),
                 routing_weights.get(),
                 seq_len,
                 seq_len,
                 num_experts,
-                top_k))
+                top_k,
+                gateup_table,
+                down_table,
+                /*filter_to_local_runtime_experts=*/false))
         {
             return false;
         }
-        if (!cuda_kernel_->executeGroupedPrefillPipelineFromRuntime(
+        if (!cuda_kernel_->executeGroupedPrefillPipelineFromPublishedRuntimePlan(
                 runtime_table.deviceLayerState(0),
                 runtime_table.hostLayerState(0),
                 hidden.get(),

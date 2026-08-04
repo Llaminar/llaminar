@@ -592,10 +592,44 @@ namespace llaminar2
             bool filter_to_local_runtime_experts = false,
             bool retain_routes_for_deferred_commit = false) override;
 
-        bool regroupPrefillRoutesFromRuntimeAssignments(
+        /**
+         * @brief Rebuild grouped rows for focused assignment diagnostics.
+         *
+         * Production execution publishes descriptors, active ids, and inverse
+         * mapping through publishCompleteGroupedPrefillPlanFromRuntimeAssignments().
+         * This concrete-only entrypoint exists so integration tests can isolate
+         * the stable grouping algorithm without manufacturing descriptor tables;
+         * it is intentionally absent from IMoEKernel and execution-stage code.
+         */
+        bool regroupPrefillRoutesForDiagnostics(
             DeviceMoELayerRuntime *runtime_layer,
-            int current_tokens, int max_tokens,
-            int num_experts, int top_k,
+            int current_tokens,
+            int max_tokens,
+            int num_experts,
+            int top_k,
+            bool retain_routes_for_deferred_commit = false);
+
+        bool publishCompleteGroupedPrefillPlanFromRouter(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int current_tokens,
+            int max_tokens,
+            int num_experts,
+            int top_k,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            bool filter_to_local_runtime_experts,
+            bool retain_routes_for_deferred_commit = false) override;
+
+        bool publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens,
+            int max_tokens,
+            int num_experts,
+            int top_k,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
             bool retain_routes_for_deferred_commit = false) override;
 
         bool commitGroupedVerifierHistograms(
@@ -674,7 +708,7 @@ namespace llaminar2
             int num_experts, int top_k,
             ITensor *canonical_route_contributions = nullptr) override;
 
-        bool executeGroupedPrefillPipelineFromRuntime(
+        bool executeGroupedPrefillPipelineFromPublishedRuntimePlan(
             DeviceMoELayerRuntime *device_runtime_layer,
             const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,

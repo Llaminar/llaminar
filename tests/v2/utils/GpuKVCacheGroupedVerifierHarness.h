@@ -1407,7 +1407,7 @@ namespace llaminar2::test::gpu_kv_verifier
     }
 
     /**
-     * @brief Run the complete production grouped KV publication proof.
+     * @brief Run one format slice of the production grouped KV publication proof.
      *
      * `grouped_append` owns backend graph API calls and must execute the native
      * grouped publication inside a captured graph. `observe_state` is an
@@ -1416,10 +1416,11 @@ namespace llaminar2::test::gpu_kv_verifier
      * value. It must never consult or update a cache-owned host mirror.
      */
     template <typename GroupedAppender, typename DeviceStateObserver>
-    void runAllFormatGroupedVerifierSweep(
+    void runFormatGroupedVerifierSweep(
         DeviceId device,
         const char *backend_label,
         const char *counter_name,
+        const FormatCase &format,
         void *stream,
         GroupedAppender &&grouped_append,
         DeviceStateObserver &&observe_state)
@@ -1434,39 +1435,37 @@ namespace llaminar2::test::gpu_kv_verifier
         uint64_t expected_call_count = 0;
         uint32_t seed = 1001;
 
-        for (const auto &format : kFormatCases)
+        for (const int head_dim : head_dims)
         {
-            for (const int head_dim : head_dims)
+            TurboQuantContext tq_context(head_dim, 0xC0FFEEu);
+            for (const auto &topology : kTopologies)
             {
-                TurboQuantContext tq_context(head_dim, 0xC0FFEEu);
-                for (const auto &topology : kTopologies)
+                const int local_heads = topology.effectiveLocalHeads();
+                const int kv_dim = local_heads * head_dim;
+                for (const bool source_head_major : source_layouts)
                 {
-                    const int local_heads = topology.effectiveLocalHeads();
-                    const int kv_dim = local_heads * head_dim;
-                    for (const bool source_head_major : source_layouts)
+                    for (const int verifier_rows : kGroupedVerifierRuntimeRows)
                     {
-                        for (const int verifier_rows : kGroupedVerifierRuntimeRows)
+                        struct LogicalRowCase
                         {
-                            struct LogicalRowCase
+                            int rows;
+                            bool resident_count;
+                        };
+                        std::vector<LogicalRowCase> logical_cases{
+                            {verifier_rows, false}};
+                        if (verifier_rows == 8)
+                        {
+                            for (int logical_rows = 1;
+                                 logical_rows <= verifier_rows;
+                                 ++logical_rows)
                             {
-                                int rows;
-                                bool resident_count;
-                            };
-                            std::vector<LogicalRowCase> logical_cases{
-                                {verifier_rows, false}};
-                            if (verifier_rows == 8)
-                            {
-                                for (int logical_rows = 1;
-                                     logical_rows <= verifier_rows;
-                                     ++logical_rows)
-                                {
-                                    logical_cases.push_back(
-                                        {logical_rows, true});
-                                }
+                                logical_cases.push_back(
+                                    {logical_rows, true});
                             }
+                        }
 
-                            for (const auto logical : logical_cases)
-                            {
+                        for (const auto logical : logical_cases)
+                        {
                                 const char *layout_label = source_head_major
                                                                ? "head_major"
                                                                : "position_major";
@@ -1628,7 +1627,6 @@ namespace llaminar2::test::gpu_kv_verifier
                                 layout_label, execution_mode,
                                 row_count_policy, topology.label));
                                 ++expected_call_count;
-                            }
                         }
                     }
                 }

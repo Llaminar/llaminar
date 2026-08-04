@@ -6173,10 +6173,58 @@ target_include_directories(v2_integration_cuda_kv_cache_grouped_verifier
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_integration_cuda_kv_cache_grouped_verifier
     llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCacheAppend
+set(V2_GROUPED_KV_RUNTIME_FORMAT_CASES
+    FP32_From_FP32
+    BF16_From_BF16
+    FP16_From_FP32
+    FP16_From_FP16
+    FP16_From_BF16
+    FP16_From_Q8_1
+    Q8_1_From_FP32
+    Q8_1_From_FP16
+    Q8_1_From_BF16
+    Q8_1_From_Q8_1
+    TQ8K_TQ4V_From_FP32
+    TQ8K_TQ4V_From_TQ8_TQ4
+    TQ8K_TQ8V_From_FP32
+    TQ8K_TQ8V_From_TQ8
+)
+foreach(FORMAT_CASE IN LISTS V2_GROUPED_KV_RUNTIME_FORMAT_CASES)
+    add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_RuntimePublication_${FORMAT_CASE}
+        COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
+                --gtest_filter=Test__CUDAKVCacheGroupedVerifier.RuntimePublication_${FORMAT_CASE}
+        LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;${FORMAT_CASE};GraphCapture;LocalTP;DeviceResident;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
+endforeach()
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_ConvertedRead
     COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
-    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;TQ8;TQ4;GraphCapture;LocalTP;DeviceResident;Regression"
+            --gtest_filter=Test__CUDAKVCacheGroupedVerifier.AllFormatsCapturedConvertedBatchReadMatchesSerialBytes
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;ConvertedRead;AllFormats;GraphCapture;DeviceResident;Regression"
     MPI_PROCS 1
+    TIMEOUT 60
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_LogicalBlockRestore
+    COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
+            --gtest_filter=Test__CUDAKVCacheGroupedVerifier.AllNativeFormatsDeviceLogicalBlockHarvestRestoreAreByteExact
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;AllFormats;LocalTP;DeviceResident;Regression"
+    MPI_PROCS 1
+    TIMEOUT 60
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_AdversarialLifecycle
+    COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
+            --gtest_filter=Test__CUDAKVCacheGroupedVerifier.AdversarialMultiStreamGraphReusePrefixRestoreMatchesSerialState
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;MultiStream;GraphReuse;DeviceResident;Regression"
+    MPI_PROCS 1
+    TIMEOUT 60
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_TurboQuantLifecycle
+    COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
+            --gtest_filter=Test__CUDAKVCacheGroupedVerifier.AdversarialTurboQuantMultiStreamGraphReuseMatchesSerialState
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;TurboQuant;TQ8;TQ4;MultiStream;GraphReuse;DeviceResident;Regression"
+    MPI_PROCS 1
+    TIMEOUT 60
 )
 
 # Integration Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
@@ -11757,10 +11805,42 @@ if(HAVE_ROCM)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_integration_rocm_kv_cache_grouped_verifier
         llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCacheAppend
+    foreach(FORMAT_CASE IN LISTS V2_GROUPED_KV_RUNTIME_FORMAT_CASES)
+        add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCache_RuntimePublication_${FORMAT_CASE}
+            COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
+                    --gtest_filter=Test__ROCmKVCacheGroupedVerifier.RuntimePublication_${FORMAT_CASE}
+            LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;${FORMAT_CASE};GraphCapture;LocalTP;DeviceResident;Regression;gfx906"
+            MPI_PROCS 1
+            TIMEOUT 30
+        )
+    endforeach()
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCache_ConvertedRead
         COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
-        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;TQ8;TQ4;GraphCapture;LocalTP;DeviceResident;Regression;gfx906"
+                --gtest_filter=Test__ROCmKVCacheGroupedVerifier.AllFormatsCapturedConvertedBatchReadMatchesSerialBytes
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;ConvertedRead;AllFormats;GraphCapture;DeviceResident;Regression;gfx906"
         MPI_PROCS 1
+        TIMEOUT 60
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCache_LogicalBlockRestore
+        COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
+                --gtest_filter=Test__ROCmKVCacheGroupedVerifier.AllNativeFormatsDeviceLogicalBlockHarvestRestoreAreByteExact
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;AllFormats;LocalTP;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 60
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCache_AdversarialLifecycle
+        COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
+                --gtest_filter=Test__ROCmKVCacheGroupedVerifier.AdversarialMultiStreamGraphReusePrefixRestoreMatchesSerialState
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;MultiStream;GraphReuse;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 60
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCache_TurboQuantLifecycle
+        COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
+                --gtest_filter=Test__ROCmKVCacheGroupedVerifier.AdversarialTurboQuantMultiStreamGraphReuseMatchesSerialState
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;PrefixCache;TurboQuant;TQ8;TQ4;MultiStream;GraphReuse;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 60
     )
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache integration tests")
 
