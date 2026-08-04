@@ -20,10 +20,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   NCCL/RCCL broadcast use planned persistent workspace and explicit
   producer/consumer event ordering. Hot paths contain no allocation, blocking
   synchronization, segmented execution, or full-logits host observation.
-- MoE prefix restore preserves stable graph addresses through explicit
-  producer events. GPU FFN/MTP APIs reject null publication streams.
-- CUDA2 LLEP d3 device-gated maintenance parity is green across fresh and
-  clear-replay requests; clipped carry is CUDA/ROCm graph-regressed.
+- Prefix restore preserves graph addresses through producer events. GPU
+  FFN/MTP APIs reject null publication streams.
 
 ## Production Matrix
 
@@ -42,25 +40,18 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 - All-format grouped attention/TurboQuant sweeps are serial-row byte exact on
   CPU, CUDA, and ROCm through the production M range.
-- CUDA/ROCm deterministic MoE route planning covers `M=1..4`, top-k 1..16,
-  all 256 experts, and 20 repeated exact launches per cell.
-- CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
-  byte-equal continuation and complete live state.
+- CUDA/ROCm MoE routing, GDN, short-conv, stochastic target preparation, and
+  draft publication are byte-exact through their production M/depth ranges.
 - Release CUDA2/ROCm2 pass all eight Dynamic/LLEP cells and `166/166` checks
-  through 2048 tokens with full capture, movement, and clean VRAM release.
-- Captured stochastic target preparation and draft publication are byte-exact
-  across every fixed depth/policy on CUDA and ROCm. Both are strict device
-  graphs with exact producer streams and no eager production route.
+  through 2048 tokens with full capture and clean VRAM release.
 - Latest Release CUDA2 Dynamic stochastic d4..15 + RAM-prefix E2E is `23/23`
   green at 4096 context and 2048 output tokens; LLEP covers 1024.
-- Penalty magnitudes are immutable admission state. Captured accepted-state
-  publication solely owns history, so mutable state cannot multiply graphs.
-- Replicated shared-expert residuals no longer enter an invalid allreduce.
-  Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
-  contributions and is covered on NCCL and RCCL.
 - CUDA2 phase-split fixed-d3 native-parent replay is same-seed exact after
   clear/reuse. PerfStats proves one captured conditional maintenance fragment
   executes when due and skips ordinary transactions; final outputs replicate.
+- CUDA2 LLEP stochastic d3 remains green after the grouped-MoE/NativeVNNI
+  geometry changes. The live long-context E2E completed in `56.6 s` with full
+  graph capture and the canonical device-residency/PerfStats assertions.
 
 ## Kernel Economy
 
@@ -73,18 +64,22 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
   40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
   32 SGPR, zero scratch, and 90.6% VALU utilization.
-- Release CUDA2 LLEP d3 is `153.97 tok/s` decode and `180.14 tok/s` prefill,
-  up from `128.13 tok/s` decode (`+20.2%`). Active-expert compaction is fused
-  into descriptor publication; its standalone per-layer launch is gone.
+- Release CUDA2 LLEP d3 is `156.08 tok/s` decode and `181.32 tok/s` prefill,
+  up from `128.13 tok/s` decode (`+21.8%`) and `9.15%` short of llama.cpp's
+  `171.81 tok/s`. Active-expert compaction is fused into descriptor
+  publication; its standalone per-layer launch is gone.
+- The Qwen3.6 MoE expert `N=512,K=2048` grouped projection now selects the
+  byte-exact `64x64` NativeVNNI tile for `M=2..31`. All 21 CUDA formats pass
+  the production-path M-totality sweep; affected formats gain `1.69x..2.21x`
+  in the isolated kernel. Nsight reports zero spills and 168 registers, but
+  only eight CTAs (`8.33%` achieved occupancy), exposing the next geometry
+  target rather than hiding it behind split-K, which is not byte exact.
 - The CUDA GDN recurrence now uses one fixed eight-part K reduction for serial
   and grouped rows. It is byte-exact through `M=31`; at `d_k=d_v=128` it fell
   from `35.52 us` to `17.73 us`: `30.6%` occupancy, `541 GB/s`, 90 registers,
   zero spills. Grouped `M=16` is `1.50x` faster than serial launches.
-- Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
-  `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
-  communication baseline; the dynamic depth controller is a later tuning lane.
-- Participant-local overlay preparation cut graph build `61.3 -> 36.5 s`, jobs
-  `32129 -> 16385`, and source bytes `15.74 -> 9.14 GB`; bindings fail closed.
+- Decode-replicated phase-split is `2.22x` faster than apportioned continuation;
+  it is the fixed-depth control before dynamic-depth tuning.
 - On this non-P2P RTX 3090 topology, graph-captured NCCL rooted
   reduce+broadcast at verifier `M=5` costs about `941 us/layer`; collective
   count, payload, and overlap are the immediate Nsight economy targets.

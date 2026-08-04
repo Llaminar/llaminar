@@ -5730,9 +5730,9 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_Qwen36AsymmetricTileOverlay
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.AsymmetricQwen36GDNProjectionUsesProfiledByteExactTile
+            --gtest_filter=Test__CUDAGemmParity.AsymmetricQwen36GDNProjectionUsesProfiledByteExactTile:Test__CUDAGemmParity.AsymmetricQwen36MoEExpertProjectionUsesProfiledMTotalByteExactTile
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;Qwen36;GDN;NativeVNNI;Dispatch;ByteExact;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GroupedVerifierRows;MTotality;AllFormats;Qwen36;GDN;MoE;NativeVNNI;Dispatch;ByteExact;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristicQwen36

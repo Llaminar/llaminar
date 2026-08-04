@@ -15263,6 +15263,17 @@ namespace
     }
 
     /**
+     * @brief Output columns owned by one ordered split-K scatter block.
+     *
+     * Two-warp blocks were capped at sixteen resident blocks per Ampere SM,
+     * which limited these otherwise spill-free kernels to 66.7% theoretical
+     * occupancy. Four warps preserve the one-thread-per-column arithmetic and
+     * memory layout while allowing register and warp limits, rather than the
+     * block-count limit, to determine useful residency.
+     */
+    constexpr int kGroupedOrderedKPartTileN = 128;
+
+    /**
      * @brief Produce decode-equivalent gate/up partials for one verifier-row tile.
      *
      * Grouped expert planning reorders route slots by expert so adjacent rows
@@ -15294,7 +15305,7 @@ namespace
         int num_experts,
         int k_partitions)
     {
-        constexpr int kTileN = 64;
+        constexpr int kTileN = kGroupedOrderedKPartTileN;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int local_route = blockIdx.y;
         const int k_part = blockIdx.z;
@@ -15575,7 +15586,7 @@ namespace
         int num_experts,
         int k_partitions)
     {
-        constexpr int kTileN = 64;
+        constexpr int kTileN = kGroupedOrderedKPartTileN;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
         const int local_route = blockIdx.z;
@@ -18207,7 +18218,7 @@ extern "C"
 
         if (use_gateup_kpart)
         {
-            constexpr int kTileN = 64;
+            constexpr int kTileN = kGroupedOrderedKPartTileN;
             constexpr int kReduceTileN = 32;
             dim3 block(kTileN);
             dim3 reduce_block(kReduceTileN);
@@ -18389,10 +18400,12 @@ extern "C"
 
         if (use_ordered_down_kpart)
         {
-            constexpr int kTileN = 64;
+            constexpr int kScatterTileN = kGroupedOrderedKPartTileN;
+            constexpr int kReduceTileN = 64;
             const int N = d_model;
             const int K = intermediate;
-            dim3 block(kTileN);
+            dim3 scatter_block(kScatterTileN);
+            dim3 reduce_block(kReduceTileN);
 
             for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
             {
@@ -18400,19 +18413,19 @@ extern "C"
                 const int tile_route_slots = tile_rows * top_k;
                 const int original_slot_base = token_base * top_k;
                 dim3 scatter_grid(
-                    (N + kTileN - 1) / kTileN,
+                    (N + kScatterTileN - 1) / kScatterTileN,
                     down_k_partitions,
                     tile_route_slots);
                 dim3 route_reduce_grid(
-                    (N + kTileN - 1) / kTileN,
+                    (N + kReduceTileN - 1) / kReduceTileN,
                     tile_route_slots);
                 dim3 direct_reduce_grid(
-                    (N + kTileN - 1) / kTileN,
+                    (N + kReduceTileN - 1) / kReduceTileN,
                     tile_rows);
 
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                      \
     grouped_prefill_down_canonical_kpart_scatter_kernel<CB>                         \
-        <<<scatter_grid, block, 0, cuda_stream>>>(                                  \
+        <<<scatter_grid, scatter_block, 0, cuda_stream>>>(                          \
             d_scratch_swiglu_int8, d_scratch_swiglu_scales,                         \
             d_down_desc_table, d_original_to_grouped,                               \
             d_original_expert_ids, d_group_weights, d_down_partials,                \
@@ -18476,7 +18489,7 @@ extern "C"
                 if (canonical_publication)
                 {
                     grouped_prefill_down_canonical_kpart_reduce_kernel<<<
-                        route_reduce_grid, block, 0, cuda_stream>>>(
+                        route_reduce_grid, reduce_block, 0, cuda_stream>>>(
                         d_down_partials,
                         d_canonical_route_contributions,
                         original_slot_base,
@@ -18487,7 +18500,7 @@ extern "C"
                 else
                 {
                     grouped_prefill_down_canonical_kpart_reduce_direct_kernel<<<
-                        direct_reduce_grid, block, 0, cuda_stream>>>(
+                        direct_reduce_grid, reduce_block, 0, cuda_stream>>>(
                         d_down_partials, d_output, token_base, tile_rows,
                         top_k, N, down_k_partitions);
                 }

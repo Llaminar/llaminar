@@ -14803,6 +14803,10 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
     ASSERT_TRUE(exact_hidden->ensureOnDevice(device, stream_));
     ASSERT_TRUE(bucket_hidden->ensureOnDevice(device, stream_));
     ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(exact_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(exact_weights->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(bucket_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(bucket_weights->ensureOnDevice(device, stream_));
 
     CudaAllocation exact_logits_allocation(
         static_cast<size_t>(real_seq_len) * num_experts * sizeof(float));
@@ -15265,6 +15269,12 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
 
+    const auto device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(cuda_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(cuda_weights->ensureOnDevice(device, stream_));
+
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
     llaminar2::PerfStatsCollector::reset();
 
@@ -15482,6 +15492,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
                          0.027f * std::cos(0.017f * static_cast<float>(i + 19)) +
                          0.0007f * static_cast<float>(static_cast<int>(i % 23) - 11);
     auto gate = makeTensor({num_experts, d_model}, gate_values);
+    ASSERT_TRUE(gate->ensureOnDevice(cuda_config.device_id, stream_));
 
     for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
@@ -15498,6 +15509,9 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
             {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
         auto batched_weights = makeZeros(
             {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        ASSERT_TRUE(hidden->ensureOnDevice(cuda_config.device_id, stream_));
+        ASSERT_TRUE(batched_indices->ensureOnDevice(cuda_config.device_id, stream_));
+        ASSERT_TRUE(batched_weights->ensureOnDevice(cuda_config.device_id, stream_));
 
         ASSERT_TRUE(cuda_kernel_->routeVerifierRowsDecodeEquivalent(
             hidden.get(), gate.get(), seq_len, d_model,
@@ -15529,6 +15543,9 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
             auto row_hidden = makeTensor({1, d_model}, row_hidden_values);
             auto row_indices = makeZeros({1, top_k});
             auto row_weights = makeZeros({1, top_k});
+            ASSERT_TRUE(row_hidden->ensureOnDevice(cuda_config.device_id, stream_));
+            ASSERT_TRUE(row_indices->ensureOnDevice(cuda_config.device_id, stream_));
+            ASSERT_TRUE(row_weights->ensureOnDevice(cuda_config.device_id, stream_));
 
             ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
                 cuda_table.deviceLayerState(0),
@@ -15888,6 +15905,12 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsRuntimeMMatchSerialDecod
         auto grouped_combined = makeZeros(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
 
+        ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_shared_only->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_shared_add->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_residual->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_combined->ensureOnDevice(device, stream_));
+
         cuda_kernel_->sharedExpertGateFromTensors(
             grouped_input.get(),
             gate.get(),
@@ -15923,6 +15946,12 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsRuntimeMMatchSerialDecod
             auto row_shared_add_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_shared);
             auto row_residual_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_residual);
             auto row_combined_tensor = makeZeros({1u, static_cast<size_t>(d_model)});
+
+            ASSERT_TRUE(row_input_tensor->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_shared_only_tensor->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_shared_add_tensor->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_residual_tensor->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_combined_tensor->ensureOnDevice(device, stream_));
 
             cuda_kernel_->sharedExpertGateFromTensors(
                 row_input_tensor.get(),
@@ -19639,6 +19668,18 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         auto prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
         auto split_prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
 
+        /*
+         * This regression calls the same device-owned entrypoints used by the
+         * captured verifier graph. Publish every input and output allocation
+         * before invoking them; allowing the kernel wrapper to repair a
+         * host-only tensor would hide an illegal production transfer.
+         */
+        ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(prefill_output->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(split_prefill_output->ensureOnDevice(device, stream_));
+
         prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
         ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
             routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
@@ -19646,6 +19687,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k));
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_TRUE(prefill_output->ensureOnHost(stream_));
 
         std::vector<float> prefill_values(
             prefill_output->data(),
@@ -19658,6 +19700,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             hidden.get(), split_prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k));
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_TRUE(split_prefill_output->ensureOnHost(stream_));
         std::vector<float> split_prefill_values(
             split_prefill_output->data(),
             split_prefill_output->data() + split_prefill_output->numel());
@@ -19686,6 +19729,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             const auto row_begin = hidden_values.begin() + static_cast<ptrdiff_t>(row) * d_model;
             std::vector<float> row_hidden_values(row_begin, row_begin + d_model);
             auto row_hidden = makeTensor({1, d_model}, row_hidden_values);
+            ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream_));
 
             std::array<int, top_k> expert_ids = {};
             std::array<float, top_k> expert_weights = {};
@@ -19704,11 +19748,16 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             {
                 gate_owned[static_cast<size_t>(k)] = makeZeros({intermediate});
                 up_owned[static_cast<size_t>(k)] = makeZeros({intermediate});
+                ASSERT_TRUE(gate_owned[static_cast<size_t>(k)]->ensureOnDevice(
+                    device, stream_));
+                ASSERT_TRUE(up_owned[static_cast<size_t>(k)]->ensureOnDevice(
+                    device, stream_));
                 gate_outputs[static_cast<size_t>(k)] = gate_owned[static_cast<size_t>(k)].get();
                 up_outputs[static_cast<size_t>(k)] = up_owned[static_cast<size_t>(k)].get();
             }
 
             auto decode_output = makeZeros({d_model});
+            ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
             ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
                 row_hidden.get(), expert_ids.data(), gateup_table, top_k,
                 gate_outputs.data(), up_outputs.data(), d_model, intermediate));
@@ -19716,6 +19765,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
                 gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
                 down_table, top_k, decode_output.get(), d_model, intermediate));
             ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            ASSERT_TRUE(decode_output->ensureOnHost(stream_));
 
             rowwise_decode_values.insert(
                 rowwise_decode_values.end(),
@@ -19731,6 +19781,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             prefill_values.size(),
             static_cast<size_t>(d_model));
 
+        ASSERT_TRUE(prefill_output->ensureOnDevice(device, stream_));
         ScopedCudaTestGraph graph(
             stream_,
             "runtime-M routed verifier prefill capture");
@@ -19744,6 +19795,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         ASSERT_TRUE(graph.finishAndInstantiate());
         ASSERT_TRUE(graph.launch());
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_TRUE(prefill_output->ensureOnHost(stream_));
 
         const float *captured_output = prefill_output->data();
         for (size_t i = 0; i < prefill_output->numel(); ++i)
@@ -20334,12 +20386,15 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
         const auto hidden_values = make_hidden_values(seq_len);
         auto hidden = makeTensor({static_cast<size_t>(seq_len), d_model}, hidden_values);
         auto prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
+        ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(prefill_output->ensureOnDevice(device, stream_));
 
         ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len));
         ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k));
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_TRUE(prefill_output->ensureOnHost(stream_));
 
         std::vector<float> prefill_values(
             prefill_output->data(),
@@ -20358,6 +20413,10 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
             auto gate = makeZeros({intermediate});
             auto up = makeZeros({intermediate});
             auto decode_output = makeZeros({d_model});
+            ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(up->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
 
             std::array<llaminar2::ITensor *, top_k> gate_outputs = {gate.get()};
             std::array<llaminar2::ITensor *, top_k> up_outputs = {up.get()};
@@ -20369,6 +20428,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
                 gate_outputs.data(), up_outputs.data(), &expert_id, &expert_weight,
                 down_table, top_k, decode_output.get(), d_model, intermediate));
             ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            ASSERT_TRUE(decode_output->ensureOnHost(stream_));
 
             rowwise_decode_values.insert(
                 rowwise_decode_values.end(),
@@ -20383,6 +20443,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
             prefill_values.size(),
             static_cast<size_t>(d_model));
 
+        ASSERT_TRUE(prefill_output->ensureOnDevice(device, stream_));
         ScopedCudaTestGraph graph(
             stream_,
             "runtime-M shared verifier prefill capture");
@@ -20538,6 +20599,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
                 hidden_values);
             auto grouped_output = makeZeros(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
 
             ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len));
             ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
@@ -20569,6 +20632,10 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
                 auto gate = makeZeros({static_cast<size_t>(intermediate)});
                 auto up = makeZeros({static_cast<size_t>(intermediate)});
                 auto decode_output = makeZeros({static_cast<size_t>(d_model)});
+                ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(up->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
 
                 std::array<llaminar2::ITensor *, top_k> gate_outputs = {gate.get()};
                 std::array<llaminar2::ITensor *, top_k> up_outputs = {up.get()};

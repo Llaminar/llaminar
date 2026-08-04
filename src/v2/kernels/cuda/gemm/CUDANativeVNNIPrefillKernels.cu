@@ -1,10 +1,14 @@
 /**
  * @file CUDANativeVNNIPrefillKernels.cu
- * @brief Q4_0 native-vnni tensor-core prefill kernels.
+ * @brief All-format native-VNNI tensor-core prefill kernels for CUDA.
  *
- * Weights stay in native payload form in VRAM. Each CTA loads compact Q4_0
- * payload blocks, decodes them into a transient shared-memory INT8 tile, then
- * reuses the existing mma.sync.m16n8k32 fragment path for compute.
+ * Weights stay in their compact native payload form in VRAM. Each CTA decodes
+ * one format-specific payload tile into transient shared-memory INT8 values,
+ * then feeds the common `mma.sync.m16n8k32` fragment path. Launch policy is
+ * responsible for exposing enough independent output tiles to fill the GPU
+ * while retaining one increasing-K FP32 accumulation walk per output value;
+ * split-K and Stream-K candidates that alter that arithmetic are diagnostic
+ * only and are never selected by production automatic dispatch.
  */
 
 #include <cuda_runtime.h>
@@ -2441,6 +2445,25 @@ namespace
     {
         const int SM = querySmCount(prefill_ctx);
         const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
+
+        /*
+         * Qwen3.6 35B MoE expert gate/up projection, verifier row domain.
+         *
+         * The ordinary 64x128 policy exposes only four CTAs for N=512, leaving
+         * most of an 82-SM GA102 idle throughout the K=2048 reduction. A full
+         * all-format tournament over every M=2..16 plus the M=31 depth sentinel
+         * proved that 64x64 preserves every result byte for all asymmetric and
+         * dual-scale codebooks while exposing eight independent output tiles.
+         * Depending on payload complexity, the measured speedup was 1.69x to
+         * 2.21x. The winning path retains split_k=1, so this is purely an output
+         * geometry change and does not re-parenthesize the canonical K sum.
+         *
+         * Keep the upper M boundary explicit. Rows above the verifier witness
+         * domain remain total through the general prefill heuristic; extending
+         * this overlay requires a new byte-exact tournament at those work sizes.
+         */
+        if (M >= 2 && M <= 31 && N == 512 && K == 2048)
+            return {TileId::T64x64_w2x2, 1};
 
         /*
          * Qwen3.6 MoE GDN QKV projection, 128-row graph bucket.

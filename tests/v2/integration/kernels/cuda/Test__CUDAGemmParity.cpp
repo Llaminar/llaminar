@@ -2768,6 +2768,160 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
 #endif
 }
 
+/**
+ * @test Prove the profiled Qwen3.6 MoE expert projection policy is byte exact
+ * for every format and every grouped-verifier row count.
+ *
+ * The production policy changes only asymmetric and dual-scale formats, but
+ * the regression intentionally sweeps every loader-supported NativeVNNI
+ * format. For each M=2..16 plus the M=31 depth sentinel, it compares production
+ * AUTO dispatch against the measured `T64x64_w2x2`, split-K=1 candidate in
+ * native FP32 bytes. Affected formats must select that candidate without a
+ * force control; unaffected formats prove that the candidate remains a valid
+ * arithmetic oracle without changing their independently tuned AUTO policy.
+ *
+ * This exercises the public tensor GEMM entrypoint with ordinary production
+ * optimizations enabled. Stream-K is disabled because it is not a legal
+ * batch-invariant production candidate, while deterministic test mode remains
+ * off so this test cannot certify a test-only execution regime.
+ */
+TEST_F(Test__CUDAGemmParity,
+       AsymmetricQwen36MoEExpertProjectionUsesProfiledMTotalByteExactTile)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    constexpr int N = 512;
+    constexpr int K = 2048;
+    constexpr int profiled_tile = 0; // T64x64_w2x2
+
+    /*
+     * These are exactly the asymmetric and dual-scale format families routed
+     * through choosePrefillTile_Asymmetric(). Keeping the expected inventory in
+     * the regression makes a newly added format fail visibly until it receives
+     * the same all-M tournament evidence.
+     */
+    const std::array<const char *, 11> profiled_formats = {{
+        "Q4_1", "Q4_K", "Q5_1", "Q5_K", "Q6_K", "Q3_K",
+        "Q2_K", "IQ2_S", "IQ2_XS", "IQ1_S", "IQ1_M",
+    }};
+    const auto is_profiled_format = [&](const char *name)
+    {
+        return std::find_if(
+                   profiled_formats.begin(),
+                   profiled_formats.end(),
+                   [&](const char *candidate)
+                   {
+                       return std::strcmp(candidate, name) == 0;
+                   }) != profiled_formats.end();
+    };
+
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    size_t profiled_formats_seen = 0;
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        SCOPED_TRACE(format.name);
+        const bool expects_profiled_tile = is_profiled_format(format.name);
+        profiled_formats_seen += expects_profiled_tile ? 1u : 0u;
+
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr);
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+
+        auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel, nullptr)
+            << format.name << " CUDA prepared kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(
+            cuda_kernel,
+            kGroupedVerifierRuntimeRows.back(),
+            N,
+            K));
+
+        for (const int M : kGroupedVerifierRuntimeRows)
+        {
+            SCOPED_TRACE(std::string("M=") + std::to_string(M));
+            const std::vector<float> input =
+                randomFP32(static_cast<size_t>(M) * K);
+
+            std::vector<float> profiled_output(
+                static_cast<size_t>(M) * N,
+                0.0f);
+            cudaNativeVNNIPrefill_setForceTile(profiled_tile, 1);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                cuda_kernel,
+                input.data(),
+                profiled_output.data(),
+                M,
+                N,
+                K,
+                gpu_device_));
+
+            int tile_id = -1;
+            int split_k = -1;
+            int used_bk256 = -1;
+            int used_streamk = -1;
+            cudaNativeVNNIPrefill_getLastLaunchSelection(
+                &tile_id,
+                &split_k,
+                &used_bk256,
+                &used_streamk);
+            ASSERT_EQ(tile_id, profiled_tile);
+            ASSERT_EQ(split_k, 1);
+            ASSERT_EQ(used_bk256, 0);
+            ASSERT_EQ(used_streamk, 0);
+
+            std::vector<float> production_output(
+                static_cast<size_t>(M) * N,
+                0.0f);
+            cudaNativeVNNIPrefill_setForceTile(-1, 0);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                cuda_kernel,
+                input.data(),
+                production_output.data(),
+                M,
+                N,
+                K,
+                gpu_device_));
+
+            cudaNativeVNNIPrefill_getLastLaunchSelection(
+                &tile_id,
+                &split_k,
+                &used_bk256,
+                &used_streamk);
+            if (expects_profiled_tile)
+            {
+                EXPECT_EQ(tile_id, profiled_tile)
+                    << format.name
+                    << " did not use the profiled verifier output geometry";
+                EXPECT_EQ(split_k, 1);
+                EXPECT_EQ(used_bk256, 0);
+                EXPECT_EQ(used_streamk, 0);
+            }
+
+            expectBitwiseEqualFloatRow(
+                (std::string(format.name) +
+                 " Qwen3.6 MoE expert AUTO vs profiled tile M=" +
+                 std::to_string(M))
+                    .c_str(),
+                production_output.data(),
+                profiled_output.data(),
+                production_output.size());
+        }
+
+        cleanupWorkspaceIfNeeded(cuda_kernel);
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+
+    EXPECT_EQ(profiled_formats_seen, profiled_formats.size())
+        << "The all-format CUDA inventory did not cover every profiled "
+           "asymmetric/dual-scale family";
+#endif
+}
+
 // ============================================================================
 // Parameterized Quantized GEMM Parity Test
 // ============================================================================
