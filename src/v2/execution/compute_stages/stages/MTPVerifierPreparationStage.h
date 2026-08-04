@@ -128,6 +128,10 @@ namespace llaminar2
             int generation_control_stride = 0;
             /** Optional resident MoE boundary used to clip this transaction. */
             const uint32_t *maintenance_rows_remaining_device = nullptr;
+            /** Device due/error state paired with the maintenance row budget. */
+            const uint32_t *maintenance_due_device = nullptr;
+            /** Mutable acknowledgement left by the preceding speculative commit. */
+            uint32_t *decode_boundary_advanced_device = nullptr;
             int32_t *position_ids_device = nullptr;
             int32_t *request_lengths_device = nullptr;
             int32_t *base_cached_tokens_snapshot_device = nullptr;

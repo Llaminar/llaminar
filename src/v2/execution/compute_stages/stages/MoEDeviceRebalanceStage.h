@@ -138,15 +138,16 @@ namespace llaminar2
         ~DeviceMoERebalanceTransferState();
 
         /**
-         * @brief Materialize persistent resources before native graph capture.
+         * @brief Materialize persistent resources when the stage workspace binds.
          *
          * This is a topology operation only: it may create the context-owned
          * auxiliary stream and this transaction's two event handles, but it must
          * never enqueue work or establish a dependency on either stream. Every
-         * captured transaction records compute-ready inside the graph, performs
-         * auxiliary work, and joins transfer-done back to its public graph stream.
-         * That complete transaction edge makes graph completion the sole replay
-         * lifetime boundary and keeps exported child fragments self-contained.
+         * eager warmup or native graph capture begins. Every transaction records
+         * compute-ready on its exact producer stream, performs auxiliary work,
+         * and joins transfer-done back to its public graph stream. That complete
+         * transaction edge makes graph completion the sole replay lifetime
+         * boundary and keeps exported child fragments self-contained.
          *
          * Calling this method again is valid only for the same backend, device,
          * and named lane. A partially initialized or aliased state is a fatal
@@ -156,7 +157,7 @@ namespace llaminar2
          * @param name_suffix Stable name of the shared auxiliary stream lane.
          * @return true when all persistent resources are bound to this identity.
          */
-        bool materializeCaptureResources(
+        bool materializePersistentResources(
             DeviceId device,
             const std::string &name_suffix);
 

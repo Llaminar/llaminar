@@ -6847,18 +6847,18 @@ namespace llaminar2
                 "valid graph-owned LocalTP binding");
         }
         if (prepare_current_batch &&
-            !params_.prefill_llep_transfer_state->materializeCaptureResources(
+            !params_.prefill_llep_transfer_state->isMaterializedFor(
                 params_.device_id,
                 params_.prefill_llep_workspace_name))
         {
             throw std::runtime_error(
                 "Transfer-backed current-batch LLEP graph preparation could "
-                "not materialize its persistent transfer resources");
+                "not validate its persistent transfer resources");
         }
         if (prepare_prefix_rehydration &&
             (!params_.prefix_runtime_rehydration_transfer_state ||
              !params_.prefix_runtime_rehydration_transfer_state->
-                 materializeCaptureResources(
+                 isMaterializedFor(
                      params_.device_id,
                      params_.prefill_llep_workspace_name)))
         {
@@ -6869,7 +6869,7 @@ namespace llaminar2
 
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_rebalance_llep_prefill_capture_resources_materialized",
+            "device_rebalance_llep_prefill_capture_resources_validated",
             1.0,
             "prefill",
             params_.device_id.to_string(),
@@ -7224,6 +7224,53 @@ namespace llaminar2
         }
 
         bound_workspace_ = workspace;
+        const bool bind_current_batch =
+            requestsTransferBackedCurrentBatchPrefillLLEP();
+        const bool bind_prefix_rehydration =
+            params_.prefix_runtime_device_rehydration;
+        if (workspace && (bind_current_batch || bind_prefix_rehydration))
+        {
+            if (!hasValidCompactLLEPTransferBinding())
+            {
+                throw std::logic_error(
+                    "MoE LLEP workspace binding requires a complete compact "
+                    "transfer topology");
+            }
+            if (bind_current_batch &&
+                !params_.prefill_llep_transfer_state->
+                     materializePersistentResources(
+                         params_.device_id,
+                         params_.prefill_llep_workspace_name))
+            {
+                throw std::runtime_error(
+                    "MoE LLEP workspace binding could not materialize its "
+                    "persistent current-batch transfer resources");
+            }
+            if (bind_prefix_rehydration &&
+                (!params_.prefix_runtime_rehydration_transfer_state ||
+                 !params_.prefix_runtime_rehydration_transfer_state->
+                      materializePersistentResources(
+                          params_.device_id,
+                          params_.prefill_llep_workspace_name)))
+            {
+                throw std::runtime_error(
+                    "MoE LLEP workspace binding could not materialize its "
+                    "distinct prefix-rehydration transfer resources");
+            }
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_llep_prefill_persistent_resources_bound",
+                1.0,
+                "setup",
+                params_.device_id.to_string(),
+                {{"stage", "moe_expert_grouped_prefill"},
+                 {"layer", std::to_string(params_.layer_idx)},
+                 {"current_batch",
+                  bind_current_batch ? "transfer_backed" : "resident_only"},
+                 {"prefix_rehydration",
+                  bind_prefix_rehydration ? "enabled" : "disabled"},
+                 {"workspace", params_.prefill_llep_workspace_name}});
+        }
         LOG_TRACE("[MoEExpertComputeStage] Bound workspace to "
                   << gate.size() + up.size() + down.size() << " expert GEMM engines");
     }

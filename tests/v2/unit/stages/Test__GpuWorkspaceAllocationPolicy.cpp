@@ -14428,6 +14428,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             cuda_capture,
             "bool CUDAGraphCapture::buildDeviceControlledWhileLoop(",
             "GraphUpdateResult CUDAGraphCapture::tryUpdate()")));
+    const auto conditional_fragment_lowerer = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            cuda_capture,
+            "DeviceControlledFragmentAppendResult appendDeviceControlledFragment(",
+            "#endif")));
     const auto fixed_depth_runner_source = sliceBetween(
         runner_source,
         "if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed &&",
@@ -14437,9 +14442,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     EXPECT_NE(
         compact_header.find(
-            "std::vector<constIGPUGraphCapture*>source_fragments"),
+            "std::vector<DeviceControlledLoopFragment>source_fragments"),
         std::string::npos)
-        << "The parent must retain the exact capture identities that it cloned.";
+        << "The parent must retain exact capture, execution-policy, and "
+           "device-predicate identities.";
     EXPECT_NE(composer.find("request_count!=1"), std::string::npos);
     EXPECT_NE(
         composer.find("verifier_rows_per_request=draft_depth+1"),
@@ -14499,6 +14505,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(state_publication, terminal_hidden);
     EXPECT_LT(terminal_hidden, maintenance)
         << "Dynamic maintenance must consume exactly the transaction committed by the preceding parent fragments.";
+    EXPECT_NE(
+        composer.find(
+            "DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero"),
+        std::string::npos)
+        << "Ordinary MTP transactions must skip the complete LLEP maintenance "
+           "body and collective through a device-owned native condition.";
+    EXPECT_NE(
+        composer.find("offsetof(DeviceMoERebalanceGraphControllerState,maintenance_due)"),
+        std::string::npos)
+        << "The conditional fragment must consume the authoritative controller "
+           "field rather than a duplicated flag.";
     EXPECT_NE(
         composer.find("MTPSidecarCaptureRole::Chained"),
         std::string::npos);
@@ -14637,6 +14654,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "Every source fragment must be recursively authenticated before "
            "conditional composition.";
+    EXPECT_NE(
+        conditional_fragment_lowerer.find(
+            "updateDeviceControlledFragmentCondition"),
+        std::string::npos)
+        << "Conditional transaction fragments must lower to a device-read IF node.";
+    EXPECT_NE(
+        conditional_fragment_lowerer.find("cudaGraphCondTypeIf"),
+        std::string::npos);
+    EXPECT_EQ(
+        countOccurrences(
+            conditional_builder,
+            "appendDeviceControlledFragment("),
+        2u)
+        << "Fixed WHILE and dynamic SWITCH/WHILE must share exactly one typed "
+           "fragment-lowering authority.";
     EXPECT_EQ(
         cuda_capture.find("lowerCudaConditionalBodyEventHandoffs"),
         std::string::npos)

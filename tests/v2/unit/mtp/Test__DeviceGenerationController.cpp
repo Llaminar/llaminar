@@ -428,6 +428,173 @@ TEST(Test__DeviceGenerationController, RejectCarryAndStopMatchSerialResponseByte
     EXPECT_EQ(response, terminal_response);
 }
 
+TEST(Test__DeviceGenerationController, MaintenanceClippingPreservesEmittedConditionCarry)
+{
+    using namespace llaminar2::sampling_math;
+
+    constexpr int verifier_rows = 4;
+    ControlRow control{};
+    std::array<int32_t, 16> response{};
+    response.fill(-1);
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/8,
+        static_cast<int>(response.size()),
+        fixedDepthPolicy(verifier_rows - 1),
+        control.data()));
+
+    /*
+     * Transaction one rejects after consuming token 10.  Its correction token
+     * 20 is emitted immediately, but has no published target-model state yet;
+     * it must therefore return as the already-committed row zero of the next
+     * verifier transaction.
+     */
+    const std::array<int32_t, verifier_rows> rejection_tokens = {
+        10, 20, -1, -1};
+    MetaRow rejection_meta = makeMeta(
+        /*output_count=*/2,
+        /*leading_count=*/0,
+        /*verifier_state_count=*/1,
+        /*accepted_prefix=*/0,
+        /*consumed_rows=*/1,
+        /*all_accepted=*/false);
+    ASSERT_EQ(
+        prepare_device_generation_transaction_budget(
+            verifier_rows,
+            verifier_rows,
+            control.data()),
+        verifier_rows);
+
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int publication_ok = 0;
+    int32_t next_condition_token = -1;
+    ASSERT_TRUE(
+        commit_device_generation_and_derive_speculative_publication_metadata(
+            rejection_tokens.data(),
+            static_cast<int>(rejection_tokens.size()),
+            rejection_meta.data(),
+            static_cast<int>(rejection_meta.size()),
+            /*request_index=*/0,
+            /*padded_state_rows_per_request=*/verifier_rows,
+            /*base_cached_tokens=*/100,
+            response.data(),
+            static_cast<int>(response.size()),
+            control.data(),
+            &restore_row,
+            &target_cached_tokens,
+            &accepted_state_count,
+            &publication_ok,
+            &next_condition_token));
+    ASSERT_EQ(
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount],
+        1);
+
+    /*
+     * Maintenance permits one newly visible state row.  Because token 20 is a
+     * carried row zero, the verifier can also produce token 30.  Token 30 is
+     * emitted now but its state is deliberately not published until the next
+     * transaction, so the carry bit must remain set.
+     */
+    std::array<int32_t, verifier_rows> clipped_tokens{};
+    clipped_tokens.fill(-1);
+    std::array<int, verifier_rows - 1> clipped_samples = {30, 31, 32};
+    std::array<int, verifier_rows - 1> clipped_acceptance = {1, 1, 1};
+    MetaRow clipped_meta{};
+    ASSERT_EQ(
+        prepare_device_generation_transaction_budget(
+            verifier_rows,
+            /*maintenance_rows_remaining=*/1,
+            control.data()),
+        1);
+    summarize_speculative_verify_batch_at_commit_boundary(
+        /*first_token=*/20,
+        clipped_samples.data(),
+        clipped_acceptance.data(),
+        static_cast<int>(clipped_samples.size()),
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/33,
+        /*has_bonus_ready_token=*/1,
+        /*max_state_commit_rows=*/1,
+        clipped_tokens.data(),
+        static_cast<int>(clipped_tokens.size()),
+        clipped_meta.data(),
+        /*greedy_draft_tokens=*/nullptr,
+        /*leading_committed_output_count=*/1);
+    ASSERT_EQ(clipped_meta[kSpecBatchMetaOutputCount], 2);
+    ASSERT_EQ(clipped_meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+    ASSERT_TRUE(
+        commit_device_generation_and_derive_speculative_publication_metadata(
+            clipped_tokens.data(),
+            static_cast<int>(clipped_tokens.size()),
+            clipped_meta.data(),
+            static_cast<int>(clipped_meta.size()),
+            /*request_index=*/0,
+            /*padded_state_rows_per_request=*/verifier_rows,
+            /*base_cached_tokens=*/101,
+            response.data(),
+            static_cast<int>(response.size()),
+            control.data(),
+            &restore_row,
+            &target_cached_tokens,
+            &accepted_state_count,
+            &publication_ok,
+            &next_condition_token));
+    EXPECT_EQ(accepted_state_count, 1);
+    EXPECT_EQ(restore_row, 0);
+    EXPECT_EQ(next_condition_token, 30);
+    EXPECT_EQ(
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount],
+        1);
+    EXPECT_EQ(
+        control[kDeviceGenerationControlPublishedStateCommitCount],
+        2);
+
+    /*
+     * The next ordinary transaction consumes token 30 as row zero and emits
+     * token 40 exactly once.  The explicit response byte sequence is the
+     * regression oracle for the production symptom: clearing the carry at the
+     * clipped boundary produces {10,20,30,30,40} instead.
+     */
+    const std::array<int32_t, verifier_rows> continuation_tokens = {
+        30, 40, -1, -1};
+    MetaRow continuation_meta = makeMeta(
+        /*output_count=*/2,
+        /*leading_count=*/1,
+        /*verifier_state_count=*/1,
+        /*accepted_prefix=*/0,
+        /*consumed_rows=*/1,
+        /*all_accepted=*/false);
+    ASSERT_EQ(
+        prepare_device_generation_transaction_budget(
+            verifier_rows,
+            verifier_rows,
+            control.data()),
+        verifier_rows);
+    ASSERT_TRUE(
+        commit_device_generation_and_derive_speculative_publication_metadata(
+            continuation_tokens.data(),
+            static_cast<int>(continuation_tokens.size()),
+            continuation_meta.data(),
+            static_cast<int>(continuation_meta.size()),
+            /*request_index=*/0,
+            /*padded_state_rows_per_request=*/verifier_rows,
+            /*base_cached_tokens=*/102,
+            response.data(),
+            static_cast<int>(response.size()),
+            control.data(),
+            &restore_row,
+            &target_cached_tokens,
+            &accepted_state_count,
+            &publication_ok,
+            &next_condition_token));
+
+    const std::array<int32_t, 4> expected = {10, 20, 30, 40};
+    EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 4);
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), response.begin()));
+}
+
 TEST(Test__DeviceGenerationController, EveryProductionMTPDepthAppendsByteExactly)
 {
     using namespace llaminar2::sampling_math;

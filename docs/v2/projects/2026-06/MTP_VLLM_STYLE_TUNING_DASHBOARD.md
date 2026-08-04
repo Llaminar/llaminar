@@ -22,8 +22,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   synchronization, segmented execution, or full-logits host observation.
 - MoE prefix restore preserves stable graph addresses through explicit
   producer events. GPU FFN/MTP APIs reject null publication streams.
-- Integration unit gate: `585/585` green on 2026-08-02. Hardware-free worker
-  contexts keep unit tests CPU-only; physical CUDA/ROCm cases are Integration.
+- CUDA2 LLEP d3 device-gated maintenance parity is green across fresh and
+  clear-replay requests; clipped carry is CUDA/ROCm graph-regressed.
 
 ## Production Matrix
 
@@ -58,9 +58,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Replicated shared-expert residuals no longer enter an invalid allreduce.
   Rooted reduce+broadcast lowering remains graph-captured for genuinely sharded
   contributions and is covered on NCCL and RCCL.
-- CUDA2 phase-split prefill and serial decode match the reference. Fixed-d3
-  native-parent replay remains same-seed exact after clear/reuse, with grouped
-  verifier/publication PerfStats intact. Final MoE outputs are replicated.
+- CUDA2 phase-split fixed-d3 native-parent replay is same-seed exact after
+  clear/reuse. PerfStats proves one captured conditional maintenance fragment
+  executes when due and skips ordinary transactions; final outputs replicate.
 
 ## Kernel Economy
 

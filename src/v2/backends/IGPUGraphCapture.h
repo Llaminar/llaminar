@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -20,6 +21,20 @@ namespace llaminar2
 {
 
     class IGPUGraphCapture;
+
+    /**
+     * @brief Device-owned execution policy for one transaction fragment.
+     *
+     * Conditional fragments are still part of the one native parent graph.
+     * The policy controls whether their body executes on a particular loop
+     * iteration; it never authorizes host inspection, segmented replay, or a
+     * second launch path.
+     */
+    enum class DeviceControlledLoopFragmentExecution
+    {
+        Always,                 ///< Execute on every admitted loop iteration.
+        IfDeviceWordNonZero,    ///< Execute only when the bound device word is non-zero.
+    };
 
     /// Result of an in-place graph executable update
     enum class GraphUpdateResult
@@ -114,13 +129,47 @@ namespace llaminar2
      */
     struct DeviceControlledLoopFragment
     {
-        const char *name = nullptr;                  ///< Stable non-empty producer role.
-        const IGPUGraphCapture *capture = nullptr;   ///< Borrowed captured graph owner.
+        const char *name = nullptr;                ///< Stable non-empty producer role.
+        const IGPUGraphCapture *capture = nullptr; ///< Borrowed captured graph owner.
+        DeviceControlledLoopFragmentExecution execution =
+            DeviceControlledLoopFragmentExecution::Always;
+        /**
+         * Persistent device scalar used by @ref IfDeviceWordNonZero.
+         *
+         * The graph reads this address through a one-thread condition kernel.
+         * It must remain stable for the complete executable lifetime.
+         */
+        const uint32_t *condition_word_device = nullptr;
 
         /** @brief Verify that the fragment carries complete diagnostic identity. */
         [[nodiscard]] bool valid() const noexcept
         {
-            return name != nullptr && name[0] != '\0' && capture != nullptr;
+            bool condition_binding_valid = false;
+            switch (execution)
+            {
+            case DeviceControlledLoopFragmentExecution::Always:
+                condition_binding_valid = condition_word_device == nullptr;
+                break;
+            case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
+                condition_binding_valid = condition_word_device != nullptr;
+                break;
+            }
+            return name != nullptr && name[0] != '\0' && capture != nullptr &&
+                   condition_binding_valid;
+        }
+
+        /**
+         * @brief Compare every field embedded in a composed executable.
+         *
+         * The semantic name is diagnostic metadata. Capture identity,
+         * execution policy, and device predicate address determine replay
+         * compatibility and therefore participate in graph-cache identity.
+         */
+        [[nodiscard]] bool hasSameExecutionIdentity(
+            const DeviceControlledLoopFragment &other) const noexcept
+        {
+            return capture == other.capture && execution == other.execution &&
+                   condition_word_device == other.condition_word_device;
         }
     };
 
@@ -212,8 +261,9 @@ namespace llaminar2
          *
          * The implementation clones every element of @p ordered_body_fragments
          * into one conditional WHILE body, adds an explicit dependency from each
-         * fragment to its successor, and appends the device predicate update
-         * after the final fragment. Backend-native composers may lower internal
+         * fragment to its successor, lowers any IfDeviceWordNonZero fragment
+         * to a native device conditional, and appends the device predicate
+         * update after the final fragment. Backend-native composers may lower internal
          * multi-stream event handoffs to equivalent direct dependency edges when
          * conditional bodies do not admit event nodes. A root wait or terminal
          * record crosses the fragment boundary and must remain a hard error. The
@@ -270,6 +320,8 @@ namespace llaminar2
          * Invalid or divergent selectors execute no branch and make the request
          * terminally unhealthy. No partial common tail is permitted outside the
          * branches because it could mutate state after selector validation failed.
+         * Each branch lowers the same typed unconditional and device-word
+         * conditional fragment policies as @ref buildDeviceControlledWhileLoop.
          *
          * Branch array index is the device selector value. Entries outside the
          * declared selector interval may be empty; every entry inside it must own

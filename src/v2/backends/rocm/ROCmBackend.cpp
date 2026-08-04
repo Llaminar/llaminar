@@ -1229,6 +1229,8 @@ namespace llaminar2
         int request_count,
         int verifier_row_capacity,
         const uint32_t *maintenance_rows_remaining,
+        const uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
         int device_idx,
         void *stream);
     extern "C" bool
@@ -2764,12 +2766,24 @@ namespace llaminar2
         int request_count,
         int verifier_row_capacity,
         const void *maintenance_rows_remaining_device,
+        const void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
         int device_id,
         void *stream)
     {
+        const bool has_maintenance_boundary =
+            maintenance_rows_remaining_device != nullptr ||
+            maintenance_due_device != nullptr ||
+            decode_boundary_advanced_device != nullptr;
+        const bool has_complete_maintenance_boundary =
+            maintenance_rows_remaining_device != nullptr &&
+            maintenance_due_device != nullptr &&
+            decode_boundary_advanced_device != nullptr;
         if (device_id < 0 || device_id >= device_count_ || !control_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
-            request_count <= 0 || verifier_row_capacity <= 0 || !stream)
+            request_count <= 0 || verifier_row_capacity <= 0 || !stream ||
+            (has_maintenance_boundary &&
+             !has_complete_maintenance_boundary))
         {
             return false;
         }
@@ -2781,6 +2795,8 @@ namespace llaminar2
             request_count,
             verifier_row_capacity,
             static_cast<const uint32_t *>(maintenance_rows_remaining_device),
+            static_cast<const uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
             device_id,
             stream);
     }

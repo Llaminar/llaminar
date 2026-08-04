@@ -2308,7 +2308,11 @@ namespace llaminar2
          *
          * The generated scalar is consumed directly by the compact verifier
          * reducer.  It is the minimum of response tokens remaining, verifier
-         * graph capacity, and the device MoE maintenance boundary.
+         * graph capacity, and the device MoE maintenance boundary. When a MoE
+         * boundary is bound, admission also acknowledges the preceding
+         * speculative commit if it did not make maintenance due. A due or
+         * poisoned boundary is invalid here: its maintenance transaction must
+         * complete before another verifier can be admitted.
          */
         virtual bool enqueuePrepareDeviceGenerationTransactionBudget(
             void *control_device,
@@ -2316,6 +2320,8 @@ namespace llaminar2
             int request_count,
             int verifier_row_capacity,
             const void *maintenance_rows_remaining_device,
+            const void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
             int device_id,
             void *stream)
         {
@@ -2324,6 +2330,8 @@ namespace llaminar2
             (void)request_count;
             (void)verifier_row_capacity;
             (void)maintenance_rows_remaining_device;
+            (void)maintenance_due_device;
+            (void)decode_boundary_advanced_device;
             (void)device_id;
             (void)stream;
             return false;

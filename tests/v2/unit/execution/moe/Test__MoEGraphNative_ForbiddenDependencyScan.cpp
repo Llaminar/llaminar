@@ -2696,11 +2696,11 @@ namespace llaminar2::test
             << "Transfer-backed graph setup must be capture-only so cached and "
                "device-controlled replays require no external host preparation.";
         EXPECT_NE(
-            stage_header.find("materializeCaptureResources("),
+            stage_header.find("materializePersistentResources("),
             std::string::npos)
             << "Every multi-stream MoE stage must share one typed resource-materialization contract.";
         const size_t materialize_lane = stage_source.find(
-            "bool DeviceMoERebalanceTransferState::materializeCaptureResources");
+            "bool DeviceMoERebalanceTransferState::materializePersistentResources");
         const size_t validate_lane = stage_source.find(
             "bool DeviceMoERebalanceTransferState::isMaterializedFor",
             materialize_lane);
@@ -2726,15 +2726,24 @@ namespace llaminar2::test
             stage_source.find("bool MoEDeviceRebalanceStage::prepareGraphLaunch");
         ASSERT_NE(prepare_launch, std::string::npos);
         const size_t prepare_lane_call =
-            stage_source.find("transfer_state->materializeCaptureResources(",
+            stage_source.find("transfer_state->isMaterializedFor(",
                               prepare_launch);
         const size_t materialization_counter = stage_source.find(
-            "device_rebalance_capture_resources_materialized",
+            "device_rebalance_capture_resources_validated",
             prepare_launch);
         ASSERT_NE(prepare_lane_call, std::string::npos)
-            << "Maintenance capture must use the shared typed transfer-resource preflight.";
+            << "Maintenance capture must validate the persistent transfer-resource binding.";
         EXPECT_NE(materialization_counter, std::string::npos)
-            << "PerfStats should prove capture resources were materialized before e2e replay.";
+            << "PerfStats should prove persistent resources were validated before e2e replay.";
+        const size_t maintenance_bind = stage_source.find(
+            "void MoEDeviceRebalanceStage::bindWorkspace");
+        ASSERT_NE(maintenance_bind, std::string::npos);
+        EXPECT_NE(
+            stage_source.find(
+                "transfer_state->materializePersistentResources(",
+                maintenance_bind),
+            std::string::npos)
+            << "Maintenance topology must materialize stream/event resources at workspace binding.";
         EXPECT_EQ(stage_source.find("synchronizeStreamChecked(transfer_state->transferStream())"),
                   std::string::npos)
             << "Capture preparation must never block the host on the auxiliary stream.";
@@ -7109,16 +7118,34 @@ namespace llaminar2::test
             expert_stage_source.substr(
                 llep_prepare_begin,
                 llep_prepare_end - llep_prepare_begin);
-        EXPECT_NE(llep_prepare_body.find("prefill_llep_transfer_state->materializeCaptureResources("),
+        EXPECT_NE(llep_prepare_body.find("prefill_llep_transfer_state->isMaterializedFor("),
                   std::string::npos)
-            << "Prefill LLEP must materialize its rolling transfer resources before graph capture.";
+            << "Prefill LLEP graph preparation must validate its persistent transfer resources.";
         EXPECT_NE(
             llep_prepare_body.find(
-                "device_rebalance_llep_prefill_capture_resources_materialized"),
+                "device_rebalance_llep_prefill_capture_resources_validated"),
             std::string::npos)
-            << "PerfStats must prove prefill LLEP materialized capture resources.";
+            << "PerfStats must prove prefill LLEP validated capture resources.";
         EXPECT_EQ(llep_prepare_body.find("synchronize"), std::string::npos)
             << "Prefill capture preparation must use event ordering, never a host fence.";
+
+        const size_t llep_bind_begin = expert_stage_source.find(
+            "void MoEExpertComputeStage::bindWorkspace");
+        const size_t llep_bind_end = expert_stage_source.find(
+            "void MoEExpertComputeStage::unbindWorkspace",
+            llep_bind_begin);
+        ASSERT_NE(llep_bind_begin, std::string::npos);
+        ASSERT_NE(llep_bind_end, std::string::npos);
+        const std::string llep_bind_body = expert_stage_source.substr(
+            llep_bind_begin,
+            llep_bind_end - llep_bind_begin);
+        EXPECT_NE(
+            llep_bind_body.find("materializePersistentResources("),
+            std::string::npos)
+            << "Prefill LLEP must materialize stream/event resources at the "
+               "workspace topology boundary, before warmup can execute.";
+        EXPECT_EQ(llep_bind_body.find("synchronize"), std::string::npos)
+            << "Persistent resource binding must never insert a host fence.";
 
         const size_t maintenance_begin = maintenance_stage_source.find(
             "bool MoEDeviceRebalanceStage::execute(IDeviceContext *ctx)");

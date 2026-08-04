@@ -995,14 +995,34 @@ namespace llaminar2::sampling_math
         const int next_remaining_count = remaining_count - newly_emitted_count;
         const bool model_stopped =
             compact_meta[kSpecBatchMetaStoppedOnOutput] != 0;
+        const int transaction_budget =
+            control[kDeviceGenerationControlTransactionCommitBudget];
+        /*
+         * The compact outcome describes every physically evaluated verifier
+         * row, while the transaction budget describes the serial-visible
+         * prefix that may actually become live state.  Those counts differ at
+         * a maintenance boundary.  In particular, a transaction entered with
+         * a carried row zero may evaluate two physical rows while publishing
+         * only row zero.  Its second output has already been emitted, but is
+         * still the next transaction's condition token and must therefore be
+         * skipped by that transaction's response append.
+         *
+         * Comparing output_count with verifier_state_count loses that carry:
+         * verifier_state_count includes the row beyond the publication
+         * boundary.  Derive the exact publication count from the same budget
+         * consumed by derive_speculative_publication_metadata() so response,
+         * KV, and recurrent-state ownership advance as one transaction.
+         */
+        const int published_state_count =
+            verifier_state_count < transaction_budget
+                ? verifier_state_count
+                : transaction_budget;
         const bool has_emitted_pending_condition =
-            !model_stopped && output_count > verifier_state_count;
+            !model_stopped && output_count > published_state_count;
         const bool rejected_transaction =
             !model_stopped &&
             compact_meta[kSpecBatchMetaAllSpeculativeAccepted] == 0 &&
             compact_meta[kSpecBatchMetaCommitBoundaryClipped] == 0;
-        const int transaction_budget =
-            control[kDeviceGenerationControlTransactionCommitBudget];
         const int active_depth =
             control[kDeviceGenerationControlCurrentDraftDepth];
         const bool budget_limited =
@@ -1026,7 +1046,7 @@ namespace llaminar2::sampling_math
         control[kDeviceGenerationControlConsumedVerifierRowCount] +=
             consumed_rows;
         control[kDeviceGenerationControlPublishedStateCommitCount] +=
-            verifier_state_count;
+            published_state_count;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
         return record_device_generation_depth_observation(

@@ -6411,13 +6411,15 @@ namespace llaminar2
         {
             std::shared_ptr<void> stream;
             std::unique_ptr<IGPUGraphCapture> capture;
-            /** Exact child-capture identities cloned into the executable. */
-            std::vector<const IGPUGraphCapture *> source_fragments;
+            /** Exact child capture, policy, and predicate identities in the executable. */
+            std::vector<DeviceControlledLoopFragment> source_fragments;
             uint64_t workspace_generation = 0;
             int request_count = 0;
             int draft_depth = 0;
             int verifier_rows_per_request = 0;
             size_t fragment_count = 0;
+            /** Number of fragments whose execution is selected by device state. */
+            size_t conditional_fragment_count = 0;
             bool valid = false;
             bool launched = false;
 
@@ -6449,6 +6451,7 @@ namespace llaminar2
                 draft_depth = 0;
                 verifier_rows_per_request = 0;
                 fragment_count = 0;
+                conditional_fragment_count = 0;
                 valid = false;
                 launched = false;
                 source_fragments.clear();

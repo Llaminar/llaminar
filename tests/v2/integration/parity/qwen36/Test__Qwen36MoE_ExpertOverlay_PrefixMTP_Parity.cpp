@@ -1600,6 +1600,37 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPLLEPPha
 }
 
 /**
+ * @brief Proves fixed-depth CUDA LLEP conditionally executes maintenance in-graph.
+ *
+ * One complete 64-token LLEP prefill evidence window exercises the persistent
+ * transfer-resource lifecycle without paying for the unrelated long-context
+ * ledger. The canonical cadence then makes maintenance due after five committed
+ * tokens and every four tokens thereafter. Sixteen output tokens provide both
+ * due and ordinary fixed-depth transactions. The shared stochastic parity
+ * harness also repeats the request after clearCache(), proving that the same
+ * native parent executable retains byte-identical decode behavior and device
+ * predicate ownership across request reset.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     StochasticMTPDepth3DeviceGatedMaintenance_CUDA2TPLLEPPhaseSplit)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*draft_depth=*/3,
+        /*require_stochastic_outcome_after_reuse=*/true,
+        MTPDepthPolicyConfig{},
+        /*enable_prefix_cache=*/false,
+        /*clear_cache_repetitions=*/1,
+        /*minimum_decode_steps=*/16,
+        /*required_first_request_draft_depth=*/0,
+        /*maximum_prompt_tokens=*/64,
+        qwen36MoEProductionStochasticSamplingParams(),
+        /*prefix_block_size=*/0,
+        MoEDeviceMaintenanceCoverage::
+            ExecutedAndSkippedInsideCapturedLoop);
+}
+
+/**
  * @brief Proves stochastic grouped MTP remains serial-equivalent while CUDA
  *        LLEP assignment and exact prefix restore are active.
  *

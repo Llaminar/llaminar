@@ -761,7 +761,6 @@ namespace
             expected_response.size() * sizeof(int32_t), device_id_);
         void *d_control = backend_->allocate(
             expected_control.size() * sizeof(int), device_id_);
-        void *d_maintenance = backend_->allocate(sizeof(uint32_t), device_id_);
         void *d_restore_rows = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_target_cached_tokens = backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_accepted_state_counts = backend_->allocate(request_count * sizeof(int), device_id_);
@@ -794,7 +793,6 @@ namespace
                 d_terminal_replay_base,
                 d_response,
                 d_control,
-                d_maintenance,
                 d_restore_rows,
                 d_target_cached_tokens,
                 d_accepted_state_counts,
@@ -824,7 +822,6 @@ namespace
         ASSERT_NE(d_terminal_replay_base, nullptr);
         ASSERT_NE(d_response, nullptr);
         ASSERT_NE(d_control, nullptr);
-        ASSERT_NE(d_maintenance, nullptr);
         ASSERT_NE(d_restore_rows, nullptr);
         ASSERT_NE(d_target_cached_tokens, nullptr);
         ASSERT_NE(d_accepted_state_counts, nullptr);
@@ -845,7 +842,6 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                const uint32_t maintenance_rows = verifier_row_capacity;
                 std::array<int32_t, request_count * response_token_stride>
                     initial_response{};
                 initial_response.fill(-1);
@@ -877,9 +873,6 @@ namespace
                 ASSERT_TRUE(copyHostToDevice(
                     d_response, initial_response.data(),
                     initial_response.size() * sizeof(int32_t), device_id_, stream));
-                ASSERT_TRUE(copyHostToDevice(
-                    d_maintenance, &maintenance_rows,
-                    sizeof(maintenance_rows), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 EXPECT_FALSE(backend_->enqueueInitializeDeviceGeneration(
@@ -891,7 +884,11 @@ namespace
                 EXPECT_FALSE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
-                        verifier_row_capacity, d_maintenance, device_id_, nullptr));
+                        verifier_row_capacity,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_, nullptr));
                 EXPECT_FALSE(
                     backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
                         d_first_tokens, output_token_stride, d_first_meta,
@@ -918,7 +915,11 @@ namespace
                 ASSERT_TRUE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
-                        verifier_row_capacity, d_maintenance, device_id_, stream));
+                        verifier_row_capacity,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_, stream));
                 ASSERT_TRUE(
                     backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
                         d_first_tokens, output_token_stride, d_first_meta,
@@ -935,7 +936,11 @@ namespace
                 ASSERT_TRUE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
-                        verifier_row_capacity, d_maintenance, device_id_, stream));
+                        verifier_row_capacity,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_, stream));
                 ASSERT_TRUE(
                     backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
                         d_second_tokens, output_token_stride, d_second_meta,
@@ -958,7 +963,11 @@ namespace
                 ASSERT_TRUE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
-                        verifier_row_capacity, d_maintenance, device_id_, stream));
+                        verifier_row_capacity,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_, stream));
                 ASSERT_TRUE(
                     backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
                         d_first_tokens, output_token_stride, d_first_meta,
@@ -1120,6 +1129,576 @@ namespace
     }
 
     /**
+     * @brief Prove a maintenance-clipped emitted condition remains a carry row.
+     *
+     * This is the backend regression for a CUDA2 LLEP failure that emitted one
+     * correction token twice. Transaction one emits a rejected correction;
+     * transaction two enters with that carried row zero and is clipped to one
+     * newly publishable state row by the resident maintenance budget. It still
+     * emits the next condition token, so transaction three must skip that token
+     * when it returns as row zero. The expected response is asserted directly,
+     * rather than generated through the shared host helper, so a common
+     * host/device accounting defect cannot bless itself as the oracle.
+     *
+     * The complete three-transaction sequence is captured and replayed twice
+     * on CUDA and ROCm. This proves initialization, budget admission, fused
+     * response/state publication, and carry ownership all remain resident and
+     * graph-replayable at the exact maintenance boundary.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures)
+    {
+        using namespace sampling_math;
+
+        constexpr int request_count = 1;
+        constexpr int verifier_rows = 4;
+        constexpr int token_stride = verifier_rows;
+        constexpr int meta_stride = kSpeculativeBatchMetaCount;
+        constexpr int response_stride = 8;
+        constexpr int control_stride = kDeviceGenerationControlCount;
+
+        using TokenRow = std::array<int32_t, token_stride>;
+        using MetaRow = std::array<int, meta_stride>;
+        auto make_meta = [](
+                             int output_count,
+                             int leading_count,
+                             int verifier_state_count,
+                             int accepted_prefix,
+                             int consumed_rows,
+                             bool all_accepted,
+                             bool boundary_clipped)
+        {
+            MetaRow meta{};
+            meta[kSpecBatchMetaOk] = 1;
+            meta[kSpecBatchMetaOutputCount] = output_count;
+            meta[kSpecBatchMetaAcceptedSpeculativePrefix] = accepted_prefix;
+            meta[kSpecBatchMetaTargetVerifierStateCommitCount] =
+                verifier_state_count;
+            meta[kSpecBatchMetaAllSpeculativeAccepted] =
+                all_accepted ? 1 : 0;
+            meta[kSpecBatchMetaConsumedVerifierRows] = consumed_rows;
+            meta[kSpecBatchMetaSampledTerminal] = all_accepted ? 1 : 0;
+            meta[kSpecBatchMetaCommitBoundaryClipped] =
+                boundary_clipped ? 1 : 0;
+            meta[kSpecBatchMetaLeadingCommittedOutputCount] = leading_count;
+            return meta;
+        };
+
+        const TokenRow rejection_tokens = {10, 20, -1, -1};
+        const TokenRow clipped_tokens = {20, 30, -1, -1};
+        const TokenRow continuation_tokens = {30, 40, -1, -1};
+        const MetaRow rejection_meta = make_meta(
+            /*output_count=*/2,
+            /*leading_count=*/0,
+            /*verifier_state_count=*/1,
+            /*accepted_prefix=*/0,
+            /*consumed_rows=*/1,
+            /*all_accepted=*/false,
+            /*boundary_clipped=*/false);
+        const MetaRow clipped_meta = make_meta(
+            /*output_count=*/2,
+            /*leading_count=*/1,
+            /*verifier_state_count=*/2,
+            /*accepted_prefix=*/1,
+            /*consumed_rows=*/1,
+            /*all_accepted=*/false,
+            /*boundary_clipped=*/true);
+        const MetaRow continuation_meta = make_meta(
+            /*output_count=*/2,
+            /*leading_count=*/1,
+            /*verifier_state_count=*/2,
+            /*accepted_prefix=*/1,
+            /*consumed_rows=*/1,
+            /*all_accepted=*/true,
+            /*boundary_clipped=*/false);
+        const int rejection_base = 100;
+        const int clipped_base = 101;
+        const int continuation_base = 102;
+        const uint32_t maintenance_rows = 1;
+        const uint32_t maintenance_due = 0;
+        const uint32_t boundary_advanced = 0;
+
+        void *d_rejection_tokens = backend_->allocate(
+            sizeof(rejection_tokens), device_id_);
+        void *d_clipped_tokens = backend_->allocate(
+            sizeof(clipped_tokens), device_id_);
+        void *d_continuation_tokens = backend_->allocate(
+            sizeof(continuation_tokens), device_id_);
+        void *d_rejection_meta = backend_->allocate(
+            sizeof(rejection_meta), device_id_);
+        void *d_clipped_meta = backend_->allocate(
+            sizeof(clipped_meta), device_id_);
+        void *d_continuation_meta = backend_->allocate(
+            sizeof(continuation_meta), device_id_);
+        void *d_rejection_base = backend_->allocate(sizeof(int), device_id_);
+        void *d_clipped_base = backend_->allocate(sizeof(int), device_id_);
+        void *d_continuation_base = backend_->allocate(sizeof(int), device_id_);
+        void *d_maintenance_rows = backend_->allocate(
+            sizeof(uint32_t), device_id_);
+        void *d_maintenance_due = backend_->allocate(
+            sizeof(uint32_t), device_id_);
+        void *d_boundary_advanced = backend_->allocate(
+            sizeof(uint32_t), device_id_);
+        void *d_response = backend_->allocate(
+            response_stride * sizeof(int32_t), device_id_);
+        void *d_control = backend_->allocate(
+            control_stride * sizeof(int), device_id_);
+        void *d_restore_row = backend_->allocate(sizeof(int), device_id_);
+        void *d_target_cached_tokens = backend_->allocate(sizeof(int), device_id_);
+        void *d_accepted_state_count = backend_->allocate(sizeof(int), device_id_);
+        void *d_publication_ok = backend_->allocate(sizeof(int), device_id_);
+        void *d_next_condition = backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_all_accepted = backend_->allocate(sizeof(int), device_id_);
+        void *d_stopped = backend_->allocate(sizeof(int), device_id_);
+        void *d_next_sidecar_condition = backend_->allocate(
+            sizeof(int32_t), device_id_);
+        void *d_next_sidecar_position = backend_->allocate(
+            sizeof(int32_t), device_id_);
+        void *d_next_verifier_condition = backend_->allocate(
+            sizeof(int32_t), device_id_);
+
+        const std::array<void *, 24> allocations = {
+            d_rejection_tokens,
+            d_clipped_tokens,
+            d_continuation_tokens,
+            d_rejection_meta,
+            d_clipped_meta,
+            d_continuation_meta,
+            d_rejection_base,
+            d_clipped_base,
+            d_continuation_base,
+            d_maintenance_rows,
+            d_maintenance_due,
+            d_boundary_advanced,
+            d_response,
+            d_control,
+            d_restore_row,
+            d_target_cached_tokens,
+            d_accepted_state_count,
+            d_publication_ok,
+            d_next_condition,
+            d_all_accepted,
+            d_stopped,
+            d_next_sidecar_condition,
+            d_next_sidecar_position,
+            d_next_verifier_condition};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        auto enqueue_commit = [&](
+                                  const void *tokens,
+                                  void *meta,
+                                  const void *base,
+                                  void *stream)
+        {
+            return backend_
+                ->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+                    tokens,
+                    token_stride,
+                    meta,
+                    meta_stride,
+                    base,
+                    request_count,
+                    verifier_rows,
+                    d_response,
+                    response_stride,
+                    d_control,
+                    control_stride,
+                    device_id_,
+                    stream,
+                    d_restore_row,
+                    d_target_cached_tokens,
+                    d_accepted_state_count,
+                    d_publication_ok,
+                    d_next_condition,
+                    d_all_accepted,
+                    d_stopped,
+                    d_next_sidecar_condition,
+                    d_next_sidecar_position,
+                    d_next_verifier_condition);
+        };
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *const stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                const std::array<std::pair<void *, const void *>, 12> uploads = {{
+                    {d_rejection_tokens, rejection_tokens.data()},
+                    {d_clipped_tokens, clipped_tokens.data()},
+                    {d_continuation_tokens, continuation_tokens.data()},
+                    {d_rejection_meta, rejection_meta.data()},
+                    {d_clipped_meta, clipped_meta.data()},
+                    {d_continuation_meta, continuation_meta.data()},
+                    {d_rejection_base, &rejection_base},
+                    {d_clipped_base, &clipped_base},
+                    {d_continuation_base, &continuation_base},
+                    {d_maintenance_rows, &maintenance_rows},
+                    {d_maintenance_due, &maintenance_due},
+                    {d_boundary_advanced, &boundary_advanced},
+                }};
+                const std::array<size_t, uploads.size()> upload_bytes = {
+                    sizeof(rejection_tokens),
+                    sizeof(clipped_tokens),
+                    sizeof(continuation_tokens),
+                    sizeof(rejection_meta),
+                    sizeof(clipped_meta),
+                    sizeof(continuation_meta),
+                    sizeof(rejection_base),
+                    sizeof(clipped_base),
+                    sizeof(continuation_base),
+                    sizeof(maintenance_rows),
+                    sizeof(maintenance_due),
+                    sizeof(boundary_advanced)};
+                for (size_t i = 0; i < uploads.size(); ++i)
+                {
+                    ASSERT_TRUE(copyHostToDevice(
+                        uploads[i].first,
+                        uploads[i].second,
+                        upload_bytes[i],
+                        device_id_,
+                        stream));
+                }
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
+                    request_count,
+                    /*max_new_tokens=*/6,
+                    DeviceGenerationDepthPolicy::fixed(verifier_rows - 1),
+                    response_stride,
+                    d_response,
+                    control_stride,
+                    d_control,
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(
+                    backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                        d_control,
+                        control_stride,
+                        request_count,
+                        verifier_rows,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(enqueue_commit(
+                    d_rejection_tokens,
+                    d_rejection_meta,
+                    d_rejection_base,
+                    stream));
+                ASSERT_TRUE(
+                    backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                        d_control,
+                        control_stride,
+                        request_count,
+                        verifier_rows,
+                        d_maintenance_rows,
+                        d_maintenance_due,
+                        d_boundary_advanced,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(enqueue_commit(
+                    d_clipped_tokens,
+                    d_clipped_meta,
+                    d_clipped_base,
+                    stream));
+                ASSERT_TRUE(
+                    backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                        d_control,
+                        control_stride,
+                        request_count,
+                        verifier_rows,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(enqueue_commit(
+                    d_continuation_tokens,
+                    d_continuation_meta,
+                    d_continuation_base,
+                    stream));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx =
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx =
+                GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::array<int32_t, response_stride> actual_response{};
+        std::array<int, control_stride> actual_control{};
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_response.data(),
+            d_response,
+            sizeof(actual_response),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_control.data(),
+            d_control,
+            sizeof(actual_control),
+            device_id_));
+
+        const std::array<int32_t, 4> expected_response = {10, 20, 30, 40};
+        EXPECT_TRUE(std::equal(
+            expected_response.begin(),
+            expected_response.end(),
+            actual_response.begin()));
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlResponseTokenCount],
+            4);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlNextLeadingCommittedOutputCount],
+            0);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlPublishedStateCommitCount],
+            4);
+        EXPECT_EQ(actual_control[kDeviceGenerationControlOk], 1);
+        EXPECT_EQ(
+            actual_control[kDeviceGenerationControlErrorCode],
+            static_cast<int>(DeviceGenerationError::None));
+
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
+    }
+
+    /**
+     * @brief Prove verifier admission consumes only an ordinary speculative boundary.
+     *
+     * Conditional CUDA maintenance skips its expensive body when a commit does
+     * not make maintenance due. The next verifier admission must still retire
+     * that commit's acknowledgement before another outcome advances the shared
+     * clock. The same captured preparation graph is replayed against an ordinary
+     * boundary and a due boundary on both GPU backends: the ordinary edge is
+     * acknowledged exactly once, while the due edge fails closed and remains
+     * available to its required maintenance transaction.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceGenerationAdmissionAcknowledgesOnlyOrdinaryMaintenanceBoundary)
+    {
+        using namespace sampling_math;
+
+        constexpr int request_count = 2;
+        constexpr int max_new_tokens = 8;
+        constexpr int response_token_stride = 8;
+        constexpr int control_stride = kDeviceGenerationControlCount;
+        constexpr int verifier_row_capacity = 4;
+
+        const size_t response_bytes =
+            static_cast<size_t>(request_count) * response_token_stride *
+            sizeof(int32_t);
+        const size_t control_bytes =
+            static_cast<size_t>(request_count) * control_stride * sizeof(int);
+        void *d_response = backend_->allocate(response_bytes, device_id_);
+        void *d_control = backend_->allocate(control_bytes, device_id_);
+        void *d_rows_remaining =
+            backend_->allocate(sizeof(uint32_t), device_id_);
+        void *d_maintenance_due =
+            backend_->allocate(sizeof(uint32_t), device_id_);
+        void *d_boundary_advanced =
+            backend_->allocate(sizeof(uint32_t), device_id_);
+        const std::array<void *, 5> allocations = {
+            d_response,
+            d_control,
+            d_rows_remaining,
+            d_maintenance_due,
+            d_boundary_advanced};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        auto cleanup = [&]()
+        {
+            for (void *allocation : allocations)
+                backend_->free(allocation, device_id_);
+        };
+
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *const stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                std::array<int32_t,
+                           request_count * response_token_stride>
+                    response{};
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(
+                    backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                        d_control,
+                        control_stride,
+                        request_count,
+                        verifier_row_capacity,
+                        d_rows_remaining,
+                        d_maintenance_due,
+                        d_boundary_advanced,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                auto initialize_controller = [&]()
+                {
+                    ASSERT_TRUE(copyHostToDevice(
+                        d_response,
+                        response.data(),
+                        response_bytes,
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
+                        request_count,
+                        max_new_tokens,
+                        DeviceGenerationDepthPolicy::fixed(
+                            verifier_row_capacity - 1),
+                        response_token_stride,
+                        d_response,
+                        control_stride,
+                        d_control,
+                        device_id_,
+                        stream));
+                };
+
+                uint32_t rows_remaining = 3u;
+                uint32_t maintenance_due = 0u;
+                uint32_t boundary_advanced = 1u;
+                initialize_controller();
+                ASSERT_TRUE(copyHostToDevice(
+                    d_rows_remaining,
+                    &rows_remaining,
+                    sizeof(rows_remaining),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_maintenance_due,
+                    &maintenance_due,
+                    sizeof(maintenance_due),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_boundary_advanced,
+                    &boundary_advanced,
+                    sizeof(boundary_advanced),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                std::array<int, request_count * control_stride> control{};
+                ASSERT_TRUE(copyDeviceToHost(
+                    control.data(), d_control, control_bytes, device_id_));
+                ASSERT_TRUE(copyDeviceToHost(
+                    &boundary_advanced,
+                    d_boundary_advanced,
+                    sizeof(boundary_advanced),
+                    device_id_));
+                ASSERT_TRUE(copyDeviceToHost(
+                    &maintenance_due,
+                    d_maintenance_due,
+                    sizeof(maintenance_due),
+                    device_id_));
+                EXPECT_EQ(boundary_advanced, 0u);
+                EXPECT_EQ(maintenance_due, 0u);
+                for (int request = 0; request < request_count; ++request)
+                {
+                    const int *row =
+                        control.data() + request * control_stride;
+                    EXPECT_EQ(row[kDeviceGenerationControlOk], 1);
+                    EXPECT_EQ(
+                        row[kDeviceGenerationControlTransactionCommitBudget],
+                        3);
+                }
+
+                rows_remaining = 0u;
+                maintenance_due = 1u;
+                boundary_advanced = 1u;
+                initialize_controller();
+                ASSERT_TRUE(copyHostToDevice(
+                    d_rows_remaining,
+                    &rows_remaining,
+                    sizeof(rows_remaining),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_maintenance_due,
+                    &maintenance_due,
+                    sizeof(maintenance_due),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_boundary_advanced,
+                    &boundary_advanced,
+                    sizeof(boundary_advanced),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                ASSERT_TRUE(copyDeviceToHost(
+                    control.data(), d_control, control_bytes, device_id_));
+                ASSERT_TRUE(copyDeviceToHost(
+                    &boundary_advanced,
+                    d_boundary_advanced,
+                    sizeof(boundary_advanced),
+                    device_id_));
+                ASSERT_TRUE(copyDeviceToHost(
+                    &maintenance_due,
+                    d_maintenance_due,
+                    sizeof(maintenance_due),
+                    device_id_));
+                EXPECT_EQ(boundary_advanced, 1u);
+                EXPECT_EQ(maintenance_due, 1u);
+                for (int request = 0; request < request_count; ++request)
+                {
+                    const int *row =
+                        control.data() + request * control_stride;
+                    EXPECT_EQ(row[kDeviceGenerationControlOk], 0);
+                    EXPECT_EQ(
+                        row[kDeviceGenerationControlErrorCode],
+                        static_cast<int>(
+                            DeviceGenerationError::InvalidController));
+                    EXPECT_EQ(
+                        row[kDeviceGenerationControlTransactionCommitBudget],
+                        0);
+                }
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        }
+        else
+        {
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+        }
+
+        cleanup();
+    }
+
+    /**
      * @brief Regress dynamic-depth budget composition through the real GPU kernels.
      *
      * Production may configure a maximum MTP depth of fifteen while selecting
@@ -1166,8 +1745,6 @@ namespace
         stop_tokens.fill(-1);
         const int base_position = 23;
         const std::array<int, 1> base_cached_tokens = {base_position};
-        const uint32_t maintenance_rows = active_verifier_rows;
-
         const size_t output_bytes =
             static_cast<size_t>(output_token_stride) * sizeof(int32_t);
         const size_t meta_bytes =
@@ -1183,7 +1760,6 @@ namespace
         void *d_stop_tokens = backend_->allocate(sizeof(stop_tokens), device_id_);
         void *d_base_position = backend_->allocate(sizeof(base_position), device_id_);
         void *d_base_cached_tokens = backend_->allocate(sizeof(base_cached_tokens), device_id_);
-        void *d_maintenance_rows = backend_->allocate(sizeof(maintenance_rows), device_id_);
         void *d_sampled = backend_->allocate(output_bytes, device_id_);
         void *d_output = backend_->allocate(output_bytes, device_id_);
         void *d_meta = backend_->allocate(meta_bytes, device_id_);
@@ -1202,14 +1778,13 @@ namespace
             backend_->allocate(sizeof(int32_t), device_id_);
         void *d_next_sidecar_position_id =
             backend_->allocate(sizeof(int32_t), device_id_);
-        const std::array<void *, 22> allocations = {
+        const std::array<void *, 21> allocations = {
             d_target_ids,
             d_target_probs,
             d_verifier_input,
             d_stop_tokens,
             d_base_position,
             d_base_cached_tokens,
-            d_maintenance_rows,
             d_sampled,
             d_output,
             d_meta,
@@ -1261,9 +1836,6 @@ namespace
                     d_base_cached_tokens, base_cached_tokens.data(),
                     sizeof(base_cached_tokens), device_id_, stream));
                 ASSERT_TRUE(copyHostToDevice(
-                    d_maintenance_rows, &maintenance_rows,
-                    sizeof(maintenance_rows), device_id_, stream));
-                ASSERT_TRUE(copyHostToDevice(
                     d_response, initial_response.data(), response_bytes,
                     device_id_, stream));
 
@@ -1286,7 +1858,9 @@ namespace
                         control_stride,
                         /*request_count=*/1,
                         active_verifier_rows,
-                        d_maintenance_rows,
+                        /*maintenance_rows_remaining_device=*/nullptr,
+                        /*maintenance_due_device=*/nullptr,
+                        /*decode_boundary_advanced_device=*/nullptr,
                         device_id_,
                         stream));
                 ASSERT_TRUE(
@@ -1556,6 +2130,8 @@ namespace
                     request_count,
                     verifier_row_capacity,
                     /*maintenance_rows_remaining_device=*/nullptr,
+                    /*maintenance_due_device=*/nullptr,
+                    /*decode_boundary_advanced_device=*/nullptr,
                     device_id_,
                     prepare_stream));
             ASSERT_TRUE(prepare->endCapture());
@@ -1688,6 +2264,210 @@ namespace
             actual_next_sidecar_position_id,
             base_cached_tokens.front() +
                 compact_meta[kSpecBatchMetaTargetVerifierStateCommitCount]);
+
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
+    }
+
+    /**
+     * @brief Prove a device word conditionally admits one complete graph fragment.
+     *
+     * The same instantiated parent is replayed twice. With the predicate word
+     * clear, the mandatory transaction commits but its conditional tail leaves
+     * the trace untouched. After resetting only device contents and setting the
+     * predicate word, the identical executable must run the tail exactly once.
+     * This is the focused contract used to omit non-due LLEP maintenance and
+     * its collective without host scheduling or graph recapture. Running the
+     * same contract through WHILE and SWITCH/WHILE also proves fixed and
+     * dynamic depth share one fragment-execution policy.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceControlledGraphLoopConditionallyExecutesDeviceOwnedFragment)
+    {
+        if (GetParam() != "CUDA")
+            GTEST_SKIP() << "CUDA conditional graph coverage is backend-specific";
+
+        constexpr int healthy_index = 0;
+        constexpr int complete_index = 1;
+        constexpr int selector_index = 2;
+        constexpr int error_index = 3;
+        constexpr int control_stride = 4;
+        constexpr int trace_sentinel = -1;
+        constexpr int trace_publication = 7331;
+        const std::array<int, control_stride> initial_control = {1, 0, 0, 0};
+        constexpr int complete = 1;
+        constexpr uint32_t condition_clear = 0u;
+        constexpr uint32_t condition_set = 1u;
+
+        void *d_control = backend_->allocate(
+            control_stride * sizeof(int), device_id_);
+        void *d_complete = backend_->allocate(sizeof(int), device_id_);
+        void *d_condition = backend_->allocate(sizeof(uint32_t), device_id_);
+        void *d_trace = backend_->allocate(sizeof(int), device_id_);
+        void *d_trace_publication = backend_->allocate(sizeof(int), device_id_);
+        const std::array<void *, 5> allocations = {
+            d_control,
+            d_complete,
+            d_condition,
+            d_trace,
+            d_trace_publication};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        auto &cuda_context =
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+        cuda_context.submitAndWait([&]()
+        {
+            void *const parent_stream = cuda_context.createStream();
+            void *const transaction_stream = cuda_context.createStream();
+            void *const conditional_stream = cuda_context.createStream();
+            ASSERT_NE(parent_stream, nullptr);
+            ASSERT_NE(transaction_stream, nullptr);
+            ASSERT_NE(conditional_stream, nullptr);
+
+            ASSERT_TRUE(copyHostToDevice(
+                d_complete,
+                &complete,
+                sizeof(complete),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyHostToDevice(
+                d_trace_publication,
+                &trace_publication,
+                sizeof(trace_publication),
+                device_id_,
+                parent_stream));
+
+            auto transaction =
+                cuda_context.createGraphCapture(transaction_stream);
+            ASSERT_NE(transaction, nullptr);
+            ASSERT_TRUE(transaction->beginCapture());
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                static_cast<int *>(d_control) + complete_index,
+                d_complete,
+                sizeof(int),
+                device_id_,
+                transaction_stream));
+            ASSERT_TRUE(transaction->endCapture());
+
+            auto conditional =
+                cuda_context.createGraphCapture(conditional_stream);
+            ASSERT_NE(conditional, nullptr);
+            ASSERT_TRUE(conditional->beginCapture());
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                d_trace,
+                d_trace_publication,
+                sizeof(int),
+                device_id_,
+                conditional_stream));
+            ASSERT_TRUE(conditional->endCapture());
+
+            auto parent = cuda_context.createGraphCapture(parent_stream);
+            ASSERT_NE(parent, nullptr);
+            const std::array<DeviceControlledLoopFragment, 2> fragments = {{
+                {
+                    .name = "terminal transaction",
+                    .capture = transaction.get(),
+                },
+                {
+                    .name = "conditional maintenance",
+                    .capture = conditional.get(),
+                    .execution = DeviceControlledLoopFragmentExecution::
+                        IfDeviceWordNonZero,
+                    .condition_word_device =
+                        static_cast<const uint32_t *>(d_condition),
+                },
+            }};
+            ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(
+                fragments,
+                DeviceControlledLoopPredicate{
+                    .control_rows_device =
+                        static_cast<const int *>(d_control),
+                    .control_stride = control_stride,
+                    .request_count = 1,
+                    .healthy_index = healthy_index,
+                    .complete_index = complete_index,
+                }));
+            ASSERT_TRUE(parent->instantiate());
+
+            auto run_case = [&](uint32_t condition, int expected_trace)
+            {
+                int actual_trace = 0;
+                ASSERT_TRUE(copyHostToDevice(
+                    d_control,
+                    initial_control.data(),
+                    sizeof(initial_control),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_trace,
+                    &trace_sentinel,
+                    sizeof(trace_sentinel),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_condition,
+                    &condition,
+                    sizeof(condition),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(parent->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    &actual_trace,
+                    d_trace,
+                    sizeof(actual_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(backend_->synchronizeStream(
+                    parent_stream,
+                    device_id_));
+                EXPECT_EQ(actual_trace, expected_trace);
+            };
+
+            run_case(condition_clear, trace_sentinel);
+            run_case(condition_set, trace_publication);
+
+            const std::array<DeviceControlledLoopBranch, 1> branches = {{
+                {
+                    .ordered_fragments = fragments,
+                },
+            }};
+            ASSERT_TRUE(parent->supportsDeviceControlledSwitchWhileLoop());
+            ASSERT_TRUE(parent->buildDeviceControlledSwitchWhileLoop(
+                branches,
+                DeviceControlledLoopPredicate{
+                    .control_rows_device =
+                        static_cast<const int *>(d_control),
+                    .control_stride = control_stride,
+                    .request_count = 1,
+                    .healthy_index = healthy_index,
+                    .complete_index = complete_index,
+                },
+                DeviceControlledLoopSwitch{
+                    .control_rows_device = static_cast<int *>(d_control),
+                    .control_stride = control_stride,
+                    .request_count = 1,
+                    .healthy_index = healthy_index,
+                    .complete_index = complete_index,
+                    .selector_index = selector_index,
+                    .error_index = error_index,
+                    .minimum_selector = 0,
+                    .maximum_selector = 0,
+                    .invalid_selector_error = 9101,
+                }));
+            ASSERT_TRUE(parent->instantiate());
+
+            run_case(condition_clear, trace_sentinel);
+            run_case(condition_set, trace_publication);
+
+            parent.reset();
+            conditional.reset();
+            transaction.reset();
+            cuda_context.destroyStream(conditional_stream);
+            cuda_context.destroyStream(transaction_stream);
+            cuda_context.destroyStream(parent_stream);
+        });
 
         for (void *allocation : allocations)
             backend_->free(allocation, device_id_);

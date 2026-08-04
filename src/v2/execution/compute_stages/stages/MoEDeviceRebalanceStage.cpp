@@ -84,7 +84,7 @@ namespace llaminar2
         release();
     }
 
-    bool DeviceMoERebalanceTransferState::materializeCaptureResources(
+    bool DeviceMoERebalanceTransferState::materializePersistentResources(
         DeviceId device,
         const std::string &name_suffix)
     {
@@ -1853,11 +1853,11 @@ namespace llaminar2
                       << " device=" << params_.device_id.to_string());
             return false;
         }
-        if (!transfer_state->materializeCaptureResources(
+        if (!transfer_state->isMaterializedFor(
                 params_.device_id,
                 workspaceSuffix()))
         {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Capture resource materialization failed"
+            LOG_ERROR("[MoEDeviceRebalanceStage] Persistent transfer resources were not bound before graph preparation"
                       << " stage=" << suffixFor(params_.stage_name)
                       << " phase=" << phaseName(params_.phase)
                       << " device=" << params_.device_id.to_string()
@@ -1866,7 +1866,7 @@ namespace llaminar2
         }
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_rebalance_capture_resources_materialized",
+            "device_rebalance_capture_resources_validated",
             1.0,
             "decode",
             params_.device_id.to_string(),
@@ -2047,6 +2047,28 @@ namespace llaminar2
     void MoEDeviceRebalanceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
+        if (!workspace || !usesTransferSlotApply())
+            return;
+
+        auto *transfer_state = transferState();
+        if (!transfer_state ||
+            !transfer_state->materializePersistentResources(
+                params_.device_id,
+                workspaceSuffix()))
+        {
+            throw std::runtime_error(
+                "MoE device-rebalance workspace binding could not materialize "
+                "its persistent transfer stream and events");
+        }
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_rebalance_persistent_transfer_resources_bound",
+            1.0,
+            "setup",
+            params_.device_id.to_string(),
+            {{"stage", suffixFor(params_.stage_name)},
+             {"phase", phaseName(params_.phase)},
+             {"participant", std::to_string(params_.tp_device_idx)}});
     }
 
     void MoEDeviceRebalanceStage::unbindWorkspace()

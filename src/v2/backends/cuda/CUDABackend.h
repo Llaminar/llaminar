@@ -579,6 +579,8 @@ namespace llaminar2
             int request_count,
             int verifier_row_capacity,
             const void *maintenance_rows_remaining_device,
+            const void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
             int device_id,
             void *stream) override;
         bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(

@@ -4659,22 +4659,46 @@ __global__ void cuda_initialize_device_generation_kernel(
 }
 
 /**
- * @brief Publish each request's next serial-visible verifier-row budget.
+ * @brief Acknowledge an ordinary prior boundary and publish the next budget.
+ *
+ * A speculative outcome leaves `decode_boundary_advanced` set so the due
+ * maintenance transaction can consume that exact edge without advancing the
+ * clock twice. When the outcome did not make maintenance due, the next verifier
+ * admission is the structural consumer of that acknowledgement. A due,
+ * poisoned, or malformed boundary is rejected before any new transaction can
+ * observe a budget.
  */
 __global__ void cuda_prepare_device_generation_transaction_budget_kernel(
     int *__restrict__ control,
     int control_stride,
     int request_count,
     int verifier_row_capacity,
-    const uint32_t *__restrict__ maintenance_rows_remaining)
+    const uint32_t *__restrict__ maintenance_rows_remaining,
+    const uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
         return;
 
-    const int maintenance_budget = maintenance_rows_remaining
-                                       ? static_cast<int>(*maintenance_rows_remaining)
-                                       : verifier_row_capacity;
+    const bool maintenance_boundary_bound =
+        maintenance_rows_remaining || maintenance_due ||
+        decode_boundary_advanced;
+    const bool maintenance_boundary_complete =
+        maintenance_rows_remaining && maintenance_due &&
+        decode_boundary_advanced;
+    const uint32_t due =
+        maintenance_boundary_complete ? *maintenance_due : 0u;
+    const uint32_t boundary_advanced =
+        maintenance_boundary_complete ? *decode_boundary_advanced : 0u;
+    const bool maintenance_boundary_valid =
+        !maintenance_boundary_bound ||
+        (maintenance_boundary_complete && due == 0u &&
+         boundary_advanced <= 1u);
+    const int maintenance_budget =
+        maintenance_boundary_valid && maintenance_rows_remaining
+            ? static_cast<int>(*maintenance_rows_remaining)
+            : (maintenance_boundary_valid ? verifier_row_capacity : 0);
     int *request_control =
         control + static_cast<size_t>(request_index) *
                       static_cast<size_t>(control_stride);
@@ -4682,6 +4706,17 @@ __global__ void cuda_prepare_device_generation_transaction_budget_kernel(
         verifier_row_capacity,
         maintenance_budget,
         request_control);
+
+    /*
+     * Exactly one lane retires the shared acknowledgement. Other lanes may
+     * observe either one or zero, both of which are valid ordinary states; no
+     * request depends on the value after validating it.
+     */
+    if (request_index == 0 && maintenance_boundary_valid &&
+        maintenance_boundary_complete && boundary_advanced == 1u)
+    {
+        *decode_boundary_advanced = 0u;
+    }
 }
 
 /**
@@ -7825,13 +7860,23 @@ extern "C"
         int request_count,
         int verifier_row_capacity,
         const uint32_t *maintenance_rows_remaining,
+        const uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
         int device_idx,
         void *stream)
     {
+        const bool has_maintenance_boundary =
+            maintenance_rows_remaining || maintenance_due ||
+            decode_boundary_advanced;
+        const bool has_complete_maintenance_boundary =
+            maintenance_rows_remaining && maintenance_due &&
+            decode_boundary_advanced;
         if (!control ||
             control_stride <
                 llaminar2::sampling_math::kDeviceGenerationControlCount ||
-            request_count <= 0 || verifier_row_capacity <= 0 || !stream)
+            request_count <= 0 || verifier_row_capacity <= 0 || !stream ||
+            (has_maintenance_boundary &&
+             !has_complete_maintenance_boundary))
         {
             return false;
         }
@@ -7850,7 +7895,9 @@ extern "C"
             control_stride,
             request_count,
             verifier_row_capacity,
-            maintenance_rows_remaining);
+            maintenance_rows_remaining,
+            maintenance_due,
+            decode_boundary_advanced);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

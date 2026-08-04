@@ -74,6 +74,7 @@
 #include <map>
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -15924,7 +15925,10 @@ namespace llaminar2
         mtp_device_generation_loop_fragment_scratch_.clear();
         auto append = [&](const char *fragment_name,
                           const auto &view,
-                          const std::string &fragment_error) -> bool
+                          const std::string &fragment_error,
+                          DeviceControlledLoopFragmentExecution execution =
+                              DeviceControlledLoopFragmentExecution::Always,
+                          const uint32_t *condition_word_device = nullptr) -> bool
         {
             if (!view || !view->capture)
             {
@@ -15939,6 +15943,8 @@ namespace llaminar2
                 DeviceControlledLoopFragment{
                     .name = fragment_name,
                     .capture = view->capture,
+                    .execution = execution,
+                    .condition_word_device = condition_word_device,
                 });
             return true;
         };
@@ -16076,22 +16082,33 @@ namespace llaminar2
          *
          * Tail placement is important. Cloning maintenance at the head would
          * consume the first transaction twice: once during the mandatory
-         * standalone first-use warmup/capture and again in iteration zero. The
-         * terminal iteration may execute one device-gated no-work maintenance
-         * boundary, but it cannot expose state to a later consumer because the
-         * parent publishes only after the complete WHILE has terminated.
+         * standalone first-use warmup/capture and again in iteration zero.
+         * The serial-outcome fragment publishes `maintenance_due`; the typed
+         * IfDeviceWordNonZero policy then skips the complete maintenance body,
+         * including its collective, on ordinary iterations. A due edge still
+         * executes exactly once before the loop predicate admits another
+         * transaction.
          */
         if (include_device_moe_maintenance)
         {
             const auto &maintenance =
                 device_moe_rebalance_maintenance_graph_;
+            const DeviceMoERebalanceGraphControllerState *const controller =
+                deviceMoERebalanceControllerStateDevice();
             if (!maintenance.graph ||
                 maintenance.workspace_generation == 0 ||
-                maintenance.workspace_generation != generation)
+                maintenance.workspace_generation != generation ||
+                !controller)
             {
                 return fail(
                     "device-generation parent graph has no current device MoE maintenance owner");
             }
+            const auto *const maintenance_due_device =
+                reinterpret_cast<const uint32_t *>(
+                    reinterpret_cast<const std::byte *>(controller) +
+                    offsetof(
+                        DeviceMoERebalanceGraphControllerState,
+                        maintenance_due));
             auto maintenance_fragment =
                 maintenance.segment_cache.deviceLoopGraphTemplate(
                     *maintenance.graph,
@@ -16099,7 +16116,10 @@ namespace llaminar2
             if (!append(
                     "device MoE maintenance",
                     maintenance_fragment,
-                    fragment_error))
+                    fragment_error,
+                    DeviceControlledLoopFragmentExecution::
+                        IfDeviceWordNonZero,
+                    maintenance_due_device))
             {
                 return false;
             }
@@ -16111,6 +16131,15 @@ namespace llaminar2
             return fail(
                 "device-generation parent graph assembled an unexpected fragment count");
         }
+        const size_t conditional_fragment_count =
+            static_cast<size_t>(std::count_if(
+                mtp_device_generation_loop_fragment_scratch_.begin(),
+                mtp_device_generation_loop_fragment_scratch_.end(),
+                [](const DeviceControlledLoopFragment &fragment)
+                {
+                    return fragment.execution !=
+                           DeviceControlledLoopFragmentExecution::Always;
+                }));
 
         const bool source_identity_matches =
             loop.source_fragments.size() == expected_fragment_count &&
@@ -16118,10 +16147,10 @@ namespace llaminar2
                 loop.source_fragments.begin(),
                 loop.source_fragments.end(),
                 mtp_device_generation_loop_fragment_scratch_.begin(),
-                [](const IGPUGraphCapture *source,
+                [](const DeviceControlledLoopFragment &source,
                    const DeviceControlledLoopFragment &candidate)
                 {
-                    return source == candidate.capture;
+                    return source.hasSameExecutionIdentity(candidate);
                 });
         if (loop.valid && loop.capture->hasExecutable() &&
             loop.workspace_generation == generation &&
@@ -16129,6 +16158,7 @@ namespace llaminar2
             loop.draft_depth == draft_depth &&
             loop.verifier_rows_per_request == verifier_rows_per_request &&
             loop.fragment_count == expected_fragment_count &&
+            loop.conditional_fragment_count == conditional_fragment_count &&
             source_identity_matches)
         {
             PerfStatsCollector::addCounter(
@@ -16141,6 +16171,8 @@ namespace llaminar2
                  {"requests", std::to_string(request_count)},
                  {"draft_depth", std::to_string(draft_depth)},
                  {"fragments", std::to_string(expected_fragment_count)},
+                 {"conditional_fragments",
+                  std::to_string(conditional_fragment_count)},
                  {"workspace_generation", std::to_string(generation)}});
             return true;
         }
@@ -16167,13 +16199,14 @@ namespace llaminar2
         for (const DeviceControlledLoopFragment &fragment :
              mtp_device_generation_loop_fragment_scratch_)
         {
-            loop.source_fragments.push_back(fragment.capture);
+            loop.source_fragments.push_back(fragment);
         }
         loop.workspace_generation = generation;
         loop.request_count = request_count;
         loop.draft_depth = draft_depth;
         loop.verifier_rows_per_request = verifier_rows_per_request;
         loop.fragment_count = expected_fragment_count;
+        loop.conditional_fragment_count = conditional_fragment_count;
         loop.valid = true;
         loop.launched = false;
 
@@ -16191,6 +16224,8 @@ namespace llaminar2
              {"physical_verifier_rows",
               std::to_string(physical_verifier_rows_per_request)},
              {"fragments", std::to_string(expected_fragment_count)},
+             {"conditional_fragments",
+              std::to_string(conditional_fragment_count)},
              {"device_moe_maintenance",
               include_device_moe_maintenance ? "true" : "false"},
              {"workspace_generation", std::to_string(generation)},
@@ -30889,8 +30924,8 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Controlled grouped-verifier preparation could not bind the MoE maintenance controller");
             return false;
         }
-        const auto *rebalance_controller_bytes =
-            reinterpret_cast<const std::byte *>(rebalance_controller);
+        auto *rebalance_controller_bytes =
+            reinterpret_cast<std::byte *>(rebalance_controller);
         stage_params.generation_control_device =
             generation_controller_owned
                 ? device_generation_storage_.control_device
@@ -30906,6 +30941,22 @@ namespace llaminar2
                       offsetof(
                           DeviceMoERebalanceGraphControllerState,
                           decode_rounds_until_maintenance))
+                : nullptr;
+        stage_params.maintenance_due_device =
+            rebalance_controller
+                ? reinterpret_cast<const uint32_t *>(
+                      rebalance_controller_bytes +
+                      offsetof(
+                          DeviceMoERebalanceGraphControllerState,
+                          maintenance_due))
+                : nullptr;
+        stage_params.decode_boundary_advanced_device =
+            rebalance_controller
+                ? reinterpret_cast<uint32_t *>(
+                      rebalance_controller_bytes +
+                      offsetof(
+                          DeviceMoERebalanceGraphControllerState,
+                          decode_boundary_advanced))
                 : nullptr;
         stage_params.position_ids_device =
             static_cast<int32_t *>(mtp_verifier_position_ids_dev_);
@@ -39825,6 +39876,8 @@ namespace llaminar2
              {"requests", std::to_string(request_count)},
              {"draft_depth", std::to_string(loop.draft_depth)},
              {"fragments", std::to_string(loop.fragment_count)},
+             {"conditional_fragments",
+              std::to_string(loop.conditional_fragment_count)},
              {"execution", "single_async_native_while_launch"}});
         return true;
     }

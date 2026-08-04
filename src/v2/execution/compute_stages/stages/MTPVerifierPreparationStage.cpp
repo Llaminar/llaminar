@@ -42,6 +42,14 @@ namespace llaminar2
         const int total_rows = params_.request_count * params_.padded_seq_len;
         const bool has_generation_control =
             params_.generation_control_device != nullptr;
+        const bool has_any_maintenance_boundary =
+            params_.maintenance_rows_remaining_device != nullptr ||
+            params_.maintenance_due_device != nullptr ||
+            params_.decode_boundary_advanced_device != nullptr;
+        const bool has_complete_maintenance_boundary =
+            params_.maintenance_rows_remaining_device != nullptr &&
+            params_.maintenance_due_device != nullptr &&
+            params_.decode_boundary_advanced_device != nullptr;
         if (!params_.device_id.is_gpu() || !params_.backend)
         {
             LOG_ERROR("[MTPVerifierPreparationStage] An explicit GPU backend is required");
@@ -80,9 +88,12 @@ namespace llaminar2
                 (params_.generation_control_stride > 0) ||
             (has_generation_control &&
              params_.generation_control_stride <
-                 sampling_math::kDeviceGenerationControlCount))
+                 sampling_math::kDeviceGenerationControlCount) ||
+            (has_any_maintenance_boundary &&
+             (!has_generation_control ||
+              !has_complete_maintenance_boundary)))
         {
-            LOG_ERROR("[MTPVerifierPreparationStage] Device-generation controller geometry is incomplete");
+            LOG_ERROR("[MTPVerifierPreparationStage] Device-generation controller or maintenance-boundary geometry is incomplete");
             return false;
         }
         if (static_cast<int>(params_.main_kv_checkpoints.size()) !=
@@ -126,6 +137,8 @@ namespace llaminar2
                 params_.request_count,
                 params_.padded_seq_len,
                 params_.maintenance_rows_remaining_device,
+                params_.maintenance_due_device,
+                params_.decode_boundary_advanced_device,
                 device_ordinal,
                 stream))
         {
@@ -370,6 +383,10 @@ namespace llaminar2
                    other.generation_control_stride &&
                params_.maintenance_rows_remaining_device ==
                    other.maintenance_rows_remaining_device &&
+               params_.maintenance_due_device ==
+                   other.maintenance_due_device &&
+               params_.decode_boundary_advanced_device ==
+                   other.decode_boundary_advanced_device &&
                params_.position_ids_device == other.position_ids_device &&
                params_.request_lengths_device ==
                    other.request_lengths_device &&
@@ -404,6 +421,11 @@ namespace llaminar2
             << ",maintenance_rows_remaining="
             << static_cast<const void *>(
                    params.maintenance_rows_remaining_device)
+            << ",maintenance_due="
+            << static_cast<const void *>(params.maintenance_due_device)
+            << ",decode_boundary_advanced="
+            << static_cast<const void *>(
+                   params.decode_boundary_advanced_device)
             << ",position_ids="
             << static_cast<const void *>(params.position_ids_device)
             << ",request_lengths="

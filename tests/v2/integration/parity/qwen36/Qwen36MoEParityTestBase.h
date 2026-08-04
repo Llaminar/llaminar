@@ -90,6 +90,21 @@ namespace llaminar2::test::parity::qwen36
         ModelTokenizer,
     };
 
+    /**
+     * @brief Selects whether stochastic parity must prove device-gated maintenance.
+     *
+     * Token equality alone cannot distinguish an economical conditional LLEP
+     * tail from an unconditional maintenance collective embedded in every native
+     * generation transaction. The stronger requirement is reserved for fixtures
+     * with enough decode work to cross a maintenance cadence and also execute an
+     * ordinary transaction between cadence boundaries.
+     */
+    enum class MoEDeviceMaintenanceCoverage
+    {
+        NotRequired,
+        ExecutedAndSkippedInsideCapturedLoop,
+    };
+
     struct MoEPrefixRestoreParityCase
     {
         std::string name;
@@ -2279,6 +2294,66 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Prove that LLEP maintenance was selected entirely by device state.
+     *
+     * Every participant reports both counters, so summing preserves the relevant
+     * inequality. A positive maintenance count proves the native IF body ran. A
+     * larger transaction count proves another iteration skipped that same body.
+     * Requiring the parent launch to advertise one conditional fragment closes
+     * the remaining ambiguity: the host submitted one native WHILE graph, rather
+     * than choosing between two launch paths after observing controller state.
+     *
+     * @param records Request-local PerfStats evidence after diagnostic export.
+     * @param context Human-readable request label for assertion failures.
+     * @param expected_draft_depth Draft depth embedded in the captured parent.
+     */
+    inline void expectMoEDeviceGatedMaintenanceCadence(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context,
+        int expected_draft_depth)
+    {
+        const double maintenance_launches = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_controller_maintenance_launches");
+        const double generation_transactions = perfCounterSum(
+            records,
+            "mtp",
+            "device_generation_terminal_transactions");
+        const std::string expected_draft_depth_tag =
+            std::to_string(expected_draft_depth);
+
+        EXPECT_TRUE(hasPositivePerfCounterTag(
+            records,
+            "mtp",
+            "device_generation_loop_graph_launches",
+            "conditional_fragments",
+            "1"))
+            << context << " did not launch a native generation parent with the "
+                          "device-gated maintenance fragment.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(hasPositivePerfCounterTag(
+            records,
+            "mtp",
+            "device_generation_loop_graph_launches",
+            "draft_depth",
+            expected_draft_depth_tag.c_str()))
+            << context << " did not replay the captured parent at requested "
+                          "draft depth "
+            << expected_draft_depth << ".\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_GT(maintenance_launches, 0.0)
+            << context << " never executed the due maintenance branch.\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
+        EXPECT_GT(generation_transactions, maintenance_launches)
+            << context << " did not prove an ordinary transaction skipped the "
+                          "maintenance branch: transactions="
+            << generation_transactions
+            << " maintenance_launches=" << maintenance_launches << ".\n"
+            << PerfStatsCollector::summaryString({"mtp", "moe_rebalance"});
+    }
+
+    /**
      * @brief Assert that capture selected the backend small-M verifier kernels.
      *
      * MTP verifier rows are economical only when the backend uses its small-M
@@ -3935,7 +4010,9 @@ namespace llaminar2::test::parity::qwen36
         int required_first_request_draft_depth = 0,
         int maximum_prompt_tokens = 0,
         std::optional<SamplingParams> sampling_params = std::nullopt,
-        int prefix_block_size = 0)
+        int prefix_block_size = 0,
+        MoEDeviceMaintenanceCoverage maintenance_coverage =
+            MoEDeviceMaintenanceCoverage::NotRequired)
     {
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
@@ -4088,6 +4165,15 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             first_mtp_records,
             test_case.name + " stochastic first request");
+        if (maintenance_coverage ==
+            MoEDeviceMaintenanceCoverage::
+                ExecutedAndSkippedInsideCapturedLoop)
+        {
+            expectMoEDeviceGatedMaintenanceCadence(
+                first_mtp_records,
+                test_case.name + " stochastic first request",
+                requested_draft_depth);
+        }
         if (enable_prefix_cache)
         {
             EXPECT_TRUE(after_first_mtp.prefix_cache_ready);
@@ -4182,6 +4268,15 @@ namespace llaminar2::test::parity::qwen36
                 test_case,
                 restored_records,
                 test_case.name + " stochastic restored-prefix request");
+            if (maintenance_coverage ==
+                MoEDeviceMaintenanceCoverage::
+                    ExecutedAndSkippedInsideCapturedLoop)
+            {
+                expectMoEDeviceGatedMaintenanceCadence(
+                    restored_records,
+                    test_case.name + " stochastic restored-prefix request",
+                    requested_draft_depth);
+            }
             if (test_case.topology ==
                     MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
                 test_case.topology ==
@@ -4277,6 +4372,15 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             phase138_records,
             test_case.name + " stochastic post-clearCache request");
+        if (maintenance_coverage ==
+            MoEDeviceMaintenanceCoverage::
+                ExecutedAndSkippedInsideCapturedLoop)
+        {
+            expectMoEDeviceGatedMaintenanceCadence(
+                phase138_records,
+                test_case.name + " stochastic post-clearCache request",
+                requested_draft_depth);
+        }
         if (moEPrefixCaseUsesGPU(test_case))
         {
             expectPerfCounterPositive(

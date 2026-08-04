@@ -234,6 +234,169 @@ namespace llaminar2
         }
         cudaGraphSetConditional(handle, continue_loop);
     }
+
+    /**
+     * @brief Publish one fragment-local IF condition from persistent device state.
+     *
+     * A non-zero word admits the complete captured fragment. This deliberately
+     * treats fatal sentinel values as true as well: the fragment owning that
+     * state must execute and publish its precise terminal diagnostic rather
+     * than allowing the parent to skip a poisoned lifecycle edge.
+     */
+    __global__ void updateDeviceControlledFragmentCondition(
+        cudaGraphConditionalHandle handle,
+        const uint32_t *condition_word)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        cudaGraphSetConditional(
+            handle,
+            condition_word && *condition_word != 0u ? 1u : 0u);
+    }
+
+    namespace
+    {
+        /**
+         * @brief Result of lowering one typed transaction fragment.
+         *
+         * CUDA reports failures through an error code, while a malformed
+         * conditional body can also be discovered after a successful node
+         * insertion. Carrying the operation name keeps the parent builder's
+         * fatal diagnostic precise without duplicating the lowering policy.
+         */
+        struct DeviceControlledFragmentAppendResult
+        {
+            cudaGraphNode_t tail = nullptr;
+            cudaError_t error = cudaSuccess;
+            const char *operation = nullptr;
+
+            /** @return true when @ref tail identifies the complete fragment. */
+            [[nodiscard]] bool succeeded() const noexcept
+            {
+                return error == cudaSuccess && operation == nullptr && tail;
+            }
+        };
+
+        /**
+         * @brief Append one typed fragment to a native conditional transaction.
+         *
+         * This is the single lowering authority shared by fixed-depth WHILE
+         * bodies and dynamic-depth SWITCH branches. An unconditional fragment
+         * becomes one ordered child graph. A conditional fragment becomes an
+         * exact device-word read followed by a native IF whose body owns the
+         * child graph. No host observation, launch split, or alternate replay
+         * path is introduced.
+         *
+         * @param transaction_graph WHILE body or SWITCH branch receiving work.
+         * @param dependency Tail of the preceding transaction fragment.
+         * @param fragment Typed execution policy and persistent predicate.
+         * @param cuda_fragment Validated CUDA capture supplying the child graph.
+         * @return Complete tail identity or a precise fatal CUDA operation.
+         */
+        DeviceControlledFragmentAppendResult appendDeviceControlledFragment(
+            cudaGraph_t transaction_graph,
+            cudaGraphNode_t dependency,
+            const DeviceControlledLoopFragment &fragment,
+            const CUDAGraphCapture &cuda_fragment)
+        {
+            DeviceControlledFragmentAppendResult result;
+            if (fragment.execution ==
+                DeviceControlledLoopFragmentExecution::Always)
+            {
+                result.error = cudaGraphAddChildGraphNode(
+                    &result.tail,
+                    transaction_graph,
+                    dependency ? &dependency : nullptr,
+                    dependency ? 1 : 0,
+                    cuda_fragment.graph());
+                if (result.error != cudaSuccess)
+                    result.operation =
+                        "cudaGraphAddChildGraphNode(transaction fragment)";
+                return result;
+            }
+
+            cudaGraphConditionalHandle condition = 0;
+            result.error = cudaGraphConditionalHandleCreate(
+                &condition,
+                transaction_graph,
+                /*defaultLaunchValue=*/0,
+                cudaGraphCondAssignDefault);
+            if (result.error != cudaSuccess)
+            {
+                result.operation =
+                    "cudaGraphConditionalHandleCreate(fragment IF)";
+                return result;
+            }
+
+            cudaGraphConditionalHandle condition_arg = condition;
+            const uint32_t *condition_word_arg =
+                fragment.condition_word_device;
+            void *condition_args[] = {
+                &condition_arg,
+                &condition_word_arg};
+            cudaKernelNodeParams condition_params{};
+            condition_params.func = reinterpret_cast<void *>(
+                updateDeviceControlledFragmentCondition);
+            condition_params.gridDim = dim3(1, 1, 1);
+            condition_params.blockDim = dim3(1, 1, 1);
+            condition_params.sharedMemBytes = 0;
+            condition_params.kernelParams = condition_args;
+            condition_params.extra = nullptr;
+
+            cudaGraphNode_t condition_node = nullptr;
+            result.error = cudaGraphAddKernelNode(
+                &condition_node,
+                transaction_graph,
+                dependency ? &dependency : nullptr,
+                dependency ? 1 : 0,
+                &condition_params);
+            if (result.error != cudaSuccess)
+            {
+                result.operation =
+                    "cudaGraphAddKernelNode(fragment IF predicate)";
+                return result;
+            }
+
+            cudaGraphNodeParams if_params{};
+            if_params.type = cudaGraphNodeTypeConditional;
+            if_params.conditional.handle = condition;
+            if_params.conditional.type = cudaGraphCondTypeIf;
+            if_params.conditional.size = 1;
+            result.error = cudaGraphAddNode(
+                &result.tail,
+                transaction_graph,
+                &condition_node,
+                /*dependencyData=*/nullptr,
+                /*numDependencies=*/1,
+                &if_params);
+            if (result.error != cudaSuccess)
+            {
+                result.operation = "cudaGraphAddNode(fragment IF)";
+                return result;
+            }
+            if (!if_params.conditional.phGraph_out ||
+                !if_params.conditional.phGraph_out[0])
+            {
+                result.error = cudaErrorInvalidValue;
+                result.operation = "cudaGraphAddNode(fragment IF body)";
+                return result;
+            }
+
+            cudaGraphNode_t child_node = nullptr;
+            result.error = cudaGraphAddChildGraphNode(
+                &child_node,
+                if_params.conditional.phGraph_out[0],
+                /*dependencies=*/nullptr,
+                /*numDependencies=*/0,
+                cuda_fragment.graph());
+            if (result.error != cudaSuccess)
+            {
+                result.operation =
+                    "cudaGraphAddChildGraphNode(fragment IF body)";
+            }
+            return result;
+        }
+    }
 #endif
 
 #if CUDART_VERSION >= 13000
@@ -582,6 +745,9 @@ namespace llaminar2
                     "[CUDAGraphCapture] Invalid device-loop fragment"
                     << " index=" << fragment_index
                     << " name=" << (fragment.name ? fragment.name : "<unnamed>")
+                    << " execution=" << static_cast<int>(fragment.execution)
+                    << " condition_word="
+                    << static_cast<const void *>(fragment.condition_word_device)
                     << " backend="
                     << (fragment.capture
                             ? fragment.capture->backendName()
@@ -702,20 +868,29 @@ namespace llaminar2
 
         cudaGraph_t loop_body = conditional_params.conditional.phGraph_out[0];
         cudaGraphNode_t transaction_tail = nullptr;
+        size_t conditional_fragment_count = 0;
         for (size_t fragment_index = 0;
              fragment_index < ordered_body_fragments.size();
              ++fragment_index)
         {
-            cudaGraphNode_t fragment_node = nullptr;
-            error = cudaGraphAddChildGraphNode(
-                &fragment_node,
-                loop_body,
-                transaction_tail ? &transaction_tail : nullptr,
-                transaction_tail ? 1 : 0,
-                validated_fragments[fragment_index]->graph());
-            if (error != cudaSuccess)
-                return fail("cudaGraphAddChildGraphNode(transaction fragment)", error);
-            transaction_tail = fragment_node;
+            const DeviceControlledLoopFragment &fragment =
+                ordered_body_fragments[fragment_index];
+            const CUDAGraphCapture *cuda_fragment =
+                validated_fragments[fragment_index];
+            const DeviceControlledFragmentAppendResult appended =
+                appendDeviceControlledFragment(
+                    loop_body,
+                    transaction_tail,
+                    fragment,
+                    *cuda_fragment);
+            if (!appended.succeeded())
+                return fail(appended.operation, appended.error);
+            transaction_tail = appended.tail;
+            conditional_fragment_count +=
+                fragment.execution ==
+                DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero
+                    ? 1u
+                    : 0u;
         }
 
         cudaGraphNode_t predicate_node = nullptr;
@@ -736,6 +911,7 @@ namespace llaminar2
         LOG_DEBUG("[CUDAGraphCapture] Built device-controlled WHILE graph"
                   << " parent_nodes=" << node_count_
                   << " fragments=" << ordered_body_fragments.size()
+                  << " conditional_fragments=" << conditional_fragment_count
                   << " transaction_nodes=" << transaction_node_count
                   << " requests=" << predicate.request_count);
         return true;
@@ -1013,6 +1189,7 @@ namespace llaminar2
             return false;
         }
 
+        size_t conditional_fragment_count = 0;
         for (int branch_index = switch_policy.minimum_selector;
              branch_index <= switch_policy.maximum_selector;
              ++branch_index)
@@ -1028,24 +1205,31 @@ namespace llaminar2
             }
 
             cudaGraphNode_t branch_tail = nullptr;
-            const auto &branch_fragments =
+            const auto branch_fragments =
+                branches[static_cast<size_t>(branch_index)].ordered_fragments;
+            const auto &validated_fragments =
                 validated_branches[static_cast<size_t>(branch_index)];
-            for (const CUDAGraphCapture *fragment : branch_fragments)
+            for (size_t fragment_index = 0;
+                 fragment_index < branch_fragments.size();
+                 ++fragment_index)
             {
-                cudaGraphNode_t fragment_node = nullptr;
-                error = cudaGraphAddChildGraphNode(
-                    &fragment_node,
+                const DeviceControlledLoopFragment &fragment =
+                    branch_fragments[fragment_index];
+                const DeviceControlledFragmentAppendResult appended =
+                    appendDeviceControlledFragment(
                     branch_graph,
-                    branch_tail ? &branch_tail : nullptr,
-                    branch_tail ? 1 : 0,
-                    fragment->graph());
-                if (error != cudaSuccess)
-                {
-                    return fail(
-                        "cudaGraphAddChildGraphNode(SWITCH transaction fragment)",
-                        error);
-                }
-                branch_tail = fragment_node;
+                    branch_tail,
+                    fragment,
+                    *validated_fragments[fragment_index]);
+                if (!appended.succeeded())
+                    return fail(appended.operation, appended.error);
+                branch_tail = appended.tail;
+                conditional_fragment_count +=
+                    fragment.execution ==
+                    DeviceControlledLoopFragmentExecution::
+                        IfDeviceWordNonZero
+                        ? 1u
+                        : 0u;
             }
         }
 
@@ -1067,6 +1251,7 @@ namespace llaminar2
         LOG_DEBUG("[CUDAGraphCapture] Built device-controlled SWITCH/WHILE graph"
                   << " parent_nodes=" << node_count_
                   << " branches=" << branches.size()
+                  << " conditional_fragments=" << conditional_fragment_count
                   << " selector_range=["
                   << switch_policy.minimum_selector << ','
                   << switch_policy.maximum_selector << ']'
