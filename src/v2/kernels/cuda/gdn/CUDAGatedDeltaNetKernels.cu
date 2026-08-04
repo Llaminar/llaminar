@@ -43,25 +43,38 @@ namespace
     //      (was 16 blocks / 108 SMs, now 32+ blocks)
     // =========================================================================
 
+    constexpr int kGdnRecurrentThreads = 256;
+    constexpr int kGdnRecurrentRowSplit = 8;
+    constexpr int kGdnRecurrentColumnsPerBlock =
+        kGdnRecurrentThreads / kGdnRecurrentRowSplit;
+
     /**
-     * @brief Advance one or more request-local GDN rows with scalar-decode arithmetic.
+     * @brief Advance request-local GDN rows with one fixed, batch-invariant tree.
      *
-     * The temporal recurrence is inherently serial. Grouped MTP verification
-     * therefore gains useful work by keeping a block resident across the
-     * runtime-sized verifier matrix, not by partitioning the `d_k` dot products
-     * and changing their reduction tree. Scalar decode calls this exact kernel
-     * with `request_seq_len == 1`; grouped verification calls it with every row
-     * that fits the graph's declared capacity. Both routes consequently execute
-     * the same preprocessing, `j=0..d_k-1` accumulation order, and state update
-     * expressions.
+     * Temporal rows remain causal and execute in increasing order inside one
+     * resident block. Within a row, eight lanes own contiguous, disjoint K
+     * partitions for each value column. Both M=1 decode and runtime-sized MTP
+     * verification launch this exact specialization, so the partial-sum order
+     * is independent of M and grouped outputs remain byte-identical to serial
+     * calls of the same production kernel.
      *
-     * Request identity is flattened into grid X while grid Y owns independent
-     * value-column tiles.  A block processes its request rows in order and
-     * optionally snapshots the complete post-row state.  There is one kernel
-     * launch for the whole request matrix and no host or launch-level row
-     * replay.
+     * A lane keeps its state partition in registers across every row. For the
+     * Qwen GDN geometry (`D_K=128`) this is sixteen floats per lane: state is
+     * loaded once and committed once, while optional post-row snapshots are
+     * still published for every verifier row. This removes the old second
+     * global state read and exposes eight times as many warps without atomics,
+     * launch-level row replay, or a host-owned recurrence.
+     *
+     * Q/K normalization deliberately retains the former one-warp arithmetic
+     * tree. Preserving that preprocessing order limits numerical change to the
+     * newly explicit K-part reduction itself and keeps capture identity stable.
+     *
+     * @tparam D_K Compile-time key width. Supported graph geometries select a
+     *              specialization before capture; no runtime fallback exists.
      */
-    __global__ void cuda_gdn_recurrent_step_kernel(
+    template <int D_K>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_recurrent_step_kernel(
         const float *__restrict__ q,        // [n_heads * d_k]
         const float *__restrict__ k,        // [n_heads * d_k]
         const float *__restrict__ v,        // [n_heads * d_v]
@@ -72,7 +85,7 @@ namespace
         float *__restrict__ output,         // [n_heads * d_v]
         float *__restrict__ state,          // [n_heads, d_k, d_v]
         int request_count, int request_seq_len,
-        int n_heads, int d_k, int d_v,
+        int n_heads, int d_v,
         bool use_qk_l2norm,
         const int *__restrict__ effective_seq_len_ptr,
         int effective_row_idx,
@@ -86,46 +99,72 @@ namespace
         if (request >= request_count || h >= n_heads)
             return;
 
-        const int tid = threadIdx.x;
-        const int block_size = blockDim.x;
+        static_assert(D_K % kGdnRecurrentRowSplit == 0);
+        constexpr int kRowsPerSplit = D_K / kGdnRecurrentRowSplit;
 
-        // Column this thread handles (2D grid: blockIdx.y selects column tile)
-        const int vi = blockIdx.y * block_size + tid;
+        const int tid = threadIdx.x;
+        const int split_id = tid / kGdnRecurrentColumnsPerBlock;
+        const int column_in_block = tid % kGdnRecurrentColumnsPerBlock;
+        const int vi =
+            blockIdx.y * kGdnRecurrentColumnsPerBlock + column_in_block;
 
         // Request-local state persists across every row processed by this block.
         const size_t request_qk_stride =
-            static_cast<size_t>(n_heads) * static_cast<size_t>(d_k);
+            static_cast<size_t>(n_heads) * static_cast<size_t>(D_K);
         const size_t request_v_stride =
             static_cast<size_t>(n_heads) * static_cast<size_t>(d_v);
         const size_t request_state_stride =
-            static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) *
+            static_cast<size_t>(n_heads) * static_cast<size_t>(D_K) *
             static_cast<size_t>(d_v);
         float *S =
             state + static_cast<size_t>(request) * request_state_stride +
-            static_cast<size_t>(h) * d_k * d_v;
+            static_cast<size_t>(h) * D_K * d_v;
 
         // Shared memory for preprocessed Q and K
         extern __shared__ float smem[];
-        float *q_local = smem;       // [d_k]
-        float *k_local = smem + d_k; // [d_k]
+        float *q_local = smem;                    // [D_K]
+        float *k_local = smem + D_K;              // [D_K]
+        float *reduce_kv = smem + 2 * D_K;        // [blockDim.x]
+        float *reduce_out = reduce_kv + blockDim.x; // [blockDim.x]
 
-        const float scale = rsqrtf((float)d_k);
-        __shared__ float warp_sums[8]; // At most two warps on this kernel route.
+        const float scale = rsqrtf(static_cast<float>(D_K));
+        __shared__ float warp_sums[1];
         __shared__ float decay_shared;
         __shared__ float beta_shared;
-        const int warp_id = tid / 32;
         const int lane_id = tid % 32;
-        const int num_warps = (block_size + 31) / 32;
+
+        /*
+         * Each lane owns one contiguous state partition. The compile-time
+         * extent is essential: nvcc scalarizes this array into registers, so
+         * grouped rows reuse live state without local-memory spills.
+         */
+        float state_rows[kRowsPerSplit];
+        const int row_begin = split_id * kRowsPerSplit;
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                state_rows[local_row] = S[state_row * d_v + vi];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
+                state_rows[local_row] = 0.0f;
+        }
 
         for (int request_row = 0; request_row < request_seq_len; ++request_row)
         {
             const int flat_row = request * request_seq_len + request_row;
             const float *q_head =
                 q + static_cast<size_t>(flat_row) * request_qk_stride +
-                static_cast<size_t>(h) * d_k;
+                static_cast<size_t>(h) * D_K;
             const float *k_head =
                 k + static_cast<size_t>(flat_row) * request_qk_stride +
-                static_cast<size_t>(h) * d_k;
+                static_cast<size_t>(h) * D_K;
             const float *v_head =
                 v + static_cast<size_t>(flat_row) * request_v_stride +
                 static_cast<size_t>(h) * d_v;
@@ -137,14 +176,14 @@ namespace
             if (effective_seq_len_ptr &&
                 logical_row >= effective_seq_len_ptr[request])
             {
-                if (vi < d_v)
+                if (vi < d_v && split_id == 0)
                     o_head[vi] = 0.0f;
                 __syncthreads();
                 continue;
             }
 
             // Load and preprocess Q/K exactly as the M=1 scalar route does.
-            for (int i = tid; i < d_k; i += block_size)
+            for (int i = tid; i < D_K; i += blockDim.x)
             {
                 q_local[i] = q_head[i];
                 k_local[i] = k_head[i];
@@ -153,53 +192,49 @@ namespace
 
             if (use_qk_l2norm)
             {
-                float q_sum = 0.0f;
-                for (int i = tid; i < d_k; i += block_size)
-                    q_sum += q_local[i] * q_local[i];
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
-                if (lane_id == 0)
-                    warp_sums[warp_id] = q_sum;
-                __syncthreads();
-                if (tid == 0)
+                if (tid < 32)
                 {
-                    float total = 0.0f;
-                    for (int w = 0; w < num_warps; ++w)
-                        total += warp_sums[w];
-                    warp_sums[0] = total;
+                    float q_sum = 0.0f;
+                    for (int i = tid; i < D_K; i += 32)
+                        q_sum += q_local[i] * q_local[i];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                    {
+                        q_sum +=
+                            __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
+                    }
+                    if (lane_id == 0)
+                        warp_sums[0] = q_sum;
                 }
                 __syncthreads();
                 const float q_inv =
                     scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-                for (int i = tid; i < d_k; i += block_size)
+                for (int i = tid; i < D_K; i += blockDim.x)
                     q_local[i] *= q_inv;
                 __syncthreads();
 
-                float k_sum = 0.0f;
-                for (int i = tid; i < d_k; i += block_size)
-                    k_sum += k_local[i] * k_local[i];
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
-                if (lane_id == 0)
-                    warp_sums[warp_id] = k_sum;
-                __syncthreads();
-                if (tid == 0)
+                if (tid < 32)
                 {
-                    float total = 0.0f;
-                    for (int w = 0; w < num_warps; ++w)
-                        total += warp_sums[w];
-                    warp_sums[0] = total;
+                    float k_sum = 0.0f;
+                    for (int i = tid; i < D_K; i += 32)
+                        k_sum += k_local[i] * k_local[i];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                    {
+                        k_sum +=
+                            __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
+                    }
+                    if (lane_id == 0)
+                        warp_sums[0] = k_sum;
                 }
                 __syncthreads();
                 const float k_inv =
                     1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-                for (int i = tid; i < d_k; i += block_size)
+                for (int i = tid; i < D_K; i += blockDim.x)
                     k_local[i] *= k_inv;
                 __syncthreads();
             }
             else
             {
-                for (int i = tid; i < d_k; i += block_size)
+                for (int i = tid; i < D_K; i += blockDim.x)
                     q_local[i] *= scale;
                 __syncthreads();
             }
@@ -220,40 +255,171 @@ namespace
             const float decay = decay_shared;
             const float beta_h = beta_shared;
 
+            float partial_kv = 0.0f;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int local_row = 0;
+                     local_row < kRowsPerSplit;
+                     ++local_row)
+                {
+                    const int state_row = row_begin + local_row;
+                    partial_kv +=
+                        (state_rows[local_row] * decay) * k_local[state_row];
+                }
+            }
+            reduce_kv[tid] = partial_kv;
+            __syncthreads();
+
+            float delta = 0.0f;
             if (vi < d_v)
             {
                 float kv = 0.0f;
-                for (int j = 0; j < d_k; ++j)
+#pragma unroll
+                for (int split = 0;
+                     split < kGdnRecurrentRowSplit;
+                     ++split)
                 {
-                    const float s_decayed = S[j * d_v + vi] * decay;
-                    kv += s_decayed * k_local[j];
+                    kv += reduce_kv[
+                        column_in_block +
+                        split * kGdnRecurrentColumnsPerBlock];
                 }
+                delta = (v_head[vi] - kv) * beta_h;
+            }
 
-                const float delta = (v_head[vi] - kv) * beta_h;
-                float out_vi = 0.0f;
-                float *snapshot =
-                    state_snapshots && flat_row < max_snapshot_rows
-                        ? state_snapshots +
-                              static_cast<size_t>(flat_row) *
-                                  static_cast<size_t>(snapshot_stride_floats) +
-                              static_cast<size_t>(h) * d_k * d_v
-                        : nullptr;
-                for (int j = 0; j < d_k; ++j)
+            float partial_out = 0.0f;
+            float *snapshot =
+                state_snapshots && flat_row < max_snapshot_rows
+                    ? state_snapshots +
+                          static_cast<size_t>(flat_row) *
+                              static_cast<size_t>(snapshot_stride_floats) +
+                          static_cast<size_t>(h) * D_K * d_v
+                    : nullptr;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int local_row = 0;
+                     local_row < kRowsPerSplit;
+                     ++local_row)
                 {
+                    const int state_row = row_begin + local_row;
                     const float s_new =
-                        S[j * d_v + vi] * decay + k_local[j] * delta;
-                    S[j * d_v + vi] = s_new;
+                        state_rows[local_row] * decay +
+                        k_local[state_row] * delta;
+                    state_rows[local_row] = s_new;
                     if (snapshot)
-                        snapshot[j * d_v + vi] = s_new;
-                    out_vi += s_new * q_local[j];
+                        snapshot[state_row * d_v + vi] = s_new;
+                    partial_out += s_new * q_local[state_row];
+                }
+            }
+            reduce_out[tid] = partial_out;
+            __syncthreads();
+
+            if (vi < d_v && split_id == 0)
+            {
+                float out_vi = 0.0f;
+#pragma unroll
+                for (int split = 0;
+                     split < kGdnRecurrentRowSplit;
+                     ++split)
+                {
+                    out_vi += reduce_out[
+                        column_in_block +
+                        split * kGdnRecurrentColumnsPerBlock];
                 }
                 o_head[vi] = out_vi;
             }
 
-            // No thread may overwrite shared Q/K for the next row while a
-            // sibling is still consuming the current row.
+            // Shared Q/K and reduction slots belong to exactly one causal row.
             __syncthreads();
         }
+
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                S[state_row * d_v + vi] = state_rows[local_row];
+            }
+        }
+    }
+
+    /**
+     * @brief Launch the fixed CUDA GDN recurrence specialization for a graph.
+     *
+     * GDN key width is model topology, not a hot-path tuning input. Selecting
+     * the concrete specialization here makes register ownership and launch
+     * geometry part of capture construction. Unknown widths fail immediately;
+     * there is no scalar or eager alternate path.
+     */
+    bool launch_cuda_gdn_recurrent_step(
+        const char *caller,
+        const float *q,
+        const float *k,
+        const float *v,
+        const float *alpha,
+        const float *beta_raw,
+        const float *A_log,
+        const float *dt_bias,
+        float *output,
+        float *state,
+        int request_count,
+        int request_seq_len,
+        int n_heads,
+        int d_k,
+        int d_v,
+        bool use_qk_l2norm,
+        const int *effective_seq_len_ptr,
+        int effective_row_idx,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        cudaStream_t stream)
+    {
+        const dim3 grid(
+            request_count * n_heads,
+            (d_v + kGdnRecurrentColumnsPerBlock - 1) /
+                kGdnRecurrentColumnsPerBlock);
+        const size_t shared_bytes =
+            static_cast<size_t>(2 * d_k + 2 * kGdnRecurrentThreads) *
+            sizeof(float);
+
+#define LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(D_K)                                \
+    cuda_gdn_recurrent_step_kernel<D_K>                                        \
+        <<<grid, kGdnRecurrentThreads, shared_bytes, stream>>>(                 \
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output, state,            \
+            request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,       \
+            effective_seq_len_ptr, effective_row_idx, state_snapshots,          \
+            snapshot_stride_floats, max_snapshot_rows)
+
+        switch (d_k)
+        {
+        case 64:
+            LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64);
+            break;
+        case 128:
+            LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128);
+            break;
+        default:
+            fprintf(
+                stderr,
+                "[%s] unsupported CUDA GDN d_k=%d; capture supports d_k in "
+                "{64,128}\n",
+                caller,
+                d_k);
+            return false;
+        }
+
+#undef LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[%s] %s\n", caller, cudaGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -1966,32 +2132,19 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        // 2D grid: x=heads, y=column tiles (32 threads = 1 warp per block)
-        int col_threads = 32;
-        if (d_v > 128)
-            col_threads = 64;
-        int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-        int smem_size = 2 * d_k * sizeof(float) + 8 * sizeof(float); // q_local + k_local + warp_sums
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        return launch_cuda_gdn_recurrent_step(
+            "cudaGDN_recurrent_step",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
             output, state,
             /*request_count=*/1, /*request_seq_len=*/1,
-            n_heads, d_k, d_v, use_qk_l2norm,
+            n_heads, d_k, d_v,
+            use_qk_l2norm,
             nullptr,
             -1,
             /*state_snapshots=*/nullptr,
             /*snapshot_stride_floats=*/0,
-            /*max_snapshot_rows=*/0);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_recurrent_step] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            /*max_snapshot_rows=*/0,
+            static_cast<cudaStream_t>(stream));
     }
 
     bool cudaGDN_recurrent_step_effective_row(
@@ -2007,31 +2160,19 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int col_threads = 32;
-        if (d_v > 128)
-            col_threads = 64;
-        const int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-        const int smem_size = 2 * d_k * sizeof(float) + 8 * sizeof(float);
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        return launch_cuda_gdn_recurrent_step(
+            "cudaGDN_recurrent_step_effective_row",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
             output, state,
             /*request_count=*/1, /*request_seq_len=*/1,
-            n_heads, d_k, d_v, use_qk_l2norm,
+            n_heads, d_k, d_v,
+            use_qk_l2norm,
             device_effective_seq_len,
             row_idx,
             /*state_snapshots=*/nullptr,
             /*snapshot_stride_floats=*/0,
-            /*max_snapshot_rows=*/0);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_recurrent_step_effective_row] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            /*max_snapshot_rows=*/0,
+            static_cast<cudaStream_t>(stream));
     }
 
     bool cudaGDN_chunk_forward_batched_kernel_route(
@@ -2088,39 +2229,19 @@ extern "C"
                     static_cast<void *>(output),
                     static_cast<const void *>(device_effective_seq_len));
             }
-            int col_threads = 32;
-            if (d_v > 128)
-                col_threads = 64;
-            const int num_col_blocks =
-                (d_v + col_threads - 1) / col_threads;
-            const int smem_size =
-                2 * d_k * sizeof(float) + 8 * sizeof(float);
-
-            const dim3 grid(request_count * n_heads, num_col_blocks);
-            cuda_gdn_recurrent_step_kernel<<<
-                grid,
-                col_threads,
-                smem_size,
-                static_cast<cudaStream_t>(stream)>>>(
+            return launch_cuda_gdn_recurrent_step(
+                "cudaGDN_recurrent_step_batched",
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, state,
                 request_count, request_seq_len,
-                n_heads, d_k, d_v, use_qk_l2norm,
+                n_heads, d_k, d_v,
+                use_qk_l2norm,
                 device_effective_seq_len,
                 /*effective_row_idx=*/0,
                 state_snapshots,
                 snapshot_stride_floats,
-                max_snapshot_rows);
-
-            const cudaError_t err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr,
-                        "[cudaGDN_recurrent_step_batched] %s\n",
-                        cudaGetErrorString(err));
-                return false;
-            }
-            return true;
+                max_snapshot_rows,
+                static_cast<cudaStream_t>(stream));
         }
 
         // Row-split: 256 threads per block, 8 threads per column = 32 cols/block.

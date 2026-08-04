@@ -15298,83 +15298,139 @@ __global__ void rocm_moe_max_expert_count_kernel(
         *d_max_out = local_max;
 }
 
+constexpr int kActiveExpertThreads = 256;
+// gfx9 uses 64-lane waves, while newer HIP targets may use wave32.  Eight
+// entries cover either mode for this fixed 256-thread launch.
+constexpr int kActiveExpertMaxWaveCount = kActiveExpertThreads / 32;
+
+/**
+ * @brief Shared prefix state for stable active-expert compaction.
+ *
+ * Downstream grouped kernels require ascending expert ids.  Scheduling an
+ * atomic append would violate that contract, so every wave publishes a count
+ * and lane zero assigns wave offsets in deterministic wave order.
+ */
+struct ActiveExpertCompactionScratch
+{
+    int wave_counts[kActiveExpertMaxWaveCount];
+    int wave_offsets[kActiveExpertMaxWaveCount];
+    int chunk_base;
+    int total_active;
+};
+
+/** @brief Initialize block-owned compaction state before the first chunk. */
+__device__ __forceinline__ void rocm_initialize_active_expert_compaction(
+    ActiveExpertCompactionScratch &scratch)
+{
+    if (threadIdx.x == 0)
+        scratch.total_active = 0;
+    __syncthreads();
+}
+
+/**
+ * @brief Append one 256-expert chunk without changing ascending output order.
+ *
+ * @param is_active True when this lane's expert must be retained.
+ * @param expert_id Ascending expert id represented by this lane.
+ * @param max_active_experts Capacity of @p active_expert_ids.
+ * @param active_expert_ids Ordered compact output, padded separately.
+ * @param scratch Block-owned prefix state shared across chunks.
+ */
+__device__ __forceinline__ void rocm_compact_active_expert_chunk(
+    bool is_active,
+    int expert_id,
+    int max_active_experts,
+    int *__restrict__ active_expert_ids,
+    ActiveExpertCompactionScratch &scratch)
+{
+    const int lane = static_cast<int>(threadIdx.x) % warpSize;
+    const int wave = static_cast<int>(threadIdx.x) / warpSize;
+    const int wave_count =
+        (static_cast<int>(blockDim.x) + warpSize - 1) / warpSize;
+    const unsigned long long votes = __ballot(is_active);
+
+    if (lane == 0)
+        scratch.wave_counts[wave] = __popcll(votes);
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        int chunk_active = 0;
+        scratch.chunk_base = scratch.total_active;
+        for (int current_wave = 0;
+             current_wave < wave_count;
+             ++current_wave)
+        {
+            scratch.wave_offsets[current_wave] = chunk_active;
+            chunk_active += scratch.wave_counts[current_wave];
+        }
+        scratch.total_active += chunk_active;
+    }
+    __syncthreads();
+
+    const unsigned long long lower_lanes =
+        lane == 0 ? 0ull : ((1ull << lane) - 1ull);
+    const int rank_in_wave = __popcll(votes & lower_lanes);
+    const int output_slot = scratch.chunk_base +
+                            scratch.wave_offsets[wave] +
+                            rank_in_wave;
+    if (is_active && output_slot < max_active_experts)
+        active_expert_ids[output_slot] = expert_id;
+
+    // The next chunk reuses every shared field, so all writes must retire.
+    __syncthreads();
+}
+
+/** @brief Fill unused compact-list capacity with the canonical -1 sentinel. */
+__device__ __forceinline__ void rocm_pad_active_expert_list(
+    int *__restrict__ active_expert_ids,
+    int max_active_experts,
+    const ActiveExpertCompactionScratch &scratch)
+{
+    const int retained_active =
+        scratch.total_active < max_active_experts
+            ? scratch.total_active
+            : max_active_experts;
+    for (int slot = retained_active + static_cast<int>(threadIdx.x);
+         slot < max_active_experts;
+         slot += static_cast<int>(blockDim.x))
+    {
+        active_expert_ids[slot] = -1;
+    }
+}
+
+/**
+ * @brief Build a stable compact list from precomputed expert counts.
+ *
+ * One block processes ascending 256-id chunks, retaining byte identity with
+ * the serial implementation while parallelizing reads, rank assignment,
+ * writes, and sentinel padding.
+ */
 __global__ void rocm_moe_build_active_expert_list_kernel(
     const int *__restrict__ expert_counts,
     int *__restrict__ active_expert_ids,
     int num_experts,
     int max_active_experts)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0)
-        return;
+    __shared__ ActiveExpertCompactionScratch scratch;
+    rocm_initialize_active_expert_compaction(scratch);
 
-    int active = 0;
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (int chunk = 0; chunk < num_experts; chunk += blockDim.x)
     {
-        const int count = expert_counts[expert];
-        if (count > 0 && active < max_active_experts)
-            active_expert_ids[active++] = expert;
+        const int expert = chunk + static_cast<int>(threadIdx.x);
+        const bool is_active =
+            expert < num_experts && expert_counts[expert] > 0;
+        rocm_compact_active_expert_chunk(
+            is_active,
+            expert,
+            max_active_experts,
+            active_expert_ids,
+            scratch);
     }
-    for (int slot = active; slot < max_active_experts; ++slot)
-        active_expert_ids[slot] = -1;
-}
-
-__global__ void rocm_moe_build_active_expert_list_runtime_kernel(
-    const DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int *__restrict__ active_expert_ids,
-    int num_experts,
-    int max_active_experts)
-{
-    if (threadIdx.x != 0 || blockIdx.x != 0)
-        return;
-    if (!runtime || !active_expert_ids ||
-        num_experts <= 0 || max_active_experts <= 0 ||
-        runtime->active_bank > 1u ||
-        !runtime->expert_counts)
-    {
-        fail_fast_incomplete_llep_transfer();
-        return;
-    }
-
-    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-    const uint32_t local_bit =
-        runtime_participant_bit(static_cast<int>(runtime->participant_id));
-    int active = 0;
-    for (int expert = 0; expert < num_experts; ++expert)
-    {
-        const int count = runtime->expert_counts[expert];
-        if (count <= 0)
-            continue;
-
-        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
-        const bool local_ready =
-            bank.local_compute_mask[expert] != 0u &&
-            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-            desc.local_slot >= 0 &&
-            rebalance_expert_desc_ready(desc);
-        if (!local_ready)
-        {
-            printf("runtime_prefill_active_expert_not_ready "
-                   "participant=%u expert=%d count=%d active_bank=%u "
-                   "local_mask=%u resident_mask=%u local_bit=%u "
-                   "local_slot=%d logical=%d owner=%d\\n",
-                   runtime->participant_id,
-                   expert,
-                   count,
-                   runtime->active_bank,
-                   bank.local_compute_mask[expert],
-                   bank.resident_participant_mask[expert],
-                   local_bit,
-                   desc.local_slot,
-                   desc.logical_expert_id,
-                   desc.owner_participant);
-            fail_fast_incomplete_llep_transfer();
-            return;
-        }
-        if (active < max_active_experts)
-            active_expert_ids[active++] = expert;
-    }
-    for (int slot = active; slot < max_active_experts; ++slot)
-        active_expert_ids[slot] = -1;
+    rocm_pad_active_expert_list(
+        active_expert_ids,
+        max_active_experts,
+        scratch);
 }
 
 /**
@@ -16716,39 +16772,118 @@ __global__ void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_ker
     }
 }
 
+/**
+ * @brief Publish compact runtime descriptors and optional active expert ids.
+ *
+ * Grouped prefill needs both products from the same 256-entry placement bank.
+ * Producing them in one block removes a redundant launch and descriptor walk;
+ * grouped decode passes no active-list destination and retains descriptor-only
+ * publication through the same kernel.
+ */
 __global__ void rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel(
     const DeviceMoELayerRuntimeView *__restrict__ runtime,
     DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
     DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
     DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
-    int num_experts)
+    int num_experts,
+    int *__restrict__ active_expert_ids,
+    int max_active_experts)
 {
-    const int expert = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!runtime || !gate_descs || !up_descs || !down_descs) return;
-    if (expert >= num_experts || expert >= kDeviceMoEMaxExperts) return;
-    if (runtime->active_bank > 1u) return;
+    const bool publish_active_experts = active_expert_ids != nullptr;
+    if (!runtime || !gate_descs || !up_descs || !down_descs ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        runtime->active_bank > 1u ||
+        (publish_active_experts &&
+         (!runtime->expert_counts || max_active_experts <= 0 ||
+          max_active_experts > num_experts)))
+    {
+        if (threadIdx.x == 0)
+            fail_fast_incomplete_llep_transfer();
+        return;
+    }
 
+    const int expert = static_cast<int>(threadIdx.x);
     const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-    const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
     const uint32_t local_bit =
         runtime_participant_bit(static_cast<int>(runtime->participant_id));
-    const bool local_ready =
-        bank.local_compute_mask[expert] != 0u &&
-        (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-        desc.local_slot >= 0 &&
-        rebalance_expert_desc_ready(desc);
-    if (local_ready)
+    bool local_ready = false;
+    if (expert < num_experts)
     {
-        gate_descs[expert] = desc.gate;
-        up_descs[expert] = desc.up;
-        down_descs[expert] = desc.down;
+        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        local_ready =
+            bank.local_compute_mask[expert] != 0u &&
+            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+            desc.local_slot >= 0 &&
+            rebalance_expert_desc_ready(desc);
+        if (local_ready)
+        {
+            gate_descs[expert] = desc.gate;
+            up_descs[expert] = desc.up;
+            down_descs[expert] = desc.down;
+        }
+        else
+        {
+            gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+            up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+            down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+        }
     }
-    else
+
+    // The branch is uniform for the workgroup, so descriptor-only decode does
+    // not strand any lane at a prefill compaction barrier.
+    if (!publish_active_experts)
+        return;
+
+    const int count = expert < num_experts
+                          ? runtime->expert_counts[expert]
+                          : 0;
+    const bool is_active = count > 0;
+    __shared__ int first_invalid_expert;
+    if (threadIdx.x == 0)
+        first_invalid_expert = num_experts;
+    __syncthreads();
+    if (is_active && !local_ready)
+        atomicMin(&first_invalid_expert, expert);
+    __syncthreads();
+
+    if (first_invalid_expert < num_experts)
     {
-        gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-        up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-        down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+        if (threadIdx.x == 0)
+        {
+            const int invalid_expert = first_invalid_expert;
+            const DeviceMoEExpertDescriptorView &desc =
+                bank.experts[invalid_expert];
+            printf("runtime_prefill_active_expert_not_ready "
+                   "participant=%u expert=%d count=%d active_bank=%u "
+                   "local_mask=%u resident_mask=%u local_bit=%u "
+                   "local_slot=%d logical=%d owner=%d\\n",
+                   runtime->participant_id,
+                   invalid_expert,
+                   runtime->expert_counts[invalid_expert],
+                   runtime->active_bank,
+                   bank.local_compute_mask[invalid_expert],
+                   bank.resident_participant_mask[invalid_expert],
+                   local_bit,
+                   desc.local_slot,
+                   desc.logical_expert_id,
+                   desc.owner_participant);
+            fail_fast_incomplete_llep_transfer();
+        }
+        return;
     }
+
+    __shared__ ActiveExpertCompactionScratch scratch;
+    rocm_initialize_active_expert_compaction(scratch);
+    rocm_compact_active_expert_chunk(
+        is_active,
+        expert,
+        max_active_experts,
+        active_expert_ids,
+        scratch);
+    rocm_pad_active_expert_list(
+        active_expert_ids,
+        max_active_experts,
+        scratch);
 }
 
 __global__ void rocm_moe_prefill_gather_expert_runtime_kernel(
@@ -16900,7 +17035,7 @@ bool hipMoE_build_active_expert_list(
     (void)hipGetLastError();
 
     hipLaunchKernelGGL(rocm_moe_build_active_expert_list_kernel,
-        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(stream),
         expert_counts, active_expert_ids, num_experts, max_active_experts);
 
     hipError_t err = hipGetLastError();
@@ -16936,38 +17071,6 @@ bool hipMoE_scatter_tokens(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE scatter_tokens kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
-bool hipMoE_build_active_expert_list_runtime(
-    const void *runtime,
-    int *active_expert_ids,
-    int num_experts,
-    int max_active_experts,
-    int device_idx,
-    void *stream)
-{
-    if (!runtime || !active_expert_ids || num_experts <= 0 ||
-        max_active_experts <= 0 || max_active_experts > num_experts || !stream)
-        return false;
-
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    hipLaunchKernelGGL(rocm_moe_build_active_expert_list_runtime_kernel,
-        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
-        static_cast<const DeviceMoELayerRuntimeView *>(runtime),
-        active_expert_ids,
-        num_experts,
-        max_active_experts);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE build_active_expert_list_runtime kernel launch failed: %s\n",
-                hipGetErrorString(err));
         return false;
     }
     return true;
@@ -17579,15 +17682,15 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_d
     }
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    const int threads = kGateLogitsGroupedThreads;
-    const int blocks = (num_experts + threads - 1) / threads;
     hipLaunchKernelGGL(rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel,
-        dim3(blocks), dim3(threads), 0, hip_stream,
+        dim3(1), dim3(kActiveExpertThreads), 0, hip_stream,
         static_cast<const DeviceMoELayerRuntimeView *>(runtime),
         gate_descs,
         up_descs,
         down_descs,
-        num_experts);
+        num_experts,
+        /*active_expert_ids=*/nullptr,
+        /*max_active_experts=*/0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17597,6 +17700,53 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_d
         return false;
     }
 
+    return true;
+}
+
+/**
+ * @brief Fuse runtime descriptor and active-expert publication for prefill.
+ */
+__attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_plan(
+    const void *runtime,
+    DeviceNativeVNNIMatrixDescView *gate_descs,
+    DeviceNativeVNNIMatrixDescView *up_descs,
+    DeviceNativeVNNIMatrixDescView *down_descs,
+    int *active_expert_ids,
+    int num_experts,
+    int max_active_experts,
+    int device_idx,
+    void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!runtime || !gate_descs || !up_descs || !down_descs ||
+        !active_expert_ids || !stream ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        max_active_experts <= 0 || max_active_experts > num_experts)
+    {
+        fprintf(stderr, "HIP MoE materialize_runtime_prefill_plan invalid arguments\n");
+        return false;
+    }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel,
+        dim3(1), dim3(kActiveExpertThreads), 0, hip_stream,
+        static_cast<const DeviceMoELayerRuntimeView *>(runtime),
+        gate_descs,
+        up_descs,
+        down_descs,
+        num_experts,
+        active_expert_ids,
+        max_active_experts);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE runtime prefill plan materialize kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
     return true;
 }
 

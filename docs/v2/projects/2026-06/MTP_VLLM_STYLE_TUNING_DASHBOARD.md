@@ -1,6 +1,6 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm. Keep this under 6 KB;
+Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA and ROCm. Keep this under 6 KB;
 put implementation detail in project handoffs.
 
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
@@ -73,9 +73,13 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
   40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
   32 SGPR, zero scratch, and 90.6% VALU utilization.
-- Current Release CUDA2 LLEP d3 fixed-prompt baseline is `77.45 tok/s` decode
-  and `179.70 tok/s` prefill. Parent reuse improved decode from `65.56 tok/s`
-  (`+18.1%`); one native WHILE is built per GPU and reused across requests.
+- Release CUDA2 LLEP d3 is `153.97 tok/s` decode and `180.14 tok/s` prefill,
+  up from `128.13 tok/s` decode (`+20.2%`). Active-expert compaction is fused
+  into descriptor publication; its standalone per-layer launch is gone.
+- The CUDA GDN recurrence now uses one fixed eight-part K reduction for serial
+  and grouped rows. It is byte-exact through `M=31`; at `d_k=d_v=128` it fell
+  from `35.52 us` to `17.73 us`: `30.6%` occupancy, `541 GB/s`, 90 registers,
+  zero spills. Grouped `M=16` is `1.50x` faster than serial launches.
 - Fixed-d3 decode-replicated phase-split reaches `53.90 tok/s`, versus
   `24.28 tok/s` for apportioned continuation (`2.22x`). This is the controlled
   communication baseline; the dynamic depth controller is a later tuning lane.

@@ -56,6 +56,7 @@
 #include "../../../utils/VerifierRowTestInventory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 
@@ -101,6 +102,14 @@ extern "C" bool hipMoE_scatter_tokens(
     int total_slots, int num_experts, int top_k,
     int device_idx, void *stream);
 
+extern "C" bool hipMoE_build_active_expert_list(
+    const int *expert_counts,
+    int *active_expert_ids,
+    int num_experts,
+    int max_active_experts,
+    int device_idx,
+    void *stream);
+
 extern "C" bool hipMoE_build_runtime_original_to_grouped(
     const void *runtime,
     int *original_to_grouped,
@@ -141,6 +150,17 @@ extern "C" bool hipMoE_materialize_runtime_prefill_descriptor_tables(
     llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
     llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
     int num_experts,
+    int device_idx,
+    void *stream);
+
+extern "C" bool hipMoE_materialize_runtime_prefill_plan(
+    const void *runtime,
+    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    int *active_expert_ids,
+    int num_experts,
+    int max_active_experts,
     int device_idx,
     void *stream);
 #endif
@@ -1380,6 +1400,130 @@ namespace
 }
 
 /**
+ * @brief Prove ROCm stable compaction across wave and block boundaries.
+ *
+ * The cases are shared verbatim with CUDA and compare the production launcher
+ * against a backend-neutral serial oracle.  The largest domain is then replayed
+ * twenty times from one HIP graph to reject schedule-dependent ordering.
+ */
+TEST(
+    Test__ROCmMoEKernel,
+    ActiveExpertCompactionIsStableTotalAndGraphCapturable)
+{
+    SKIP_IF_NO_ROCM();
+
+    const auto cases = activeExpertCompactionCases();
+    const auto max_domain = std::max_element(
+        cases.begin(),
+        cases.end(),
+        [](const auto &lhs, const auto &rhs)
+        {
+            return lhs.expert_counts.size() < rhs.expert_counts.size();
+        })->expert_counts.size();
+    const auto max_output = std::max_element(
+        cases.begin(),
+        cases.end(),
+        [](const auto &lhs, const auto &rhs)
+        {
+            return lhs.max_active_experts < rhs.max_active_experts;
+        })->max_active_experts;
+
+    ScopedHipDeviceStream stream(/*device_ordinal=*/0);
+    ASSERT_EQ(stream.status(), hipSuccess);
+    HipAllocation counts_device(max_domain * sizeof(int));
+    HipAllocation active_device(
+        static_cast<std::size_t>(max_output) * sizeof(int));
+
+    for (const auto &test_case : cases)
+    {
+        SCOPED_TRACE(test_case.name);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                counts_device.get(),
+                test_case.expert_counts.data(),
+                test_case.expert_counts.size() * sizeof(int),
+                hipMemcpyHostToDevice,
+                stream.get()),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemsetAsync(
+                active_device.get(),
+                0xa5,
+                static_cast<std::size_t>(test_case.max_active_experts) *
+                    sizeof(int),
+                stream.get()),
+            hipSuccess);
+        ASSERT_TRUE(hipMoE_build_active_expert_list(
+            static_cast<const int *>(counts_device.get()),
+            static_cast<int *>(active_device.get()),
+            static_cast<int>(test_case.expert_counts.size()),
+            test_case.max_active_experts,
+            /*device_idx=*/0,
+            stream.get()));
+
+        std::vector<int> actual(
+            static_cast<std::size_t>(test_case.max_active_experts));
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual.data(),
+                active_device.get(),
+                actual.size() * sizeof(int),
+                hipMemcpyDeviceToHost,
+                stream.get()),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
+        EXPECT_EQ(actual, test_case.expected_active_expert_ids);
+    }
+
+    const auto &graph_case = cases.back();
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            counts_device.get(),
+            graph_case.expert_counts.data(),
+            graph_case.expert_counts.size() * sizeof(int),
+            hipMemcpyHostToDevice,
+            stream.get()),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
+
+    ScopedHipTestGraph graph(
+        /*device_ordinal=*/0,
+        stream.get(),
+        "ROCm active-expert stable compaction");
+    ASSERT_TRUE(hipMoE_build_active_expert_list(
+        static_cast<const int *>(counts_device.get()),
+        static_cast<int *>(active_device.get()),
+        static_cast<int>(graph_case.expert_counts.size()),
+        graph_case.max_active_experts,
+        /*device_idx=*/0,
+        stream.get()));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    for (int replay = 0; replay < 20; ++replay)
+        ASSERT_TRUE(graph.launch());
+
+    std::vector<int> replayed(
+        static_cast<std::size_t>(graph_case.max_active_experts));
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            replayed.data(),
+            active_device.get(),
+            replayed.size() * sizeof(int),
+            hipMemcpyDeviceToHost,
+            stream.get()),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
+    EXPECT_EQ(replayed, graph_case.expected_active_expert_ids);
+
+    EXPECT_FALSE(hipMoE_build_active_expert_list(
+        static_cast<const int *>(counts_device.get()),
+        static_cast<int *>(active_device.get()),
+        /*num_experts=*/1,
+        /*max_active_experts=*/1,
+        /*device_idx=*/0,
+        /*stream=*/nullptr));
+}
+
+/**
  * @brief Prove construction cannot adopt the ROCm context's default stream.
  *
  * A kernel object is created before the graph executor assigns its producer
@@ -1520,6 +1664,8 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
     DeviceNativeVNNIMatrixDesc *device_gate = nullptr;
     DeviceNativeVNNIMatrixDesc *device_up = nullptr;
     DeviceNativeVNNIMatrixDesc *device_down = nullptr;
+    int32_t *device_counts = nullptr;
+    int32_t *device_active = nullptr;
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_gate),
                         num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
@@ -1530,7 +1676,19 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_down),
                         num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_counts),
+                        num_experts * sizeof(int32_t)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_active),
+                        num_experts * sizeof(int32_t)),
+              hipSuccess);
+    const std::array<int32_t, num_experts> expert_counts = {0, 2, 0, 1};
+    const std::array<int32_t, num_experts> expected_active = {1, 3, -1, -1};
+    host_runtime.expert_counts = device_counts;
 
+    ASSERT_EQ(hipMemcpyAsync(device_counts, expert_counts.data(),
+                             sizeof(expert_counts), hipMemcpyHostToDevice, stream),
+              hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(device_runtime, &host_runtime, sizeof(host_runtime),
                              hipMemcpyHostToDevice, stream),
               hipSuccess);
@@ -1542,6 +1700,26 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
         num_experts,
         0,
         stream));
+    ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(
+        device_runtime,
+        device_gate,
+        device_up,
+        device_down,
+        device_active,
+        num_experts,
+        num_experts,
+        0,
+        stream));
+    EXPECT_FALSE(hipMoE_materialize_runtime_prefill_plan(
+        device_runtime,
+        device_gate,
+        device_up,
+        device_down,
+        device_active,
+        num_experts,
+        num_experts,
+        0,
+        nullptr));
     EXPECT_FALSE(hipMoE_materialize_runtime_prefill_descriptor_tables(
         device_runtime,
         device_gate,
@@ -1554,6 +1732,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
     std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
     std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
     std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    std::array<int32_t, num_experts> actual_active{};
     ASSERT_EQ(hipMemcpyAsync(actual_gate.data(), device_gate,
                              actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
@@ -1566,7 +1745,11 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
                              actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
               hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(actual_active.data(), device_active,
+                             sizeof(actual_active), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    EXPECT_EQ(actual_active, expected_active);
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
@@ -1579,6 +1762,8 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
                                  expected_down[static_cast<size_t>(expert)]);
     }
 
+    EXPECT_EQ(hipFree(device_active), hipSuccess);
+    EXPECT_EQ(hipFree(device_counts), hipSuccess);
     EXPECT_EQ(hipFree(device_down), hipSuccess);
     EXPECT_EQ(hipFree(device_up), hipSuccess);
     EXPECT_EQ(hipFree(device_gate), hipSuccess);

@@ -1017,8 +1017,11 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool hipMoE_build_active_expert_list_runtime(
+    bool hipMoE_materialize_runtime_prefill_plan(
         const void *runtime,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
@@ -9708,6 +9711,35 @@ namespace llaminar2
         const int total_slots = seq_len * top_k;
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        void *stream = getStream();
+
+        /*
+         * Resolve both fused-publication outputs before launch.  These are
+         * persistent workspace addresses selected by graph identity; binding
+         * performs validation and pointer arithmetic only, never allocation.
+         */
+        if (total_slots > group_slots_cap_ ||
+            !d_group_active_expert_ids_ ||
+            !d_group_original_to_grouped_)
+        {
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "executeGroupedPrefillPipelineFromRuntime(group_active_expert_ids)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
+                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "executeGroupedPrefillPipelineFromRuntime(group_original_to_grouped)"))
+            {
+                d_group_active_expert_ids_ = nullptr;
+                d_group_original_to_grouped_ = nullptr;
+                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] runtime grouping workspace is required");
+                return false;
+            }
+            group_slots_cap_ = total_slots;
+        }
+        const int active_expert_slots = std::min(total_slots, num_experts);
 
         /*
          * Runtime placement changes descriptor values without changing the
@@ -9743,21 +9775,22 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_materialize_runtime_prefill_descriptor_tables(
+        if (!hipMoE_materialize_runtime_prefill_plan(
                 device_runtime_layer,
                 runtime_gate_descs,
                 runtime_up_descs,
                 runtime_down_descs,
+                d_group_active_expert_ids_,
                 num_experts,
+                active_expert_slots,
                 device_ordinal_,
-                getStream()))
+                stream))
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to materialize runtime descriptors");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "failed to materialize runtime descriptors and active experts");
             return false;
         }
 
-        const DeviceId device = DeviceId::rocm(device_ordinal_);
-        void *stream = getStream();
         ITensor *publication_output = canonical_route_contributions
                                           ? canonical_route_contributions
                                           : output;
@@ -9796,38 +9829,6 @@ namespace llaminar2
             return false;
         }
 
-        if (total_slots > group_slots_cap_ ||
-            !d_group_active_expert_ids_ ||
-            !d_group_original_to_grouped_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
-                                     static_cast<size_t>(num_experts) * sizeof(int),
-                                     "executeGroupedPrefillPipelineFromRuntime(group_active_expert_ids)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
-                                     static_cast<size_t>(total_slots) * sizeof(int),
-                                     "executeGroupedPrefillPipelineFromRuntime(group_original_to_grouped)"))
-            {
-                d_group_active_expert_ids_ = nullptr;
-                d_group_original_to_grouped_ = nullptr;
-                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] runtime grouping workspace is required");
-                return false;
-            }
-            group_slots_cap_ = total_slots;
-        }
-        const int active_expert_slots = std::min(total_slots, num_experts);
-        if (!hipMoE_build_active_expert_list_runtime(
-                device_runtime_layer,
-                d_group_active_expert_ids_,
-                num_experts,
-                active_expert_slots,
-                device_ordinal_,
-                getStream()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build active expert list");
-            return false;
-        }
         group_active_expert_slots_ = active_expert_slots;
 
         /*
@@ -9843,7 +9844,7 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 device_ordinal_,
-                getStream()))
+                stream))
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build runtime ordered-scatter map");
             return false;

@@ -1170,8 +1170,11 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_build_active_expert_list_runtime(
+    bool cudaMoE_materialize_runtime_prefill_plan(
         const void *runtime,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
@@ -6585,16 +6588,19 @@ namespace llaminar2
             return false;
         }
 
-        if (!cudaMoE_materialize_runtime_prefill_descriptor_tables(
+        if (!cudaMoE_materialize_runtime_prefill_plan(
                 device_runtime_layer,
                 runtime_gate_descs,
                 runtime_up_descs,
                 runtime_down_descs,
+                d_group_active_expert_ids_,
                 num_experts,
+                active_expert_slots,
                 device_ordinal_,
                 stream))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to materialize runtime descriptors");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "failed to materialize runtime descriptors and active experts");
             return false;
         }
 
@@ -6633,17 +6639,6 @@ namespace llaminar2
                                        : "unpublished")}});
         }
 
-        if (!cudaMoE_build_active_expert_list_runtime(
-                device_runtime_layer,
-                d_group_active_expert_ids_,
-                num_experts,
-                active_expert_slots,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build active expert list");
-            return false;
-        }
         group_active_expert_slots_ = active_expert_slots;
 
         /*

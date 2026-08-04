@@ -5751,6 +5751,13 @@ add_v2_test(V2_Integration_CUDAMoEKernel
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDA_MoEActiveExpertCompaction
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.ActiveExpertCompactionIsStableTotalAndGraphCapturable:Test__CUDAMoEKernel.RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;LLEP;ActiveExperts;StableCompaction;DeviceResident;GraphCapture;Regression"
+    MPI_PROCS 1
+)
 add_v2_test(V2_Integration_CUDA_MoETransferStateMachine
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.DeviceRebalance*:Test__CUDAMoERequestReset.RepeatedRequestResetRestoresImmutableTransferDirectoryBaseline
@@ -6014,6 +6021,25 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
             --gtest_filter=Test__CUDAGDNPaddedRealLength.RequestBatchedUnequalLengthsPreserveByteExactContinuation
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;ShortConv;RequestBatch;VariableLength;StatePublication;FP32;Regression"
+    MPI_PROCS 1
+)
+endif()
+
+# Performance: CUDA GDN scalar decode and grouped verifier recurrence.
+# The timed region invokes production C ABI launches with persistent buffers;
+# correctness and graph replay are owned by the integration gates above.
+if(HAVE_CUDA)
+add_executable(v2_perf_cuda_gdn_verifier_rows
+    performance/kernels/cuda/gdn/Perf__CUDAGatedDeltaNetVerifierRows.cpp
+)
+target_link_libraries(v2_perf_cuda_gdn_verifier_rows
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CUDAGatedDeltaNetVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cuda_gdn_verifier_rows>
+    LABELS "V2;Performance;CUDA;GatedDeltaNet;MTP;GroupedVerifierRows;Decode;Latency;Economy"
     MPI_PROCS 1
 )
 endif()
@@ -12286,6 +12312,13 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmMoEKernel
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCm_MoEActiveExpertCompaction
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.ActiveExpertCompactionIsStableTotalAndGraphCapturable:Test__ROCmMoEKernel.RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;LLEP;ActiveExperts;StableCompaction;DeviceResident;GraphCapture;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_ROCm_MoETransferStateMachine

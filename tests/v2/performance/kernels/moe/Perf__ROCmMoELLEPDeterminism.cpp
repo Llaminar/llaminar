@@ -27,6 +27,17 @@ namespace
     using namespace llaminar2::test::moe_llep_perf;
 
 #ifdef HAVE_ROCM
+    extern "C" bool hipMoE_materialize_runtime_prefill_plan(
+        const void *runtime,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int num_experts,
+        int max_active_experts,
+        int device_idx,
+        void *stream);
+
     bool hasROCmDevice()
     {
         int count = 0;
@@ -327,6 +338,140 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CurrentBatchSpanAssignmentDeterministic)
                 route_hash,
                 static_cast<uint32_t>(runtime.reserved_u64[2]),
                 static_cast<uint32_t>(runtime.reserved_u64[3]));
+#endif
+}
+
+/**
+ * @brief Time fused HIP runtime descriptor and active-expert plan publication.
+ *
+ * Setup publishes realistic resident descriptors before timing. The measured
+ * interval contains only fused descriptor materialization and deterministic
+ * active-list publication: allocation, transfer, and per-launch
+ * synchronization remain outside the sample, and one event pair brackets the
+ * complete sequence on the explicit stream.
+ */
+TEST(Perf__MoELLEPDeterminism, ROCm_RuntimePrefillPlanPublication)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const Shape shape{};
+    const int warmups = envInt("LLAMINAR_MOE_ACTIVE_LIST_WARMUPS", 20);
+    const int iterations = envInt("LLAMINAR_MOE_ACTIVE_LIST_ITERS", 1000);
+    const float max_avg_us = static_cast<float>(
+        envInt("LLAMINAR_MOE_ACTIVE_LIST_MAX_US", 25));
+    ROCmHarness harness(shape);
+    harness.prepare(
+        /*all_participants_resident=*/true,
+        makeResidentAssignmentRouteExperts(shape),
+        makeRouteWeights(shape));
+
+    DeviceNativeVNNIMatrixDesc *gate_descs = nullptr;
+    DeviceNativeVNNIMatrixDesc *up_descs = nullptr;
+    DeviceNativeVNNIMatrixDesc *down_descs = nullptr;
+    int *active_expert_ids = nullptr;
+    const std::size_t descriptor_bytes =
+        static_cast<std::size_t>(shape.num_experts) *
+        sizeof(DeviceNativeVNNIMatrixDesc);
+    ASSERT_EQ(hipMalloc(&gate_descs, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&up_descs, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(&down_descs, descriptor_bytes), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            &active_expert_ids,
+            static_cast<std::size_t>(shape.num_experts) * sizeof(int)),
+        hipSuccess);
+
+    for (int i = 0; i < warmups; ++i)
+    {
+        ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(
+            harness.runtime_table_->deviceLayerState(0),
+            gate_descs,
+            up_descs,
+            down_descs,
+            active_expert_ids,
+            shape.num_experts,
+            shape.num_experts,
+            /*device_idx=*/0,
+            harness.stream_));
+    }
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    HipEvents events;
+    ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+    for (int i = 0; i < iterations; ++i)
+    {
+        ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(
+            harness.runtime_table_->deviceLayerState(0),
+            gate_descs,
+            up_descs,
+            down_descs,
+            active_expert_ids,
+            shape.num_experts,
+            shape.num_experts,
+            /*device_idx=*/0,
+            harness.stream_));
+    }
+    ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+    ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(
+        hipEventElapsedTime(&elapsed_ms, events.start, events.stop),
+        hipSuccess);
+
+    const auto runtime = harness.copyRuntime();
+    std::vector<int32_t> counts(static_cast<std::size_t>(shape.num_experts));
+    std::vector<int32_t> actual(static_cast<std::size_t>(shape.num_experts));
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            counts.data(),
+            runtime.expert_counts,
+            counts.size() * sizeof(int32_t),
+            hipMemcpyDeviceToHost,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            actual.data(),
+            active_expert_ids,
+            actual.size() * sizeof(int32_t),
+            hipMemcpyDeviceToHost,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    std::vector<int32_t> expected;
+    expected.reserve(static_cast<std::size_t>(shape.num_experts));
+    for (int expert = 0; expert < shape.num_experts; ++expert)
+    {
+        if (counts[static_cast<std::size_t>(expert)] > 0)
+            expected.push_back(expert);
+    }
+    const uint32_t active_count = static_cast<uint32_t>(expected.size());
+    expected.resize(static_cast<std::size_t>(shape.num_experts), -1);
+    EXPECT_EQ(actual, expected);
+
+    const float avg_us =
+        elapsed_ms * 1000.0f / static_cast<float>(iterations);
+    printTiming(
+        "rocm",
+        "runtime_prefill_plan_publication",
+        shape,
+        iterations,
+        avg_us,
+        fnv1a64(actual),
+        active_count,
+        0);
+    EXPECT_LT(avg_us, max_avg_us)
+        << "fused runtime prefill publication regressed toward serial execution";
+
+    ASSERT_EQ(hipFree(down_descs), hipSuccess);
+    ASSERT_EQ(hipFree(up_descs), hipSuccess);
+    ASSERT_EQ(hipFree(gate_descs), hipSuccess);
+    ASSERT_EQ(hipFree(active_expert_ids), hipSuccess);
 #endif
 }
 
