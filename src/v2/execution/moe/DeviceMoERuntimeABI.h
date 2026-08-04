@@ -14,7 +14,7 @@
 
 namespace llaminar2::moe_runtime_abi
 {
-    inline constexpr std::size_t kLayerRuntimeBytes = 89528;
+    inline constexpr std::size_t kLayerRuntimeBytes = 89536;
     inline constexpr std::size_t kRouteParticipantIdsOffset = 89360;
     inline constexpr std::size_t kDeferredVerifierExpertIdsOffset = 89368;
     inline constexpr std::size_t kDeferredVerifierParticipantIdsOffset = 89376;
@@ -22,6 +22,8 @@ namespace llaminar2::moe_runtime_abi
     inline constexpr std::size_t kDeferredVerifierRouteCapacityOffset = 89512;
     inline constexpr std::size_t kParticipantCountOffset = 89520;
     inline constexpr std::size_t kCurrentBatchLLEPMovementObservedOffset = 89524;
+    inline constexpr std::size_t
+        kCurrentBatchLLEPNonOwnerAssignmentObservedOffset = 89528;
 
     static_assert(sizeof(void *) == 8,
                   "DeviceMoELayerRuntime ABI requires 64-bit pointers");

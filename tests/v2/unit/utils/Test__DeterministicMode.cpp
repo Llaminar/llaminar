@@ -73,10 +73,52 @@ TEST(Test__DeterministicMode, CudaMoEOrderedKPartDefaultsUseProductionProvenGeom
     ScopedEnv env({
         {"LLAMINAR_CUDA_MOE_GATEUP_KPARTS", ""},
         {"LLAMINAR_CUDA_MOE_DOWN_KPARTS", ""},
+        {"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", ""},
+        {"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", ""},
     });
 
     EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_kparts, 16);
     EXPECT_EQ(debugEnv().gemm.cuda_moe_down_kparts, 16);
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 128);
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 9);
+}
+
+/**
+ * @brief Accept only warp-aligned ordered split-K scatter geometries.
+ *
+ * The launch width is selected before graph capture and becomes part of the
+ * executable topology. Invalid values must resolve to the proven production
+ * geometry instead of creating a partial warp or an oversized CUDA block.
+ */
+TEST(Test__DeterministicMode, CudaMoEOrderedKPartTileRequiresWarpAlignedGeometry)
+{
+    {
+        ScopedEnv env({{"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", "192"}});
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 192);
+    }
+    {
+        ScopedEnv env({{"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", "190"}});
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 128);
+    }
+}
+
+/**
+ * @brief Bound scratch-free grouped-down launches to legal whole-warp blocks.
+ *
+ * The kernel derives route ownership from the captured block width. Keeping
+ * this override between eight and sixteen warps guarantees enough workers for
+ * the production top-k range without exceeding CUDA's 512-thread block size.
+ */
+TEST(Test__DeterministicMode, CudaMoEDownDirectWarpGeometryIsBounded)
+{
+    {
+        ScopedEnv env({{"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", "11"}});
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 11);
+    }
+    {
+        ScopedEnv env({{"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", "7"}});
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 9);
+    }
 }
 
 TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreservesOrderedCudaKPart)

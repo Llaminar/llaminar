@@ -318,6 +318,13 @@ namespace llaminar2
         int rejected_transaction_count = 0; ///< Transactions that emitted a rejection correction.
         int consumed_verifier_row_count = 0; ///< Total verifier rows consumed by committed transactions.
         int published_state_commit_count = 0; ///< Total main-graph state rows committed by the device.
+        int attempted_draft_token_count = 0; ///< Sum of device-selected draft widths.
+        int verifier_token_count = 0; ///< Sum of logical verifier widths, including condition rows.
+        int final_draft_depth = 0; ///< Device selector at the terminal boundary.
+        int depth_evaluated_window_count = 0; ///< Device-owned dynamic-policy windows evaluated.
+        int depth_update_count = 0; ///< Applied dynamic selector transitions.
+        int depth_promotion_count = 0; ///< Applied one-step promotions.
+        int depth_demotion_count = 0; ///< Applied one-step demotions.
 
         bool operator==(
             const DeviceGenerationTerminalRequestResult &) const = default;
@@ -341,6 +348,49 @@ namespace llaminar2
             return device.is_gpu() && !requests.empty();
         }
     };
+
+    /**
+     * @brief Sampling topology embedded in a native device-generation parent.
+     *
+     * Greedy grouped verification reduces compact outcomes inside the retained
+     * all-position forward graph. Stochastic grouped verification instead owns
+     * separate target-distribution and serial-rejection child graphs. The two
+     * parent bodies are therefore different executables even when their request
+     * and verifier geometry match. Carrying this closed mode through the public
+     * runner contract prevents either topology from being guessed from ambient
+     * sampling parameters or reused under the other's cache identity.
+     */
+    enum class DeviceGenerationSamplingMode : uint8_t
+    {
+        Greedy = 0,
+        Stochastic = 1,
+    };
+
+    /**
+     * @brief Return the stable diagnostic name for a device-generation mode.
+     */
+    constexpr const char *deviceGenerationSamplingModeName(
+        DeviceGenerationSamplingMode mode) noexcept
+    {
+        switch (mode)
+        {
+        case DeviceGenerationSamplingMode::Greedy:
+            return "greedy";
+        case DeviceGenerationSamplingMode::Stochastic:
+            return "stochastic";
+        }
+        return "invalid";
+    }
+
+    /**
+     * @brief Validate a possibly deserialized device-generation mode.
+     */
+    constexpr bool isValidDeviceGenerationSamplingMode(
+        DeviceGenerationSamplingMode mode) noexcept
+    {
+        return mode == DeviceGenerationSamplingMode::Greedy ||
+               mode == DeviceGenerationSamplingMode::Stochastic;
+    }
 
     /**
      * @brief Static graph shape for publication from a device outcome row.
@@ -4024,7 +4074,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compose the exact fixed-depth device generation parent.
+         * @brief Compose the exact policy-complete device generation parent.
          *
          * The first externally orchestrated transaction must already have
          * committed its resident response/state rows, and every child graph in
@@ -4041,16 +4091,25 @@ namespace llaminar2
          * segmented/eager execution.
          *
          * @param request_count Number of admitted resident controller rows.
-         * @param draft_depth Exact immutable draft depth captured by the child
-         *        graph family. The verifier child owns `draft_depth + 1` rows.
+         * Fixed policy produces one immutable WHILE body. Dynamic policy produces
+         * a native device-selected branch for every legal depth; all branches use
+         * one maximum-capacity verifier family and mask inactive rows from the
+         * resident selector. No host-selected replay path is part of the contract.
+         *
+         * @param draft_depth Fixed depth, or maximum capture depth for a dynamic
+         *        child family. The verifier child owns `draft_depth + 1` rows.
+         * @param sampling_mode Exact compact-outcome topology embedded in every
+         *        transaction body. It is part of graph-cache identity.
          * @return true when the complete parent executable is ready to launch.
          */
         virtual bool materializeDeviceResidentGeneration(
             int request_count,
-            int draft_depth)
+            int draft_depth,
+            DeviceGenerationSamplingMode sampling_mode)
         {
             (void)request_count;
             (void)draft_depth;
+            (void)sampling_mode;
             return false;
         }
 

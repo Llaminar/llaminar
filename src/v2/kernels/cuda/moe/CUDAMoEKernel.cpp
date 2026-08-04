@@ -462,6 +462,7 @@ namespace
         bool fuse_swiglu_requested,
         bool use_ordered_down_kpart,
         bool ordered_scatter,
+        bool canonical_route_publication,
         int splitk_tile_rows)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
@@ -497,6 +498,17 @@ namespace
                                             ? "row_ordered_kpart"
                                             : (ordered_scatter ? "row_ordered"
                                                                : "slot_scatter");
+            if (use_ordered_down_kpart)
+            {
+                tags["down_publication"] = canonical_route_publication
+                                                ? "route_major_collective"
+                                                : "fused_direct";
+                if (!canonical_route_publication)
+                {
+                    tags["down_direct_warps"] = std::to_string(
+                        llaminar2::debugEnv().gemm.cuda_moe_down_direct_warps);
+                }
+            }
         }
         else if (ordered_scatter)
         {
@@ -6244,7 +6256,9 @@ namespace llaminar2
             return false;
         }
         const bool use_down_ordered_kpart = active_expert_slots > 0;
-        if (use_down_ordered_kpart &&
+        const bool publishes_canonical_routes =
+            canonical_route_contributions != nullptr;
+        if (use_down_ordered_kpart && publishes_canonical_routes &&
             !ensureGroupedDownKPartScratchCapacity(
                 debugEnv().gemm.cuda_moe_down_kparts,
                 d_model,
@@ -6368,7 +6382,9 @@ namespace llaminar2
             use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
-            use_down_ordered_kpart ? d_grouped_down_partials_ : nullptr,
+            use_down_ordered_kpart && publishes_canonical_routes
+                ? d_grouped_down_partials_
+                : nullptr,
             d_prefill_gate_,
             d_output,
             d_canonical_route_contributions,
@@ -6429,6 +6445,7 @@ namespace llaminar2
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
             ordered_scatter_overwrites_output,
+            canonical_route_contributions != nullptr,
             splitk_tile_rows);
         return true;
     }
@@ -6519,6 +6536,8 @@ namespace llaminar2
             return false;
         }
         const bool use_down_ordered_kpart = active_expert_slots > 0;
+        const bool publishes_canonical_routes =
+            canonical_route_contributions != nullptr;
         if ((use_gateup_kpart || use_down_ordered_kpart) &&
             !runtime_host_layer.route_expert_ids)
         {
@@ -6526,7 +6545,7 @@ namespace llaminar2
                       "verifier grouped down split-K requires runtime route expert ids");
             return false;
         }
-        if (use_down_ordered_kpart &&
+        if (use_down_ordered_kpart && publishes_canonical_routes &&
             !ensureGroupedDownKPartScratchCapacity(
                 debugEnv().gemm.cuda_moe_down_kparts,
                 d_model,
@@ -6687,7 +6706,9 @@ namespace llaminar2
             use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
-            use_down_ordered_kpart ? d_grouped_down_partials_ : nullptr,
+            use_down_ordered_kpart && publishes_canonical_routes
+                ? d_grouped_down_partials_
+                : nullptr,
             d_prefill_gate_,
             d_output,
             d_canonical_route_contributions,
@@ -6744,6 +6765,7 @@ namespace llaminar2
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
             true,
+            canonical_route_contributions != nullptr,
             splitk_tile_rows);
         return true;
     }

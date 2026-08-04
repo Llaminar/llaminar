@@ -121,6 +121,46 @@ namespace llaminar2::least_loaded_ep
         uint32_t standard_ep_selected = 0;
     };
 
+    /**
+     * @brief Report whether a published assignment redistributes any routed row.
+     *
+     * LLEP can improve participant balance without copying an expert payload
+     * when the selected destination already owns a resident replica. In that
+     * case @ref LeastLoadedExpertAssignmentStatus::spilled_rows and
+     * @ref LeastLoadedExpertAssignmentStatus::weight_transfer_count both remain
+     * zero even though production execution deliberately sends routed rows away
+     * from the expert's authoritative owner. This predicate names that semantic
+     * distinction directly so host tests and both GPU consumers use the same
+     * definition.
+     *
+     * Empty spans are ignored because they do not assign executable work. A
+     * null span array is valid only for an empty publication and therefore
+     * reports no redistribution.
+     *
+     * @param spans Canonical assignment-span publication.
+     * @param span_count Number of readable entries in @p spans.
+     * @return `true` when at least one non-empty span targets a non-owner
+     *         participant.
+     */
+    LLAMINAR_LLEP_HD bool containsNonOwnerAssignmentRows(
+        const LeastLoadedExpertAssignmentSpan *spans,
+        uint32_t span_count) noexcept
+    {
+        if (spans == nullptr)
+            return false;
+
+        for (uint32_t span_index = 0; span_index < span_count; ++span_index)
+        {
+            const auto &span = spans[span_index];
+            if (span.route_row_begin < span.route_row_end &&
+                span.destination_participant != span.owner_participant)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     LLAMINAR_LLEP_HD uint64_t saturatedMul(uint64_t lhs, uint64_t rhs) noexcept
     {
         if (lhs != 0ULL && rhs > (~0ULL) / lhs)

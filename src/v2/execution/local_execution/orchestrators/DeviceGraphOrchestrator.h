@@ -2729,7 +2729,8 @@ namespace llaminar2
             int max_new_tokens) override;
         bool materializeDeviceResidentGeneration(
             int request_count,
-            int draft_depth) override;
+            int draft_depth,
+            DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
         bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;
@@ -2812,6 +2813,7 @@ namespace llaminar2
         mtpAllPositionVerifierDeviceLoopGraphTemplate(
             int request_count,
             int padded_seq_len,
+            DeviceGenerationSamplingMode sampling_mode,
             std::string *error = nullptr) const;
 
         /**
@@ -5089,6 +5091,11 @@ namespace llaminar2
              */
             uint32_t prefill_current_batch_movement_layers = 0;
             /**
+             * Runtime layers whose current-batch span consumer redistributed
+             * rows to a resident non-owner participant without moving payload.
+             */
+            uint32_t prefill_current_batch_non_owner_assignment_layers = 0;
+            /**
              * Transfer-slot-backed experts still active in the device runtime.
              *
              * This is terminal-state storage evidence collected by the
@@ -6399,7 +6406,15 @@ namespace llaminar2
         };
 
         /**
-         * @brief Persistent owner for one fixed-depth device generation loop.
+         * @brief Persistent owner for one policy-complete device generation loop.
+         *
+         * Fixed and observe policies own one immutable transaction body. Dynamic
+         * policy owns a native SWITCH-in-WHILE parent whose branch index is the
+         * resident controller's exact draft depth. Every branch is composed from
+         * strict child captures at one maximum-capacity verifier geometry, while
+         * the branch itself contains only the sidecar/publication prefix required
+         * by that depth. This gives the device controller sole depth authority
+         * without executing inactive draft rows.
          *
          * The stream is allocated with runner workspace setup. The graph object
          * is retained across request boundaries and rebuilt from exact child
@@ -6415,8 +6430,16 @@ namespace llaminar2
             std::vector<DeviceControlledLoopFragment> source_fragments;
             uint64_t workspace_generation = 0;
             int request_count = 0;
+            /** Maximum/capture draft width embedded in every verifier child. */
             int draft_depth = 0;
             int verifier_rows_per_request = 0;
+            /** Inclusive native SWITCH range; equal for a fixed body. */
+            int minimum_draft_depth = 0;
+            int maximum_draft_depth = 0;
+            /** DeviceGenerationDepthPolicyMode encoded into this executable. */
+            int depth_policy_mode = -1;
+            /** Greedy/stochastic compact-outcome topology in every branch. */
+            std::optional<DeviceGenerationSamplingMode> sampling_mode;
             size_t fragment_count = 0;
             /** Number of fragments whose execution is selected by device state. */
             size_t conditional_fragment_count = 0;
@@ -6450,6 +6473,10 @@ namespace llaminar2
                 request_count = 0;
                 draft_depth = 0;
                 verifier_rows_per_request = 0;
+                minimum_draft_depth = 0;
+                maximum_draft_depth = 0;
+                depth_policy_mode = -1;
+                sampling_mode.reset();
                 fragment_count = 0;
                 conditional_fragment_count = 0;
                 valid = false;
@@ -6626,6 +6653,17 @@ namespace llaminar2
          */
         std::vector<DeviceControlledLoopFragment>
             mtp_device_generation_loop_fragment_scratch_;
+
+        /**
+         * @brief Allocation-free native SWITCH branch descriptors.
+         *
+         * Entry `d` names the complete transaction for resident draft depth `d`.
+         * Its span borrows the flattened fragment scratch above only during
+         * synchronous parent composition. Workspace setup sizes this inventory
+         * through the maximum supported depth so materialization never grows it.
+         */
+        std::vector<DeviceControlledLoopBranch>
+            mtp_device_generation_loop_branch_scratch_;
 
         /**
          * @brief Allocation-free identity scratch for verifier graph selection.
@@ -8896,16 +8934,27 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
-         * @brief Assemble one fixed-depth stochastic transaction into a CUDA WHILE graph.
+         * @brief Assemble the configured stochastic policy into one native parent.
          *
-         * Every fragment must already be replay-ready and must match the active
-         * request/workspace identity. The method clones them in semantic producer
-         * order and instantiates one persistent parent executable; it never launches
-         * the graph or reads the generation controller on host.
+         * Fixed/observe policy clones one producer-ordered transaction into a
+         * WHILE body. Dynamic policy clones one complete transaction per legal
+         * depth into a device-selected SWITCH-in-WHILE. Every fragment must
+         * already be replay-ready at @p draft_depth capture capacity and match
+         * the active request/workspace identity. This method composes and
+         * instantiates only; it never launches or reads controller state on host.
+         *
+         * @param request_count Exact admitted controller row count.
+         * @param draft_depth Fixed transaction depth, or maximum capture depth
+         *        for dynamic policy.
+         * @param sampling_mode Exact compact-outcome topology retained by the
+         *        verifier child and transaction tail.
+         * @param error Optional first violated capture/composition invariant.
+         * @return true when one complete native parent is executable.
          */
         bool materializeMTPDeviceGenerationLoopGraph(
             int request_count,
             int draft_depth,
+            DeviceGenerationSamplingMode sampling_mode,
             std::string *error = nullptr);
 
         /**

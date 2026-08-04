@@ -44,6 +44,61 @@ namespace llaminar2
                              toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot));
         }
 
+        /**
+         * @brief Compare portable placement semantics while ignoring request history.
+         *
+         * Active epochs, histograms, physical payload pointers, and rolling slot
+         * identities do not decide where an expert is logically resident or
+         * eligible to execute. Keeping this comparison beside the runtime-table
+         * ABI prevents prefix restore from manufacturing a placement movement
+         * merely because it imported newer counters.
+         */
+        bool portablePlacementMatchesRuntime(
+            const DeviceMoEPortableLayerRuntimeState &portable,
+            const DeviceMoELayerRuntime &runtime) noexcept
+        {
+            if (runtime.active_bank > 1u ||
+                portable.expert_count != runtime.expert_count ||
+                portable.top_k != runtime.top_k ||
+                portable.participant_id != runtime.participant_id ||
+                portable.participant_count != runtime.participant_count ||
+                portable.experts.size() !=
+                    static_cast<size_t>(runtime.expert_count))
+            {
+                return false;
+            }
+
+            const auto &bank = runtime.banks[runtime.active_bank];
+            for (uint32_t expert = 0; expert < runtime.expert_count; ++expert)
+            {
+                const auto &saved = portable.experts[expert];
+                const auto &live = bank.experts[expert];
+                const int32_t live_logical_expert =
+                    live.logical_expert_id >= 0
+                        ? live.logical_expert_id
+                        : static_cast<int32_t>(expert);
+                const uint32_t saved_policy_flags =
+                    clearPayloadBearingMoEExpertFlags(
+                        portableMoEExpertFlags(saved.flags));
+                const uint32_t live_policy_flags =
+                    clearPayloadBearingMoEExpertFlags(
+                        portableMoEExpertFlags(live.flags));
+
+                if (saved.logical_expert_id != live_logical_expert ||
+                    saved.owner_participant != live.owner_participant ||
+                    saved.local_compute !=
+                        (bank.local_compute_mask[expert] != 0u ? 1u : 0u) ||
+                    saved.replica_role != bank.replica_role[expert] ||
+                    saved.resident_participant_mask !=
+                        bank.resident_participant_mask[expert] ||
+                    saved_policy_flags != live_policy_flags)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool descriptorRequiresReadyPayload(const DeviceMoEExpertDescriptor &desc, uint8_t local_compute)
         {
             return local_compute != 0 ||
@@ -1652,7 +1707,8 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceMoERuntimeTable::restorePortableRuntimeState(
+    DeviceMoEPortableRuntimeRestoreResult
+    DeviceMoERuntimeTable::restorePortableRuntimeState(
         const std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
         void *stream,
         const LocalPayloadDescriptorResolver &local_payload_resolver)
@@ -1661,12 +1717,14 @@ namespace llaminar2
         {
             LOG_ERROR("[MoERuntimeTable] portable runtime restore layer count mismatch: table="
                       << num_layers_ << " snapshot=" << layers.size());
-            return false;
+            return {};
         }
         if (mirror_to_device_ && !stream)
             throw std::invalid_argument(
                 "[MoERuntimeTable] mirrored portable runtime restore requires an explicit stream");
 
+        bool placement_changed = false;
+        bool requires_device_payload_rehydration = false;
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
@@ -1678,10 +1736,24 @@ namespace llaminar2
             {
                 LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                      << ": portable runtime restore metadata mismatch");
-                return false;
+                return {};
             }
 
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            const size_t layer_offset = static_cast<size_t>(layer_idx);
+            const bool has_initial_baseline =
+                layer_offset < initial_layer_captured_.size() &&
+                initial_layer_captured_[layer_offset] != 0u;
+            const DeviceMoELayerRuntime &placement_baseline =
+                has_initial_baseline
+                    ? initial_host_layers_[layer_offset]
+                    : state;
+            placement_changed =
+                placement_changed ||
+                !portablePlacementMatchesRuntime(snapshot, placement_baseline);
+            requires_device_payload_rehydration =
+                requires_device_payload_rehydration ||
+                snapshot.requires_device_payload_rehydration != 0u;
             if (snapshot.requires_device_payload_rehydration != 0u)
             {
                 /*
@@ -1703,7 +1775,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                          << ": transient portable restore requires a mirrored GPU table with immutable placement");
-                    return false;
+                    return {};
                 }
 
                 const auto scratch = captureRuntimeScratchBindings(state);
@@ -1712,7 +1784,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                          << ": transient portable restore has no persistent LLEP transfer scratch");
-                    return false;
+                    return {};
                 }
 
                 const auto &initial = initial_host_layers_[idx];
@@ -1726,7 +1798,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                          << ": transient portable restore immutable placement metadata mismatch");
-                    return false;
+                    return {};
                 }
 
                 const auto &initial_bank = initial.banks[initial.active_bank];
@@ -1765,7 +1837,7 @@ namespace llaminar2
                         LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                              << ": transient portable restore cannot derive an immutable-owner replica plan for expert "
                                                              << expert);
-                        return false;
+                        return {};
                     }
 
                     const bool expected_local_compute =
@@ -1776,7 +1848,7 @@ namespace llaminar2
                         LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                              << ": transient portable restore local-compute/residency mismatch for expert "
                                                              << expert);
-                        return false;
+                        return {};
                     }
                     uint32_t arrivals = desired_mask & ~initial_mask;
                     while (arrivals != 0u)
@@ -1804,7 +1876,7 @@ namespace llaminar2
                                                          << transfers.size()
                                                          << " capacity="
                                                          << scratch.reserved_u64[1]);
-                    return false;
+                    return {};
                 }
 
                 state = initial;
@@ -1859,7 +1931,7 @@ namespace llaminar2
                                                          << ": portable runtime restore logical expert mismatch"
                                                          << " slot=" << expert
                                                          << " logical=" << saved.logical_expert_id);
-                    return false;
+                    return {};
                 }
 
                 DeviceMoEExpertDescriptor desc;
@@ -1892,7 +1964,7 @@ namespace llaminar2
                                                                  << expert
                                                                  << " slot=" << saved.local_slot
                                                                  << " but the resolver could not bind it");
-                            return false;
+                            return {};
                         }
                         if (!descriptorMatchesPortableLocalClaim(ready_desc,
                                                                  expert,
@@ -1901,7 +1973,7 @@ namespace llaminar2
                             LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                                  << ": portable runtime restore resolver returned an invalid descriptor for expert "
                                                                  << expert);
-                            return false;
+                            return {};
                         }
                     }
                     else
@@ -1926,7 +1998,7 @@ namespace llaminar2
                                 LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                                      << ": portable runtime restore resolver returned an invalid descriptor for expert "
                                                                      << expert);
-                                return false;
+                                return {};
                             }
                         }
                     }
@@ -1937,7 +2009,7 @@ namespace llaminar2
                                                              << ": portable runtime restore requires local payload for expert "
                                                              << expert
                                                              << " but no live descriptor is resident");
-                        return false;
+                        return {};
                     }
                     desc = ready_desc;
                     desc.logical_expert_id = expert;
@@ -1973,7 +2045,7 @@ namespace llaminar2
                 LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                      << ": portable runtime restore failed: "
                                                      << ex.what());
-                return false;
+                return {};
             }
 
             auto &restored = host_layers_[static_cast<size_t>(layer_idx)];
@@ -1990,7 +2062,15 @@ namespace llaminar2
                 uploadLayerState(layer_idx, stream);
         }
 
-        return true;
+        return DeviceMoEPortableRuntimeRestoreResult{
+            .restored = true,
+            .placement_effect =
+                placement_changed
+                    ? DeviceMoEPortablePlacementEffect::Changed
+                    : DeviceMoEPortablePlacementEffect::Unchanged,
+            .requires_device_payload_rehydration =
+                requires_device_payload_rehydration,
+        };
     }
 
     void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(int token_capacity, void *stream)

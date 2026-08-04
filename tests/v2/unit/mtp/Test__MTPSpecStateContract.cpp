@@ -683,6 +683,87 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGroupedOutcomePublicatio
 }
 
 TEST(Test__MTPSpecStateContract,
+     TransactionDriverUsesDeviceSelectedWidthForDynamicDepthFullAcceptance)
+{
+    /*
+     * The graph is captured for six verifier inputs, while the resident depth
+     * controller selects four comparison rows for this replay.  Full acceptance
+     * therefore describes five verifier input states, plus one ready-token row.
+     * Treating all six capacity rows as active reproduces the long-context HTTP
+     * failure caught by the CUDA2 LLEP dynamic-depth E2E lane.
+     */
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6, 5, 4};
+
+    MTPDeviceRejectionBatchOutcome outcome;
+    outcome.ok = true;
+    outcome.output_tokens[0] = 7;
+    outcome.output_tokens[1] = 9;
+    outcome.output_tokens[2] = 8;
+    outcome.output_tokens[3] = 6;
+    outcome.output_tokens[4] = 5;
+    outcome.output_token_count = 5;
+    outcome.accepted_speculative_prefix = 4;
+    outcome.target_verifier_state_commit_count = 5;
+    outcome.ready_token = 3;
+    outcome.rejected_verified_token = -1;
+    outcome.all_speculative_accepted = true;
+    outcome.consumed_verifier_rows = 4;
+    outcome.sampled_terminal = true;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/6),
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {outcome},
+            /*base_cached_tokens=*/{100});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    ASSERT_THAT(plan.metadata.transactions, SizeIs(1));
+    EXPECT_EQ(plan.metadata.transactions.front().target_query_len, 6);
+    EXPECT_THAT(plan.metadata.accepted_draft_prefixes, ElementsAre(5));
+    EXPECT_THAT(plan.metadata.valid_sampled_counts, ElementsAre(6));
+    EXPECT_THAT(plan.metadata.next_condition_tokens, ElementsAre(3));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 5);
+    EXPECT_TRUE(plan.step_plans.steps.front().all_drafts_accepted);
+}
+
+TEST(Test__MTPSpecStateContract,
+     TransactionDriverRejectsMalformedDynamicDepthFullAcceptance)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6, 5, 4};
+
+    MTPDeviceRejectionBatchOutcome outcome;
+    outcome.ok = true;
+    outcome.output_tokens[0] = 7;
+    outcome.output_tokens[1] = 9;
+    outcome.output_tokens[2] = 8;
+    outcome.output_token_count = 3;
+    outcome.accepted_speculative_prefix = 4;
+    outcome.target_verifier_state_commit_count = 5;
+    outcome.ready_token = 3;
+    outcome.all_speculative_accepted = true;
+    outcome.consumed_verifier_rows = 4;
+    outcome.sampled_terminal = true;
+
+    const MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/6),
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {outcome},
+            /*base_cached_tokens=*/{100});
+
+    EXPECT_FALSE(plan.ok);
+    EXPECT_THAT(plan.error, HasSubstr("all-accepted active-width outcome"));
+}
+
+TEST(Test__MTPSpecStateContract,
      TransactionDriverPreservesEveryGroupedCommitBoundary)
 {
     using namespace sampling_math;

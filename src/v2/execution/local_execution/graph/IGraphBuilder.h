@@ -42,6 +42,37 @@ namespace llaminar2
     class IModelContext;
     struct PrefixFingerprintMaterial;
 
+    /**
+     * @brief Semantic placement effect of importing model-owned prefix state.
+     *
+     * Runtime counters, histograms, and epochs may be restored without changing
+     * where model payloads reside or execute. This enum prevents callers from
+     * treating every successful archive import as a placement mutation.
+     */
+    enum class PrefixCacheRuntimePlacementEffect : uint8_t
+    {
+        Unchanged,
+        Changed,
+    };
+
+    /**
+     * @brief Atomic result of one model-owned prefix-runtime restore.
+     *
+     * `restored` validates the archive transaction. `placement_effect` reports
+     * only semantic ownership/residency changes. `device_rehydration_required`
+     * declares persistent device work that the next captured main graph must
+     * complete before restored routes may execute.
+     */
+    struct PrefixCacheRuntimeRestoreResult
+    {
+        bool restored = false;
+        PrefixCacheRuntimePlacementEffect placement_effect =
+            PrefixCacheRuntimePlacementEffect::Unchanged;
+        bool device_rehydration_required = false;
+
+        explicit constexpr operator bool() const noexcept { return restored; }
+    };
+
     // =========================================================================
     // Generic Input/Output Structures
     // =========================================================================
@@ -444,11 +475,22 @@ namespace llaminar2
             return true;
         }
 
-        /// Restore state captured by capturePrefixCacheRuntimeState().
-        virtual bool restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream)
+        /**
+         * @brief Restore state captured by capturePrefixCacheRuntimeState().
+         *
+         * The typed result is the sole publication of restore validity,
+         * placement effect, and pending device work. A successful import with
+         * Unchanged placement must not invalidate graph identity or advance an
+         * MoE movement epoch.
+         */
+        virtual PrefixCacheRuntimeRestoreResult restorePrefixCacheRuntimeState(
+            const std::vector<uint8_t> &state,
+            void *stream)
         {
             (void)stream;
-            return state.empty();
+            return PrefixCacheRuntimeRestoreResult{
+                .restored = state.empty(),
+            };
         }
 
         /**

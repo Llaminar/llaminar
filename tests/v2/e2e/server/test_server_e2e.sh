@@ -2085,6 +2085,10 @@ sys.path.insert(0, policy_module_dir)
 
 from graph_capture_perf_policy import validate_graph_capture_policy
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
+from llep_verifier_perf_policy import validate_llep_verifier_policy
+from mtp_device_generation_perf_policy import (
+    validate_cuda_dynamic_mtp_device_generation_policy,
+)
 from request_input_lifetime_perf_policy import (
     validate_request_input_lifetime_policy,
 )
@@ -2328,36 +2332,17 @@ if is_gpu and is_mtp:
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
         sys.exit(0)
 
-    # LLEP's grouped verifier consumes only experts that are already resident
-    # on a participant. Migrating an entire expert payload for the current
-    # verifier batch is both unnecessary and catastrophically expensive at
-    # MTP-sized M. Require the production serving graph to publish its typed
-    # logical-position resident decision so an accidental return to either
-    # position-derived assignment or transfer-backed verifier assignment fails
-    # the canonical E2E matrix immediately.
+    # LLEP's grouped verifier has two economical typed policies. Sharded rows
+    # choose among resident experts using their device logical position. A
+    # mirrored verifier owns every expert and row locally, so assignment itself
+    # is absent and both transport and routed-result collectives must remain
+    # absent. The standalone validator rejects missing, mixed, or incomplete
+    # policy evidence.
     if flag_value("--moe-rebalance") == "llep":
-        verifier_assignment_records = [
-            record
-            for record in records
-            if record.get("domain") == "moe_rebalance"
-            and record.get("name") == "device_rebalance_llep_resident_assignment_calls"
-            and record.get("phase") == "verifier"
-        ]
-        if not verifier_assignment_records:
-            print("FAIL: GPU LLEP+MTP case emitted no logical-position resident verifier assignment evidence")
+        llep_validation = validate_llep_verifier_policy(records)
+        if llep_validation.error:
+            print(f"FAIL: {llep_validation.error}")
             sys.exit(0)
-        for record in verifier_assignment_records:
-            record_tags = record.get("tags") or {}
-            if (
-                record_tags.get("assignment") != "logical_position_resident"
-                or record_tags.get("current_batch_transport") != "none"
-            ):
-                print(
-                    "FAIL: GPU LLEP+MTP verifier did not select the "
-                    "logical-position resident assignment with no "
-                    f"current-batch transport: {record_tags}"
-                )
-                sys.exit(0)
 
 if require_stochastic_mtp:
     if not is_gpu or not is_mtp:
@@ -2382,10 +2367,27 @@ if require_stochastic_mtp:
     if resident_accept_tests <= 0.0:
         print("FAIL: stochastic MTP acceptance did not use the device-resident verifier")
         sys.exit(0)
-    if record_value_sum(
+    native_generation_parent = any(
+        record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_loop_graph_materializations"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("execution")
+        == "native_device_controlled_switch_while"
+        and (record.get("tags") or {}).get("sampling_mode") == "stochastic"
+        for record in records
+    )
+    request_batch_outcome_bridges = record_value_sum(
         ("stochastic_verify_request_batch_outcomes",),
         "mtp",
-    ) <= 0.0:
+    )
+    if native_generation_parent and request_batch_outcome_bridges > 0.0:
+        print(
+            "FAIL: native stochastic MTP entered the retired request-batched "
+            "host outcome bridge"
+        )
+        sys.exit(0)
+    if not native_generation_parent and request_batch_outcome_bridges <= 0.0:
         print("FAIL: stochastic MTP emitted no request-batched device outcome")
         sys.exit(0)
     gpu_reducer_records = [
@@ -2396,7 +2398,22 @@ if require_stochastic_mtp:
         == "stochastic_request_batch_summary_gpu_reducer"
         and numeric(record.get("total_ns")) > 0.0
     ]
-    if not gpu_reducer_records:
+    native_reducer_records = [
+        record
+        for record in records
+        if record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_terminal_compact_outcome_reductions"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("authority")
+        == "device_generation_controller"
+        and (record.get("tags") or {}).get("source")
+        == "captured_stochastic_compact_outcome"
+    ]
+    if native_generation_parent and not native_reducer_records:
+        print("FAIL: native stochastic MTP emitted no terminal compact-outcome reducer ledger")
+        sys.exit(0)
+    if not native_generation_parent and not gpu_reducer_records:
         print("FAIL: stochastic MTP emitted no GPU compact-outcome reducer evidence")
         sys.exit(0)
     if record_value_sum(
@@ -2408,6 +2425,27 @@ if require_stochastic_mtp:
     if record_value_sum(("depth_policy_windows",), "mtp") <= 0.0:
         print("FAIL: stochastic dynamic-depth MTP emitted no controller window")
         sys.exit(0)
+    if "cuda:" in extra_flags:
+        try:
+            expected_minimum_depth = int(
+                flag_value("--mtp-min-draft-tokens") or "0"
+            )
+            expected_maximum_depth = int(
+                flag_value("--mtp-max-draft-tokens") or "0"
+            )
+        except ValueError:
+            print("FAIL: stochastic CUDA MTP has malformed dynamic depth bounds")
+            sys.exit(0)
+        device_generation_validation = (
+            validate_cuda_dynamic_mtp_device_generation_policy(
+                records,
+                expected_minimum_depth=expected_minimum_depth,
+                expected_maximum_depth=expected_maximum_depth,
+            )
+        )
+        if device_generation_validation.error:
+            print(f"FAIL: {device_generation_validation.error}")
+            sys.exit(0)
 
 if require_prefix_rebalance_clear:
     if not is_gpu:
@@ -2452,7 +2490,7 @@ if require_prefix_rebalance_clear:
     ):
         print("FAIL: prefix-cache+MTP rebalance case did not restore MTP-bearing prefix-cache state")
         sys.exit(0)
-    movement_score = (
+    payload_movement_score = (
         record_value_sum(
             (
                 "device_rebalance_prefill_current_batch_movement_layers",
@@ -2479,8 +2517,24 @@ if require_prefix_rebalance_clear:
             domain="moe_rebalance",
         )
     )
-    if movement_score <= 0.0:
-        print("FAIL: prefix-cache rebalance clear probe saw no applied/imported expert movement")
+    resident_row_assignment_score = record_value_sum(
+        (
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+        ),
+        "moe_rebalance",
+    )
+    effective_movement_score = payload_movement_score
+    if mode == "llep":
+        # Fully mirrored LLEP has no expert payload to migrate. Its economical
+        # production action is to send routed rows to an already-resident
+        # non-owner replica. The sticky counter comes from the real assignment
+        # consumer, not from a planner proposal, so it is applied-work evidence.
+        effective_movement_score += resident_row_assignment_score
+    if effective_movement_score <= 0.0:
+        print(
+            "FAIL: prefix-cache rebalance clear probe saw neither applied expert "
+            "movement nor proven resident LLEP row redistribution"
+        )
         sys.exit(0)
     maintenance_launch_score = record_value_sum(
         ("device_maintenance_graph_launches",),
@@ -2527,9 +2581,17 @@ if require_prefix_rebalance_clear:
         )
         for operation in ("clear_cache", "request-clear-cache")
     )
-    if runtime_movement_epoch <= 0.0:
-        print("FAIL: prefix-cache rebalance clear probe did not observe nonzero moe_runtime_movement_epoch at request-boundary clear_cache")
-        sys.exit(0)
+    if payload_movement_score > 0.0:
+        if runtime_movement_epoch <= 0.0:
+            print("FAIL: prefix-cache rebalance clear probe applied payload movement without advancing moe_runtime_movement_epoch")
+            sys.exit(0)
+    elif mode == "llep" and resident_row_assignment_score > 0.0:
+        if runtime_movement_epoch != 0.0:
+            print(
+                "FAIL: resident-only LLEP row redistribution changed the placement "
+                "epoch even though ownership and residency were unchanged"
+            )
+            sys.exit(0)
 
 if require_moe_rebalance_movement:
     if not is_gpu:
@@ -2574,15 +2636,21 @@ if require_moe_rebalance_movement:
                 )
                 sys.exit(0)
 
-    # A sticky transient-placement layer is stronger evidence than an
-    # intermediate planner counter and more durable than terminal slot
-    # occupancy. The device sets this marker only after a payload-backed move
-    # is applied, then preserves it across later bank swaps even if maintenance
-    # retires the physical slot. Count that applied history toward every phase.
+    # Sticky runtime observations are stronger than intermediate planner
+    # counters. Payload-backed movement is set by apply; resident-only LLEP is
+    # set by the production span consumer when it observes non-owner rows. Both
+    # survive later maintenance and count as applied work for their exact mode.
     prefill_applied_movement = record_value_sum(
         ("device_rebalance_prefill_current_batch_movement_layers",),
         "moe_rebalance",
     )
+    resident_row_assignment = record_value_sum(
+        (
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+        ),
+        "moe_rebalance",
+    )
+    llep_applied_work = resident_row_assignment if mode == "llep" else 0.0
     # Request-reset diagnostics run after the transient planner status has
     # advanced to WindowNotReady for the next window.  The controller's wave
     # state is the durable device-owned transaction record: a nonzero planned
@@ -2590,8 +2658,8 @@ if require_moe_rebalance_movement:
     # independently of the command and apply counters checked below.
     planned_score = (
         prefill_applied_movement
-        +
-        record_value_sum(
+        + llep_applied_work
+        + record_value_sum(
             (
                 "device_rebalance_planned_arrivals",
                 "device_rebalance_dynamic_ownership_swap_accepts",
@@ -2616,8 +2684,8 @@ if require_moe_rebalance_movement:
     )
     materialized_score = (
         prefill_applied_movement
-        +
-        record_value_sum(
+        + llep_applied_work
+        + record_value_sum(
             (
                 "device_rebalance_plan_count",
                 "device_rebalance_planned_arrivals",
@@ -2640,8 +2708,8 @@ if require_moe_rebalance_movement:
     )
     applied_score = (
         prefill_applied_movement
-        +
-        record_value_sum(
+        + llep_applied_work
+        + record_value_sum(
             (
                 "device_rebalance_apply_applied_arrivals",
                 "device_rebalance_transfer_current_applied_arrivals",
@@ -2669,10 +2737,10 @@ if require_moe_rebalance_movement:
         print("FAIL: MoE rebalance movement probe saw no planned expert movement")
         sys.exit(0)
     if materialized_score <= 0.0:
-        print("FAIL: MoE rebalance movement probe saw a policy proposal but no materialized transfer command/payload")
+        print("FAIL: MoE rebalance movement probe saw a policy proposal but no materialized payload or consumed resident-row assignment")
         sys.exit(0)
     if applied_score <= 0.0:
-        print("FAIL: MoE rebalance movement probe saw materialized work but no applied/imported expert movement")
+        print("FAIL: MoE rebalance movement probe saw materialized work but no applied expert movement or resident-row redistribution")
         sys.exit(0)
 
 print(f"ok {len(records)}")

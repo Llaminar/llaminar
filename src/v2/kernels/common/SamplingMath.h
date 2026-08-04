@@ -497,7 +497,11 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlDepthPromotions = 37,
         kDeviceGenerationControlDepthDemotions = 38,
         kDeviceGenerationControlDepthLastRecommendedDepth = 39,
-        kDeviceGenerationControlCount = 40,
+        /** Sum of device-selected speculative widths across transactions. */
+        kDeviceGenerationControlAttemptedDraftTokenCount = 40,
+        /** Sum of logical verifier widths, including each condition row. */
+        kDeviceGenerationControlVerifierTokenCount = 41,
+        kDeviceGenerationControlCount = 42,
     };
 
     /**
@@ -1047,6 +1051,10 @@ namespace llaminar2::sampling_math
             consumed_rows;
         control[kDeviceGenerationControlPublishedStateCommitCount] +=
             published_state_count;
+        control[kDeviceGenerationControlAttemptedDraftTokenCount] +=
+            active_depth;
+        control[kDeviceGenerationControlVerifierTokenCount] +=
+            active_depth + 1;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
         return record_device_generation_depth_observation(

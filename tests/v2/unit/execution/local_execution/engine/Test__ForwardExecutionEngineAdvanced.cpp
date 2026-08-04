@@ -24,6 +24,7 @@
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "memory/BufferArena.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
 #include "../../../../mocks/MockWorkerGPUContext.h"
@@ -225,8 +226,14 @@ namespace
 class Test__ForwardExecutionEngineAdvanced : public ::testing::Test
 {
 protected:
+    BufferArena arena_;
     DeviceGraphExecutor executor_;
     llaminar2::testing::MockDeviceContext mock_ctx_{DeviceId::cpu()};
+
+    void SetUp() override
+    {
+        executor_.setArena(&arena_);
+    }
 
     ForwardExecutionEngine makeEngine(bool cache_enabled = true,
                                       bool has_pp = false,
@@ -381,13 +388,18 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCal
     engine.execute(decode1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
     EXPECT_FALSE(engine.cacheEmpty());
+    const int workspace_calls_after_first_decode =
+        host.ensure_workspace_calls;
+    EXPECT_GE(workspace_calls_after_first_decode, 1);
 
     // Second decode (same shape): should be cache hit → no build
     TestInput decode2(1, 1, DeviceId::cuda(0));
     engine.execute(decode2.input, output, host);
     // On cache HIT, buildForwardGraph is NOT called
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
-    EXPECT_EQ(host.ensure_workspace_calls, 2)
+    EXPECT_EQ(
+        host.ensure_workspace_calls,
+        workspace_calls_after_first_decode + 1)
         << "Cache hits must rebind workspace in case another cached bucket replaced it";
 }
 

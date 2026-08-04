@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import io
 import json
 import os
 import re
@@ -50,6 +52,83 @@ CPU_DECODE_CHECKPOINT = (
     "fixture-cxx,x86_64-fixture|build=AVX2,fixture-cpu,fixture-linux,"
     f"{_current_cpu_serial_policy_hash()},fixture\n"
 )
+
+
+def _affinity_visible_physical_core_count() -> int:
+    """Return the physical cores available to this CTest process.
+
+    The refresh regressions launch shell transactions of their own. Counting
+    package/core identities instead of logical CPUs prevents the test runner
+    from scheduling both SMT siblings as independent subprocess owners.
+    """
+
+    visible_cpus = tuple(
+        sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else range(os.cpu_count() or 1)
+    )
+    physical_cores: set[tuple[str, str]] = set()
+    for cpu in visible_cpus:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package_id = (topology / "physical_package_id").read_text(
+                encoding="utf-8"
+            ).strip()
+            core_id = (topology / "core_id").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            continue
+        physical_cores.add((package_id, core_id))
+    return max(1, len(physical_cores) or len(visible_cpus))
+
+
+def _run_refresh_test_method(method_name: str) -> tuple[str, bool, str]:
+    """Run one isolated unittest method inside a persistent worker process."""
+
+    stream = io.StringIO()
+    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(
+        NativeVNNIDispatchRefreshTest(method_name)
+    )
+    return method_name, result.wasSuccessful(), stream.getvalue()
+
+
+def _run_parallel_refresh_suite() -> int:
+    """Run independent shell-wrapper regressions without a serial process tax."""
+
+    methods = unittest.defaultTestLoader.getTestCaseNames(
+        NativeVNNIDispatchRefreshTest
+    )
+    physical_cores = _affinity_visible_physical_core_count()
+    requested_workers = int(
+        os.environ.get("LLAMINAR_NATIVE_VNNI_REFRESH_TEST_WORKERS", "16")
+    )
+    workers = min(max(1, requested_workers), physical_cores, len(methods))
+
+    outcomes: dict[str, tuple[bool, str]] = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_run_refresh_test_method, method): method
+            for method in methods
+        }
+        for future in concurrent.futures.as_completed(futures):
+            method = futures[future]
+            try:
+                _, successful, output = future.result()
+            except BaseException as error:  # Preserve worker failures as test failures.
+                successful = False
+                output = f"worker failed before reporting unittest state: {error!r}\n"
+            outcomes[method] = (successful, output)
+
+    failed = [method for method in methods if not outcomes[method][0]]
+    if failed:
+        for method in failed:
+            print(f"\n[{method}]\n{outcomes[method][1]}", file=sys.stderr)
+    print(
+        f"Ran {len(methods)} NativeVNNI refresh tests with {workers} "
+        f"physical-core-capped workers: {len(failed)} failed"
+    )
+    return 1 if failed else 0
 
 
 class NativeVNNIDispatchRefreshTest(unittest.TestCase):
@@ -3756,4 +3835,4 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(_run_parallel_refresh_suite())

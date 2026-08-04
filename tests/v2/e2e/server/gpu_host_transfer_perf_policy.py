@@ -2,8 +2,9 @@
 """Validate the server E2E GPU-to-host transfer contract.
 
 GPU inference owns intermediate execution state on the device.  The host may
-observe only the compact response produced after a decode/MTP publication
-transaction.  Prefix-cache movement is the sole data-plane exception because
+observe only a compact serial-visible token result or the terminal response
+ledger produced after a complete device-owned generation request. Prefix-cache
+movement is the sole data-plane exception because
 RAM and disk are intentional cache tiers rather than execution-state mirrors.
 
 PerfStats includes both semantic operation records and legacy aggregate
@@ -31,6 +32,8 @@ _FINAL_RESPONSE_OPERATIONS = frozenset(
         "first_token_greedy_device_target_slot_d2h_sync",
         "grouped_outcome_greedy_device_outcome_host_bridge",
         "grouped_outcome_stochastic_device_outcome_host_bridge",
+        "device_generation_terminal_d2h_enqueue",
+        "device_generation_terminal_d2h_wait",
         "rank_mirrored_localtp_greedy_outcome_host_materializations",
         "rank_mirrored_localtp_stochastic_outcome_host_materializations",
         "sample_stochastic_distribution_d2h_sync",

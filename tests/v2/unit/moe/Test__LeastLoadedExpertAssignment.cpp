@@ -523,6 +523,37 @@ TEST(Test__LeastLoadedExpertAssignment, ResidentReplicaDestinationDoesNotRequire
     EXPECT_EQ(fixture.spans[1].expert, 0u);
     EXPECT_EQ(fixture.spans[1].destination_participant, 1u);
     EXPECT_EQ(fixture.spans[1].needs_foreign_weight, 0u);
+    EXPECT_TRUE(containsNonOwnerAssignmentRows(
+        fixture.spans.data(), fixture.status.span_count));
+}
+
+TEST(Test__LeastLoadedExpertAssignment, OwnerOnlyAndEmptySpansAreNotRedistribution)
+{
+    std::array<LeastLoadedExpertAssignmentSpan, 3> spans{};
+    spans[0] = {
+        .expert = 0u,
+        .owner_participant = 0u,
+        .destination_participant = 0u,
+        .route_row_begin = 0u,
+        .route_row_end = 8u,
+    };
+    spans[1] = {
+        .expert = 1u,
+        .owner_participant = 0u,
+        .destination_participant = 1u,
+        .route_row_begin = 8u,
+        .route_row_end = 8u,
+    };
+    spans[2] = {
+        .expert = 2u,
+        .owner_participant = 1u,
+        .destination_participant = 1u,
+        .route_row_begin = 8u,
+        .route_row_end = 12u,
+    };
+
+    EXPECT_FALSE(containsNonOwnerAssignmentRows(spans.data(), spans.size()));
+    EXPECT_FALSE(containsNonOwnerAssignmentRows(nullptr, 0u));
 }
 
 TEST(Test__LeastLoadedExpertAssignment, ForeignTransferSourceComesFromPhysicalResident)

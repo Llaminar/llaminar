@@ -17916,6 +17916,18 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
                                                             0.10f,
                                                         });
 
+    /*
+     * Production grouping consumes exact-device inputs and no longer adopts a
+     * HOST_ONLY tensor implicitly. Publish every fixture tensor on the same
+     * explicit stream used by the kernel so this test exercises the real
+     * transfer/coherence contract instead of relying on legacy host adoption.
+     */
+    const auto device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(output->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream_));
+
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
     ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
@@ -17942,6 +17954,11 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
         << "compact verifier rows use the small-N expert tile while "
            "max_tokens_per_expert <= 4";
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2);
+    const auto path_records = llaminar2::PerfStatsCollector::snapshot(
+        {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+    ASSERT_FALSE(path_records.empty());
+    EXPECT_EQ(path_records.front().tags.at("down_publication"), "fused_direct");
+    EXPECT_EQ(path_records.front().tags.at("down_direct_warps"), "9");
 
     llaminar2::PerfStatsCollector::reset();
 #endif

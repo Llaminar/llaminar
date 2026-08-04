@@ -15,6 +15,7 @@ from pathlib import Path
 SERVER_E2E_DIR = (
     Path(__file__).resolve().parents[2] / "e2e" / "server"
 )
+REPO_ROOT = SERVER_E2E_DIR.parents[3]
 sys.path.insert(0, str(SERVER_E2E_DIR))
 
 from graph_capture_perf_policy import (  # noqa: E402
@@ -23,6 +24,12 @@ from graph_capture_perf_policy import (  # noqa: E402
 )
 from gpu_host_transfer_perf_policy import (  # noqa: E402
     validate_gpu_host_transfer_policy,
+)
+from llep_verifier_perf_policy import (  # noqa: E402
+    validate_llep_verifier_policy,
+)
+from mtp_device_generation_perf_policy import (  # noqa: E402
+    validate_cuda_dynamic_mtp_device_generation_policy,
 )
 from request_input_lifetime_perf_policy import (  # noqa: E402
     validate_request_input_lifetime_policy,
@@ -35,15 +42,19 @@ def counter(
     value: float = 1.0,
     domain: str = "forward_graph",
     tags: dict[str, str] | None = None,
+    device: str | None = None,
 ) -> dict[str, object]:
     """Build the minimal PerfStats counter shape consumed by the validator."""
 
-    return {
+    record: dict[str, object] = {
         "name": name,
         "domain": domain,
         "value": value,
         "tags": tags or {},
     }
+    if device is not None:
+        record["device"] = device
+    return record
 
 
 class TestServerGraphCapturePerfPolicy(unittest.TestCase):
@@ -94,6 +105,24 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="mtp",
                 tags={"timing": "post_publication_response_bridge"},
             ),
+            {
+                "kind": "timer",
+                "name": "device_generation_terminal_d2h_enqueue",
+                "domain": "mtp",
+                "value": 0,
+                "count": 1,
+                "total_ns": 500,
+                "tags": {"requests": "1"},
+            },
+            {
+                "kind": "timer",
+                "name": "device_generation_terminal_d2h_wait",
+                "domain": "mtp",
+                "value": 0,
+                "count": 1,
+                "total_ns": 700,
+                "tags": {"requests": "1"},
+            },
             counter("d2h_bytes", value=4096.0, domain="transfer"),
         ]
         result = validate_gpu_host_transfer_policy(records)
@@ -101,9 +130,239 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertEqual(
             result.final_response_operations,
             (
+                "device_generation_terminal_d2h_enqueue",
+                "device_generation_terminal_d2h_wait",
                 "grouped_outcome_stochastic_device_outcome_host_bridge",
                 "stochastic_request_batch_summary_d2h_sync",
             ),
+        )
+
+    def test_llep_verifier_policy_accepts_fully_replicated_local_execution(
+        self,
+    ) -> None:
+        """Mirrored verifier rows need neither assignment nor communication."""
+
+        result = validate_llep_verifier_policy(
+            [
+                counter(
+                    "fully_replicated_local_verifier_execution_calls",
+                    domain="moe_rebalance",
+                    tags={
+                        "execution_policy": "fully_replicated_local",
+                        "participant_assignment": "none",
+                        "current_batch_transport": "none",
+                        "routed_result_collective": "none",
+                    },
+                )
+                | {"phase": "verifier"}
+            ]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.policy, "fully_replicated_local")
+
+    def test_cuda_dynamic_mtp_policy_accepts_exact_switch_terminal_ledger(
+        self,
+    ) -> None:
+        """The native selector and terminal totals jointly prove device ownership."""
+
+        device = "CUDA:0"
+        records = [
+            counter(
+                "device_generation_loop_graph_materializations",
+                domain="mtp",
+                device=device,
+                tags={
+                    "backend": "CUDA",
+                    "depth_policy": "dynamic",
+                    "execution": "native_device_controlled_switch_while",
+                    "minimum_draft_depth": "1",
+                    "maximum_draft_depth": "15",
+                    "draft_depth": "15",
+                    "verifier_rows": "16",
+                    "sampling_mode": "stochastic",
+                },
+            ),
+            counter(
+                "device_generation_loop_graph_launches",
+                domain="mtp",
+                device=device,
+                tags={
+                    "execution": "single_async_native_switch_while_launch",
+                    "minimum_draft_depth": "1",
+                    "maximum_draft_depth": "15",
+                },
+            ),
+            counter(
+                "dynamic_device_generation_capacity_capture_transactions",
+                domain="mtp",
+                device=device,
+                tags={
+                    "capture_depth": "15",
+                    "selected_depth": "4",
+                    "authority": "device_generation_controller",
+                },
+            ),
+            counter(
+                "device_generation_terminal_transactions",
+                value=3,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_attempted_draft_tokens",
+                value=8,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_verifier_tokens",
+                value=11,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_depth_updates",
+                value=1,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_depth_evaluated_windows",
+                value=2,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_depth_demotions",
+                value=1,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_response_bridges",
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_compact_outcome_reductions",
+                value=3,
+                domain="mtp",
+                device=device,
+                tags={
+                    "authority": "device_generation_controller",
+                    "accounting_role": "captured_graph_replay_multiplier",
+                    "source": "captured_stochastic_compact_outcome",
+                    "execution": "native_device_generation_parent",
+                },
+            ),
+            counter(
+                "device_generation_terminal_consumed_verifier_rows",
+                value=6,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_accepted_speculative_tokens",
+                value=4,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_rejected_transactions",
+                value=1,
+                domain="mtp",
+                device=device,
+            ),
+        ]
+
+        result = validate_cuda_dynamic_mtp_device_generation_policy(
+            records,
+            expected_minimum_depth=1,
+            expected_maximum_depth=15,
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.devices, (device,))
+
+        missing_stochastic_parent = list(records)
+        missing_stochastic_parent[0] = records[0] | {
+            "tags": (records[0].get("tags") or {}) | {"sampling_mode": "greedy"}
+        }
+        result = validate_cuda_dynamic_mtp_device_generation_policy(
+            missing_stochastic_parent,
+            expected_minimum_depth=1,
+            expected_maximum_depth=15,
+        )
+        self.assertIn("native stochastic sampling parent", result.error or "")
+
+        records[5] = counter(
+            "device_generation_terminal_verifier_tokens",
+            value=12,
+            domain="mtp",
+            device=device,
+        )
+        result = validate_cuda_dynamic_mtp_device_generation_policy(
+            records,
+            expected_minimum_depth=1,
+            expected_maximum_depth=15,
+        )
+        self.assertIn("terminal depth ledger", result.error or "")
+
+    def test_llep_verifier_policy_accepts_resident_assignment(self) -> None:
+        """Sharded verifier rows may choose among already-resident replicas."""
+
+        result = validate_llep_verifier_policy(
+            [
+                counter(
+                    "device_rebalance_llep_resident_assignment_calls",
+                    domain="moe_rebalance",
+                    tags={
+                        "assignment": "logical_position_resident",
+                        "current_batch_transport": "none",
+                    },
+                )
+                | {"phase": "verifier"}
+            ]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.policy, "logical_position_resident")
+
+    def test_llep_verifier_policy_rejects_mixed_or_incomplete_evidence(
+        self,
+    ) -> None:
+        """One homogeneous verifier graph cannot advertise ambiguous ownership."""
+
+        mirrored = counter(
+            "fully_replicated_local_verifier_execution_calls",
+            domain="moe_rebalance",
+            tags={
+                "execution_policy": "fully_replicated_local",
+                "participant_assignment": "none",
+                "current_batch_transport": "none",
+                "routed_result_collective": "none",
+            },
+        ) | {"phase": "verifier"}
+        resident = counter(
+            "device_rebalance_llep_resident_assignment_calls",
+            domain="moe_rebalance",
+            tags={
+                "assignment": "logical_position_resident",
+                "current_batch_transport": "none",
+            },
+        ) | {"phase": "verifier"}
+
+        self.assertIn(
+            "both participant-assigned and fully replicated",
+            validate_llep_verifier_policy([mirrored, resident]).error or "",
+        )
+        incomplete = dict(mirrored)
+        incomplete["tags"] = {
+            "execution_policy": "fully_replicated_local",
+            "participant_assignment": "none",
+            "current_batch_transport": "none",
+        }
+        self.assertIn(
+            "incomplete",
+            validate_llep_verifier_policy([incomplete]).error or "",
         )
 
     def test_gpu_host_transfer_policy_rejects_draft_proposal_readback(
@@ -510,12 +769,38 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             'record.get("name") == "stochastic_accept_tests"',
             'get("device_resident") == "true"',
             '"stochastic_verify_request_batch_outcomes"',
+            '"FAIL: native stochastic MTP entered the retired request-batched "',
+            'get("sampling_mode") == "stochastic"',
             '"stochastic_request_batch_summary_gpu_reducer"',
+            '"device_generation_terminal_compact_outcome_reductions"',
+            '"captured_stochastic_compact_outcome"',
             'numeric(record.get("total_ns")) > 0.0',
             '"stochastic_serial_equivalent_host_verifier_rows"',
             '"depth_policy_windows"',
         ):
             self.assertIn(marker, harness)
+
+        runner = (
+            REPO_ROOT / "src/v2/execution/runner/OrchestrationRunner.cpp"
+        ).read_text(encoding="utf-8")
+        terminal_ledger_start = runner.index(
+            "GenerationResult OrchestrationRunner::completeNativeDeviceGenerationParent"
+        )
+        terminal_ledger_end = runner.index(
+            "GenerationResult OrchestrationRunner::decodeStepMTP",
+            terminal_ledger_start,
+        )
+        terminal_ledger = runner[terminal_ledger_start:terminal_ledger_end]
+        for marker in (
+            "DeviceGenerationSamplingMode::Stochastic",
+            '"device_resident",',
+            '"true"',
+            '"grouped_decode_equivalent_stochastic"',
+            '"native_device_generation_parent_terminal_ledger"',
+            '"stochastic_accept_tests"',
+            "stochastic_tags",
+        ):
+            self.assertIn(marker, terminal_ledger)
 
     def test_stochastic_probe_can_complete_a_dynamic_depth_window(self) -> None:
         """The HTTP workload must outlive the four-sample controller window."""

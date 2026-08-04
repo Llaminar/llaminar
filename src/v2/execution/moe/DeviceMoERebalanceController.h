@@ -690,6 +690,16 @@ namespace llaminar2
         uint32_t prefill_first_invalid_resident_mask = 0;
         /** @brief Authoritative owner carried by the first invalid claim. */
         int32_t prefill_first_invalid_owner = -1;
+        /**
+         * @brief Runtime layers that consumed current-batch non-owner row spans.
+         *
+         * A positive value proves economical LLEP work redistribution even when
+         * every destination already has a resident expert replica and no payload
+         * transfer is necessary. The assignment consumer owns the sticky layer
+         * marker; maintenance merely aggregates it into this existing ordered
+         * status publication.
+         */
+        uint32_t prefill_current_batch_non_owner_assignment_layers = 0;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceConfig>);
@@ -702,6 +712,12 @@ namespace llaminar2
         sizeof(DeviceMoERebalanceStatus) ==
             moe_rebalance_abi::kStatusBytes,
         "host rebalance status ABI must match the shared host/device contract");
+    static_assert(
+        offsetof(DeviceMoERebalanceStatus,
+                 prefill_current_batch_non_owner_assignment_layers) ==
+            moe_rebalance_abi::
+                kPrefillCurrentBatchNonOwnerAssignmentLayersOffset,
+        "host resident-assignment evidence must occupy the shared status tail");
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceCommandBufferHeader>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveState>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveProgress>);
@@ -771,6 +787,11 @@ namespace llaminar2
             {
                 continue;
             }
+
+            if (runtime.current_batch_llep_movement_observed != 0u)
+                ++summary.transient_placement_layers;
+            if (runtime.current_batch_llep_non_owner_assignment_observed != 0u)
+                ++summary.non_owner_assignment_layers;
 
             const auto &bank = runtime.banks[runtime.active_bank];
             for (uint32_t expert = 0; expert < config.num_experts; ++expert)
@@ -2152,6 +2173,10 @@ namespace llaminar2
             deviceMoETransferSlotClaimSummary(runtime_layers, config);
         if (status)
         {
+            status->prefill_current_batch_movement_layers =
+                transfer_slot_claims.transient_placement_layers;
+            status->prefill_current_batch_non_owner_assignment_layers =
+                transfer_slot_claims.non_owner_assignment_layers;
             status->prefill_active_transfer_slot_experts =
                 transfer_slot_claims.active_claims;
             status->prefill_unique_transfer_slot_claims =

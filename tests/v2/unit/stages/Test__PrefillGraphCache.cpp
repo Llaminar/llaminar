@@ -296,6 +296,10 @@ static MoERoutingStage::Params makeColdRocmRoutingParams(
     int num_experts,
     int top_k)
 {
+    // Preflight only checks ownership. The pointer is never dereferenced by
+    // this device-free unit test, but its stable lifetime models the required
+    // resident active-row scalar owned by a real padded graph.
+    static int32_t active_row_count_device_sentinel = 0;
     MoERoutingStage::Params params;
     params.device_id = device;
     params.input = input;
@@ -308,6 +312,8 @@ static MoERoutingStage::Params makeColdRocmRoutingParams(
     params.top_k = top_k;
     params.norm_topk_prob = true;
     params.layer_idx = 0;
+    params.active_row_count_device =
+        &active_row_count_device_sentinel;
     return params;
 }
 
@@ -1069,6 +1075,66 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
 #else
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 #endif
+}
+
+/**
+ * @brief A padded router must name the resident scalar that masks padding rows.
+ *
+ * Backend support alone is insufficient: without this device-owned logical-row
+ * count, a fixed-width captured launch would route synthetic padding and mutate
+ * downstream expert state. Cold preflight must reject that incomplete graph
+ * before warmup or capture can hide the missing ownership edge.
+ */
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedMoERoutingWithoutResidentRowCount)
+{
+    constexpr int seq_len = 608;
+    constexpr int real_seq_len = 595;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+
+    auto input = TestTensorFactory::createFP32({seq_len, d_model});
+    auto gate_weights = TestTensorFactory::createFP32({num_experts, d_model});
+    auto output_indices = TestTensorFactory::createFP32({seq_len * top_k, 1});
+    auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
+
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = seq_len;
+    key.device_id = DeviceId::rocm(0);
+
+    auto params = makeColdRocmRoutingParams(
+        input.get(),
+        gate_weights.get(),
+        output_indices.get(),
+        output_weights.get(),
+        key.device_id,
+        seq_len,
+        d_model,
+        num_experts,
+        top_k);
+    params.active_row_count_device = nullptr;
+
+    ComputeGraph graph;
+    graph.addNode(
+        "layer0_moe_routing",
+        std::make_unique<MoERoutingStage>(params),
+        key.device_id);
+
+    EXPECT_EQ(
+        cache.preflight(
+            graph,
+            key,
+            nullptr,
+            /*snapshots_active=*/false,
+            /*moe_rebalancing_active=*/false,
+            real_seq_len,
+            seq_len),
+        PrefillGraphRejectReason::StageNotCapturable);
 }
 
 TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingUsesBackendGroupedCapability)

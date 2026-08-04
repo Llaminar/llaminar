@@ -175,7 +175,7 @@ namespace
         }
         else if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP)
         {
-            expectLLEPAppliedPrefillMovementPositive(records, context);
+            expectLLEPPrefillWorkRedistributionPositive(records, context);
             expectPerfCounterPositive(
                 records,
                 "moe_rebalance",

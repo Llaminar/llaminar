@@ -206,6 +206,7 @@ namespace
         uint32_t participant_id;
         uint32_t participant_count;
         uint32_t current_batch_llep_movement_observed;
+        uint32_t current_batch_llep_non_owner_assignment_observed;
     };
 
     static_assert(
@@ -222,6 +223,11 @@ namespace
         offsetof(DeviceMoELayerRuntimeView,
                  current_batch_llep_movement_observed) ==
         llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 current_batch_llep_non_owner_assignment_observed) ==
+        llaminar2::moe_runtime_abi::
+            kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
     struct DeviceMoERebalanceConfigView
     {
@@ -365,11 +371,18 @@ namespace
         uint32_t prefill_first_invalid_flags;
         uint32_t prefill_first_invalid_resident_mask;
         int32_t prefill_first_invalid_owner;
+        uint32_t prefill_current_batch_non_owner_assignment_layers;
     };
     static_assert(
         sizeof(DeviceMoERebalanceStatusView) ==
             llaminar2::moe_rebalance_abi::kStatusBytes,
         "ROCm rebalance status ABI must match the shared host/device record");
+    static_assert(
+        offsetof(DeviceMoERebalanceStatusView,
+                 prefill_current_batch_non_owner_assignment_layers) ==
+            llaminar2::moe_rebalance_abi::
+                kPrefillCurrentBatchNonOwnerAssignmentLayersOffset,
+        "ROCm resident-assignment evidence must occupy the shared status tail");
 
     /**
      * @brief Terminate the active ROCm execution after publishing an invariant.
@@ -1587,6 +1600,8 @@ namespace
 
         destination.transient_placement_layers +=
             source.transient_placement_layers;
+        destination.non_owner_assignment_layers +=
+            source.non_owner_assignment_layers;
         destination.active_claims += source.active_claims;
         destination.unique_claims += source.unique_claims;
         destination.duplicate_claims += source.duplicate_claims;
@@ -1648,6 +1663,8 @@ namespace
 
             if (runtime.current_batch_llep_movement_observed != 0u)
                 ++summary.transient_placement_layers;
+            if (runtime.current_batch_llep_non_owner_assignment_observed != 0u)
+                ++summary.non_owner_assignment_layers;
         }
 
         const uint64_t claim_count =
@@ -1893,6 +1910,8 @@ namespace
             return;
         status->prefill_current_batch_movement_layers =
             summary.transient_placement_layers;
+        status->prefill_current_batch_non_owner_assignment_layers =
+            summary.non_owner_assignment_layers;
         status->prefill_active_transfer_slot_experts = summary.active_claims;
         status->prefill_unique_transfer_slot_claims = summary.unique_claims;
         status->prefill_duplicate_transfer_slot_claims =
@@ -16661,6 +16680,23 @@ __global__ void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_ker
         span_count_u64 > span_capacity_u64
             ? static_cast<uint32_t>(span_capacity_u64)
             : static_cast<uint32_t>(span_count_u64);
+    const auto *spans =
+        static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan *>(
+            runtime->reserved_ptrs[1]);
+
+    /*
+     * One exact lane publishes durable proof from the production span
+     * consumer. Stream ordering makes the write visible to maintenance
+     * preflight, and a later assignment failure is fatal rather than tolerated.
+     * This keeps resident-row evidence deterministic and atomic-free.
+     */
+    if (expert == 0 && threadIdx.x == 0 &&
+        llaminar2::least_loaded_ep::containsNonOwnerAssignmentRows(
+            spans, span_count))
+    {
+        runtime->current_batch_llep_non_owner_assignment_observed = 1u;
+    }
+
     const int expert_count = runtime->expert_counts[expert];
     const int expert_offset = runtime->expert_offsets[expert];
     if (expert_count <= 0 || expert_offset < 0)
@@ -16692,9 +16728,6 @@ __global__ void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_ker
         return;
     }
 
-    const auto *spans =
-        static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan *>(
-            runtime->reserved_ptrs[1]);
     const auto *span_bounds = static_cast<const int32_t *>(runtime->reserved_ptrs[0]);
     int span_begin = 0;
     int span_end = static_cast<int>(span_count);

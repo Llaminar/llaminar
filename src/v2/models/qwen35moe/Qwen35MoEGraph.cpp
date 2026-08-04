@@ -2225,17 +2225,24 @@ namespace llaminar2
         return true;
     }
 
-    bool Qwen35MoEGraph::restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream)
+    PrefixCacheRuntimeRestoreResult
+    Qwen35MoEGraph::restorePrefixCacheRuntimeState(
+        const std::vector<uint8_t> &state,
+        void *stream)
     {
         prefix_runtime_device_rehydration_pending_ = false;
         if (state.empty())
-            return true;
+        {
+            return PrefixCacheRuntimeRestoreResult{
+                .restored = true,
+            };
+        }
         if (state.size() < sizeof(kMoEPrefixRuntimeMagic) ||
             std::memcmp(state.data(), kMoEPrefixRuntimeMagic, sizeof(kMoEPrefixRuntimeMagic)) != 0)
         {
             LOG_ERROR("[Qwen35MoEGraph] Refusing obsolete prefix-cache MoE runtime state: "
                       "MoE placement snapshots must not serialize runtime-local device descriptors");
-            return false;
+            return {};
         }
 
         size_t offset = sizeof(kMoEPrefixRuntimeMagic);
@@ -2247,23 +2254,24 @@ namespace llaminar2
             !readU32(state, offset, table_count))
         {
             LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE runtime state header");
-            return false;
+            return {};
         }
         if (version != kMoEPrefixRuntimeVersion)
         {
             LOG_ERROR("[Qwen35MoEGraph] Unsupported prefix-cache MoE runtime state version "
                       << version);
-            return false;
+            return {};
         }
         if (top_k != static_cast<uint32_t>(config_.moe.top_k))
         {
             LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE histogram top-k mismatch: blob="
                       << top_k << " graph=" << config_.moe.top_k);
-            return false;
+            return {};
         }
 
         uint32_t restored_tables = 0;
         bool requires_device_rehydration = false;
+        bool placement_changed = false;
         for (uint32_t table_idx = 0; table_idx < table_count; ++table_idx)
         {
             std::string key;
@@ -2274,28 +2282,28 @@ namespace llaminar2
                 !readU32(state, offset, experts))
             {
                 LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime table header");
-                return false;
+                return {};
             }
             if (experts != static_cast<uint32_t>(config_.moe.num_experts))
             {
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime expert-count mismatch for "
                           << key << ": blob=" << experts
                           << " graph=" << config_.moe.num_experts);
-                return false;
+                return {};
             }
             auto it = moe_runtime_tables_.find(key);
             if (it == moe_runtime_tables_.end() || !it->second)
             {
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime restore could not find runtime table "
                           << key);
-                return false;
+                return {};
             }
             if (layers != static_cast<uint32_t>(it->second->layerCount()))
             {
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime layer-count mismatch for "
                           << key << ": blob=" << layers
                           << " table=" << it->second->layerCount());
-                return false;
+                return {};
             }
 
             std::vector<DeviceMoEPortableLayerRuntimeState> runtime_layers;
@@ -2314,18 +2322,15 @@ namespace llaminar2
                         layer.requires_device_payload_rehydration))
                 {
                     LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime layer header");
-                    return false;
+                    return {};
                 }
                 if (layer.expert_count != experts ||
                     layer.top_k != static_cast<uint32_t>(config_.moe.top_k))
                 {
                     LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime layer metadata mismatch for "
                               << key << " layer=" << layer_idx);
-                    return false;
+                    return {};
                 }
-                requires_device_rehydration =
-                    requires_device_rehydration ||
-                    layer.requires_device_payload_rehydration != 0u;
                 layer.experts.resize(static_cast<size_t>(experts));
                 for (uint32_t expert_idx = 0; expert_idx < experts; ++expert_idx)
                 {
@@ -2344,7 +2349,7 @@ namespace llaminar2
                         !readU32(state, offset, expert.resident_participant_mask))
                     {
                         LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime expert payload");
-                        return false;
+                        return {};
                     }
                     expert.logical_expert_id = logical_expert_id;
                     expert.owner_participant = owner_participant;
@@ -2359,7 +2364,7 @@ namespace llaminar2
                     if (!readU64(state, offset, layer.selected_histogram[static_cast<size_t>(expert_idx)]))
                     {
                         LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable selected histogram payload");
-                        return false;
+                        return {};
                     }
                 }
                 for (uint32_t expert_idx = 0; expert_idx < experts; ++expert_idx)
@@ -2367,7 +2372,7 @@ namespace llaminar2
                     if (!readU64(state, offset, layer.local_histogram[static_cast<size_t>(expert_idx)]))
                     {
                         LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable local histogram payload");
-                        return false;
+                        return {};
                     }
                 }
             }
@@ -2379,17 +2384,26 @@ namespace llaminar2
              * parsing must never consult a rolling slot directory whose bytes
              * may have been reused since the prefix was harvested.
              */
-            if (!it->second->restorePortableRuntimeState(runtime_layers, stream))
+            const DeviceMoEPortableRuntimeRestoreResult table_restore =
+                it->second->restorePortableRuntimeState(runtime_layers, stream);
+            if (!table_restore)
             {
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime restore failed for " << key);
-                return false;
+                return {};
             }
+            placement_changed =
+                placement_changed ||
+                table_restore.placement_effect ==
+                    DeviceMoEPortablePlacementEffect::Changed;
+            requires_device_rehydration =
+                requires_device_rehydration ||
+                table_restore.requires_device_payload_rehydration;
             ++restored_tables;
         }
         if (offset != state.size())
         {
             LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE runtime state has trailing bytes");
-            return false;
+            return {};
         }
 
         prefix_runtime_device_rehydration_pending_ =
@@ -2397,6 +2411,8 @@ namespace llaminar2
         LOG_INFO("[Qwen35MoEGraph] Prefix-runtime restore transaction"
                  << " device=" << config_.default_device.toString()
                  << " tables=" << restored_tables
+                 << " placement_effect="
+                 << (placement_changed ? "changed" : "unchanged")
                  << " device_payload_rehydration="
                  << (prefix_runtime_device_rehydration_pending_
                          ? "pending"
@@ -2408,8 +2424,19 @@ namespace llaminar2
             "prefix_cache",
             config_.default_device.toString(),
             {{"tables", std::to_string(restored_tables)},
-             {"bytes", std::to_string(state.size())}});
-        return true;
+             {"bytes", std::to_string(state.size())},
+             {"placement_effect",
+              placement_changed ? "changed" : "unchanged"},
+             {"device_payload_rehydration",
+              requires_device_rehydration ? "required" : "not_required"}});
+        return PrefixCacheRuntimeRestoreResult{
+            .restored = true,
+            .placement_effect =
+                placement_changed
+                    ? PrefixCacheRuntimePlacementEffect::Changed
+                    : PrefixCacheRuntimePlacementEffect::Unchanged,
+            .device_rehydration_required = requires_device_rehydration,
+        };
     }
 
     void Qwen35MoEGraph::completePrefixCacheRuntimeStateDeviceRehydration()

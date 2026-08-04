@@ -1737,6 +1737,8 @@ struct DeviceMoELayerRuntimeView
     uint32_t deferred_verifier_route_capacity;
     uint32_t participant_id;
     uint32_t participant_count;
+    uint32_t current_batch_llep_movement_observed;
+    uint32_t current_batch_llep_non_owner_assignment_observed;
 };
 
 static_assert(
@@ -1748,6 +1750,15 @@ static_assert(
 static_assert(
     offsetof(DeviceMoELayerRuntimeView, participant_count) ==
     llaminar2::moe_runtime_abi::kParticipantCountOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView,
+             current_batch_llep_movement_observed) ==
+    llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView,
+             current_batch_llep_non_owner_assignment_observed) ==
+    llaminar2::moe_runtime_abi::
+        kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
 template <NativeVNNIFormat FMT>
 __device__ __forceinline__ bool native_vnni_desc_shape_ok(

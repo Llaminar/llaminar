@@ -899,6 +899,74 @@ namespace llaminar2::test
         EXPECT_EQ(republished.reserved_ptrs[2], reinterpret_cast<void *>(0xE000u));
     }
 
+    /**
+     * @brief Distinguish request-history restore from semantic placement import.
+     *
+     * Prefix harvest records active epochs and decode histograms beside logical
+     * placement. Replaying newer history over the same owner/residency topology
+     * must not advertise expert movement. Conversely, changing an owner and its
+     * local replica role must produce an explicit Changed result even when all
+     * payload bytes were already resident.
+     */
+    TEST(Test__MoERuntimeTable, PortableRestoreReportsOnlySemanticPlacementChanges)
+    {
+        constexpr int kExpertCount = 4;
+        MoERuntimeTable table(DeviceId::cpu(), 1, kExpertCount, 2);
+
+        MoEPlacementUpdate initial;
+        initial.epoch = 1;
+        initial.expert_count = kExpertCount;
+        initial.participant_id = 0;
+        initial.participant_count = 2;
+        initial.experts.resize(kExpertCount);
+        initial.local_compute_mask.assign(kExpertCount, 1u);
+        initial.replica_role.resize(kExpertCount);
+        initial.resident_participant_mask.assign(kExpertCount, 0b11u);
+        for (int expert = 0; expert < kExpertCount; ++expert)
+        {
+            const int owner = expert % 2;
+            initial.experts[static_cast<size_t>(expert)] =
+                expertDesc(expert, owner, expert);
+            initial.replica_role[static_cast<size_t>(expert)] =
+                static_cast<uint8_t>(
+                    owner == 0
+                        ? DeviceMoEReplicaRole::Primary
+                        : DeviceMoEReplicaRole::Replica);
+        }
+        ASSERT_TRUE(table.prepareInactiveBank(0, initial));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
+        ASSERT_TRUE(table.capturePortableRuntimeState(snapshot));
+        ASSERT_EQ(snapshot.size(), 1u);
+        snapshot[0].active_epoch = 91u;
+        snapshot[0].selected_histogram[1] = 1234u;
+        snapshot[0].local_histogram[1] = 567u;
+
+        const DeviceMoEPortableRuntimeRestoreResult history_restore =
+            table.restorePortableRuntimeState(snapshot);
+        ASSERT_TRUE(history_restore);
+        EXPECT_EQ(
+            history_restore.placement_effect,
+            DeviceMoEPortablePlacementEffect::Unchanged)
+            << "Runtime epochs and histograms are not expert placement.";
+        EXPECT_FALSE(history_restore.requires_device_payload_rehydration);
+        EXPECT_EQ(table.hostLayerState(0).decode_histogram[1], 1234u);
+        EXPECT_EQ(table.hostLayerState(0).decode_local_histogram[1], 567u);
+
+        snapshot[0].experts[0].owner_participant = 1;
+        snapshot[0].experts[0].replica_role =
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
+        const DeviceMoEPortableRuntimeRestoreResult placement_restore =
+            table.restorePortableRuntimeState(snapshot);
+        ASSERT_TRUE(placement_restore);
+        EXPECT_EQ(
+            placement_restore.placement_effect,
+            DeviceMoEPortablePlacementEffect::Changed);
+        EXPECT_FALSE(placement_restore.requires_device_payload_rehydration)
+            << "Already-resident placement changes require no payload copy.";
+    }
+
     TEST(Test__MoERuntimeTable, PortableRuntimeStatePreservesTransientLogicalPlacementWithoutPointers)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);

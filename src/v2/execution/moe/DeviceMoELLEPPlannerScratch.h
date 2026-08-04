@@ -33,7 +33,10 @@ namespace llaminar2
      */
     struct DeviceMoETransferSlotClaimSummary
     {
+        /** Layers that applied a current-request payload-backed placement. */
         uint32_t transient_placement_layers = 0;
+        /** Layers whose current-batch span consumer assigned non-owner rows. */
+        uint32_t non_owner_assignment_layers = 0;
         uint32_t active_claims = 0;
         uint32_t unique_claims = 0;
         uint32_t duplicate_claims = 0;

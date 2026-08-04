@@ -2080,7 +2080,7 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
-     * @brief Require durable evidence that LLEP copied and published experts.
+     * @brief Require durable evidence that LLEP redistributed executable work.
      *
      * The transfer-command span/count fields belong to one layer-local LLEP
      * planning transaction. They are intentionally not copied into the
@@ -2088,27 +2088,37 @@ namespace llaminar2::test::parity::qwen36
      * teardown. Requiring those transient fields from the final maintenance
      * status can therefore report zero after a completely successful prefill.
      *
-     * `device_rebalance_prefill_current_batch_movement_layers` is the stable
-     * device-resident proof. Applying a payload-backed command sets the active
-     * bank's domain-wide sticky placement marker on every participant. Later
-     * bank swaps preserve that marker even when maintenance economically
-     * retires the physical transfer slot, so a positive layer count proves
-     * planning, payload copy, publication, and runtime activation instead of
-     * merely proving that an intermediate planner considered a move.
+     * Two production outcomes are economical and valid. A missing destination
+     * payload takes the transfer path and publishes
+     * `device_rebalance_prefill_current_batch_movement_layers`. A destination
+     * that already owns a resident replica needs no copy; the actual span
+     * consumer publishes
+     * `device_rebalance_prefill_current_batch_non_owner_assignment_layers`
+     * after observing non-owner routed rows. Either marker is device-resident,
+     * sticky for the request, and exported through the same ordered status
+     * publication. Planner span counts alone cannot satisfy this assertion.
      *
      * The separate active/unique transfer-slot counters remain terminal-state
      * integrity checks. They must agree, but neither is required to remain
      * positive after a subsequent maintenance wave.
      */
-    inline void expectLLEPAppliedPrefillMovementPositive(
+    inline void expectLLEPPrefillWorkRedistributionPositive(
         const std::vector<PerfStatRecord> &records,
         const std::string &context)
     {
-        expectPerfCounterPositive(
+        const double payload_movement = perfCounterSum(
             records,
             "moe_rebalance",
-            "device_rebalance_prefill_current_batch_movement_layers",
-            context);
+            "device_rebalance_prefill_current_batch_movement_layers");
+        const double resident_row_assignment = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers");
+        EXPECT_GT(payload_movement + resident_row_assignment, 0.0)
+            << context
+            << " should publish durable device proof of payload movement or "
+               "resident non-owner row assignment.\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
     }
 
     /**
@@ -2252,7 +2262,7 @@ namespace llaminar2::test::parity::qwen36
         else if (require_fresh_movement &&
                  mode == MoERebalanceRuntimeMode::LLEP)
         {
-            expectLLEPAppliedPrefillMovementPositive(records, context);
+            expectLLEPPrefillWorkRedistributionPositive(records, context);
             expectPerfCounterPositive(
                 records,
                 "moe_rebalance",

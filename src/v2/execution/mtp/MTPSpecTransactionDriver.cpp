@@ -164,12 +164,38 @@ namespace llaminar2
                     std::to_string(i) + " failed: " + outcome.error);
             }
 
-            const int draft_count =
+            const int declared_draft_capacity =
                 static_cast<int>(request.draft_tokens.size());
+            /*
+             * A captured dynamic-depth verifier has one immutable maximum row
+             * capacity, but its resident controller may select a smaller active
+             * depth for a particular replay.  A full acceptance proves exactly
+             * how many active rows were consumed: every comparison row accepted,
+             * followed by one first-token state row.  Metadata must describe that
+             * active transaction width, not the larger host diagnostic vector.
+             *
+             * Rejection and stop outcomes may terminate before the selected depth
+             * is observable, so they retain the declared capacity and publish only
+             * their accepted prefix.  This keeps graph capacity and transaction
+             * semantics separate without introducing a host-side depth authority.
+             */
+            const int transaction_draft_count =
+                outcome.all_speculative_accepted &&
+                        !outcome.stopped_on_output
+                    ? outcome.consumed_verifier_rows + 1
+                    : declared_draft_capacity;
+            if (transaction_draft_count <= 0 ||
+                transaction_draft_count > declared_draft_capacity)
+            {
+                return transactionPlanFailure(
+                    std::string("MTP device rejection outcome ") +
+                    std::to_string(i) +
+                    " selected an invalid active verifier width");
+            }
             MTPSpecDecodeAcceptedOutcome accepted;
             accepted.request_id = request_ids[i];
             accepted.vocab_size = vocab_size;
-            accepted.draft_count = draft_count;
+            accepted.draft_count = transaction_draft_count;
             accepted.committed_output_tokens = std::move(outcome.output_tokens);
             if (!outcome.stopped_on_output &&
                 outcome.all_speculative_accepted &&
@@ -183,7 +209,7 @@ namespace llaminar2
             }
             accepted.accepted_verifier_input_prefix =
                 std::min(
-                    draft_count,
+                    transaction_draft_count,
                     std::max(0, outcome.accepted_speculative_prefix) + 1);
             accepted.target_verifier_state_commit_count =
                 outcome.target_verifier_state_commit_count;

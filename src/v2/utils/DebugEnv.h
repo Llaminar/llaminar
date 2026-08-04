@@ -136,6 +136,7 @@ namespace llaminar2
         bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
         bool stage_checksum_trace = false;     ///< Emit per-stage checksum traces when LLAMINAR_STAGE_CHECKSUM_TRACE is truthy.
         std::string stage_checksum_filter;     ///< Optional substring filter for stage checksum traces.
+        std::optional<std::string> nccl_graph_mixing_support; ///< Exact external NCCL graph-mixing override, when present.
 
         RuntimeDebugConfig()
         {
@@ -171,6 +172,8 @@ namespace llaminar2
             allow_numa_bind_fallback = readTruthy("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK");
             stage_checksum_trace = readTruthy("LLAMINAR_STAGE_CHECKSUM_TRACE");
             stage_checksum_filter = readString("LLAMINAR_STAGE_CHECKSUM_FILTER");
+            nccl_graph_mixing_support =
+                readOptionalString("NCCL_GRAPH_MIXING_SUPPORT");
         }
 
     private:
@@ -212,6 +215,15 @@ namespace llaminar2
         {
             const char *value = std::getenv(name);
             return value != nullptr ? std::string(value) : std::string{};
+        }
+
+        /// @brief Read a string while preserving the distinction between unset and empty.
+        static std::optional<std::string> readOptionalString(const char *name)
+        {
+            const char *value = std::getenv(name);
+            if (value == nullptr)
+                return std::nullopt;
+            return std::string(value);
         }
 
         /// @brief Read an integer environment override and clamp to a conservative range.
@@ -391,6 +403,8 @@ namespace llaminar2
         int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
         int cuda_moe_gateup_kparts = 16;          ///< K partitions for the mandatory decode-equivalent grouped MoE gate/up CUDA path (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, proven default 16)
         int cuda_moe_down_kparts = 16;            ///< K partitions for the mandatory decode-equivalent grouped MoE SwiGLU down CUDA path (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, proven default 16)
+        int cuda_moe_ordered_kpart_tile_n = 128;  ///< Warp-aligned output columns per ordered split-K CUDA block (LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
+        int cuda_moe_down_direct_warps = 9;       ///< Warps per block for scratch-free ordered grouped-down publication (LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS, valid 8..16, proven top-9 default 9; capture-time geometry)
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -560,6 +574,31 @@ namespace llaminar2
                 if (requested == 2 || requested == 4 || requested == 8 ||
                     requested == 16)
                     cuda_moe_down_kparts = requested;
+            }
+            // The ordered split-K scatter owns one output column per thread,
+            // so changing block width does not alter arithmetic. Restrict the
+            // capture-time geometry to whole warps and a practical Ampere
+            // occupancy range; 128 is the production-model-proven default.
+            cuda_moe_ordered_kpart_tile_n = 128;
+            const char *moe_ordered_tile_n_env =
+                std::getenv("LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N");
+            if (moe_ordered_tile_n_env)
+            {
+                const int requested = std::atoi(moe_ordered_tile_n_env);
+                if (requested >= 64 && requested <= 256 &&
+                    (requested % 32) == 0)
+                {
+                    cuda_moe_ordered_kpart_tile_n = requested;
+                }
+            }
+            cuda_moe_down_direct_warps = 9;
+            const char *moe_down_direct_warps_env =
+                std::getenv("LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS");
+            if (moe_down_direct_warps_env)
+            {
+                const int requested = std::atoi(moe_down_direct_warps_env);
+                if (requested >= 8 && requested <= 16)
+                    cuda_moe_down_direct_warps = requested;
             }
             // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
             // It reduces router GEMV traffic and lets the grouped gate/up decode

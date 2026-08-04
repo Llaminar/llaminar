@@ -1210,11 +1210,11 @@ namespace llaminar2::test
                 << " must leave tensor placement and concrete coherence "
                    "validation inside TransferEngine";
             EXPECT_NE(
-                contents.find("TransferEngine::prepareDeviceInput("),
+                contents.find("TransferEngine::requireDeviceInput("),
                 std::string::npos)
                 << relative_path;
             EXPECT_NE(
-                contents.find("TransferEngine::prepareDeviceOutput("),
+                contents.find("TransferEngine::requireDeviceOutput("),
                 std::string::npos)
                 << relative_path;
             EXPECT_NE(
@@ -1352,7 +1352,7 @@ namespace llaminar2::test
                 std::string::npos)
                 << contract.relative_path;
             EXPECT_NE(
-                contents.find("TransferEngine::prepareDeviceInput("),
+                contents.find("TransferEngine::requireDeviceInput("),
                 std::string::npos)
                 << contract.relative_path
                 << " must join input readiness through the transfer service";
@@ -4303,9 +4303,9 @@ namespace llaminar2::test
             << "Applied movement must not substitute for independent planning evidence.";
         EXPECT_NE(
             server_e2e.find(
-                "saw a policy proposal but no materialized transfer command/payload"),
+                "saw a policy proposal but no materialized payload or consumed resident-row assignment"),
             std::string::npos)
-            << "The E2E probe must fail when LLEP proposes spans without publishing a transfer wave.";
+            << "The E2E probe must require payload materialization or exact proof that the resident assignment consumer ran.";
         const size_t applied_score = server_e2e.find("applied_score = (");
         ASSERT_NE(applied_score, std::string::npos);
         const size_t applied_gate =
@@ -5168,7 +5168,7 @@ namespace llaminar2::test
                                   "CUDA route-copy");
         require_fused_publication(rocm_contents,
                                   "void runtime_publish_decode_dispatch(",
-                                  "__global__ void device_rebalance_controller_kernel(",
+                                  "__global__ void device_rebalance_llep_claim_preflight_kernel(",
                                   "ROCm");
     }
 
@@ -6137,9 +6137,11 @@ namespace llaminar2::test
             << "Capacity pressure must remain observable instead of being silently discarded";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefillMovementEvidenceIsDeviceResidentAndBackendSymmetric)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefillWorkRedistributionEvidenceIsDeviceResidentAndBackendSymmetric)
     {
         const fs::path root = findRepoRoot();
+        const fs::path assignment_path =
+            root / "src/v2/execution/moe/LeastLoadedExpertAssignment.h";
         const fs::path controller_path =
             root / "src/v2/execution/moe/DeviceMoERebalanceController.h";
         const fs::path runtime_path =
@@ -6156,6 +6158,7 @@ namespace llaminar2::test
             root / "tests/v2/e2e/server/test_server_e2e.sh";
         const fs::path parity_base_path =
             root / "tests/v2/integration/parity/qwen36/Qwen36MoEParityTestBase.h";
+        ASSERT_TRUE(fs::exists(assignment_path)) << assignment_path;
         ASSERT_TRUE(fs::exists(controller_path)) << controller_path;
         ASSERT_TRUE(fs::exists(runtime_path)) << runtime_path;
         ASSERT_TRUE(fs::exists(expert_stage_path)) << expert_stage_path;
@@ -6165,6 +6168,7 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(e2e_path)) << e2e_path;
         ASSERT_TRUE(fs::exists(parity_base_path)) << parity_base_path;
 
+        const std::string assignment = readFile(assignment_path);
         const std::string controller = readFile(controller_path);
         const std::string runtime = readFile(runtime_path);
         const std::string expert_stage = readFile(expert_stage_path);
@@ -6182,22 +6186,45 @@ namespace llaminar2::test
                       "uint32_t current_batch_llep_movement_observed = 0;"),
                   std::string::npos)
             << "Current-batch movement needs a device-owned marker distinct from portable prefix state";
+        EXPECT_NE(controller.find(
+                      "uint32_t prefill_current_batch_non_owner_assignment_layers = 0;"),
+                  std::string::npos)
+            << "The request-boundary ABI must distinguish resident row redistribution from payload movement";
+        EXPECT_NE(runtime.find(
+                      "uint32_t current_batch_llep_non_owner_assignment_observed = 0;"),
+                  std::string::npos)
+            << "Resident row redistribution needs a request-local device marker";
+        EXPECT_NE(assignment.find("containsNonOwnerAssignmentRows("),
+                  std::string::npos)
+            << "All backends must share one exact non-owner row predicate";
         EXPECT_NE(orchestrator.find(
                       "\"device_rebalance_prefill_current_batch_movement_layers\""),
                   std::string::npos)
             << "Current-batch movement history must use the existing status readback";
+        EXPECT_NE(orchestrator.find(
+                      "\"device_rebalance_prefill_current_batch_non_owner_assignment_layers\""),
+                  std::string::npos)
+            << "Resident row evidence must use the existing status readback";
         EXPECT_NE(e2e.find(
                       "prefill_applied_movement = record_value_sum("),
                   std::string::npos)
             << "The canonical E2E movement gate must consume stronger final-state evidence";
-        EXPECT_NE(parity_base.find(
-                      "expectLLEPAppliedPrefillMovementPositive(records, context)"),
+        EXPECT_NE(e2e.find(
+                      "resident_row_assignment = record_value_sum("),
                   std::string::npos)
-            << "Focused Qwen 3.6 parity must consume the same durable movement proof as E2E";
+            << "The canonical E2E gate must recognize applied resident-row redistribution";
+        EXPECT_NE(parity_base.find(
+                      "expectLLEPPrefillWorkRedistributionPositive(records, context)"),
+                  std::string::npos)
+            << "Focused Qwen 3.6 parity must consume the same durable redistribution proof as E2E";
         EXPECT_NE(parity_base.find(
                       "\"device_rebalance_prefill_current_batch_movement_layers\""),
                   std::string::npos)
             << "Parity movement proof must inspect current-batch device history";
+        EXPECT_NE(parity_base.find(
+                      "\"device_rebalance_prefill_current_batch_non_owner_assignment_layers\""),
+                  std::string::npos)
+            << "Parity must accept applied resident-row work without inventing a payload transfer";
         EXPECT_NE(expert_stage.find(
                       "params_.prefill_llep_rebalance_config\n"
                       "                            .min_wave_spread_improvement_per_payload_slot"),
@@ -6225,6 +6252,10 @@ namespace llaminar2::test
                           "uint32_t prefill_current_batch_movement_layers;"),
                       std::string::npos)
                 << backend << " must mirror the current-batch status ABI field";
+            EXPECT_NE(source->find(
+                          "uint32_t prefill_current_batch_non_owner_assignment_layers;"),
+                      std::string::npos)
+                << backend << " must mirror resident-row evidence in the status ABI";
             EXPECT_GE(countOccurrences(
                           *source,
                           "rebalance_publish_transfer_slot_claim_summary("),
@@ -6237,9 +6268,21 @@ namespace llaminar2::test
                 << backend << " shared publisher must derive current-batch movement "
                    "from the complete device-resident runtime audit.";
             EXPECT_NE(source->find(
+                          "status->prefill_current_batch_non_owner_assignment_layers ="),
+                      std::string::npos)
+                << backend << " shared publisher must export resident-row evidence";
+            EXPECT_NE(source->find(
                           "runtime.current_batch_llep_movement_observed != 0u"),
                       std::string::npos)
                 << backend << " must not confuse portable bank state with fresh movement";
+            EXPECT_NE(source->find(
+                          "runtime.current_batch_llep_non_owner_assignment_observed != 0u"),
+                      std::string::npos)
+                << backend << " must aggregate the assignment consumer's sticky marker";
+            EXPECT_NE(source->find(
+                          "containsNonOwnerAssignmentRows("),
+                      std::string::npos)
+                << backend << " production assignment consumer must publish exact resident-row evidence";
             EXPECT_NE(source->find(
                           "kDeviceMoERebalancePlanFlagCurrentBatchLLEP"),
                       std::string::npos)
@@ -6254,6 +6297,10 @@ namespace llaminar2::test
                       "deviceToHostOnStream(&prefill_current_batch_movement_layers"),
                   std::string::npos)
             << "Movement evidence must share the request-boundary status copy, not add hot-path D2H";
+        EXPECT_EQ(orchestrator.find(
+                      "deviceToHostOnStream(&prefill_current_batch_non_owner_assignment_layers"),
+                  std::string::npos)
+            << "Resident-row evidence must share the request-boundary status copy, not add hot-path D2H";
     }
 
     /**
@@ -6423,7 +6470,7 @@ namespace llaminar2::test
             << "Each path uses total slots for both config addressability and directory allocation";
 
         EXPECT_NE(
-            abi.find("kVersion = 9u"),
+            abi.find("kVersion = 10u"),
             std::string::npos);
         EXPECT_NE(
             abi.find("kConfigBytes = 140u"),
@@ -7551,7 +7598,7 @@ namespace llaminar2::test
             graph.find("bool Qwen35MoEGraph::capturePrefixCacheRuntimeState(");
         ASSERT_NE(capture_start, std::string::npos);
         const size_t restore_start =
-            graph.find("bool Qwen35MoEGraph::restorePrefixCacheRuntimeState(",
+            graph.find("Qwen35MoEGraph::restorePrefixCacheRuntimeState(",
                        capture_start);
         ASSERT_NE(restore_start, std::string::npos);
         const std::string capture_body =
@@ -7575,6 +7622,14 @@ namespace llaminar2::test
         EXPECT_NE(graph.find("restorePortableRuntimeState"),
                   std::string::npos)
             << "MoE prefix restore should replay portable logical runtime state.";
+        EXPECT_NE(graph.find("DeviceMoEPortableRuntimeRestoreResult table_restore"),
+                  std::string::npos)
+            << "Portable restore must publish semantic placement and payload "
+               "rehydration as a typed result.";
+        EXPECT_NE(graph.find("DeviceMoEPortablePlacementEffect::Changed"),
+                  std::string::npos)
+            << "Prefix restore must distinguish placement mutation from "
+               "histogram/epoch restoration.";
         EXPECT_EQ(graph.find("localPayloadDescriptorResolverForRuntimeTable"),
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
@@ -7792,6 +7847,38 @@ namespace llaminar2::test
             std::string::npos)
             << "A successful rehydration graph must retire that same "
                "model-runtime transaction.";
+        const size_t restore_transaction_start =
+            source.find("if (restore_model_runtime_state)");
+        ASSERT_NE(restore_transaction_start, std::string::npos);
+        const size_t restore_transaction_end =
+            source.find("for (const auto &handle : restore_blocks)",
+                        restore_transaction_start);
+        ASSERT_NE(restore_transaction_end, std::string::npos);
+        const std::string restore_transaction =
+            source.substr(
+                restore_transaction_start,
+                restore_transaction_end - restore_transaction_start);
+        EXPECT_NE(
+            restore_transaction.find(
+                "const PrefixCacheRuntimeRestoreResult restore_result"),
+            std::string::npos)
+            << "The orchestrator must consume one typed restore publication, "
+               "not reconstruct placement effects from host state.";
+        EXPECT_NE(
+            restore_transaction.find(
+                "restore_result.placement_effect"),
+            std::string::npos);
+        EXPECT_NE(
+            restore_transaction.find(
+                "if (placement_changed)\n                ++moe_runtime_movement_epoch_;"),
+            std::string::npos)
+            << "Histogram-only prefix restore must not advance the MoE movement epoch.";
+        EXPECT_EQ(
+            countOccurrences(
+                restore_transaction,
+                "++moe_runtime_movement_epoch_;"),
+            1u)
+            << "Prefix restore owns exactly one placement-gated movement publication.";
         EXPECT_EQ(
             source.find(
                 "prefix-runtime rehydration policy disagrees with the model runtime owner"),
@@ -8003,12 +8090,15 @@ namespace llaminar2::test
         const size_t materialize_start = manifest_publish_start;
         const std::string copy_body =
             source.substr(copy_start, materialize_start - copy_start);
-        EXPECT_NE(copy_body.find("if (!record_device_copy && !capture_active)"),
+        EXPECT_NE(copy_body.find("const bool capture_active = isGraphCaptureActive()"),
                   std::string::npos)
-            << "Allocation-only pre-capture preparation must validate the descriptor finalized by warmup execution.";
-        EXPECT_NE(copy_body.find("reached capture preparation before warmup finalized its device manifest"),
+            << "Snapshot preparation and recording must share one explicit capture-state contract.";
+        EXPECT_NE(copy_body.find("if (capture_active)"),
                   std::string::npos)
-            << "Missing warmup snapshot manifests must hard-fail instead of substituting pre-execution stage tensors.";
+            << "Capture must validate the immutable descriptor frozen during launch preparation.";
+        EXPECT_NE(copy_body.find("changed GPU snapshot descriptor during graph capture"),
+                  std::string::npos)
+            << "Capture-time descriptor drift must be fatal rather than reconciled from mutable stage state.";
         EXPECT_NE(
             copy_body.find(
                 "snapshot_manifest.outputless_stages.contains(node.name)"),

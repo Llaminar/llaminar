@@ -10763,13 +10763,17 @@ namespace llaminar2
 
     bool RankOrchestrator::materializeDeviceResidentGeneration(
         int request_count,
-        int draft_depth)
+        int draft_depth,
+        DeviceGenerationSamplingMode sampling_mode)
     {
-        if (request_count <= 0 || draft_depth <= 0)
+        if (request_count <= 0 || draft_depth <= 0 ||
+            !isValidDeviceGenerationSamplingMode(sampling_mode))
         {
             LOG_ERROR("[RankOrchestrator] Invalid device-generation parent preparation geometry"
                       << " requests=" << request_count
-                      << " draft_depth=" << draft_depth);
+                      << " draft_depth=" << draft_depth
+                      << " sampling_mode="
+                      << deviceGenerationSamplingModeName(sampling_mode));
             return false;
         }
 
@@ -10787,7 +10791,8 @@ namespace llaminar2
                    participants.front()
                        ->materializeDeviceResidentGeneration(
                            request_count,
-                           draft_depth);
+                           draft_depth,
+                           sampling_mode);
         }
 
         /*
@@ -10824,6 +10829,7 @@ namespace llaminar2
         const auto executor_phase = GraphExecutorStats::currentPhase();
         tp_worker_pool_->dispatch(
             [this, use_pp_participants, request_count, draft_depth,
+             sampling_mode,
              kernel_phase, rocm_phase, cuda_phase, kv_phase,
              executor_phase](size_t i) -> bool
             {
@@ -10850,7 +10856,8 @@ namespace llaminar2
                 return worker_participants[i]
                     ->materializeDeviceResidentGeneration(
                         request_count,
-                        draft_depth);
+                        draft_depth,
+                        sampling_mode);
             });
 
         const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();

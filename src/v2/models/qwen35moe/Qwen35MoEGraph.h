@@ -109,7 +109,9 @@ namespace llaminar2
         void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
 
         bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream) override;
-        bool restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream) override;
+        PrefixCacheRuntimeRestoreResult restorePrefixCacheRuntimeState(
+            const std::vector<uint8_t> &state,
+            void *stream) override;
         bool prefixCacheRuntimeStateRequiresDeviceRehydration() const override
         {
             return prefix_runtime_device_rehydration_pending_;

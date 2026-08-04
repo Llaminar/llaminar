@@ -226,6 +226,7 @@ namespace
         uint32_t participant_id;
         uint32_t participant_count;
         uint32_t current_batch_llep_movement_observed;
+        uint32_t current_batch_llep_non_owner_assignment_observed;
     };
 
     static_assert(
@@ -242,6 +243,11 @@ namespace
         offsetof(DeviceMoELayerRuntimeView,
                  current_batch_llep_movement_observed) ==
         llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 current_batch_llep_non_owner_assignment_observed) ==
+        llaminar2::moe_runtime_abi::
+            kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
     struct DeviceMoERebalanceConfigView
     {
@@ -385,11 +391,18 @@ namespace
         uint32_t prefill_first_invalid_flags;
         uint32_t prefill_first_invalid_resident_mask;
         int32_t prefill_first_invalid_owner;
+        uint32_t prefill_current_batch_non_owner_assignment_layers;
     };
     static_assert(
         sizeof(DeviceMoERebalanceStatusView) ==
             llaminar2::moe_rebalance_abi::kStatusBytes,
         "CUDA rebalance status ABI must match the shared host/device record");
+    static_assert(
+        offsetof(DeviceMoERebalanceStatusView,
+                 prefill_current_batch_non_owner_assignment_layers) ==
+            llaminar2::moe_rebalance_abi::
+                kPrefillCurrentBatchNonOwnerAssignmentLayersOffset,
+        "CUDA resident-assignment evidence must occupy the shared status tail");
 
     /**
      * @brief Terminate CUDA execution with the exact violated LLEP invariant.
@@ -1569,6 +1582,8 @@ namespace
 
         destination.transient_placement_layers +=
             source.transient_placement_layers;
+        destination.non_owner_assignment_layers +=
+            source.non_owner_assignment_layers;
         destination.active_claims += source.active_claims;
         destination.unique_claims += source.unique_claims;
         destination.duplicate_claims += source.duplicate_claims;
@@ -1632,6 +1647,8 @@ namespace
 
             if (runtime.current_batch_llep_movement_observed != 0u)
                 ++summary.transient_placement_layers;
+            if (runtime.current_batch_llep_non_owner_assignment_observed != 0u)
+                ++summary.non_owner_assignment_layers;
         }
 
         const uint64_t claim_count =
@@ -1884,6 +1901,8 @@ namespace
             return;
         status->prefill_current_batch_movement_layers =
             summary.transient_placement_layers;
+        status->prefill_current_batch_non_owner_assignment_layers =
+            summary.non_owner_assignment_layers;
         status->prefill_active_transfer_slot_experts = summary.active_claims;
         status->prefill_unique_transfer_slot_claims = summary.unique_claims;
         status->prefill_duplicate_transfer_slot_claims =
@@ -12731,25 +12750,18 @@ namespace
         }
     }
 
-    __global__ void prefill_group_exclusive_scan_runtime_kernel(
-        DeviceMoELayerRuntimeView *__restrict__ runtime,
-        int num_experts)
-    {
-        if (!runtime || threadIdx.x != 0)
-            return;
-        if (!runtime->expert_counts || !runtime->expert_offsets)
-            return;
-
-        int running = 0;
-        for (int expert = 0; expert < num_experts; ++expert)
-        {
-            const int count = runtime->expert_counts[expert];
-            runtime->expert_offsets[expert] = running;
-            running += count;
-        }
-    }
-
-    __global__ void prefill_group_scatter_deterministic_runtime_kernel(
+    /**
+     * @brief Publish expert offsets and scatter routes in one deterministic launch.
+     *
+     * Block @c expert computes the exact ascending-expert prefix that the old
+     * one-thread scan published for that expert, stores the offset, and then
+     * scatters only that expert's routes. Prefixes are integer sums, so the
+     * independently computed values are byte-identical to the former serial
+     * scan and have no floating-point ordering concern. Keeping publication
+     * and consumption in one block makes the offset dependency explicit and
+     * removes one graph node from every MoE layer.
+     */
+    __global__ void prefill_group_scan_scatter_deterministic_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         int current_slots,
         int max_slots,
@@ -12776,8 +12788,31 @@ namespace
         if (threadIdx.x == 0)
         {
             running_count = 0;
-            expert_offset = runtime->expert_offsets[expert];
-            expert_end = runtime->expert_offsets[expert] + runtime->expert_counts[expert];
+            int prefix = 0;
+#pragma unroll 1
+            for (int preceding_expert = 0;
+                 preceding_expert < expert;
+                 ++preceding_expert)
+            {
+                prefix += runtime->expert_counts[preceding_expert];
+            }
+            const int count = runtime->expert_counts[expert];
+            if (prefix < 0 || count < 0 || prefix + count > max_slots)
+            {
+                printf("runtime_group_scan_scatter_invalid_range "
+                       "participant=%u expert=%d prefix=%d count=%d max_slots=%d\n",
+                       runtime->participant_id,
+                       expert,
+                       prefix,
+                       count,
+                       max_slots);
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime grouped route prefix exceeds the published capacity");
+                return;
+            }
+            runtime->expert_offsets[expert] = prefix;
+            expert_offset = prefix;
+            expert_end = prefix + count;
             participant_id = static_cast<int>(runtime->participant_id);
         }
         __syncthreads();
@@ -13572,6 +13607,25 @@ namespace
             span_count_u64 > span_capacity_u64
                 ? static_cast<uint32_t>(span_capacity_u64)
                 : static_cast<uint32_t>(span_count_u64);
+        const auto *spans =
+            static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan *>(
+                runtime->reserved_ptrs[1]);
+
+        /*
+         * Block zero is the single writer for the request-local evidence bit.
+         * The marker is published by the same kernel that consumes the span
+         * plan, after transfer/apply validation and before any expert block can
+         * return for having no routed rows. A later failure is fatal, so a
+         * successful request-boundary read proves that the assignment completed.
+         * No atomic is needed because one exact lane owns the sticky transition.
+         */
+        if (expert == 0 && threadIdx.x == 0 &&
+            llaminar2::least_loaded_ep::containsNonOwnerAssignmentRows(
+                spans, span_count))
+        {
+            runtime->current_batch_llep_non_owner_assignment_observed = 1u;
+        }
+
         const int expert_count = runtime->expert_counts[expert];
         const int expert_offset = runtime->expert_offsets[expert];
         if (expert_count <= 0 || expert_offset < 0)
@@ -13604,9 +13658,6 @@ namespace
             return;
         }
 
-        const auto *spans =
-            static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan *>(
-                runtime->reserved_ptrs[1]);
         const auto *span_bounds = static_cast<const int32_t *>(runtime->reserved_ptrs[0]);
         int span_begin = 0;
         int span_end = static_cast<int>(span_count);
@@ -15042,6 +15093,109 @@ namespace
     }
 
     /**
+     * @brief Evaluate gate and up projections in one K-block traversal.
+     *
+     * Gate and up descriptors have identical geometry and consume the same
+     * quantized activation row. The former implementation called
+     * native_vnni_dot_desc_range() twice, which repeated activation/scaling
+     * loads and all loop/index work. This paired primitive loads each
+     * activation block once, decodes the two independent payloads in sequence,
+     * and retains one accumulator per projection.
+     *
+     * Arithmetic is unchanged: each accumulator receives exactly the same
+     * block contribution sequence and explicit round-to-nearest FP32 additions
+     * as its standalone projection. Interleaving independent gate/up work does
+     * not alter either dependency chain, so serial-row byte equivalence is
+     * preserved.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ void native_vnni_dot_desc_pair_range(
+        const DeviceNativeVNNIMatrixDesc &gate_desc,
+        const DeviceNativeVNNIMatrixDesc &up_desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K,
+        int b_start,
+        int b_end,
+        float &gate_acc,
+        float &up_acc)
+    {
+        const int blocks_per_row = K / 32;
+        gate_acc = 0.0f;
+        up_acc = 0.0f;
+        if (!A_int8 || !scales_A_blockwise || n < 0 || n >= N ||
+            blocks_per_row <= 0 ||
+            !native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
+            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
+        {
+            return;
+        }
+
+        const auto *gate_scales =
+            static_cast<const uint16_t *>(gate_desc.scales);
+        const auto *gate_mins =
+            static_cast<const uint16_t *>(gate_desc.mins);
+        const auto *gate_emins =
+            static_cast<const uint32_t *>(gate_desc.emins);
+        const auto *up_scales =
+            static_cast<const uint16_t *>(up_desc.scales);
+        const auto *up_mins =
+            static_cast<const uint16_t *>(up_desc.mins);
+        const auto *up_emins =
+            static_cast<const uint32_t *>(up_desc.emins);
+
+        b_start = max(0, b_start);
+        b_end = min(blocks_per_row, b_end);
+        const size_t payload_bytes =
+            llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
+
+#pragma unroll 1
+        for (int block_idx = b_start; block_idx < b_end; ++block_idx)
+        {
+            const int32_t *a4 =
+                reinterpret_cast<const int32_t *>(A_int8 + block_idx * 32);
+            const float scale_a = scales_A_blockwise[block_idx];
+            const size_t linear =
+                static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
+
+            int32_t packed_groups[8];
+            const uint8_t *gate_payload =
+                gate_desc.payload + linear * payload_bytes;
+            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(
+                gate_payload, packed_groups);
+            gate_acc = __fadd_rn(
+                gate_acc,
+                moe_native_vnni_block_contribution_rn<CodebookId>(
+                    a4,
+                    packed_groups,
+                    gate_payload,
+                    gate_scales,
+                    gate_mins,
+                    gate_emins,
+                    linear,
+                    scale_a));
+
+            const uint8_t *up_payload =
+                up_desc.payload + linear * payload_bytes;
+            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(
+                up_payload, packed_groups);
+            up_acc = __fadd_rn(
+                up_acc,
+                moe_native_vnni_block_contribution_rn<CodebookId>(
+                    a4,
+                    packed_groups,
+                    up_payload,
+                    up_scales,
+                    up_mins,
+                    up_emins,
+                    linear,
+                    scale_a));
+        }
+    }
+
+    /**
      * @brief Full-K dot product wrapper (reduces all K-blocks). Preserves the
      *        original single-shot reduction semantics for non-split-K callers.
      */
@@ -15263,17 +15417,6 @@ namespace
     }
 
     /**
-     * @brief Output columns owned by one ordered split-K scatter block.
-     *
-     * Two-warp blocks were capped at sixteen resident blocks per Ampere SM,
-     * which limited these otherwise spill-free kernels to 66.7% theoretical
-     * occupancy. Four warps preserve the one-thread-per-column arithmetic and
-     * memory layout while allowing register and warp limits, rather than the
-     * block-count limit, to determine useful residency.
-     */
-    constexpr int kGroupedOrderedKPartTileN = 128;
-
-    /**
      * @brief Produce decode-equivalent gate/up partials for one verifier-row tile.
      *
      * Grouped expert planning reorders route slots by expert so adjacent rows
@@ -15305,8 +15448,7 @@ namespace
         int num_experts,
         int k_partitions)
     {
-        constexpr int kTileN = kGroupedOrderedKPartTileN;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int n = blockIdx.x * blockDim.x + threadIdx.x;
         const int local_route = blockIdx.y;
         const int k_part = blockIdx.z;
         if (n >= N || local_route >= tile_route_slots ||
@@ -15347,10 +15489,22 @@ namespace
         const int8_t *slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
         const float *slot_scales =
             scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
-        gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
-            gate_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-        up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
-            up_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+        float gate_partial = 0.0f;
+        float up_partial = 0.0f;
+        native_vnni_dot_desc_pair_range<CodebookId>(
+            gate_desc,
+            up_desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            K,
+            b_start,
+            b_end,
+            gate_partial,
+            up_partial);
+        gate_partials[partial_index] = gate_partial;
+        up_partials[partial_index] = up_partial;
     }
 
     /**
@@ -15586,8 +15740,7 @@ namespace
         int num_experts,
         int k_partitions)
     {
-        constexpr int kTileN = kGroupedOrderedKPartTileN;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int n = blockIdx.x * blockDim.x + threadIdx.x;
         const int k_part = blockIdx.y;
         const int local_route = blockIdx.z;
         if (local_route >= tile_route_slots ||
@@ -15670,54 +15823,105 @@ namespace
     }
 
     /**
-     * @brief Reduce route-major verifier scratch directly to grouped rows.
+     * @brief Evaluate non-collective down routes without global split-K scratch.
      *
-     * Every local token owns `top_k` consecutive route rows in @p partials.
-     * Reducing K partitions inside each route and routes in router order makes
-     * this direct path byte-identical to persistent route publication followed
-     * by the LocalTP collective epilogue.
+     * One eight-warp block owns 32 output columns for one verifier token. Each
+     * warp evaluates one router route at a time. It preserves the canonical
+     * arithmetic by weighting every K-partition independently, summing those
+     * partials in ascending partition order, and then having warp zero sum the
+     * completed routes in ascending router order.
      */
-    __global__ void grouped_prefill_down_canonical_kpart_reduce_direct_kernel(
-        const float *__restrict__ partials,
+    template <uint8_t CodebookId>
+    __global__ void grouped_prefill_down_canonical_kpart_fused_direct_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
+        const float *__restrict__ grouped_weights,
         float *__restrict__ output,
+        int original_slot_base,
         int token_base,
         int tile_rows,
         int top_k,
         int N,
+        int K,
+        int num_experts,
         int k_partitions)
     {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
+        constexpr int kWarpSize = 32;
+        __shared__ float route_sums[kMaxTopK][kWarpSize];
+
+        const int warps_per_block = static_cast<int>(blockDim.x) / kWarpSize;
+        const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+        const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+        const int n = static_cast<int>(blockIdx.x) * kWarpSize + lane;
         const int local_token = blockIdx.y;
-        if (local_token >= tile_rows || n >= N)
+        if (local_token >= tile_rows)
             return;
 
-        float output_sum = 0.0f;
 #pragma unroll 1
-        for (int route = 0; route < top_k; ++route)
+        for (int route = warp; route < top_k; route += warps_per_block)
         {
-            const size_t route_base =
-                (static_cast<size_t>(local_token) *
-                     static_cast<size_t>(top_k) +
-                 static_cast<size_t>(route)) *
-                static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
             float route_sum = 0.0f;
-            for (int k_part = 0; k_part < k_partitions; ++k_part)
+            if (n < N)
             {
-                route_sum = moe_accumulate_rn(
-                    route_sum,
-                    partials[
-                        route_base + static_cast<size_t>(k_part) *
-                                         static_cast<size_t>(N) +
-                        static_cast<size_t>(n)]);
-            }
-            output_sum = moe_accumulate_rn(output_sum, route_sum);
-        }
+                const int local_route = local_token * top_k + route;
+                const int original_slot = original_slot_base + local_route;
+                const int grouped_slot = original_to_grouped[original_slot];
+                const int expert_id = original_expert_ids[original_slot];
+                if (grouped_slot >= 0 && expert_id >= 0 && expert_id < num_experts)
+                {
+                    const int blocks_per_row = K / 32;
+                    const int blocks_per_part =
+                        (blocks_per_row + k_partitions - 1) / k_partitions;
+                    const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+                    const int8_t *slot_A =
+                        A_int8 + static_cast<size_t>(grouped_slot) * K;
+                    const float *slot_scales =
+                        scales_A_blockwise +
+                        static_cast<size_t>(grouped_slot) * blocks_per_row;
+                    const float route_weight = grouped_weights[grouped_slot];
 
-        output[
-            static_cast<size_t>(token_base + local_token) *
-                static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = output_sum;
+#pragma unroll 1
+                    for (int k_part = 0; k_part < k_partitions; ++k_part)
+                    {
+                        const int b_start = k_part * blocks_per_part;
+                        const int b_end =
+                            min(blocks_per_row, b_start + blocks_per_part);
+                        float weighted_partial = 0.0f;
+                        if (b_start < b_end)
+                        {
+                            const float expert_partial =
+                                native_vnni_dot_desc_range_dispatch<CodebookId>(
+                                    desc, n, slot_A, slot_scales, N, K,
+                                    b_start, b_end);
+                            weighted_partial =
+                                moe_weight_route_rn(route_weight, expert_partial);
+                        }
+                        route_sum =
+                            moe_accumulate_rn(route_sum, weighted_partial);
+                    }
+                }
+            }
+            route_sums[route][lane] = route_sum;
+        }
+        __syncthreads();
+
+        if (warp == 0 && n < N)
+        {
+            float output_sum = 0.0f;
+#pragma unroll 1
+            for (int route = 0; route < top_k; ++route)
+            {
+                output_sum =
+                    moe_accumulate_rn(output_sum, route_sums[route][lane]);
+            }
+            output[
+                static_cast<size_t>(token_base + local_token) *
+                    static_cast<size_t>(N) +
+                static_cast<size_t>(n)] = output_sum;
+        }
     }
 
     /** @brief Canonically sum allreduced route slots in original router order. */
@@ -17276,14 +17480,11 @@ extern "C"
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_count_assigned_runtime", cuda_stream))
             return false;
 
-        prefill_group_exclusive_scan_runtime_kernel<<<1, 1, 0, cuda_stream>>>(
-            runtime_view, num_experts);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_scan_runtime", cuda_stream))
-            return false;
-
-        prefill_group_scatter_deterministic_runtime_kernel<<<num_experts, kThreads, 0, cuda_stream>>>(
+        prefill_group_scan_scatter_deterministic_runtime_kernel<<<
+            num_experts, kThreads, 0, cuda_stream>>>(
             runtime_view, current_slots, max_slots, num_experts, top_k);
-        return finishGroupedPrefillLaunch("cudaMoE_prefill_group_scatter_runtime", cuda_stream);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_prefill_group_scan_scatter_runtime", cuda_stream);
     }
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
@@ -17319,14 +17520,11 @@ extern "C"
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_count_assigned_runtime", cuda_stream))
             return false;
 
-        prefill_group_exclusive_scan_runtime_kernel<<<1, 1, 0, cuda_stream>>>(
-            runtime_view, num_experts);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_scan_runtime", cuda_stream))
-            return false;
-
-        prefill_group_scatter_deterministic_runtime_kernel<<<num_experts, kThreads, 0, cuda_stream>>>(
+        prefill_group_scan_scatter_deterministic_runtime_kernel<<<
+            num_experts, kThreads, 0, cuda_stream>>>(
             runtime_view, current_slots, max_slots, num_experts, top_k);
-        return finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_scatter_runtime", cuda_stream);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_prefill_regroup_scan_scatter_runtime", cuda_stream);
     }
 
     bool cudaMoE_commit_grouped_verifier_histograms(
@@ -18153,7 +18351,8 @@ extern "C"
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out ||
             (!d_output && !d_canonical_route_contributions) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-            max_tokens_per_expert <= 0 || total_slots <= 0 || top_k <= 0 ||
+            max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            top_k <= 0 || top_k > kMaxTopK ||
             active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0)
         {
@@ -18174,11 +18373,13 @@ extern "C"
             (down_k_partitions == 2 || down_k_partitions == 4 ||
              down_k_partitions == 8 || down_k_partitions == 16);
         const bool down_kpart_requested = down_k_partitions > 0;
+        const bool canonical_publication =
+            d_canonical_route_contributions != nullptr;
         const bool use_ordered_down_kpart =
             use_active_expert_grid && down_kpart_requested &&
             d_original_to_grouped &&
             d_original_expert_ids &&
-            d_down_partials &&
+            (!canonical_publication || d_down_partials) &&
             valid_down_k_partitions;
         if (gateup_kpart_requested && !use_gateup_kpart)
             return false;
@@ -18195,9 +18396,6 @@ extern "C"
             return false;
         const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
         const int seq_len = total_slots / top_k;
-        const bool canonical_publication =
-            d_canonical_route_contributions != nullptr;
-
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
@@ -18218,7 +18416,7 @@ extern "C"
 
         if (use_gateup_kpart)
         {
-            constexpr int kTileN = kGroupedOrderedKPartTileN;
+            const int kTileN = llaminar2::debugEnv().gemm.cuda_moe_ordered_kpart_tile_n;
             constexpr int kReduceTileN = 32;
             dim3 block(kTileN);
             dim3 reduce_block(kReduceTileN);
@@ -18400,12 +18598,16 @@ extern "C"
 
         if (use_ordered_down_kpart)
         {
-            constexpr int kScatterTileN = kGroupedOrderedKPartTileN;
+            const int kScatterTileN =
+                llaminar2::debugEnv().gemm.cuda_moe_ordered_kpart_tile_n;
             constexpr int kReduceTileN = 64;
+            const int kDirectWarpsPerBlock =
+                llaminar2::debugEnv().gemm.cuda_moe_down_direct_warps;
             const int N = d_model;
             const int K = intermediate;
             dim3 scatter_block(kScatterTileN);
             dim3 reduce_block(kReduceTileN);
+            dim3 direct_block(kDirectWarpsPerBlock * 32);
 
             for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
             {
@@ -18419,18 +18621,28 @@ extern "C"
                 dim3 route_reduce_grid(
                     (N + kReduceTileN - 1) / kReduceTileN,
                     tile_route_slots);
-                dim3 direct_reduce_grid(
-                    (N + kReduceTileN - 1) / kReduceTileN,
-                    tile_rows);
+                dim3 direct_grid((N + 31) / 32, tile_rows);
 
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                      \
-    grouped_prefill_down_canonical_kpart_scatter_kernel<CB>                         \
-        <<<scatter_grid, scatter_block, 0, cuda_stream>>>(                          \
-            d_scratch_swiglu_int8, d_scratch_swiglu_scales,                         \
-            d_down_desc_table, d_original_to_grouped,                               \
-            d_original_expert_ids, d_group_weights, d_down_partials,                \
-            original_slot_base, tile_route_slots, N, K, num_experts,                \
-            down_k_partitions)
+    do {                                                                             \
+        if (canonical_publication) {                                                  \
+            grouped_prefill_down_canonical_kpart_scatter_kernel<CB>                  \
+                <<<scatter_grid, scatter_block, 0, cuda_stream>>>(                   \
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,                  \
+                    d_down_desc_table, d_original_to_grouped,                        \
+                    d_original_expert_ids, d_group_weights, d_down_partials,         \
+                    original_slot_base, tile_route_slots, N, K, num_experts,         \
+                    down_k_partitions);                                              \
+        } else {                                                                     \
+            grouped_prefill_down_canonical_kpart_fused_direct_kernel<CB>             \
+                <<<direct_grid, direct_block, 0, cuda_stream>>>(                     \
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,                  \
+                    d_down_desc_table, d_original_to_grouped,                        \
+                    d_original_expert_ids, d_group_weights, d_output,                \
+                    original_slot_base, token_base, tile_rows, top_k, N, K,          \
+                    num_experts, down_k_partitions);                                  \
+        }                                                                            \
+    } while (0)
 
                 bool launched_down = false;
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(CB)                                           \
@@ -18497,14 +18709,8 @@ extern "C"
                         N,
                         down_k_partitions);
                 }
-                else
-                {
-                    grouped_prefill_down_canonical_kpart_reduce_direct_kernel<<<
-                        direct_reduce_grid, reduce_block, 0, cuda_stream>>>(
-                        d_down_partials, d_output, token_base, tile_rows,
-                        top_k, N, down_k_partitions);
-                }
-                if (!finishGroupedPrefillLaunch(
+                if (canonical_publication &&
+                    !finishGroupedPrefillLaunch(
                         "cudaMoE_grouped_down_ordered_kpart_reduce_prefill",
                         cuda_stream))
                 {

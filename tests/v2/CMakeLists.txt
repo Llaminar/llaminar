@@ -2100,7 +2100,8 @@ add_test(NAME V2_Unit_NativeVNNIDispatchRefreshScript
 )
 set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
     LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Regression"
-    TIMEOUT 1800
+    PROCESSORS 16
+    TIMEOUT 60
 )
 
 add_test(NAME V2_Unit_NativeVNNICorpusBundle
@@ -14460,23 +14461,24 @@ add_v2_test(V2_Unit_LoadOrchestrator
 )
 
 # GPU Weight Loading Pipeline - Phase 2 GPU Repack Kernels
-add_executable(v2_test_vnni_repack_kernels unit/Test__VnniRepackKernels.cpp)
-target_include_directories(v2_test_vnni_repack_kernels PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(v2_test_vnni_repack_kernels
+add_executable(v2_integration_rocm_vnni_repack_kernels
+    integration/kernels/rocm/Test__ROCmVnniRepackKernels.cpp)
+target_include_directories(v2_integration_rocm_vnni_repack_kernels PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_integration_rocm_vnni_repack_kernels
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
 if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_test_vnni_repack_kernels rocm_backend)
+    target_link_libraries(v2_integration_rocm_vnni_repack_kernels rocm_backend)
 endif()
 if(HAVE_ROCM)
-    target_compile_definitions(v2_test_vnni_repack_kernels PRIVATE __HIP_PLATFORM_AMD__=1)
-    target_link_libraries(v2_test_vnni_repack_kernels hip::host)
+    target_compile_definitions(v2_integration_rocm_vnni_repack_kernels PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_rocm_vnni_repack_kernels hip::host)
 endif()
-add_v2_test(V2_Unit_VnniRepackKernels
-    COMMAND $<TARGET_FILE:v2_test_vnni_repack_kernels>
-    LABELS "V2;Unit;WeightLoading;GpuPipeline;ROCm;HIP"
+add_v2_test(V2_Integration_ROCm_VnniRepackKernels
+    COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+    LABELS "V2;Integration;WeightLoading;GpuPipeline;ROCm;HIP"
     MPI_PROCS 1
 )
 

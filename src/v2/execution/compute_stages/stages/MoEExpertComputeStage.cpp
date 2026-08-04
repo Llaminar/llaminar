@@ -5839,6 +5839,33 @@ namespace llaminar2
                 top_k,
                 filter_runtime_grouping_to_local_experts,
                 retain_routes_during_initial_grouping);
+            if (groups_prepared && fully_replicated_local_rows)
+            {
+                /*
+                 * A mirrored verifier owns every routed row locally on every
+                 * participant.  It deliberately has no participant assignment,
+                 * current-batch expert transport, or routed-result collective.
+                 * Publish that complete policy as one typed observation so the
+                 * serving gate can distinguish this economical first-class mode
+                 * from a missing LLEP assignment launch.
+                 */
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "fully_replicated_local_verifier_execution_calls",
+                    1.0,
+                    params_.force_grouped_verifier_prefill_for_decode
+                        ? "verifier"
+                        : "prefill",
+                    params_.device_id.toString(),
+                    {{"stage", "moe_expert_grouped_prefill"},
+                     {"execution_policy", "fully_replicated_local"},
+                     {"participant_assignment", "none"},
+                     {"current_batch_transport", "none"},
+                     {"routed_result_collective", "none"},
+                     {"layer", std::to_string(params_.layer_idx)},
+                     {"seq_len", std::to_string(seq_len)},
+                     {"top_k", std::to_string(top_k)}});
+            }
             if (groups_prepared &&
                 !trace_runtime_assignment("after_group"))
             {

@@ -2050,10 +2050,10 @@ TEST_F(Test__DeviceGraphOrchestrator, MTPStopControlsArePublishedOnlyAtRequestBo
         std::string::npos);
     EXPECT_NE(
         verifier_body.find(
-            "graph_owned_greedy_penalty_policy_publications"),
+            "graph_owned_greedy_penalty_policy_consumptions"),
         std::string::npos)
-        << "Only transaction-varying penalty policy may be published beside "
-           "verifier replay.";
+        << "Verifier replay may consume the request-published penalty policy, "
+           "but it must not republish request controls.";
 
     const auto admission_pos =
         source.find("bool DeviceGraphOrchestrator::admitRequestInputsOnDevice(");

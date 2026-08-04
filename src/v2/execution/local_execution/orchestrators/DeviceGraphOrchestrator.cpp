@@ -1429,6 +1429,8 @@ namespace llaminar2
             appendJsonNumberField(out, status_first, "window_required_slots", status.window_required_slots);
             appendJsonNumberField(out, status_first, "payload_bucket_requested_slots", status.payload_bucket_requested_slots);
             appendJsonNumberField(out, status_first, "payload_bucket_slots", status.payload_bucket_slots);
+            appendJsonNumberField(out, status_first, "prefill_current_batch_movement_layers", status.prefill_current_batch_movement_layers);
+            appendJsonNumberField(out, status_first, "prefill_current_batch_non_owner_assignment_layers", status.prefill_current_batch_non_owner_assignment_layers);
             appendJsonNumberField(out, status_first, "skipped_wave_cost_floor", status.skipped_wave_cost_floor);
             appendJsonNumberField(out, status_first, "skipped_low_router_benefit", status.skipped_low_router_benefit);
             appendJsonNumberField(out, status_first, "skipped_post_load_spread_ceiling", status.skipped_post_load_spread_ceiling);
@@ -5365,12 +5367,26 @@ namespace llaminar2
             mtp_verifier_preparation_checkpoint_scratch_.reserve(
                 static_cast<size_t>(
                     stochastic_batch_output_request_capacity_));
+            /*
+             * A dynamic SWITCH parent duplicates the common verifier/publication
+             * tail in every legal branch because CUDA conditional graphs may not
+             * execute a common tail after an invalid selector. Reserve the full
+             * depth-1-through-depth-D inventory here. The largest branch has one
+             * optional maintenance fragment, so the exact upper bound is
+             * sum(2*d + 7) = D * (D + 8).
+             */
+            const size_t device_generation_dynamic_fragment_capacity =
+                static_cast<size_t>(mtp_max_draft_depth_) *
+                static_cast<size_t>(mtp_max_draft_depth_ + 8);
             mtp_device_generation_loop_fragment_scratch_.clear();
             mtp_device_generation_loop_fragment_scratch_.reserve(
-                static_cast<size_t>(2 * mtp_max_draft_depth_ + 7));
+                device_generation_dynamic_fragment_capacity);
+            mtp_device_generation_loop_branch_scratch_.clear();
+            mtp_device_generation_loop_branch_scratch_.resize(
+                static_cast<size_t>(mtp_max_draft_depth_ + 1));
             mtp_device_generation_loop_graph_.source_fragments.clear();
             mtp_device_generation_loop_graph_.source_fragments.reserve(
-                static_cast<size_t>(2 * mtp_max_draft_depth_ + 7));
+                device_generation_dynamic_fragment_capacity);
             const size_t stochastic_topk_partial_capacity =
                 static_cast<size_t>(stochastic_target_row_capacity_) *
                 kStochasticTopKPartialBlocks *
@@ -7000,6 +7016,8 @@ namespace llaminar2
                 apply_status_valid ? apply_status.applied_arrivals : 0u;
             outcome->prefill_current_batch_movement_layers =
                 status.prefill_current_batch_movement_layers;
+            outcome->prefill_current_batch_non_owner_assignment_layers =
+                status.prefill_current_batch_non_owner_assignment_layers;
             outcome->prefill_active_transfer_slot_experts =
                 status.prefill_active_transfer_slot_experts;
             outcome->prefill_unique_transfer_slot_claims =
@@ -7045,6 +7063,7 @@ namespace llaminar2
             outcome->useful_work =
                 outcome->valid &&
                 (status.prefill_current_batch_movement_layers != 0u ||
+                 status.prefill_current_batch_non_owner_assignment_layers != 0u ||
                  status.prefill_active_transfer_slot_experts != 0u ||
                  (status.status_code ==
                       static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
@@ -7271,6 +7290,9 @@ namespace llaminar2
                  status.llep_weight_transfer_count);
         emit_u32("device_rebalance_prefill_current_batch_movement_layers",
                  status.prefill_current_batch_movement_layers);
+        emit_u32(
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+            status.prefill_current_batch_non_owner_assignment_layers);
         emit_u32("device_rebalance_prefill_active_transfer_slot_experts",
                  status.prefill_active_transfer_slot_experts);
         emit_u32("device_rebalance_prefill_unique_transfer_slot_claims",
@@ -15405,6 +15427,7 @@ namespace llaminar2
         mtpAllPositionVerifierDeviceLoopGraphTemplate(
             int request_count,
             int padded_seq_len,
+            DeviceGenerationSamplingMode sampling_mode,
             std::string *error) const
     {
         using TemplateView =
@@ -15418,6 +15441,11 @@ namespace llaminar2
         };
         if (error)
             error->clear();
+        if (!isValidDeviceGenerationSamplingMode(sampling_mode))
+        {
+            return reject(
+                "all-position verifier loop composition received an invalid sampling topology");
+        }
 
         const MTPVerifierPreparationGraphKey key{
             .control_policy = MTPVerifierPreparationControlPolicy::
@@ -15466,6 +15494,10 @@ namespace llaminar2
         }
 
         const auto &signature = forward->signature;
+        const MTPVerifierOutcomeGraphMode expected_outcome_mode =
+            sampling_mode == DeviceGenerationSamplingMode::Greedy
+                ? MTPVerifierOutcomeGraphMode::Greedy
+                : MTPVerifierOutcomeGraphMode::Disabled;
         if (forward->device != state_.device_id ||
             signature.device != state_.device_id || !signature.decode ||
             !signature.all_position_logits ||
@@ -15476,10 +15508,14 @@ namespace llaminar2
             !signature.uses_device_token_ids ||
             !signature.uses_device_position_ids ||
             !signature.uses_device_sequence_lengths ||
+            signature.mtp_verifier_outcome_graph_mode !=
+                expected_outcome_mode ||
             signature.is_bucketed_prefill)
         {
             return reject(
-                "retained all-position verifier signature does not consume the active device-owned preparation geometry");
+                std::string("retained all-position verifier signature does not consume the active device-owned ") +
+                deviceGenerationSamplingModeName(sampling_mode) +
+                " preparation/outcome topology");
         }
         return forward;
     }
@@ -15851,6 +15887,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::materializeMTPDeviceGenerationLoopGraph(
         int request_count,
         int draft_depth,
+        DeviceGenerationSamplingMode sampling_mode,
         std::string *error)
     {
         using namespace sampling_math;
@@ -15866,8 +15903,21 @@ namespace llaminar2
         };
         if (error)
             error->clear();
+        if (!isValidDeviceGenerationSamplingMode(sampling_mode))
+        {
+            return fail(
+                "device-generation parent graph received an invalid sampling topology");
+        }
 
         const uint64_t generation = workspaceGeneration(state_.device_id);
+        const DeviceGenerationDepthPolicy depth_policy =
+            makeDeviceGenerationDepthPolicy(graph_builder_->config().mtp);
+        const bool dynamic_depth =
+            depth_policy.mode == DeviceGenerationDepthPolicyMode::Dynamic;
+        const int minimum_draft_depth =
+            dynamic_depth ? depth_policy.minimum_depth : draft_depth;
+        const int maximum_draft_depth =
+            dynamic_depth ? depth_policy.maximum_depth : draft_depth;
         const int verifier_rows_per_request = draft_depth + 1;
         std::string width_policy_error;
         const auto width_policy =
@@ -15884,17 +15934,39 @@ namespace llaminar2
                 : 0;
         const bool include_device_moe_maintenance =
             usesDeviceSideMoERebalanceController();
-        const size_t expected_fragment_count =
-            static_cast<size_t>(2 * draft_depth + 6) +
-            (include_device_moe_maintenance ? 1u : 0u);
+        const auto fragment_count_for_depth =
+            [include_device_moe_maintenance,
+             sampling_mode](int depth) -> size_t
+        {
+            const size_t common_fragment_count =
+                static_cast<size_t>(2 * depth + 4);
+            const size_t stochastic_fragment_count =
+                sampling_mode == DeviceGenerationSamplingMode::Stochastic
+                    ? 2u
+                    : 0u;
+            return common_fragment_count + stochastic_fragment_count +
+                   (include_device_moe_maintenance ? 1u : 0u);
+        };
+        size_t expected_fragment_count = 0;
+        for (int depth = minimum_draft_depth;
+             depth <= maximum_draft_depth;
+             ++depth)
+        {
+            expected_fragment_count += fragment_count_for_depth(depth);
+        }
         if (!state_.device_id.is_gpu() || generation == 0 ||
             request_count != 1 || draft_depth <= 0 ||
             draft_depth > mtp_max_draft_depth_ ||
-            physical_verifier_rows_per_request <= 0)
+            physical_verifier_rows_per_request <= 0 ||
+            !depth_policy.valid() || minimum_draft_depth <= 0 ||
+            maximum_draft_depth < minimum_draft_depth ||
+            maximum_draft_depth > mtp_max_draft_depth_ ||
+            (dynamic_depth && draft_depth != maximum_draft_depth) ||
+            (!dynamic_depth && draft_depth != depth_policy.initial_depth))
         {
             return fail(
                 "device-generation parent graph requires one admitted GPU "
-                "request and a supported positive fixed depth: " +
+                "request and an exact supported depth-policy capture width: " +
                 width_policy_error);
         }
         if (!loop.stream || !loop.capture ||
@@ -15903,10 +15975,14 @@ namespace llaminar2
             return fail(
                 "device-generation parent graph has no exact preallocated stream/capture owner");
         }
-        if (!loop.capture->supportsDeviceControlledWhileLoop())
+        if (!loop.capture->supportsDeviceControlledWhileLoop() ||
+            (dynamic_depth &&
+             !loop.capture->supportsDeviceControlledSwitchWhileLoop()))
         {
             return fail(
-                "device-generation parent graph requires a native device-controlled WHILE implementation");
+                dynamic_depth
+                    ? "dynamic device-generation parent graph requires a native device-controlled SWITCH-in-WHILE implementation"
+                    : "device-generation parent graph requires a native device-controlled WHILE implementation");
         }
         if (!device_generation_storage_.validFor(request_count) ||
             device_generation_storage_.active_request_count != request_count)
@@ -15916,13 +15992,27 @@ namespace llaminar2
         }
         if (mtp_device_generation_loop_fragment_scratch_.capacity() <
                 expected_fragment_count ||
-            loop.source_fragments.capacity() < expected_fragment_count)
+            loop.source_fragments.capacity() < expected_fragment_count ||
+            mtp_device_generation_loop_branch_scratch_.size() <=
+                static_cast<size_t>(maximum_draft_depth))
         {
             return fail(
-                "device-generation parent graph fragment storage was not preallocated for the configured depth");
+                "device-generation parent graph branch/fragment storage was not preallocated for the complete configured policy");
         }
 
         mtp_device_generation_loop_fragment_scratch_.clear();
+        for (DeviceControlledLoopBranch &branch :
+             mtp_device_generation_loop_branch_scratch_)
+        {
+            branch = DeviceControlledLoopBranch{};
+        }
+        std::array<size_t,
+                   DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth + 1>
+            branch_offsets{};
+        std::array<size_t,
+                   DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth + 1>
+            branch_fragment_counts{};
+        int assembling_depth = 0;
         auto append = [&](const char *fragment_name,
                           const auto &view,
                           const std::string &fragment_error,
@@ -15934,7 +16024,8 @@ namespace llaminar2
             {
                 return fail(
                     std::string("device-generation parent graph rejected ") +
-                    fragment_name +
+                    fragment_name + " for depth " +
+                    std::to_string(assembling_depth) +
                     (fragment_error.empty()
                          ? ": no strict monolithic capture was exported"
                          : ": " + fragment_error));
@@ -15949,27 +16040,60 @@ namespace llaminar2
             return true;
         };
 
-        std::string fragment_error;
-        fragment_error.clear();
-        auto full_sidecar = mtpSidecarDeviceLoopGraphTemplate(
-            MTPSidecarCaptureRole::Full,
-            request_count,
-            &fragment_error);
-        if (!append("full sidecar", full_sidecar, fragment_error))
-            return false;
-
-        for (int slot = 0; slot < draft_depth; ++slot)
+        /*
+         * Request orchestration executes the maintenance boundary for the
+         * externally materialized first transaction before composing this
+         * parent. That operation also leaves the exact maintenance child
+         * replay-ready. Every branch therefore owns one complete transaction in
+         * producer order: sidecars, verifier, compact outcome, state publication,
+         * terminal-hidden selection, then maintenance for the state it committed.
+         *
+         * The verifier/publication tail always uses the maximum captured width.
+         * Its kernels consume ActiveVerifierRowCount from the same controller as
+         * the SWITCH selector and mask inactive rows. Keeping one physical width
+         * makes child graph identity stable while each branch still executes only
+         * the selected number of expensive sidecar forwards.
+         */
+        auto assemble_transaction_branch = [&](int transaction_depth) -> bool
         {
-            if (slot > 0)
+            assembling_depth = transaction_depth;
+            const size_t branch_offset =
+                mtp_device_generation_loop_fragment_scratch_.size();
+            std::string fragment_error;
+
+            auto full_sidecar = mtpSidecarDeviceLoopGraphTemplate(
+                MTPSidecarCaptureRole::Full,
+                request_count,
+                &fragment_error);
+            if (!append("full sidecar", full_sidecar, fragment_error))
+                return false;
+
+            for (int slot = 0; slot < transaction_depth; ++slot)
             {
+                if (slot > 0)
+                {
+                    fragment_error.clear();
+                    auto chained_sidecar = mtpSidecarDeviceLoopGraphTemplate(
+                        MTPSidecarCaptureRole::Chained,
+                        request_count,
+                        &fragment_error);
+                    if (!append(
+                            "chained sidecar",
+                            chained_sidecar,
+                            fragment_error))
+                    {
+                        return false;
+                    }
+                }
+
                 fragment_error.clear();
-                auto chained_sidecar = mtpSidecarDeviceLoopGraphTemplate(
-                    MTPSidecarCaptureRole::Chained,
-                    request_count,
-                    &fragment_error);
+                auto draft_publication =
+                    mtpDraftTokenPublicationDeviceLoopGraphTemplate(
+                        slot,
+                        &fragment_error);
                 if (!append(
-                        "chained sidecar",
-                        chained_sidecar,
+                        "draft-token publication",
+                        draft_publication,
                         fragment_error))
                 {
                     return false;
@@ -15977,151 +16101,173 @@ namespace llaminar2
             }
 
             fragment_error.clear();
-            auto draft_publication =
-                mtpDraftTokenPublicationDeviceLoopGraphTemplate(
-                    slot,
+            auto verifier_preparation =
+                mtpVerifierPreparationDeviceLoopGraphTemplate(
+                    request_count,
+                    physical_verifier_rows_per_request,
                     &fragment_error);
             if (!append(
-                    "draft-token publication",
-                    draft_publication,
+                    "verifier preparation",
+                    verifier_preparation,
                     fragment_error))
             {
                 return false;
             }
-        }
 
-        fragment_error.clear();
-        auto verifier_preparation =
-            mtpVerifierPreparationDeviceLoopGraphTemplate(
-                request_count,
-                physical_verifier_rows_per_request,
-                &fragment_error);
-        if (!append(
-                "verifier preparation",
-                verifier_preparation,
-                fragment_error))
-        {
-            return false;
-        }
-
-        fragment_error.clear();
-        auto verifier_forward = mtpAllPositionVerifierDeviceLoopGraphTemplate(
-            request_count,
-            physical_verifier_rows_per_request,
-            &fragment_error);
-        if (!append(
-                "all-position verifier forward",
-                verifier_forward,
-                fragment_error))
-        {
-            return false;
-        }
-
-        fragment_error.clear();
-        auto target_distribution =
-            mtpStochasticTargetDistributionDeviceLoopGraphTemplate(
-                verifier_rows_per_request,
-                &fragment_error);
-        if (!append(
-                "stochastic target distribution",
-                target_distribution,
-                fragment_error))
-        {
-            return false;
-        }
-
-        fragment_error.clear();
-        auto serial_outcome =
-            mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
-                request_count,
-                draft_depth,
-                &fragment_error);
-        if (!append(
-                "stochastic serial-equivalent outcome",
-                serial_outcome,
-                fragment_error))
-        {
-            return false;
-        }
-
-        fragment_error.clear();
-        auto state_publication =
-            mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
-                request_count,
-                verifier_rows_per_request,
-                &fragment_error);
-        if (!append(
-                "speculative state publication",
-                state_publication,
-                fragment_error))
-        {
-            return false;
-        }
-
-        fragment_error.clear();
-        auto terminal_hidden =
-            mtpAcceptedTerminalHiddenDeviceLoopGraphTemplate(
-                request_count,
-                &fragment_error);
-        if (!append(
-                "accepted terminal-hidden publication",
-                terminal_hidden,
-                fragment_error))
-        {
-            return false;
-        }
-
-        /*
-         * Request orchestration executes the maintenance boundary for the
-         * externally materialized first transaction before composing this
-         * parent. That operation also leaves the exact maintenance child
-         * replay-ready. Every WHILE iteration therefore owns the next complete
-         * transaction in producer order: sidecars, verifier, compact outcome,
-         * state publication, terminal-hidden selection, then maintenance for
-         * the state it just committed.
-         *
-         * Tail placement is important. Cloning maintenance at the head would
-         * consume the first transaction twice: once during the mandatory
-         * standalone first-use warmup/capture and again in iteration zero.
-         * The serial-outcome fragment publishes `maintenance_due`; the typed
-         * IfDeviceWordNonZero policy then skips the complete maintenance body,
-         * including its collective, on ordinary iterations. A due edge still
-         * executes exactly once before the loop predicate admits another
-         * transaction.
-         */
-        if (include_device_moe_maintenance)
-        {
-            const auto &maintenance =
-                device_moe_rebalance_maintenance_graph_;
-            const DeviceMoERebalanceGraphControllerState *const controller =
-                deviceMoERebalanceControllerStateDevice();
-            if (!maintenance.graph ||
-                maintenance.workspace_generation == 0 ||
-                maintenance.workspace_generation != generation ||
-                !controller)
-            {
-                return fail(
-                    "device-generation parent graph has no current device MoE maintenance owner");
-            }
-            const auto *const maintenance_due_device =
-                reinterpret_cast<const uint32_t *>(
-                    reinterpret_cast<const std::byte *>(controller) +
-                    offsetof(
-                        DeviceMoERebalanceGraphControllerState,
-                        maintenance_due));
-            auto maintenance_fragment =
-                maintenance.segment_cache.deviceLoopGraphTemplate(
-                    *maintenance.graph,
+            fragment_error.clear();
+            auto verifier_forward =
+                mtpAllPositionVerifierDeviceLoopGraphTemplate(
+                    request_count,
+                    physical_verifier_rows_per_request,
+                    sampling_mode,
                     &fragment_error);
             if (!append(
-                    "device MoE maintenance",
-                    maintenance_fragment,
-                    fragment_error,
-                    DeviceControlledLoopFragmentExecution::
-                        IfDeviceWordNonZero,
-                    maintenance_due_device))
+                    "all-position verifier forward",
+                    verifier_forward,
+                    fragment_error))
             {
                 return false;
+            }
+
+            if (sampling_mode == DeviceGenerationSamplingMode::Stochastic)
+            {
+                fragment_error.clear();
+                auto target_distribution =
+                    mtpStochasticTargetDistributionDeviceLoopGraphTemplate(
+                        verifier_rows_per_request,
+                        &fragment_error);
+                if (!append(
+                        "stochastic target distribution",
+                        target_distribution,
+                        fragment_error))
+                {
+                    return false;
+                }
+
+                fragment_error.clear();
+                auto serial_outcome =
+                    mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
+                        request_count,
+                        draft_depth,
+                        &fragment_error);
+                if (!append(
+                        "stochastic serial-equivalent outcome",
+                        serial_outcome,
+                        fragment_error))
+                {
+                    return false;
+                }
+            }
+
+            fragment_error.clear();
+            auto state_publication =
+                mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
+                    request_count,
+                    verifier_rows_per_request,
+                    &fragment_error);
+            if (!append(
+                    "speculative state publication",
+                    state_publication,
+                    fragment_error))
+            {
+                return false;
+            }
+
+            fragment_error.clear();
+            auto terminal_hidden =
+                mtpAcceptedTerminalHiddenDeviceLoopGraphTemplate(
+                    request_count,
+                    &fragment_error);
+            if (!append(
+                    "accepted terminal-hidden publication",
+                    terminal_hidden,
+                    fragment_error))
+            {
+                return false;
+            }
+
+            /*
+             * Tail placement is exact: cloning maintenance at the head would
+             * consume the first transaction twice. The serial-outcome fragment
+             * publishes `maintenance_due`; the typed conditional skips the whole
+             * maintenance body, including its collective, on ordinary iterations.
+             */
+            if (include_device_moe_maintenance)
+            {
+                const auto &maintenance =
+                    device_moe_rebalance_maintenance_graph_;
+                const DeviceMoERebalanceGraphControllerState *const controller =
+                    deviceMoERebalanceControllerStateDevice();
+                if (!maintenance.graph ||
+                    maintenance.workspace_generation == 0 ||
+                    maintenance.workspace_generation != generation ||
+                    !controller)
+                {
+                    return fail(
+                        "device-generation parent graph has no current device MoE maintenance owner");
+                }
+                const auto *const maintenance_due_device =
+                    reinterpret_cast<const uint32_t *>(
+                        reinterpret_cast<const std::byte *>(controller) +
+                        offsetof(
+                            DeviceMoERebalanceGraphControllerState,
+                            maintenance_due));
+                auto maintenance_fragment =
+                    maintenance.segment_cache.deviceLoopGraphTemplate(
+                        *maintenance.graph,
+                        &fragment_error);
+                if (!append(
+                        "device MoE maintenance",
+                        maintenance_fragment,
+                        fragment_error,
+                        DeviceControlledLoopFragmentExecution::
+                            IfDeviceWordNonZero,
+                        maintenance_due_device))
+                {
+                    return false;
+                }
+            }
+
+            const size_t assembled_count =
+                mtp_device_generation_loop_fragment_scratch_.size() -
+                branch_offset;
+            if (assembled_count !=
+                fragment_count_for_depth(transaction_depth))
+            {
+                return fail(
+                    "device-generation parent graph assembled an invalid per-depth transaction body");
+            }
+            branch_offsets[static_cast<size_t>(transaction_depth)] =
+                branch_offset;
+            branch_fragment_counts[static_cast<size_t>(transaction_depth)] =
+                assembled_count;
+            return true;
+        };
+
+        for (int depth = minimum_draft_depth;
+             depth <= maximum_draft_depth;
+             ++depth)
+        {
+            if (!assemble_transaction_branch(depth))
+                return false;
+        }
+
+        if (dynamic_depth)
+        {
+            const DeviceControlledLoopFragment *const fragment_base =
+                mtp_device_generation_loop_fragment_scratch_.data();
+            for (int depth = minimum_draft_depth;
+                 depth <= maximum_draft_depth;
+                 ++depth)
+            {
+                const size_t index = static_cast<size_t>(depth);
+                mtp_device_generation_loop_branch_scratch_[index] =
+                    DeviceControlledLoopBranch{
+                        .ordered_fragments =
+                            std::span<const DeviceControlledLoopFragment>(
+                                fragment_base + branch_offsets[index],
+                                branch_fragment_counts[index]),
+                    };
             }
         }
 
@@ -16157,6 +16303,10 @@ namespace llaminar2
             loop.request_count == request_count &&
             loop.draft_depth == draft_depth &&
             loop.verifier_rows_per_request == verifier_rows_per_request &&
+            loop.minimum_draft_depth == minimum_draft_depth &&
+            loop.maximum_draft_depth == maximum_draft_depth &&
+            loop.depth_policy_mode == static_cast<int>(depth_policy.mode) &&
+            loop.sampling_mode == sampling_mode &&
             loop.fragment_count == expected_fragment_count &&
             loop.conditional_fragment_count == conditional_fragment_count &&
             source_identity_matches)
@@ -16170,6 +16320,14 @@ namespace llaminar2
                 {{"backend", loop.capture->backendName()},
                  {"requests", std::to_string(request_count)},
                  {"draft_depth", std::to_string(draft_depth)},
+                 {"minimum_draft_depth",
+                  std::to_string(minimum_draft_depth)},
+                 {"maximum_draft_depth",
+                  std::to_string(maximum_draft_depth)},
+                 {"depth_policy",
+                  dynamic_depth ? "dynamic" : "fixed_width"},
+                 {"sampling_mode",
+                  deviceGenerationSamplingModeName(sampling_mode)},
                  {"fragments", std::to_string(expected_fragment_count)},
                  {"conditional_fragments",
                   std::to_string(conditional_fragment_count)},
@@ -16185,9 +16343,33 @@ namespace llaminar2
             .healthy_index = kDeviceGenerationControlOk,
             .complete_index = kDeviceGenerationControlRequestComplete,
         };
-        if (!loop.capture->buildDeviceControlledWhileLoop(
-                mtp_device_generation_loop_fragment_scratch_,
-                predicate) ||
+        const bool built =
+            dynamic_depth
+                ? loop.capture->buildDeviceControlledSwitchWhileLoop(
+                      mtp_device_generation_loop_branch_scratch_,
+                      predicate,
+                      DeviceControlledLoopSwitch{
+                          .control_rows_device =
+                              device_generation_storage_.control_device,
+                          .control_stride =
+                              device_generation_storage_.control_stride,
+                          .request_count = request_count,
+                          .healthy_index = kDeviceGenerationControlOk,
+                          .complete_index =
+                              kDeviceGenerationControlRequestComplete,
+                          .selector_index =
+                              kDeviceGenerationControlCurrentDraftDepth,
+                          .error_index =
+                              kDeviceGenerationControlErrorCode,
+                          .minimum_selector = minimum_draft_depth,
+                          .maximum_selector = maximum_draft_depth,
+                          .invalid_selector_error = static_cast<int>(
+                              DeviceGenerationError::InvalidDepthSelector),
+                      })
+                : loop.capture->buildDeviceControlledWhileLoop(
+                      mtp_device_generation_loop_fragment_scratch_,
+                      predicate);
+        if (!built ||
             !loop.capture->instantiate() ||
             !loop.capture->hasExecutable())
         {
@@ -16205,6 +16387,10 @@ namespace llaminar2
         loop.request_count = request_count;
         loop.draft_depth = draft_depth;
         loop.verifier_rows_per_request = verifier_rows_per_request;
+        loop.minimum_draft_depth = minimum_draft_depth;
+        loop.maximum_draft_depth = maximum_draft_depth;
+        loop.depth_policy_mode = static_cast<int>(depth_policy.mode);
+        loop.sampling_mode = sampling_mode;
         loop.fragment_count = expected_fragment_count;
         loop.conditional_fragment_count = conditional_fragment_count;
         loop.valid = true;
@@ -16219,6 +16405,14 @@ namespace llaminar2
             {{"backend", loop.capture->backendName()},
              {"requests", std::to_string(request_count)},
              {"draft_depth", std::to_string(draft_depth)},
+             {"minimum_draft_depth",
+              std::to_string(minimum_draft_depth)},
+             {"maximum_draft_depth",
+              std::to_string(maximum_draft_depth)},
+             {"depth_policy",
+              dynamic_depth ? "dynamic" : "fixed_width"},
+             {"sampling_mode",
+              deviceGenerationSamplingModeName(sampling_mode)},
              {"verifier_rows",
               std::to_string(verifier_rows_per_request)},
              {"physical_verifier_rows",
@@ -16229,7 +16423,10 @@ namespace llaminar2
              {"device_moe_maintenance",
               include_device_moe_maintenance ? "true" : "false"},
              {"workspace_generation", std::to_string(generation)},
-             {"execution", "native_device_controlled_while"}});
+             {"execution",
+              dynamic_depth
+                  ? "native_device_controlled_switch_while"
+                  : "native_device_controlled_while"}});
         return true;
     }
 
@@ -35706,32 +35903,46 @@ namespace llaminar2
                          << " cached_tokens=" << hit.cached_tokens
                          << " bytes=" << terminal_block.model_runtime_state_storage->size());
             }
-            if (!graph_builder_ ||
-                !graph_builder_->restorePrefixCacheRuntimeState(
+            if (!graph_builder_)
+            {
+                return fail("model runtime state restore has no graph builder");
+            }
+            const PrefixCacheRuntimeRestoreResult restore_result =
+                graph_builder_->restorePrefixCacheRuntimeState(
                     *terminal_block.model_runtime_state_storage,
-                    stream))
+                    stream);
+            if (!restore_result)
             {
                 return fail("model runtime state restore failed");
             }
             const bool device_rehydration_pending =
-                graph_builder_->
-                    prefixCacheRuntimeStateRequiresDeviceRehydration();
+                restore_result.device_rehydration_required;
+            const bool placement_changed =
+                restore_result.placement_effect ==
+                PrefixCacheRuntimePlacementEffect::Changed;
             LOG_INFO("[DeviceGraphOrchestrator] Adopted prefix-runtime restore "
                      "transaction"
                      << " device=" << state_.device_id.toString()
                      << " cached_tokens=" << hit.cached_tokens
+                     << " placement_effect="
+                     << (placement_changed ? "changed" : "unchanged")
                      << " device_payload_rehydration="
                      << (device_rehydration_pending
                              ? "pending"
                              : "not_required"));
-            ++moe_runtime_movement_epoch_;
+            if (placement_changed)
+                ++moe_runtime_movement_epoch_;
             PerfStatsCollector::addCounter(
                 "prefix_cache",
                 "model_runtime_state_restores",
                 1.0,
                 "prefix_cache",
                 state_.device_id.toString(),
-                {{"cached_tokens", std::to_string(hit.cached_tokens)}});
+                {{"cached_tokens", std::to_string(hit.cached_tokens)},
+                 {"placement_effect",
+                  placement_changed ? "changed" : "unchanged"},
+                 {"device_payload_rehydration",
+                  device_rehydration_pending ? "required" : "not_required"}});
         }
 
         for (const auto &handle : restore_blocks)
@@ -39742,10 +39953,12 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(
         int request_count,
-        int draft_depth)
+        int draft_depth,
+        DeviceGenerationSamplingMode sampling_mode)
     {
         if (!state_.device_id.is_gpu() || request_count <= 0 ||
             draft_depth <= 0 ||
+            !isValidDeviceGenerationSamplingMode(sampling_mode) ||
             device_generation_storage_.active_request_count != request_count ||
             !device_generation_storage_.validFor(request_count) ||
             !device_generation_state_ready_.valid ||
@@ -39757,6 +39970,8 @@ namespace llaminar2
                       << " active_requests="
                       << device_generation_storage_.active_request_count
                       << " draft_depth=" << draft_depth
+                      << " sampling_mode="
+                      << deviceGenerationSamplingModeName(sampling_mode)
                       << " controller_ready="
                       << device_generation_state_ready_.valid);
             return false;
@@ -39785,6 +40000,7 @@ namespace llaminar2
         if (!materializeMTPDeviceGenerationLoopGraph(
                 request_count,
                 draft_depth,
+                sampling_mode,
                 &error))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation failed: "
@@ -39872,13 +40088,20 @@ namespace llaminar2
             1.0,
             "decode",
             state_.device_id.toString(),
-            {{"backend", loop.capture->backendName()},
-             {"requests", std::to_string(request_count)},
-             {"draft_depth", std::to_string(loop.draft_depth)},
-             {"fragments", std::to_string(loop.fragment_count)},
-             {"conditional_fragments",
-              std::to_string(loop.conditional_fragment_count)},
-             {"execution", "single_async_native_while_launch"}});
+             {{"backend", loop.capture->backendName()},
+              {"requests", std::to_string(request_count)},
+              {"draft_depth", std::to_string(loop.draft_depth)},
+              {"minimum_draft_depth",
+               std::to_string(loop.minimum_draft_depth)},
+              {"maximum_draft_depth",
+               std::to_string(loop.maximum_draft_depth)},
+              {"fragments", std::to_string(loop.fragment_count)},
+              {"conditional_fragments",
+               std::to_string(loop.conditional_fragment_count)},
+              {"execution",
+               loop.minimum_draft_depth != loop.maximum_draft_depth
+                   ? "single_async_native_switch_while_launch"
+                   : "single_async_native_while_launch"}});
         return true;
     }
 
@@ -39990,6 +40213,12 @@ namespace llaminar2
         int total_rejected_transactions = 0;
         int total_consumed_verifier_rows = 0;
         int total_published_state_commits = 0;
+        int total_attempted_draft_tokens = 0;
+        int total_verifier_tokens = 0;
+        int total_depth_evaluated_windows = 0;
+        int total_depth_updates = 0;
+        int total_depth_promotions = 0;
+        int total_depth_demotions = 0;
         for (int request_index = 0;
              request_index < request_count;
              ++request_index)
@@ -40027,8 +40256,37 @@ namespace llaminar2
             const int published_state_commits =
                 control[
                     kDeviceGenerationControlPublishedStateCommitCount];
+            const int attempted_draft_tokens =
+                control[
+                    kDeviceGenerationControlAttemptedDraftTokenCount];
+            const int verifier_tokens =
+                control[kDeviceGenerationControlVerifierTokenCount];
+            const int final_draft_depth =
+                control[kDeviceGenerationControlCurrentDraftDepth];
+            const int minimum_draft_depth =
+                control[kDeviceGenerationControlMinimumDraftDepth];
+            const int maximum_draft_depth =
+                control[kDeviceGenerationControlMaximumDraftDepth];
+            const int depth_policy_mode =
+                control[kDeviceGenerationControlDepthPolicyMode];
+            const int depth_evaluated_windows =
+                control[kDeviceGenerationControlDepthEvaluatedWindows];
+            const int depth_updates =
+                control[kDeviceGenerationControlDepthUpdates];
+            const int depth_promotions =
+                control[kDeviceGenerationControlDepthPromotions];
+            const int depth_demotions =
+                control[kDeviceGenerationControlDepthDemotions];
             const int error_code =
                 control[kDeviceGenerationControlErrorCode];
+
+            const bool recognized_depth_policy =
+                depth_policy_mode ==
+                    static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) ||
+                depth_policy_mode ==
+                    static_cast<int>(DeviceGenerationDepthPolicyMode::Observe) ||
+                depth_policy_mode ==
+                    static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic);
 
             const bool valid_control =
                 control[kDeviceGenerationControlOk] == 1 &&
@@ -40049,7 +40307,26 @@ namespace llaminar2
                 rejected_count <= transaction_count &&
                 consumed_rows >= accepted_count &&
                 published_state_commits >= 0 &&
-                published_state_commits <= response_count + 1;
+                published_state_commits <= response_count + 1 &&
+                recognized_depth_policy && minimum_draft_depth > 0 &&
+                maximum_draft_depth >= minimum_draft_depth &&
+                final_draft_depth >= minimum_draft_depth &&
+                final_draft_depth <= maximum_draft_depth &&
+                attempted_draft_tokens >=
+                    transaction_count * minimum_draft_depth &&
+                attempted_draft_tokens <=
+                    transaction_count * maximum_draft_depth &&
+                verifier_tokens ==
+                    attempted_draft_tokens + transaction_count &&
+                depth_evaluated_windows >= 0 && depth_updates >= 0 &&
+                depth_updates <= depth_evaluated_windows &&
+                depth_promotions >= 0 &&
+                depth_demotions >= 0 &&
+                depth_updates == depth_promotions + depth_demotions &&
+                (depth_policy_mode ==
+                         static_cast<int>(
+                             DeviceGenerationDepthPolicyMode::Dynamic) ||
+                 depth_updates == 0);
             if (!valid_control)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation controller is invalid"
@@ -40068,7 +40345,18 @@ namespace llaminar2
                           << " accepted=" << accepted_count
                           << " rejected=" << rejected_count
                           << " consumed_rows=" << consumed_rows
-                          << " state_commits=" << published_state_commits);
+                          << " state_commits=" << published_state_commits
+                          << " attempted_drafts=" << attempted_draft_tokens
+                          << " verifier_tokens=" << verifier_tokens
+                          << " final_depth=" << final_draft_depth
+                          << " depth_range=[" << minimum_draft_depth << ','
+                          << maximum_draft_depth << ']'
+                          << " depth_policy=" << depth_policy_mode
+                          << " evaluated_windows="
+                          << depth_evaluated_windows
+                          << " depth_updates=" << depth_updates
+                          << " promotions=" << depth_promotions
+                          << " demotions=" << depth_demotions);
                 return false;
             }
 
@@ -40082,6 +40370,15 @@ namespace llaminar2
             request_result.consumed_verifier_row_count = consumed_rows;
             request_result.published_state_commit_count =
                 published_state_commits;
+            request_result.attempted_draft_token_count =
+                attempted_draft_tokens;
+            request_result.verifier_token_count = verifier_tokens;
+            request_result.final_draft_depth = final_draft_depth;
+            request_result.depth_evaluated_window_count =
+                depth_evaluated_windows;
+            request_result.depth_update_count = depth_updates;
+            request_result.depth_promotion_count = depth_promotions;
+            request_result.depth_demotion_count = depth_demotions;
             request_result.tokens.reserve(
                 static_cast<size_t>(response_count));
             const int32_t *const response_row =
@@ -40110,6 +40407,12 @@ namespace llaminar2
             total_rejected_transactions += rejected_count;
             total_consumed_verifier_rows += consumed_rows;
             total_published_state_commits += published_state_commits;
+            total_attempted_draft_tokens += attempted_draft_tokens;
+            total_verifier_tokens += verifier_tokens;
+            total_depth_evaluated_windows += depth_evaluated_windows;
+            total_depth_updates += depth_updates;
+            total_depth_promotions += depth_promotions;
+            total_depth_demotions += depth_demotions;
             parsed.requests.push_back(std::move(request_result));
         }
 
@@ -40168,6 +40471,29 @@ namespace llaminar2
             "decode",
             state_.device_id.toString(),
             terminal_multiplier_tags);
+        /*
+         * A native parent transaction is committed only after
+         * append_speculative_outcome_to_device_generation() consumes one valid
+         * compact reducer row.  Publish that causal identity explicitly.  The
+         * ordinary per-launch GPU timing event is intentionally not observed by
+         * the host inside a captured WHILE replay, so the terminal device ledger
+         * is the authoritative execution proof for this path.
+         */
+        PerfStatsCollector::Tags compact_reducer_tags =
+            terminal_multiplier_tags;
+        compact_reducer_tags.emplace(
+            "source",
+            "captured_stochastic_compact_outcome");
+        compact_reducer_tags.emplace(
+            "execution",
+            "native_device_generation_parent");
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_compact_outcome_reductions",
+            static_cast<double>(total_transactions),
+            "decode",
+            state_.device_id.toString(),
+            compact_reducer_tags);
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_terminal_accepted_speculative_tokens",
@@ -40193,6 +40519,48 @@ namespace llaminar2
             "mtp",
             "device_generation_terminal_published_state_commits",
             static_cast<double>(total_published_state_commits),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_attempted_draft_tokens",
+            static_cast<double>(total_attempted_draft_tokens),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_verifier_tokens",
+            static_cast<double>(total_verifier_tokens),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_depth_evaluated_windows",
+            static_cast<double>(total_depth_evaluated_windows),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_depth_updates",
+            static_cast<double>(total_depth_updates),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_depth_promotions",
+            static_cast<double>(total_depth_promotions),
+            "decode",
+            state_.device_id.toString(),
+            terminal_multiplier_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_terminal_depth_demotions",
+            static_cast<double>(total_depth_demotions),
             "decode",
             state_.device_id.toString(),
             terminal_multiplier_tags);

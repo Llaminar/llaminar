@@ -1060,7 +1060,7 @@ namespace
          */
         if (test_case.moe_rebalance->mode == MoERebalanceRuntimeMode::LLEP)
         {
-            expectLLEPAppliedPrefillMovementPositive(
+            expectLLEPPrefillWorkRedistributionPositive(
                 records,
                 test_case.name + " lifecycle stress");
             expectPerfCounterPositive(

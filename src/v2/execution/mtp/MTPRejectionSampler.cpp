@@ -839,6 +839,29 @@ namespace llaminar2
             return stochasticOutcomeFailure(
                 "device stochastic verifier sampled terminal token is invalid");
         }
+        if (device_outcome.all_speculative_accepted &&
+            !device_outcome.stopped_on_output &&
+            (device_outcome.commit_boundary_clipped ||
+             !device_outcome.sampled_terminal ||
+             device_outcome.ready_token < 0 ||
+             device_outcome.rejected_verified_token >= 0 ||
+             device_outcome.consumed_verifier_rows <= 0 ||
+             device_outcome.output_token_count !=
+                 device_outcome.consumed_verifier_rows + 1 ||
+             device_outcome.accepted_speculative_prefix !=
+                 device_outcome.consumed_verifier_rows ||
+             device_outcome.target_verifier_state_commit_count !=
+                 device_outcome.consumed_verifier_rows + 1))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier all-accepted active-width outcome is inconsistent");
+        }
+        if (!device_outcome.all_speculative_accepted &&
+            device_outcome.sampled_terminal)
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier non-terminal outcome sampled a terminal ready token");
+        }
         if (device_outcome.commit_boundary_clipped &&
             (device_outcome.ready_token < 0 ||
              device_outcome.sampled_terminal ||

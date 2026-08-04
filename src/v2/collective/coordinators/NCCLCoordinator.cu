@@ -16,6 +16,7 @@
  */
 
 #include "NCCLCoordinator.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
 #include <cuda_runtime.h>
@@ -62,14 +63,14 @@ namespace llaminar2
          */
         bool installNCCLGraphOrderingPolicy(std::string &error)
         {
-            const char *configured =
-                std::getenv(kNCCLGraphMixingEnvironment);
-            if (configured && std::strcmp(configured, "0") != 0)
+            const auto &configured =
+                debugEnv().runtime_debug.nccl_graph_mixing_support;
+            if (configured && *configured != "0")
             {
                 error = std::string(kNCCLGraphMixingEnvironment) +
                         " must be 0 because Llaminar owns communicator "
                         "ordering and CUDA conditional graphs forbid NCCL's "
-                        "mixing event nodes; received '" + configured + "'";
+                        "mixing event nodes; received '" + *configured + "'";
                 return false;
             }
 

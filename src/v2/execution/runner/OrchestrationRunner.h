@@ -533,6 +533,33 @@ namespace llaminar2
             int committed_rows,
             const char *source);
         /**
+         * @brief Run and surface one complete native device-generation parent.
+         *
+         * The externally orchestrated first transaction has already published
+         * its compact outcome and accepted state. This method composes the
+         * sampling-specific parent, launches it once, consumes one terminal
+         * ledger, and updates host-visible response/statistics only after the
+         * request is complete. No per-transaction outcome or controller state
+         * crosses this boundary.
+         *
+         * @param publication_request First committed transaction and exact
+         *        controller-owned verifier geometry.
+         * @param sampling_mode Greedy or stochastic parent topology.
+         * @param transaction_base_cached_tokens Scheduler position at entry.
+         * @param requested_draft_depth Device-selected first-transaction depth.
+         * @param capture_draft_depth Physical child-family capacity materialized
+         *        by the first transaction.
+         * @param result Current decode result to complete with terminal tokens.
+         * @return Completed result, or an error suitable for atomic rollback.
+         */
+        GenerationResult completeNativeDeviceGenerationParent(
+            const DeviceSpeculativePublicationRequest &publication_request,
+            DeviceGenerationSamplingMode sampling_mode,
+            int transaction_base_cached_tokens,
+            int requested_draft_depth,
+            int capture_draft_depth,
+            GenerationResult result);
+        /**
          * @brief Publish device MoE maintenance before launching a future MTP consumer.
          *
          * Accepted-state publication and the next speculative sidecar use
@@ -822,6 +849,15 @@ namespace llaminar2
          * has initialized and event-published its resident controller.
          */
         bool device_generation_admission_pending_{false};
+        /**
+         * @brief Whether the terminal GPU ledger owns reported adaptive depth.
+         *
+         * Native generation does not advance the dormant host depth controller.
+         * Once its single terminal bridge succeeds, diagnostics must read the
+         * final selector and counters copied from that ledger rather than
+         * reviving the host controller as a second authority.
+         */
+        bool device_generation_terminal_ledger_authoritative_{false};
         /**
          * @brief Per-request state initialized by prefillBatch().
          *

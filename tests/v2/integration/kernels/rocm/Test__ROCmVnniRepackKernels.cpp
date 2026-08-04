@@ -1,5 +1,5 @@
 /**
- * @file Test__VnniRepackKernels.cpp
+ * @file Test__ROCmVnniRepackKernels.cpp
  * @brief Parity tests for GPU VNNI repack kernels vs CPU reference
  *
  * Creates synthetic GGUF blocks with known values, packs them via both
@@ -1002,6 +1002,10 @@ inline bool fp16_approx_equal(uint16_t a, uint16_t b) {
 
 class Test__VnniRepackKernels : public ::testing::Test {
 protected:
+#ifdef HAVE_ROCM
+    hipStream_t hip_stream_ = nullptr;
+#endif
+
     void SetUp() override {
 #ifdef HAVE_ROCM
         int count = 0;
@@ -1009,9 +1013,29 @@ protected:
         if (err != hipSuccess || count == 0) {
             GTEST_SKIP() << "No ROCm devices available";
         }
-        (void)hipSetDevice(0);
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&hip_stream_, hipStreamNonBlocking),
+            hipSuccess);
 #else
         GTEST_SKIP() << "HAVE_ROCM not defined";
+#endif
+    }
+
+    void TearDown() override {
+#ifdef HAVE_ROCM
+        if (hip_stream_ != nullptr) {
+            EXPECT_EQ(hipStreamDestroy(hip_stream_), hipSuccess);
+            hip_stream_ = nullptr;
+        }
+#endif
+    }
+
+    void* producerStream() const {
+#ifdef HAVE_ROCM
+        return reinterpret_cast<void*>(hip_stream_);
+#else
+        return nullptr;
 #endif
     }
 };
@@ -1090,9 +1114,9 @@ TEST_F(Test__VnniRepackKernels, Q4_0_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q4_0, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     // Download and compare
     std::vector<uint8_t> gpu_payload;
@@ -1138,9 +1162,9 @@ TEST_F(Test__VnniRepackKernels, IQ4_NL_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ4_NL, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1184,9 +1208,9 @@ TEST_F(Test__VnniRepackKernels, Q4_K_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q4_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1263,9 +1287,9 @@ TEST_F(Test__VnniRepackKernels, Q4_K_LargerDimensions) {
 
     bool ok = launchVnniRepack(RepackFormat::Q4_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1321,9 +1345,9 @@ TEST_F(Test__VnniRepackKernels, Q4_1_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q4_1, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     // Download and compare
     std::vector<uint8_t> gpu_payload;
@@ -1373,9 +1397,9 @@ TEST_F(Test__VnniRepackKernels, Q5_0_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q5_0, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     // Download and compare
     std::vector<uint8_t> gpu_payload;
@@ -1422,9 +1446,9 @@ TEST_F(Test__VnniRepackKernels, Q5_1_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q5_1, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     // Download and compare
     std::vector<uint8_t> gpu_payload;
@@ -1476,9 +1500,9 @@ TEST_F(Test__VnniRepackKernels, Q5_K_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q5_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1552,9 +1576,9 @@ TEST_F(Test__VnniRepackKernels, Q6_K_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q6_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1628,9 +1652,9 @@ TEST_F(Test__VnniRepackKernels, Q3_K_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q3_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1706,9 +1730,9 @@ TEST_F(Test__VnniRepackKernels, Q2_K_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::Q2_K, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               d_emins.ptr, N, K, nullptr);
+                               d_emins.ptr, N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1798,9 +1822,9 @@ TEST_F(Test__VnniRepackKernels, IQ4_XS_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ4_XS, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1852,9 +1876,9 @@ TEST_F(Test__VnniRepackKernels, IQ3_S_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ3_S, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1906,9 +1930,9 @@ TEST_F(Test__VnniRepackKernels, IQ3_XXS_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ3_XXS, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -1962,9 +1986,9 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ2_S, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -2032,9 +2056,9 @@ TEST_F(Test__VnniRepackKernels, IQ2_XS_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ2_XS, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -2100,9 +2124,9 @@ TEST_F(Test__VnniRepackKernels, IQ2_XXS_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ2_XXS, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, nullptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -2156,9 +2180,9 @@ TEST_F(Test__VnniRepackKernels, IQ1_S_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ1_S, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -2226,9 +2250,9 @@ TEST_F(Test__VnniRepackKernels, IQ1_M_Parity) {
 
     bool ok = launchVnniRepack(RepackFormat::IQ1_M, d_blocks.ptr,
                                d_payload.ptr, d_scales.ptr, d_mins.ptr,
-                               N, K, nullptr);
+                               N, K, producerStream());
     ASSERT_TRUE(ok);
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
     std::vector<uint16_t> gpu_scales;
@@ -2276,7 +2300,7 @@ TEST_F(Test__VnniRepackKernels, InvalidFormatReturnsFalse) {
     // Use an unrecognized format value (cast from an unused enum value)
     auto bad_format = static_cast<RepackFormat>(255);
     bool ok = launchVnniRepack(bad_format, nullptr, nullptr, nullptr, nullptr,
-                               1, 32, nullptr);
+                               1, 32, producerStream());
     EXPECT_FALSE(ok);
 #endif
 }

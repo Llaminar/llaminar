@@ -4653,8 +4653,57 @@ namespace
             ++device_generation_admission_count_;
             last_device_generation_request_count_ = request_count;
             last_device_generation_max_new_tokens_ = max_new_tokens;
+            device_generation_materialized_ = false;
+            device_generation_launched_ = false;
             device_generation_lifecycle_events_.push_back("admission");
             return request_count > 0 && max_new_tokens > 0;
+        }
+
+        /**
+         * @brief Model native parent composition without executing GPU work.
+         *
+         * The mock accepts this operation only when a focused test has supplied
+         * a complete terminal ledger. This keeps ordinary unit tests on their
+         * transaction-by-transaction inspection path while allowing the native
+         * lifecycle regression to prove typed sampling identity and the absence
+         * of an intermediate host outcome bridge.
+         */
+        bool materializeDeviceResidentGeneration(
+            int request_count,
+            int draft_depth,
+            DeviceGenerationSamplingMode sampling_mode) override
+        {
+            ++device_generation_materialization_count_;
+            last_device_generation_draft_depth_ = draft_depth;
+            last_device_generation_sampling_mode_ = sampling_mode;
+            device_generation_lifecycle_events_.push_back(
+                std::string("materialize:") +
+                deviceGenerationSamplingModeName(sampling_mode));
+            device_generation_materialized_ =
+                native_device_generation_enabled_ &&
+                request_count == last_device_generation_request_count_ &&
+                request_count == 1 && draft_depth > 0 &&
+                isValidDeviceGenerationSamplingMode(sampling_mode);
+            return device_generation_materialized_;
+        }
+
+        bool launchDeviceResidentGeneration() override
+        {
+            device_generation_lifecycle_events_.push_back("launch");
+            device_generation_launched_ = device_generation_materialized_;
+            return device_generation_launched_;
+        }
+
+        bool finishDeviceResidentGeneration(
+            DeviceGenerationTerminalResult *out_result) override
+        {
+            device_generation_lifecycle_events_.push_back("finish");
+            if (!out_result || !device_generation_launched_)
+                return false;
+            out_result->device = primary_device_;
+            out_result->requests = {native_device_generation_terminal_};
+            device_generation_launched_ = false;
+            return out_result->valid();
         }
 
         // =====================================================================
@@ -5613,6 +5662,24 @@ namespace
         {
             return device_generation_lifecycle_events_;
         }
+        void enableNativeDeviceGeneration(
+            DeviceGenerationTerminalRequestResult terminal)
+        {
+            native_device_generation_terminal_ = std::move(terminal);
+            native_device_generation_enabled_ = true;
+        }
+        int deviceGenerationMaterializationCount() const
+        {
+            return device_generation_materialization_count_;
+        }
+        int lastDeviceGenerationDraftDepth() const
+        {
+            return last_device_generation_draft_depth_;
+        }
+        DeviceGenerationSamplingMode lastDeviceGenerationSamplingMode() const
+        {
+            return last_device_generation_sampling_mode_;
+        }
 
     private:
         bool applyDeviceOwnedMTPPenaltyRowsMath(
@@ -6299,6 +6366,15 @@ namespace
         int device_generation_admission_count_{0};
         int last_device_generation_request_count_{0};
         int last_device_generation_max_new_tokens_{0};
+        int device_generation_materialization_count_{0};
+        int last_device_generation_draft_depth_{0};
+        DeviceGenerationSamplingMode last_device_generation_sampling_mode_{
+            DeviceGenerationSamplingMode::Greedy};
+        DeviceGenerationTerminalRequestResult
+            native_device_generation_terminal_{};
+        bool native_device_generation_enabled_{false};
+        bool device_generation_materialized_{false};
+        bool device_generation_launched_{false};
         int all_position_verifier_sync_deferral_set_count_{0};
         int all_position_verifier_sync_deferral_enable_count_{0};
         int all_position_verifier_sync_deferral_disable_count_{0};
@@ -12692,6 +12768,152 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    /**
+     * @brief Dynamic CUDA greedy generation has one resident depth authority.
+     *
+     * The historical failure initialized host and device adaptive controllers,
+     * then let the host choose draft-vector width while the captured greedy
+     * reducer read the device selector. Once the two windows diverged, a valid
+     * compact outcome could be wider than the host vector. This regression
+     * requires first-use maximum-width capture, a typed greedy native parent,
+     * one terminal ledger, and no per-transaction host outcome bridge.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           CUDADynamicGreedyUsesNativeParentAndNeverBridgesOutcomeToHost)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_cuda_dynamic_greedy_native_parent_unit.json";
+        ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+        PerfStatsCollector::reset();
+
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 2;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        depth_policy.promote_consecutive_windows = 1;
+        depth_policy.use_generated_policy = false;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({3});
+
+        const std::vector<int32_t> terminal_tokens{
+            MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+        };
+        mock->enableNativeDeviceGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = terminal_tokens,
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 3,
+                .accepted_speculative_token_count = 7,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 11,
+                .published_state_commit_count = 8,
+                .attempted_draft_token_count = 8,
+                .verifier_token_count = 11,
+                .final_draft_depth = 3,
+                .depth_evaluated_window_count = 2,
+                .depth_update_count = 1,
+                .depth_promotion_count = 1,
+                .depth_demotion_count = 0,
+            });
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        runner->setDecodeStepTokenBudget(
+            static_cast<int>(terminal_tokens.size()));
+        GenerationResult step = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_EQ(step.tokens, terminal_tokens);
+        EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 1);
+        EXPECT_EQ(mock->lastDeviceGenerationDraftDepth(), 3)
+            << "Dynamic capture must materialize the complete configured depth family.";
+        EXPECT_EQ(
+            mock->lastDeviceGenerationSamplingMode(),
+            DeviceGenerationSamplingMode::Greedy);
+        EXPECT_THAT(
+            mock->deviceGenerationLifecycleEvents(),
+            ElementsAre(
+                "admission",
+                "resident_verifier",
+                "materialize:greedy",
+                "launch",
+                "finish"));
+        EXPECT_THAT(
+            mock->publicationEvents(),
+            ElementsAre("device_outcome_publish"))
+            << "No compact outcome may cross to the host before terminal generation.";
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 8u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 3u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 11u);
+        EXPECT_EQ(probe.mtp_current_depth, 3);
+        EXPECT_EQ(probe.mtp_depth_policy_promotions, 1u);
+        EXPECT_EQ(
+            probe.mtp_request.last_depth_policy_reason,
+            "device_terminal_ledger")
+            << "Native generation diagnostics must not quote the dormant host "
+               "depth controller after the device terminal ledger becomes authoritative.";
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_NE(
+            findPerfRecordWithTags(
+                records,
+                PerfStatRecord::Kind::Counter,
+                "native_device_generation_requests",
+                {{"sampling", "greedy"}}),
+            nullptr);
+        EXPECT_NE(
+            findPerfRecordWithTags(
+                records,
+                PerfStatRecord::Kind::Counter,
+                "grouped_decode_equivalent_greedy_verifier_runs",
+                {{"execution", "native_device_generation_parent"}}),
+            nullptr);
+        EXPECT_EQ(
+            findPerfRecord(
+                records,
+                PerfStatRecord::Kind::Timer,
+                "grouped_outcome_greedy_device_outcome_host_bridge"),
+            nullptr);
+
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationStochasticReplaysResidualCorrection)
     {
         const std::filesystem::path export_path =
@@ -13228,7 +13450,7 @@ namespace
                                         {"accepted_mtp_draft_prefix", "3"},
                                         {"rejected_token_count", "0"},
                                         {"all_drafts_accepted", "true"},
-                                        {"draft_tokens", "device_deferred:4"},
+                                        {"draft_tokens", "device_deferred_capacity:4"},
                                         {"committed_output_tokens", "7,9,9,9"}});
             ASSERT_NE(spec_tx, nullptr);
         }

@@ -550,7 +550,7 @@ namespace
 
         runner->setSamplingParams(params);
 
-        // Expected: command tag + 4 float params
+        // Expected: command tag + the complete six-field sampling policy.
         ASSERT_EQ(mpi->broadcastCount(), 2u);
 
         // Command tag
@@ -558,14 +558,16 @@ namespace
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING));
 
-        // Params buffer (4 floats: temperature, top_p, top_k, seed)
+        // Params buffer: temperature, top_p, top_k, seed, and both penalties.
         const auto &data = mpi->broadcasts()[1];
         EXPECT_EQ(data.type, RecordingMPIContext::BroadcastRecord::Type::FLOAT);
-        ASSERT_EQ(data.float_data.size(), 4u);
+        ASSERT_EQ(data.float_data.size(), 6u);
         EXPECT_FLOAT_EQ(data.float_data[0], 0.7f);
         EXPECT_FLOAT_EQ(data.float_data[1], 0.9f);
         EXPECT_FLOAT_EQ(data.float_data[2], 40.0f);
         EXPECT_FLOAT_EQ(data.float_data[3], 42.0f);
+        EXPECT_FLOAT_EQ(data.float_data[4], 0.0f);
+        EXPECT_FLOAT_EQ(data.float_data[5], 0.0f);
     }
 
     // =========================================================================

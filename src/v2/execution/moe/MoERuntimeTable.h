@@ -198,6 +198,21 @@ namespace llaminar2
          * movement.
          */
         uint32_t current_batch_llep_movement_observed = 0;
+        /**
+         * @brief Sticky proof that current-batch LLEP consumed redistributed rows.
+         *
+         * The production current-batch assignment kernel sets this marker only
+         * after validating the transfer/apply publication and observing a
+         * non-empty assignment span whose destination differs from the expert's
+         * authoritative owner. It therefore covers the economical resident
+         * replica case where routed work moves but no expert payload needs to.
+         *
+         * Like @ref current_batch_llep_movement_observed, this is request-local
+         * device state. It is never restored from prefix-cache state and reaches
+         * PerfStats only through the existing stream-ordered maintenance status
+         * publication.
+         */
+        uint32_t current_batch_llep_non_owner_assignment_observed = 0;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
@@ -226,6 +241,10 @@ namespace llaminar2
         offsetof(DeviceMoELayerRuntime,
                  current_batch_llep_movement_observed) ==
         moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime,
+                 current_batch_llep_non_owner_assignment_observed) ==
+        moe_runtime_abi::kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
     /**
      * @brief Count active experts backed by graph-owned transient transfer slots.
@@ -378,6 +397,37 @@ namespace llaminar2
         std::vector<DeviceMoEPortableExpertRuntimeState> experts;
         std::vector<uint64_t> selected_histogram;
         std::vector<uint64_t> local_histogram;
+    };
+
+    /**
+     * @brief Semantic placement effect produced by a portable runtime restore.
+     *
+     * Histograms and runtime epochs are request history, not expert placement.
+     * A restore reports Changed only when ownership, participant residency,
+     * local-compute eligibility, replica role, or graph-facing placement flags
+     * differ from the live table's immutable model baseline.
+     */
+    enum class DeviceMoEPortablePlacementEffect : uint8_t
+    {
+        Unchanged,
+        Changed,
+    };
+
+    /**
+     * @brief Complete outcome of restoring pointer-free MoE runtime state.
+     *
+     * The result keeps archive validity, semantic placement mutation, and
+     * pending device payload work separate. Callers must not infer movement
+     * merely because histogram or epoch state was imported successfully.
+     */
+    struct DeviceMoEPortableRuntimeRestoreResult
+    {
+        bool restored = false;
+        DeviceMoEPortablePlacementEffect placement_effect =
+            DeviceMoEPortablePlacementEffect::Unchanged;
+        bool requires_device_payload_rehydration = false;
+
+        explicit constexpr operator bool() const noexcept { return restored; }
     };
 
     /**
@@ -616,9 +666,10 @@ namespace llaminar2
 
         bool capturePortableRuntimeState(std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
                                          void *stream = nullptr);
-        bool restorePortableRuntimeState(const std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
-                                         void *stream = nullptr,
-                                         const LocalPayloadDescriptorResolver &local_payload_resolver = {});
+        DeviceMoEPortableRuntimeRestoreResult restorePortableRuntimeState(
+            const std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
+            void *stream = nullptr,
+            const LocalPayloadDescriptorResolver &local_payload_resolver = {});
         void ensurePrefillRouteScratchCapacity(int token_capacity, void *stream = nullptr);
 
         const DeviceId &deviceId() const noexcept { return device_id_; }

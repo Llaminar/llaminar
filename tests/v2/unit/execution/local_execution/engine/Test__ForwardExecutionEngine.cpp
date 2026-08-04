@@ -22,6 +22,7 @@
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "memory/BufferArena.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
@@ -606,10 +607,16 @@ TEST(ForwardExecutionEngineSourceScan, WorkerGPUContextIsHostOwned)
 class Test__ForwardExecutionEngine : public ::testing::Test
 {
 protected:
+    BufferArena arena_;
     // Default executor — CPU, default config
     DeviceGraphExecutor executor_;
     // Mock CPU device context
     llaminar2::testing::MockDeviceContext mock_ctx_{DeviceId::cpu()};
+
+    void SetUp() override
+    {
+        executor_.setArena(&arena_);
+    }
 
     // Helper to create engine with default config (caching enabled, no PP)
     ForwardExecutionEngine makeEngine(bool cache_enabled = true)

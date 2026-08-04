@@ -14377,14 +14377,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 }
 
 /**
- * @brief Lock fixed-depth stochastic generation into one native device loop.
+ * @brief Lock both grouped sampling topologies into typed native device loops.
  *
  * The parent is valid only when every production fragment exports one strict
- * monolithic capture for the active request.  Depth D has D draft rows, D+1
- * verifier/bonus rows, and exactly 2D+6 ordered child graphs for static/LLEP.
- * Dynamic placement appends one device-gated maintenance transaction, making
- * 2D+7. Child replacement must retire prior parent identity, while an unchanged
- * child family remains reusable across request-content reset.
+ * monolithic capture for the active request. Depth D has D draft rows and D+1
+ * verifier/bonus rows. Greedy uses 2D+4 common fragments because its compact
+ * reducer is inside the verifier forward; stochastic adds exactly two child
+ * graphs for target-distribution preparation and serial rejection. Dynamic
+ * placement may append one device-gated maintenance transaction. Sampling mode
+ * and child replacement are cache identity, while unchanged parents remain
+ * reusable across request-content reset.
  */
 TEST(Test__GpuWorkspaceAllocationPolicy,
      DeviceGenerationParentOwnsTheCompleteOrderedTransaction)
@@ -14433,12 +14435,24 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             cuda_capture,
             "DeviceControlledFragmentAppendResult appendDeviceControlledFragment(",
             "#endif")));
-    const auto fixed_depth_runner_source = sliceBetween(
+    const auto native_parent_runner_source = sliceBetween(
         runner_source,
-        "if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed &&",
-        "Device publication derives next-condition rows into the");
-    const auto fixed_depth_runner = removeAsciiWhitespace(
-        stripCommentsAndStringLiterals(fixed_depth_runner_source));
+        "GenerationResult OrchestrationRunner::completeNativeDeviceGenerationParent(",
+        "GenerationResult OrchestrationRunner::decodeStepMTP()");
+    const auto native_parent_runner = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(native_parent_runner_source));
+    const auto native_parent_runner_text = removeAsciiWhitespace(
+        native_parent_runner_source);
+    const auto decode_step_source = sliceBetween(
+        runner_source,
+        "GenerationResult OrchestrationRunner::decodeStepMTP()",
+        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_step_text = removeAsciiWhitespace(decode_step_source);
+    const auto dynamic_parent_admission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            decode_step_source,
+            "const bool materialize_cuda_dynamic_parent_this_step =",
+            "if (!admitScalarDeviceResidentGeneration(")));
 
     EXPECT_NE(
         compact_header.find(
@@ -14446,6 +14460,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "The parent must retain exact capture, execution-policy, and "
            "device-predicate identities.";
+    EXPECT_NE(
+        compact_header.find(
+            "std::optional<DeviceGenerationSamplingMode>sampling_mode"),
+        std::string::npos)
+        << "Greedy and stochastic parent bodies must never share cache identity.";
     EXPECT_NE(composer.find("request_count!=1"), std::string::npos);
     EXPECT_NE(
         composer.find("verifier_rows_per_request=draft_depth+1"),
@@ -14459,7 +14478,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         composer.find("mtpVerifierPhysicalPaddedSeqLen("),
         std::string::npos);
     EXPECT_NE(
-        composer.find("expected_fragment_count=static_cast<size_t>(2*draft_depth+6)"),
+        composer.find("common_fragment_count=static_cast<size_t>(2*depth+4)"),
+        std::string::npos);
+    EXPECT_NE(
+        composer.find(
+            "sampling_mode==DeviceGenerationSamplingMode::Stochastic?2u:0u"),
         std::string::npos);
     EXPECT_NE(
         composer.find("include_device_moe_maintenance?1u:0u"),
@@ -14536,6 +14559,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "complete_index=kDeviceGenerationControlRequestComplete"),
         std::string::npos);
     EXPECT_NE(composer.find("source_identity_matches"), std::string::npos);
+    EXPECT_NE(
+        composer.find("loop.sampling_mode==sampling_mode"),
+        std::string::npos);
+    EXPECT_NE(
+        composer.find("loop.sampling_mode=sampling_mode"),
+        std::string::npos);
+    EXPECT_NE(
+        composer.find(
+            "mtpAllPositionVerifierDeviceLoopGraphTemplate(request_count,physical_verifier_rows_per_request,sampling_mode"),
+        std::string::npos)
+        << "The retained forward must authenticate the same sampling topology as its parent.";
 
     const std::array<const char *, 18> forbidden = {
         "cudaMalloc",
@@ -14600,11 +14634,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "The terminal bridge must consume one event published after the complete parent launch.";
 
-    const size_t first_maintenance = fixed_depth_runner.find(
+    const size_t first_maintenance = native_parent_runner.find(
         "publishDeviceMoEMaintenanceBeforeMTPConsumer(");
-    const size_t parent_prepare = fixed_depth_runner.find(
+    const size_t parent_prepare = native_parent_runner.find(
         "runner_->materializeDeviceResidentGeneration(");
-    const size_t parent_launch = fixed_depth_runner.find(
+    const size_t parent_launch = native_parent_runner.find(
         "runner_->launchDeviceResidentGeneration()");
     ASSERT_NE(first_maintenance, std::string::npos);
     ASSERT_NE(parent_prepare, std::string::npos);
@@ -14614,27 +14648,56 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(parent_prepare, parent_launch)
         << "Every participant must finish parent composition before any parent launch.";
     EXPECT_NE(
-        fixed_depth_runner.find(
+        native_parent_runner.find(
             "runner_->finishDeviceResidentGeneration(&terminal)"),
         std::string::npos);
     EXPECT_NE(
-        fixed_depth_runner_source.find(
-            "\"grouped_decode_equivalent_stochastic_verifier_runs\""),
+        native_parent_runner_text.find(
+            "grouped_decode_equivalent_stochastic_verifier_runs"),
+        std::string::npos);
+    EXPECT_NE(
+        native_parent_runner_text.find(
+            "grouped_decode_equivalent_greedy_verifier_runs"),
         std::string::npos)
         << "A reused native parent must publish transaction-derived grouped "
-           "verifier evidence because captured iterations do not re-enter "
+           "verifier evidence for both modes because captured iterations do not re-enter "
            "host instrumentation.";
     EXPECT_NE(
-        fixed_depth_runner.find(
+        native_parent_runner.find(
             "static_cast<double>(transactions)"),
         std::string::npos)
         << "Grouped verifier evidence must use the terminal device ledger's "
            "exact transaction count.";
     EXPECT_EQ(
-        fixed_depth_runner.find(
+        native_parent_runner.find(
             "materializeDeviceSpeculativeOutcomesForHostResponse("),
         std::string::npos)
-        << "Fixed-depth production generation must not enter the per-transaction compatibility bridge.";
+        << "Native production generation must not enter the per-transaction compatibility bridge.";
+
+    EXPECT_NE(
+        dynamic_parent_admission.find(
+            "use_grouped_outcome_device_resident_publication_verifier"),
+        std::string::npos);
+    EXPECT_NE(
+        dynamic_parent_admission.find("runner_->primaryDeviceId().is_cuda()"),
+        std::string::npos);
+    EXPECT_NE(
+        dynamic_parent_admission.find(
+            "mtp.depth_policy.mode==MTPDepthPolicyMode::Dynamic"),
+        std::string::npos);
+    EXPECT_EQ(
+        dynamic_parent_admission.find("stochastic_device_verify"),
+        std::string::npos)
+        << "Sampling mode must not retain a second host-owned dynamic controller.";
+
+    const size_t greedy_native_parent = decode_step_text.find(
+        "completeNativeDeviceGenerationParent(publication_request,DeviceGenerationSamplingMode::Greedy");
+    const size_t greedy_host_bridge = decode_step_text.find(
+        "grouped_outcome_greedy_device_outcome_host_bridge");
+    ASSERT_NE(greedy_native_parent, std::string::npos);
+    ASSERT_NE(greedy_host_bridge, std::string::npos);
+    EXPECT_LT(greedy_native_parent, greedy_host_bridge)
+        << "Dynamic greedy generation must return through the terminal ledger before the compatibility D2H bridge.";
 
     EXPECT_NE(
         conditional_builder.find(

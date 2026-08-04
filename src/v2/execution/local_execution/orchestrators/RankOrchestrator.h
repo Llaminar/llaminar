@@ -1004,7 +1004,8 @@ namespace llaminar2
             int max_new_tokens) override;
         bool materializeDeviceResidentGeneration(
             int request_count,
-            int draft_depth) override;
+            int draft_depth,
+            DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
         bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;

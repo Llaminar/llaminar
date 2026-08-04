@@ -1768,6 +1768,7 @@ namespace llaminar2
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
         mtp_stats_ = {};
+        device_generation_terminal_ledger_authoritative_ = false;
         ready_sampled_token_.reset();
         ready_sampled_params_.reset();
         ready_sampled_resident_state_.reset();
@@ -2333,6 +2334,7 @@ namespace llaminar2
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
         mtp_stats_ = {};
+        device_generation_terminal_ledger_authoritative_ = false;
         prefix_request_summary_ = {};
         ready_sampled_token_.reset();
         ready_sampled_params_.reset();
@@ -5294,6 +5296,299 @@ namespace llaminar2
         }
     }
 
+    GenerationResult OrchestrationRunner::completeNativeDeviceGenerationParent(
+        const DeviceSpeculativePublicationRequest &publication_request,
+        DeviceGenerationSamplingMode sampling_mode,
+        int transaction_base_cached_tokens,
+        int requested_draft_depth,
+        int capture_draft_depth,
+        GenerationResult result)
+    {
+        const auto fail = [&](const std::string &message) -> GenerationResult
+        {
+            result.error = message;
+            return result;
+        };
+        if (!isValidDeviceGenerationSamplingMode(sampling_mode) ||
+            !publication_request.valid() ||
+            !publication_request.outcome.device_generation_controller_owned)
+        {
+            return fail(
+                "Native MTP generation parent requires one valid controller-owned compact outcome and sampling topology");
+        }
+
+        const char *const sampling_name =
+            deviceGenerationSamplingModeName(sampling_mode);
+        const bool stochastic =
+            sampling_mode == DeviceGenerationSamplingMode::Stochastic;
+
+        /*
+         * The externally orchestrated transaction and every parent iteration
+         * share one exact tail lifecycle. Execute its maintenance boundary
+         * first; on first use this atomically captures the reusable maintenance
+         * child. Every rank participant must cross this boundary before any
+         * collective-bearing parent is launched.
+         */
+        if (!publishDeviceMoEMaintenanceBeforeMTPConsumer(
+                "native_device_generation_parent"))
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP could not publish first-transaction device maintenance");
+        }
+
+        const int parent_draft_depth =
+            publication_request.logicalVerifierRowsPerRequest() - 1;
+        if (parent_draft_depth <= 0 || capture_draft_depth <= 0 ||
+            parent_draft_depth != capture_draft_depth ||
+            !runner_->materializeDeviceResidentGeneration(
+                publication_request.requestCount(),
+                parent_draft_depth,
+                sampling_mode))
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP could not materialize its complete device-generation graph family");
+        }
+
+        if (!runner_->launchDeviceResidentGeneration())
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP could not launch its device-generation graph");
+        }
+
+        DeviceGenerationTerminalResult terminal;
+        if (!runner_->finishDeviceResidentGeneration(&terminal) ||
+            !terminal.valid() || terminal.requests.size() != 1u)
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP could not materialize one valid terminal device ledger");
+        }
+
+        const DeviceGenerationTerminalRequestResult &request_result =
+            terminal.requests.front();
+        const int response_count =
+            static_cast<int>(request_result.tokens.size());
+        if (response_count <= 0 ||
+            request_result.remaining_token_count < 0 ||
+            response_count + request_result.remaining_token_count !=
+                decode_step_token_budget_ ||
+            request_result.transaction_count <= 0 ||
+            request_result.published_state_commit_count < 0 ||
+            request_result.published_state_commit_count > response_count + 1)
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP terminal ledger disagrees with the admitted response/state budget");
+        }
+        if (!publishDecodeTransactionPlanningPositionAfterMTPCommit(
+                transaction_base_cached_tokens,
+                request_result.published_state_commit_count,
+                "native_device_generation_parent"))
+        {
+            return fail(
+                last_error_.empty()
+                    ? std::string("Native ") + sampling_name +
+                          " MTP could not publish its terminal scheduler position"
+                    : last_error_);
+        }
+
+        pending_mtp_condition_token_.reset();
+        pending_mtp_condition_params_.reset();
+        pending_mtp_condition_resident_state_.reset();
+        prelaunched_mtp_first_sidecar_resident_state_.reset();
+        prelaunched_mtp_first_sidecar_params_.reset();
+        prefill_logits_ready_ = false;
+        ready_sampled_token_.reset();
+        ready_sampled_params_.reset();
+        ready_sampled_resident_state_.reset();
+
+        for (const int32_t token : request_result.tokens)
+        {
+            sampler_.record_token(token);
+            result.tokens.push_back(token);
+        }
+        last_token_ = request_result.tokens.back();
+        result.is_complete = request_result.model_stopped;
+
+        const uint64_t transactions =
+            static_cast<uint64_t>(request_result.transaction_count);
+        const uint64_t accepted = static_cast<uint64_t>(
+            request_result.accepted_speculative_token_count);
+        const uint64_t rejected = static_cast<uint64_t>(
+            request_result.rejected_transaction_count);
+        const uint64_t consumed_rows = static_cast<uint64_t>(
+            request_result.consumed_verifier_row_count);
+        if (request_result.attempted_draft_token_count <= 0 ||
+            request_result.verifier_token_count <= 0 ||
+            request_result.verifier_token_count !=
+                request_result.attempted_draft_token_count +
+                    request_result.transaction_count ||
+            mtp_stats_.draft_steps <
+                static_cast<uint64_t>(capture_draft_depth))
+        {
+            return fail(
+                std::string("Native ") + sampling_name +
+                " MTP terminal depth ledger is internally inconsistent");
+        }
+
+        /*
+         * Dynamic first-use capture physically warms every capacity slot. Its
+         * host-side setup counter therefore describes graph construction, not
+         * selected work. Replace that setup width with the exact cumulative
+         * widths recorded by the sole device controller.
+         */
+        mtp_stats_.draft_steps -=
+            static_cast<uint64_t>(capture_draft_depth);
+        mtp_stats_.draft_steps += static_cast<uint64_t>(
+            request_result.attempted_draft_token_count);
+        mtp_stats_.verifier_runs += transactions;
+        mtp_stats_.verifier_token_count += static_cast<uint64_t>(
+            request_result.verifier_token_count);
+        mtp_stats_.accepted_tokens += accepted;
+        mtp_stats_.rejected_tokens += rejected;
+        if (stochastic)
+        {
+            mtp_stats_.rollbacks += rejected;
+            mtp_stats_.transaction_rollbacks += rejected;
+            mtp_stats_.stochastic_accept_tests += consumed_rows;
+            mtp_stats_.stochastic_accepts += accepted;
+            mtp_stats_.stochastic_residual_samples += rejected;
+        }
+        mtp_stats_.transaction_commits += transactions;
+        mtp_stats_.depth_policy_windows += static_cast<uint64_t>(
+            request_result.depth_evaluated_window_count);
+        mtp_stats_.depth_policy_updates += static_cast<uint64_t>(
+            request_result.depth_update_count);
+        mtp_stats_.depth_policy_promotions += static_cast<uint64_t>(
+            request_result.depth_promotion_count);
+        mtp_stats_.depth_policy_demotions += static_cast<uint64_t>(
+            request_result.depth_demotion_count);
+        mtp_stats_.current_depth = request_result.final_draft_depth;
+
+        const PerfStatsCollector::Tags terminal_tags{
+            {"path", "native_device_generation_parent"},
+            {"sampling", sampling_name},
+            {"depth", std::to_string(requested_draft_depth)},
+            {"capture_depth", std::to_string(capture_draft_depth)},
+            {"final_depth",
+             std::to_string(request_result.final_draft_depth)},
+            {"depth_evaluated_windows",
+             std::to_string(request_result.depth_evaluated_window_count)},
+            {"depth_updates",
+             std::to_string(request_result.depth_update_count)},
+            {"depth_promotions",
+             std::to_string(request_result.depth_promotion_count)},
+            {"depth_demotions",
+             std::to_string(request_result.depth_demotion_count)},
+            {"transactions",
+             std::to_string(request_result.transaction_count)},
+            {"state_commits",
+             std::to_string(request_result.published_state_commit_count)}};
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "native_device_generation_requests",
+            1.0,
+            "decode",
+            {},
+            terminal_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "output_tokens",
+            static_cast<double>(response_count),
+            "decode",
+            {},
+            terminal_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_runs",
+            static_cast<double>(transactions),
+            "decode",
+            {},
+            terminal_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_tokens",
+            static_cast<double>(request_result.verifier_token_count),
+            "decode",
+            {},
+            terminal_tags);
+
+        const std::string grouped_route_counter =
+            stochastic
+                ? "grouped_decode_equivalent_stochastic_verifier_runs"
+                : "grouped_decode_equivalent_greedy_verifier_runs";
+        const std::string verifier_path =
+            stochastic
+                ? "grouped_decode_equivalent_stochastic"
+                : "grouped_decode_equivalent_greedy";
+        PerfStatsCollector::addCounter(
+            "mtp",
+            grouped_route_counter,
+            static_cast<double>(transactions),
+            "decode",
+            {},
+            {{"execution", "native_device_generation_parent"},
+             {"sampling", sampling_name},
+             {"verifier_forward_tokens",
+              std::to_string(request_result.verifier_token_count)},
+             {"verifier_rows",
+              std::to_string(
+                  publication_request.logicalVerifierRowsPerRequest())},
+             {"replay_forward_tokens", "0"},
+             {"accepted_tokens", std::to_string(accepted)},
+             {"state_publication", "device_resident"}});
+
+        if (stochastic)
+        {
+            PerfStatsCollector::Tags stochastic_tags = terminal_tags;
+            stochastic_tags.emplace("device_resident", "true");
+            stochastic_tags.emplace("verifier_path", verifier_path);
+            stochastic_tags.emplace(
+                "implementation",
+                "native_device_generation_parent_terminal_ledger");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "stochastic_accept_tests",
+                static_cast<double>(consumed_rows),
+                "decode",
+                {},
+                stochastic_tags);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "stochastic_accepts",
+                static_cast<double>(accepted),
+                "decode",
+                {},
+                stochastic_tags);
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "depth_policy_windows",
+            static_cast<double>(request_result.depth_evaluated_window_count),
+            "decode",
+            {},
+            terminal_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "accepted_tokens",
+            static_cast<double>(accepted),
+            "decode",
+            {},
+            terminal_tags);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rejected_tokens",
+            static_cast<double>(rejected),
+            "decode",
+            {},
+            terminal_tags);
+        device_generation_terminal_ledger_authoritative_ = true;
+        return result;
+    }
+
     GenerationResult OrchestrationRunner::decodeStepMTP()
     {
         PerfStatsCollector::ScopedTimer step_timer("mtp", "decode_step_total", "decode");
@@ -5668,6 +5963,19 @@ namespace llaminar2
             return fail_without_checkpoint(
                 "Grouped decode-equivalent MTP verifier has no grouped publication path; GPU grouped verifier requires device-resident accepted-state publication");
         }
+        /*
+         * CUDA dynamic generation materializes one policy-complete parent from
+         * the first transaction for both compact outcome topologies. Preserve
+         * this admission edge explicitly: after beginDeviceResidentGeneration()
+         * succeeds, the pending flag is consumed and can no longer distinguish
+         * capture warmup from ordinary replay. Sampling mode is graph identity,
+         * not a reason to retain a second host-owned controller loop.
+         */
+        const bool materialize_cuda_dynamic_parent_this_step =
+            device_generation_admission_pending_ &&
+            use_grouped_outcome_device_resident_publication_verifier &&
+            runner_->primaryDeviceId().is_cuda() &&
+            mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         if (!admitScalarDeviceResidentGeneration(
                 use_grouped_outcome_device_resident_publication_verifier))
         {
@@ -6212,6 +6520,91 @@ namespace llaminar2
             return std::nullopt;
         };
 
+        auto inspect_spec_decode_metadata = [&](
+                                                    const char *path,
+                                                    const std::string &implementation,
+                                                    const MTPSpecDecodeMetadataBatch &metadata,
+                                                    bool stopped_on_output,
+                                                    const std::string &draft_token_description,
+                                                    const std::vector<int32_t> &committed_output_tokens)
+            -> std::optional<std::string>
+        {
+            if (!metadata.ok)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "spec_decode_transaction_metadata_failures",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"path", path},
+                     {"implementation", implementation},
+                     {"reason", metadata.error}});
+                return std::string("MTP spec-decode metadata failed on ") +
+                       path + ": " + metadata.error;
+            }
+            if (metadata.transactions.empty())
+                return std::string("MTP spec-decode metadata produced no transaction");
+
+            const MTPSpecDecodeTransaction &tx = metadata.transactions.front();
+            if (!tx.ok)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "spec_decode_transaction_metadata_failures",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"path", path},
+                     {"implementation", implementation},
+                     {"reason", tx.error}});
+                return std::string("MTP spec-decode transaction metadata failed on ") +
+                       path + ": " + tx.error;
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_decode_transaction_metadata",
+                1.0,
+                "decode",
+                {},
+                {{"path", path},
+                 {"implementation", implementation},
+                 {"target_query_len", std::to_string(tx.target_query_len)},
+                 {"metadata_total_target_query_tokens",
+                  std::to_string(metadata.total_target_query_tokens)},
+                 {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
+                 {"committed_output_count",
+                  std::to_string(metadata.committed_output_counts.front())},
+                 {"accepted_state_count",
+                  std::to_string(metadata.accepted_state_counts.front())},
+                 {"committed_state_row",
+                  std::to_string(metadata.committed_state_rows.front())},
+                 {"committed_state_index",
+                  std::to_string(metadata.committed_state_indices.front())},
+                 {"accepted_state_slot_index",
+                  std::to_string(metadata.accepted_state_slot_indices.front())},
+                 {"bonus_ready_token_row",
+                  std::to_string(metadata.bonus_ready_token_rows.front())},
+                 {"bonus_ready_token_index",
+                  std::to_string(metadata.bonus_ready_token_indices.front())},
+                 {"bonus_ready_state_slot_index",
+                  std::to_string(metadata.bonus_ready_state_slot_indices.front())},
+                 {"accepted_verifier_input_prefix",
+                  std::to_string(tx.accepted_speculative_prefix)},
+                 {"accepted_mtp_draft_prefix",
+                  std::to_string(std::max(0, tx.accepted_speculative_prefix - 1))},
+                 {"rejected_token_count", std::to_string(tx.rejected_token_count)},
+                 {"token_index_to_sample", std::to_string(tx.token_index_to_sample)},
+                 {"next_condition_token", std::to_string(tx.next_condition_token)},
+                 {"all_drafts_accepted", tx.allDraftsAccepted() ? "true" : "false"},
+                 {"stopped_on_output", stopped_on_output ? "true" : "false"},
+                 {"draft_tokens", draft_token_description},
+                 {"committed_output_tokens",
+                  join_tokens(committed_output_tokens)}});
+            return std::nullopt;
+        };
+
         auto validate_spec_decode_transaction = [&](
                                                         const char *path,
                                                         const std::string &implementation,
@@ -6280,79 +6673,13 @@ namespace llaminar2
                     catchup_request_for_tx,
                     catchup_result_for_tx);
             }
-            if (!metadata.ok)
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "spec_decode_transaction_metadata_failures",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"path", path},
-                     {"implementation", implementation},
-                     {"reason", metadata.error}});
-                return std::string("MTP spec-decode metadata batch failed on ") +
-                       path + ": " + metadata.error;
-            }
-            if (metadata.transactions.empty())
-                return std::string("MTP spec-decode metadata batch produced no transaction");
-
-            const MTPSpecDecodeTransaction &tx = metadata.transactions.front();
-            if (!tx.ok)
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "spec_decode_transaction_metadata_failures",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"path", path},
-                     {"implementation", implementation},
-                     {"reason", tx.error}});
-                return std::string("MTP spec-decode transaction metadata failed on ") +
-                       path + ": " + tx.error;
-            }
-
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "spec_decode_transaction_metadata",
-                1.0,
-                "decode",
-                {},
-                {{"path", path},
-                 {"implementation", implementation},
-                 {"target_query_len", std::to_string(tx.target_query_len)},
-                 {"metadata_total_target_query_tokens",
-                  std::to_string(metadata.total_target_query_tokens)},
-                 {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
-                 {"committed_output_count",
-                  std::to_string(metadata.committed_output_counts.front())},
-                 {"accepted_state_count",
-                  std::to_string(metadata.accepted_state_counts.front())},
-                 {"committed_state_row",
-                  std::to_string(metadata.committed_state_rows.front())},
-                 {"committed_state_index",
-                  std::to_string(metadata.committed_state_indices.front())},
-                 {"accepted_state_slot_index",
-                  std::to_string(metadata.accepted_state_slot_indices.front())},
-                 {"bonus_ready_token_row",
-                  std::to_string(metadata.bonus_ready_token_rows.front())},
-                 {"bonus_ready_token_index",
-                  std::to_string(metadata.bonus_ready_token_indices.front())},
-                 {"bonus_ready_state_slot_index",
-                  std::to_string(metadata.bonus_ready_state_slot_indices.front())},
-                 {"accepted_verifier_input_prefix",
-                  std::to_string(tx.accepted_speculative_prefix)},
-                 {"accepted_mtp_draft_prefix",
-                  std::to_string(std::max(0, tx.accepted_speculative_prefix - 1))},
-                 {"rejected_token_count", std::to_string(tx.rejected_token_count)},
-                 {"token_index_to_sample", std::to_string(tx.token_index_to_sample)},
-                 {"next_condition_token", std::to_string(tx.next_condition_token)},
-                 {"all_drafts_accepted", tx.allDraftsAccepted() ? "true" : "false"},
-                 {"stopped_on_output", stopped_on_output ? "true" : "false"},
-                 {"draft_tokens", join_tokens(draft_tokens_for_tx)},
-                 {"committed_output_tokens", join_tokens(committed_output_tokens)}});
-            return std::nullopt;
+            return inspect_spec_decode_metadata(
+                path,
+                implementation,
+                metadata,
+                stopped_on_output,
+                join_tokens(draft_tokens_for_tx),
+                committed_output_tokens);
         };
 
         auto validate_spec_decode_accepted_outcome = [&](
@@ -6380,69 +6707,14 @@ namespace llaminar2
                 buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(
                     metadata_shape,
                     outcome);
-            if (!metadata.ok)
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "spec_decode_transaction_metadata_failures",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"path", path},
-                     {"implementation", implementation},
-                     {"reason", metadata.error}});
-                return std::string("MTP spec-decode accepted-outcome metadata failed on ") +
-                       path + ": " + metadata.error;
-            }
-            if (metadata.transactions.empty())
-                return std::string("MTP spec-decode accepted-outcome metadata produced no transaction");
-
-            const MTPSpecDecodeTransaction &tx = metadata.transactions.front();
-            if (!tx.ok)
-                return std::string("MTP spec-decode accepted-outcome transaction is invalid: ") + tx.error;
-
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "spec_decode_transaction_metadata",
-                1.0,
-                "decode",
-                {},
-                {{"path", path},
-                 {"implementation", implementation},
-                 {"target_query_len", std::to_string(tx.target_query_len)},
-                 {"metadata_total_target_query_tokens",
-                  std::to_string(metadata.total_target_query_tokens)},
-                 {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
-                 {"committed_output_count",
-                  std::to_string(metadata.committed_output_counts.front())},
-                 {"accepted_state_count",
-                  std::to_string(metadata.accepted_state_counts.front())},
-                 {"committed_state_row",
-                  std::to_string(metadata.committed_state_rows.front())},
-                 {"committed_state_index",
-                  std::to_string(metadata.committed_state_indices.front())},
-                 {"accepted_state_slot_index",
-                  std::to_string(metadata.accepted_state_slot_indices.front())},
-                 {"bonus_ready_token_row",
-                  std::to_string(metadata.bonus_ready_token_rows.front())},
-                 {"bonus_ready_token_index",
-                  std::to_string(metadata.bonus_ready_token_indices.front())},
-                 {"bonus_ready_state_slot_index",
-                  std::to_string(metadata.bonus_ready_state_slot_indices.front())},
-                 {"accepted_verifier_input_prefix",
-                  std::to_string(tx.accepted_speculative_prefix)},
-                 {"accepted_mtp_draft_prefix",
-                  std::to_string(std::max(0, tx.accepted_speculative_prefix - 1))},
-                 {"rejected_token_count", std::to_string(tx.rejected_token_count)},
-                 {"token_index_to_sample", std::to_string(tx.token_index_to_sample)},
-                 {"next_condition_token", std::to_string(tx.next_condition_token)},
-                 {"all_drafts_accepted", tx.allDraftsAccepted() ? "true" : "false"},
-                 {"stopped_on_output", outcome.stopped_on_output ? "true" : "false"},
-                 {"draft_tokens", std::string("device_deferred:") +
-                                      std::to_string(outcome.draft_count)},
-                 {"committed_output_tokens",
-                  join_tokens(outcome.committed_output_tokens)}});
-            return std::nullopt;
+            return inspect_spec_decode_metadata(
+                path,
+                implementation,
+                metadata,
+                outcome.stopped_on_output,
+                std::string("device_deferred:") +
+                    std::to_string(outcome.draft_count),
+                outcome.committed_output_tokens);
         };
 
         const bool can_defer_main_decode_sync =
@@ -6662,15 +6934,38 @@ namespace llaminar2
         }
 
         const int requested_speculative_draft_count = currentMTPDraftDepth(mtp);
+        const int transaction_draft_capacity =
+            materialize_cuda_dynamic_parent_this_step
+                ? effectiveMTPMaxDraftDepth(mtp)
+                : requested_speculative_draft_count;
+        if (transaction_draft_capacity < requested_speculative_draft_count)
+        {
+            return fail_after_checkpoint(
+                "CUDA dynamic MTP parent capture capacity is narrower than its admitted device selector");
+        }
+        if (materialize_cuda_dynamic_parent_this_step)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "dynamic_device_generation_capacity_capture_transactions",
+                1.0,
+                "graph_setup",
+                {},
+                {{"selected_depth",
+                  std::to_string(requested_speculative_draft_count)},
+                 {"capture_depth",
+                  std::to_string(transaction_draft_capacity)},
+                 {"authority", "device_generation_controller"}});
+        }
         const int first_token_output_budget_cost =
             use_pending_condition_row ? 0 : 1;
         const int pre_sample_effective_draft_count =
             decode_step_token_budget_ > 0
                 ? std::min(
-                      requested_speculative_draft_count,
+                      transaction_draft_capacity,
                       std::max(0, decode_step_token_budget_ -
                                       first_token_output_budget_cost))
-                : requested_speculative_draft_count;
+                : transaction_draft_capacity;
         constexpr int32_t kDeferredMTPFirstTokenShadow = -3;
         const bool verifier_accepts_device_first_token =
             use_all_position_state_publication_verifier ||
@@ -7072,7 +7367,7 @@ namespace llaminar2
             return tokens;
         };
 
-        int speculative_draft_count = requested_speculative_draft_count;
+        int speculative_draft_count = transaction_draft_capacity;
         bool draft_count_budget_limited = false;
         if (decode_step_token_budget_ > 0)
         {
@@ -12149,251 +12444,32 @@ namespace llaminar2
                           publication_request.logicalVerifierRowsPerRequest())},
                      {"shifted_commits",
                       std::to_string(shifted_publication_commit_count)}});
-
                 /*
-                 * Fixed-depth stochastic generation is now one native GPU
-                 * graph launch. The first transaction above establishes and
-                 * captures every exact child binding; the parent consumes its
-                 * controller publication, repeats complete transactions until
-                 * the device-owned response budget is terminal, and exposes
-                 * only the final ledger. Dynamic depth remains a distinct
-                 * controller architecture because changing graph depth inside
-                 * this fixed child family would violate capture identity.
+                 * The first committed transaction has now made every child
+                 * capture replay-ready. Fixed stochastic policy and first-use
+                 * CUDA dynamic policy continue through the same typed native
+                 * parent; no per-transaction response bridge is reachable once
+                 * controller ownership is sealed.
                  */
-                if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed &&
+                const bool use_native_device_generation_parent =
+                    mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed ||
+                    materialize_cuda_dynamic_parent_this_step;
+                if (use_native_device_generation_parent &&
                     publication_request.outcome
                         .device_generation_controller_owned)
                 {
-                    /*
-                     * The externally orchestrated transaction and every parent
-                     * iteration share one exact tail lifecycle. Execute its
-                     * maintenance boundary first; on the first request this
-                     * atomically warms and captures the reusable maintenance
-                     * child, while later requests replay that same child. Only
-                     * after every rank participant has crossed this boundary may
-                     * the fixed parent clone all child executables.
-                     */
-                    if (!publishDeviceMoEMaintenanceBeforeMTPConsumer(
-                            "fixed_depth_device_generation_parent"))
-                    {
-                        return fail_after_checkpoint(
-                            "Fixed-depth stochastic MTP could not publish first-transaction device maintenance");
-                    }
-
-                    const int parent_draft_depth =
-                        publication_request.logicalVerifierRowsPerRequest() - 1;
-                    if (parent_draft_depth <= 0 ||
-                        !runner_
-                             ->materializeDeviceResidentGeneration(
-                                 publication_request.requestCount(),
-                                 parent_draft_depth))
-                    {
-                        return fail_after_checkpoint(
-                            "Fixed-depth stochastic MTP could not materialize its complete native device-generation graph family");
-                    }
-
-                    if (!runner_
-                             ->launchDeviceResidentGeneration())
-                    {
-                        return fail_after_checkpoint(
-                            "Fixed-depth stochastic MTP could not launch its native device-generation graph");
-                    }
-
-                    DeviceGenerationTerminalResult terminal;
-                    if (!runner_
-                             ->finishDeviceResidentGeneration(
-                                 &terminal) ||
-                        !terminal.valid() || terminal.requests.size() != 1u)
-                    {
-                        return fail_after_checkpoint(
-                            "Fixed-depth stochastic MTP could not materialize one valid terminal device ledger");
-                    }
-
-                    const DeviceGenerationTerminalRequestResult &request_result =
-                        terminal.requests.front();
-                    const int response_count =
-                        static_cast<int>(request_result.tokens.size());
-                    if (response_count <= 0 ||
-                        request_result.remaining_token_count < 0 ||
-                        response_count +
-                                request_result.remaining_token_count !=
-                            decode_step_token_budget_ ||
-                        request_result.transaction_count <= 0 ||
-                        request_result.published_state_commit_count < 0 ||
-                        request_result.published_state_commit_count >
-                            response_count + 1)
-                    {
-                        return fail_after_checkpoint(
-                            "Fixed-depth stochastic MTP terminal ledger disagrees with the admitted response/state budget");
-                    }
-                    if (!publishDecodeTransactionPlanningPositionAfterMTPCommit(
+                    GenerationResult native_result =
+                        completeNativeDeviceGenerationParent(
+                            publication_request,
+                            DeviceGenerationSamplingMode::Stochastic,
                             transaction_base_cached_tokens,
-                            request_result.published_state_commit_count,
-                            "native_device_generation_parent"))
-                    {
-                        return fail_after_checkpoint(
-                            last_error_.empty()
-                                ? "Fixed-depth stochastic MTP could not publish its terminal scheduler position"
-                                : last_error_);
-                    }
-
-                    pending_mtp_condition_token_.reset();
-                    pending_mtp_condition_params_.reset();
-                    pending_mtp_condition_resident_state_.reset();
-                    prelaunched_mtp_first_sidecar_resident_state_.reset();
-                    prelaunched_mtp_first_sidecar_params_.reset();
-                    prefill_logits_ready_ = false;
-                    ready_sampled_token_.reset();
-                    ready_sampled_params_.reset();
-                    ready_sampled_resident_state_.reset();
-
-                    for (const int32_t token : request_result.tokens)
-                    {
-                        sampler_.record_token(token);
-                        result.tokens.push_back(token);
-                    }
-                    last_token_ = request_result.tokens.back();
-                    result.is_complete = request_result.model_stopped;
-
-                    const uint64_t transactions =
-                        static_cast<uint64_t>(
-                            request_result.transaction_count);
-                    const uint64_t accepted =
-                        static_cast<uint64_t>(
-                            request_result
-                                .accepted_speculative_token_count);
-                    const uint64_t rejected =
-                        static_cast<uint64_t>(
-                            request_result.rejected_transaction_count);
-                    const uint64_t consumed_rows =
-                        static_cast<uint64_t>(
-                            request_result.consumed_verifier_row_count);
-                    const uint64_t additional_transactions =
-                        transactions > 0 ? transactions - 1u : 0u;
-                    mtp_stats_.draft_steps +=
-                        additional_transactions *
-                        static_cast<uint64_t>(
-                            requested_speculative_draft_count);
-                    mtp_stats_.verifier_runs += transactions;
-                    mtp_stats_.verifier_token_count +=
-                        transactions *
-                        static_cast<uint64_t>(
-                            publication_request.logicalVerifierRowsPerRequest());
-                    mtp_stats_.accepted_tokens += accepted;
-                    mtp_stats_.rejected_tokens += rejected;
-                    mtp_stats_.rollbacks += rejected;
-                    mtp_stats_.stochastic_accept_tests += consumed_rows;
-                    mtp_stats_.stochastic_accepts += accepted;
-                    mtp_stats_.stochastic_residual_samples += rejected;
-                    mtp_stats_.transaction_commits += transactions;
-                    mtp_stats_.transaction_rollbacks += rejected;
-
-                    const PerfStatsCollector::Tags terminal_tags{
-                        {"path", "native_device_generation_parent"},
-                        {"depth",
-                         std::to_string(
-                             requested_speculative_draft_count)},
-                        {"transactions",
-                         std::to_string(
-                             request_result.transaction_count)},
-                        {"state_commits",
-                         std::to_string(
-                             request_result
-                                 .published_state_commit_count)}};
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "native_device_generation_requests",
-                        1.0,
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "output_tokens",
-                        static_cast<double>(response_count),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "verifier_runs",
-                        static_cast<double>(transactions),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "verifier_tokens",
-                        static_cast<double>(
-                            transactions *
-                            static_cast<uint64_t>(
-                                publication_request
-                                    .logicalVerifierRowsPerRequest())),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    /*
-                     * Captured WHILE iterations do not re-enter the host
-                     * verifier orchestration that normally publishes this
-                     * route counter. The terminal controller ledger is the
-                     * authoritative execution record for the whole parent
-                     * launch, so publish the exact completed transaction count
-                     * here. This lets PerfStats prove that a reused parent ran
-                     * the grouped, decode-equivalent stochastic verifier; a
-                     * graph-cache hit must never make the production path
-                     * invisible to correctness gates.
-                     */
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "grouped_decode_equivalent_stochastic_verifier_runs",
-                        static_cast<double>(transactions),
-                        "decode",
-                        {},
-                        {{"execution", "native_device_generation_parent"},
-                         {"verifier_forward_tokens",
-                          std::to_string(
-                              transactions *
-                              static_cast<uint64_t>(
-                                  publication_request
-                                      .logicalVerifierRowsPerRequest()))},
-                         {"verifier_rows",
-                          std::to_string(
-                              publication_request
-                                  .logicalVerifierRowsPerRequest())},
-                         {"replay_forward_tokens", "0"},
-                         {"accepted_tokens", std::to_string(accepted)},
-                         {"state_publication", "device_resident"}});
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "stochastic_accept_tests",
-                        static_cast<double>(consumed_rows),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "stochastic_accepts",
-                        static_cast<double>(accepted),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "accepted_tokens",
-                        static_cast<double>(accepted),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "rejected_tokens",
-                        static_cast<double>(rejected),
-                        "decode",
-                        {},
-                        terminal_tags);
-                    return result;
+                            requested_speculative_draft_count,
+                            speculative_draft_count,
+                            std::move(result));
+                    if (!native_result.success())
+                        return fail_after_checkpoint(native_result.error);
+                    return native_result;
                 }
-
                 /*
                  * Device publication derives next-condition rows into the
                  * runner mailbox before any compatibility D2H bridge.  Launch
@@ -12782,50 +12858,19 @@ namespace llaminar2
                     /*
                      * Device-resident grouped verification intentionally keeps
                      * sampled draft ids in device slots.  The host mirror uses
-                     * negative sentinels, so validate transaction metadata from
-                     * the already-reduced device outcome instead of pretending
-                     * those sentinels are real vocabulary tokens.
+                     * negative sentinels.  The transaction driver has already
+                     * reduced the authoritative device outcome and validated
+                     * its active width.  Inspect that exact metadata rather than
+                     * reconstructing a second transaction from host capacity.
                      */
-                    MTPSpecDecodeAcceptedOutcome accepted_outcome;
-                    accepted_outcome.request_id = 0;
-                    accepted_outcome.vocab_size = vocab;
-                    accepted_outcome.draft_count =
-                        static_cast<int>(draft_tokens.size());
-                    accepted_outcome.committed_output_tokens =
-                        accepted_tokens;
-                    if (commit_boundary_clipped)
-                    {
-                        accepted_outcome.commit_boundary_ready_token =
-                            raw_ready_token;
-                    }
-                    else if (!stopped_on_output &&
-                             all_speculative_accepted &&
-                             raw_ready_token >= 0)
-                    {
-                        /*
-                         * Validate the complete verifier outcome, not the
-                         * response-boundary-clipped continuation state.  The raw
-                         * bonus remains valid acceptance evidence even when the
-                         * final visible output is kept as a pending condition.
-                         */
-                        accepted_outcome.bonus_ready_token = raw_ready_token;
-                    }
-                    accepted_outcome.accepted_verifier_input_prefix =
-                        std::min<int>(
-                            static_cast<int>(draft_tokens.size()),
-                            std::max(0, accepted_speculative_prefix) + 1);
-                    accepted_outcome.target_verifier_state_commit_count =
-                        catchup.target_verifier_state_commit_count;
-                    accepted_outcome.all_drafts_accepted =
-                        all_speculative_accepted;
-                    accepted_outcome.stopped_on_output = stopped_on_output;
-                    accepted_outcome.commit_boundary_clipped =
-                        commit_boundary_clipped;
-
-                    if (auto tx_error = validate_spec_decode_accepted_outcome(
+                    if (auto tx_error = inspect_spec_decode_metadata(
                             "grouped_decode_equivalent_stochastic_verifier",
                             "device_batch_outcome_device_resident_publication",
-                            accepted_outcome))
+                            transaction_plan.metadata,
+                            stopped_on_output,
+                            std::string("device_deferred_capacity:") +
+                                std::to_string(draft_tokens.size()),
+                            accepted_tokens))
                     {
                         return fail_after_checkpoint(*tx_error);
                     }
@@ -13454,6 +13499,29 @@ namespace llaminar2
                       std::to_string(shifted_publication_commit_count)},
                      {"sampling", "greedy"}});
 
+                /*
+                 * Dynamic greedy generation must not return to the host depth
+                 * controller after the first compact publication. The captured
+                 * greedy forward already owns its serial-equivalent reducer, so
+                 * the native parent can continue directly with publication and
+                 * terminal-row fragments while the resident selector remains
+                 * the sole depth authority.
+                 */
+                if (materialize_cuda_dynamic_parent_this_step)
+                {
+                    GenerationResult native_result =
+                        completeNativeDeviceGenerationParent(
+                            publication_request,
+                            DeviceGenerationSamplingMode::Greedy,
+                            transaction_base_cached_tokens,
+                            requested_speculative_draft_count,
+                            speculative_draft_count,
+                            std::move(result));
+                    if (!native_result.success())
+                        return fail_after_checkpoint(native_result.error);
+                    return native_result;
+                }
+
                 const bool can_prelaunch_next_first_sidecar =
                     use_sidecar_stream_handoff_for_grouped_greedy &&
                     use_device_draft_token_sidecar &&
@@ -13751,40 +13819,14 @@ namespace llaminar2
                     first_token_deferred || has_deferred_draft_token;
                 if (grouped_metadata_has_deferred_tokens)
                 {
-                    MTPSpecDecodeAcceptedOutcome accepted_outcome;
-                    accepted_outcome.request_id = 0;
-                    accepted_outcome.vocab_size = vocab;
-                    accepted_outcome.draft_count =
-                        static_cast<int>(draft_tokens.size());
-                    accepted_outcome.committed_output_tokens =
-                        accepted_tokens;
-                    if (commit_boundary_clipped)
-                    {
-                        accepted_outcome.commit_boundary_ready_token =
-                            raw_ready_token;
-                    }
-                    else if (!stopped_on_output &&
-                             all_speculative_accepted &&
-                             raw_ready_token >= 0)
-                    {
-                        accepted_outcome.bonus_ready_token = raw_ready_token;
-                    }
-                    accepted_outcome.accepted_verifier_input_prefix =
-                        std::min<int>(
-                            static_cast<int>(draft_tokens.size()),
-                            std::max(0, accepted_speculative_prefix) + 1);
-                    accepted_outcome.target_verifier_state_commit_count =
-                        catchup.target_verifier_state_commit_count;
-                    accepted_outcome.all_drafts_accepted =
-                        all_speculative_accepted;
-                    accepted_outcome.stopped_on_output = stopped_on_output;
-                    accepted_outcome.commit_boundary_clipped =
-                        commit_boundary_clipped;
-
-                    if (auto tx_error = validate_spec_decode_accepted_outcome(
+                    if (auto tx_error = inspect_spec_decode_metadata(
                             "grouped_decode_equivalent_greedy_verifier",
                             "device_batch_outcome_device_resident_publication",
-                            accepted_outcome))
+                            transaction_plan.metadata,
+                            stopped_on_output,
+                            std::string("device_deferred_capacity:") +
+                                std::to_string(draft_tokens.size()),
+                            accepted_tokens))
                     {
                         return fail_after_checkpoint(*tx_error);
                     }
@@ -15078,6 +15120,7 @@ namespace llaminar2
         device_moe_maintenance_published_in_decode_step_ = false;
         decode_transaction_planning_position_.reset();
         device_generation_admission_pending_ = false;
+        device_generation_terminal_ledger_authoritative_ = false;
         clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);
         mtp_bypassed_ = false;
@@ -15144,8 +15187,11 @@ namespace llaminar2
         snapshot.mtp_depth_policy_observe_recommendations =
             mtp_stats_.depth_policy_observe_recommendations;
         snapshot.mtp_current_depth =
-            mtp_depth_controller_ ? mtp_depth_controller_->currentDepth()
-                                  : std::max(0, mtp.draft_tokens);
+            device_generation_terminal_ledger_authoritative_
+                ? mtp_stats_.current_depth
+                : (mtp_depth_controller_
+                       ? mtp_depth_controller_->currentDepth()
+                       : std::max(0, mtp.draft_tokens));
         snapshot.mtp_min_depth =
             mtp_depth_controller_ ? mtp_depth_controller_->minDepth()
                                   : std::max(0, mtp.draft_tokens);
@@ -15173,7 +15219,19 @@ namespace llaminar2
         snapshot.mtp_request.min_depth = snapshot.mtp_min_depth;
         snapshot.mtp_request.max_depth = snapshot.mtp_max_depth;
         snapshot.mtp_request.depth_policy_updates = mtp_stats_.depth_policy_updates;
-        if (mtp_depth_controller_)
+        if (device_generation_terminal_ledger_authoritative_)
+        {
+            /*
+             * Native generation owns every adaptive transition after admission.
+             * The terminal ledger currently exports aggregate transition counts,
+             * not a host-readable per-window decision enum.  Reporting the
+             * dormant host controller's reason beside the device-selected depth
+             * would manufacture a mixed-authority diagnostic.
+             */
+            snapshot.mtp_request.last_depth_policy_reason =
+                "device_terminal_ledger";
+        }
+        else if (mtp_depth_controller_)
         {
             snapshot.mtp_request.last_depth_policy_reason =
                 toString(mtp_depth_controller_->lastDecision().reason);

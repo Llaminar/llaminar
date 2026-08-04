@@ -21,7 +21,7 @@ namespace llaminar2::moe_rebalance_abi
      * Any field-layout change to a cross-backend record must increment this
      * value and update the corresponding byte-size assertion below.
      */
-    inline constexpr uint32_t kVersion = 9u;
+    inline constexpr uint32_t kVersion = 10u;
 
     /**
      * @brief Exact byte size of DeviceMoERebalanceConfig and device views.
@@ -40,6 +40,9 @@ namespace llaminar2::moe_rebalance_abi
      * A diagnostic field can therefore never shift only one backend silently.
      */
     inline constexpr uint32_t kStatusBytes = 648u;
+    /** Tail-padding slot used for resident non-owner assignment evidence. */
+    inline constexpr uint32_t
+        kPrefillCurrentBatchNonOwnerAssignmentLayersOffset = 644u;
 
     /**
      * @brief Identify payload movement planned from the current routed batch.
