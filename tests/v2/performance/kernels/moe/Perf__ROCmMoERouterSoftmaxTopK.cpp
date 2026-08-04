@@ -31,9 +31,9 @@
 #include <vector>
 
 #ifdef HAVE_ROCM
-extern "C" bool hipMoE_softmax_topk(
-    float *logits,
-    int *expert_indices,
+extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
+    const float *logits,
+    float *expert_indices,
     float *expert_weights,
     int seq_len,
     int num_experts,
@@ -151,7 +151,7 @@ namespace
         }
 
         HipPerfBuffer logits(logits_count * sizeof(float));
-        HipPerfBuffer indices(topk_count * sizeof(int));
+        HipPerfBuffer indices(topk_count * sizeof(float));
         HipPerfBuffer weights(topk_count * sizeof(float));
         HipPerfBuffer effective_rows(sizeof(int));
         ASSERT_EQ(
@@ -177,9 +177,9 @@ namespace
                 : static_cast<const int *>(effective_rows.get());
         auto launch = [&]()
         {
-            return hipMoE_softmax_topk(
+            return hipMoE_softmax_topk_decode_equivalent_rows(
                 static_cast<float *>(logits.get()),
-                static_cast<int *>(indices.get()),
+                static_cast<float *>(indices.get()),
                 static_cast<float *>(weights.get()),
                 launch_rows,
                 kNumExperts,

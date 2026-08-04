@@ -1,3 +1,12 @@
+/**
+ * @file HIPGraphCapture.h
+ * @brief HIP ownership, replay, and metadata inspection for native GPU graphs.
+ *
+ * The capture borrows one exact HIP stream and owns its graph/executable
+ * handles. Read-only recursive kernel inspection mirrors the CUDA contract so
+ * graph-level performance diagnostics remain backend-symmetric.
+ */
+
 #pragma once
 
 #ifdef HAVE_ROCM
@@ -36,6 +45,9 @@ namespace llaminar2
         [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return false; }
         bool hasExecutable() const override;
         size_t nodeCount() const override;
+        bool inspectKernelNodes(
+            std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
+            std::string *error = nullptr) const override;
         void reset() override;
         const char *backendName() const override { return "HIP"; }
 

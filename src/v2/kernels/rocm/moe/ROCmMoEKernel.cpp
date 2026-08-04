@@ -495,14 +495,6 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr);
 
-    bool hipMoE_softmax_topk(
-        float *logits,
-        int *expert_indices, float *expert_weights,
-        int seq_len, int num_experts, int top_k,
-        bool normalize_weights,
-        int device_idx, void *stream,
-        const int *device_effective_seq_len);
-
     bool hipMoE_softmax_topk_decode_runtime(
         float *logits,
         void *runtime,
@@ -553,7 +545,7 @@ extern "C"
 
     bool hipMoE_softmax_topk_decode_equivalent_rows(
         const float *logits,
-        int *expert_indices, float *expert_weights,
+        float *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
         int device_idx, void *stream,
@@ -912,10 +904,6 @@ extern "C"
         void *stream);
 
     // Phase 4: Tensor-aware utility bridges
-    bool hipMoE_int_to_float(
-        const int *d_input, float *d_output, int count,
-        int device_idx, void *stream);
-
     bool hipMoE_float_to_int(
         const float *d_input, int *d_output, int count,
         int device_idx, void *stream);
@@ -1702,8 +1690,6 @@ namespace llaminar2
         d_router_q8_hidden_ = nullptr;
         d_router_q8_hidden_scales_ = nullptr;
         invalidateRouterQ8HiddenPublication();
-        d_route_indices_ = nullptr;
-        d_route_weights_ = nullptr;
         d_group_int_indices_ = nullptr;
         d_group_offsets_ = nullptr;
         d_group_counts_ = nullptr;
@@ -1732,7 +1718,6 @@ namespace llaminar2
         grouped_gateup_kpart_intermediate_cap_ = 0;
         shared_gate_scratch_capacity_ = 0;
         route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
         route_logits_partials_capacity_ = 0;
         router_q8_hidden_rows_cap_ = 0;
         router_q8_hidden_d_model_cap_ = 0;
@@ -2145,7 +2130,7 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
+    bool ROCmMoEKernel::ensureRouteBufferCapacity(size_t logits_count)
     {
         if (logits_count > route_logits_capacity_)
         {
@@ -2160,29 +2145,7 @@ namespace llaminar2
             route_logits_capacity_ = logits_count;
         }
 
-        if (topk_count > route_topk_capacity_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_indices_),
-                                     MoEWorkspaceBuffers::ROUTE_INDICES,
-                                     topk_count * sizeof(int),
-                                     "ensureRouteBufferCapacity(indices)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_weights_),
-                                     MoEWorkspaceBuffers::ROUTE_WEIGHTS,
-                                     topk_count * sizeof(float),
-                                     "ensureRouteBufferCapacity(weights)"))
-            {
-                d_route_indices_ = nullptr;
-                d_route_weights_ = nullptr;
-                route_topk_capacity_ = 0;
-                return false;
-            }
-            route_topk_capacity_ = topk_count;
-        }
-
-        if (topk_count == 0)
-            return d_route_logits_ != nullptr;
-
-        return d_route_logits_ && d_route_indices_ && d_route_weights_;
+        return d_route_logits_ != nullptr;
     }
 
     bool ROCmMoEKernel::ensureRouteLogitsPartialsCapacity(size_t partial_count)
@@ -2710,32 +2673,30 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // routeCore() — Shared GPU routing logic: gate GEMM + softmax + top-k.
-    // Returns pointers into persistent device buffers owned by this kernel.
+    // routeCore() — Shared GPU routing logic: gate GEMM + direct FP32 publication.
     // =========================================================================
 
     bool ROCmMoEKernel::routeCore(
         const float *hidden, const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model, int num_experts, int top_k,
-        bool normalize_weights, DeviceRouteBuffers &bufs,
+        bool normalize_weights,
+        float *output_indices, float *output_weights,
         const int *device_effective_seq_len)
     {
-        bufs.logits_count = static_cast<size_t>(seq_len) * num_experts;
-        bufs.topk_count = static_cast<size_t>(seq_len) * top_k;
-
-        if (!ensureRouteBufferCapacity(bufs.logits_count, bufs.topk_count))
+        if (!output_indices || !output_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeCore] final FP32 route outputs are required");
             return false;
-
-        bufs.d_logits = d_route_logits_;
-        bufs.d_indices = d_route_indices_;
-        bufs.d_weights = d_route_weights_;
+        }
+        const size_t logits_count = static_cast<size_t>(seq_len) * num_experts;
+        if (!ensureRouteBufferCapacity(logits_count))
+            return false;
         if (device_effective_seq_len &&
             !validateDevicePointerOrLog(device_effective_seq_len,
                                         device_ordinal_,
                                         "effective prefill sequence length",
                                         "ROCmMoEKernel::routeCore"))
         {
-            bufs = {};
             return false;
         }
 
@@ -2746,12 +2707,11 @@ namespace llaminar2
         if (decode_single_token)
         {
             if (!launchDecodeGateLogitsForGateType(
-                    hidden, gate_weights, gate_type, bufs.d_logits,
+                    hidden, gate_weights, gate_type, d_route_logits_,
                     d_model, num_experts,
                     device_ordinal_, getStream(),
                     "ROCmMoEKernel::routeCore"))
             {
-                bufs = {};
                 return false;
             }
         }
@@ -2776,7 +2736,6 @@ namespace llaminar2
                     {
                         LOG_ERROR("[ROCmMoEKernel::routeCore] batch-invariant Q8 prefill router "
                                   "requires 32-column blocks and declared row scratch");
-                        bufs = {};
                         return false;
                     }
                     const auto *q8_gate = getOrCreateQ8RouterGateCache(
@@ -2786,7 +2745,6 @@ namespace llaminar2
                     if (!q8_gate)
                     {
                         LOG_ERROR("[ROCmMoEKernel::routeCore] Q8 prefill router gate cache unavailable");
-                        bufs = {};
                         return false;
                     }
                     logits_ready = hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
@@ -2795,7 +2753,7 @@ namespace llaminar2
                         d_router_q8_hidden_scales_,
                         q8_gate->d_gate_weights_q8,
                         q8_gate->d_gate_scales,
-                        bufs.d_logits,
+                        d_route_logits_,
                         seq_len,
                         d_model,
                         num_experts,
@@ -2822,13 +2780,12 @@ namespace llaminar2
                     if (!gate_fp16)
                     {
                         LOG_ERROR("[ROCmMoEKernel::routeCore] FP16 prefill router gate cache unavailable");
-                        bufs = {};
                         return false;
                     }
                     logits_ready = hipMoE_gate_logits_fp16_decode_equivalent_rows(
                         hidden,
                         gate_fp16,
-                        bufs.d_logits,
+                        d_route_logits_,
                         seq_len,
                         d_model,
                         num_experts,
@@ -2842,7 +2799,7 @@ namespace llaminar2
                     logits_ready = launchDecodeEquivalentFP32Rows(
                         hidden,
                         static_cast<const float *>(gate_weights),
-                        bufs.d_logits,
+                        d_route_logits_,
                         seq_len,
                         d_model,
                         num_experts,
@@ -2856,7 +2813,7 @@ namespace llaminar2
                 logits_ready = hipMoE_gate_logits_fp16_decode_equivalent_rows(
                     hidden,
                     gate_weights,
-                    bufs.d_logits,
+                    d_route_logits_,
                     seq_len,
                     d_model,
                     num_experts,
@@ -2870,7 +2827,7 @@ namespace llaminar2
                 logits_ready = hipMoE_gate_logits_bf16_decode_equivalent_rows(
                     hidden,
                     gate_weights,
-                    bufs.d_logits,
+                    d_route_logits_,
                     seq_len,
                     d_model,
                     num_experts,
@@ -2882,14 +2839,12 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmMoEKernel::routeCore] unsupported batch-invariant prefill router gate type "
                           << tensorTypeName(gate_type));
-                bufs = {};
                 return false;
             }
 
             if (!logits_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::routeCore] batch-invariant grouped prefill logits failed");
-                bufs = {};
                 return false;
             }
         }
@@ -2897,9 +2852,9 @@ namespace llaminar2
         // The row-owned top-k kernel mirrors serial decode and independently
         // handles every padded graph row from the device effective-length scalar.
         if (!hipMoE_softmax_topk_decode_equivalent_rows(
-                bufs.d_logits,
-                bufs.d_indices,
-                bufs.d_weights,
+                d_route_logits_,
+                output_indices,
+                output_weights,
                 seq_len,
                 num_experts,
                 top_k,
@@ -2908,7 +2863,6 @@ namespace llaminar2
                 getStream(),
                 device_effective_seq_len))
         {
-            bufs = {};
             return false;
         }
 
@@ -3720,22 +3674,12 @@ namespace llaminar2
             return false;
         }
 
-        DeviceRouteBuffers bufs;
-        if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
-                       normalize_weights, bufs,
-                       device_effective_seq_len))
-            return false;
-
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (!stream)
         {
             LOG_ERROR("[" << context << "] explicit HIP stream is required");
             return false;
         }
-        hipError_t err;
-
-        // D2D: write routing results to output tensors on device.
-        // Indices need int→float conversion; weights are a D2D copy.
         float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
         float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
         if (!d_idx || !d_wt)
@@ -3744,23 +3688,10 @@ namespace llaminar2
             return false;
         }
 
-        // int→float conversion kernel (indices are int on device, tensor stores float)
-        if (!hipMoE_int_to_float(bufs.d_indices, d_idx,
-                                 static_cast<int>(bufs.topk_count),
-                                 device_ordinal_, getStream()))
-        {
-            LOG_ERROR("[" << context << "] D2D index conversion failed");
+        if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
+                       normalize_weights, d_idx, d_wt,
+                       device_effective_seq_len))
             return false;
-        }
-
-        err = hipMemcpyAsync(d_wt, bufs.d_weights,
-                             bufs.topk_count * sizeof(float),
-                             hipMemcpyDeviceToDevice, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[" << context << "] D2D weights failed: " << hipGetErrorString(err));
-            return false;
-        }
 
         host_result.expert_indices.clear();
         host_result.expert_weights.clear();
@@ -3877,10 +3808,7 @@ namespace llaminar2
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
-        const size_t topk_count =
-            static_cast<size_t>(plan.physical_rows) *
-            static_cast<size_t>(plan.top_k);
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
         {
             LOG_ERROR("[" << kContext << "] failed to bind persistent route scratch");
             return false;
@@ -4059,9 +3987,7 @@ namespace llaminar2
 
         const size_t logits_count =
             static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts);
-        const size_t topk_count =
-            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
         {
             LOG_ERROR("[" << kContext << "] route scratch allocation failed");
             return false;
@@ -4194,8 +4120,8 @@ namespace llaminar2
 
         if (!hipMoE_softmax_topk_decode_equivalent_rows(
                 d_route_logits_,
-                d_route_indices_,
-                d_route_weights_,
+                d_idx,
+                d_wt,
                 seq_len,
                 num_experts,
                 top_k,
@@ -4205,28 +4131,6 @@ namespace llaminar2
                 device_effective_seq_len))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
-            return false;
-        }
-
-        if (!hipMoE_int_to_float(d_route_indices_,
-                                 d_idx,
-                                 static_cast<int>(topk_count),
-                                 device_ordinal_,
-                                 getStream()))
-        {
-            LOG_ERROR("[" << kContext << "] grouped int-to-float index conversion failed");
-            return false;
-        }
-        const hipError_t copy_status = hipMemcpyAsync(
-            d_wt,
-            d_route_weights_,
-            topk_count * sizeof(float),
-            hipMemcpyDeviceToDevice,
-            stream);
-        if (copy_status != hipSuccess)
-        {
-            LOG_ERROR("[" << kContext << "] grouped D2D weight copy failed: "
-                          << hipGetErrorString(copy_status));
             return false;
         }
 
@@ -4293,7 +4197,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), /*topk_count=*/0))
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] route logits scratch allocation failed");
             return false;
@@ -4584,7 +4488,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), /*topk_count=*/0))
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] route logits scratch allocation failed");
             return false;

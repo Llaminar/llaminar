@@ -248,12 +248,22 @@ def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
         )
 
     # Full-tier structured generation is primarily an anti-degeneration and
-    # long-completion check. Some large MoE models spend more tokens per line,
-    # so scale the evidence threshold to the actual completion budget. At the
-    # canonical 512+ token budget this still requires at least 40 lines; at a
-    # deliberately shortened 128-token matrix budget it requires ten clean,
-    # monotonic lines instead of an impossible fixed forty.
-    min_lines = max(1, min(120, usable_max // 12))
+    # long-completion check. Preserve the ten-line and forty-line evidence
+    # floors at 128 and 512 tokens, respectively. Above 512 tokens, budget for
+    # up to sixteen model tokens per formatted sentence. Real Qwen MoE output
+    # includes the line prefix, punctuation, and tokenizer-dependent word
+    # pieces, so a twelve-token assumption can reject a healthy completion
+    # solely because it reaches the requested token boundary. The independent
+    # completion-token gate below still proves that the model generated a long
+    # response rather than satisfying this structural check with a short one.
+    min_lines = max(
+        1,
+        min(
+            120,
+            usable_max // 12,
+            max(40, usable_max // 16),
+        ),
+    )
     requested_lines = max(
         min_lines,
         min(220, max(1, usable_max // 8)),
@@ -1037,6 +1047,7 @@ def run_self_test() -> int:
         assert full.min_numbered_lines >= lite.min_numbered_lines
     assert tier_settings("full", 128).min_numbered_lines == 10
     assert tier_settings("full", 512).min_numbered_lines >= 40
+    assert tier_settings("full", 1024).min_numbered_lines == 63
 
     print("PASS [self-test] helper pure-function checks", flush=True)
     return 0

@@ -11362,7 +11362,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
         "ROCm gate/up descriptors must be published before capture.");
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoERouteScratchReuseRequiresWorkspaceBinding)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoERouteLogitsScratchReuseRequiresWorkspaceBinding)
 {
     const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
     const auto header = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.h");
@@ -11373,15 +11373,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoERouteScratchReuseRequiresWorkspa
     const auto executable_route_capacity =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(route_capacity));
 
-    EXPECT_NE(executable_route_capacity.find("if(route_buffers_workspace_bound_&&"),
+    EXPECT_NE(executable_route_capacity.find("if(route_logits_workspace_bound_&&"),
               std::string::npos)
         << "CUDA MoE routing scratch is owned by the graph workspace. Capacity "
            "alone must not make a cached route buffer reusable across singleton "
            "kernel rebinds.";
-    EXPECT_NE(executable_route_capacity.find("d_route_logits_&&d_route_indices_&&d_route_weights_"),
+    EXPECT_NE(executable_route_capacity.find("d_route_logits_&&"),
               std::string::npos)
-        << "Route-buffer reuse must also require non-null workspace pointers.";
-    EXPECT_LT(executable_route_capacity.find("if(route_buffers_workspace_bound_&&"),
+        << "Route-logits reuse must also require its non-null workspace pointer.";
+    EXPECT_LT(executable_route_capacity.find("if(route_logits_workspace_bound_&&"),
               executable_route_capacity.find("bindWorkspaceBuffer(&route_logits"))
         << "The binding-aware reuse guard must be checked before rebinding route scratch.";
 

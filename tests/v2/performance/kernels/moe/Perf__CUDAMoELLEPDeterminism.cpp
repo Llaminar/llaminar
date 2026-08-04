@@ -483,7 +483,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_GroupPrefillRoutesDeterministic)
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    const Shape shape{};
+    Shape shape{};
+    shape.seq_len = envInt("LLAMINAR_MOE_GROUP_ROUTES_ROWS", shape.seq_len);
     const int warmups = envInt("LLAMINAR_MOE_GROUP_ROUTES_WARMUPS", 10);
     const int iterations = envInt("LLAMINAR_MOE_GROUP_ROUTES_ITERS", 100);
     CudaHarness harness(shape);

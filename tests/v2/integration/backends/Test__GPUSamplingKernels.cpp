@@ -3718,6 +3718,27 @@ namespace
                 ASSERT_TRUE(stage_enqueued);
                 ASSERT_GE(capture->nodeCount(), 2U)
                     << "checkpoint and fused controlled-row preparation were not captured";
+
+                std::vector<GPUGraphKernelNodeInfo> captured_kernels;
+                std::string inventory_error;
+                ASSERT_TRUE(capture->inspectKernelNodes(
+                    captured_kernels,
+                    &inventory_error))
+                    << inventory_error;
+                ASSERT_FALSE(captured_kernels.empty())
+                    << "the production verifier-preparation capture must expose its kernel nodes";
+                for (const GPUGraphKernelNodeInfo &kernel : captured_kernels)
+                {
+                    EXPECT_TRUE(kernel.valid())
+                        << "invalid captured launch at " << kernel.graph_path;
+                    EXPECT_TRUE(kernel.name_resolved)
+                        << "backend failed to name captured launch at "
+                        << kernel.graph_path;
+                    EXPECT_FALSE(kernel.name.empty());
+                    EXPECT_GT(kernel.registers_per_thread, 0U);
+                    EXPECT_GT(kernel.max_threads_per_block, 0U);
+                    EXPECT_GT(kernel.max_active_blocks_per_sm, 0U);
+                }
                 ASSERT_TRUE(capture->instantiate());
 
                 auto initialize_control = [&](int width)

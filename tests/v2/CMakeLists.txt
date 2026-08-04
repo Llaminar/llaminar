@@ -12299,6 +12299,31 @@ if(HAVE_CUDA)
 endif()
 
 # =============================================================================
+# Performance Test: monolithic CUDA verifier fixed-geometry feasibility
+# =============================================================================
+# Replays the measured Qwen3.6-35B MoE verifier launch distribution either as
+# 1,376 native CUDA Graph nodes or as one cooperative persistent kernel. This
+# is an architectural lower-bound experiment; production fusion proceeds only
+# after byte parity and profiler-backed geometry evidence are both available.
+if(HAVE_CUDA)
+    add_executable(v2_perf_cuda_persistent_verifier_geometry
+        performance/Perf__CUDAPersistentVerifierGeometry.cu
+    )
+    target_link_libraries(v2_perf_cuda_persistent_verifier_geometry PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    add_v2_test(V2_Perf_CUDAPersistentVerifierGeometry
+        COMMAND $<TARGET_FILE:v2_perf_cuda_persistent_verifier_geometry>
+        LABELS "V2;Performance;CUDA;MTP;Verifier;GraphCapture;CooperativeGroups;PersistentKernel;Geometry;Qwen36;MoE"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
+    message(STATUS "V2 Tests: Added CUDA persistent-verifier geometry benchmark")
+endif()
+
+# =============================================================================
 # ROCm MoE Kernel Integration Tests
 # =============================================================================
 if(HAVE_ROCM)

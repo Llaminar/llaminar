@@ -16,6 +16,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -42,6 +43,56 @@ namespace llaminar2
         Success,            ///< Graph executable updated in-place
         NeedsReinstantiate, ///< Topology changed, needs full re-instantiation
         Failed              ///< Update failed; the owning execution path must fail
+    };
+
+    /**
+     * @brief One recursively discovered kernel node in a captured GPU graph.
+     *
+     * The record contains only immutable capture-time metadata. Inspecting a
+     * graph never launches it, reads device memory, synchronizes a stream, or
+     * changes executable state. `graph_path` identifies the nested child-graph
+     * route used to reach the node; it is diagnostic identity and is not an
+     * execution-order guarantee.
+     *
+     * A backend may encounter a kernel registered through a library mechanism
+     * that does not expose a symbolic name through its runtime API. Such a node
+     * remains present with `name_resolved == false` and its non-zero function
+     * identity, so an inventory can never silently omit work.
+     */
+    struct GPUGraphKernelNodeInfo
+    {
+        std::string name;                       ///< Runtime kernel name or `unresolved_kernel`.
+        std::string graph_path;                 ///< Recursive root/child path for diagnostics.
+        uintptr_t function_identity = 0;        ///< Backend runtime function identity.
+        uint32_t grid_x = 0;                    ///< Capture-time grid width.
+        uint32_t grid_y = 0;                    ///< Capture-time grid height.
+        uint32_t grid_z = 0;                    ///< Capture-time grid depth.
+        uint32_t block_x = 0;                   ///< Capture-time block width.
+        uint32_t block_y = 0;                   ///< Capture-time block height.
+        uint32_t block_z = 0;                   ///< Capture-time block depth.
+        size_t dynamic_shared_memory_bytes = 0;   ///< Per-block dynamic shared memory.
+        size_t static_shared_memory_bytes = 0;    ///< Compiler-owned shared memory per block.
+        size_t local_memory_bytes_per_thread = 0; ///< Compiler-owned local memory per thread.
+        uint32_t registers_per_thread = 0;         ///< Compiler-assigned registers per thread.
+        uint32_t max_threads_per_block = 0;        ///< Backend launch ceiling for this kernel.
+        uint32_t max_active_blocks_per_sm = 0;     ///< Occupancy ceiling at captured geometry.
+        size_t nesting_depth = 0;                 ///< Number of enclosing child graphs.
+        bool name_resolved = false;               ///< Whether `name` came from the runtime.
+
+        /**
+         * @brief Verify that the record describes a launchable kernel node.
+         *
+         * @return true when function identity and every launch dimension are
+         *         present. A symbolic name is intentionally not required because
+         *         opaque library kernels must still be represented.
+         */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return function_identity != 0 && grid_x > 0 && grid_y > 0 &&
+                   grid_z > 0 && block_x > 0 && block_y > 0 && block_z > 0 &&
+                   registers_per_thread > 0 && max_threads_per_block > 0 &&
+                   max_active_blocks_per_sm > 0;
+        }
     };
 
     /**
@@ -387,6 +438,31 @@ namespace llaminar2
 
         /// @return Number of nodes in the last captured graph (0 if no capture done)
         virtual size_t nodeCount() const = 0;
+
+        /**
+         * @brief Recursively enumerate every kernel in the captured graph.
+         *
+         * This setup/diagnostic operation walks native graph metadata only. It
+         * must not instantiate or launch the graph, allocate device memory,
+         * synchronize execution, or transfer device data. Implementations clear
+         * @p kernel_nodes before writing and fail when no captured graph exists or
+         * when a native node cannot be inspected. Name-resolution failure alone
+         * does not drop a node; see @ref GPUGraphKernelNodeInfo.
+         *
+         * @param kernel_nodes Receives one record for every recursively reachable
+         *        kernel node, including kernels inside child graphs.
+         * @param error Optional precise diagnostic, cleared on success.
+         * @return true when the complete graph was traversed without omission.
+         */
+        virtual bool inspectKernelNodes(
+            std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
+            std::string *error = nullptr) const
+        {
+            kernel_nodes.clear();
+            if (error)
+                *error = "GPU graph backend does not implement kernel-node inspection";
+            return false;
+        }
 
         /// Destroy all captured graph and executable resources.
         /// Safe to call multiple times or on an empty object.

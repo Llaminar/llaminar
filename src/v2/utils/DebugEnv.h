@@ -132,6 +132,7 @@ namespace llaminar2
         bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
         bool mtp_device_phase_snapshots = false; ///< Preserve device-only logical-state phase snapshots until a fatal diagnostic boundary.
         bool mtp_condition_graph_contract_trace = false; ///< Trace only the participant/cache/graph lifecycle of resident MTP condition advances.
+        bool gpu_graph_kernel_inventory = false; ///< Export captured kernel names/geometries to PerfStats during graph setup.
         bool cuda_gdn_pointer_trace = false;      ///< Emit CUDA GDN grouped-row pointer diagnostics.
         bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
         bool stage_checksum_trace = false;     ///< Emit per-stage checksum traces when LLAMINAR_STAGE_CHECKSUM_TRACE is truthy.
@@ -167,6 +168,8 @@ namespace llaminar2
             mtp_condition_graph_contract_trace =
                 readTruthy(
                     "LLAMINAR_MTP_CONDITION_GRAPH_CONTRACT_TRACE");
+            gpu_graph_kernel_inventory =
+                readTruthy("LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY");
             cuda_gdn_pointer_trace =
                 readTruthy("LLAMINAR_CUDA_GDN_PTR_TRACE");
             allow_numa_bind_fallback = readTruthy("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK");

@@ -14,8 +14,6 @@ namespace llaminar2
         constexpr const char *STAGING_INDICES = "moe_staging_indices";
         constexpr const char *STAGING_WEIGHTS = "moe_staging_weights";
         constexpr const char *ROUTE_LOGITS = "moe_route_logits";
-        constexpr const char *ROUTE_INDICES = "moe_route_indices";
-        constexpr const char *ROUTE_WEIGHTS = "moe_route_weights";
 
         constexpr const char *GROUP_INT_INDICES = "moe_group_int_indices";
         constexpr const char *GROUP_OFFSETS = "moe_group_offsets";
@@ -141,18 +139,14 @@ namespace llaminar2
             reqs.buffers.push_back({name, bytes, 256, true});
         }
 
-        inline WorkspaceRequirements routing(int max_seq_len, int num_experts, int top_k)
+        inline WorkspaceRequirements routing(int max_seq_len, int num_experts)
         {
             WorkspaceRequirements reqs;
             max_seq_len = std::max(1, max_seq_len);
             num_experts = std::max(1, num_experts);
-            top_k = std::max(1, top_k);
 
             const std::size_t tokens = static_cast<std::size_t>(max_seq_len);
-            const std::size_t route_slots = tokens * static_cast<std::size_t>(top_k);
             add(reqs, ROUTE_LOGITS, tokens * static_cast<std::size_t>(num_experts) * sizeof(float));
-            add(reqs, ROUTE_INDICES, route_slots * sizeof(int));
-            add(reqs, ROUTE_WEIGHTS, route_slots * sizeof(float));
             return reqs;
         }
 
@@ -168,11 +162,10 @@ namespace llaminar2
         inline WorkspaceRequirements cudaRouting(
             int max_seq_len,
             int d_model,
-            int num_experts,
-            int top_k)
+            int num_experts)
         {
             WorkspaceRequirements reqs =
-                routing(max_seq_len, num_experts, top_k);
+                routing(max_seq_len, num_experts);
             max_seq_len = std::max(1, max_seq_len);
             d_model = std::max(1, d_model);
             num_experts = std::max(1, num_experts);
@@ -295,7 +288,7 @@ namespace llaminar2
             int top_k)
         {
             WorkspaceRequirements reqs =
-                cudaRouting(max_seq_len, d_model, num_experts, top_k);
+                cudaRouting(max_seq_len, d_model, num_experts);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
             num_experts = std::max(1, num_experts);
             const std::size_t table_descs =
@@ -324,14 +317,12 @@ namespace llaminar2
         inline WorkspaceRequirements rocmRouting(
             int max_seq_len,
             int d_model,
-            int num_experts,
-            int top_k)
+            int num_experts)
         {
-            WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
+            WorkspaceRequirements reqs = routing(max_seq_len, num_experts);
             max_seq_len = std::max(1, max_seq_len);
             d_model = std::max(1, d_model);
             num_experts = std::max(1, num_experts);
-            top_k = std::max(1, top_k);
 
             const int d_model_blocks = ceilDiv(d_model, 32);
             constexpr int kMaxRouterPartitions = 16;
@@ -366,7 +357,7 @@ namespace llaminar2
             int num_experts,
             int top_k)
         {
-            WorkspaceRequirements reqs = rocmRouting(max_seq_len, d_model, num_experts, top_k);
+            WorkspaceRequirements reqs = rocmRouting(max_seq_len, d_model, num_experts);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
             max_seq_len = std::max(1, max_seq_len);
             top_k = std::max(1, top_k);

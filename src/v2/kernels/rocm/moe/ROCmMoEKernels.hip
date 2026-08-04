@@ -11960,149 +11960,6 @@ __global__ void rocm_moe_gate_logits_grouped_decode_router_rows_kernel(
 }
 
 // =========================================================================
-// Kernel 2: Row-wise Softmax + Top-K Selection
-//
-// For each token:
-//   1. Find max logit (numerical stability)
-//   2. Compute exp(logit - max) and sum
-//   3. Normalize to probabilities
-//   4. Select top-k experts by probability
-//   5. Optionally renormalize top-k weights
-//
-// One block per token. Uses shared memory for the logits array.
-// =========================================================================
-
-__global__ void rocm_moe_softmax_topk_kernel(
-    float *__restrict__ logits,             // [seq_len, num_experts] IN/OUT (probabilities)
-    int *__restrict__ expert_indices,       // [seq_len * top_k] OUT
-    float *__restrict__ expert_weights,     // [seq_len * top_k] OUT
-    int seq_len, int num_experts, int top_k,
-    bool normalize_weights,
-    const int *__restrict__ effective_seq_len_ptr)
-{
-    const int token = blockIdx.x;
-    if (token >= seq_len) return;
-
-    int effective_seq_len = seq_len;
-    if (effective_seq_len_ptr)
-    {
-        const int raw_effective = *effective_seq_len_ptr;
-        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
-    }
-    if (token >= effective_seq_len)
-    {
-        if (threadIdx.x == 0)
-        {
-            for (int k = 0; k < top_k; ++k)
-            {
-                const size_t out = static_cast<size_t>(token) * top_k + k;
-                expert_indices[out] = -1;
-                expert_weights[out] = 0.0f;
-            }
-        }
-        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
-            logits[static_cast<size_t>(token) * num_experts + e] = 0.0f;
-        return;
-    }
-
-    float *row = logits + token * num_experts;
-    __shared__ float values[kDeviceMoEMaxExperts];
-    __shared__ int selected_indices[kDeviceMoEMaxTopK];
-    __shared__ float selected_weights[kDeviceMoEMaxTopK];
-
-    /*
-     * Softmax is monotonic, so top-k is selected directly from byte-identical
-     * router logits. This keeps the expert decision independent of any
-     * all-expert probability reduction while retaining the wave-aware stable
-     * pair reduction shared with decode routing.
-     */
-    for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
-        values[e] = row[e];
-    __syncthreads();
-
-    moe_select_topk_probabilities_block(
-        values,
-        num_experts,
-        top_k,
-        selected_indices,
-        selected_weights);
-
-    /*
-     * Normalize with the same wave64-plus-cross-wave reduction used by the
-     * production decode-equivalent router.  A prior correctness slice summed
-     * every exponential on lane zero.  That was deterministic, but it
-     * serialized the transcendental-heavy portion of each row and left three
-     * waves idle on gfx906.
-     *
-     * Each block owns exactly one router row.  Neither the lane assignment nor
-     * the reduction tree depends on `seq_len`, so an active row executes
-     * identically in an exact-M launch and in a padded graph bucket.
-     */
-    const float max_value = selected_weights[0];
-    float local_sum = 0.0f;
-    for (int expert = threadIdx.x;
-         expert < num_experts;
-         expert += blockDim.x)
-    {
-        const float exponential = expf(row[expert] - max_value);
-        values[expert] = exponential;
-        local_sum += exponential;
-    }
-    local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
-
-    __shared__ float shared_sum[8];
-    const int lane = threadIdx.x % warpSize;
-    const int warp_id = threadIdx.x / warpSize;
-    if (lane == 0)
-        shared_sum[warp_id] = local_sum;
-    __syncthreads();
-
-    if (warp_id == 0)
-    {
-        const int num_warps =
-            (blockDim.x + warpSize - 1) / warpSize;
-        local_sum = lane < num_warps ? shared_sum[lane] : 0.0f;
-        local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
-        if (lane == 0)
-            shared_sum[0] = local_sum;
-    }
-    __syncthreads();
-
-    const float denominator = shared_sum[0];
-    for (int expert = threadIdx.x;
-         expert < num_experts;
-         expert += blockDim.x)
-    {
-        const float probability =
-            denominator > 0.0f ? values[expert] / denominator : 0.0f;
-        values[expert] = probability;
-        row[expert] = probability;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-    {
-        float selected_sum = 0.0f;
-        for (int k = 0; k < top_k; ++k)
-        {
-            selected_weights[k] = values[selected_indices[k]];
-            selected_sum += selected_weights[k];
-        }
-
-        int *out_idx = expert_indices + token * top_k;
-        float *out_wt = expert_weights + token * top_k;
-        for (int k = 0; k < top_k; ++k)
-        {
-            out_idx[k] = selected_indices[k];
-            out_wt[k] =
-                normalize_weights && selected_sum > 0.0f
-                    ? selected_weights[k] * (1.0f / selected_sum)
-                    : selected_weights[k];
-        }
-    }
-}
-
-// =========================================================================
 // Kernel 2b: Decode Softmax + Top-K + Runtime Write
 //
 // Single-token decode variant that keeps routing entirely device-side: it
@@ -12408,7 +12265,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
  */
 __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
     const float *__restrict__ logits,                 // [seq_len, num_experts] input logits, left unmodified
-    int *__restrict__ expert_indices,                 // [seq_len, top_k] OUT
+    float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
     float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
@@ -12430,7 +12287,7 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
         for (int slot = threadIdx.x; slot < top_k; slot += blockDim.x)
         {
             const size_t output_slot = static_cast<size_t>(token) * top_k + slot;
-            expert_indices[output_slot] = -1;
+            expert_indices[output_slot] = -1.0f;
             expert_weights[output_slot] = 0.0f;
         }
         return;
@@ -12514,11 +12371,11 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
             }
         }
 
-        int *out_idx = expert_indices + static_cast<size_t>(token) * top_k;
+        float *out_idx = expert_indices + static_cast<size_t>(token) * top_k;
         float *out_wt = expert_weights + static_cast<size_t>(token) * top_k;
         for (int slot = 0; slot < top_k; ++slot)
         {
-            out_idx[slot] = selected_ids[slot];
+            out_idx[slot] = static_cast<float>(selected_ids[slot]);
             out_wt[slot] = selected_weights[slot];
         }
     }
@@ -13668,42 +13525,6 @@ bool hipMoE_gate_logits_grouped_decode_router_rows(
     return true;
 }
 
-bool hipMoE_softmax_topk(
-    float *logits,
-    int *expert_indices, float *expert_weights,
-    int seq_len, int num_experts, int top_k,
-    bool normalize_weights,
-    int device_idx, void *stream,
-    const int *device_effective_seq_len)
-{
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    if (!stream || !logits || !expert_indices || !expert_weights ||
-        seq_len <= 0 || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts)
-    {
-        fprintf(stderr, "HIP MoE softmax_topk invalid arguments\n");
-        return false;
-    }
-
-    // One block per token, 256 threads for parallel softmax
-    const int threads = 256;
-    hipLaunchKernelGGL(rocm_moe_softmax_topk_kernel,
-        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        logits, expert_indices, expert_weights,
-        seq_len, num_experts, top_k, normalize_weights,
-        device_effective_seq_len);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE softmax_topk kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
 bool hipMoE_softmax_topk_decode_runtime(
     float *logits,
     void *runtime,
@@ -13852,7 +13673,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
 
 bool hipMoE_softmax_topk_decode_equivalent_rows(
     const float *logits,
-    int *expert_indices, float *expert_weights,
+    float *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
     int device_idx, void *stream,
@@ -17856,15 +17677,6 @@ bool hipMoE_prefill_scatter_expert_runtime(
 // Phase 4: Tensor-aware utility kernels
 // =========================================================================
 
-/// Convert int array to float array on device (for routing index tensors)
-__global__ void rocm_moe_int_to_float_kernel(
-    const int *__restrict__ input, float *__restrict__ output, int count)
-{
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx < count)
-        output[idx] = static_cast<float>(input[idx]);
-}
-
 /// Convert float array to int array on device (reverse: for GPU-side token grouping)
 __global__ void rocm_moe_float_to_int_kernel(
     const float *__restrict__ input, int *__restrict__ output, int count)
@@ -17979,29 +17791,6 @@ bool hipMoE_stage_const_pointer_arrays(
     return true;
 }
 
-bool hipMoE_int_to_float(
-    const int *d_input, float *d_output, int count,
-    int device_idx, void *stream)
-{
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    const int threads = 256;
-    const int blocks = (count + threads - 1) / threads;
-
-    hipLaunchKernelGGL(rocm_moe_int_to_float_kernel,
-        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        d_input, d_output, count);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE int_to_float kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
 bool hipMoE_float_to_int(
     const float *d_input, int *d_output, int count,
     int device_idx, void *stream)
@@ -18012,7 +17801,7 @@ bool hipMoE_float_to_int(
     const int threads = 256;
     const int blocks = (count + threads - 1) / threads;
 
-    // Reuse int_to_float kernel pattern with reversed types —
+    // Convert FP32 routing IDs to integer grouping IDs on the explicit stream.
     // a trivial __device__ lambda would be ideal but HIP doesn't support
     // device lambdas in extern "C".  Instead, add a dedicated kernel below.
     // For now, use a trivial inline kernel via hipLaunchKernelGGL.

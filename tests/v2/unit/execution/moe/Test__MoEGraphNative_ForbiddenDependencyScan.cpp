@@ -5112,7 +5112,7 @@ namespace llaminar2::test
 
         require_fused_ready_apply(cuda_contents,
                                   "bool cudaMoE_apply_ready_rebalance_wave(",
-                                  "bool cudaMoE_int_to_float",
+                                  "bool cudaMoE_float_to_int",
                                   "CUDA");
         require_fused_ready_apply(rocm_contents,
                                   "bool hipMoE_apply_ready_rebalance_wave(",
@@ -5164,12 +5164,115 @@ namespace llaminar2::test
                                   "CUDA softmax-topk");
         require_fused_publication(cuda_contents,
                                   "__global__ void decode_route_select_runtime_kernel(",
-                                  "__global__ void int_to_float_kernel",
+                                  "__global__ void float_to_int_kernel",
                                   "CUDA route-copy");
         require_fused_publication(rocm_contents,
                                   "void runtime_publish_decode_dispatch(",
                                   "__global__ void device_rebalance_llep_claim_preflight_kernel(",
                                   "ROCm");
+    }
+
+    /**
+     * @brief Keep final route publication inside production softmax/top-k.
+     *
+     * Expert IDs are represented as FP32 tensors at the graph boundary. Both GPU
+     * backends must therefore publish those exact FP32 values and route weights
+     * from the softmax producer itself. An intermediate INT32 route table would
+     * require a conversion launch, while an intermediate weight table would
+     * require a captured D2D copy; either silently restores two tiny nodes per
+     * MoE layer to every verifier replay.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GPURouterSoftmaxPublishesFinalFP32TensorsDirectly)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path cuda_kernel_path =
+            root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
+        const fs::path cuda_owner_path =
+            root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";
+        const fs::path rocm_kernel_path =
+            root / "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip";
+        const fs::path rocm_owner_path =
+            root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        const fs::path workspace_path =
+            root / "src/v2/execution/moe/MoEWorkspaceRequirements.h";
+
+        const std::string cuda_kernel = readFile(cuda_kernel_path);
+        const std::string cuda_owner = readFile(cuda_owner_path);
+        const std::string rocm_kernel = readFile(rocm_kernel_path);
+        const std::string rocm_owner = readFile(rocm_owner_path);
+        const std::string workspace = readFile(workspace_path);
+        ASSERT_FALSE(cuda_kernel.empty()) << cuda_kernel_path;
+        ASSERT_FALSE(cuda_owner.empty()) << cuda_owner_path;
+        ASSERT_FALSE(rocm_kernel.empty()) << rocm_kernel_path;
+        ASSERT_FALSE(rocm_owner.empty()) << rocm_owner_path;
+        ASSERT_FALSE(workspace.empty()) << workspace_path;
+
+        EXPECT_EQ(cuda_kernel.find("int_to_float_kernel"), std::string::npos);
+        EXPECT_EQ(cuda_owner.find("cudaMoE_int_to_float"), std::string::npos);
+        EXPECT_EQ(rocm_kernel.find("rocm_moe_int_to_float_kernel"), std::string::npos);
+        EXPECT_EQ(rocm_owner.find("hipMoE_int_to_float"), std::string::npos);
+        EXPECT_EQ(workspace.find("ROUTE_INDICES"), std::string::npos);
+        EXPECT_EQ(workspace.find("ROUTE_WEIGHTS"), std::string::npos);
+
+        EXPECT_NE(
+            cuda_kernel.find(
+                "expert_indices[out] = static_cast<float>(selected[k])"),
+            std::string::npos)
+            << "CUDA softmax/top-k must publish final FP32 expert IDs";
+        EXPECT_NE(
+            rocm_kernel.find(
+                "out_idx[slot] = static_cast<float>(selected_ids[slot])"),
+            std::string::npos)
+            << "ROCm softmax/top-k must publish final FP32 expert IDs";
+
+        auto method_region = [](
+                                 const std::string &contents,
+                                 const std::string &begin_token,
+                                 const std::string &end_token)
+        {
+            const size_t begin = contents.find(begin_token);
+            if (begin == std::string::npos)
+                return std::string{};
+            const size_t end = contents.find(end_token, begin + begin_token.size());
+            return contents.substr(
+                begin,
+                end == std::string::npos ? std::string::npos : end - begin);
+        };
+
+        const std::array<std::tuple<std::string, std::string, const char *>, 4>
+            publication_regions = {{
+                {method_region(
+                     cuda_owner,
+                     "bool CUDAMoEKernel::routeWithTensorsImpl(",
+                     "bool CUDAMoEKernel::routeWithTensors("),
+                 "cudaMemcpyDeviceToDevice",
+                 "CUDA routeWithTensors"},
+                {method_region(
+                     cuda_owner,
+                     "bool CUDAMoEKernel::routeVerifierRowsDecodeEquivalent(",
+                     "bool CUDAMoEKernel::decodeRouteSelect("),
+                 "cudaMemcpyDeviceToDevice",
+                 "CUDA verifier routing"},
+                {method_region(
+                     rocm_owner,
+                     "bool ROCmMoEKernel::routeWithTensorsImpl(",
+                     "bool ROCmMoEKernel::routeWithTensors("),
+                 "hipMemcpyDeviceToDevice",
+                 "ROCm routeWithTensors"},
+                {method_region(
+                     rocm_owner,
+                     "bool ROCmMoEKernel::routeVerifierRowsDecodeEquivalent(",
+                     "bool ROCmMoEKernel::decodeRouteSelect("),
+                 "hipMemcpyDeviceToDevice",
+                 "ROCm verifier routing"},
+            }};
+        for (const auto &[region, forbidden_copy, label] : publication_regions)
+        {
+            ASSERT_FALSE(region.empty()) << label << " source region missing";
+            EXPECT_EQ(region.find(forbidden_copy), std::string::npos)
+                << label << " must not republish route weights through D2D copy";
+        }
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DeviceRebalanceTransferBackedPlansAreNotReadyBeforeCopy)

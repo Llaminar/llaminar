@@ -34,7 +34,7 @@
 #ifdef HAVE_CUDA
 extern "C" bool cudaMoE_softmax_topk(
     float *logits,
-    int *expert_indices,
+    float *expert_indices,
     float *expert_weights,
     int seq_len,
     int num_experts,
@@ -157,7 +157,7 @@ namespace
         }
 
         CudaPerfBuffer logits(logits_count * sizeof(float));
-        CudaPerfBuffer indices(topk_count * sizeof(int));
+        CudaPerfBuffer indices(topk_count * sizeof(float));
         CudaPerfBuffer weights(topk_count * sizeof(float));
         CudaPerfBuffer effective_rows(sizeof(int));
         ASSERT_EQ(
@@ -185,7 +185,7 @@ namespace
         {
             return cudaMoE_softmax_topk(
                 static_cast<float *>(logits.get()),
-                static_cast<int *>(indices.get()),
+                static_cast<float *>(indices.get()),
                 static_cast<float *>(weights.get()),
                 launch_rows,
                 kNumExperts,

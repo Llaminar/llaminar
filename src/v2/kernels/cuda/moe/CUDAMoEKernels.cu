@@ -40,6 +40,15 @@ namespace
     constexpr int kDeviceMoEMaxExperts = 256;
     constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
     constexpr int kDeviceMoESmallGroupMaxSlots = 64;
+    /**
+     * Maximum route-table width owned by one runtime grouping block.
+     *
+     * The production MTP contract admits up to fifteen draft tokens plus the
+     * target bonus row. Qwen's eight routed experts per token therefore require
+     * at most 128 slots, while the extended M=31 regression requires 248. One
+     * 256-thread block covers both without inter-block ordering or atomics.
+     */
+    constexpr int kDeviceMoERuntimeSmallGroupMaxSlots = 256;
     constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kMaxTopK = 16;
     constexpr uint8_t kMixedCodebookSentinel = 0xffu;
@@ -11319,7 +11328,7 @@ namespace
 
     __global__ void softmax_topk_kernel(
         float *__restrict__ logits,
-        int *__restrict__ expert_indices,
+        float *__restrict__ expert_indices,
         float *__restrict__ expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
@@ -11342,7 +11351,7 @@ namespace
                 for (int k = 0; k < top_k; ++k)
                 {
                     const size_t out = static_cast<size_t>(token) * top_k + k;
-                    expert_indices[out] = -1;
+                    expert_indices[out] = -1.0f;
                     expert_weights[out] = 0.0f;
                 }
             }
@@ -11434,7 +11443,7 @@ namespace
             for (int k = 0; k < top_k; ++k)
             {
                 const size_t out = static_cast<size_t>(token) * top_k + k;
-                expert_indices[out] = selected[k];
+                expert_indices[out] = static_cast<float>(selected[k]);
                 expert_weights[out] =
                     normalize_weights && selected_sum > 0.0f
                         ? selected_weights[k] / selected_sum
@@ -11647,13 +11656,6 @@ namespace
                 }
             }
         }
-    }
-
-    __global__ void int_to_float_kernel(const int *__restrict__ input, float *__restrict__ output, int count)
-    {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < count)
-            output[idx] = static_cast<float>(input[idx]);
     }
 
     __global__ void float_to_int_kernel(const float *__restrict__ input, int *__restrict__ output, int count)
@@ -12234,108 +12236,6 @@ namespace
             scratch);
     }
 
-    /**
-     * @brief Build the deterministic route-slot to grouped-slot map for runtime prefill.
-     *
-     * LLEP runtime grouping stores route slots, not token ids, in grouped_token_ids.
-     * The ordered grouped-prefill scatter needs the inverse map so it can replay a
-     * token's top-k router choices in original route order instead of depending on
-     * atomicAdd scheduling.  Any malformed grouped row traps immediately because a
-     * corrupted map would silently publish numerically unstable MoE output.
-     */
-    __global__ void build_runtime_original_to_grouped_kernel(
-        const DeviceMoELayerRuntimeView *__restrict__ runtime,
-        int *__restrict__ original_to_grouped,
-        int current_slots,
-        int max_slots,
-        int num_experts)
-    {
-        const int expert = blockIdx.x;
-        if (!runtime || !original_to_grouped ||
-            current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-            runtime->active_bank > 1u ||
-            runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
-            !runtime->route_expert_ids ||
-            !runtime->route_participant_ids ||
-            !runtime->expert_counts ||
-            !runtime->expert_offsets ||
-            !runtime->grouped_token_ids)
-        {
-            if (expert == 0 && threadIdx.x == 0)
-            {
-                printf("runtime_original_to_grouped_invalid_contract "
-                       "current_slots=%d max_slots=%d num_experts=%d route_capacity=%u "
-                       "route_experts=%p route_participants=%p counts=%p offsets=%p grouped=%p\\n",
-                       current_slots,
-                       max_slots,
-                       num_experts,
-                       runtime ? runtime->prefill_route_capacity : 0u,
-                       runtime ? runtime->route_expert_ids : nullptr,
-                       runtime ? runtime->route_participant_ids : nullptr,
-                       runtime ? runtime->expert_counts : nullptr,
-                       runtime ? runtime->expert_offsets : nullptr,
-                       runtime ? runtime->grouped_token_ids : nullptr);
-            }
-            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                "runtime original-to-grouped map has an invalid device contract");
-            return;
-        }
-        if (expert >= num_experts)
-            return;
-
-        const int count = runtime->expert_counts[expert];
-        const int offset = runtime->expert_offsets[expert];
-        if (count < 0 || offset < 0 || offset + count > max_slots)
-        {
-            if (threadIdx.x == 0)
-            {
-                printf("runtime_original_to_grouped_invalid_expert_range "
-                       "participant=%u expert=%d count=%d offset=%d max_slots=%d\\n",
-                       runtime->participant_id,
-                       expert,
-                       count,
-                       offset,
-                       max_slots);
-            }
-            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                "runtime grouped expert range exceeds the published route capacity");
-            return;
-        }
-
-        const int local_participant = static_cast<int>(runtime->participant_id);
-        for (int row = threadIdx.x; row < count; row += blockDim.x)
-        {
-            const int grouped_slot = offset + row;
-            const int route_slot = runtime->grouped_token_ids[grouped_slot];
-            if (route_slot < 0 ||
-                route_slot >= current_slots ||
-                route_slot >= max_slots ||
-                runtime->route_expert_ids[route_slot] != expert ||
-                runtime->route_participant_ids[route_slot] != local_participant)
-            {
-                printf("runtime_original_to_grouped_invalid_row "
-                       "participant=%u expert=%d row=%d grouped_slot=%d route_slot=%d "
-                       "route_expert=%d route_participant=%d\\n",
-                       runtime->participant_id,
-                       expert,
-                       row,
-                       grouped_slot,
-                       route_slot,
-                       (route_slot >= 0 && route_slot < max_slots)
-                           ? runtime->route_expert_ids[route_slot]
-                           : -1,
-                       (route_slot >= 0 && route_slot < max_slots)
-                           ? runtime->route_participant_ids[route_slot]
-                           : -1);
-                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                    "runtime grouped route row does not match its original route slot");
-                return;
-            }
-            original_to_grouped[route_slot] = grouped_slot;
-        }
-    }
-
     __global__ void scatter_tokens_deterministic_kernel(
         const int *__restrict__ routing_indices,
         const float *__restrict__ routing_weights,
@@ -12513,6 +12413,7 @@ namespace
 
     __global__ void prefill_group_clear_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
+        int *__restrict__ original_to_grouped,
         int max_slots,
         int num_experts,
         int clear_route_metadata)
@@ -12539,6 +12440,8 @@ namespace
                 runtime->grouped_token_ids[idx] = 0;
             if (runtime->grouped_route_weights)
                 runtime->grouped_route_weights[idx] = 0.0f;
+            if (original_to_grouped)
+                original_to_grouped[idx] = -1;
         }
     }
 
@@ -12574,6 +12477,245 @@ namespace
                (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
                desc.local_slot >= 0 &&
                rebalance_expert_desc_ready(desc);
+    }
+
+    /**
+     * @brief Publish a complete verifier-sized runtime grouping transaction.
+     *
+     * One block owns every route slot and every expert. The initial-grouping
+     * specialization first converts FP32 router ids into the runtime route
+     * ledger; the regrouping specialization consumes participant assignments
+     * already written by the LLEP planner. Both specializations then derive
+     * exact integer counts, ascending-expert offsets, stable grouped rows, and
+     * the inverse original-to-grouped map in one launch.
+     *
+     * Stable route order is part of MTP correctness. A route thread computes its
+     * destination by counting earlier local routes to the same expert, exactly
+     * matching serial traversal. Every output has one writer, no floating-point
+     * reduction is reordered, and no atomic participates in this small-M path.
+     *
+     * @tparam PublishRouterInputs Whether this launch owns initial router-output
+     *         conversion (`true`) or post-LLEP regrouping (`false`).
+     */
+    template <bool PublishRouterInputs>
+    __global__ void prefill_group_small_runtime_kernel(
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const float *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        int *__restrict__ original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit)
+    {
+        __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
+        __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
+        __shared__ float shared_route_weights[kDeviceMoERuntimeSmallGroupMaxSlots];
+        __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
+
+        const int tid = static_cast<int>(threadIdx.x);
+        const bool invalid_contract =
+            !runtime || !original_to_grouped ||
+            current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+            max_slots > kDeviceMoERuntimeSmallGroupMaxSlots ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
+            runtime->active_bank > 1u ||
+            runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
+            !runtime->route_expert_ids || !runtime->route_weights ||
+            !runtime->route_participant_ids || !runtime->expert_counts ||
+            !runtime->expert_offsets || !runtime->grouped_token_ids ||
+            !runtime->grouped_route_weights ||
+            (retain_routes_for_deferred_commit != 0 &&
+             (!runtime->deferred_verifier_route_expert_ids ||
+              !runtime->deferred_verifier_route_participant_ids ||
+              runtime->deferred_verifier_route_capacity <
+                  static_cast<uint32_t>(current_slots)));
+        if (invalid_contract)
+        {
+            if (tid == 0)
+            {
+                printf("runtime_small_group_invalid_contract "
+                       "publish_inputs=%d current_slots=%d max_slots=%d "
+                       "num_experts=%d top_k=%d route_capacity=%u deferred_capacity=%u\n",
+                       PublishRouterInputs ? 1 : 0,
+                       current_slots,
+                       max_slots,
+                       num_experts,
+                       top_k,
+                       runtime ? runtime->prefill_route_capacity : 0u,
+                       runtime ? runtime->deferred_verifier_route_capacity : 0u);
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "verifier-sized runtime grouping has an invalid device contract");
+            }
+            return;
+        }
+
+        if (tid < num_experts)
+        {
+            shared_expert_counts[tid] = 0;
+            runtime->expert_counts[tid] = 0;
+            runtime->expert_offsets[tid] = 0;
+        }
+
+        if (tid < max_slots)
+        {
+            runtime->grouped_token_ids[tid] = 0;
+            runtime->grouped_route_weights[tid] = 0.0f;
+            original_to_grouped[tid] = -1;
+
+            int expert_id = -1;
+            float route_weight = 0.0f;
+            int participant_id = -1;
+            if (tid < current_slots)
+            {
+                if constexpr (PublishRouterInputs)
+                {
+                    expert_id = static_cast<int>(routing_indices[tid]);
+                    route_weight = routing_weights[tid];
+                    if (expert_id < 0 || expert_id >= num_experts)
+                    {
+                        expert_id = -1;
+                        route_weight = 0.0f;
+                    }
+                    else if (filter_to_local_runtime_experts != 0 &&
+                             !prefill_static_local_runtime_ready(
+                                 runtime,
+                                 expert_id,
+                                 num_experts))
+                    {
+                        // Preserve the selected expert while excluding local work.
+                        route_weight = 0.0f;
+                    }
+                    else
+                    {
+                        participant_id = static_cast<int>(runtime->participant_id);
+                    }
+
+                    runtime->route_expert_ids[tid] = expert_id;
+                    runtime->route_weights[tid] = route_weight;
+                    runtime->route_participant_ids[tid] = participant_id;
+                }
+                else
+                {
+                    expert_id = runtime->route_expert_ids[tid];
+                    route_weight = runtime->route_weights[tid];
+                    participant_id = runtime->route_participant_ids[tid];
+                }
+
+                if (retain_routes_for_deferred_commit != 0)
+                {
+                    runtime->deferred_verifier_route_expert_ids[tid] = expert_id;
+                    runtime->deferred_verifier_route_participant_ids[tid] =
+                        participant_id;
+                }
+            }
+            else if constexpr (PublishRouterInputs)
+            {
+                runtime->route_expert_ids[tid] = -1;
+                runtime->route_weights[tid] = 0.0f;
+                runtime->route_participant_ids[tid] = -1;
+            }
+
+            shared_route_experts[tid] = expert_id;
+            shared_route_weights[tid] = route_weight;
+            shared_route_participants[tid] = participant_id;
+        }
+        __syncthreads();
+
+        const int local_participant = static_cast<int>(runtime->participant_id);
+        if (tid < num_experts)
+        {
+            int count = 0;
+            for (int slot = 0; slot < current_slots; ++slot)
+            {
+                count += shared_route_experts[slot] == tid &&
+                                 shared_route_participants[slot] == local_participant
+                             ? 1
+                             : 0;
+            }
+            shared_expert_counts[tid] = count;
+        }
+        __syncthreads();
+
+        if (tid < num_experts)
+        {
+            int offset = 0;
+            for (int expert = 0; expert < tid; ++expert)
+                offset += shared_expert_counts[expert];
+            runtime->expert_counts[tid] = shared_expert_counts[tid];
+            runtime->expert_offsets[tid] = offset;
+        }
+        __syncthreads();
+
+        if (tid < current_slots)
+        {
+            const int expert_id = shared_route_experts[tid];
+            if (expert_id >= 0 && expert_id < num_experts &&
+                shared_route_participants[tid] == local_participant)
+            {
+                int stable_local_rank = 0;
+                for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+                {
+                    stable_local_rank +=
+                        shared_route_experts[previous_slot] == expert_id &&
+                                shared_route_participants[previous_slot] == local_participant
+                            ? 1
+                            : 0;
+                }
+                const int destination =
+                    runtime->expert_offsets[expert_id] + stable_local_rank;
+                runtime->grouped_token_ids[destination] = tid;
+                runtime->grouped_route_weights[destination] =
+                    shared_route_weights[tid];
+                original_to_grouped[tid] = destination;
+            }
+        }
+        __syncthreads();
+
+        /*
+         * The former multi-launch grouping path validated this inverse map in a
+         * separate kernel. Fusion must retain that fatal contract: a duplicate
+         * destination, bad offset, or stale grouped row would otherwise feed a
+         * different activation to the ordered verifier GEMM. Every route lane
+         * checks its own expected membership after all grouped rows are visible,
+         * proving that the two maps form a bijection without another launch.
+         */
+        if (tid < current_slots)
+        {
+            const int expert_id = shared_route_experts[tid];
+            const int participant_id = shared_route_participants[tid];
+            const bool should_be_local =
+                expert_id >= 0 && expert_id < num_experts &&
+                participant_id == local_participant;
+            const int grouped_slot = original_to_grouped[tid];
+            const bool valid_mapping =
+                should_be_local
+                    ? grouped_slot >= 0 && grouped_slot < max_slots &&
+                          runtime->grouped_token_ids[grouped_slot] == tid &&
+                          runtime->route_expert_ids[tid] == expert_id &&
+                          runtime->route_participant_ids[tid] == local_participant
+                    : grouped_slot == -1;
+            if (!valid_mapping)
+            {
+                printf("runtime_small_group_invalid_row "
+                       "participant=%d route_slot=%d grouped_slot=%d "
+                       "expert=%d route_participant=%d grouped_route_slot=%d\n",
+                       local_participant,
+                       tid,
+                       grouped_slot,
+                       expert_id,
+                       participant_id,
+                       grouped_slot >= 0 && grouped_slot < max_slots
+                           ? runtime->grouped_token_ids[grouped_slot]
+                           : -1);
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime grouped route row does not match its original route slot");
+            }
+        }
     }
 
     __global__ void prefill_group_cast_count_runtime_kernel(
@@ -12638,6 +12780,18 @@ namespace
             runtime->deferred_verifier_route_expert_ids[slot] = expert_id;
             runtime->deferred_verifier_route_participant_ids[slot] =
                 participant_id;
+        }
+        /*
+         * The scalable regime folds counting into route publication. Counts are
+         * integers, so atomic arrival order cannot alter the result or the later
+         * stable route ordering. The preceding clear launch is the graph edge
+         * that makes every counter available before this publication begins.
+         */
+        if (expert_id >= 0 &&
+            expert_id < num_experts &&
+            participant_id == static_cast<int>(runtime->participant_id))
+        {
+            atomicAdd(runtime->expert_counts + expert_id, 1);
         }
     }
 
@@ -12763,6 +12917,7 @@ namespace
      */
     __global__ void prefill_group_scan_scatter_deterministic_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
+        int *__restrict__ original_to_grouped,
         int current_slots,
         int max_slots,
         int num_experts,
@@ -12771,7 +12926,8 @@ namespace
         const int expert = blockIdx.x;
         if (!runtime || expert >= num_experts)
             return;
-        if (!runtime->route_expert_ids || !runtime->route_weights ||
+        if (!original_to_grouped ||
+            !runtime->route_expert_ids || !runtime->route_weights ||
             !runtime->route_participant_ids ||
             !runtime->expert_offsets || !runtime->expert_counts ||
             !runtime->grouped_token_ids || !runtime->grouped_route_weights)
@@ -12848,6 +13004,7 @@ namespace
                 {
                     runtime->grouped_token_ids[dest] = slot;
                     runtime->grouped_route_weights[dest] = runtime->route_weights[slot];
+                    original_to_grouped[slot] = dest;
                 }
             }
             __syncthreads();
@@ -16290,7 +16447,7 @@ extern "C"
         return finishLaunch("cudaMoE_route_logits_bf16");
     }
 
-    bool cudaMoE_softmax_topk(float *logits, int *expert_indices, float *expert_weights,
+    bool cudaMoE_softmax_topk(float *logits, float *expert_indices, float *expert_weights,
                               int seq_len, int num_experts, int top_k, bool normalize_weights,
                               int device_idx, void *stream,
                               const int *device_effective_seq_len)
@@ -17091,13 +17248,6 @@ extern "C"
         return finishLaunch("cudaMoE_apply_ready_rebalance_wave");
     }
 
-    bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream)
-    {
-        cudaSetDevice(device_idx);
-        int_to_float_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(input, output, count);
-        return finishLaunch("cudaMoE_int_to_float");
-    }
-
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -17293,48 +17443,6 @@ extern "C"
         return finishLaunch("cudaMoE_build_active_expert_list");
     }
 
-    bool cudaMoE_build_runtime_original_to_grouped(
-        const void *runtime,
-        int *original_to_grouped,
-        int current_slots,
-        int max_slots,
-        int num_experts,
-        int top_k,
-        int device_idx,
-        void *stream)
-    {
-        if (!runtime || !original_to_grouped || !stream ||
-            current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-            top_k <= 0 || top_k > kMaxTopK)
-        {
-            return false;
-        }
-        cudaSetDevice(device_idx);
-        auto cuda_stream = static_cast<cudaStream_t>(stream);
-        const cudaError_t memset_err =
-            cudaMemsetAsync(
-                original_to_grouped,
-                0xff,
-                static_cast<size_t>(max_slots) * sizeof(int),
-                cuda_stream);
-        if (memset_err != cudaSuccess)
-            return false;
-        build_runtime_original_to_grouped_kernel<<<
-            num_experts,
-            kThreads,
-            0,
-            cuda_stream>>>(
-            static_cast<const DeviceMoELayerRuntimeView *>(runtime),
-            original_to_grouped,
-            current_slots,
-            max_slots,
-            num_experts);
-        return finishGroupedPrefillLaunch(
-            "cudaMoE_build_runtime_original_to_grouped",
-            cuda_stream);
-    }
-
     bool cudaMoE_scatter_tokens(const int *routing_indices, const float *routing_weights,
                                 int *write_heads, const int *expert_offsets,
                                 int *grouped_token_indices, float *grouped_weights,
@@ -17440,6 +17548,7 @@ extern "C"
         const float *routing_indices,
         const float *routing_weights,
         void *runtime,
+        int *original_to_grouped,
         int current_slots,
         int max_slots,
         int num_experts,
@@ -17449,9 +17558,11 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!runtime || !routing_indices || !routing_weights || !stream ||
+        if (!runtime || !routing_indices || !routing_weights ||
+            !original_to_grouped || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK)
         {
             return false;
         }
@@ -17460,9 +17571,27 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
 
+        if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+        {
+            prefill_group_small_runtime_kernel<true><<<
+                1, kThreads, 0, cuda_stream>>>(
+                runtime_view,
+                routing_indices,
+                routing_weights,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                filter_to_local_runtime_experts,
+                retain_routes_for_deferred_commit);
+            return finishGroupedPrefillLaunch(
+                "cudaMoE_prefill_group_small_runtime", cuda_stream);
+        }
+
         const int clear_items = max_slots > num_experts ? max_slots : num_experts;
         prefill_group_clear_runtime_kernel<<<blocksFor(clear_items), kThreads, 0, cuda_stream>>>(
-            runtime_view, max_slots, num_experts, 1);
+            runtime_view, original_to_grouped, max_slots, num_experts, 1);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_clear_runtime", cuda_stream))
             return false;
 
@@ -17474,21 +17603,17 @@ extern "C"
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_cast_count_runtime", cuda_stream))
             return false;
 
-        prefill_group_count_assigned_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts,
-            /*retain_routes_for_deferred_commit=*/0);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_count_assigned_runtime", cuda_stream))
-            return false;
-
         prefill_group_scan_scatter_deterministic_runtime_kernel<<<
             num_experts, kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts, top_k);
+            runtime_view, original_to_grouped,
+            current_slots, max_slots, num_experts, top_k);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_group_scan_scatter_runtime", cuda_stream);
     }
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
+        int *original_to_grouped,
         int current_slots,
         int max_slots,
         int num_experts,
@@ -17497,9 +17622,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!runtime || !stream ||
+        if (!runtime || !original_to_grouped || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
-            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK)
         {
             return false;
         }
@@ -17508,9 +17634,27 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
 
+        if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
+        {
+            prefill_group_small_runtime_kernel<false><<<
+                1, kThreads, 0, cuda_stream>>>(
+                runtime_view,
+                nullptr,
+                nullptr,
+                original_to_grouped,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k,
+                /*filter_to_local_runtime_experts=*/0,
+                retain_routes_for_deferred_commit);
+            return finishGroupedPrefillLaunch(
+                "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
+        }
+
         const int clear_items = max_slots > num_experts ? max_slots : num_experts;
         prefill_group_clear_runtime_kernel<<<blocksFor(clear_items), kThreads, 0, cuda_stream>>>(
-            runtime_view, max_slots, num_experts, 0);
+            runtime_view, original_to_grouped, max_slots, num_experts, 0);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_clear_runtime", cuda_stream))
             return false;
 
@@ -17522,7 +17666,8 @@ extern "C"
 
         prefill_group_scan_scatter_deterministic_runtime_kernel<<<
             num_experts, kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts, top_k);
+            runtime_view, original_to_grouped,
+            current_slots, max_slots, num_experts, top_k);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_regroup_scan_scatter_runtime", cuda_stream);
     }

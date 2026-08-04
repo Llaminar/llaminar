@@ -1,7 +1,7 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA and ROCm. Keep this under 6 KB;
-put implementation detail in project handoffs.
+Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm. Keep implementation
+detail in project handoffs.
 
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
 failing or not yet proven. Token equality alone is not verifier parity proof.
@@ -10,16 +10,15 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 | Goal | Completion | Remaining proof |
 |---|---:|---|
-| SingleDevice fully device-resident MTP | 97% | refresh d1 economy and full stochastic matrix |
-| LocalTP fully device-resident MTP | 99% | remote-participant and economy matrix |
+| SingleDevice fully device-resident MTP | 97% | refresh d1 economy and stochastic matrix |
+| LocalTP fully device-resident MTP | 99% | remote participants and economy matrix |
 | ExpertParallel fully device-resident MTP | 97% | mirrored-head batching across every EP mode |
 
 - Homogeneous CUDA/ROCm execution is full-graph only. Device parameters select
-  regimes inside one immutable capture; attention does not request recapture.
-- GPU KV append, TurboQuant conversion, verifier publication, and compact
-  NCCL/RCCL broadcast use planned persistent workspace and explicit
-  producer/consumer event ordering. Hot paths contain no allocation, blocking
-  synchronization, segmented execution, or full-logits host observation.
+  regimes inside one immutable capture; attention never requests recapture.
+- GPU KV append, TurboQuant, verifier publication, and collectives use
+  persistent workspace and explicit events. Hot paths have no allocation,
+  blocking sync, segmentation, or intermediate host observation.
 - Prefix restore preserves graph addresses through producer events. GPU
   FFN/MTP APIs reject null publication streams.
 
@@ -30,62 +29,53 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 | SingleDevice | CPU | R/R | A/A | refresh paused |
 | SingleDevice | CUDA | A/G | A/R | dense d3 wins; d1/MoE need tuning |
 | SingleDevice | ROCm | A/A | A/A | dense d3 wins; d1/MoE need tuning |
-| LocalTP | CUDA2 | A/A | A/A | Dynamic/LLEP full matrix green; perf pending |
-| LocalTP | ROCm2 | A/A | A/A | Dynamic/LLEP full matrix green; perf pending |
+| LocalTP | CUDA2 | A/A | A/A | Dynamic/LLEP matrix green; perf active |
+| LocalTP | ROCm2 | A/A | A/A | Dynamic/LLEP matrix green; perf pending |
 | LocalTP | ROCm4 | A/R | R/R | full refresh pending |
 | NodeLocalTP | CPU2 | A/A | R/R | dense E2E green; MoE/perf pending |
 | ExpertParallel | GPU+CPU | A/R | G/R | Dynamic/LLEP greedy+prefix green |
 
-## Fresh Correctness Proofs
+## Correctness Proof
 
-- All-format grouped attention/TurboQuant sweeps are serial-row byte exact on
-  CPU, CUDA, and ROCm through the production M range.
-- CUDA/ROCm MoE routing, GDN, short-conv, stochastic target preparation, and
-  draft publication are byte-exact through their production M/depth ranges.
-- Release CUDA2/ROCm2 pass all eight Dynamic/LLEP cells and `166/166` checks
+- All-format grouped attention, TurboQuant, MoE routing, GDN, short-conv,
+  stochastic target preparation, and draft publication sweeps are serial-row
+  byte exact on their production backends and M ranges.
+- CUDA MoE grouped verifier passed every native format at M=2..16 and M=31
+  through the real router/expert path after the small-M grouping fusion.
+- Release CUDA2/ROCm2 passed all eight Dynamic/LLEP cells and `166/166` checks
   through 2048 tokens with full capture and clean VRAM release.
-- Latest Release CUDA2 Dynamic stochastic d4..15 + RAM-prefix E2E is `23/23`
-  green at 4096 context and 2048 output tokens; LLEP covers 1024.
-- CUDA2 phase-split fixed-d3 native-parent replay is same-seed exact after
-  clear/reuse. PerfStats proves one captured conditional maintenance fragment
-  executes when due and skips ordinary transactions; final outputs replicate.
-- CUDA2 LLEP stochastic d3 remains green after the grouped-MoE/NativeVNNI
-  geometry changes. The live long-context E2E completed in `56.6 s` with full
-  graph capture and the canonical device-residency/PerfStats assertions.
+- Release CUDA2 LLEP + RAM prefix + stochastic dynamic d4..15 passed `23/23`
+  canonical server checks at context 4096 and 1024 output tokens.
+  This includes deterministic prefix replay, forced movement, long recall,
+  prefill replay, no segmented execution, clean shutdown, and PerfStats path
+  assertions.
 
-## Kernel Economy
+## CUDA LLEP Economy
 
-- Stable LocalTP2 graph replay medians:
-  CUDA KV32 `9.196 us`, KV16384 `107.167 us`;
-  ROCm KV32 `24.454 us`, KV16384 `380.806 us`.
-- Deterministic MoE route planner: CUDA `3.392 us` versus `22.212 us`
-  (`6.55x`), 31 registers and zero spills; ROCm `11.2 us`, 16 VGPR, 33 SGPR,
-  1.25 KiB LDS, zero scratch/spills.
-- Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
-  40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
-  32 SGPR, zero scratch, and 90.6% VALU utilization.
-- Release CUDA2 LLEP d3 is `164.72 tok/s` decode and `181.18 tok/s` prefill,
-  up from `128.13 tok/s` decode (`+28.6%`) and `4.13%` short of llama.cpp's
-  `171.81 tok/s`.
-- Cooperative CUDA Top-K 40 reduced the depth-3 target distribution
-  `1.076 ms -> 0.238 ms` and draft distribution `0.920 ms -> 0.214 ms`.
-  Both kernels use 96 registers, 552 B shared memory, and have zero spills;
-  tied candidates and FP32 probabilities are byte exact through `M=16`.
-- The Qwen3.6 MoE expert `N=512,K=2048` grouped projection now selects the
-  byte-exact `64x64` NativeVNNI tile for `M=2..31`. All 21 CUDA formats pass
-  the production-path M-totality sweep; affected formats gain `1.69x..2.21x`
-  in the isolated kernel. Nsight reports zero spills and 168 registers, but
-  only eight CTAs (`8.33%` achieved occupancy), exposing the next geometry
-  target rather than hiding it behind split-K, which is not byte exact.
-- The CUDA GDN recurrence now uses one fixed eight-part K reduction for serial
-  and grouped rows. It is byte-exact through `M=31`; at `d_k=d_v=128` it fell
-  from `35.52 us` to `17.73 us`: `30.6%` occupancy, `541 GB/s`, 90 registers,
-  zero spills. Grouped `M=16` is `1.50x` faster than serial launches.
-- Decode-replicated phase-split is `2.22x` faster than apportioned continuation;
-  it is the fixed-depth control before dynamic-depth tuning.
-- On this non-P2P RTX 3090 topology, graph-captured NCCL rooted
-  reduce+broadcast at verifier `M=5` costs about `941 us/layer`; collective
-  count, payload, and overlap are the immediate Nsight economy targets.
+- Fixed-d3 control: Qwen3.6-35B-A3B IQ3_S, stochastic sampling, fixed prompt,
+  425 prefill + 256 decode tokens, three iterations after one warmup.
+- Stable M=4 grouping removed four launches/layer and moved verifier compute
+  nodes `1536 -> 1376` per device. Direct FP32 route publication then removed
+  one conversion kernel plus one memcpy/layer: compute nodes are now `1336`,
+  captured prefill graphs are 80 total nodes/device smaller, and the native hot
+  transaction is `1403` kernels including 67 NCCL/control sidecars.
+- Isolated M=4 grouping is `5.99 us`: 38 registers/thread, 4.10 KiB shared,
+  zero spills, and 100% theoretical per-SM
+  occupancy. Achieved whole-GPU occupancy is intentionally low for this single
+  dependency block; splitting it would restore launch/dependency overhead.
+- Matched decode improved `156.97 -> 164.93 -> 165.92 tok/s`; acceptance stayed
+  `61.57%` with zero validation failures. Prefill is `179.51 tok/s`; decode is
+  `3.43%` below the historical `171.81 tok/s` promotion target.
+- Direct CUDA router publication is 40 registers, zero spills, 100% theoretical
+  and 83% achieved occupancy. ROCm is 18 VGPR with no scratch or spills.
+- Cooperative CUDA Top-K 40 cut target/draft distribution to `0.238/0.214 ms`;
+  it is spill-free and byte exact through M=16.
+- Qwen `N=512,K=2048` grouped projection is byte exact across all 21 CUDA
+  formats at M=2..31 and gains `1.69x..2.21x`; its eight-CTA geometry remains a target.
+- CUDA GDN is byte exact through M=31; at `d_k=d_v=128` it reaches `17.73 us`,
+  541 GB/s, and zero spills.
+- This RTX 3090 pair has no peer access; mirrored verification avoids its
+  measured `941 us/layer` rooted M=5 NCCL collective.
 
 Matched llama.cpp master comparison, tok/s:
 
@@ -96,13 +86,30 @@ Matched llama.cpp master comparison, tok/s:
 | ROCm dense 27B | `20.08/25.15` | `39.28/22.66` |
 | ROCm MoE 35B | `46.33/73.93` | `74.94/95.84` |
 
+### Reproducible llama.cpp CUDA Reference
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  /workspaces/llama.cpp-reference/build-cuda/bin/llama-cli \
+  -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 3 \
+  -f /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed.txt \
+  -n 256 -c 4096 -ngl all --split-mode none --main-gpu 0 --fit off \
+  --flash-attn on --seed 123 --temp 0.8 --top-k 40 --top-p 0.9 --min-p 0 \
+  --repeat-penalty 1 --dry-multiplier 0 --perf \
+  --conversation --single-turn --no-display-prompt
+```
+
+On llama.cpp `5788b51`, three runs gave a `155.4 tok/s` decode median and
+`1122.5 tok/s` prefill median. Promotion retains the stricter historical
+`171.81 tok/s` decode target and requires at least `2245 tok/s` prefill.
+
 ## Next Gates
 
-1. Profile fixed-d3 CUDA LLEP end to end; reduce/overlap rooted collectives and
-   tune every dominant kernel until decode exceeds llama.cpp `171.81 tok/s`.
-   Tune dynamic depth and hysteresis only after this fixed control is economical.
-2. Run the remaining full-context CPU matrix, then close remote-participant
-   lifetime and mirrored-head request batching for
-   every LocalTP and ExpertParallel mode.
-3. Tune d1 attention/GEMV and MoE grouped FFN until SingleDevice is at least
-   llama.cpp economy, preserving byte equality and the device-owned graph.
+1. Keep native geometry for large kernels and fuse adjacent tiny/control work.
+   `V2_Perf_CUDAPersistentVerifierGeometry` found a one-kernel CTA proxy `1.25x`
+   faster, but full-lane/ALU8 proxies only `0.964x/0.952x`; ncu attributes
+   `63-68%` of issue stalls to cooperative barriers. Zero spills.
+2. Exceed `171.81 tok/s` on fixed d3, then tune dynamic depth/hysteresis through
+   depth 15 under deterministic prompt scenarios.
+3. Repeat the economy pass for ROCm and the remaining SingleDevice/EP lanes.

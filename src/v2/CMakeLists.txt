@@ -465,10 +465,12 @@ if(HAVE_CUDA)
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
+    # - cuda_driver: uniform graph metadata inspection for runtime and NCCL nodes
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
+        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt
     )

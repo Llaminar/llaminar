@@ -139,6 +139,123 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Publish one captured transaction fragment's kernel inventory.
+         *
+         * Inventory is opt-in and runs only while a new parent graph is being
+         * materialized. The backend walk reads native graph metadata; it does not
+         * launch a second execution path, synchronize, allocate device memory, or
+         * transfer device data. Repeated nodes deliberately share the same
+         * PerfStats key, so the record value/count is the exact multiplicity of a
+         * kernel geometry in this semantic fragment and transaction-depth branch.
+         *
+         * @param capture Captured source graph to inspect.
+         * @param fragment_name Declarative producer role in the MTP transaction.
+         * @param transaction_depth Device-selected MTP branch owning the fragment.
+         * @param device Participant whose graph is being composed.
+         * @param error Receives a fatal, actionable inspection diagnostic.
+         * @return true when instrumentation is disabled or the complete inventory
+         *         was validated and published.
+         */
+        bool publishMTPGraphKernelInventory(
+            const IGPUGraphCapture &capture,
+            const char *fragment_name,
+            int transaction_depth,
+            DeviceId device,
+            std::string &error)
+        {
+            if (!debugEnv().runtime_debug.gpu_graph_kernel_inventory)
+                return true;
+
+            std::vector<GPUGraphKernelNodeInfo> kernel_nodes;
+            std::string inspection_error;
+            if (!capture.inspectKernelNodes(kernel_nodes, &inspection_error))
+            {
+                error = "kernel inventory failed for fragment '" +
+                        std::string(fragment_name ? fragment_name : "unknown") +
+                        "': " + inspection_error;
+                return false;
+            }
+
+            size_t unresolved_names = 0;
+            for (const GPUGraphKernelNodeInfo &node : kernel_nodes)
+            {
+                if (!node.valid())
+                {
+                    error = "kernel inventory returned invalid launch geometry for fragment '" +
+                            std::string(fragment_name ? fragment_name : "unknown") +
+                            "' at " + node.graph_path;
+                    return false;
+                }
+                unresolved_names += node.name_resolved ? 0u : 1u;
+
+                const std::string grid =
+                    std::to_string(node.grid_x) + "x" +
+                    std::to_string(node.grid_y) + "x" +
+                    std::to_string(node.grid_z);
+                const std::string block =
+                    std::to_string(node.block_x) + "x" +
+                    std::to_string(node.block_y) + "x" +
+                    std::to_string(node.block_z);
+                PerfStatsCollector::Tags tags{
+                    {"backend", capture.backendName()},
+                    {"fragment", fragment_name ? fragment_name : "unknown"},
+                    {"transaction_depth", std::to_string(transaction_depth)},
+                    {"kernel", node.name},
+                    {"grid", grid},
+                    {"block", block},
+                    {"dynamic_smem_bytes",
+                     std::to_string(node.dynamic_shared_memory_bytes)},
+                    {"static_smem_bytes",
+                     std::to_string(node.static_shared_memory_bytes)},
+                    {"local_bytes_per_thread",
+                     std::to_string(node.local_memory_bytes_per_thread)},
+                    {"registers_per_thread",
+                     std::to_string(node.registers_per_thread)},
+                    {"max_threads_per_block",
+                     std::to_string(node.max_threads_per_block)},
+                    {"max_active_blocks_per_sm",
+                     std::to_string(node.max_active_blocks_per_sm)},
+                    {"nesting_depth", std::to_string(node.nesting_depth)},
+                    {"name_resolved", node.name_resolved ? "true" : "false"},
+                };
+                if (!node.name_resolved)
+                {
+                    tags.emplace(
+                        "function_identity",
+                        std::to_string(node.function_identity));
+                }
+                PerfStatsCollector::addCounter(
+                    "gpu_graph_inventory",
+                    "kernel_nodes",
+                    1.0,
+                    "graph_setup",
+                    device.toString(),
+                    std::move(tags));
+            }
+
+            PerfStatsCollector::addCounter(
+                "gpu_graph_inventory",
+                "fragment_kernel_nodes",
+                static_cast<double>(kernel_nodes.size()),
+                "graph_setup",
+                device.toString(),
+                {{"backend", capture.backendName()},
+                 {"fragment", fragment_name ? fragment_name : "unknown"},
+                 {"transaction_depth", std::to_string(transaction_depth)},
+                 {"unresolved_names", std::to_string(unresolved_names)}});
+            PerfStatsCollector::addCounter(
+                "gpu_graph_inventory",
+                "fragment_native_nodes",
+                static_cast<double>(capture.nodeCount()),
+                "graph_setup",
+                device.toString(),
+                {{"backend", capture.backendName()},
+                 {"fragment", fragment_name ? fragment_name : "unknown"},
+                 {"transaction_depth", std::to_string(transaction_depth)}});
+            return true;
+        }
+
         constexpr size_t kStochasticDistributionMaxK = 256;
         constexpr size_t kStochasticTopKSmallKCap = 64;
         constexpr size_t kStochasticTopKPartialBlocks = 128;
@@ -16277,6 +16394,15 @@ namespace llaminar2
             return fail(
                 "device-generation parent graph assembled an unexpected fragment count");
         }
+
+        /*
+         * Keep semantic graph attribution beside the declarative branch table.
+         * Walking source captures here gives each kernel its producer role and
+         * depth before native WHILE/SWITCH composition erases that distinction.
+         * It also runs only for a new executable: the reuse return above occurs
+         * after source identity is checked, while publication is intentionally
+         * placed below that check and immediately before graph construction.
+         */
         const size_t conditional_fragment_count =
             static_cast<size_t>(std::count_if(
                 mtp_device_generation_loop_fragment_scratch_.begin(),
@@ -16336,6 +16462,36 @@ namespace llaminar2
         }
 
         loop.invalidateGraph();
+        if (debugEnv().runtime_debug.gpu_graph_kernel_inventory)
+        {
+            for (int depth = minimum_draft_depth;
+                 depth <= maximum_draft_depth;
+                 ++depth)
+            {
+                const size_t branch_index = static_cast<size_t>(depth);
+                const size_t branch_offset = branch_offsets[branch_index];
+                const size_t branch_count =
+                    branch_fragment_counts[branch_index];
+                for (size_t fragment_index = 0;
+                     fragment_index < branch_count;
+                     ++fragment_index)
+                {
+                    const DeviceControlledLoopFragment &fragment =
+                        mtp_device_generation_loop_fragment_scratch_[
+                            branch_offset + fragment_index];
+                    std::string inventory_error;
+                    if (!publishMTPGraphKernelInventory(
+                            *fragment.capture,
+                            fragment.name,
+                            depth,
+                            state_.device_id,
+                            inventory_error))
+                    {
+                        return fail(inventory_error);
+                    }
+                }
+            }
+        }
         const DeviceControlledLoopPredicate predicate{
             .control_rows_device = device_generation_storage_.control_device,
             .control_stride = device_generation_storage_.control_stride,

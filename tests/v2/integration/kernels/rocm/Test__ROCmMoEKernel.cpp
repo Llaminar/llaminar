@@ -136,9 +136,9 @@ extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     int *tile_m,
     int *tile_n);
 
-extern "C" bool hipMoE_softmax_topk(
-    float *logits,
-    int *expert_indices, float *expert_weights,
+extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
+    const float *logits,
+    float *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
     int device_idx, void *stream,
@@ -19537,7 +19537,7 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
     const DeviceId device = DeviceId::rocm(0);
 
     auto logits = TestTensorFactory::createFP32({seq_len, num_experts});
-    auto indices = TestTensorFactory::createINT32({seq_len, top_k});
+    auto indices = TestTensorFactory::createFP32({seq_len, top_k});
     auto weights = TestTensorFactory::createFP32({seq_len, top_k});
 
     // Row 0 has two equal winner pairs; row 1 is all ties. The expected expert
@@ -19557,9 +19557,9 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
 
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
-    ASSERT_TRUE(hipMoE_softmax_topk(
+    ASSERT_TRUE(hipMoE_softmax_topk_decode_equivalent_rows(
         static_cast<float *>(logits->gpu_data_ptr()),
-        static_cast<int *>(indices->gpu_data_ptr()),
+        static_cast<float *>(indices->gpu_data_ptr()),
         static_cast<float *>(weights->gpu_data_ptr()),
         seq_len,
         num_experts,
@@ -19575,12 +19575,13 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 
-    const int *actual_indices = indices->int32_data();
+    const float *actual_indices = indices->data();
     const float *actual_weights = weights->data();
 
     const int expected_indices[seq_len * top_k] = {2, 4, 1, 7, 0, 1, 2, 3};
     for (int i = 0; i < seq_len * top_k; ++i)
-        EXPECT_EQ(actual_indices[i], expected_indices[i]) << "slot=" << i;
+        EXPECT_FLOAT_EQ(actual_indices[i], static_cast<float>(expected_indices[i]))
+            << "slot=" << i;
 
     const float row0_pair_sum = 2.0f * std::exp(5.0f) + 2.0f * std::exp(4.0f);
     const float expected_row0[4] = {
@@ -19599,7 +19600,7 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
  *
  * Qwen3.6 prefill captures an M=2048 graph for a request whose semantic token
  * count may be smaller.  The launch geometry must never change any active
- * router probability, selected expert, or normalized top-k weight.  This
+ * selected expert or normalized top-k weight.  This
  * regression uses the production 256-expert/top-8 geometry and the original
  * failure's M=1583 boundary, then compares an exact eager launch with a padded
  * captured replay byte-for-byte.
@@ -19647,10 +19648,10 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGra
         bucket_logits_values.begin(),
         bucket_logits_values.end(),
         bucket_logits->mutable_data());
-    auto exact_indices = TestTensorFactory::createINT32(
+    auto exact_indices = TestTensorFactory::createFP32(
         {static_cast<size_t>(real_seq_len),
          static_cast<size_t>(top_k)});
-    auto bucket_indices = TestTensorFactory::createINT32(
+    auto bucket_indices = TestTensorFactory::createFP32(
         {static_cast<size_t>(bucket_seq_len),
          static_cast<size_t>(top_k)});
     auto exact_weights = TestTensorFactory::createFP32(
@@ -19670,9 +19671,9 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGra
     ASSERT_TRUE(bucket_weights->ensureOnDevice(device, stream));
     ASSERT_TRUE(effective_rows->ensureOnDevice(device, stream));
 
-    ASSERT_TRUE(hipMoE_softmax_topk(
+    ASSERT_TRUE(hipMoE_softmax_topk_decode_equivalent_rows(
         static_cast<float *>(exact_logits->gpu_data_ptr()),
-        static_cast<int *>(exact_indices->gpu_data_ptr()),
+        static_cast<float *>(exact_indices->gpu_data_ptr()),
         static_cast<float *>(exact_weights->gpu_data_ptr()),
         real_seq_len,
         num_experts,
@@ -19686,9 +19687,9 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGra
     ASSERT_EQ(
         hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
         hipSuccess);
-    const bool captured = hipMoE_softmax_topk(
+    const bool captured = hipMoE_softmax_topk_decode_equivalent_rows(
         static_cast<float *>(bucket_logits->gpu_data_ptr()),
-        static_cast<int *>(bucket_indices->gpu_data_ptr()),
+        static_cast<float *>(bucket_indices->gpu_data_ptr()),
         static_cast<float *>(bucket_weights->gpu_data_ptr()),
         bucket_seq_len,
         num_experts,
@@ -19710,36 +19711,23 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGra
         hipSuccess);
     ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
 
-    TransferEngine::publishDeviceWrite(exact_logits, device, stream);
     TransferEngine::publishDeviceWrite(exact_indices, device, stream);
     TransferEngine::publishDeviceWrite(exact_weights, device, stream);
-    TransferEngine::publishDeviceWrite(bucket_logits, device, stream);
     TransferEngine::publishDeviceWrite(bucket_indices, device, stream);
     TransferEngine::publishDeviceWrite(bucket_weights, device, stream);
-    ASSERT_TRUE(exact_logits->ensureOnHost(stream));
     ASSERT_TRUE(exact_indices->ensureOnHost(stream));
     ASSERT_TRUE(exact_weights->ensureOnHost(stream));
-    ASSERT_TRUE(bucket_logits->ensureOnHost(stream));
     ASSERT_TRUE(bucket_indices->ensureOnHost(stream));
     ASSERT_TRUE(bucket_weights->ensureOnHost(stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    const size_t active_logits =
-        static_cast<size_t>(real_seq_len) * num_experts;
     const size_t active_topk =
         static_cast<size_t>(real_seq_len) * top_k;
     EXPECT_EQ(
         std::memcmp(
-            exact_logits->data(),
-            bucket_logits->data(),
-            active_logits * sizeof(float)),
-        0)
-        << "active softmax probabilities changed in the padded graph";
-    EXPECT_EQ(
-        std::memcmp(
-            exact_indices->int32_data(),
-            bucket_indices->int32_data(),
-            active_topk * sizeof(int32_t)),
+            exact_indices->data(),
+            bucket_indices->data(),
+            active_topk * sizeof(float)),
         0)
         << "active expert IDs changed in the padded graph";
     EXPECT_EQ(

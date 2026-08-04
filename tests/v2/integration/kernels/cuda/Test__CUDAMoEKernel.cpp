@@ -24,6 +24,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -141,7 +142,7 @@ extern "C" bool cudaMoE_route_logits(
 
 extern "C" bool cudaMoE_softmax_topk(
     float *logits,
-    int *expert_indices,
+    float *expert_indices,
     float *expert_weights,
     int seq_len,
     int num_experts,
@@ -171,13 +172,28 @@ extern "C" bool cudaMoE_materialize_runtime_prefill_plan(
     int device_idx,
     void *stream);
 
-extern "C" bool cudaMoE_build_runtime_original_to_grouped(
-    const void *runtime,
+extern "C" bool cudaMoE_regroup_prefill_routes_runtime_assignments(
+    void *runtime,
     int *original_to_grouped,
     int current_slots,
     int max_slots,
     int num_experts,
     int top_k,
+    int retain_routes_for_deferred_commit,
+    int device_idx,
+    void *stream);
+
+extern "C" bool cudaMoE_group_prefill_routes_runtime(
+    const float *routing_indices,
+    const float *routing_weights,
+    void *runtime,
+    int *original_to_grouped,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int filter_to_local_runtime_experts,
+    int retain_routes_for_deferred_commit,
     int device_idx,
     void *stream);
 
@@ -1882,6 +1898,27 @@ namespace
             };
         }
 
+        /**
+         * @brief Establish the explicit storage boundary for one router launch.
+         *
+         * `routeWithTensors()` is an execution-only API: production graph setup
+         * has already uploaded immutable inputs and allocated stable outputs
+         * before a stage invokes it. Direct kernel integration tests model that
+         * same lifecycle so captured calls contain no allocation or transfer.
+         */
+        void prepareRouteTensorStorage(
+            llaminar2::ITensor *hidden,
+            llaminar2::ITensor *gate,
+            llaminar2::ITensor *indices,
+            llaminar2::ITensor *weights)
+        {
+            const auto device = llaminar2::DeviceId::cuda(0);
+            llaminar2::TransferEngine::prepareDeviceInput(hidden, device, stream_);
+            llaminar2::TransferEngine::prepareDeviceInput(gate, device, stream_);
+            llaminar2::TransferEngine::prepareDeviceOutput(indices, device, stream_);
+            llaminar2::TransferEngine::prepareDeviceOutput(weights, device, stream_);
+        }
+
         cudaStream_t stream_ = nullptr;
         int32_t *device_position_ = nullptr;
         std::unique_ptr<llaminar2::DeviceWorkspaceManager> workspace_;
@@ -2163,12 +2200,18 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticip
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->regroupPrefillRoutesFromRuntimeAssignments(
+    CudaAllocation original_to_grouped(sizeof(int) * total_slots);
+    auto *d_original_to_grouped = static_cast<int *>(original_to_grouped.get());
+    ASSERT_TRUE(cudaMoE_regroup_prefill_routes_runtime_assignments(
         runtime_table.deviceLayerState(0),
-        seq_len,
-        seq_len,
+        d_original_to_grouped,
+        total_slots,
+        total_slots,
         num_experts,
-        top_k));
+        top_k,
+        /*retain_routes_for_deferred_commit=*/0,
+        0,
+        stream_));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     std::array<int32_t, num_experts> counts{};
@@ -2203,17 +2246,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticip
     EXPECT_NEAR(grouped_weights[4], 0.0f, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[5], 0.0f, 1.0e-6f);
 
-    CudaAllocation original_to_grouped(sizeof(int) * total_slots);
-    auto *d_original_to_grouped = static_cast<int *>(original_to_grouped.get());
-    ASSERT_TRUE(cudaMoE_build_runtime_original_to_grouped(
-        runtime_table.deviceLayerState(0),
-        d_original_to_grouped,
-        total_slots,
-        total_slots,
-        num_experts,
-        top_k,
-        0,
-        stream_));
     std::array<int32_t, total_slots> ordered_map{};
     ASSERT_EQ(cudaMemcpyAsync(ordered_map.data(),
                               d_original_to_grouped,
@@ -2223,6 +2255,180 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticip
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     EXPECT_EQ(ordered_map, (std::array<int32_t, total_slots>{0, -1, 1, 2, -1, 3}));
+#endif
+}
+
+/**
+ * @brief Prove the scalable runtime grouping transaction above 256 route slots.
+ *
+ * Verifier-sized grouping uses one block, while long prefill uses a scalable
+ * multi-block publication. This boundary test places 264 routes just above the
+ * fused regime and checks every published array after both initial grouping and
+ * participant-aware regrouping. In particular, it prevents a future launch
+ * reduction from leaving the inverse map stale or changing stable expert-major
+ * route order.
+ */
+TEST_F(Test__CUDAMoEKernel, RuntimePrefillScalableGroupingPublishesCompleteStableTransaction)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    const auto device = llaminar2::DeviceId::cuda(0);
+    constexpr int seq_len = 33;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 256;
+    constexpr int total_slots = seq_len * top_k;
+    static_assert(total_slots > 256);
+
+    llaminar2::DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = device;
+    runtime_config.num_layers = 1;
+    runtime_config.num_experts = num_experts;
+    runtime_config.top_k = top_k;
+    runtime_config.mirror_to_device = true;
+    runtime_config.prefill_token_capacity = seq_len;
+    llaminar2::MoERuntimeTable runtime_table(runtime_config);
+    const auto runtime_state = runtime_table.hostLayerState(0);
+
+    std::vector<float> routing_indices(static_cast<size_t>(total_slots));
+    std::vector<float> routing_weights(static_cast<size_t>(total_slots));
+    for (int slot = 0; slot < total_slots; ++slot)
+    {
+        routing_indices[static_cast<size_t>(slot)] =
+            static_cast<float>((slot * 37 + 5) % num_experts);
+        routing_weights[static_cast<size_t>(slot)] =
+            static_cast<float>((slot % 17) + 1) / 32.0f;
+    }
+    auto routing_tensor = makeTensor({seq_len, top_k}, routing_indices);
+    auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
+    ASSERT_TRUE(routing_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
+
+    CudaAllocation inverse_map_allocation(sizeof(int32_t) * total_slots);
+    auto *inverse_map =
+        static_cast<int32_t *>(inverse_map_allocation.get());
+
+    auto verify_transaction =
+        [&](const std::vector<int32_t> &participants, const char *phase)
+    {
+        std::vector<int32_t> expected_counts(static_cast<size_t>(num_experts), 0);
+        std::vector<int32_t> expected_offsets(static_cast<size_t>(num_experts), 0);
+        std::vector<int32_t> expected_grouped;
+        std::vector<float> expected_grouped_weights;
+        std::vector<int32_t> expected_inverse(static_cast<size_t>(total_slots), -1);
+        expected_grouped.reserve(total_slots);
+        expected_grouped_weights.reserve(total_slots);
+
+        int running_offset = 0;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            expected_offsets[static_cast<size_t>(expert)] = running_offset;
+            for (int slot = 0; slot < total_slots; ++slot)
+            {
+                if (static_cast<int>(routing_indices[static_cast<size_t>(slot)]) != expert ||
+                    participants[static_cast<size_t>(slot)] != 0)
+                {
+                    continue;
+                }
+                expected_inverse[static_cast<size_t>(slot)] = running_offset;
+                expected_grouped.push_back(slot);
+                expected_grouped_weights.push_back(
+                    routing_weights[static_cast<size_t>(slot)]);
+                ++expected_counts[static_cast<size_t>(expert)];
+                ++running_offset;
+            }
+        }
+
+        std::vector<int32_t> actual_counts(static_cast<size_t>(num_experts));
+        std::vector<int32_t> actual_offsets(static_cast<size_t>(num_experts));
+        std::vector<int32_t> actual_grouped(static_cast<size_t>(total_slots));
+        std::vector<float> actual_grouped_weights(static_cast<size_t>(total_slots));
+        std::vector<int32_t> actual_inverse(static_cast<size_t>(total_slots));
+        ASSERT_EQ(cudaMemcpyAsync(actual_counts.data(), runtime_state.expert_counts,
+                                  actual_counts.size() * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_offsets.data(), runtime_state.expert_offsets,
+                                  actual_offsets.size() * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_grouped.data(), runtime_state.grouped_token_ids,
+                                  actual_grouped.size() * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_grouped_weights.data(),
+                                  runtime_state.grouped_route_weights,
+                                  actual_grouped_weights.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_inverse.data(), inverse_map,
+                                  actual_inverse.size() * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        EXPECT_EQ(actual_counts, expected_counts) << phase;
+        EXPECT_EQ(actual_offsets, expected_offsets) << phase;
+        EXPECT_EQ(actual_inverse, expected_inverse) << phase;
+        ASSERT_EQ(expected_grouped.size(), static_cast<size_t>(running_offset));
+        for (int grouped = 0; grouped < running_offset; ++grouped)
+        {
+            EXPECT_EQ(actual_grouped[static_cast<size_t>(grouped)],
+                      expected_grouped[static_cast<size_t>(grouped)])
+                << phase << " grouped=" << grouped;
+            EXPECT_EQ(actual_grouped_weights[static_cast<size_t>(grouped)],
+                      expected_grouped_weights[static_cast<size_t>(grouped)])
+                << phase << " grouped=" << grouped;
+        }
+        for (int grouped = running_offset; grouped < total_slots; ++grouped)
+        {
+            EXPECT_EQ(actual_grouped[static_cast<size_t>(grouped)], 0)
+                << phase << " grouped=" << grouped;
+            EXPECT_EQ(actual_grouped_weights[static_cast<size_t>(grouped)], 0.0f)
+                << phase << " grouped=" << grouped;
+        }
+    };
+
+    ASSERT_TRUE(cudaMoE_group_prefill_routes_runtime(
+        static_cast<const float *>(routing_tensor->gpu_data_ptr()),
+        static_cast<const float *>(weights_tensor->gpu_data_ptr()),
+        runtime_table.deviceLayerState(0),
+        inverse_map,
+        total_slots,
+        total_slots,
+        num_experts,
+        top_k,
+        /*filter_to_local_runtime_experts=*/0,
+        /*retain_routes_for_deferred_commit=*/0,
+        /*device_idx=*/0,
+        stream_));
+    verify_transaction(
+        std::vector<int32_t>(static_cast<size_t>(total_slots), 0),
+        "initial scalable grouping");
+
+    std::vector<int32_t> assignments(static_cast<size_t>(total_slots));
+    for (int slot = 0; slot < total_slots; ++slot)
+        assignments[static_cast<size_t>(slot)] = slot % 3 == 0 ? 0 : 1;
+    ASSERT_EQ(cudaMemcpyAsync(runtime_state.route_participant_ids,
+                              assignments.data(),
+                              assignments.size() * sizeof(int32_t),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_TRUE(cudaMoE_regroup_prefill_routes_runtime_assignments(
+        runtime_table.deviceLayerState(0),
+        inverse_map,
+        total_slots,
+        total_slots,
+        num_experts,
+        top_k,
+        /*retain_routes_for_deferred_commit=*/0,
+        /*device_idx=*/0,
+        stream_));
+    verify_transaction(assignments, "scalable regroup");
 #endif
 }
 
@@ -14222,8 +14428,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
     {
         auto reqs = llaminar2::MoEWorkspaceBuffers::routing(
             /*max_seq_len=*/seq_len,
-            /*num_experts=*/num_experts,
-            /*top_k=*/top_k);
+            /*num_experts=*/num_experts);
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             llaminar2::DeviceId::cuda(0),
             reqs.total_bytes_with_alignment() + 1024 * 1024);
@@ -14499,6 +14704,9 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillMatchesCPU)
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
 
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
+
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
     llaminar2::PerfStatsCollector::reset();
 
@@ -14569,6 +14777,9 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillCapturesAfterWarmup)
     auto cuda_weights = makeZeros({seq_len, top_k});
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
+
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
 
     llaminar2::MoERoutingResult warmup_host_result;
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
@@ -14888,11 +15099,11 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
     const size_t active_topk =
         static_cast<size_t>(real_seq_len) * top_k;
     CudaAllocation exact_topk_indices_allocation(
-        active_topk * sizeof(int));
+        active_topk * sizeof(float));
     CudaAllocation exact_topk_weights_allocation(
         active_topk * sizeof(float));
     CudaAllocation bucket_topk_indices_allocation(
-        static_cast<size_t>(bucket_seq_len) * top_k * sizeof(int));
+        static_cast<size_t>(bucket_seq_len) * top_k * sizeof(float));
     CudaAllocation bucket_topk_weights_allocation(
         static_cast<size_t>(bucket_seq_len) * top_k * sizeof(float));
     CudaAllocation direct_effective_seq_len_allocation(sizeof(int));
@@ -14907,7 +15118,7 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
               cudaSuccess);
     ASSERT_TRUE(cudaMoE_softmax_topk(
         exact_logits,
-        static_cast<int *>(exact_topk_indices_allocation.get()),
+        static_cast<float *>(exact_topk_indices_allocation.get()),
         static_cast<float *>(exact_topk_weights_allocation.get()),
         real_seq_len,
         num_experts,
@@ -14918,7 +15129,7 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
         direct_effective_seq_len));
     ASSERT_TRUE(cudaMoE_softmax_topk(
         bucket_logits,
-        static_cast<int *>(bucket_topk_indices_allocation.get()),
+        static_cast<float *>(bucket_topk_indices_allocation.get()),
         static_cast<float *>(bucket_topk_weights_allocation.get()),
         bucket_seq_len,
         num_experts,
@@ -14928,8 +15139,8 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
         stream_,
         /*device_effective_seq_len=*/nullptr));
 
-    std::vector<int> direct_exact_indices(active_topk);
-    std::vector<int> direct_bucket_indices(
+    std::vector<float> direct_exact_indices(active_topk);
+    std::vector<float> direct_bucket_indices(
         static_cast<size_t>(bucket_seq_len) * top_k);
     std::vector<float> direct_exact_weights(active_topk);
     std::vector<float> direct_bucket_weights(
@@ -14937,14 +15148,14 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
     ASSERT_EQ(cudaMemcpyAsync(
                   direct_exact_indices.data(),
                   exact_topk_indices_allocation.get(),
-                  direct_exact_indices.size() * sizeof(int),
+                  direct_exact_indices.size() * sizeof(float),
                   cudaMemcpyDeviceToHost,
                   stream_),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(
                   direct_bucket_indices.data(),
                   bucket_topk_indices_allocation.get(),
-                  direct_bucket_indices.size() * sizeof(int),
+                  direct_bucket_indices.size() * sizeof(float),
                   cudaMemcpyDeviceToHost,
                   stream_),
               cudaSuccess);
@@ -14967,9 +15178,9 @@ TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraph
         std::memcmp(
             direct_exact_indices.data(),
             direct_bucket_indices.data(),
-            active_topk * sizeof(int)),
+            active_topk * sizeof(float)),
         0)
-        << "softmax/top-k integer selection changed with padded launch geometry";
+        << "softmax/top-k FP32 expert publication changed with padded launch geometry";
     EXPECT_EQ(
         std::memcmp(
             direct_exact_weights.data(),
@@ -21835,6 +22046,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
     constexpr int d_model = 32;
     constexpr int intermediate = 32;
     constexpr size_t descriptor_bytes = 4096;
+    const auto device = llaminar2::DeviceId::cuda(0);
 
     std::vector<CudaAllocation> payloads;
     std::vector<CudaAllocation> scales;
@@ -21894,6 +22106,10 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
     auto output = makeZeros({seq_len, d_model});
     auto routing_tensor = makeTensor({seq_len, top_k}, routing_indices);
     auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(output->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
 
     // Warmup allocates grouping/prefill scratch and pins tensor residency before capture.
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
@@ -22207,6 +22423,10 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
     auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
 
     auto split_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(split_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));
@@ -22219,6 +22439,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
         split_output->data() + split_output->numel());
 
     auto fused_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(fused_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
 
     // Warm once outside capture to bind all workspace slices and tensor residency.
@@ -22414,6 +22635,10 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
     auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
 
     auto split_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(split_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));
@@ -22426,6 +22651,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
         split_output->data() + split_output->numel());
 
     auto fused_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(fused_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
 
     // Warm once outside capture so descriptor tables, workspace-backed grouping
@@ -22465,6 +22691,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
     ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
 
     split_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(split_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));
@@ -22648,6 +22875,10 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
     auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
 
     auto split_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(routing_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(split_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));
@@ -22660,6 +22891,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
         split_output->data() + split_output->numel());
 
     auto fused_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(fused_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
 
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
@@ -22696,6 +22928,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
     ASSERT_TRUE(weights_tensor->ensureOnDevice(device, stream_));
 
     split_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(split_output->ensureOnDevice(device, stream_));
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));

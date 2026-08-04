@@ -1,3 +1,13 @@
+/**
+ * @file CUDAGraphCapture.h
+ * @brief CUDA ownership, composition, replay, and metadata inspection for native graphs.
+ *
+ * The capture owns CUDA graph and executable handles but borrows one exact,
+ * non-default execution stream. It also exposes read-only recursive kernel
+ * inventory so orchestration diagnostics can attribute captured production work
+ * without replaying a second path or involving device memory.
+ */
+
 #pragma once
 
 #ifdef HAVE_CUDA
@@ -64,6 +74,9 @@ namespace llaminar2
         [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
         bool hasExecutable() const override;
         size_t nodeCount() const override;
+        bool inspectKernelNodes(
+            std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
+            std::string *error = nullptr) const override;
         void reset() override;
         const char *backendName() const override { return "CUDA"; }
 

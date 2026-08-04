@@ -737,7 +737,7 @@ extern "C"
         int device_idx, void *stream);
 
     bool cudaMoE_softmax_topk(
-        float *logits, int *expert_indices, float *expert_weights,
+        float *logits, float *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
         int device_idx, void *stream,
         const int *device_effective_seq_len);
@@ -972,7 +972,6 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream);
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream);
     bool cudaMoE_float_to_masked_int(
         const float *input,
@@ -1090,6 +1089,7 @@ extern "C"
         const float *routing_indices,
         const float *routing_weights,
         void *runtime,
+        int *original_to_grouped,
         int current_slots,
         int max_slots,
         int num_experts,
@@ -1101,6 +1101,7 @@ extern "C"
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
+        int *original_to_grouped,
         int current_slots,
         int max_slots,
         int num_experts,
@@ -1190,16 +1191,6 @@ extern "C"
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_build_runtime_original_to_grouped(
-        const void *runtime,
-        int *original_to_grouped,
-        int current_slots,
-        int max_slots,
-        int num_experts,
-        int top_k,
         int device_idx,
         void *stream);
 
@@ -1533,11 +1524,8 @@ namespace llaminar2
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
         d_route_logits_ = nullptr;
-        d_route_indices_ = nullptr;
-        d_route_weights_ = nullptr;
         route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
-        route_buffers_workspace_bound_ = false;
+        route_logits_workspace_bound_ = false;
         d_group_int_indices_ = nullptr;
         d_group_offsets_ = nullptr;
         d_group_counts_ = nullptr;
@@ -1962,7 +1950,6 @@ namespace llaminar2
         clearWorkspaceScratchBindings();
         staging_capacity_ = 0;
         route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         group_active_expert_slots_ = 0;
@@ -2023,46 +2010,35 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
+    bool CUDAMoEKernel::ensureRouteBufferCapacity(size_t logits_count)
     {
         // Capacity alone is not enough for graph-captured MoE routing.  This
         // kernel is a per-device singleton shared by many stages, so a previous
         // eager or stale binding can leave counters that look large enough while
         // the actual pointers are no longer the current graph workspace buffers.
-        if (route_buffers_workspace_bound_ &&
-            d_route_logits_ && d_route_indices_ && d_route_weights_ &&
-            logits_count <= route_logits_capacity_ && topk_count <= route_topk_capacity_)
+        if (route_logits_workspace_bound_ &&
+            d_route_logits_ && logits_count <= route_logits_capacity_)
         {
             return true;
         }
 
         void *route_logits = nullptr;
-        void *route_indices = nullptr;
-        void *route_weights = nullptr;
-        const bool ok =
-            bindWorkspaceBuffer(&route_logits, MoEWorkspaceBuffers::ROUTE_LOGITS,
-                                logits_count * sizeof(float), "route logits") &&
-            bindWorkspaceBuffer(&route_indices, MoEWorkspaceBuffers::ROUTE_INDICES,
-                                topk_count * sizeof(int), "route indices") &&
-            bindWorkspaceBuffer(&route_weights, MoEWorkspaceBuffers::ROUTE_WEIGHTS,
-                                topk_count * sizeof(float), "route weights");
+        const bool ok = bindWorkspaceBuffer(
+            &route_logits,
+            MoEWorkspaceBuffers::ROUTE_LOGITS,
+            logits_count * sizeof(float),
+            "route logits");
         if (!ok)
         {
             d_route_logits_ = nullptr;
-            d_route_indices_ = nullptr;
-            d_route_weights_ = nullptr;
             route_logits_capacity_ = 0;
-            route_topk_capacity_ = 0;
-            route_buffers_workspace_bound_ = false;
+            route_logits_workspace_bound_ = false;
             return false;
         }
 
         d_route_logits_ = static_cast<float *>(route_logits);
-        d_route_indices_ = static_cast<int *>(route_indices);
-        d_route_weights_ = static_cast<float *>(route_weights);
         route_logits_capacity_ = logits_count;
-        route_topk_capacity_ = topk_count;
-        route_buffers_workspace_bound_ = true;
+        route_logits_workspace_bound_ = true;
         return true;
     }
 
@@ -3090,10 +3066,13 @@ namespace llaminar2
 
     bool CUDAMoEKernel::routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                                   int seq_len, int d_model, int num_experts, int top_k,
-                                  bool normalize_weights, DeviceRouteBuffers &buffers,
+                                  bool normalize_weights,
+                                  float *output_indices, float *output_weights,
                                   const int *device_effective_seq_len)
     {
-        if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        if (!output_indices || !output_weights ||
+            seq_len <= 0 || d_model <= 0 || num_experts <= 0 ||
+            top_k <= 0 || top_k > num_experts)
             return false;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         const bool gate_is_bf16 = (gate_type == TensorType::BF16);
@@ -3111,19 +3090,22 @@ namespace llaminar2
         }
 
         const size_t logits_count = static_cast<size_t>(seq_len) * num_experts;
-        const size_t topk_count = static_cast<size_t>(seq_len) * top_k;
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
             return false;
 
         void *stream = getStream();
         if (!requireAlignedPointer(hidden, 16, "hidden", "routeCore") ||
-            !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore"))
+            !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore") ||
+            !requireAlignedPointer(output_indices, 16, "output indices", "routeCore") ||
+            !requireAlignedPointer(output_weights, 16, "output weights", "routeCore"))
             return false;
         if (gate_is_fp32 && !requireAlignedPointer(gate_weights, 16, "FP32 gate", "routeCore"))
             return false;
         if (!requireCudaDevicePointer(hidden, device_ordinal_, "hidden", "routeCore", stream) ||
             !requireCudaDevicePointer(gate_weights, device_ordinal_, "gate weights", "routeCore", stream) ||
-            !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream))
+            !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream) ||
+            !requireCudaDevicePointer(output_indices, device_ordinal_, "output indices", "routeCore", stream) ||
+            !requireCudaDevicePointer(output_weights, device_ordinal_, "output weights", "routeCore", stream))
             return false;
         if (device_effective_seq_len &&
             !requireCudaDevicePointer(device_effective_seq_len, device_ordinal_,
@@ -3150,17 +3132,11 @@ namespace llaminar2
                  {"d_model", std::to_string(d_model)},
                  {"num_experts", std::to_string(num_experts)}});
         }
-        if (!cudaMoE_softmax_topk(d_route_logits_, d_route_indices_, d_route_weights_,
+        if (!cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
                                   seq_len, num_experts, top_k, normalize_weights,
                                   device_ordinal_, getStream(),
                                   device_effective_seq_len))
             return false;
-
-        buffers.d_logits = d_route_logits_;
-        buffers.d_indices = d_route_indices_;
-        buffers.d_weights = d_route_weights_;
-        buffers.logits_count = logits_count;
-        buffers.topk_count = topk_count;
         return true;
     }
 
@@ -3261,23 +3237,11 @@ namespace llaminar2
         if (!d_hidden || !d_gate || !d_idx || !d_wt)
             return false;
 
-        DeviceRouteBuffers buffers;
         if (!routeCore(d_hidden, d_gate, gate_base->native_type(),
-                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers,
+                       seq_len, d_model, num_experts, top_k, normalize_weights,
+                       d_idx, d_wt,
                        device_effective_seq_len))
             return false;
-
-        if (!cudaMoE_int_to_float(buffers.d_indices, d_idx, static_cast<int>(buffers.topk_count), device_ordinal_, stream))
-            return false;
-        cudaError_t err = cudaMemcpyAsync(d_wt, buffers.d_weights,
-                                          buffers.topk_count * sizeof(float),
-                                          cudaMemcpyDeviceToDevice,
-                                          static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[" << context << "] D2D weights failed: " << cudaGetErrorString(err));
-            return false;
-        }
 
         host_result.expert_indices.clear();
         host_result.expert_weights.clear();
@@ -3382,10 +3346,7 @@ namespace llaminar2
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
-        const size_t topk_count =
-            static_cast<size_t>(plan.physical_rows) *
-            static_cast<size_t>(plan.top_k);
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
         {
             LOG_ERROR("[" << kContext << "] failed to bind persistent route scratch");
             return false;
@@ -3511,9 +3472,7 @@ namespace llaminar2
 
         const size_t logits_count =
             static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts);
-        const size_t topk_count =
-            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
         {
             LOG_ERROR("[" << kContext << "] route scratch allocation failed");
             return false;
@@ -3594,8 +3553,8 @@ namespace llaminar2
 
         if (!cudaMoE_softmax_topk(
                 d_route_logits_,
-                d_route_indices_,
-                d_route_weights_,
+                d_idx,
+                d_wt,
                 seq_len,
                 num_experts,
                 top_k,
@@ -3605,29 +3564,6 @@ namespace llaminar2
                 device_effective_seq_len))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
-            return false;
-        }
-
-        if (!cudaMoE_int_to_float(d_route_indices_,
-                                  d_idx,
-                                  static_cast<int>(topk_count),
-                                  device_ordinal_,
-                                  stream))
-        {
-            LOG_ERROR("[" << kContext << "] grouped int-to-float index conversion failed");
-            return false;
-        }
-
-        const cudaError_t copy_status = cudaMemcpyAsync(
-            d_wt,
-            d_route_weights_,
-            topk_count * sizeof(float),
-            cudaMemcpyDeviceToDevice,
-            static_cast<cudaStream_t>(stream));
-        if (copy_status != cudaSuccess)
-        {
-            LOG_ERROR("[" << kContext << "] grouped D2D weight copy failed: "
-                          << cudaGetErrorString(copy_status));
             return false;
         }
 
@@ -3703,7 +3639,7 @@ namespace llaminar2
         if (!d_hidden || !d_gate)
             return false;
 
-        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
             return false;
         if (!requireAlignedPointer(d_hidden, 16, "hidden", "decodeRouteSelect") ||
             !requireAlignedPointer(d_route_logits_, 16, "route logits", "decodeRouteSelect"))
@@ -3846,7 +3782,7 @@ namespace llaminar2
         if (!d_hidden || !d_gate)
             return false;
 
-        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
             return false;
         if (!requireAlignedPointer(d_hidden, 16, "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
             !requireAlignedPointer(d_route_logits_, 16, "route logits", "decodeRouteSelectWithReadyRebalanceApply"))
@@ -4986,8 +4922,10 @@ namespace llaminar2
 
         void *stream = requireStream("CUDAMoEKernel::groupPrefillRoutes");
         const DeviceId device = deviceId();
+        const int max_slots = max_tokens * top_k;
         if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
-            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights"))
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(max_slots, num_experts))
         {
             return false;
         }
@@ -5018,8 +4956,9 @@ namespace llaminar2
             d_indices,
             d_weights,
             static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
             current_tokens * top_k,
-            max_tokens * top_k,
+            max_slots,
             num_experts,
             top_k,
             filter_to_local_runtime_experts ? 1 : 0,
@@ -5050,10 +4989,14 @@ namespace llaminar2
             return false;
         }
         void *stream = requireStream("CUDAMoEKernel::regroupPrefillRoutesFromRuntimeAssignments");
+        const int max_slots = max_tokens * top_k;
+        if (!ensureGroupingBufferCapacity(max_slots, num_experts))
+            return false;
         return cudaMoE_regroup_prefill_routes_runtime_assignments(
             static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
             current_tokens * top_k,
-            max_tokens * top_k,
+            max_slots,
             num_experts,
             top_k,
             retain_routes_for_deferred_commit ? 1 : 0,
@@ -6661,26 +6604,12 @@ namespace llaminar2
         group_active_expert_slots_ = active_expert_slots;
 
         /*
-         * Runtime grouped prefill stores route slots in grouped_token_ids because
-         * LLEP first balances individual top-k router choices and then regroups
-         * only choices local to this participant.  Rebuilding the ordered scatter
-         * map from the runtime scratch gives LLEP the same deterministic top-k
-         * accumulation order as ordinary grouped prefill and avoids prefix-cache
-         * drift from atomicAdd ordering.
+         * groupPrefillRoutes() or the post-assignment regroup transaction has
+         * already published d_group_original_to_grouped_ beside counts, offsets,
+         * and grouped rows. Treating those arrays as one ordered transaction
+         * prevents a consumer from observing a grouping table with a stale
+         * inverse map and removes reconstruction work from every MoE layer.
          */
-        if (!cudaMoE_build_runtime_original_to_grouped(
-                device_runtime_layer,
-                d_group_original_to_grouped_,
-                total_slots,
-                total_slots,
-                num_experts,
-                top_k,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build runtime ordered-scatter map");
-            return false;
-        }
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,

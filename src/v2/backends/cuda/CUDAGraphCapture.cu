@@ -17,7 +17,11 @@
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 
+#include <cuda.h>
+
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -193,6 +197,255 @@ namespace llaminar2
                               << " node_type=" << cudaGraphNodeTypeName(type)
                               << " node_type_value=" << static_cast<int>(type));
                     return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * @brief Render a CUDA driver result without losing its symbolic name.
+         *
+         * Graphs captured through libraries such as NCCL may contain driver
+         * kernel handles that the CUDA runtime graph-query API cannot decode.
+         * Inventory therefore uses the driver graph API uniformly and reports
+         * both the stable driver enum and the optional explanatory string.
+         */
+        std::string cudaDriverErrorString(CUresult status)
+        {
+            const char *name = nullptr;
+            const char *description = nullptr;
+            (void)cuGetErrorName(status, &name);
+            (void)cuGetErrorString(status, &description);
+            return std::string(name ? name : "CUDA_ERROR_UNKNOWN") +
+                   " (" + (description ? description : "no description") + ")";
+        }
+
+        /**
+         * @brief Recursively append every CUDA kernel node in one captured graph.
+         *
+         * CUDA represents a captured stage hierarchy with child-graph nodes. A
+         * shallow walk would therefore undercount the production workload and
+         * hide precisely the small launches needed for fusion analysis. This
+         * routine follows every child and records launch metadata without
+         * instantiating, replaying, synchronizing, or reading device memory.
+         *
+         * @param graph Current graph in the recursive traversal.
+         * @param graph_path Stable diagnostic path rooted at `root`.
+         * @param nesting_depth Number of child-graph edges already traversed.
+         * @param kernel_nodes Destination inventory.
+         * @param error Receives a precise native-API failure.
+         * @return true only when every reachable node was inspected.
+         */
+        bool inspectCudaKernelNodesRecursive(
+            CUgraph graph,
+            const std::string &graph_path,
+            size_t nesting_depth,
+            std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
+            std::string &error)
+        {
+            size_t node_count = 0;
+            CUresult status = cuGraphGetNodes(graph, nullptr, &node_count);
+            if (status != CUDA_SUCCESS)
+            {
+                error = "cuGraphGetNodes(count) failed at " + graph_path +
+                        ": " + cudaDriverErrorString(status);
+                return false;
+            }
+
+            std::vector<CUgraphNode> nodes(node_count);
+            if (node_count > 0)
+            {
+                status = cuGraphGetNodes(graph, nodes.data(), &node_count);
+                if (status != CUDA_SUCCESS)
+                {
+                    error = "cuGraphGetNodes(nodes) failed at " + graph_path +
+                            ": " + cudaDriverErrorString(status);
+                    return false;
+                }
+                nodes.resize(node_count);
+            }
+
+            for (size_t node_index = 0; node_index < nodes.size(); ++node_index)
+            {
+                const std::string node_path =
+                    graph_path + "/node[" + std::to_string(node_index) + "]";
+                CUgraphNodeType type = CU_GRAPH_NODE_TYPE_EMPTY;
+                status = cuGraphNodeGetType(nodes[node_index], &type);
+                if (status != CUDA_SUCCESS)
+                {
+                    error = "cuGraphNodeGetType failed at " + node_path +
+                            ": " + cudaDriverErrorString(status);
+                    return false;
+                }
+
+                if (type == CU_GRAPH_NODE_TYPE_KERNEL)
+                {
+                    CUDA_KERNEL_NODE_PARAMS params{};
+                    status = cuGraphKernelNodeGetParams(
+                        nodes[node_index], &params);
+                    if (status != CUDA_SUCCESS)
+                    {
+                        error = "cuGraphKernelNodeGetParams failed at " +
+                                node_path + ": " +
+                                cudaDriverErrorString(status);
+                        return false;
+                    }
+
+                    const char *driver_name = nullptr;
+                    CUresult name_status = CUDA_ERROR_INVALID_HANDLE;
+                    uintptr_t function_identity = 0;
+                    CUfunction function = nullptr;
+                    if (params.func != nullptr)
+                    {
+                        function = params.func;
+                        function_identity =
+                            reinterpret_cast<uintptr_t>(params.func);
+                        name_status = cuFuncGetName(&driver_name, params.func);
+                    }
+#if CUDA_VERSION >= 12000
+                    else if (params.kern != nullptr)
+                    {
+                        function_identity =
+                            reinterpret_cast<uintptr_t>(params.kern);
+                        name_status = cuKernelGetName(&driver_name, params.kern);
+                        status = cuKernelGetFunction(&function, params.kern);
+                        if (status != CUDA_SUCCESS || function == nullptr)
+                        {
+                            error = "cuKernelGetFunction failed at " +
+                                    node_path + ": " +
+                                    cudaDriverErrorString(status);
+                            return false;
+                        }
+                    }
+#endif
+                    else
+                    {
+                        error = "CUDA kernel node has neither CUfunction nor "
+                                "CUkernel identity at " + node_path;
+                        return false;
+                    }
+                    const bool name_resolved =
+                        name_status == CUDA_SUCCESS && driver_name != nullptr &&
+                        driver_name[0] != '\0';
+
+                    auto requireFunctionAttribute =
+                        [&](CUfunction_attribute attribute,
+                            const char *attribute_name,
+                            int &value) -> bool
+                    {
+                        status = cuFuncGetAttribute(
+                            &value,
+                            attribute,
+                            function);
+                        if (status == CUDA_SUCCESS)
+                            return true;
+                        error = std::string("cuFuncGetAttribute(") +
+                                attribute_name + ") failed at " + node_path +
+                                ": " + cudaDriverErrorString(status);
+                        return false;
+                    };
+
+                    int registers_per_thread = 0;
+                    int static_shared_memory_bytes = 0;
+                    int local_memory_bytes_per_thread = 0;
+                    int max_threads_per_block = 0;
+                    if (!requireFunctionAttribute(
+                            CU_FUNC_ATTRIBUTE_NUM_REGS,
+                            "NUM_REGS",
+                            registers_per_thread) ||
+                        !requireFunctionAttribute(
+                            CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                            "SHARED_SIZE_BYTES",
+                            static_shared_memory_bytes) ||
+                        !requireFunctionAttribute(
+                            CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                            "LOCAL_SIZE_BYTES",
+                            local_memory_bytes_per_thread) ||
+                        !requireFunctionAttribute(
+                            CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                            "MAX_THREADS_PER_BLOCK",
+                            max_threads_per_block))
+                    {
+                        return false;
+                    }
+
+                    const uint64_t captured_block_threads =
+                        static_cast<uint64_t>(params.blockDimX) *
+                        static_cast<uint64_t>(params.blockDimY) *
+                        static_cast<uint64_t>(params.blockDimZ);
+                    if (captured_block_threads == 0 ||
+                        captured_block_threads >
+                            static_cast<uint64_t>(
+                                std::numeric_limits<int>::max()))
+                    {
+                        error = "CUDA kernel node has invalid flattened block "
+                                "size at " +
+                                node_path;
+                        return false;
+                    }
+                    int max_active_blocks_per_sm = 0;
+                    status = cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &max_active_blocks_per_sm,
+                        function,
+                        static_cast<int>(captured_block_threads),
+                        params.sharedMemBytes);
+                    if (status != CUDA_SUCCESS ||
+                        max_active_blocks_per_sm <= 0)
+                    {
+                        error = "cuOccupancyMaxActiveBlocksPerMultiprocessor "
+                                "failed at " +
+                                node_path + ": " +
+                                cudaDriverErrorString(status);
+                        return false;
+                    }
+                    kernel_nodes.push_back(GPUGraphKernelNodeInfo{
+                        .name = name_resolved ? driver_name : "unresolved_kernel",
+                        .graph_path = node_path,
+                        .function_identity = function_identity,
+                        .grid_x = params.gridDimX,
+                        .grid_y = params.gridDimY,
+                        .grid_z = params.gridDimZ,
+                        .block_x = params.blockDimX,
+                        .block_y = params.blockDimY,
+                        .block_z = params.blockDimZ,
+                        .dynamic_shared_memory_bytes = params.sharedMemBytes,
+                        .static_shared_memory_bytes = static_cast<size_t>(
+                            std::max(0, static_shared_memory_bytes)),
+                        .local_memory_bytes_per_thread = static_cast<size_t>(
+                            std::max(0, local_memory_bytes_per_thread)),
+                        .registers_per_thread = static_cast<uint32_t>(
+                            std::max(0, registers_per_thread)),
+                        .max_threads_per_block = static_cast<uint32_t>(
+                            std::max(0, max_threads_per_block)),
+                        .max_active_blocks_per_sm = static_cast<uint32_t>(
+                            max_active_blocks_per_sm),
+                        .nesting_depth = nesting_depth,
+                        .name_resolved = name_resolved,
+                    });
+                    continue;
+                }
+
+                if (type == CU_GRAPH_NODE_TYPE_GRAPH)
+                {
+                    CUgraph child_graph = nullptr;
+                    status = cuGraphChildGraphNodeGetGraph(
+                        nodes[node_index], &child_graph);
+                    if (status != CUDA_SUCCESS || child_graph == nullptr)
+                    {
+                        error = "cuGraphChildGraphNodeGetGraph failed at " +
+                                node_path + ": " +
+                                cudaDriverErrorString(status);
+                        return false;
+                    }
+                    if (!inspectCudaKernelNodesRecursive(
+                            child_graph,
+                            node_path + "/child",
+                            nesting_depth + 1,
+                            kernel_nodes,
+                            error))
+                    {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -1303,6 +1556,42 @@ namespace llaminar2
     size_t CUDAGraphCapture::nodeCount() const
     {
         return node_count_;
+    }
+
+    bool CUDAGraphCapture::inspectKernelNodes(
+        std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
+        std::string *error) const
+    {
+        kernel_nodes.clear();
+        if (error)
+            error->clear();
+        if (!activateOwner("inspect kernel nodes"))
+        {
+            if (error)
+                *error = "failed to activate the CUDA graph owner device";
+            return false;
+        }
+        if (graph_ == nullptr)
+        {
+            if (error)
+                *error = "cannot inspect CUDA kernel nodes without a captured graph";
+            return false;
+        }
+
+        std::string inspection_error;
+        if (!inspectCudaKernelNodesRecursive(
+                reinterpret_cast<CUgraph>(graph_),
+                "root",
+                0,
+                kernel_nodes,
+                inspection_error))
+        {
+            kernel_nodes.clear();
+            if (error)
+                *error = std::move(inspection_error);
+            return false;
+        }
+        return true;
     }
 
     void CUDAGraphCapture::reset()

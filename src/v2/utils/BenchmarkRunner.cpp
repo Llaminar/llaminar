@@ -1830,12 +1830,12 @@ namespace llaminar2
         }
         /*
          * Warmup and post-warmup setup are deliberately outside the measured
-         * benchmark loop.  Keep memory lifecycle records, but reset MoE
-         * rebalance stats here so maintenance perfstats describe steady-state
-         * measured decode rather than graph capture, setup, or host
-         * post-warmup placement work.
+         * benchmark loop.  Keep immutable setup evidence (the memory lifecycle
+         * and captured-graph kernel inventory), but reset MoE rebalance stats
+         * here so maintenance perfstats describe steady-state measured decode
+         * rather than graph capture, setup, or host post-warmup placement work.
          */
-        PerfStatsCollector::resetPreservingDomains({"memory"});
+        PerfStatsCollector::resetPreservingDomains({"memory", "gpu_graph_inventory"});
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 

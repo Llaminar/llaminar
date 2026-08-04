@@ -712,20 +712,34 @@ namespace llaminar2
             RuntimeFused = 2,
         };
 
-        struct DeviceRouteBuffers
-        {
-            float *d_logits = nullptr;
-            int *d_indices = nullptr;
-            float *d_weights = nullptr;
-            size_t logits_count = 0;
-            size_t topk_count = 0;
-        };
-
         DeviceId deviceId() const { return DeviceId::cuda(device_ordinal_); }
 
+        /**
+         * @brief Produce router logits and publish final FP32 route tensors.
+         *
+         * Logits use graph-stable workspace scratch because they are private to
+         * the two-stage router. Expert IDs and weights are final graph outputs,
+         * so softmax/top-k writes the caller-owned tensors directly. Keeping
+         * those outputs in the contract prevents a second conversion kernel or
+         * device-to-device publication copy from becoming part of replay.
+         *
+         * @param hidden Device FP32 hidden rows.
+         * @param gate_weights Device gate matrix in @p gate_type.
+         * @param gate_type Native gate tensor type.
+         * @param seq_len Number of physical rows in the captured launch.
+         * @param d_model Hidden width.
+         * @param num_experts Router output width.
+         * @param top_k Number of routes published per row.
+         * @param normalize_weights Whether selected weights are renormalized.
+         * @param output_indices Caller-owned FP32 expert IDs.
+         * @param output_weights Caller-owned FP32 selected weights.
+         * @param device_effective_seq_len Optional device scalar masking padded rows.
+         * @return True when both router kernels were enqueued successfully.
+         */
         bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
-                       bool normalize_weights, DeviceRouteBuffers &buffers,
+                       bool normalize_weights,
+                       float *output_indices, float *output_weights,
                        const int *device_effective_seq_len = nullptr);
         bool routeWithTensorsImpl(
             ITensor *hidden, ITensor *gate_weights,
@@ -736,7 +750,7 @@ namespace llaminar2
             const int *device_effective_seq_len,
             const char *context);
         bool ensureStagingCapacity(int count);
-        bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
+        bool ensureRouteBufferCapacity(size_t logits_count);
         bool ensureGroupingBufferCapacity(int total_slots, int num_experts);
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
         /**
@@ -1003,11 +1017,8 @@ namespace llaminar2
         int staging_capacity_ = 0;
 
         float *d_route_logits_ = nullptr;
-        int *d_route_indices_ = nullptr;
-        float *d_route_weights_ = nullptr;
         size_t route_logits_capacity_ = 0;
-        size_t route_topk_capacity_ = 0;
-        bool route_buffers_workspace_bound_ = false;
+        bool route_logits_workspace_bound_ = false;
         uint64_t bound_workspace_id_ = 0;
 
         int *d_group_int_indices_ = nullptr;

@@ -1094,13 +1094,11 @@ namespace llaminar2
                 ? MoEWorkspaceBuffers::rocmRouting(
                       params_.seq_len,
                       params_.d_model,
-                      params_.num_experts,
-                      params_.top_k)
+                      params_.num_experts)
                 : MoEWorkspaceBuffers::cudaRouting(
                       params_.seq_len,
                       params_.d_model,
-                      params_.num_experts,
-                      params_.top_k);
+                      params_.num_experts);
 
         if (params_.device_rebalance_route_apply)
         {

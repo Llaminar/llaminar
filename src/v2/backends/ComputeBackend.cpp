@@ -444,7 +444,12 @@ namespace llaminar2
 
             log_table(table.to_string());
 
-            // Print degraded link warnings after the table
+            /*
+             * Enumeration precedes model traffic, and autonomous PCIe power
+             * management may temporarily reduce link speed or width. Keep the
+             * observation available as a diagnostic without presenting this
+             * pre-workload snapshot as an inference failure.
+             */
             for (const auto &dev : devices)
             {
                 if (dev.pcie.degraded)
@@ -464,16 +469,16 @@ namespace llaminar2
                     const char *type_prefix = (dev.type == ComputeBackendType::GPU_CUDA) ? "cuda" : "rocm";
                     if (!dev.pcie.bottleneck_bdf.empty())
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf
-                                        << " (bottleneck at upstream bridge " << dev.pcie.bottleneck_bdf << ")");
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf
+                                       << " (narrowest upstream bridge " << dev.pcie.bottleneck_bdf << ")");
                     }
                     else
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf);
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf);
                     }
                 }
             }

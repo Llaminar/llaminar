@@ -2012,7 +2012,7 @@ TEST(Test__BenchmarkRunnerCPU, RuntimeDebugParsesBenchmarkIterationOverrides)
     EXPECT_EQ(debugEnv().runtime_debug.benchmark_warmup_iterations, 1);
 }
 
-TEST(Test__BenchmarkRunnerCPU, PreservesMemoryBOMAcrossMeasuredReset)
+TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredReset)
 {
     ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -2023,6 +2023,13 @@ TEST(Test__BenchmarkRunnerCPU, PreservesMemoryBOMAcrossMeasuredReset)
         "allocate",
         "cuda:0",
         {{"buffer_count", "2"}});
+    PerfStatsCollector::addCounter(
+        "gpu_graph_inventory",
+        "fragment_kernel_nodes",
+        17.0,
+        "setup",
+        "cuda:0",
+        {{"fragment", "all-position verifier forward"}});
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
     auto runner = std::make_shared<MockCPUInferenceRunner>();
@@ -2049,6 +2056,8 @@ TEST(Test__BenchmarkRunnerCPU, PreservesMemoryBOMAcrossMeasuredReset)
     };
     EXPECT_TRUE(has_record("memory", "workspace_block_bytes"))
         << "Benchmark JSON diagnostics need the allocation BOM after warmup reset";
+    EXPECT_TRUE(has_record("gpu_graph_inventory", "fragment_kernel_nodes"))
+        << "Captured graph metadata is emitted during warmup and must survive into the benchmark artifact";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))
         << "Non-preserved warmup counters should still be cleared before measurement";
     PerfStatsCollector::reset();

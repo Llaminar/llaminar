@@ -188,6 +188,19 @@ TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTim
     EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
 }
 
+TEST(Test__PerfStatsCollector, GraphKernelInventoryIsExplicitAndReloadable)
+{
+    ScopedEnv inventory("LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY", nullptr);
+    EXPECT_FALSE(debugEnv().runtime_debug.gpu_graph_kernel_inventory);
+
+    {
+        ScopedEnv enable("LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY", "1");
+        EXPECT_TRUE(debugEnv().runtime_debug.gpu_graph_kernel_inventory);
+    }
+
+    EXPECT_FALSE(debugEnv().runtime_debug.gpu_graph_kernel_inventory);
+}
+
 TEST(Test__PerfStatsCollector, GpuStageTimingEnablesStructuredCollection)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);

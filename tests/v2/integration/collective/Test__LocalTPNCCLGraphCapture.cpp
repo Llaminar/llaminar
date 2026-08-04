@@ -31,6 +31,7 @@
 #include "backends/ComputeBackend.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "backends/IBackend.h"
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -618,6 +619,161 @@ namespace
         worker1.join();
     }
 } // namespace
+
+/**
+ * @brief Inventory graph-captured NCCL kernels through their driver identities.
+ *
+ * NCCL may publish CUDA graph kernel nodes as `CUkernel` objects rather than
+ * legacy runtime `cudaFunction_t` handles. Runtime-only parameter inspection
+ * rejects those valid nodes with `cudaErrorInvalidDeviceFunction`, which once
+ * made opt-in production graph inventory abort before the first MTP replay.
+ * This test captures one real participant-local NCCL operation on each GPU and
+ * proves the backend inspector accepts and names every resulting kernel.
+ */
+TEST(
+    Test__LocalTPNCCLGraphCapture,
+    KernelInventoryAcceptsDriverOriginNCCLNodes)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found "
+                     << cuda_backend->deviceCount();
+    }
+
+    constexpr size_t kElementCount = 2048;
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    auto tensor0 = TestTensorFactory::createFP32({kElementCount});
+    auto tensor1 = TestTensorFactory::createFP32({kElementCount});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    std::array<cudaStream_t, 2> streams{nullptr, nullptr};
+    for (int device = 0; device < 2; ++device)
+    {
+        ASSERT_EQ(cudaSetDevice(device), cudaSuccess);
+        ASSERT_EQ(
+            cudaStreamCreateWithFlags(
+                &streams[static_cast<size_t>(device)],
+                cudaStreamNonBlocking),
+            cudaSuccess);
+    }
+
+    /*
+     * The eager operation provisions LocalTP's persistent transport scratch.
+     * The subsequent capture must contain no allocation or workspace binding.
+     */
+    std::array<bool, 2> warmup_ok{false, false};
+    std::thread warmup0([&]
+                        {
+                            ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+                            warmup_ok[0] = ctx->allreduceOnStream(
+                                tensor0.get(),
+                                "inventory_nccl_warmup",
+                                kElementCount,
+                                streams[0],
+                                "fp32");
+                        });
+    std::thread warmup1([&]
+                        {
+                            ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+                            warmup_ok[1] = ctx->allreduceOnStream(
+                                tensor1.get(),
+                                "inventory_nccl_warmup",
+                                kElementCount,
+                                streams[1],
+                                "fp32");
+                        });
+    warmup0.join();
+    warmup1.join();
+    ASSERT_TRUE(warmup_ok[0]);
+    ASSERT_TRUE(warmup_ok[1]);
+    for (int device = 0; device < 2; ++device)
+    {
+        ASSERT_EQ(cudaSetDevice(device), cudaSuccess);
+        ASSERT_EQ(
+            cudaStreamSynchronize(streams[static_cast<size_t>(device)]),
+            cudaSuccess);
+    }
+
+    std::array<std::unique_ptr<CUDAGraphCapture>, 2> captures{
+        std::make_unique<CUDAGraphCapture>(streams[0], 0),
+        std::make_unique<CUDAGraphCapture>(streams[1], 1)};
+    std::array<bool, 2> begin_ok{false, false};
+    std::array<bool, 2> collective_ok{false, false};
+    std::array<bool, 2> end_ok{false, false};
+    Barrier capture_started(2);
+    Barrier collective_recorded(2);
+
+    auto capture_participant = [&](int device, TensorBase *tensor)
+    {
+        const size_t participant = static_cast<size_t>(device);
+        ASSERT_EQ(cudaSetDevice(device), cudaSuccess);
+        begin_ok[participant] = captures[participant]->beginCapture();
+        capture_started.arriveAndWait();
+        if (begin_ok[participant])
+        {
+            GraphCaptureGuard guard;
+            collective_ok[participant] = ctx->allreduceOnStream(
+                tensor,
+                "inventory_nccl_captured",
+                kElementCount,
+                streams[participant],
+                "fp32");
+        }
+        collective_recorded.arriveAndWait();
+        if (begin_ok[participant] && collective_ok[participant])
+            end_ok[participant] = captures[participant]->endCapture();
+    };
+
+    std::thread capture0(capture_participant, 0, tensor0.get());
+    std::thread capture1(capture_participant, 1, tensor1.get());
+    capture0.join();
+    capture1.join();
+
+    for (size_t participant = 0; participant < captures.size(); ++participant)
+    {
+        ASSERT_TRUE(begin_ok[participant]);
+        ASSERT_TRUE(collective_ok[participant]);
+        ASSERT_TRUE(end_ok[participant]);
+
+        std::vector<GPUGraphKernelNodeInfo> kernels;
+        std::string error;
+        ASSERT_TRUE(captures[participant]->inspectKernelNodes(kernels, &error))
+            << error;
+        ASSERT_FALSE(kernels.empty());
+        for (const GPUGraphKernelNodeInfo &kernel : kernels)
+        {
+            EXPECT_TRUE(kernel.valid()) << kernel.graph_path;
+            EXPECT_TRUE(kernel.name_resolved)
+                << "NCCL kernel identity was not resolved at "
+                << kernel.graph_path;
+            EXPECT_GT(kernel.registers_per_thread, 0U);
+            EXPECT_GT(kernel.max_threads_per_block, 0U);
+            EXPECT_GT(kernel.max_active_blocks_per_sm, 0U);
+        }
+    }
+
+    captures = {};
+    for (int device = 0; device < 2; ++device)
+    {
+        EXPECT_EQ(cudaSetDevice(device), cudaSuccess);
+        EXPECT_EQ(
+            cudaStreamDestroy(streams[static_cast<size_t>(device)]),
+            cudaSuccess);
+    }
+}
 
 /**
  * @brief Captured FP16 NCCL output must be live for its immediate consumer.
