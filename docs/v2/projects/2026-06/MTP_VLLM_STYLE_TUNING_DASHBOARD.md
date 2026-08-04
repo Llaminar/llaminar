@@ -69,6 +69,17 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   one conversion kernel plus one memcpy/layer: compute nodes are now `1336`,
   captured prefill graphs are 80 total nodes/device smaller, and the native hot
   transaction is `1403` kernels including 67 NCCL/control sidecars.
+- Runtime expert publication now uses one deterministic two-level warp/wave
+  scan for counts, offsets, and active ranks instead of the former quadratic
+  per-expert scan and second publication phase. Across M=2..31 the fused plan is
+  `1.14x..1.26x` faster on CUDA and `1.16x..1.72x` faster on ROCm; at M=4 it
+  moved `12.16 -> 9.76 us` and `30.28 -> 19.43 us`, respectively.
+- The M=4 CUDA fused kernel uses 40 registers/thread and 4.23 KiB shared memory,
+  has zero spills, and retains 100% theoretical occupancy. The ROCm wave64
+  kernel uses 45 VGPR, 89 SGPR, and 4,232 bytes LDS with zero private segment
+  and zero spills. The post-change Integration tree rebuilt cleanly, the
+  canonical grouped-verifier gate passed `89/89` in 834.31 seconds, and the
+  device-free unit/source gate passed `585/585` in 134.99 seconds.
 - Isolated M=4 grouping is `5.99 us`: 38 registers/thread, 4.10 KiB shared,
   zero spills, and 100% theoretical per-SM
   occupancy. Achieved whole-GPU occupancy is intentionally low for this single

@@ -15276,6 +15276,56 @@ struct RuntimePrefillPlanPublicationScratch
 };
 
 /**
+ * @brief Publish one expert's compact projection descriptors from a bank.
+ *
+ * Each lane owns exactly one expert id.  Separating descriptor publication
+ * from active-list compaction lets the fused verifier transaction overlap it
+ * with count/offset publication while descriptor-only decode continues to use
+ * the same readiness and zero-fill contract.
+ *
+ * @param bank Active immutable placement bank selected by the caller.
+ * @param local_bit Bit identifying the local participant in residency masks.
+ * @param expert Expert id owned by this lane.
+ * @param num_experts Number of logical experts in the layer.
+ * @param gate_descs Compact gate descriptor table to publish.
+ * @param up_descs Compact up descriptor table to publish.
+ * @param down_descs Compact down descriptor table to publish.
+ * @return True when the expert is locally resident and compute-ready.
+ */
+__device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
+    const DeviceMoEPlacementBankView &bank,
+    uint32_t local_bit,
+    int expert,
+    int num_experts,
+    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
+    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs)
+{
+    if (expert >= num_experts)
+        return false;
+
+    const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+    const bool local_ready =
+        bank.local_compute_mask[expert] != 0u &&
+        (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+        desc.local_slot >= 0 &&
+        rebalance_expert_desc_ready(desc);
+    if (local_ready)
+    {
+        gate_descs[expert] = desc.gate;
+        up_descs[expert] = desc.up;
+        down_descs[expert] = desc.down;
+    }
+    else
+    {
+        gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+        up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+        down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
+    }
+    return local_ready;
+}
+
+/**
  * @brief Publish runtime descriptors and the stable local active-expert list.
  *
  * Every lane in the workgroup must call this function. Descriptor publication
@@ -15311,28 +15361,14 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
     const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
     const uint32_t local_bit =
         runtime_participant_bit(static_cast<int>(runtime->participant_id));
-    bool local_ready = false;
-    if (expert < num_experts)
-    {
-        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
-        local_ready =
-            bank.local_compute_mask[expert] != 0u &&
-            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-            desc.local_slot >= 0 &&
-            rebalance_expert_desc_ready(desc);
-        if (local_ready)
-        {
-            gate_descs[expert] = desc.gate;
-            up_descs[expert] = desc.up;
-            down_descs[expert] = desc.down;
-        }
-        else
-        {
-            gate_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-            up_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-            down_descs[expert] = DeviceNativeVNNIMatrixDescView{};
-        }
-    }
+    const bool local_ready = rocm_publish_runtime_expert_descriptors_lane(
+        bank,
+        local_bit,
+        expert,
+        num_experts,
+        gate_descs,
+        up_descs,
+        down_descs);
 
     // Descriptor-only decode publication is complete. This branch is uniform
     // across the workgroup and cannot strand a lane at a later barrier.
@@ -15756,6 +15792,133 @@ __device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
 }
 
 /**
+ * @brief Shared state for the verifier-sized expert prefix scan.
+ *
+ * The first component publishes stable route offsets and the optional second
+ * component publishes active-expert ranks.  Both are scanned in ascending wave
+ * order, preserving the serial expert-id result without quadratic LDS reads.
+ */
+struct RuntimeSmallGroupScanScratch
+{
+    int count_wave_totals[kActiveExpertMaxWaveCount];
+    int count_wave_prefixes[kActiveExpertMaxWaveCount];
+    int active_wave_totals[kActiveExpertMaxWaveCount];
+    int active_wave_prefixes[kActiveExpertMaxWaveCount];
+    int total_active;
+    int first_invalid_expert;
+};
+
+/**
+ * @brief Compute deterministic workgroup-wide count and active-list prefixes.
+ *
+ * Every lane must participate. Each wave scans its own values with shuffle
+ * instructions, then wave zero scans the per-wave totals in ascending order.
+ * Integer addition is exact, so this fixed two-level tree reproduces the same
+ * offsets and active ranks as serial expert traversal on wave32 and wave64.
+ *
+ * @tparam ScanActive Whether to scan the active-expert predicate as well.
+ * @param count Number of local routes assigned to this lane's expert.
+ * @param scratch Workgroup-owned scan state.
+ * @param count_prefix Receives the exclusive route-count prefix.
+ * @param active_prefix Receives the exclusive active-expert prefix.
+ * @param total_active Receives the total number of active experts.
+ */
+template <bool ScanActive>
+__device__ __forceinline__ void rocm_scan_runtime_small_group_experts(
+    int count,
+    RuntimeSmallGroupScanScratch &scratch,
+    int &count_prefix,
+    int &active_prefix,
+    int &total_active)
+{
+    const int lane = static_cast<int>(threadIdx.x) % warpSize;
+    const int wave = static_cast<int>(threadIdx.x) / warpSize;
+    const int wave_count =
+        (static_cast<int>(blockDim.x) + warpSize - 1) / warpSize;
+    int count_inclusive = count;
+    int active_inclusive = count > 0 ? 1 : 0;
+
+    for (int delta = 1; delta < warpSize; delta <<= 1)
+    {
+        const int prior_count = __shfl_up(count_inclusive, delta, warpSize);
+        if (lane >= delta)
+            count_inclusive += prior_count;
+        if constexpr (ScanActive)
+        {
+            const int prior_active = __shfl_up(active_inclusive, delta, warpSize);
+            if (lane >= delta)
+                active_inclusive += prior_active;
+        }
+    }
+
+    if (lane == warpSize - 1)
+    {
+        scratch.count_wave_totals[wave] = count_inclusive;
+        if constexpr (ScanActive)
+            scratch.active_wave_totals[wave] = active_inclusive;
+    }
+    __syncthreads();
+
+    if (wave == 0)
+    {
+        const int wave_count_value =
+            lane < wave_count ? scratch.count_wave_totals[lane] : 0;
+        const int wave_active_value =
+            ScanActive && lane < wave_count
+                ? scratch.active_wave_totals[lane]
+                : 0;
+        int count_wave_inclusive = wave_count_value;
+        int active_wave_inclusive = wave_active_value;
+        for (int delta = 1; delta < warpSize; delta <<= 1)
+        {
+            const int prior_count =
+                __shfl_up(count_wave_inclusive, delta, warpSize);
+            if (lane >= delta)
+                count_wave_inclusive += prior_count;
+            if constexpr (ScanActive)
+            {
+                const int prior_active =
+                    __shfl_up(active_wave_inclusive, delta, warpSize);
+                if (lane >= delta)
+                    active_wave_inclusive += prior_active;
+            }
+        }
+
+        if (lane < wave_count)
+        {
+            scratch.count_wave_prefixes[lane] =
+                count_wave_inclusive - wave_count_value;
+            if constexpr (ScanActive)
+            {
+                scratch.active_wave_prefixes[lane] =
+                    active_wave_inclusive - wave_active_value;
+            }
+        }
+        if constexpr (ScanActive)
+        {
+            if (lane == wave_count - 1)
+                scratch.total_active = active_wave_inclusive;
+        }
+    }
+    __syncthreads();
+
+    count_prefix = scratch.count_wave_prefixes[wave] +
+                   count_inclusive - count;
+    if constexpr (ScanActive)
+    {
+        const int active = count > 0 ? 1 : 0;
+        active_prefix = scratch.active_wave_prefixes[wave] +
+                        active_inclusive - active;
+        total_active = scratch.total_active;
+    }
+    else
+    {
+        active_prefix = 0;
+        total_active = 0;
+    }
+}
+
+/**
  * @brief Publish one verifier-sized runtime grouping transaction.
  *
  * One 256-thread workgroup owns every route slot and every expert. The router
@@ -15795,11 +15958,13 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
     __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
     __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
     __shared__ float shared_route_weights[kDeviceMoERuntimeSmallGroupMaxSlots];
-    __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
+    __shared__ int shared_expert_offsets[kDeviceMoEMaxExperts];
+    __shared__ RuntimeSmallGroupScanScratch scan_scratch;
 
     const int tid = static_cast<int>(threadIdx.x);
     const bool invalid_contract =
         !runtime ||
+        blockDim.x != kActiveExpertThreads ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
         max_slots > kDeviceMoERuntimeSmallGroupMaxSlots ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -15837,13 +16002,6 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
             fail_fast_incomplete_llep_transfer();
         }
         return;
-    }
-
-    if (tid < num_experts)
-    {
-        shared_expert_counts[tid] = 0;
-        runtime->expert_counts[tid] = 0;
-        runtime->expert_offsets[tid] = 0;
     }
 
     if (tid < max_slots)
@@ -15913,9 +16071,9 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
     __syncthreads();
 
     const int local_participant = static_cast<int>(runtime->participant_id);
+    int count = 0;
     if (tid < num_experts)
     {
-        int count = 0;
         for (int slot = 0; slot < current_slots; ++slot)
         {
             count += shared_route_experts[slot] == tid &&
@@ -15923,19 +16081,106 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
                          ? 1
                          : 0;
         }
-        shared_expert_counts[tid] = count;
     }
-    __syncthreads();
+
+    if constexpr (PublishCompletePlan)
+    {
+        if (tid == 0)
+            scan_scratch.first_invalid_expert = num_experts;
+    }
+    int expert_offset = 0;
+    int active_rank = 0;
+    int total_active = 0;
+    rocm_scan_runtime_small_group_experts<PublishCompletePlan>(
+        count,
+        scan_scratch,
+        expert_offset,
+        active_rank,
+        total_active);
 
     if (tid < num_experts)
     {
-        int offset = 0;
-        for (int expert = 0; expert < tid; ++expert)
-            offset += shared_expert_counts[expert];
-        runtime->expert_counts[tid] = shared_expert_counts[tid];
-        runtime->expert_offsets[tid] = offset;
+        shared_expert_offsets[tid] = expert_offset;
+        runtime->expert_counts[tid] = count;
+        runtime->expert_offsets[tid] = expert_offset;
+
+        if constexpr (PublishCompletePlan)
+        {
+            const DeviceMoEPlacementBankView &bank =
+                runtime->banks[runtime->active_bank];
+            const uint32_t local_bit =
+                runtime_participant_bit(local_participant);
+            const bool local_ready =
+                rocm_publish_runtime_expert_descriptors_lane(
+                    bank,
+                    local_bit,
+                    tid,
+                    num_experts,
+                    gate_descs,
+                    up_descs,
+                    down_descs);
+            if (count > 0)
+            {
+                if (active_rank < max_active_experts)
+                    active_expert_ids[active_rank] = tid;
+                if (!local_ready)
+                {
+                    atomicMin(
+                        &scan_scratch.first_invalid_expert,
+                        tid);
+                }
+            }
+        }
+    }
+
+    if constexpr (PublishCompletePlan)
+    {
+        const int retained_active =
+            total_active < max_active_experts
+                ? total_active
+                : max_active_experts;
+        for (int slot = retained_active + tid;
+             slot < max_active_experts;
+             slot += static_cast<int>(blockDim.x))
+        {
+            active_expert_ids[slot] = -1;
+        }
     }
     __syncthreads();
+
+    if constexpr (PublishCompletePlan)
+    {
+        if (scan_scratch.first_invalid_expert < num_experts)
+        {
+            if (tid == 0)
+            {
+                const int invalid_expert =
+                    scan_scratch.first_invalid_expert;
+                const DeviceMoEPlacementBankView &bank =
+                    runtime->banks[runtime->active_bank];
+                const DeviceMoEExpertDescriptorView &desc =
+                    bank.experts[invalid_expert];
+                const uint32_t local_bit =
+                    runtime_participant_bit(local_participant);
+                printf("runtime_prefill_active_expert_not_ready "
+                       "participant=%u expert=%d count=%d active_bank=%u "
+                       "local_mask=%u resident_mask=%u local_bit=%u "
+                       "local_slot=%d logical=%d owner=%d\\n",
+                       runtime->participant_id,
+                       invalid_expert,
+                       runtime->expert_counts[invalid_expert],
+                       runtime->active_bank,
+                       bank.local_compute_mask[invalid_expert],
+                       bank.resident_participant_mask[invalid_expert],
+                       local_bit,
+                       desc.local_slot,
+                       desc.logical_expert_id,
+                       desc.owner_participant);
+                fail_fast_incomplete_llep_transfer();
+            }
+            return;
+        }
+    }
 
     if (tid < current_slots)
     {
@@ -15953,7 +16198,7 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
                         : 0;
             }
             const int destination =
-                runtime->expert_offsets[expert_id] + stable_local_rank;
+                shared_expert_offsets[expert_id] + stable_local_rank;
             runtime->grouped_token_ids[destination] = tid;
             runtime->grouped_route_weights[destination] =
                 shared_route_weights[tid];
@@ -15988,7 +16233,7 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
                         : 0;
             }
             expected_grouped_slot =
-                runtime->expert_offsets[expert_id] + stable_local_rank;
+                shared_expert_offsets[expert_id] + stable_local_rank;
         }
         const int published_grouped_slot = original_to_grouped
                                                ? original_to_grouped[tid]
@@ -16018,20 +16263,6 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
         }
     }
 
-    if constexpr (PublishCompletePlan)
-    {
-        __syncthreads();
-        __shared__ RuntimePrefillPlanPublicationScratch plan_scratch;
-        rocm_publish_runtime_prefill_plan_block(
-            runtime,
-            gate_descs,
-            up_descs,
-            down_descs,
-            num_experts,
-            active_expert_ids,
-            max_active_experts,
-            plan_scratch);
-    }
 }
 
 __global__ void rocm_moe_prefill_group_cast_count_kernel(
