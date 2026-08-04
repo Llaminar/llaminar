@@ -10631,10 +10631,10 @@ namespace
      * The earlier batched-distribution regression compared against a relaxed
      * CPU oracle at one three-row geometry. This test instead compares the two
      * GPU production paths directly for every runtime M=1..16, using the Qwen
-     * 3.6 vocabulary and the stochastic server policy that exposed a
-     * long-context grouped-verifier mismatch. All launches are captured into
-     * one graph and reuse persistent scratch; only the completed evidence is
-     * copied to the host.
+     * 3.6 vocabulary and production Top-K 40 policy. Tied frontier pairs also
+     * prove that cooperative work partitioning retains the canonical lower-id
+     * tie break. All launches are captured into one graph and reuse persistent
+     * scratch; only the completed evidence is copied to the host.
      */
     TEST_P(
         GPUSamplingTest,
@@ -10642,7 +10642,7 @@ namespace
     {
         constexpr int max_rows = 16;
         constexpr int vocab_size = 248320;
-        constexpr int top_k = 20;
+        constexpr int top_k = 40;
         constexpr float top_p = 0.9f;
         constexpr float temperature = 0.7f;
         constexpr int partial_block_capacity = 128;
@@ -10650,10 +10650,10 @@ namespace
             max_rows * (max_rows + 1) / 2;
 
         /*
-         * Every row has a distinct, non-degenerate Top-K frontier. The broad
-         * low-logit background exercises the complete Qwen-sized reduction,
-         * while row-dependent hot-token positions prevent an indexing or
-         * stride defect from passing because adjacent rows happen to match.
+         * Every row has a distinct Top-K frontier made of equal-valued pairs.
+         * The broad low-logit background exercises the complete Qwen-sized
+         * reduction, while row-dependent hot-token positions prevent an
+         * indexing or stride defect from passing because adjacent rows match.
          */
         std::vector<float> logits(
             static_cast<size_t>(max_rows) * vocab_size);
@@ -10675,7 +10675,7 @@ namespace
                     (row * 15401 + rank * 7919 + 321) % vocab_size;
                 row_logits[token] =
                     6.0f -
-                    0.071f * static_cast<float>(rank) +
+                    0.071f * static_cast<float>(rank / 2) +
                     0.003f * static_cast<float>(row);
             }
         }

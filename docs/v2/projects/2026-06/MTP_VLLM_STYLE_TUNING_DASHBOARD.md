@@ -64,10 +64,13 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Qwen-vocab draft argmax selected fixed `256x4/256` geometry: CUDA `5.01 us`,
   40 registers, 40.6% occupancy, zero spills; ROCm `8.95 us`, 16 VGPR,
   32 SGPR, zero scratch, and 90.6% VALU utilization.
-- Release CUDA2 LLEP d3 is `156.08 tok/s` decode and `181.32 tok/s` prefill,
-  up from `128.13 tok/s` decode (`+21.8%`) and `9.15%` short of llama.cpp's
-  `171.81 tok/s`. Active-expert compaction is fused into descriptor
-  publication; its standalone per-layer launch is gone.
+- Release CUDA2 LLEP d3 is `164.72 tok/s` decode and `181.18 tok/s` prefill,
+  up from `128.13 tok/s` decode (`+28.6%`) and `4.13%` short of llama.cpp's
+  `171.81 tok/s`.
+- Cooperative CUDA Top-K 40 reduced the depth-3 target distribution
+  `1.076 ms -> 0.238 ms` and draft distribution `0.920 ms -> 0.214 ms`.
+  Both kernels use 96 registers, 552 B shared memory, and have zero spills;
+  tied candidates and FP32 probabilities are byte exact through `M=16`.
 - The Qwen3.6 MoE expert `N=512,K=2048` grouped projection now selects the
   byte-exact `64x64` NativeVNNI tile for `M=2..31`. All 21 CUDA formats pass
   the production-path M-totality sweep; affected formats gain `1.69x..2.21x`

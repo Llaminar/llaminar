@@ -11,7 +11,9 @@
  *     many blocks/SMs producing one partial per block; pass 2 reduces the
  *     partials in a single small block). Falls back to a single-block reduction
  *     when no partial scratch is supplied.
- *   - Top-K: Single-block 32-thread insertion sort + merge (~15-25µs for 76K, k=40)
+ *   - Top-K: deterministic value/index ordering. Qwen-sized batched rows use
+ *     a two-stage cooperative register selector; larger geometries retain a
+ *     total generic partial-list implementation.
  */
 
 #include <cuda_runtime.h>
@@ -30,10 +32,18 @@ constexpr int TOPK_THREADS = 32;
 constexpr int TOPK_MEDIUM_K_CAP = 40;
 constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
-// Qwen-style top_k=40/64 distributions still benefit from wider partial
-// reductions; 32 blocks regressed the ROCm fixed-depth-1 MTP lane.
+// Qwen-style top_k=40/64 distributions expose enough independent partials to
+// cover one full GA102 while keeping each segment within the cooperative
+// selector's fixed register capacity.
 constexpr int TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS = 64;
 constexpr int TOPK_SMALL_K_THREADS = 64;
+constexpr int TOPK_BATCHED_COOPERATIVE_THREADS = 256;
+constexpr int TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD = 16;
+constexpr int TOPK_BATCHED_COOPERATIVE_CAPACITY =
+    TOPK_BATCHED_COOPERATIVE_THREADS *
+    TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+constexpr int TOPK_BATCHED_COOPERATIVE_WARPS =
+    TOPK_BATCHED_COOPERATIVE_THREADS / 32;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "CUDA sampling TOPK_MAX_K must match shared sampling math");
 
@@ -986,6 +996,253 @@ __global__ void cuda_topk_topp_distribution_from_partials_f32_kernel(
             out_token_ids,
             out_probs,
             weights);
+    }
+}
+
+template <int K_CAP>
+struct CUDABatchedTopKCooperativeStorage
+{
+    float warp_values[TOPK_BATCHED_COOPERATIVE_WARPS];
+    int warp_indices[TOPK_BATCHED_COOPERATIVE_WARPS];
+    int winner_index;
+    float selected_values[K_CAP];
+    int selected_indices[K_CAP];
+};
+
+struct CUDATopKCandidate
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Reduce one deterministic candidate across a full CUDA warp.
+ *
+ * Every batched selector launches a whole number of 32-lane warps. The same
+ * value-descending/index-ascending comparator used by the serial-row oracle is
+ * applied at every shuffle edge, so work partitioning cannot change ties.
+ */
+__device__ __forceinline__ CUDATopKCandidate cudaTopKReduceWarpBest(
+    CUDATopKCandidate candidate)
+{
+    constexpr unsigned kFullWarp = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        const float other_value =
+            __shfl_down_sync(kFullWarp, candidate.value, offset);
+        const int other_index =
+            __shfl_down_sync(kFullWarp, candidate.index, offset);
+        if (lane + offset < 32 &&
+            topkCandidateBetter(
+                other_value,
+                other_index,
+                candidate.value,
+                candidate.index))
+        {
+            candidate.value = other_value;
+            candidate.index = other_index;
+        }
+    }
+    return candidate;
+}
+
+/**
+ * @brief Select a block-wide sorted Top-K from register-resident candidates.
+ *
+ * Each thread owns exactly sixteen candidate slots. Forty cooperative maxima
+ * therefore replace the former per-thread insertion sorts and thread-zero
+ * k-way merge. The winner index is invalidated only in its owning thread after
+ * every rank, which preserves one deterministic global order without atomics,
+ * temporary allocation, or cross-block reduction.
+ */
+template <int K_CAP>
+__device__ __forceinline__ void cudaSelectBatchedTopKCooperative(
+    float (&local_values)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int (&local_indices)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int k,
+    CUDABatchedTopKCooperativeStorage<K_CAP> &storage)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    for (int rank = 0; rank < k; ++rank)
+    {
+        CUDATopKCandidate local_best{-FLT_MAX, -1};
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (topkCandidateBetter(
+                    local_values[item],
+                    local_indices[item],
+                    local_best.value,
+                    local_best.index))
+            {
+                local_best.value = local_values[item];
+                local_best.index = local_indices[item];
+            }
+        }
+
+        const CUDATopKCandidate warp_best =
+            cudaTopKReduceWarpBest(local_best);
+        if (lane == 0)
+        {
+            storage.warp_values[warp] = warp_best.value;
+            storage.warp_indices[warp] = warp_best.index;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            CUDATopKCandidate block_best{-FLT_MAX, -1};
+            if (lane < TOPK_BATCHED_COOPERATIVE_WARPS)
+            {
+                block_best.value = storage.warp_values[lane];
+                block_best.index = storage.warp_indices[lane];
+            }
+            block_best = cudaTopKReduceWarpBest(block_best);
+            if (lane == 0)
+            {
+                storage.winner_index = block_best.index;
+                storage.selected_values[rank] = block_best.value;
+                storage.selected_indices[rank] = block_best.index;
+            }
+        }
+        __syncthreads();
+
+        const int winner_index = storage.winner_index;
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (local_indices[item] == winner_index)
+                local_indices[item] = -1;
+        }
+    }
+}
+
+/**
+ * @brief Produce exact sorted Top-K partials for Qwen-sized batched rows.
+ */
+template <int K_CAP>
+__global__ void cuda_topk_cooperative_partials_batched_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int row_stride,
+    int k,
+    int partial_blocks,
+    float *__restrict__ partial_values,
+    int *__restrict__ partial_indices,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.y;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.y);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.y) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int partial = blockIdx.x;
+    const int block_start =
+        static_cast<int>((static_cast<long long>(partial) * n) / partial_blocks);
+    const int block_end = static_cast<int>(
+        (static_cast<long long>(partial + 1) * n) / partial_blocks);
+    const float *row_data = data + static_cast<size_t>(row) * row_stride;
+
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            threadIdx.x + item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const int index = block_start + offset;
+        const bool valid = index < block_end;
+        local_values[item] = valid ? row_data[index] : -FLT_MAX;
+        local_indices[item] = valid ? index : -1;
+    }
+
+    __shared__ CUDABatchedTopKCooperativeStorage<K_CAP> storage;
+    cudaSelectBatchedTopKCooperative(
+        local_values, local_indices, k, storage);
+
+    const int out_base = (row * partial_blocks + partial) * k;
+    for (int rank = threadIdx.x; rank < k; rank += blockDim.x)
+    {
+        partial_values[out_base + rank] = storage.selected_values[rank];
+        partial_indices[out_base + rank] = storage.selected_indices[rank];
+    }
+}
+
+/**
+ * @brief Merge cooperative partials and build one compact Top-K/Top-P row.
+ */
+template <int K_CAP>
+__global__ void cuda_topk_topp_distribution_cooperative_batched_f32_kernel(
+    const float *__restrict__ partial_values,
+    const int *__restrict__ partial_indices,
+    int partial_blocks,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    int out_stride,
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.x) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int candidate_count = partial_blocks * k;
+    const int partial_base = row * candidate_count;
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            threadIdx.x + item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const bool valid = offset < candidate_count;
+        local_values[item] = valid
+                                 ? partial_values[partial_base + offset]
+                                 : -FLT_MAX;
+        local_indices[item] = valid
+                                  ? partial_indices[partial_base + offset]
+                                  : -1;
+    }
+
+    __shared__ CUDABatchedTopKCooperativeStorage<K_CAP> storage;
+    __shared__ float distribution_weights[K_CAP];
+    cudaSelectBatchedTopKCooperative(
+        local_values, local_indices, k, storage);
+
+    if (threadIdx.x == 0)
+    {
+        const int out_base = row * out_stride;
+        llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
+            storage.selected_values,
+            storage.selected_indices,
+            k,
+            top_p,
+            temperature,
+            out_token_ids + out_base,
+            out_probs + out_base,
+            distribution_weights);
     }
 }
 
@@ -6129,7 +6386,34 @@ extern "C"
             {
                 const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
                 const dim3 partial_grid(partial_blocks, row_count);
-                if (k <= TOPK_MEDIUM_K_CAP)
+                const int maximum_partial_span =
+                    (n + partial_blocks - 1) / partial_blocks;
+                const bool use_cooperative_selector =
+                    maximum_partial_span <= TOPK_BATCHED_COOPERATIVE_CAPACITY &&
+                    partial_blocks * k <= TOPK_BATCHED_COOPERATIVE_CAPACITY;
+                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+                {
+                    cuda_topk_cooperative_partials_batched_f32_kernel<
+                        TOPK_MEDIUM_K_CAP>
+                        <<<partial_grid,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            data, n, row_stride, k, partial_blocks,
+                            scratch_values, scratch_indices, active_rows);
+                }
+                else if (use_cooperative_selector)
+                {
+                    cuda_topk_cooperative_partials_batched_f32_kernel<
+                        TOPK_SMALL_K_CAP>
+                        <<<partial_grid,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            data, n, row_stride, k, partial_blocks,
+                            scratch_values, scratch_indices, active_rows);
+                }
+                else if (k <= TOPK_MEDIUM_K_CAP)
                 {
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
@@ -6152,7 +6436,31 @@ extern "C"
                     return false;
                 }
 
-                if (k <= TOPK_MEDIUM_K_CAP)
+                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+                {
+                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                        TOPK_MEDIUM_K_CAP>
+                        <<<row_count,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            scratch_values, scratch_indices, partial_blocks, k,
+                            top_p, temperature, out_token_ids, out_stride,
+                            out_probs, active_rows);
+                }
+                else if (use_cooperative_selector)
+                {
+                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                        TOPK_SMALL_K_CAP>
+                        <<<row_count,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            scratch_values, scratch_indices, partial_blocks, k,
+                            top_p, temperature, out_token_ids, out_stride,
+                            out_probs, active_rows);
+                }
+                else if (k <= TOPK_MEDIUM_K_CAP)
                 {
                     cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<row_count, threads, smem_size, s>>>(

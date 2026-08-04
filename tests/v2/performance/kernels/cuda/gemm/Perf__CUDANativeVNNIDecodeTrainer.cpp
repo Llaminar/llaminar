@@ -27,9 +27,11 @@
 
 #include "backends/DeviceId.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/KernelFactory.h"
+#include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/NativeVNNITrainerEvidence.h"
@@ -46,6 +48,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1120,7 +1123,16 @@ namespace
         bool active_ = false;
     };
 
-    /** Own a captured production launch and executable graph. */
+    /**
+     * @brief Own one production-contract capture and its output publication.
+     *
+     * A raw CUDA stream capture is not sufficient for a public tensor kernel:
+     * the kernel publishes every device write, while recording has not yet
+     * executed those bytes. Production solves that distinction with a frozen
+     * dependency ledger during capture and one exact-stream publication after
+     * replay. The trainer must use the same lifecycle or its graph surface
+     * measures an ordering contract that inference can never execute.
+     */
     class CapturedLaunch
     {
     public:
@@ -1129,17 +1141,76 @@ namespace
             reset();
         }
 
+        /**
+         * @brief Record one declared stage and freeze its executable graph.
+         *
+         * @param stream Exact non-default CUDA stream used for capture/replay.
+         * @param device CUDA device that owns every declared tensor.
+         * @param inputs Stable graph-external inputs joined before capture.
+         * @param outputs Stable outputs published after each graph replay.
+         * @param launch Public production entrypoint that records device work.
+         * @return True only when capture and instantiation both succeed.
+         */
         template <typename Launch>
-        bool capture(cudaStream_t stream, Launch &&launch)
+        bool capture(
+            cudaStream_t stream,
+            DeviceId device,
+            const std::vector<const TensorBase *> &inputs,
+            const std::vector<TensorBase *> &outputs,
+            Launch &&launch)
         {
             reset();
+            if (!stream || !device.is_gpu() || outputs.empty())
+                return false;
+
+            std::vector<const TensorBase *> declared_outputs;
+            declared_outputs.reserve(outputs.size());
+            for (TensorBase *output : outputs)
+            {
+                if (!output)
+                    return false;
+                declared_outputs.push_back(output);
+            }
+
+            GraphCaptureDependencyLedger ledger(
+                device,
+                reinterpret_cast<void *>(stream),
+                {GraphCaptureDependencyLedger::StagePlan{
+                    .stage_identity = this,
+                    .stage_name = "NativeVNNI trainer projection",
+                    .external_inputs = inputs,
+                    .internal_inputs = {},
+                    .outputs = std::move(declared_outputs),
+                }},
+                "NativeVNNI trainer captured launch");
+
             if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) !=
                 cudaSuccess)
             {
                 return false;
             }
-            const bool launch_ok = launch();
+
+            bool launch_ok = false;
+            std::exception_ptr launch_error;
+            try
+            {
+                GraphCaptureGuard guard(&ledger);
+                ScopedGraphCaptureStage stage(this);
+                launch_ok = launch();
+                if (launch_ok)
+                    stage.complete();
+            }
+            catch (...)
+            {
+                launch_error = std::current_exception();
+            }
+
             const cudaError_t end_status = cudaStreamEndCapture(stream, &graph_);
+            if (launch_error)
+            {
+                reset();
+                std::rethrow_exception(launch_error);
+            }
             if (!launch_ok || end_status != cudaSuccess || graph_ == nullptr)
             {
                 reset();
@@ -1151,13 +1222,33 @@ namespace
                 reset();
                 return false;
             }
+            device_ = device;
+            outputs_ = outputs;
             return true;
         }
 
+        /**
+         * @brief Replay and publish the completed graph generation in order.
+         *
+         * Publication records events after `cudaGraphLaunch()` on this exact
+         * stream. It performs no synchronization or host transfer, and the
+         * resulting edge is what a downstream production consumer would join.
+         */
         bool launch(cudaStream_t stream) const
         {
-            return executable_ != nullptr &&
-                   cudaGraphLaunch(executable_, stream) == cudaSuccess;
+            if (!stream || executable_ == nullptr || !device_.has_value() ||
+                cudaGraphLaunch(executable_, stream) != cudaSuccess)
+            {
+                return false;
+            }
+            for (TensorBase *output : outputs_)
+            {
+                TransferEngine::publishDeviceWrite(
+                    output,
+                    *device_,
+                    reinterpret_cast<void *>(stream));
+            }
+            return true;
         }
 
         void reset()
@@ -1168,11 +1259,15 @@ namespace
                 (void)cudaGraphDestroy(graph_);
             executable_ = nullptr;
             graph_ = nullptr;
+            outputs_.clear();
+            device_.reset();
         }
 
     private:
         cudaGraph_t graph_ = nullptr;
         cudaGraphExec_t executable_ = nullptr;
+        std::vector<TensorBase *> outputs_;
+        std::optional<DeviceId> device_;
     };
 
     size_t workspaceBudgetFor(const WorkspaceRequirements &requirements)
@@ -1352,8 +1447,12 @@ namespace
         const float *source = static_cast<const float *>(grouped_input->data());
         std::vector<std::unique_ptr<FP32Tensor>> row_inputs;
         std::vector<std::unique_ptr<FP32Tensor>> row_outputs;
+        std::vector<const TensorBase *> serial_inputs;
+        std::vector<TensorBase *> serial_outputs;
         row_inputs.reserve(static_cast<size_t>(m));
         row_outputs.reserve(static_cast<size_t>(m));
+        serial_inputs.reserve(static_cast<size_t>(m));
+        serial_outputs.reserve(static_cast<size_t>(m));
         for (int row = 0; row < m; ++row)
         {
             auto row_input = TestTensorFactory::createFP32(
@@ -1370,6 +1469,10 @@ namespace
                 cleanup();
                 return fail("serial_row_prepare");
             }
+            TransferEngine::requireDeviceInput(
+                row_input.get(), device, reinterpret_cast<void *>(stream));
+            serial_inputs.push_back(row_input.get());
+            serial_outputs.push_back(row_output.get());
             row_inputs.push_back(std::move(row_input));
             row_outputs.push_back(std::move(row_output));
         }
@@ -1401,7 +1504,12 @@ namespace
              * surface rather than borrowing the eager M1 route.
              */
             CapturedLaunch primer;
-            if (!primer.capture(stream, launch_serial_rows) ||
+            if (!primer.capture(
+                    stream,
+                    device,
+                    serial_inputs,
+                    serial_outputs,
+                    launch_serial_rows) ||
                 !primer.launch(stream) ||
                 cudaStreamSynchronize(stream) != cudaSuccess)
             {
@@ -1410,7 +1518,12 @@ namespace
             }
             primer.reset();
             PerfStatsCollector::reset();
-            if (!captured.capture(stream, launch_serial_rows) ||
+            if (!captured.capture(
+                    stream,
+                    device,
+                    serial_inputs,
+                    serial_outputs,
+                    launch_serial_rows) ||
                 !captured.launch(stream) ||
                 cudaStreamSynchronize(stream) != cudaSuccess)
             {
@@ -1584,6 +1697,10 @@ namespace
             {static_cast<size_t>(m), static_cast<size_t>(n)});
         if (!input->ensureOnDevice(device) || !output->allocateOnDevice(device))
             return fail("tensor_prepare");
+        TransferEngine::requireDeviceInput(
+            input, device, reinterpret_cast<void *>(stream));
+        const std::vector<const TensorBase *> capture_inputs = {input};
+        const std::vector<TensorBase *> capture_outputs = {output.get()};
         if (cudaEventCreate(&start) != cudaSuccess ||
             cudaEventCreate(&stop) != cudaSuccess)
         {
@@ -1656,7 +1773,11 @@ namespace
                 {
                     CandidateOverride override(candidate);
                     state.evidence.graph_capture_ok = state.captured->capture(
-                        stream, run_once);
+                        stream,
+                        device,
+                        capture_inputs,
+                        capture_outputs,
+                        run_once);
                 }
                 if (!state.evidence.graph_capture_ok)
                     return fail(candidate.id + ":graph_capture");
