@@ -94,7 +94,9 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.mtp.draft_tokens, 1);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
-    EXPECT_TRUE(config.mtp.mirror_full_head_for_local_tp)
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary)
         << "LocalTP MTP defaults to mirrored verifier heads; disabled MTP "
            "configurations simply never activate the flag.";
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
@@ -198,7 +200,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--mtp-draft-tokens", "2",
         "--mtp-max-request-batch", "4",
         "--mtp-verify-mode", "speculative-sampling",
-        "--mtp-mirror-full-head-local-tp",
+        "--mtp-terminal-head-policy", "mirrored-full-vocabulary",
         "--mtp-depth-policy", "dynamic",
         "--mtp-min-draft-tokens", "1",
         "--mtp-max-draft-tokens", "3",
@@ -229,7 +231,9 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_EQ(config.mtp.draft_tokens, 2);
     EXPECT_EQ(config.mtp.max_request_batch, 4);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
-    EXPECT_TRUE(config.mtp.mirror_full_head_for_local_tp);
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
@@ -372,7 +376,7 @@ mtp:
   draft_tokens: 3
   max_request_batch: 2
   verify_mode: greedy
-  mirror_full_head_for_local_tp: true
+  terminal_head_policy: mirrored-full-vocabulary
   require_terminal_hidden_for_full_hit: false
   depth_policy: observe
   min_draft_tokens: 1
@@ -404,7 +408,9 @@ mtp:
     EXPECT_EQ(config.mtp.draft_tokens, 3);
     EXPECT_EQ(config.mtp.max_request_batch, 2);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
-    EXPECT_TRUE(config.mtp.mirror_full_head_for_local_tp);
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary);
     EXPECT_FALSE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Observe);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
@@ -438,6 +444,8 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     source.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
     source.mtp.depth_policy.max_depth = 3;
     source.mtp.depth_policy.window_size = 8;
+    source.moe_routed_prefill.assignment_window_tokens = 64;
+    source.moe_routed_prefill.least_loaded_min_routed_rows = 4096;
 
     RuntimeConfig runtime = RuntimeConfig::fromOrchestrationConfig(
         source.max_seq_len,
@@ -447,6 +455,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
         source.fused_attention_backend,
         source.routed_expert_compute_policy,
         source.moe_hot_expert_cache,
+        source.moe_routed_prefill,
         source.moe_rebalance,
         source.prefix_cache,
         source.mtp);
@@ -461,6 +470,11 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     GraphConfig graph_config;
     graph_config.prefix_cache = runner_config.prefix_cache;
     graph_config.mtp = runner_config.mtp;
+
+    EXPECT_EQ(runner_config.moe_routed_prefill.assignment_window_tokens, 64);
+    EXPECT_EQ(runner_config.moe_routed_prefill.least_loaded_min_routed_rows,
+              4096u);
+    EXPECT_EQ(rank_config.moe_routed_prefill.assignment_window_tokens, 64);
 
     EXPECT_TRUE(graph_config.prefix_cache.enabled);
     EXPECT_EQ(graph_config.prefix_cache.storage_mode, PrefixCacheStorageMode::Ram);
@@ -501,7 +515,8 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     config.mtp.draft_tokens = 2;
     config.mtp.max_request_batch = 3;
     config.mtp.verify_mode = MTPVerifyMode::Greedy;
-    config.mtp.mirror_full_head_for_local_tp = true;
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     config.mtp.require_terminal_hidden_for_full_hit = false;
     config.mtp.depth_policy.mode = MTPDepthPolicyMode::Observe;
     config.mtp.depth_policy.max_depth = 3;
@@ -523,7 +538,9 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
     EXPECT_NE(explanation.find("max_request_batch: 3"), std::string::npos);
     EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
-    EXPECT_NE(explanation.find("mirror_full_head_for_local_tp: true"), std::string::npos);
+    EXPECT_NE(
+        explanation.find("terminal_head_policy: mirrored-full-vocabulary"),
+        std::string::npos);
     EXPECT_NE(explanation.find("depth_policy: observe"), std::string::npos);
     EXPECT_NE(explanation.find("max_draft_tokens: 3"), std::string::npos);
     EXPECT_NE(explanation.find("depth_window: 8"), std::string::npos);

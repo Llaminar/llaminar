@@ -4,9 +4,9 @@
  *
  * The tests in this file exercise request-boundary state restoration across
  * CUDA and ROCm two-device expert-overlay plans.  They intentionally pair the
- * prefix cache with MTP verifier state, KV cache state, and MoE rebalance state
+ * prefix cache with MTP verifier state, KV cache state, and routed-expert state
  * because those lifetimes are independent in production but must agree at a
- * request boundary.  The phase-split migration probes use the same long-decode
+ * request boundary.  The explicit expert-overlay policy probes use the same long-decode
  * PyTorch metadata as the math parity suite, so their context window must be
  * large enough for the full metadata prompt even when an individual partial-hit
  * prefix-restore test later trims that prompt.
@@ -35,7 +35,7 @@ using namespace llaminar2::test::parity::qwen36;
 namespace
 {
     /**
-     * @brief Context length used by phase-split probes backed by long-decode metadata.
+     * @brief Context length used by expert-overlay probes backed by long-decode metadata.
      *
      * The long-decode PyTorch fixtures currently contain prompts in the low
      * thousands of tokens.  A 4096-token window matches the expert-overlay math
@@ -43,7 +43,7 @@ namespace
      * metadata prompt instead of relying on the partial-hit prefix cap used by
      * the non-MTP restore tests.
      */
-    constexpr int kPhaseSplitLongDecodeMaxSeqLen = 4096;
+    constexpr int kExpertOverlayLongDecodeMaxSeqLen = 4096;
 
     /**
      * @brief Tokenize the full-tier server's structured-generation prompt exactly.
@@ -217,50 +217,51 @@ namespace
         return "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock";
     }
 
+    enum class ExpertOverlayPolicyScenario
+    {
+        DynamicResidencyMaintenance,
+        CurrentBatchLLEP,
+    };
+
     /**
-     * @brief Builds a rebalance policy that deliberately encourages expert movement.
+     * @brief Builds explicit residency and current-batch movement test policy.
      *
-     * The values remove the usual production hysteresis so short parity prompts
-     * can exercise phase-split expert placement changes.  The resulting config
-     * is test-only and is paired with strict parity assertions rather than a
-     * degraded fallback path.
+     * Dynamic maintenance removes normal production hysteresis so short parity
+     * prompts can exercise durable whole-expert placement changes. Current-batch
+     * LLEP explicitly leaves maintenance disabled; its movement controls live in
+     * `RoutedExpertPrefillRuntimeConfig` instead.
      *
-     * @param mode Dynamic or LLEP rebalance mode to exercise.
+     * @param scenario Independent policy scenario to exercise.
      * @return Runtime rebalance configuration for the migration probes.
      */
-    MoERebalanceRuntimeConfig movementFriendlyRebalanceConfig(
-        MoERebalanceRuntimeMode mode)
+    MoERebalanceRuntimeConfig residencyMaintenanceConfig(
+        ExpertOverlayPolicyScenario scenario)
     {
         MoERebalanceRuntimeConfig config;
-        config.mode = mode;
-        config.window_size = 4;
-        config.max_window_size = 4;
-        config.window_growth_factor = 1.0f;
-        config.dynamic_imbalance_threshold_per_mille = 0;
-        config.dynamic_min_improvement_per_mille = 0;
-        config.dynamic_max_swaps_per_layer = 20;
-        config.dynamic_max_plan_entries_per_wave = 20;
-        config.dynamic_min_window_activations = 0;
-        config.device_min_load_spread_improvement = 0;
-        config.device_min_load_spread_improvement_divisor = 0;
-        config.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.device_min_foreign_rows_per_transfer = 0;
-        config.device_min_router_spread_improvement_per_payload_slot = 0;
-        config.device_max_post_wave_load_spread_per_mille = 1000;
-        config.device_maintenance_slack_tokens = 0;
-        config.device_min_maintenance_period_tokens = 4;
-        config.device_initial_maintenance_period_tokens = 4;
-        if (mode == MoERebalanceRuntimeMode::LLEP)
+        config.mode =
+            scenario ==
+                    ExpertOverlayPolicyScenario::DynamicResidencyMaintenance
+                ? MoERebalanceRuntimeMode::Dynamic
+                : MoERebalanceRuntimeMode::Off;
+        if (config.mode == MoERebalanceRuntimeMode::Dynamic)
         {
-            /*
-             * These cells are coverage tests, not production economics tests:
-             * make the LLEP assignment capacity strict enough that both CUDA
-             * and ROCm must publish transfer-backed migrations instead of
-             * legally selecting static-owner assignment for already-balanced router loads.
-             */
-            config.device_llep_alpha_numerator = 1;
-            config.device_llep_alpha_denominator = 2;
-            config.device_llep_enable_balanced_skip = false;
+            config.window_size = 4;
+            config.max_window_size = 4;
+            config.window_growth_factor = 1.0f;
+            config.dynamic_imbalance_threshold_per_mille = 0;
+            config.dynamic_min_improvement_per_mille = 0;
+            config.dynamic_max_swaps_per_layer = 20;
+            config.dynamic_max_plan_entries_per_wave = 20;
+            config.dynamic_min_window_activations = 0;
+            config.device_min_load_spread_improvement = 0;
+            config.device_min_load_spread_improvement_divisor = 0;
+            config.device_min_wave_spread_improvement_per_payload_slot = 0;
+            config.device_min_foreign_rows_per_transfer = 0;
+            config.device_min_router_spread_improvement_per_payload_slot = 0;
+            config.device_max_post_wave_load_spread_per_mille = 1000;
+            config.device_maintenance_slack_tokens = 0;
+            config.device_min_maintenance_period_tokens = 4;
+            config.device_initial_maintenance_period_tokens = 4;
         }
         config.release_raw_expert_weights = true;
         return config;
@@ -289,7 +290,7 @@ namespace
         test_case.metadata_envs.clear();
         test_case.default_metadata_path.clear();
         test_case.decode_steps = 8;
-        test_case.max_seq_len = kPhaseSplitLongDecodeMaxSeqLen;
+        test_case.max_seq_len = kExpertOverlayLongDecodeMaxSeqLen;
         test_case.prefix_restore_prompt_token_limit = 640;
         test_case.minimum_prompt_tokens = 640;
         test_case.env_overrides = {
@@ -301,8 +302,8 @@ namespace
          * Runtime rebalance defaults to Dynamic in production configuration.
          * A missing optional test override is therefore not static placement.
          * Declare Off explicitly so this fixture is a genuine long-position
-         * control; configurePhaseSplitMigrationProbe() replaces this policy
-         * with its movement-friendly Dynamic or LLEP configuration.
+         * control; configureExpertOverlayPolicyProbe() replaces this policy
+         * only when the selected scenario enables Dynamic maintenance.
          */
         MoERebalanceRuntimeConfig static_placement;
         static_placement.mode = MoERebalanceRuntimeMode::Off;
@@ -310,7 +311,7 @@ namespace
     }
 
     /**
-     * @brief Converts a hot-only expert-overlay case into a phase-split migration probe.
+     * @brief Applies one explicit hot-only expert-overlay policy scenario.
      *
      * Prefix partial-hit tests cap the tokenized prompt locally, while MTP
      * restore tests use the complete deterministic ledger. Both obtain tokens
@@ -320,16 +321,17 @@ namespace
      * of depending on the partial-prefix cap.
      *
      * @param test_case Case object to mutate.
-     * @param mode Rebalance mode under test.
+     * @param scenario Independent policy scenario under test.
      */
-    void configurePhaseSplitMigrationProbe(
+    void configureExpertOverlayPolicyProbe(
         MoEPrefixRestoreParityCase &test_case,
-        MoERebalanceRuntimeMode mode)
+        ExpertOverlayPolicyScenario scenario)
     {
         configureLongContextMTPProbe(test_case);
-        test_case.name += mode == MoERebalanceRuntimeMode::LLEP
-                              ? " LLEP phase-split migration"
-                              : " Dynamic phase-split migration";
+        test_case.name +=
+            scenario == ExpertOverlayPolicyScenario::CurrentBatchLLEP
+                ? " current-batch LLEP prefill with static-owner decode"
+                : " Dynamic residency maintenance with static row assignment";
         /*
          * The shared long-context fixture emits eight requested tokens. At
          * grouped depth two that budget is sufficient to publish the first
@@ -339,9 +341,23 @@ namespace
          * tokens and explicitly require applied arrivals; these ordinary
          * parity cells remain the affordable single-request correctness gate.
          */
-        test_case.moe_rebalance = movementFriendlyRebalanceConfig(mode);
-        if (mode == MoERebalanceRuntimeMode::LLEP)
+        test_case.moe_rebalance =
+            residencyMaintenanceConfig(scenario);
+        MoEHotExpertCacheConfig no_hot_replicas;
+        no_hot_replicas.kind = MoEHotExpertCacheConfig::Kind::Off;
+        test_case.moe_hot_expert_cache = no_hot_replicas;
+        const bool current_batch_llep =
+            scenario == ExpertOverlayPolicyScenario::CurrentBatchLLEP;
+        if (current_batch_llep)
         {
+            test_case.moe_routed_prefill =
+                RoutedExpertPrefillRuntimeConfig{
+                    .assignment_window_tokens = 0,
+                    .least_loaded_min_routed_rows = 0,
+                    .llep_alpha_numerator = 1,
+                    .llep_alpha_denominator = 2,
+                    .llep_enable_balanced_skip = false,
+                };
             ASSERT_NE(test_case.moe_routed_expert_plan, nullptr)
                 << "LLEP parity requires an explicit routed-expert graph plan";
             auto &plan = *test_case.moe_routed_expert_plan;
@@ -359,15 +375,26 @@ namespace
                     << "' references missing execution domain '"
                     << tier.domain << "'";
                 /*
-                 * Runtime rebalance mode controls when placement maintenance
-                 * runs; it deliberately does not rewrite graph scheduling.
-                 * The fixture must therefore declare the production LLEP row
-                 * assignment policy in the graph plan itself.  Keeping that
-                 * distinction explicit prevents a test-only mode flag from
-                 * silently exercising StaticOwner while claiming LLEP parity.
+                 * Runtime maintenance deliberately does not rewrite graph
+                 * scheduling. Declare current-batch LLEP on ordinary prefill
+                 * only; grouped verifier/decode remains static-owner so this
+                 * fixture is the exact economical production policy.
                  */
-                domain->routed_assignment_policy =
+                domain->routed_decode_assignment_policy =
+                    RoutedExpertAssignmentPolicy::StaticOwner;
+                domain->routed_prefill_assignment_policy =
                     RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            }
+        }
+        else
+        {
+            ASSERT_NE(test_case.moe_routed_expert_plan, nullptr);
+            for (auto &domain : test_case.moe_routed_expert_plan->domains)
+            {
+                domain.routed_decode_assignment_policy =
+                    RoutedExpertAssignmentPolicy::StaticOwner;
+                domain.routed_prefill_assignment_policy =
+                    RoutedExpertAssignmentPolicy::StaticOwner;
             }
         }
         test_case.env_overrides.emplace_back(
@@ -379,39 +406,26 @@ namespace
         test_case.env_overrides.emplace_back(
             "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS",
             "32");
-        if (mode == MoERebalanceRuntimeMode::LLEP)
-        {
-            test_case.env_overrides.emplace_back(
-                "LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE",
-                "full");
-            test_case.env_overrides.emplace_back(
-                "LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS",
-                "0");
-        }
     }
 
     /**
      * @brief Match the canonical server's seeded stochastic movement probe.
      *
-     * The E2E probe is intentionally a narrow one-slot LLEP transaction. Its
-     * first maintenance opportunity occurs after a four-row evidence window
-     * plus one slack row. Those values affect the relative ordering of expert
-     * publication and chained MTP sidecars, so a larger payload or a different
-     * cadence is not a valid reproduction even when prompt length and draft
-     * depth happen to match.
+     * The E2E probe is intentionally a narrow current-batch LLEP transaction.
+     * Its assignment window and transfer capacity affect expert publication
+     * ordering relative to chained MTP sidecars, so they are part of the
+     * routed-prefill policy rather than durable maintenance cadence.
      *
-     * @param test_case CUDA or ROCm phase-split LLEP fixture to specialize.
+     * @param test_case CUDA or ROCm current-batch LLEP fixture to specialize.
      */
     void configureCanonicalStochasticServerProbe(
         MoEPrefixRestoreParityCase &test_case)
     {
         ASSERT_TRUE(test_case.moe_rebalance.has_value());
         auto &rebalance = *test_case.moe_rebalance;
-        rebalance.window_size = 4;
-        rebalance.max_window_size = 4;
-        rebalance.device_maintenance_slack_tokens = 1;
-        rebalance.device_min_maintenance_period_tokens = 4;
-        rebalance.device_initial_maintenance_period_tokens = 5;
+        ASSERT_EQ(rebalance.mode, MoERebalanceRuntimeMode::Off)
+            << "canonical current-batch LLEP must not enable durable "
+               "residency maintenance";
         /*
          * The canonical prefix-cache cell uses 64-token blocks. LLEP derives
          * its initial placement evidence from these prefill windows, so the
@@ -419,7 +433,14 @@ namespace
          * plumbing. Declare it here once so direct verifier proofs and full
          * orchestration runners construct the same initial expert layout.
          */
-        rebalance.prefill_window_tokens = 64;
+        test_case.moe_routed_prefill =
+            RoutedExpertPrefillRuntimeConfig{
+                .assignment_window_tokens = 64,
+                .least_loaded_min_routed_rows = 0,
+                .llep_alpha_numerator = 1,
+                .llep_alpha_denominator = 2,
+                .llep_enable_balanced_skip = false,
+            };
 
         auto set_env =
             [&](const char *name, const char *value)
@@ -436,21 +457,12 @@ namespace
             else
                 existing->second = value;
         };
-        set_env("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER", "2");
+        set_env("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER", "0");
         set_env(
             "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS",
             "1");
         set_env(
             "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS",
-            "1");
-        set_env(
-            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS",
-            "5");
-        set_env(
-            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS",
-            "4");
-        set_env(
-            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS",
             "1");
 
         test_case.chat_messages = {
@@ -493,7 +505,7 @@ namespace
             MoEReferenceInputSource::ModelTokenizer;
         test_case.metadata_envs.clear();
         test_case.default_metadata_path.clear();
-        test_case.max_seq_len = kPhaseSplitLongDecodeMaxSeqLen;
+        test_case.max_seq_len = kExpertOverlayLongDecodeMaxSeqLen;
         test_case.prefix_restore_prompt_token_limit = 640;
         test_case.minimum_prompt_tokens = 640;
     }
@@ -525,8 +537,8 @@ namespace
          * This fixture is the static-placement stochastic control. Runtime
          * configuration defaults to Dynamic, so leaving the optional override
          * unset would silently turn a small parity probe into a 40-layer
-         * transfer-slot stress test. Dynamic and LLEP coverage use their
-         * dedicated phase-split fixtures below.
+         * transfer-slot stress test. Dynamic maintenance and current-batch LLEP
+         * coverage use their dedicated explicit-policy fixtures below.
          */
         MoERebalanceRuntimeConfig static_placement;
         static_placement.mode = MoERebalanceRuntimeMode::Off;
@@ -630,30 +642,30 @@ namespace
     }
 
     /**
-     * @brief Builds the CUDA dynamic phase-split migration fixture.
+     * @brief Builds the CUDA durable Dynamic-residency maintenance fixture.
      *
-     * @return CUDA hot-only expert-overlay case with movement-friendly dynamic rebalance.
+     * @return CUDA hot-only expert-overlay case with movement-friendly Dynamic maintenance.
      */
-    MoEPrefixRestoreParityCase cudaOnlyDynamicPhaseSplitCase()
+    MoEPrefixRestoreParityCase cudaOnlyDynamicMaintenanceCase()
     {
         auto test_case = cudaOnlyExpertOverlayCase();
-        configurePhaseSplitMigrationProbe(
+        configureExpertOverlayPolicyProbe(
             test_case,
-            MoERebalanceRuntimeMode::Dynamic);
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
         return test_case;
     }
 
     /**
-     * @brief Builds the CUDA LLEP phase-split migration fixture.
+     * @brief Builds the canonical CUDA current-batch LLEP fixture.
      *
-     * @return CUDA hot-only expert-overlay case with movement-friendly LLEP rebalance.
+     * @return CUDA hot-only case with LLEP prefill and static-owner grouped decode.
      */
-    MoEPrefixRestoreParityCase cudaOnlyLLEPPhaseSplitCase()
+    MoEPrefixRestoreParityCase cudaOnlyCurrentBatchLLEPCase()
     {
         auto test_case = cudaOnlyExpertOverlayCase();
-        configurePhaseSplitMigrationProbe(
+        configureExpertOverlayPolicyProbe(
             test_case,
-            MoERebalanceRuntimeMode::LLEP);
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP);
         return test_case;
     }
 
@@ -662,22 +674,22 @@ namespace
      */
     MoEPrefixRestoreParityCase cudaOnlyCanonicalStochasticLLEPCase()
     {
-        auto test_case = cudaOnlyLLEPPhaseSplitCase();
+        auto test_case = cudaOnlyCurrentBatchLLEPCase();
         configureCanonicalStochasticServerProbe(test_case);
         return test_case;
     }
 
     /**
-     * @brief Builds the ROCm dynamic phase-split migration fixture.
+     * @brief Builds the ROCm durable Dynamic-residency maintenance fixture.
      *
-     * @return ROCm hot-only expert-overlay case with movement-friendly dynamic rebalance.
+     * @return ROCm hot-only expert-overlay case with movement-friendly Dynamic maintenance.
      */
-    MoEPrefixRestoreParityCase rocmOnlyDynamicPhaseSplitCase()
+    MoEPrefixRestoreParityCase rocmOnlyDynamicMaintenanceCase()
     {
         auto test_case = rocmOnlyExpertOverlayCase();
-        configurePhaseSplitMigrationProbe(
+        configureExpertOverlayPolicyProbe(
             test_case,
-            MoERebalanceRuntimeMode::Dynamic);
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
         return test_case;
     }
 
@@ -707,16 +719,16 @@ namespace
     }
 
     /**
-     * @brief Builds the ROCm LLEP phase-split migration fixture.
+     * @brief Builds the canonical ROCm current-batch LLEP fixture.
      *
-     * @return ROCm hot-only expert-overlay case with movement-friendly LLEP rebalance.
+     * @return ROCm hot-only case with LLEP prefill and static-owner grouped decode.
      */
-    MoEPrefixRestoreParityCase rocmOnlyLLEPPhaseSplitCase()
+    MoEPrefixRestoreParityCase rocmOnlyCurrentBatchLLEPCase()
     {
         auto test_case = rocmOnlyExpertOverlayCase();
-        configurePhaseSplitMigrationProbe(
+        configureExpertOverlayPolicyProbe(
             test_case,
-            MoERebalanceRuntimeMode::LLEP);
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP);
         return test_case;
     }
 
@@ -725,28 +737,28 @@ namespace
      */
     MoEPrefixRestoreParityCase rocmOnlyCanonicalStochasticLLEPCase()
     {
-        auto test_case = rocmOnlyLLEPPhaseSplitCase();
+        auto test_case = rocmOnlyCurrentBatchLLEPCase();
         configureCanonicalStochasticServerProbe(test_case);
         return test_case;
     }
 
     /**
-     * @brief Stress GPU rebalance request-boundary ordering without reloading model weights.
+     * @brief Stress explicit GPU expert-overlay ordering without reloading model weights.
      *
-     * @param test_case Backend-specific CUDA or ROCm Dynamic/LLEP phase-split fixture.
+     * @param test_case Backend-specific CUDA or ROCm explicit-policy fixture.
      *
      * The server regression that motivated this test appeared only after several
      * different prefills had alternated with grouped MTP decode. A single parity
      * request followed by one exact cache hit was therefore too narrow: it reused
-     * one graph shape and gave the asynchronous token-four maintenance wave only
+     * one graph shape and gave the asynchronous expert-state publication only
      * one subsequent consumer.
      *
      * This fixture keeps one production runner alive across the exact prefill
      * row-count history observed before the failing structured request:
      * 39, 68, 39, 62, 62, 431, 36, 1815, 1813, 1801, and 1305. Each history
      * request performs the canonical 64-token decode workload, which gives
-     * asynchronous Dynamic/LLEP maintenance several opportunities to plan,
-     * transfer, publish, and consume a new placement before request reset.
+     * Dynamic maintenance or current-batch LLEP several opportunities to plan,
+     * transfer, publish, and consume routed work before request reset.
      *
      * The next request uses the exact 154-token structured-generation prompt
      * and 512-token completion budget from the server gate. The former
@@ -759,14 +771,20 @@ namespace
      *
      * Keeping the implementation backend-neutral is important. CUDA originally
      * exposed the lifecycle race, but ROCm owns the same asynchronous graph,
-     * prefix-cache, and LLEP publication contract. Both backends therefore run
+     * prefix-cache, and expert-overlay publication contract. Both backends therefore run
      * this exact request sequence and validate the same production counters.
      */
-    void runRebalancedPrefillRequestBoundaryStress(
+    void runExpertOverlayRequestBoundaryStress(
         MoEPrefixRestoreParityCase test_case)
     {
         ASSERT_TRUE(test_case.moe_rebalance.has_value())
-            << "Rebalanced lifecycle stress requires an explicit runtime mode";
+            << "Expert-overlay lifecycle stress requires an explicit maintenance policy";
+        const bool uses_dynamic_maintenance =
+            test_case.moe_rebalance->mode == MoERebalanceRuntimeMode::Dynamic;
+        const bool uses_current_batch_llep = usesCurrentBatchLLEP(test_case);
+        ASSERT_TRUE(uses_dynamic_maintenance != uses_current_batch_llep)
+            << "Lifecycle stress must select exactly one of durable Dynamic "
+               "maintenance or current-batch LLEP";
 
         /*
          * Keep the movement-friendly four-token histogram window and the early
@@ -777,11 +795,17 @@ namespace
          * eight times, and the final restore launches once. This preserves repeated
          * cross-request capture, transfer, apply, eviction, and restore coverage
          * while avoiding roughly two hundred redundant full-payload collectives.
+         * Current-batch LLEP has no durable maintenance cadence: every eligible
+         * prefill owns its own temporary assignment transaction. Programming a
+         * maintenance period for that policy would blur two independent axes.
          */
-        constexpr int kStressMaintenancePeriodTokens = 64;
-        test_case.moe_rebalance->device_min_maintenance_period_tokens =
-            kStressMaintenancePeriodTokens;
-        test_case.moe_rebalance->device_initial_maintenance_period_tokens = 4;
+        if (uses_dynamic_maintenance)
+        {
+            constexpr int kStressMaintenancePeriodTokens = 64;
+            test_case.moe_rebalance->device_min_maintenance_period_tokens =
+                kStressMaintenancePeriodTokens;
+            test_case.moe_rebalance->device_initial_maintenance_period_tokens = 4;
+        }
 
         /*
          * Match the canonical server cell before installing the scoped
@@ -789,14 +813,16 @@ namespace
          * this collective topology, while ordinary decode and grouped MTP
          * graphs remain enabled. The two-expert hot cache is also part of the
          * failing production configuration and materially affects ownership
-         * pressure, so it belongs in the regression contract.
+         * pressure. The canonical economical policy deliberately disables that
+         * cache, leaving whole-expert apportioned residency as the only durable
+         * placement and making current-batch LLEP movement explicit.
          */
         test_case.env_overrides.emplace_back(
             "LLAMINAR_PREFILL_GRAPH_BUCKETS",
             "0");
         test_case.env_overrides.emplace_back(
             "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER",
-            "2");
+            "0");
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
         ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
@@ -805,8 +831,8 @@ namespace
             /*
              * The canonical server gate records per-stage GPU events for every
              * request. Keep that instrumentation active here because
-             * its event lifecycle overlaps the same graph-captured LLEP
-             * maintenance streams that this regression is designed to stress.
+             * its event lifecycle overlaps the same graph-captured expert
+             * transfer/publication streams that this regression stresses.
              */
             {"LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "1"},
         });
@@ -990,9 +1016,9 @@ namespace
         /*
          * Diagnostic export is deliberately outside the inference hot path. It
          * waits only after the entire production-shaped request sequence so
-         * the assertions below observe completed graph-owned maintenance
-         * records without inserting a host fence between the producer and
-         * consumer requests under test.
+         * the assertions below observe completed graph-owned expert-state
+         * records without inserting a host fence between producer and consumer
+         * requests under test.
          */
         runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto records = PerfStatsCollector::snapshot(
@@ -1050,15 +1076,15 @@ namespace
                "entirely on device";
         /*
          * A single final diagnostics drain exports the currently completed
-         * maintenance slot; it intentionally does not fence and replay every
-         * prior request's copy/apply status. Prove that the selected rebalance
+         * publication slot; it intentionally does not fence and replay every
+         * prior request's copy/apply status. Prove that the selected overlay
          * policy planned real transfer-backed assignments during this stress,
          * then use the common health gate for zero error counters and
          * producer/consumer event ordering. The ordinary two-request parity
          * cells drain each wave and remain the canonical copied/applied-arrival
          * counter proof.
          */
-        if (test_case.moe_rebalance->mode == MoERebalanceRuntimeMode::LLEP)
+        if (uses_current_batch_llep)
         {
             expectLLEPPrefillWorkRedistributionPositive(
                 records,
@@ -1237,7 +1263,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_CUDA2
  * serial row without running a second full stochastic request.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierM2AtLongPositionMatchesSerial_CUDA2TPLLEPPhaseSplit)
+     GroupedVerifierM2AtLongPositionMatchesSerial_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1253,7 +1279,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true);
+        /*exercise_device_rebalance_maintenance=*/false);
 }
 
 /**
@@ -1268,7 +1294,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * request whenever this boundary regresses.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierM6AtLongPositionMatchesSerial_CUDA2TPLLEPPhaseSplit)
+     GroupedVerifierM6AtLongPositionMatchesSerial_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1284,11 +1310,11 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true);
+        /*exercise_device_rebalance_maintenance=*/false);
 }
 
 /**
- * @brief Proves the first grouped verifier after LLEP maintenance is serial exact.
+ * @brief Proves the first grouped verifier after Dynamic maintenance is serial exact.
  *
  * The canonical stochastic request reaches its third maintenance boundary
  * after publishing generated token fifteen (`18016`). The following grouped
@@ -1296,11 +1322,11 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * `430`. Older focused fixtures started after this boundary and accidentally
  * embedded the divergent grouped token (`1345`) in their explicit setup path,
  * so they could not expose the production failure. This regression advances
- * the graph-owned LLEP controller through the exact 5/10/15-token cadence and
+ * the graph-owned Dynamic controller through the exact 5/10/15-token cadence and
  * compares both post-boundary grouped rows byte-for-byte with serial replay.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierM2ImmediatelyAfterMaintenanceMatchesSerial_CUDA2TPLLEPPhaseSplit)
+     GroupedVerifierM2ImmediatelyAfterDynamicMaintenanceMatchesSerial_CUDA2TPDynamicMaintenanceDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1309,7 +1335,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         21030, 43776, 279,   3594,  557,   40473, 321,   7478,
     };
     runMoEMainVerifierGroupedRowsMatchSerialDecode(
-        cudaOnlyCanonicalStochasticLLEPCase(),
+        cudaOnlyDynamicMaintenanceCase(),
         /*verifier_row_count=*/2,
         /*serial_setup_token_count=*/15,
         /*exercise_shifted_row_maintenance=*/true,
@@ -1331,7 +1357,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * All four physical rows also remain byte-exact to serial decode.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierPendingConditionStochasticSummaryMatchesSerial_CUDA2TPLLEPPhaseSplit)
+     GroupedVerifierPendingConditionStochasticSummaryMatchesSerial_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1347,7 +1373,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true,
+        /*exercise_device_rebalance_maintenance=*/false,
         /*accepted_grouped_rows_before_verifier=*/0,
         /*grouped_publication_tokens=*/{},
         /*stochastic_summary_params=*/
@@ -1374,7 +1400,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * the serving path, allowing the full E2E failure to escape focused coverage.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     AcceptedPublicationThenGroupedVerifierMatchesSerial_CUDA2TPLLEPPhaseSplit)
+     AcceptedPublicationThenGroupedVerifierMatchesSerial_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1390,7 +1416,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true,
+        /*exercise_device_rebalance_maintenance=*/false,
         /*accepted_grouped_rows_before_verifier=*/2,
         /*grouped_publication_tokens=*/{
             34904,
@@ -1449,7 +1475,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
  * and checks the complete device-resident publication before continuation.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     DeviceResidentPartialAcceptanceM5MatchesSerial_CUDA2TPLLEPPhaseSplit)
+     DeviceResidentPartialAcceptanceM5MatchesSerial_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1519,10 +1545,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPHotOn
         PrefixRestoreParityMode::PartialHit);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPDynamicMaintenanceDenseTP)
 {
     runMoEPrefixRestoreParity(
-        cudaOnlyDynamicPhaseSplitCase(),
+        cudaOnlyDynamicMaintenanceCase(),
         PrefixRestoreParityMode::PartialHit);
 }
 
@@ -1536,9 +1562,9 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPDynam
  * Pairing the two cells tells a core long-context verifier defect apart from a
  * prefix snapshot/import lifetime defect.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2TPDynamicMaintenanceDenseTP)
 {
-    runMoEMTPParity(cudaOnlyDynamicPhaseSplitCase(), false);
+    runMoEMTPParity(cudaOnlyDynamicMaintenanceCase(), false);
 }
 
 /**
@@ -1549,9 +1575,9 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2
  * runtime expert-placement maintenance remain coherent after a restored
  * request, not merely during a plain partial-prefix restore.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPDynamicMaintenanceDenseTP)
 {
-    runMoEMTPParity(cudaOnlyDynamicPhaseSplitCase(), true);
+    runMoEMTPParity(cudaOnlyDynamicMaintenanceCase(), true);
 }
 
 /**
@@ -1564,10 +1590,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPDynamic
  * tests cannot expose ordering defects between those independently asynchronous
  * paths.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPDynamicMaintenanceDenseTP)
 {
     runMoEStochasticMTPVerifierParity(
-        cudaOnlyDynamicPhaseSplitCase(),
+        cudaOnlyDynamicMaintenanceCase(),
         3,
         false,
         qwen36MoEStochasticDynamicDepthPolicy(3),
@@ -1577,45 +1603,45 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
 /**
  * @brief Reproduces asynchronous CUDA Dynamic publication races across requests.
  *
- * Dynamic and LLEP share the captured maintenance and prefix-cache ownership
- * protocol, but their device planners and placement mutations are distinct.
+ * Dynamic maintenance and current-batch LLEP share event-published transfer
+ * infrastructure, but only Dynamic mutates durable expert residency.
  * Keep a dedicated Dynamic cell so a late mirrored-terminal-hidden divergence
  * cannot hide behind the otherwise comprehensive LLEP lifecycle stress.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPDynamicMaintenanceDenseTP)
 {
-    runRebalancedPrefillRequestBoundaryStress(cudaOnlyDynamicPhaseSplitCase());
+    runExpertOverlayRequestBoundaryStress(cudaOnlyDynamicMaintenanceCase());
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     runMoEPrefixRestoreParity(
-        cudaOnlyLLEPPhaseSplitCase(),
+        cudaOnlyCurrentBatchLLEPCase(),
         PrefixRestoreParityMode::PartialHit);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
-    runMoEMTPParity(cudaOnlyLLEPPhaseSplitCase(), true);
+    runMoEMTPParity(cudaOnlyCurrentBatchLLEPCase(), true);
 }
 
 /**
- * @brief Proves fixed-depth CUDA LLEP conditionally executes maintenance in-graph.
+ * @brief Proves fixed-depth CUDA Dynamic maintenance is device-gated in-graph.
  *
- * One complete 64-token LLEP prefill evidence window exercises the persistent
- * transfer-resource lifecycle without paying for the unrelated long-context
- * ledger. The canonical cadence then makes maintenance due after five committed
- * tokens and every four tokens thereafter. Sixteen output tokens provide both
+ * One 64-token prefix of the production-tokenized ledger exercises the persistent
+ * transfer-resource lifecycle without paying for the complete long context.
+ * The four-token Dynamic cadence makes maintenance due during the request.
+ * Sixteen output tokens provide both
  * due and ordinary fixed-depth transactions. The shared stochastic parity
  * harness also repeats the request after clearCache(), proving that the same
  * native parent executable retains byte-identical decode behavior and device
  * predicate ownership across request reset.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     StochasticMTPDepth3DeviceGatedMaintenance_CUDA2TPLLEPPhaseSplit)
+     StochasticMTPDepth3DeviceGatedMaintenance_CUDA2TPDynamicMaintenanceDenseTP)
 {
     runMoEStochasticMTPVerifierParity(
-        cudaOnlyCanonicalStochasticLLEPCase(),
+        cudaOnlyDynamicMaintenanceCase(),
         /*draft_depth=*/3,
         /*require_stochastic_outcome_after_reuse=*/true,
         MTPDepthPolicyConfig{},
@@ -1638,7 +1664,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * Dynamic rebalance.  This regression requires that path to coexist with the
  * adaptive stochastic verifier and its fully captured NCCL publication graph.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     runMoEStochasticMTPVerifierParity(
         cudaOnlyCanonicalStochasticLLEPCase(),
@@ -1660,11 +1686,11 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
  * This is the focused lifecycle regression for the long-context server trap:
  * one initialized runner must survive the production prefill/decode history
  * and a subsequent exact prefix restore while graph-captured grouped MTP and
- * device maintenance remain live.
+ * current-batch prefill assignment remain live.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
-    runRebalancedPrefillRequestBoundaryStress(cudaOnlyLLEPPhaseSplitCase());
+    runExpertOverlayRequestBoundaryStress(cudaOnlyCurrentBatchLLEPCase());
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHotOnly)
@@ -1800,7 +1826,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_ROCm2
  * @brief Mirrors the long-position M=2 grouped-verifier proof on ROCm LLEP.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierM2AtLongPositionMatchesSerial_ROCm2TPLLEPPhaseSplit)
+     GroupedVerifierM2AtLongPositionMatchesSerial_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1816,7 +1842,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true);
+        /*exercise_device_rebalance_maintenance=*/false);
 }
 
 /**
@@ -1827,7 +1853,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
  * remain numerically transparent before that grouped row is evaluated.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     GroupedVerifierM6AtLongPositionMatchesSerial_ROCm2TPLLEPPhaseSplit)
+     GroupedVerifierM6AtLongPositionMatchesSerial_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1843,7 +1869,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         /*configured_draft_tokens=*/15,
         /*mirror_shifted_maintenance_in_serial_oracle=*/true,
         serial_token_path,
-        /*exercise_device_rebalance_maintenance=*/true);
+        /*exercise_device_rebalance_maintenance=*/false);
 }
 
 /**
@@ -1886,7 +1912,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
  * prevents a common-code fix from leaving the HIP state handoff unproven.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
-     DeviceResidentPartialAcceptanceM5MatchesSerial_ROCm2TPLLEPPhaseSplit)
+     DeviceResidentPartialAcceptanceM5MatchesSerial_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     const std::vector<int32_t> serial_token_path{
         1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
@@ -1954,10 +1980,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPHotOn
         PrefixRestoreParityMode::PartialHit);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPDynamicMaintenanceDenseTP)
 {
     runMoEPrefixRestoreParity(
-        rocmOnlyDynamicPhaseSplitCase(),
+        rocmOnlyDynamicMaintenanceCase(),
         PrefixRestoreParityMode::PartialHit);
 }
 
@@ -1967,9 +1993,9 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPDynam
  * Symmetric coverage proves whether the failure belongs to shared verifier
  * state ownership or to one vendor's graph/KV implementation.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPDynamicMaintenanceDenseTP)
 {
-    runMoEMTPParity(rocmOnlyDynamicPhaseSplitCase(), false);
+    runMoEMTPParity(rocmOnlyDynamicMaintenanceCase(), false);
 }
 
 /**
@@ -1980,9 +2006,9 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2
  * the ExpertOverlay matrix catch backend-specific drift in the MTP/prefix-cache
  * state handoff.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPDynamicMaintenanceDenseTP)
 {
-    runMoEMTPParity(rocmOnlyDynamicPhaseSplitCase(), true);
+    runMoEMTPParity(rocmOnlyDynamicMaintenanceCase(), true);
 }
 
 /**
@@ -1993,10 +2019,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPDynamic
  * runtimes.  Keeping this cell symmetric prevents a device-owned mailbox or
  * adaptive-depth fix from becoming accidentally CUDA-specific.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPDynamicMaintenanceDenseTP)
 {
     runMoEStochasticMTPVerifierParity(
-        rocmOnlyDynamicPhaseSplitCase(),
+        rocmOnlyDynamicMaintenanceCase(),
         3,
         false,
         qwen36MoEStochasticDynamicDepthPolicy(3),
@@ -2011,21 +2037,21 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
  * the production prompt-shape history and final prefix-restore transition,
  * making that ownership lifetime part of the focused integration gate.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPDynamicPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPDynamicMaintenanceDenseTP)
 {
-    runRebalancedPrefillRequestBoundaryStress(rocmOnlyDynamicPhaseSplitCase());
+    runExpertOverlayRequestBoundaryStress(rocmOnlyDynamicMaintenanceCase());
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     runMoEPrefixRestoreParity(
-        rocmOnlyLLEPPhaseSplitCase(),
+        rocmOnlyCurrentBatchLLEPCase(),
         PrefixRestoreParityMode::PartialHit);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
-    runMoEMTPParity(rocmOnlyLLEPPhaseSplitCase(), true);
+    runMoEMTPParity(rocmOnlyCurrentBatchLLEPCase(), true);
 }
 
 /**
@@ -2036,7 +2062,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPLLEPPha
  * activity, exact same-seed token replay, and whole-graph RCCL execution in a
  * single long-context fixture.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     runMoEStochasticMTPVerifierParity(
         rocmOnlyCanonicalStochasticLLEPCase(),
@@ -2055,13 +2081,13 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
 /**
  * @brief Mirrors the CUDA multi-request lifecycle regression on ROCm.
  *
- * ROCm owns the same graph-local routed-kernel state and asynchronous LLEP
- * maintenance contract. This companion prevents a future ownership or
+ * ROCm owns the same graph-local routed-kernel state and current-batch LLEP
+ * publication contract. This companion prevents a future ownership or
  * request-boundary fix from becoming accidentally CUDA-only.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPLLEPPhaseSplit)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
-    runRebalancedPrefillRequestBoundaryStress(rocmOnlyLLEPPhaseSplitCase());
+    runExpertOverlayRequestBoundaryStress(rocmOnlyCurrentBatchLLEPCase());
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold)
@@ -2075,7 +2101,99 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHot_CPU
 }
 
 /**
- * @brief Guards every phase-split fixture against short or heavyweight inputs.
+ * @brief Locks the complete economical homogeneous-GPU LLEP policy tuple.
+ *
+ * This model-free regression keeps the independent policy axes visible in one
+ * place. It prevents a future fixture edit from silently turning mirrored MTP
+ * terminal weights into replicated dense decode, applying least-loaded routing
+ * to grouped verifier rows, enabling durable maintenance, or resurrecting the
+ * hot replica cache. Runtime cells separately prove that CUDA/NCCL and
+ * ROCm/RCCL execute this declared tuple as one complete captured transaction.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     HomogeneousCurrentBatchLLEPFixturesDeclareCanonicalPolicyTuple)
+{
+    const std::array<MoEPrefixRestoreParityCase, 2> test_cases = {
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        rocmOnlyCanonicalStochasticLLEPCase(),
+    };
+    const std::array<CollectiveBackendType, 2> expected_backends = {
+        CollectiveBackendType::NCCL,
+        CollectiveBackendType::RCCL,
+    };
+
+    for (size_t index = 0; index < test_cases.size(); ++index)
+    {
+        const auto &test_case = test_cases[index];
+        ASSERT_NE(test_case.moe_routed_expert_plan, nullptr);
+        const auto &plan = *test_case.moe_routed_expert_plan;
+
+        EXPECT_EQ(
+            plan.continuation_domain_spec.effectiveDensePolicy(),
+            DenseParallelPolicy::TensorParallel);
+        EXPECT_TRUE(plan.continuation_domain_spec.dense_tp_enabled);
+        EXPECT_FALSE(plan.continuation_domain_spec.dense_decode_replicated);
+        EXPECT_EQ(plan.residency_policy, RoutedExpertResidencyPolicy::StaticById);
+        ASSERT_FALSE(plan.domains.empty());
+        for (const auto &domain : plan.domains)
+        {
+            EXPECT_EQ(domain.backend, expected_backends[index]);
+            EXPECT_EQ(
+                domain.routed_compute_policy,
+                RoutedExpertComputePolicy::Apportioned);
+            EXPECT_EQ(
+                domain.routed_phase_policy,
+                RoutedExpertPhasePolicy::Uniform);
+            EXPECT_EQ(
+                domain.routed_decode_assignment_policy,
+                RoutedExpertAssignmentPolicy::StaticOwner);
+            EXPECT_EQ(
+                domain.routed_prefill_assignment_policy,
+                RoutedExpertAssignmentPolicy::LeastLoadedResident);
+        }
+
+        ASSERT_TRUE(test_case.moe_rebalance.has_value());
+        EXPECT_EQ(
+            test_case.moe_rebalance->mode,
+            MoERebalanceRuntimeMode::Off);
+        ASSERT_TRUE(test_case.moe_hot_expert_cache.has_value());
+        EXPECT_EQ(
+            test_case.moe_hot_expert_cache->kind,
+            MoEHotExpertCacheConfig::Kind::Off);
+        ASSERT_TRUE(test_case.moe_routed_prefill.has_value());
+        EXPECT_EQ(
+            test_case.moe_routed_prefill->least_loaded_min_routed_rows,
+            0);
+
+        const auto runtime_config = makeMoEPrefixRestoreConfig(
+            test_case,
+            "model-free-policy-probe.gguf",
+            /*enable_prefix_cache=*/false,
+            /*block_size=*/64,
+            /*enable_mtp=*/true,
+            /*mtp_draft_tokens=*/3);
+        EXPECT_EQ(
+            runtime_config.mtp.terminal_head_policy,
+            MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        EXPECT_EQ(
+            runtime_config.moe_hot_expert_cache.kind,
+            MoEHotExpertCacheConfig::Kind::Off);
+
+        const auto cache_override = std::find_if(
+            test_case.env_overrides.begin(),
+            test_case.env_overrides.end(),
+            [](const auto &entry)
+            {
+                return entry.first ==
+                       "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER";
+            });
+        ASSERT_NE(cache_override, test_case.env_overrides.end());
+        EXPECT_EQ(cache_override->second, "0");
+    }
+}
+
+/**
+ * @brief Guards every explicit-policy fixture against short or heavyweight inputs.
  *
  * This test is intentionally source-level and model-free.  The expensive
  * runtime cells validate device behavior; this one catches the fixture
@@ -2090,10 +2208,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata
     const std::array<MoEPrefixRestoreParityCase, 6> test_cases = {
         cudaOnlyPartialPrefixCase(),
         rocmOnlyPartialPrefixCase(),
-        cudaOnlyDynamicPhaseSplitCase(),
-        cudaOnlyLLEPPhaseSplitCase(),
-        rocmOnlyDynamicPhaseSplitCase(),
-        rocmOnlyLLEPPhaseSplitCase(),
+        cudaOnlyDynamicMaintenanceCase(),
+        cudaOnlyCurrentBatchLLEPCase(),
+        rocmOnlyDynamicMaintenanceCase(),
+        rocmOnlyCurrentBatchLLEPCase(),
     };
 
     ASSERT_GT(expected_prompt.size(), 4096u)
@@ -2105,7 +2223,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata
     for (const auto &test_case : test_cases)
     {
         EXPECT_EQ(test_case.prompt, expected_prompt);
-        EXPECT_EQ(test_case.max_seq_len, kPhaseSplitLongDecodeMaxSeqLen);
+        EXPECT_EQ(test_case.max_seq_len, kExpertOverlayLongDecodeMaxSeqLen);
         EXPECT_GT(test_case.prefix_restore_prompt_token_limit, 256);
         EXPECT_GE(test_case.minimum_prompt_tokens, 640u);
         EXPECT_EQ(
@@ -2119,7 +2237,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata
 /**
  * @brief Guards the mixed hot/cold MTP fixture's dense decode ownership.
  *
- * The CPU cold tier is a routed-expert fallback, not the owner of verifier
+ * The CPU cold tier is the declared overflow execution tier, not the owner of verifier
  * logits.  This model-free check catches the regression where the mixed plan
  * forgot to request phase-split dense decode and therefore left the ROCm hot
  * MTP sidecar without terminal dense/MTP bindings.

@@ -30,7 +30,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         dense_tp: bool = False,
         dense_decode_replicated: bool = False,
         dense_policy: str | None = None,
-        assignment_policy: str | None = None,
+        decode_assignment_policy: str | None = None,
+        prefill_assignment_policy: str | None = None,
         allreduce_precision: str | None = None,
         allreduce_fp16_min_elements: str | None = None,
         no_require_prefill_graph: bool = False,
@@ -38,6 +39,9 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         seeds: str | None = None,
         prompt: str | None = None,
         prompt_file: str | None = None,
+        maintenance_slack_tokens: int | None = None,
+        minimum_maintenance_period_tokens: int | None = None,
+        initial_maintenance_period_tokens: int | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -85,6 +89,21 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 args.extend(["--prompt-file", prompt_file])
             if rebalance_window is not None:
                 args.extend(["--rebalance-window", str(rebalance_window)])
+            if maintenance_slack_tokens is not None:
+                args.extend([
+                    "--maintenance-slack-tokens",
+                    str(maintenance_slack_tokens),
+                ])
+            if minimum_maintenance_period_tokens is not None:
+                args.extend([
+                    "--minimum-maintenance-period-tokens",
+                    str(minimum_maintenance_period_tokens),
+                ])
+            if initial_maintenance_period_tokens is not None:
+                args.extend([
+                    "--initial-maintenance-period-tokens",
+                    str(initial_maintenance_period_tokens),
+                ])
             if perfstats:
                 args.append("--perfstats")
             if stage_gpu_stats:
@@ -103,8 +122,16 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 args.append("--dense-decode-replicated")
             if dense_policy is not None:
                 args.extend(["--dense-policy", dense_policy])
-            if assignment_policy is not None:
-                args.extend(["--routed-assignment-policy", assignment_policy])
+            if decode_assignment_policy is not None:
+                args.extend([
+                    "--routed-decode-assignment-policy",
+                    decode_assignment_policy,
+                ])
+            if prefill_assignment_policy is not None:
+                args.extend([
+                    "--routed-prefill-assignment-policy",
+                    prefill_assignment_policy,
+                ])
             if allreduce_precision is not None:
                 args.extend(["--allreduce-precision", allreduce_precision])
             if allreduce_fp16_min_elements is not None:
@@ -138,32 +165,88 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
         self.assertIn("routed_compute=apportioned", result.stdout)
         self.assertIn("routed_phase=uniform", result.stdout)
-        self.assertIn("routed_assignment=static-owner", result.stdout)
-        self.assertNotIn("routed_assignment=least-loaded-resident", result.stdout)
+        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn("routed_prefill_assignment=static-owner", result.stdout)
 
     def test_twocard_dry_run_can_request_llep_assignment_policy(self) -> None:
-        result = self.run_script(assignment_policy="least-loaded-resident")
+        result = self.run_script(
+            prefill_assignment_policy="least-loaded-resident"
+        )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("routed_compute=apportioned", result.stdout)
         self.assertIn("routed_phase=uniform", result.stdout)
-        self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
+        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn(
+            "routed_prefill_assignment=least-loaded-resident",
+            result.stdout,
+        )
         self.assertIn("owner=0", result.stdout)
 
-    def test_llep_declares_phase_split_policy_without_factory_inference(self) -> None:
+    def test_llep_declares_apportioned_least_loaded_policy(self) -> None:
         result = self.run_script(cases="llep")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--moe-rebalance llep", result.stdout)
+        self.assertIn("--moe-residency-maintenance off", result.stdout)
+        self.assertIn("routed_compute=apportioned", result.stdout)
+        self.assertIn("routed_phase=uniform", result.stdout)
+        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn(
+            "routed_prefill_assignment=least-loaded-resident",
+            result.stdout,
+        )
+        self.assertNotIn("routed_compute=replicated", result.stdout)
+        self.assertIn("--moe-continuation-dense-policy tensor-parallel", result.stdout)
+        self.assertIn("--mtp-terminal-head-policy mirrored-full-vocabulary", result.stdout)
+        self.assertNotIn("--moe-device-rebalance-maintenance-slack-tokens", result.stdout)
+
+    def test_replicated_experts_decode_llep_is_an_explicit_distinct_case(self) -> None:
+        result = self.run_script(cases="llep_replicated_experts_decode")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--moe-residency-maintenance off", result.stdout)
         self.assertIn("routed_compute=replicated", result.stdout)
         self.assertIn(
             "routed_phase=prefill-apportioned-decode-replicated",
             result.stdout,
         )
-        self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
+        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn("routed_prefill_assignment=least-loaded-resident", result.stdout)
+
+    def test_obsolete_ambiguous_replicated_decode_case_is_rejected(self) -> None:
+        result = self.run_script(cases="llep_replicated_decode")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown case 'llep_replicated_decode'", result.stderr)
+
+    def test_dynamic_policy_can_override_every_maintenance_cadence_axis(self) -> None:
+        result = self.run_script(
+            cases="dynamic",
+            rebalance_window=32,
+            maintenance_slack_tokens=2,
+            minimum_maintenance_period_tokens=96,
+            initial_maintenance_period_tokens=48,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--moe-device-rebalance-maintenance-slack-tokens 2",
+            result.stdout,
+        )
+        self.assertIn(
+            "--moe-device-rebalance-min-maintenance-period-tokens 96",
+            result.stdout,
+        )
+        self.assertIn(
+            "--moe-device-rebalance-initial-maintenance-period-tokens 48",
+            result.stdout,
+        )
 
     def test_llep_rejects_conflicting_static_owner_assignment(self) -> None:
-        result = self.run_script(cases="llep", assignment_policy="static-owner")
+        result = self.run_script(
+            cases="llep",
+            prefill_assignment_policy="static-owner",
+        )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
@@ -188,6 +271,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
         self.assertIn("tp_allreduce_bom", result.stdout)
         self.assertIn("forward_graph", result.stdout)
+        self.assertIn("mtp", result.stdout)
         self.assertNotIn("stage_gpu", result.stdout)
 
     def test_stage_gpu_stats_dry_run_adds_heavy_timing_filter(self) -> None:
@@ -364,14 +448,17 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         result = self.run_script(cases="dynamic,dynamic_hot10")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("--moe-rebalance-window 64"), 2)
+        self.assertEqual(
+            result.stdout.count("--moe-residency-maintenance-window 64"),
+            2,
+        )
 
     def test_rebalance_window_override_is_used(self) -> None:
         result = self.run_script(cases="observe", rebalance_window=8)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--moe-rebalance-window 8", result.stdout)
-        self.assertNotIn("--moe-rebalance-window 64", result.stdout)
+        self.assertIn("--moe-residency-maintenance-window 8", result.stdout)
+        self.assertNotIn("--moe-residency-maintenance-window 64", result.stdout)
 
     def test_device_rebalance_env_knobs_are_forwarded_to_benchmark(self) -> None:
         result = self.run_script(

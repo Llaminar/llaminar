@@ -182,7 +182,10 @@ namespace llaminar2
             resolved.backend = canonical.backend;
             resolved.routed_compute_policy = domain.routed_compute_policy;
             resolved.routed_phase_policy = domain.routed_phase_policy;
-            resolved.routed_assignment_policy = domain.routed_assignment_policy;
+            resolved.routed_decode_assignment_policy =
+                domain.routed_decode_assignment_policy;
+            resolved.routed_prefill_assignment_policy =
+                domain.routed_prefill_assignment_policy;
             resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
             resolved.participants.reserve(canonical.participants.size());
@@ -359,8 +362,12 @@ namespace llaminar2
                 << routedExpertComputePolicyToString(domain.routed_compute_policy)
                 << " routed_phase="
                 << routedExpertPhasePolicyToString(domain.routed_phase_policy)
-                << " routed_assignment="
-                << routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)
+                << " routed_decode_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       domain.routed_decode_assignment_policy)
+                << " routed_prefill_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       domain.routed_prefill_assignment_policy)
                 << " participants=" << domain.participants.size()
                 << " primary=" << domain.primary_participant.toShortString()
                 << " primary_device=" << domain.primary_device.to_string()

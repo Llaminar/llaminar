@@ -252,7 +252,10 @@ namespace llaminar2
                    lhs.ranks == rhs.ranks &&
                    lhs.routed_compute_policy == rhs.routed_compute_policy &&
                    lhs.routed_phase_policy == rhs.routed_phase_policy &&
-                   lhs.routed_assignment_policy == rhs.routed_assignment_policy;
+                   lhs.routed_decode_assignment_policy ==
+                       rhs.routed_decode_assignment_policy &&
+                   lhs.routed_prefill_assignment_policy ==
+                       rhs.routed_prefill_assignment_policy;
         }
 
         void addUniqueName(std::vector<std::string> &names, const std::string &name)
@@ -322,7 +325,10 @@ namespace llaminar2
         domain.ranks = explicit_ranks;
         domain.routed_compute_policy = routed_compute_policy;
         domain.routed_phase_policy = routed_phase_policy;
-        domain.routed_assignment_policy = routed_assignment_policy;
+        domain.routed_decode_assignment_policy =
+            routed_decode_assignment_policy;
+        domain.routed_prefill_assignment_policy =
+            routed_prefill_assignment_policy;
         return domain;
     }
 
@@ -335,7 +341,10 @@ namespace llaminar2
         def.backend = domain.backend;
         def.routed_compute_policy = domain.routed_compute_policy;
         def.routed_phase_policy = domain.routed_phase_policy;
-        def.routed_assignment_policy = domain.routed_assignment_policy;
+        def.routed_decode_assignment_policy =
+            domain.routed_decode_assignment_policy;
+        def.routed_prefill_assignment_policy =
+            domain.routed_prefill_assignment_policy;
         def.scope = toTPScope(domain.scope);
         def.owner_rank = domain.owner_rank;
         def.explicit_ranks = domain.ranks;
@@ -874,9 +883,37 @@ namespace llaminar2
         {
             errors.push_back("MoE rebalance window growth factor must be > 0");
         }
-        if (moe_rebalance.prefill_window_tokens < 0)
+        if (moe_routed_prefill.assignment_window_tokens < 0)
         {
-            errors.push_back("MoE rebalance prefill window tokens must be >= 0");
+            errors.push_back("MoE routed-prefill assignment window tokens must be >= 0");
+        }
+        if (moe_routed_prefill.llep_alpha_numerator == 0)
+        {
+            errors.push_back("MoE routed-prefill LLEP alpha numerator must be > 0");
+        }
+        if (moe_routed_prefill.llep_alpha_denominator == 0)
+        {
+            errors.push_back("MoE routed-prefill LLEP alpha denominator must be > 0");
+        }
+        if (moe_routed_prefill.llep_lambda_numerator == 0)
+        {
+            errors.push_back("MoE routed-prefill LLEP lambda numerator must be > 0");
+        }
+        if (moe_routed_prefill.llep_lambda_denominator == 0)
+        {
+            errors.push_back("MoE routed-prefill LLEP lambda denominator must be > 0");
+        }
+        if (moe_rebalance.device_maintenance_slack_tokens < -1)
+        {
+            errors.push_back("MoE device maintenance slack tokens must be >= -1");
+        }
+        if (moe_rebalance.device_min_maintenance_period_tokens < -1)
+        {
+            errors.push_back("MoE device minimum maintenance period tokens must be >= -1");
+        }
+        if (moe_rebalance.device_initial_maintenance_period_tokens < -1)
+        {
+            errors.push_back("MoE device initial maintenance period tokens must be >= -1");
         }
 
         // Validate precision strings
@@ -1067,13 +1104,27 @@ namespace llaminar2
         oss << "  moe:\n";
         oss << "    routed_expert_compute_policy: "
             << routedExpertComputePolicyToString(routed_expert_compute_policy) << "\n";
-        oss << "    rebalance: " << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
+        oss << "    residency_maintenance: "
+            << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
         oss << "    hot_expert_cache: " << moe_hot_expert_cache.toString() << "\n";
-        oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";
-        oss << "    rebalance_max_window: " << moe_rebalance.max_window_size << "\n";
-        oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
-        oss << "    rebalance_prefill_window_tokens: "
-            << moe_rebalance.prefill_window_tokens << "\n";
+        oss << "    residency_maintenance_window: "
+            << moe_rebalance.window_size << "\n";
+        oss << "    residency_maintenance_max_window: "
+            << moe_rebalance.max_window_size << "\n";
+        oss << "    residency_maintenance_window_growth: "
+            << moe_rebalance.window_growth_factor << "\n";
+        oss << "    routed_prefill_assignment_window_tokens: "
+            << moe_routed_prefill.assignment_window_tokens << "\n";
+        oss << "    routed_prefill_least_loaded_min_routed_rows: "
+            << moe_routed_prefill.least_loaded_min_routed_rows << "\n";
+        oss << "    routed_prefill_llep_alpha: "
+            << moe_routed_prefill.llep_alpha_numerator
+            << "/" << moe_routed_prefill.llep_alpha_denominator << "\n";
+        oss << "    routed_prefill_llep_lambda: "
+            << moe_routed_prefill.llep_lambda_numerator
+            << "/" << moe_routed_prefill.llep_lambda_denominator << "\n";
+        oss << "    routed_prefill_llep_enable_balanced_skip: "
+            << (moe_routed_prefill.llep_enable_balanced_skip ? "true" : "false") << "\n";
         oss << "    dynamic_imbalance_threshold_permille: "
             << moe_rebalance.dynamic_imbalance_threshold_per_mille << "\n";
         oss << "    dynamic_min_improvement_permille: "
@@ -1084,6 +1135,12 @@ namespace llaminar2
             << moe_rebalance.dynamic_max_plan_entries_per_wave << "\n";
         oss << "    dynamic_min_window_activations: "
             << moe_rebalance.dynamic_min_window_activations << "\n";
+        oss << "    device_rebalance_maintenance_slack_tokens: "
+            << moe_rebalance.device_maintenance_slack_tokens << "\n";
+        oss << "    device_rebalance_min_maintenance_period_tokens: "
+            << moe_rebalance.device_min_maintenance_period_tokens << "\n";
+        oss << "    device_rebalance_initial_maintenance_period_tokens: "
+            << moe_rebalance.device_initial_maintenance_period_tokens << "\n";
         oss << "    device_min_load_spread_improvement: "
             << moe_rebalance.device_min_load_spread_improvement << "\n";
         oss << "    device_min_load_spread_improvement_divisor: "
@@ -1096,14 +1153,6 @@ namespace llaminar2
             << moe_rebalance.device_min_router_spread_improvement_per_payload_slot << "\n";
         oss << "    device_max_post_wave_load_spread_permille: "
             << moe_rebalance.device_max_post_wave_load_spread_per_mille << "\n";
-        oss << "    device_llep_alpha: "
-            << moe_rebalance.device_llep_alpha_numerator
-            << "/" << moe_rebalance.device_llep_alpha_denominator << "\n";
-        oss << "    device_llep_lambda: "
-            << moe_rebalance.device_llep_lambda_numerator
-            << "/" << moe_rebalance.device_llep_lambda_denominator << "\n";
-        oss << "    device_llep_enable_balanced_skip: "
-            << (moe_rebalance.device_llep_enable_balanced_skip ? "true" : "false") << "\n";
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 
@@ -1138,8 +1187,8 @@ namespace llaminar2
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
         oss << "    max_request_batch: " << mtp.max_request_batch << "\n";
         oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
-        oss << "    mirror_full_head_for_local_tp: "
-            << (mtp.mirror_full_head_for_local_tp ? "true" : "false") << "\n";
+        oss << "    terminal_head_policy: "
+            << mtpTerminalHeadPolicyToString(mtp.terminal_head_policy) << "\n";
         oss << "    depth_policy: " << mtpDepthPolicyModeToString(mtp.depth_policy.mode) << "\n";
         oss << "    min_draft_tokens: " << mtp.depth_policy.min_depth << "\n";
         oss << "    max_draft_tokens: " << mtp.depth_policy.max_depth << "\n";

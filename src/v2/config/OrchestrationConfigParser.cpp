@@ -186,6 +186,24 @@ namespace llaminar2
             return parsed;
         }
 
+        /**
+         * @brief Parse a non-negative signed integer without accepting truncation.
+         * @param value User-provided decimal value.
+         * @param option_name Human-readable option name used in diagnostics.
+         * @return Parsed value in the range `[0, INT_MAX]`.
+         * @throws std::invalid_argument If the value is negative, malformed, or
+         *         cannot be represented by `int`.
+         */
+        int parseNonNegativeIntValue(const std::string &value, const std::string &option_name)
+        {
+            const uint64_t parsed = parseNonNegativeUint64Value(value, option_name);
+            if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return static_cast<int>(parsed);
+        }
+
         size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
         {
             constexpr size_t MiB = 1024ull * 1024ull;
@@ -227,8 +245,8 @@ namespace llaminar2
             if (!parsed)
             {
                 throw std::invalid_argument(
-                    "Invalid MoE rebalance mode: '" + value +
-                    "' (valid: off, observe, dynamic, llep)");
+                    "Invalid routed-expert residency maintenance mode: '" +
+                    value + "' (valid: off, observe, dynamic)");
             }
             return *parsed;
         }
@@ -304,30 +322,70 @@ namespace llaminar2
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
             }
-            else if (normalized_key == "rebalance")
+            else if (normalized_key == "residency_maintenance")
             {
                 config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
             }
-            else if (normalized_key == "rebalance_window")
+            else if (normalized_key == "residency_maintenance_window")
             {
                 config.moe_rebalance.window_size = std::stoi(value);
             }
-            else if (normalized_key == "rebalance_max_window")
+            else if (normalized_key == "residency_maintenance_max_window")
             {
                 config.moe_rebalance.max_window_size = std::stoi(value);
             }
-            else if (normalized_key == "rebalance_window_growth")
+            else if (normalized_key == "residency_maintenance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
-            else if (normalized_key == "rebalance_prefill_window_tokens" ||
-                     normalized_key == "rebalance_prefill_window")
+            else if (normalized_key ==
+                     "routed_prefill_assignment_window_tokens")
             {
-                config.moe_rebalance.prefill_window_tokens = std::stoi(value);
-                if (config.moe_rebalance.prefill_window_tokens < 0)
-                {
-                    throw std::invalid_argument("moe.rebalance_prefill_window_tokens must be >= 0");
-                }
+                config.moe_routed_prefill.assignment_window_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key ==
+                     "routed_prefill_least_loaded_min_routed_rows")
+            {
+                config.moe_routed_prefill.least_loaded_min_routed_rows =
+                    parseNonNegativeUint64Value(
+                        value,
+                        "moe.routed_prefill_least_loaded_min_routed_rows");
+            }
+            else if (normalized_key == "routed_prefill_llep_alpha_numerator")
+            {
+                config.moe_routed_prefill.llep_alpha_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_alpha_numerator");
+            }
+            else if (normalized_key == "routed_prefill_llep_alpha_denominator")
+            {
+                config.moe_routed_prefill.llep_alpha_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_alpha_denominator");
+            }
+            else if (normalized_key == "routed_prefill_llep_lambda_numerator")
+            {
+                config.moe_routed_prefill.llep_lambda_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_lambda_numerator");
+            }
+            else if (normalized_key == "routed_prefill_llep_lambda_denominator")
+            {
+                config.moe_routed_prefill.llep_lambda_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_lambda_denominator");
+            }
+            else if (normalized_key == "routed_prefill_llep_enable_balanced_skip")
+            {
+                config.moe_routed_prefill.llep_enable_balanced_skip =
+                    parseBoolValue(value);
             }
             else if (normalized_key == "dynamic_imbalance_threshold_permille")
             {
@@ -353,6 +411,27 @@ namespace llaminar2
             {
                 config.moe_rebalance.dynamic_min_window_activations =
                     parseNonNegativeUint64Value(value, "moe.dynamic_min_window_activations");
+            }
+            else if (normalized_key == "device_rebalance_maintenance_slack_tokens")
+            {
+                config.moe_rebalance.device_maintenance_slack_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_maintenance_slack_tokens");
+            }
+            else if (normalized_key == "device_rebalance_min_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_min_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_min_maintenance_period_tokens");
+            }
+            else if (normalized_key == "device_rebalance_initial_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_initial_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_initial_maintenance_period_tokens");
             }
             else if (normalized_key == "device_min_load_spread_improvement")
             {
@@ -389,30 +468,6 @@ namespace llaminar2
             {
                 config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
                     parseNonNegativeUint32Value(value, "moe.device_max_post_wave_load_spread_permille");
-            }
-            else if (normalized_key == "device_llep_alpha_numerator")
-            {
-                config.moe_rebalance.device_llep_alpha_numerator =
-                    parsePositiveUint32Value(value, "moe.device_llep_alpha_numerator");
-            }
-            else if (normalized_key == "device_llep_alpha_denominator")
-            {
-                config.moe_rebalance.device_llep_alpha_denominator =
-                    parsePositiveUint32Value(value, "moe.device_llep_alpha_denominator");
-            }
-            else if (normalized_key == "device_llep_lambda_numerator")
-            {
-                config.moe_rebalance.device_llep_lambda_numerator =
-                    parsePositiveUint32Value(value, "moe.device_llep_lambda_numerator");
-            }
-            else if (normalized_key == "device_llep_lambda_denominator")
-            {
-                config.moe_rebalance.device_llep_lambda_denominator =
-                    parsePositiveUint32Value(value, "moe.device_llep_lambda_denominator");
-            }
-            else if (normalized_key == "device_llep_enable_balanced_skip")
-            {
-                config.moe_rebalance.device_llep_enable_balanced_skip = parseBoolValue(value);
             }
             else if (normalized_key == "release_raw_expert_weights")
             {
@@ -500,9 +555,16 @@ namespace llaminar2
                     throw std::invalid_argument("Invalid mtp verify_mode: '" + value + "'");
                 config.mtp.verify_mode = *parsed;
             }
-            else if (key == "mirror_full_head_for_local_tp")
+            else if (key == "terminal_head_policy")
             {
-                config.mtp.mirror_full_head_for_local_tp = parseBoolValue(value);
+                auto parsed = parseMTPTerminalHeadPolicy(value);
+                if (!parsed)
+                {
+                    throw std::invalid_argument(
+                        "Invalid mtp terminal_head_policy: '" + value +
+                        "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                }
+                config.mtp.terminal_head_policy = *parsed;
             }
             else if (key == "require_terminal_hidden_for_full_hit")
             {
@@ -572,6 +634,10 @@ namespace llaminar2
             else if (key == "depth_demote_acceptance")
             {
                 config.mtp.depth_policy.demote_acceptance_rate = std::stod(value);
+            }
+            else
+            {
+                throw std::invalid_argument("Unknown mtp option: '" + key + "'");
             }
         }
 
@@ -1587,11 +1653,11 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance",
+            .long_name = "--moe-residency-maintenance",
             .category = "MoE Configuration",
             .value_label = "<mode>",
-            .description = "MoE decode rebalance mode: off, observe, dynamic (default), llep",
-            .valid_values = {"off", "observe", "dynamic", "llep"},
+            .description = "Durable routed-expert residency maintenance: off, observe, dynamic (default); independent of current-batch LLEP",
+            .valid_values = {"off", "observe", "dynamic"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1599,10 +1665,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-window",
+            .long_name = "--moe-residency-maintenance-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Decode histogram window size for MoE rebalance (default: 256)",
+            .description = "Decode histogram window size for durable expert residency maintenance (default: 256)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1610,10 +1676,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-max-window",
+            .long_name = "--moe-residency-maintenance-max-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Maximum adaptive MoE rebalance window (default: 4096; 0 disables growth)",
+            .description = "Maximum adaptive expert residency maintenance window (default: 4096; 0 disables growth)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1621,10 +1687,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-window-growth",
+            .long_name = "--moe-residency-maintenance-window-growth",
             .category = "MoE Configuration",
             .value_label = "<factor>",
-            .description = "Adaptive MoE rebalance window growth factor (default: 1.5)",
+            .description = "Adaptive expert residency maintenance window growth factor (default: 1.5)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1632,19 +1698,97 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-prefill-window",
-            .aliases = {"--moe-llep-prefill-window"},
+            .long_name = "--moe-routed-prefill-assignment-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Fixed request-local LLEP prefill assignment window; 0 keeps the historical single prefill transaction unless prefix cache supplies a block boundary",
+            .description = "Fixed request-local current-batch routed-prefill assignment window; 0 keeps one ordinary prefill transaction unless prefix cache supplies a block boundary",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.moe_rebalance.prefill_window_tokens = std::stoi(v);
-                    if (c.moe_rebalance.prefill_window_tokens < 0)
-                    {
-                        throw std::invalid_argument("--moe-rebalance-prefill-window must be >= 0");
-                    }
+                    c.moe_routed_prefill.assignment_window_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-routed-prefill-assignment-window");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-least-loaded-min-routed-rows",
+            .category = "MoE Configuration",
+            .value_label = "<rows>",
+            .description = "Minimum M*top-k routed rows for transfer-backed least-loaded ordinary prefill (default: 8192; 0 forces every ordinary prefill)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.least_loaded_min_routed_rows =
+                        parseNonNegativeUint64Value(
+                            v,
+                            "--moe-routed-prefill-least-loaded-min-routed-rows");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-alpha-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP capacity alpha numerator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_alpha_numerator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-alpha-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-alpha-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP capacity alpha denominator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_alpha_denominator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-alpha-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-lambda-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP balanced-skip lambda numerator (default: 13)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_lambda_numerator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-lambda-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-lambda-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP balanced-skip lambda denominator (default: 10)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_lambda_denominator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-lambda-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-disable-balanced-skip",
+            .category = "MoE Configuration",
+            .description = "Require current-batch LLEP planning even when static-owner EP is balanced",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.moe_routed_prefill.llep_enable_balanced_skip = false;
                 }),
         });
         spec.add({
@@ -1705,6 +1849,48 @@ namespace llaminar2
                 {
                     c.moe_rebalance.dynamic_min_window_activations =
                         parseNonNegativeUint64Value(v, "--moe-dynamic-min-window-activations");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-maintenance-slack-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Tokens beyond a full routing window before device-owned maintenance is due",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_maintenance_slack_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-maintenance-slack-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-maintenance-period-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Recurring device-owned maintenance cadence floor; 0 uses window plus slack",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_maintenance_period_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-min-maintenance-period-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-initial-maintenance-period-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "First device-owned maintenance cadence; 0 uses the recurring period",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_initial_maintenance_period_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-initial-maintenance-period-tokens");
                 }),
         });
         spec.add({
@@ -1787,64 +1973,6 @@ namespace llaminar2
                         parseNonNegativeUint32Value(
                             v,
                             "--moe-device-rebalance-max-post-wave-load-spread-permille");
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-device-llep-alpha-numerator",
-            .category = "MoE Configuration",
-            .value_label = "<n>",
-            .description = "Least-loaded-resident device capacity alpha numerator (default: 1)",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    c.moe_rebalance.device_llep_alpha_numerator =
-                        parsePositiveUint32Value(v, "--moe-device-llep-alpha-numerator");
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-device-llep-alpha-denominator",
-            .category = "MoE Configuration",
-            .value_label = "<n>",
-            .description = "Least-loaded-resident device capacity alpha denominator (default: 1)",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    c.moe_rebalance.device_llep_alpha_denominator =
-                        parsePositiveUint32Value(v, "--moe-device-llep-alpha-denominator");
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-device-llep-lambda-numerator",
-            .category = "MoE Configuration",
-            .value_label = "<n>",
-            .description = "Least-loaded-resident balanced-skip lambda numerator (default: 13)",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    c.moe_rebalance.device_llep_lambda_numerator =
-                        parsePositiveUint32Value(v, "--moe-device-llep-lambda-numerator");
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-device-llep-lambda-denominator",
-            .category = "MoE Configuration",
-            .value_label = "<n>",
-            .description = "Least-loaded-resident balanced-skip lambda denominator (default: 10)",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    c.moe_rebalance.device_llep_lambda_denominator =
-                        parsePositiveUint32Value(v, "--moe-device-llep-lambda-denominator");
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-device-llep-disable-balanced-skip",
-            .category = "MoE Configuration",
-            .description = "Require LLEP assignment planning even when static-owner apportionment is load-balanced",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &)
-                {
-                    c.moe_rebalance.device_llep_enable_balanced_skip = false;
                 }),
         });
         spec.add({
@@ -1961,7 +2089,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
+            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_decode_assignment=static-owner|least-loaded-resident][;routed_prefill_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2232,13 +2360,22 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--mtp-mirror-full-head-local-tp",
+            .long_name = "--mtp-terminal-head-policy",
             .category = "MTP",
-            .description = "Mirror the full MTP verifier LM head on each LocalTP device instead of sampling a vocab shard collective",
+            .value_label = "<policy>",
+            .description = "MTP final norm/LM-head placement: vocabulary-sharded or mirrored-full-vocabulary",
+            .valid_values = {"vocabulary-sharded", "mirrored-full-vocabulary"},
             .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &)
+                [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.mtp.mirror_full_head_for_local_tp = true;
+                    auto parsed = parseMTPTerminalHeadPolicy(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --mtp-terminal-head-policy: '" + v +
+                            "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                    }
+                    c.mtp.terminal_head_policy = *parsed;
                 }),
         });
         spec.add({
@@ -3006,30 +3143,37 @@ namespace llaminar2
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
             }
-            else if (normalized_key == "moe_rebalance")
+            else if (normalized_key == "moe_residency_maintenance")
             {
                 config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
             }
-            else if (normalized_key == "moe_rebalance_window")
+            else if (normalized_key == "moe_residency_maintenance_window")
             {
                 config.moe_rebalance.window_size = std::stoi(value);
             }
-            else if (normalized_key == "moe_rebalance_max_window")
+            else if (normalized_key == "moe_residency_maintenance_max_window")
             {
                 config.moe_rebalance.max_window_size = std::stoi(value);
             }
-            else if (normalized_key == "moe_rebalance_window_growth")
+            else if (normalized_key == "moe_residency_maintenance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
-            else if (normalized_key == "moe_rebalance_prefill_window" ||
-                     normalized_key == "moe_rebalance_prefill_window_tokens")
+            else if (normalized_key ==
+                     "moe_routed_prefill_assignment_window_tokens")
             {
-                config.moe_rebalance.prefill_window_tokens = std::stoi(value);
-                if (config.moe_rebalance.prefill_window_tokens < 0)
-                {
-                    throw std::invalid_argument("moe_rebalance_prefill_window_tokens must be >= 0");
-                }
+                config.moe_routed_prefill.assignment_window_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key ==
+                     "moe_routed_prefill_least_loaded_min_routed_rows")
+            {
+                config.moe_routed_prefill.least_loaded_min_routed_rows =
+                    parseNonNegativeUint64Value(
+                        value,
+                        "moe_routed_prefill_least_loaded_min_routed_rows");
             }
             else if (normalized_key == "moe_dynamic_imbalance_threshold_permille")
             {
@@ -3055,6 +3199,27 @@ namespace llaminar2
             {
                 config.moe_rebalance.dynamic_min_window_activations =
                     parseNonNegativeUint64Value(value, "moe_dynamic_min_window_activations");
+            }
+            else if (normalized_key == "moe_device_rebalance_maintenance_slack_tokens")
+            {
+                config.moe_rebalance.device_maintenance_slack_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_maintenance_slack_tokens");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_min_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_min_maintenance_period_tokens");
+            }
+            else if (normalized_key == "moe_device_rebalance_initial_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_initial_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_initial_maintenance_period_tokens");
             }
             else if (normalized_key == "moe_device_rebalance_min_load_spread_improvement")
             {
@@ -3096,29 +3261,38 @@ namespace llaminar2
                         value,
                         "moe_device_rebalance_max_post_wave_load_spread_permille");
             }
-            else if (normalized_key == "moe_device_llep_alpha_numerator")
+            else if (normalized_key == "moe_routed_prefill_llep_alpha_numerator")
             {
-                config.moe_rebalance.device_llep_alpha_numerator =
-                    parsePositiveUint32Value(value, "moe_device_llep_alpha_numerator");
+                config.moe_routed_prefill.llep_alpha_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_alpha_numerator");
             }
-            else if (normalized_key == "moe_device_llep_alpha_denominator")
+            else if (normalized_key == "moe_routed_prefill_llep_alpha_denominator")
             {
-                config.moe_rebalance.device_llep_alpha_denominator =
-                    parsePositiveUint32Value(value, "moe_device_llep_alpha_denominator");
+                config.moe_routed_prefill.llep_alpha_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_alpha_denominator");
             }
-            else if (normalized_key == "moe_device_llep_lambda_numerator")
+            else if (normalized_key == "moe_routed_prefill_llep_lambda_numerator")
             {
-                config.moe_rebalance.device_llep_lambda_numerator =
-                    parsePositiveUint32Value(value, "moe_device_llep_lambda_numerator");
+                config.moe_routed_prefill.llep_lambda_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_lambda_numerator");
             }
-            else if (normalized_key == "moe_device_llep_lambda_denominator")
+            else if (normalized_key == "moe_routed_prefill_llep_lambda_denominator")
             {
-                config.moe_rebalance.device_llep_lambda_denominator =
-                    parsePositiveUint32Value(value, "moe_device_llep_lambda_denominator");
+                config.moe_routed_prefill.llep_lambda_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_lambda_denominator");
             }
-            else if (normalized_key == "moe_device_llep_enable_balanced_skip")
+            else if (normalized_key == "moe_routed_prefill_llep_enable_balanced_skip")
             {
-                config.moe_rebalance.device_llep_enable_balanced_skip = parseBoolValue(value);
+                config.moe_routed_prefill.llep_enable_balanced_skip =
+                    parseBoolValue(value);
             }
             else if (normalized_key == "moe_release_raw_expert_weights")
             {

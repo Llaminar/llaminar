@@ -14570,7 +14570,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         composer.find(
             "DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero"),
         std::string::npos)
-        << "Ordinary MTP transactions must skip the complete LLEP maintenance "
+        << "Ordinary MTP transactions must skip the complete Dynamic maintenance "
            "body and collective through a device-owned native condition.";
     EXPECT_NE(
         composer.find("offsetof(DeviceMoERebalanceGraphControllerState,maintenance_due)"),

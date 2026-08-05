@@ -129,7 +129,8 @@ namespace llaminar2::test
 
         EXPECT_NE(explanation.find("topology: graph-native tiered-overlay"), std::string::npos);
         EXPECT_NE(explanation.find("routed_compute=apportioned"), std::string::npos);
-        EXPECT_NE(explanation.find("routed_assignment=static-owner"), std::string::npos);
+        EXPECT_NE(explanation.find("routed_decode_assignment=static-owner"), std::string::npos);
+        EXPECT_NE(explanation.find("routed_prefill_assignment=static-owner"), std::string::npos);
         EXPECT_NE(explanation.find("continuation_domain: cuda_hot"), std::string::npos);
         EXPECT_NE(explanation.find("routed_domains:"), std::string::npos);
         EXPECT_NE(explanation.find("routed_tiers:"), std::string::npos);

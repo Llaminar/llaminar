@@ -508,7 +508,8 @@ namespace
     RankExecutionPlan makePlan(
         bool mtp_enabled = false,
         int mtp_draft_tokens = 1,
-        MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+        RoutedExpertAssignmentPolicy prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner,
         int prefix_block_size = 2,
         int prefill_window_tokens = 0,
         bool prefix_cache_enabled = true)
@@ -527,8 +528,9 @@ namespace
         plan.runtime.prefix_cache.storage_mode =
             prefix_cache_enabled ? PrefixCacheStorageMode::Ram : PrefixCacheStorageMode::Disabled;
         plan.runtime.prefix_cache.block_size = prefix_block_size;
-        plan.runtime.moe_rebalance.mode = rebalance_mode;
-        plan.runtime.moe_rebalance.prefill_window_tokens = prefill_window_tokens;
+        plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        plan.runtime.moe_routed_prefill.assignment_window_tokens =
+            prefill_window_tokens;
         plan.runtime.mtp.enabled = mtp_enabled;
         plan.runtime.mtp.draft_tokens = mtp_draft_tokens;
         plan.runtime.mtp.verify_mode = MTPVerifyMode::Greedy;
@@ -538,7 +540,8 @@ namespace
     OrchestrationConfig makeConfig(
         bool mtp_enabled = false,
         int mtp_draft_tokens = 1,
-        MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+        RoutedExpertAssignmentPolicy prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner,
         int prefix_block_size = 2,
         int prefill_window_tokens = 0,
         bool prefix_cache_enabled = true)
@@ -549,8 +552,21 @@ namespace
         config.prefix_cache.storage_mode =
             prefix_cache_enabled ? PrefixCacheStorageMode::Ram : PrefixCacheStorageMode::Disabled;
         config.prefix_cache.block_size = prefix_block_size;
-        config.moe_rebalance.mode = rebalance_mode;
-        config.moe_rebalance.prefill_window_tokens = prefill_window_tokens;
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        config.moe_routed_prefill.assignment_window_tokens =
+            prefill_window_tokens;
+        if (prefill_assignment_policy ==
+            RoutedExpertAssignmentPolicy::LeastLoadedResident)
+        {
+            auto placement = std::make_shared<MoERoutedExpertPlacementPlan>();
+            placement->enabled = true;
+            RoutedExpertDomain domain;
+            domain.name = "least_loaded_prefill_test";
+            domain.routed_prefill_assignment_policy =
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            placement->domains.push_back(std::move(domain));
+            config.moe_routed_expert_plan = std::move(placement);
+        }
         config.mtp.enabled = mtp_enabled;
         config.mtp.draft_tokens = mtp_draft_tokens;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
@@ -560,7 +576,8 @@ namespace
     std::unique_ptr<OrchestrationRunner> makeRunner(std::unique_ptr<PrefixFlowMockRunner> mock,
                                                     bool mtp_enabled = false,
                                                     int mtp_draft_tokens = 1,
-                                                    MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+                                                    RoutedExpertAssignmentPolicy prefill_assignment_policy =
+                                                        RoutedExpertAssignmentPolicy::StaticOwner,
                                                     int prefix_block_size = 2,
                                                     int prefill_window_tokens = 0,
                                                     bool prefix_cache_enabled = true)
@@ -569,13 +586,13 @@ namespace
         auto runner = std::make_unique<OrchestrationRunner>(
             makeConfig(mtp_enabled,
                        mtp_draft_tokens,
-                       rebalance_mode,
+                       prefill_assignment_policy,
                        prefix_block_size,
                        prefill_window_tokens,
                        prefix_cache_enabled),
             makePlan(mtp_enabled,
                      mtp_draft_tokens,
-                     rebalance_mode,
+                     prefill_assignment_policy,
                      prefix_block_size,
                      prefill_window_tokens,
                      prefix_cache_enabled),
@@ -675,7 +692,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutConfiguredWindowUsesSing
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/false,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP);
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident);
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
@@ -699,7 +716,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPPartialHitUsesStableCacheBlockPrefillBoun
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/false,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP);
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident);
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
@@ -726,7 +743,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitAtUnalignedBoundaryRecomputesRemai
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/false,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP);
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident);
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
@@ -793,7 +810,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestore
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/true,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP);
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident);
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
@@ -822,7 +839,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPConfiguredPrefillWindowSegmentsUncachedPr
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/false,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP,
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident,
                              /*prefix_block_size=*/2,
                              /*prefill_window_tokens=*/2,
                              /*prefix_cache_enabled=*/false);
@@ -852,7 +869,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutPrefixBlockSizeUsesSingl
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/false,
                              /*mtp_draft_tokens=*/1,
-                             MoERebalanceRuntimeMode::LLEP,
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident,
                              /*prefix_block_size=*/0);
     ASSERT_TRUE(runner->prefill({1, 2, 3})) << runner->lastError();
 

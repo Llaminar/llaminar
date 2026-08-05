@@ -41,7 +41,9 @@ namespace llaminar2
             RoutedExpertComputePolicy::Apportioned;
         RoutedExpertPhasePolicy routed_phase_policy =
             RoutedExpertPhasePolicy::Uniform;
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;
 
         std::vector<MoEOverlayDomainParticipant> participants;

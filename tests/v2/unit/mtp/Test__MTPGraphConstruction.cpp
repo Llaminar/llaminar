@@ -1638,7 +1638,8 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
     local_tp->setBackend(CollectiveBackendType::HOST);
 
     mirrored_fixture.config.mtp.enabled = true;
-    mirrored_fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    mirrored_fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     mirrored_fixture.config.lm_head_column_parallel = true;
     mirrored_fixture.config.vocab_local = mirrored_fixture.config.vocab_size / 2;
     mirrored_fixture.config.tp_ctx = local_tp.get();
@@ -1766,7 +1767,8 @@ TEST(Test__MTPGraphConstruction,
     fixture.config.mtp.enabled = true;
     fixture.config.mtp.draft_tokens = 1;
     fixture.config.mtp.max_request_batch = 2;
-    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
     fixture.config.tp_ctx = local_tp.get();
@@ -2623,7 +2625,8 @@ TEST(Test__MTPGraphConstruction,
     local_tp.setBackend(CollectiveBackendType::HOST);
 
     fixture.config.mtp.enabled = false;
-    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
     fixture.config.tp_ctx = &local_tp;
@@ -2802,7 +2805,8 @@ TEST(Test__MTPGraphConstruction,
     local_tp->setBackend(CollectiveBackendType::HOST);
 
     fixture.config.mtp.enabled = true;
-    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
     fixture.config.tp_ctx = local_tp.get();

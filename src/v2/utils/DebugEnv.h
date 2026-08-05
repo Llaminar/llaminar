@@ -3519,29 +3519,6 @@ namespace llaminar2
                 moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
             /// Max experts to replicate per socket (0 = auto: 2×top_k) (from LLAMINAR_MOE_REBALANCE_REPLICAS)
             int max_replicas = 0;
-            /// Current-batch LLEP prefill movement mode.
-            ///
-            /// 0 = resident-only: apply graph-capturable LLEP route spans only
-            ///     when all destinations already have the required expert weights.
-            /// 1 = full: require compact transfer-slot backing and import missing
-            ///     foreign expert payloads; unavailable transfer backing is a hard
-            ///     configuration error.
-            /// 2 = invalid: fail during graph construction.
-            ///
-            /// Default is full because production LLEP must exercise the
-            /// transfer-backed current-batch path. Resident-only is a diagnostic
-            /// mode, not the production default.
-            /// (env: LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE)
-            int llep_prefill_transfer_mode = 1;
-            /// Minimum current-batch routed rows before prefill LLEP may run.
-            ///
-            /// LLEP prefill imports foreign expert payloads and rewrites route
-            /// participant assignment. That work is only economic for a chunky
-            /// routed batch; below this threshold the explicit LLEP cost gate
-            /// selects standard apportioned expert routing for the batch.
-            /// Set to 0 to force LLEP planning for diagnostics.
-            /// (env: LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS)
-            uint64_t llep_prefill_min_routed_rows = 8192;
             /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
             /// 0 disables cross-domain GPU-cache placement. (from LLAMINAR_MOE_GPU_EXPERT_CACHE)
             int gpu_cache_experts_per_layer = 0;
@@ -3846,23 +3823,6 @@ namespace llaminar2
                 gpu_vram_preflight_min_margin_mib = std::max(0, std::atoi(min_mib));
         }
 
-        static int parseLLEPPrefillTransferMode(const char *value)
-        {
-            std::string normalized = normalizedEnvValue(value);
-            std::replace(normalized.begin(), normalized.end(), '_', '-');
-            if (normalized.empty() || normalized == "resident-only" ||
-                normalized == "resident" || normalized == "0")
-            {
-                return 0;
-            }
-            if (normalized == "full" || normalized == "transfer-backed" ||
-                normalized == "1")
-            {
-                return 1;
-            }
-            return 2;
-        }
-
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
@@ -3943,20 +3903,6 @@ namespace llaminar2
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
-            if (const char *moe_llep_prefill_transfer =
-                    std::getenv("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"))
-                moe_rebalance.llep_prefill_transfer_mode =
-                    parseLLEPPrefillTransferMode(moe_llep_prefill_transfer);
-            if (const char *moe_llep_prefill_min_rows =
-                    std::getenv("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS"))
-            {
-                char *end = nullptr;
-                const unsigned long long parsed =
-                    std::strtoull(moe_llep_prefill_min_rows, &end, 10);
-                if (end != moe_llep_prefill_min_rows)
-                    moe_rebalance.llep_prefill_min_routed_rows =
-                        static_cast<uint64_t>(parsed);
-            }
             const char *moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE");
             if (!moe_gpu_cache)
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
@@ -4136,22 +4082,6 @@ namespace llaminar2
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
-            moe_rebalance.llep_prefill_transfer_mode = 1;
-            if (const char *moe_llep_prefill_transfer =
-                    std::getenv("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"))
-                moe_rebalance.llep_prefill_transfer_mode =
-                    parseLLEPPrefillTransferMode(moe_llep_prefill_transfer);
-            moe_rebalance.llep_prefill_min_routed_rows = 8192;
-            if (const char *moe_llep_prefill_min_rows =
-                    std::getenv("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS"))
-            {
-                char *end = nullptr;
-                const unsigned long long parsed =
-                    std::strtoull(moe_llep_prefill_min_rows, &end, 10);
-                if (end != moe_llep_prefill_min_rows)
-                    moe_rebalance.llep_prefill_min_routed_rows =
-                        static_cast<uint64_t>(parsed);
-            }
             moe_rebalance.gpu_cache_experts_per_layer = 0;
             const char *moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE");
             if (!moe_gpu_cache)

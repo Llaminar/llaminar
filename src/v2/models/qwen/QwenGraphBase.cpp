@@ -465,7 +465,7 @@ namespace llaminar2
          * mirrored, leaving stochastic parity dependent on two different
          * reduction and sampling implementations.
          */
-        return config_.mtp.mirror_full_head_for_local_tp &&
+        return mtpTerminalHeadIsMirrored(config_.mtp.terminal_head_policy) &&
                config_.lm_head_column_parallel &&
                config_.tp_ctx != nullptr &&
                config_.tp_ctx->isLocal();
@@ -1548,7 +1548,7 @@ namespace llaminar2
             config_.tp_ctx->isLocal() &&
             config_.tp_ctx->degree() > 1;
         if (mirrored_local_tp &&
-            !config_.mtp.mirror_full_head_for_local_tp)
+            !mtpTerminalHeadIsMirrored(config_.mtp.terminal_head_policy))
         {
             throw std::runtime_error(
                 "Participant-local LocalTP MTP outcomes require a mirrored "

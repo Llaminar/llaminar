@@ -365,7 +365,16 @@ namespace llaminar2
             // Stable graph-facing MoE runtime placement state. Owned by the graph/model
             // layer; stages only cache the per-layer device pointer.
             IMoERuntimeTable *moe_runtime_table = nullptr;
-            bool use_runtime_prefill_grouping = false;
+            /**
+             * Route grouped rows through the persistent runtime-table grouper.
+             *
+             * This mechanism is shared by ordinary prefill and grouped MTP
+             * verification.  Assignment policy remains an independent axis:
+             * verifier rows use static ownership, while an explicitly selected
+             * ordinary-prefill graph may use current-batch least-loaded
+             * assignment.
+             */
+            bool use_runtime_row_grouping = false;
 
             /// LocalTP context for future full LLEP current-batch row exchange.
             /// Required by graph-capturable homogeneous GPU LLEP prefill once
@@ -504,9 +513,9 @@ namespace llaminar2
         {
             return params_.routed_row_execution_policy;
         }
-        bool usesRuntimePrefillGroupingForTesting() const
+        bool usesRuntimeRowGroupingForTesting() const
         {
-            return params_.use_runtime_prefill_grouping;
+            return params_.use_runtime_row_grouping;
         }
         bool supportsRequestedRoutedAssignmentPolicyForTesting() const
         {
@@ -897,12 +906,12 @@ namespace llaminar2
          *
          * Unit tests use a host-backed runtime-table sentinel to exercise the
          * capture predicate.  Real execution may set this state only through
-         * initializeMoERuntimeTableForGroupedPrefill(), which validates every
+         * initializeMoERuntimeTableForGroupedRows(), which validates every
          * persistent device pointer and capacity before returning true.
          */
         void setRuntimePrefillGroupingAvailableForTesting(bool available)
         {
-            moe_prefill_runtime_grouping_available_ = available;
+            moe_runtime_row_grouping_available_ = available;
         }
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const
         {
@@ -1137,12 +1146,12 @@ namespace llaminar2
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureCombinedSharedVerifierResources(IMoEKernel *kernel, int d_model, int intermediate);
         bool initializeMoERuntimeTableForGroupedDecode();
-        bool initializeMoERuntimeTableForGroupedPrefill();
+        bool initializeMoERuntimeTableForGroupedRows();
         bool initializeFixedTopologyGroupedPrefill();
         int expectedGroupedDecodeParticipantCount() const;
         bool runtimeTableHasActiveGroupedDecodeBank() const;
         bool supportsRequestedRoutedAssignmentPolicy() const;
-        bool canUseRuntimePrefillGrouping() const;
+        bool canUseRuntimeRowGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
         /**
          * @brief True when verifier rows can use the safe routed+shared composite path.
@@ -1243,7 +1252,7 @@ namespace llaminar2
 
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
         bool moe_runtime_table_initialized_ = false;
-        bool moe_prefill_runtime_grouping_available_ = false;
+        bool moe_runtime_row_grouping_available_ = false;
         bool moe_prefill_fixed_topology_available_ = false;
         std::vector<GpuDirectTransferCompletion> pending_gpu_direct_transfers_;
     };

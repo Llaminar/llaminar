@@ -410,19 +410,20 @@ namespace llaminar2::test::moe_llep_perf
     }
 
     /**
-     * @brief Build the production-sized decode-maintenance policy used by LLEP.
+     * @brief Build Dynamic maintenance with least-loaded resident assignment.
      *
-     * Decode maintenance intentionally plans a small rolling layer wave instead
-     * of revisiting every model layer after each histogram window.  This helper
-     * keeps the performance test aligned with Qwen3.6 serving defaults while
-     * leaving the model layer count explicit for future geometries.
+     * This is an explicit orthogonal policy combination, not the canonical
+     * current-batch LLEP serving lane: Dynamic owns durable residency changes,
+     * while LeastLoadedResident selects the planner used within each rolling
+     * wave. Decode maintenance intentionally plans a small layer wave instead
+     * of revisiting every model layer after each histogram window.
      *
      * @param shape Expert and participant geometry under test.
      * @param num_layers Number of routed MoE layers in the model.
      * @param layer_wave_count Number of consecutive layers planned per replay.
-     * @return Device planner configuration matching the production LLEP lane.
+     * @return Device planner configuration for the named Dynamic policy tuple.
      */
-    inline DeviceMoERebalanceConfig llepMaintenanceConfig(
+    inline DeviceMoERebalanceConfig dynamicLeastLoadedMaintenanceConfig(
         const Shape &shape,
         uint32_t num_layers,
         uint32_t layer_wave_count = 4u)

@@ -1894,10 +1894,11 @@ namespace
         /**
          * @brief Report that this mock owns a device-side MoE maintenance controller.
          *
-         * Production LLEP runners publish placement-bank maintenance on a GPU
-         * stream at each committed decode boundary. Tests opt into that contract
-         * explicitly so ordinary MTP publication tests retain their smaller event
-         * trace while ordering regressions can observe the maintenance handoff.
+         * Production Dynamic-maintenance runners publish placement-bank updates
+         * on a GPU stream at each committed decode boundary. Tests opt into that
+         * contract explicitly so ordinary MTP publication tests retain their
+         * smaller event trace while ordering regressions can observe the
+         * maintenance handoff.
          */
         bool usesDeviceSideMoERebalanceController() const override
         {

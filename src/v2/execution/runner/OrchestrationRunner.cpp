@@ -1575,23 +1575,35 @@ namespace llaminar2
     // Inference
     // =========================================================================
 
-    bool OrchestrationRunner::leastLoadedEPPrefillUsesStableWindows() const
+    bool OrchestrationRunner::leastLoadedCurrentBatchPrefillUsesStableWindows() const
     {
-        return plan_.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP ||
-               config_.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP;
+        const auto &placement = config_.moe_routed_expert_plan;
+        if (!placement || !placement->enabled)
+            return false;
+
+        return std::any_of(
+            placement->domains.begin(),
+            placement->domains.end(),
+            [](const RoutedExpertDomain &domain)
+            {
+                return domain.routed_prefill_assignment_policy ==
+                       RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            });
     }
 
-    int OrchestrationRunner::stableLLEPPrefillWindowTokens(
+    int OrchestrationRunner::stableRoutedPrefillAssignmentWindowTokens(
         int prefix_cache_block_size,
         bool prefix_cache_enabled) const
     {
-        if (!leastLoadedEPPrefillUsesStableWindows())
+        if (!leastLoadedCurrentBatchPrefillUsesStableWindows())
         {
             return 0;
         }
 
-        const int plan_window = plan_.runtime.moe_rebalance.prefill_window_tokens;
-        const int config_window = config_.moe_rebalance.prefill_window_tokens;
+        const int plan_window =
+            plan_.runtime.moe_routed_prefill.assignment_window_tokens;
+        const int config_window =
+            config_.moe_routed_prefill.assignment_window_tokens;
         if (plan_window < 0 || config_window < 0)
         {
             return -1;
@@ -1880,33 +1892,33 @@ namespace llaminar2
                 const bool coordinated_prefix_hit =
                     coordinated_cache_available && coordinated_hit.cached_tokens > 0;
                 int stable_prefix_prefill_segment_tokens =
-                    stableLLEPPrefillWindowTokens(
+                    stableRoutedPrefillAssignmentWindowTokens(
                         coordinated_hit.block_size,
                         coordinated_prefix_hit);
-                if (leastLoadedEPPrefillUsesStableWindows() &&
+                if (leastLoadedCurrentBatchPrefillUsesStableWindows() &&
                     stable_prefix_prefill_segment_tokens < 0)
                 {
                     std::ostringstream error;
-                    error << "LLEP prefill window cannot be negative"
+                    error << "Routed-prefill assignment window cannot be negative"
                           << " plan_prefill_window="
-                          << plan_.runtime.moe_rebalance.prefill_window_tokens
+                          << plan_.runtime.moe_routed_prefill.assignment_window_tokens
                           << " config_prefill_window="
-                          << config_.moe_rebalance.prefill_window_tokens;
+                          << config_.moe_routed_prefill.assignment_window_tokens;
                     return setError(error.str());
                 }
                 if (coordinated_prefix_hit &&
-                    leastLoadedEPPrefillUsesStableWindows() &&
+                    leastLoadedCurrentBatchPrefillUsesStableWindows() &&
                     stable_prefix_prefill_segment_tokens <= 0)
                 {
                     std::ostringstream error;
-                    error << "Prefix cache LLEP prefill requires a positive stable block size"
+                    error << "Prefix cache least-loaded routed prefill requires a positive stable block size"
                           << " local_hit_block_size=" << local_hit.block_size
                           << " plan_block_size=" << plan_prefix.block_size
                           << " config_block_size=" << config_prefix.block_size
                           << " plan_prefill_window="
-                          << plan_.runtime.moe_rebalance.prefill_window_tokens
+                          << plan_.runtime.moe_routed_prefill.assignment_window_tokens
                           << " config_prefill_window="
-                          << config_.moe_rebalance.prefill_window_tokens;
+                          << config_.moe_routed_prefill.assignment_window_tokens;
                     return setError(error.str());
                 }
                 int matched_tokens = coordinated_hit.cached_tokens;
@@ -2028,7 +2040,7 @@ namespace llaminar2
                 if (matched_tokens == 0 && stable_prefix_prefill_segment_tokens > 0)
                 {
                     stable_prefix_prefill_segment_tokens =
-                        stableLLEPPrefillWindowTokens(
+                        stableRoutedPrefillAssignmentWindowTokens(
                             coordinated_hit.block_size,
                             /*prefix_cache_enabled=*/false);
                 }
@@ -2173,17 +2185,17 @@ namespace llaminar2
         try
         {
             const int stable_llep_prefill_window =
-                stableLLEPPrefillWindowTokens(
+                stableRoutedPrefillAssignmentWindowTokens(
                     /*prefix_cache_block_size=*/0,
                     /*prefix_cache_enabled=*/false);
             if (stable_llep_prefill_window < 0)
             {
                 std::ostringstream error;
-                error << "LLEP prefill window cannot be negative"
+                error << "Routed-prefill assignment window cannot be negative"
                       << " plan_prefill_window="
-                      << plan_.runtime.moe_rebalance.prefill_window_tokens
+                      << plan_.runtime.moe_routed_prefill.assignment_window_tokens
                       << " config_prefill_window="
-                      << config_.moe_rebalance.prefill_window_tokens;
+                      << config_.moe_routed_prefill.assignment_window_tokens;
                 return setError(error.str());
             }
             if (!forwardPrefillTokens(prompt_tokens.data(),

@@ -1842,7 +1842,9 @@ namespace
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayRocm2TPHotOnlyForProbe(
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner,
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner)
     {
         constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
@@ -1859,7 +1861,10 @@ namespace
                 CollectiveBackendType::RCCL,
                 {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
         };
-        plan->domains.front().routed_assignment_policy = routed_assignment_policy;
+        plan->domains.front().routed_decode_assignment_policy =
+            routed_decode_assignment_policy;
+        plan->domains.front().routed_prefill_assignment_policy =
+            routed_prefill_assignment_policy;
         plan->routed_tiers = {
             qwen36MoERoutedTierForProbe(
                 "hot",
@@ -1874,7 +1879,9 @@ namespace
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayCuda2TPHotOnlyForProbe(
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner,
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner)
     {
         constexpr const char *kCudaHotDomain = "qwen36_moe_cuda_hot";
@@ -1891,7 +1898,10 @@ namespace
                 CollectiveBackendType::NCCL,
                 {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
         };
-        plan->domains.front().routed_assignment_policy = routed_assignment_policy;
+        plan->domains.front().routed_decode_assignment_policy =
+            routed_decode_assignment_policy;
+        plan->domains.front().routed_prefill_assignment_policy =
+            routed_prefill_assignment_policy;
         plan->routed_tiers = {
             qwen36MoERoutedTierForProbe(
                 "hot",
@@ -2460,8 +2470,10 @@ namespace
     struct OverlayRecallProbeConfig
     {
         const char *label = "overlay";
-        MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::LLEP;
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Off;
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;
         bool prefix_cache = true;
         int prefill_window_tokens = 0;
@@ -5759,8 +5771,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
         {"LLAMINAR_PERF_STATS_JSON", "1"},
         {"LLAMINAR_PERF_STATS_FILTER", "prefix_cache,request_admission"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
@@ -5815,12 +5825,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-        config.moe_routed_expert_plan = qwen36MoEOverlayRocm2TPHotOnlyForProbe();
-        config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
+        config.moe_routed_expert_plan =
+            qwen36MoEOverlayRocm2TPHotOnlyForProbe(
+                RoutedExpertAssignmentPolicy::StaticOwner,
+                RoutedExpertAssignmentPolicy::LeastLoadedResident);
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
         config.moe_rebalance.window_growth_factor = 1.0f;
-        config.moe_rebalance.prefill_window_tokens = block_size;
+        config.moe_routed_prefill.assignment_window_tokens = block_size;
+        config.moe_routed_prefill.least_loaded_min_routed_rows = 0;
         config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
         config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
         config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
@@ -6137,8 +6151,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
         {"LLAMINAR_PERF_STATS_JSON", "1"},
         {"LLAMINAR_PERF_STATS_FILTER", "prefix_cache,request_admission"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
@@ -6193,12 +6205,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-        config.moe_routed_expert_plan = qwen36MoEOverlayCuda2TPHotOnlyForProbe();
-        config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
+        config.moe_routed_expert_plan =
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe(
+                RoutedExpertAssignmentPolicy::StaticOwner,
+                RoutedExpertAssignmentPolicy::LeastLoadedResident);
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
         config.moe_rebalance.window_growth_factor = 1.0f;
-        config.moe_rebalance.prefill_window_tokens = block_size;
+        config.moe_routed_prefill.assignment_window_tokens = block_size;
+        config.moe_routed_prefill.least_loaded_min_routed_rows = 0;
         config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
         config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
         config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
@@ -6476,8 +6492,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
     });
 
     if (mpiWorldSize() != 1)
@@ -6553,15 +6567,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
         config.tp_allreduce_precision_override = "schema";
         configure_prefix_cache(config, probe.prefix_cache);
         config.moe_routed_expert_plan =
-            qwen36MoEOverlayRocm2TPHotOnlyForProbe(probe.routed_assignment_policy);
+            qwen36MoEOverlayRocm2TPHotOnlyForProbe(
+                probe.routed_decode_assignment_policy,
+                probe.routed_prefill_assignment_policy);
         config.moe_rebalance.mode = probe.mode;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
         config.moe_rebalance.window_growth_factor = 1.0f;
-        config.moe_rebalance.prefill_window_tokens =
+        config.moe_routed_prefill.assignment_window_tokens =
             firstIntEnvOrDefault(
                 {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_PREFILL_WINDOW_TOKENS"},
                 probe.prefill_window_tokens);
+        config.moe_routed_prefill.least_loaded_min_routed_rows =
+            probe.routed_prefill_assignment_policy ==
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident
+                ? 0
+                : 8192;
         config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
         config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
         config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
@@ -6610,15 +6631,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig static_probe;
     static_probe.label = "static-overlay";
     static_probe.mode = MoERebalanceRuntimeMode::Off;
-    static_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_prefill_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
     static_probe.prefix_cache = true;
     static_probe.prefill_window_tokens = 0;
     static_probe.require_transfer_backing = false;
 
     OverlayRecallProbeConfig llep_probe;
     llep_probe.label = "llep-overlay-prefix-window";
-    llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
-    llep_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.mode = MoERebalanceRuntimeMode::Off;
+    llep_probe.routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.routed_prefill_assignment_policy =
+        RoutedExpertAssignmentPolicy::LeastLoadedResident;
     llep_probe.prefix_cache = true;
     llep_probe.prefill_window_tokens = 0;
     llep_probe.require_transfer_backing = true;
@@ -6680,8 +6707,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
     });
 
     if (mpiWorldSize() != 1)
@@ -6758,15 +6783,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         config.tp_allreduce_precision_override = "schema";
         configure_prefix_cache(config, probe.prefix_cache);
         config.moe_routed_expert_plan =
-            qwen36MoEOverlayCuda2TPHotOnlyForProbe(probe.routed_assignment_policy);
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe(
+                probe.routed_decode_assignment_policy,
+                probe.routed_prefill_assignment_policy);
         config.moe_rebalance.mode = probe.mode;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
         config.moe_rebalance.window_growth_factor = 1.0f;
-        config.moe_rebalance.prefill_window_tokens =
+        config.moe_routed_prefill.assignment_window_tokens =
             firstIntEnvOrDefault(
                 {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_PREFILL_WINDOW_TOKENS"},
                 probe.prefill_window_tokens);
+        config.moe_routed_prefill.least_loaded_min_routed_rows =
+            probe.routed_prefill_assignment_policy ==
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident
+                ? 0
+                : 8192;
         config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
         config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
         config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
@@ -6815,15 +6847,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig static_probe;
     static_probe.label = "static-overlay";
     static_probe.mode = MoERebalanceRuntimeMode::Off;
-    static_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_prefill_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
     static_probe.prefix_cache = true;
     static_probe.prefill_window_tokens = 0;
     static_probe.require_transfer_backing = false;
 
     OverlayRecallProbeConfig llep_probe;
     llep_probe.label = "llep-overlay-prefix-window";
-    llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
-    llep_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.mode = MoERebalanceRuntimeMode::Off;
+    llep_probe.routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.routed_prefill_assignment_policy =
+        RoutedExpertAssignmentPolicy::LeastLoadedResident;
     llep_probe.prefix_cache = true;
     llep_probe.prefill_window_tokens = 0;
     llep_probe.require_transfer_backing = true;
@@ -7163,8 +7201,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongReque
     if (diagnostic_placement == 0)
     {
         config.moe_routed_expert_plan =
-            qwen36MoEOverlayCuda2TPHotOnlyForProbe(
-                RoutedExpertAssignmentPolicy::StaticOwner);
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe();
     }
     config.moe_rebalance.mode =
         diagnostic_dynamic_enabled

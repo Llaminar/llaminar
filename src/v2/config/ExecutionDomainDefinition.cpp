@@ -129,7 +129,7 @@ namespace llaminar2
         if (eq_pos == std::string::npos)
         {
             throw std::invalid_argument("Invalid " + options.context + " spec: '" + spec +
-                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_phase=...][;routed_assignment=...])");
+                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_phase=...][;routed_decode_assignment=...][;routed_prefill_assignment=...])");
         }
 
         ExecutionDomainDefinition domain;
@@ -220,12 +220,19 @@ namespace llaminar2
                 domain.routed_compute_policy = *compute;
                 saw_routed_compute = true;
             }
-            else if (key == "routed_assignment")
+            else if (key == "routed_decode_assignment")
             {
                 auto assignment = parseRoutedExpertAssignmentPolicy(value);
                 if (!assignment)
-                    throw std::invalid_argument("Invalid " + options.context + " routed assignment policy: '" + value + "'");
-                domain.routed_assignment_policy = *assignment;
+                    throw std::invalid_argument("Invalid " + options.context + " routed decode assignment policy: '" + value + "'");
+                domain.routed_decode_assignment_policy = *assignment;
+            }
+            else if (key == "routed_prefill_assignment")
+            {
+                auto assignment = parseRoutedExpertAssignmentPolicy(value);
+                if (!assignment)
+                    throw std::invalid_argument("Invalid " + options.context + " routed prefill assignment policy: '" + value + "'");
+                domain.routed_prefill_assignment_policy = *assignment;
             }
             else if (key == "routed_phase")
             {
@@ -372,18 +379,40 @@ namespace llaminar2
                 "but is not a multi-participant domain-scoped TP domain");
         }
 
-        if (routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
-            routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
-            !apportioned_prefill_over_replicated_weights)
+        const auto validate_assignment =
+            [&](RoutedExpertAssignmentPolicy assignment,
+                const char *configuration_key,
+                bool phase_allows_replicated_apportionment)
         {
-            errors.push_back("Domain '" + name + "' uses routed_assignment=least-loaded-resident but does not use routed_compute=apportioned");
-        }
+            if (assignment != RoutedExpertAssignmentPolicy::LeastLoadedResident)
+                return;
 
-        if (routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
-            !supportsLeastLoadedResidentAssignment())
-        {
-            errors.push_back("Domain '" + name + "' uses routed_assignment=least-loaded-resident but is not a multi-participant domain-scoped TP domain");
-        }
+            if (routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+                !(phase_allows_replicated_apportionment &&
+                  apportioned_prefill_over_replicated_weights))
+            {
+                errors.push_back(
+                    "Domain '" + name + "' uses " + configuration_key +
+                    "=least-loaded-resident but that workload does not use "
+                    "participant-assigned complete experts");
+            }
+
+            if (!supportsLeastLoadedResidentAssignment())
+            {
+                errors.push_back(
+                    "Domain '" + name + "' uses " + configuration_key +
+                    "=least-loaded-resident but is not a multi-participant "
+                    "domain-scoped TP domain");
+            }
+        };
+        validate_assignment(
+            routed_decode_assignment_policy,
+            "routed_decode_assignment",
+            false);
+        validate_assignment(
+            routed_prefill_assignment_policy,
+            "routed_prefill_assignment",
+            true);
 
         if (routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
             !supportsRoutedExpertTensorSharding())
@@ -441,9 +470,20 @@ namespace llaminar2
         if (routed_phase_policy != RoutedExpertPhasePolicy::Unspecified)
             oss << " routed_phase="
                 << routedExpertPhasePolicyToString(routed_phase_policy);
-        if (routed_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
-            oss << " routed_assignment="
-                << routedExpertAssignmentPolicyToString(routed_assignment_policy);
+        if (routed_decode_assignment_policy !=
+            RoutedExpertAssignmentPolicy::Unspecified)
+        {
+            oss << " routed_decode_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       routed_decode_assignment_policy);
+        }
+        if (routed_prefill_assignment_policy !=
+            RoutedExpertAssignmentPolicy::Unspecified)
+        {
+            oss << " routed_prefill_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       routed_prefill_assignment_policy);
+        }
 
         return oss.str();
     }

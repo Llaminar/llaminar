@@ -598,7 +598,7 @@ namespace
      * collective behind an apportioned outer policy.
      */
     TEST(Test__InferenceRunnerFactory_SourceContract,
-         LLEPModeDoesNotRewriteRoutedAssignmentPolicy)
+         CurrentBatchLLEPPolicyIsValidatedAndNeverSynthesized)
     {
         const std::string source =
             readFactorySourceFile(
@@ -610,18 +610,18 @@ namespace
             std::string::npos)
             << "the runner factory must not mutate declarative routed policy";
         EXPECT_NE(
-            source.find("validateLLEPRoutedOverlayPolicy"),
+            source.find("validateCurrentBatchLLEPOverlayPolicy"),
             std::string::npos)
-            << "LLEP must validate its declared graph policy before lowering";
+            << "current-batch LLEP must validate its declared graph policy before lowering";
         EXPECT_NE(
             source.find(
-                "routed_assignment=least-loaded-resident for LLEP"),
+                "routed_prefill_assignment=least-loaded-resident"),
             std::string::npos)
-            << "a missing explicit LLEP assignment must fail with actionable diagnostics";
+            << "a missing explicit LLEP prefill assignment must fail with actionable diagnostics";
         EXPECT_NE(
-            source.find("never rewrites graph scheduling policy"),
+            source.find("routed_decode_assignment=static-owner"),
             std::string::npos)
-            << "the diagnostic must make the declarative ownership boundary explicit";
+            << "the economical grouped-verifier assignment must be validated independently";
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlansMissingPlacementsFromModelMetadata)
@@ -790,13 +790,18 @@ namespace
         EXPECT_EQ(graph_config.moe.rebalance_mode, active->mode());
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, LLEPModeUsesDynamicControllerClock)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         CurrentBatchLLEPDoesNotEnableDurableResidencyMaintenance)
     {
         GraphConfig graph_config;
         graph_config.n_layers = kMoELayers;
         graph_config.moe.num_experts = kMoEExperts;
         graph_config.moe.top_k = 2;
-        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::LLEP;
+        graph_config.moe.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        graph_config.moe.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Off;
         graph_config.moe.rebalance_config.window_size = 32;
         graph_config.moe.hot_expert_cache.kind = MoEHotExpertCacheConfig::Kind::Off;
         graph_config.moe.expert_overlay_runtime_plan =
@@ -807,21 +812,9 @@ namespace
             nullptr,
             nullptr);
 
-        ASSERT_EQ(controllers.size(), 2u);
-        ASSERT_EQ(controllers.front()->domainId(), "single");
-
-        auto *active = bindActiveMoERebalanceControllerForGraph(
-            graph_config,
-            controllers);
-
-        ASSERT_NE(active, nullptr);
-        EXPECT_EQ(active->domainId(), "overlay_routed_cuda_hot");
-        EXPECT_EQ(active->mode(), MoERebalanceMode::DYNAMIC)
-            << "LLEP is a first-class public strategy, but it still uses the graph-captured dynamic maintenance clock";
-        EXPECT_EQ(active->maxReplicasPerSocket(), 0)
-            << "LLEP without an explicit hot-cache layer must not implicitly enable replicas";
-        EXPECT_EQ(graph_config.moe.decode_histogram, active->histogram());
-        EXPECT_EQ(graph_config.moe.rebalance_mode, MoERebalanceMode::DYNAMIC);
+        EXPECT_TRUE(controllers.empty())
+            << "Current-batch LLEP is a routed-prefill assignment policy and "
+               "must not implicitly construct a durable ownership controller.";
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, HomogeneousGpuOwnershipMovesAreBoundedByLayerFanout)

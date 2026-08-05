@@ -1262,15 +1262,17 @@ TEST(Perf__MoELLEPDeterminism, CUDA_DynamicMaintenancePackAndControllerDetermini
 }
 
 /**
- * @brief Time the exact Qwen3.6 LLEP decode-maintenance controller geometry.
+ * @brief Time Qwen3.6 Dynamic maintenance with least-loaded assignment.
  *
  * Runtime state, histogram evidence, controller transactions, and output
  * buffers are materialized before timing. Each launch receives an independent
  * request transaction that is due on its next decode edge, so the timed region
- * measures the production LLEP planner rather than a busy-wave or invalid-state
- * guard. One event synchronization follows the complete launch batch.
+ * measures the explicit Dynamic-plus-LeastLoadedResident planner rather than a
+ * busy-wave or invalid-state guard. This optional policy combination is kept
+ * distinct from canonical current-batch LLEP, whose durable maintenance mode
+ * is Off. One event synchronization follows the complete launch batch.
  */
-TEST(Perf__MoELLEPDeterminism, CUDA_Qwen36LLEPMaintenanceControllerEconomy)
+TEST(Perf__MoELLEPDeterminism, CUDA_Qwen36DynamicLeastLoadedMaintenanceControllerEconomy)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -1286,15 +1288,15 @@ TEST(Perf__MoELLEPDeterminism, CUDA_Qwen36LLEPMaintenanceControllerEconomy)
     const uint32_t layer_wave_count = static_cast<uint32_t>(
         std::min(
             4,
-            envInt("LLAMINAR_MOE_LLEP_MAINT_LAYER_WAVE", 4)));
+            envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_LAYER_WAVE", 4)));
     const DeviceMoERebalanceConfig config =
-        llepMaintenanceConfig(shape, num_layers, layer_wave_count);
+        dynamicLeastLoadedMaintenanceConfig(shape, num_layers, layer_wave_count);
     const uint32_t gathered_histogram_count =
         config.participant_count * config.layer_wave_count * config.num_experts;
     const int warmups =
-        envInt("LLAMINAR_MOE_LLEP_MAINT_WARMUPS", 2);
+        envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_WARMUPS", 2);
     const int iterations =
-        envInt("LLAMINAR_MOE_LLEP_MAINT_ITERS", 20);
+        envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_ITERS", 20);
 
     CudaHarness harness(shape);
     harness.prepare(/*all_participants_resident=*/false,
@@ -1491,7 +1493,7 @@ TEST(Perf__MoELLEPDeterminism, CUDA_Qwen36LLEPMaintenanceControllerEconomy)
     const auto plan = harness.copyPlan(d_plan, plan_count);
     printTiming(
         "cuda",
-        "qwen36_llep_maintenance_controller",
+        "qwen36_dynamic_least_loaded_maintenance_controller",
         shape,
         iterations,
         elapsed_ms * 1000.0f / static_cast<float>(iterations),

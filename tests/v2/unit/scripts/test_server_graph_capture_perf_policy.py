@@ -137,28 +137,29 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
         )
 
-    def test_llep_verifier_policy_accepts_fully_replicated_local_execution(
+    def test_llep_verifier_policy_accepts_grouped_static_owner_execution(
         self,
     ) -> None:
-        """Mirrored verifier rows need neither assignment nor communication."""
+        """Canonical LLEP keeps verifier rows on ordinary expert owners."""
 
         result = validate_llep_verifier_policy(
             [
                 counter(
-                    "fully_replicated_local_verifier_execution_calls",
-                    domain="moe_rebalance",
+                    "static_owner_grouped_verifier_calls",
+                    domain="moe_routed_execution",
                     tags={
-                        "execution_policy": "fully_replicated_local",
-                        "participant_assignment": "none",
+                        "execution_policy": "static_owner_grouped",
+                        "assignment": "static_owner",
+                        "runtime_grouping": "runtime_table",
+                        "row_execution_policy": "participant_assigned",
                         "current_batch_transport": "none",
-                        "routed_result_collective": "none",
                     },
                 )
                 | {"phase": "verifier"}
             ]
         )
         self.assertIsNone(result.error)
-        self.assertEqual(result.policy, "fully_replicated_local")
+        self.assertEqual(result.policy, "static_owner_grouped")
 
     def test_cuda_dynamic_mtp_policy_accepts_exact_switch_terminal_ledger(
         self,
@@ -307,8 +308,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         self.assertIn("terminal depth ledger", result.error or "")
 
-    def test_llep_verifier_policy_accepts_resident_assignment(self) -> None:
-        """Sharded verifier rows may choose among already-resident replicas."""
+    def test_llep_verifier_policy_rejects_prefill_assignment_bleed(self) -> None:
+        """Least-loaded current-batch assignment is never a verifier policy."""
 
         result = validate_llep_verifier_policy(
             [
@@ -323,13 +324,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 | {"phase": "verifier"}
             ]
         )
-        self.assertIsNone(result.error)
-        self.assertEqual(result.policy, "logical_position_resident")
+        self.assertIn("leaked prefill assignment", result.error or "")
 
-    def test_llep_verifier_policy_rejects_mixed_or_incomplete_evidence(
+    def test_llep_verifier_policy_rejects_replicated_or_incomplete_evidence(
         self,
     ) -> None:
-        """One homogeneous verifier graph cannot advertise ambiguous ownership."""
+        """The canonical lane rejects alternate expert-placement policies."""
 
         mirrored = counter(
             "fully_replicated_local_verifier_execution_calls",
@@ -341,23 +341,27 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 "routed_result_collective": "none",
             },
         ) | {"phase": "verifier"}
-        resident = counter(
-            "device_rebalance_llep_resident_assignment_calls",
-            domain="moe_rebalance",
+        static_owner = counter(
+            "static_owner_grouped_verifier_calls",
+            domain="moe_routed_execution",
             tags={
-                "assignment": "logical_position_resident",
+                "execution_policy": "static_owner_grouped",
+                "assignment": "static_owner",
+                "runtime_grouping": "runtime_table",
+                "row_execution_policy": "participant_assigned",
                 "current_batch_transport": "none",
             },
         ) | {"phase": "verifier"}
 
         self.assertIn(
-            "both participant-assigned and fully replicated",
-            validate_llep_verifier_policy([mirrored, resident]).error or "",
+            "replicated-expert policy",
+            validate_llep_verifier_policy([mirrored, static_owner]).error or "",
         )
-        incomplete = dict(mirrored)
+        incomplete = dict(static_owner)
         incomplete["tags"] = {
-            "execution_policy": "fully_replicated_local",
-            "participant_assignment": "none",
+            "execution_policy": "static_owner_grouped",
+            "assignment": "static_owner",
+            "runtime_grouping": "runtime_table",
             "current_batch_transport": "none",
         }
         self.assertIn(
@@ -483,14 +487,14 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             self.assertNotIn("no-prefill-graph-buckets", row)
             self.assertIn("prefill-graph-probe", row)
 
-    def test_qwen36_moe_cells_name_their_rebalance_mode_explicitly(self) -> None:
-        """Do not let a CLI default silently change a canonical matrix lane."""
+    def test_qwen36_moe_cells_name_residency_maintenance_explicitly(self) -> None:
+        """Do not let a CLI default silently change an independent policy axis."""
 
         harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            'S9_STATIC_FLAGS="--moe-rebalance off"',
+            'S9_STATIC_FLAGS="--moe-residency-maintenance off"',
             harness,
         )
         qwen36_moe_rows = [
@@ -504,9 +508,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 marker in row
                 for marker in (
                     "${S9_STATIC_FLAGS}",
-                    "--moe-rebalance dynamic",
-                    "--moe-rebalance llep",
-                    "${S9_REBALANCE_FLAGS}",
+                    "--moe-residency-maintenance dynamic",
+                    "--moe-residency-maintenance off",
+                    "${S9_DYNAMIC_RESIDENCY_FLAGS}",
                 )
             )
             self.assertTrue(
@@ -514,8 +518,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 f"Qwen3.6 MoE matrix row inherits an ambiguous CLI mode: {row}",
             )
 
-    def test_llep_cells_declare_phase_split_routed_policy_explicitly(self) -> None:
-        """LLEP mode must not rely on runner-factory policy mutation."""
+    def test_llep_cells_declare_economical_policy_tuple_explicitly(self) -> None:
+        """Current-batch LLEP must not imply expert or verifier replication."""
 
         harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
             encoding="utf-8"
@@ -526,25 +530,34 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 for line in harness.splitlines()
                 if line.startswith(f"    S9_LLEP_OVERLAY_{backend}2_FLAGS=")
             )
-            self.assertIn("routed_compute=replicated", definition)
+            self.assertIn("--moe-continuation-dense-policy tensor-parallel", definition)
+            self.assertIn("--mtp-terminal-head-policy mirrored-full-vocabulary", definition)
+            self.assertIn("routed_compute=apportioned", definition)
             self.assertIn(
-                "routed_phase=prefill-apportioned-decode-replicated",
+                "routed_phase=uniform",
                 definition,
             )
             self.assertIn(
-                "routed_assignment=least-loaded-resident",
+                "routed_decode_assignment=static-owner",
                 definition,
             )
+            self.assertIn(
+                "routed_prefill_assignment=least-loaded-resident",
+                definition,
+            )
+            self.assertNotIn("routed_assignment=", definition)
 
         llep_rows = [
             line
             for line in harness.splitlines()
-            if "SUITES+=" in line and "--moe-rebalance llep" in line
+            if "SUITES+=" in line and "qwen36-moe-llep-" in line
         ]
         self.assertGreater(len(llep_rows), 0)
         for row in llep_rows:
             self.assertRegex(row, r"\$\{S9_LLEP_OVERLAY_(?:CUDA|ROCM)2_FLAGS\}")
             self.assertNotRegex(row, r"\$\{S9_OVERLAY_(?:CUDA|ROCM)2_FLAGS\}")
+            self.assertIn("--moe-residency-maintenance off", row)
+            self.assertIn("${S9_LLEP_MOVEMENT_FLAGS}", row)
 
     def test_prefill_graph_probe_defeats_full_prefix_hits_at_fixed_geometry(
         self,
@@ -691,7 +704,11 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     )
                     self.assertIn("--mtp-depth-policy dynamic", flags)
                     self.assertIn("--mtp-max-draft-tokens 15", flags)
-                    self.assertIn(f"--moe-rebalance {mode}", flags)
+                    expected_maintenance = "dynamic" if mode == "dynamic" else "off"
+                    self.assertIn(
+                        f"--moe-residency-maintenance {expected_maintenance}",
+                        flags,
+                    )
                     self.assertNotIn("--tp-devices", flags)
                     self.assertIn(
                         "--moe-routed-expert-domain "
@@ -699,24 +716,28 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                         f"{backend}:0,{backend}:1;",
                         flags,
                     )
+                    self.assertIn("routed_compute=apportioned", flags)
+                    self.assertIn("routed_phase=uniform", flags)
+                    self.assertIn(
+                        "routed_decode_assignment=static-owner",
+                        flags,
+                    )
                     if mode == "llep":
-                        self.assertIn("routed_compute=replicated", flags)
                         self.assertIn(
-                            "routed_phase="
-                            "prefill-apportioned-decode-replicated",
+                            "routed_prefill_assignment=least-loaded-resident",
                             flags,
                         )
                         self.assertIn(
-                            "routed_assignment=least-loaded-resident",
+                            "--mtp-terminal-head-policy "
+                            "mirrored-full-vocabulary",
                             flags,
                         )
                     else:
-                        self.assertIn("routed_compute=apportioned", flags)
-                        self.assertIn("routed_phase=uniform", flags)
                         self.assertIn(
-                            "routed_assignment=static-owner",
+                            "routed_prefill_assignment=static-owner",
                             flags,
                         )
+                    self.assertNotIn("routed_assignment=", flags)
                     self.assertIn("prefill-graph-probe", options)
                     self.assertIn(
                         "prefix-cache-rebalance-clear-probe",

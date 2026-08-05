@@ -883,7 +883,9 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
         RoutedExpertComputePolicy::Apportioned;
     prefill_config.moe.routed_phase_policy =
         RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
-    prefill_config.moe.routed_assignment_policy =
+    prefill_config.moe.routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    prefill_config.moe.routed_prefill_assignment_policy =
         RoutedExpertAssignmentPolicy::LeastLoadedResident;
     prefill_config.moe.local_expert_count = -1;
     prefill_config.moe.routed_expert_plan =
@@ -893,6 +895,12 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
     prefill_config.moe.routed_expert_plan->domains[0]
         .routed_phase_policy =
         RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+    prefill_config.moe.routed_expert_plan->domains[0]
+        .routed_decode_assignment_policy =
+        RoutedExpertAssignmentPolicy::StaticOwner;
+    prefill_config.moe.routed_expert_plan->domains[0]
+        .routed_prefill_assignment_policy =
+        RoutedExpertAssignmentPolicy::LeastLoadedResident;
     prefill_config.moe.expert_overlay_runtime_plan =
         resolveMoEExpertOverlayRuntimePlan(
             prefill_config.moe.routed_expert_plan,
@@ -990,9 +998,9 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
         << "mirrored MTP routing and expert execution must share one policy";
     EXPECT_EQ(
         verifier_expert_stage->routedExpertAssignmentPolicyForTesting(),
-        RoutedExpertAssignmentPolicy::LeastLoadedResident)
-        << "The declared resident scheduler may remain visible for diagnostics, "
-           "but fully replicated local execution must not invoke it.";
+        RoutedExpertAssignmentPolicy::StaticOwner)
+        << "Grouped verifier rows consume the explicit decode assignment and "
+           "must not inherit ordinary-prefill LLEP from the same domain.";
     EXPECT_FALSE(
         verifier_expert_stage->hasPrefillLLEPTPContextForTesting())
         << "Replicated verifier rows require neither resident assignment nor "
@@ -2391,7 +2399,8 @@ TEST(Test__Qwen35MoEGraph, LocalTPColumnParallelForwardPublishesLocalLogits)
     config.max_seq_len = 2;
     config.dense_tp_enabled = true;
     config.lm_head_column_parallel = true;
-    config.mtp.mirror_full_head_for_local_tp = false;
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     config.vocab_local = config.vocab_size / 2;
 
     TensorArena arena;

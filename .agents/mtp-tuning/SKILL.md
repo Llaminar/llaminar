@@ -60,6 +60,39 @@ sidecar graphs. LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay must extend the
 same transaction semantics with collective coordination, not invent separate
 state machines.
 
+### Canonical MoE LLEP Policy Tuple
+
+`LLEP` names one current-batch routed-row assignment policy. It is not a
+complete execution mode, routed-expert storage policy, decode policy, durable
+residency controller, or hot-cache policy. Keep these axes explicit whenever
+constructing, testing, or benchmarking a MoE graph:
+
+- dense/shared trunk: tensor parallel;
+- routed-expert storage and compute: apportioned whole experts;
+- routed phase: uniform;
+- grouped verifier/decode assignment: static owner;
+- ordinary large-prefill assignment: least-loaded resident (LLEP);
+- MTP terminal norm/head: mirrored full vocabulary;
+- durable expert-residency maintenance: off;
+- hot expert replica cache: off;
+- same-backend transport: one fully captured NCCL or RCCL graph.
+
+The prefill row threshold is an explicit work-regime boundary, not recovery
+behavior: below it, execute economical static-owner EP; at or above it, execute
+the current-batch least-loaded assignment. Set the threshold to zero only in a
+focused integration test that must force and prove the transfer-backed LLEP
+path. Never let prefill assignment bleed into grouped verifier/decode, and
+never use whole-expert decode movement as a proxy for LLEP.
+
+Declare the tuple through `DenseParallelPolicy`,
+`RoutedExpertComputePolicy`, `RoutedExpertPhasePolicy`, separate
+`routed_decode_assignment` and `routed_prefill_assignment` domain fields,
+`MTPTerminalHeadPolicy`, `--moe-residency-maintenance`, and
+`--moe-hot-expert-cache`. Graph builders own the resulting stage, collective,
+and event wiring. PerfStats must prove static-owner grouped verification,
+least-loaded large prefill, mirrored terminal-head execution, full graph
+capture, and zero segmented execution.
+
 ## Non-Negotiable Rules
 
 - Never use CUDA/HIP default or null streams. Every GPU operation needs an
@@ -71,12 +104,12 @@ state machines.
   graph-stage buffer contract already provides the correct resident pointer.
 - Never capture H2D copies inside GPU graphs. Upload persistent inputs before
   capture and replay device-resident buffers.
-- Never leave quiet fallbacks. Unsupported MTP lanes must fail fast and loudly
-  in tests or bypass with explicit counters only when the project plan says the
-  lane is not implemented yet.
+- Never leave quiet recovery paths. Every advertised MTP lane must implement
+  its declared policy or fail fast with a precise diagnostic.
 - Never land special codebook exceptions in production kernels. Use generic
   dispatch keyed by codebook family, M, aspect ratio, work size, and generated
-  policy tables. Exact shape overlays are allowed only above a general fallback.
+  policy tables. Exact shape overlays are additive to a total general dispatch
+  rule; they never substitute for that rule.
 - Never accept token equality alone as correctness proof for verifier kernels.
   Require distribution and numeric gates.
 - Remove dead-end code and tests once a path is abandoned. Negative tests for

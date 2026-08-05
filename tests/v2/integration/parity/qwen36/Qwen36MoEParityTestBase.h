@@ -148,9 +148,41 @@ namespace llaminar2::test::parity::qwen36
         int required_cpu_sockets = 0;
         int mpi_ranks = 1;
         std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
+        /**
+         * @brief Explicit typed hot-replica policy for the runner under test.
+         *
+         * Leaving this disengaged preserves defaults for unrelated fixtures.
+         * Expert-overlay policy regressions engage it so a debug-environment
+         * override cannot masquerade as the production configuration consumed
+         * by graph planning.
+         */
+        std::optional<MoEHotExpertCacheConfig> moe_hot_expert_cache;
+        std::optional<RoutedExpertPrefillRuntimeConfig> moe_routed_prefill;
         std::optional<MoERebalanceRuntimeConfig> moe_rebalance;
         std::vector<std::pair<std::string, std::string>> env_overrides;
     };
+
+    /**
+     * @brief Return whether a parity case explicitly selects current-batch LLEP.
+     *
+     * The answer comes only from routed-prefill domain policy. Durable
+     * residency maintenance mode is a separate axis and must never be used as
+     * a proxy for this workload assignment decision.
+     */
+    inline bool usesCurrentBatchLLEP(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        const auto &plan = test_case.moe_routed_expert_plan;
+        return plan &&
+               std::any_of(
+                   plan->domains.begin(),
+                   plan->domains.end(),
+                   [](const RoutedExpertDomain &domain)
+                   {
+                       return domain.routed_prefill_assignment_policy ==
+                              RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                   });
+    }
 
     inline size_t gib(size_t value)
     {
@@ -629,6 +661,11 @@ namespace llaminar2::test::parity::qwen36
         domain.participants = std::move(participants);
         domain.owner_rank = 0;
         domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+        domain.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        domain.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
         return domain;
     }
 
@@ -659,9 +696,10 @@ namespace llaminar2::test::parity::qwen36
      * helpers intentionally build one runner directly so they can drive
      * all-position verifier publication APIs without the full parity harness.
      * Those helpers still need the same continuation-domain TP context whenever
-     * the MoE overlay plan requests phase-split dense decode; otherwise the
-     * runner advertises dense_tp_decode_replicated but never materializes the
-     * replicated dense/MTP sidecar weights.
+     * the MoE overlay plan requests LocalTP dense execution. This applies both
+     * to homogeneous dense TP and to the heterogeneous policy that replicates
+     * decode on the hot domain; without the context, the runner advertises a TP
+     * policy but never materializes its dense/MTP sidecar weights.
      */
     struct MoEContinuationLocalTPHarness
     {
@@ -938,6 +976,9 @@ namespace llaminar2::test::parity::qwen36
          */
         if (test_case.moe_rebalance.has_value())
             effective_config.moe_rebalance = *test_case.moe_rebalance;
+        if (test_case.moe_routed_prefill.has_value())
+            effective_config.moe_routed_prefill =
+                *test_case.moe_routed_prefill;
         effective_config.tp_allreduce_precision_override =
             test_case.tp_allreduce_precision_override;
         if (test_case.moe_routed_expert_plan)
@@ -1016,6 +1057,8 @@ namespace llaminar2::test::parity::qwen36
             effective_config.routed_expert_compute_policy;
         rank_config.moe_hot_expert_cache =
             effective_config.moe_hot_expert_cache;
+        rank_config.moe_routed_prefill =
+            effective_config.moe_routed_prefill;
         rank_config.moe_rebalance = effective_config.moe_rebalance;
         rank_config.use_mapped_memory = effective_config.use_mapped_memory;
         rank_config.prepared_weight_store =
@@ -1062,10 +1105,11 @@ namespace llaminar2::test::parity::qwen36
         };
         /*
          * MTP verifier rows are dense decode work even when base-layer routed
-         * experts spill to a CPU cold tier.  Keep the continuation domain in
-         * the same phase-split policy used by the hot-only MTP fixtures so the
-         * ROCm hot devices own the replicated terminal dense/MTP sidecar while
-         * the CPU domain remains responsible only for cold routed expert rows.
+         * experts spill to a CPU cold tier. This genuinely heterogeneous plan
+         * uses phase-split dense execution so the ROCm hot devices own the
+         * replicated decode sidecar while the CPU domain remains responsible
+         * only for cold routed expert rows. Homogeneous hot-only plans use dense
+         * TP in both phases instead.
          */
         plan->continuation_domain_spec.setDensePolicy(
             DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
@@ -1091,8 +1135,13 @@ namespace llaminar2::test::parity::qwen36
         plan->routed_tiers = {
             routedTier("hot", kRocmHotDomain, 0, 256, gib(8)),
         };
+        /*
+         * The homogeneous target keeps the dense/shared trunk tensor parallel
+         * in both phases. MTP terminal-head mirroring is an independent policy
+         * and must not silently replicate the full dense decode graph.
+         */
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+            DenseParallelPolicy::TensorParallel);
         return plan;
     }
 
@@ -1115,8 +1164,12 @@ namespace llaminar2::test::parity::qwen36
         plan->routed_tiers = {
             routedTier("hot", kCudaHotDomain, 0, 256, gib(8)),
         };
+        /*
+         * Match the ROCm and server policy exactly: dense work remains tensor
+         * parallel while only the narrow MTP terminal projection is mirrored.
+         */
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+            DenseParallelPolicy::TensorParallel);
         return plan;
     }
 
@@ -1455,12 +1508,30 @@ namespace llaminar2::test::parity::qwen36
         config.mtp.draft_tokens = std::max(1, mtp_draft_tokens);
         config.mtp.depth_policy = mtp_depth_policy;
         config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
+        if (test_case.moe_hot_expert_cache)
+        {
+            config.moe_hot_expert_cache = *test_case.moe_hot_expert_cache;
+        }
         if (test_case.moe_rebalance)
         {
             config.moe_rebalance = *test_case.moe_rebalance;
         }
-        if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP &&
-            config.moe_rebalance.prefill_window_tokens <= 0)
+        if (test_case.moe_routed_prefill)
+        {
+            config.moe_routed_prefill = *test_case.moe_routed_prefill;
+        }
+        const bool least_loaded_prefill =
+            config.moe_routed_expert_plan &&
+            std::any_of(
+                config.moe_routed_expert_plan->domains.begin(),
+                config.moe_routed_expert_plan->domains.end(),
+                [](const RoutedExpertDomain &domain)
+                {
+                    return domain.routed_prefill_assignment_policy ==
+                           RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                });
+        if (least_loaded_prefill &&
+            config.moe_routed_prefill.assignment_window_tokens <= 0)
         {
             /*
              * Prefix-restore parity compares cache-disabled baselines with
@@ -1469,7 +1540,7 @@ namespace llaminar2::test::parity::qwen36
              * prefix-cache block size rather than letting the uncached baseline
              * use one monolithic prompt transaction.
              */
-            config.moe_rebalance.prefill_window_tokens = block_size;
+            config.moe_routed_prefill.assignment_window_tokens = block_size;
         }
 
         switch (test_case.topology)
@@ -2215,21 +2286,20 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
-     * @brief Assert that MoE rebalance counters match the mode named by a fixture.
+     * @brief Assert that expert-overlay counters match the independent fixture policies.
      *
-     * Dynamic and LLEP use different movement planners. Token parity can pass
-     * even if a planner never moved anything, so phase-split tests require
-     * non-zero mode-specific movement counters on the request that owns prefill
-     * and movement, plus zero descriptor/copy health errors on every request.
+     * Durable Dynamic maintenance and current-batch LLEP use different movement
+     * planners and do not imply one another. Token parity can pass even if the
+     * requested planner never assigned any work, so explicit-policy tests require
+     * non-zero mode-specific counters on the request that owns the transaction,
+     * plus zero descriptor/copy health errors on every request.
      *
-     * LLEP's transfer-backed prefill and the rolling decode-maintenance mover
-     * are separate device transactions. The request-boundary export therefore
-     * checks the durable placement marker published by an applied prefill
-     * movement, not one layer's transient planner status or the set of
+     * LLEP's transfer-backed prefill transaction does not mutate durable expert
+     * residency. The request-boundary export therefore checks its sticky
+     * current-batch work marker, not a rolling maintenance status or the set of
      * transfer slots that happen to remain active at request teardown. Grouped
-     * MTP must additionally execute the resident LLEP assignment kernel,
-     * proving that the published placement is consumed by the production
-     * verifier path.
+     * MTP must independently execute static-owner assignment; it must never
+     * inherit least-loaded LLEP assignment from ordinary prefill.
      *
      * A full prefix-cache hit deliberately skips prefill, and short MTP parity
      * requests can end before the next maintenance cadence.  Such restored
@@ -2253,14 +2323,7 @@ namespace llaminar2::test::parity::qwen36
         if (!test_case.moe_rebalance)
             return;
 
-        const auto mode = test_case.moe_rebalance->mode;
-        if (require_fresh_movement &&
-            mode == MoERebalanceRuntimeMode::Dynamic)
-        {
-            expectDynamicRebalancePlacementPositive(records, context);
-        }
-        else if (require_fresh_movement &&
-                 mode == MoERebalanceRuntimeMode::LLEP)
+        if (require_fresh_movement && usesCurrentBatchLLEP(test_case))
         {
             expectLLEPPrefillWorkRedistributionPositive(records, context);
             expectPerfCounterPositive(
@@ -2268,6 +2331,12 @@ namespace llaminar2::test::parity::qwen36
                 "moe_rebalance",
                 "device_rebalance_llep_resident_assignment_calls",
                 context);
+        }
+        else if (require_fresh_movement &&
+                 test_case.moe_rebalance->mode ==
+                     MoERebalanceRuntimeMode::Dynamic)
+        {
+            expectDynamicRebalancePlacementPositive(records, context);
         }
 
         for (const char *error_counter : {
@@ -2304,7 +2373,7 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
-     * @brief Prove that LLEP maintenance was selected entirely by device state.
+     * @brief Prove that Dynamic maintenance was selected entirely by device state.
      *
      * Every participant reports both counters, so summing preserves the relevant
      * inequality. A positive maintenance count proves the native IF body ran. A
@@ -2317,7 +2386,7 @@ namespace llaminar2::test::parity::qwen36
      * @param context Human-readable request label for assertion failures.
      * @param expected_draft_depth Draft depth embedded in the captured parent.
      */
-    inline void expectMoEDeviceGatedMaintenanceCadence(
+    inline void expectMoEDynamicDeviceGatedMaintenanceCadence(
         const std::vector<PerfStatRecord> &records,
         const std::string &context,
         int expected_draft_depth)
@@ -4024,6 +4093,22 @@ namespace llaminar2::test::parity::qwen36
         MoEDeviceMaintenanceCoverage maintenance_coverage =
             MoEDeviceMaintenanceCoverage::NotRequired)
     {
+        if (maintenance_coverage != MoEDeviceMaintenanceCoverage::NotRequired)
+        {
+            ASSERT_TRUE(test_case.moe_rebalance.has_value())
+                << "Device-gated maintenance coverage requires an explicit "
+                   "durable maintenance policy";
+            ASSERT_EQ(
+                test_case.moe_rebalance->mode,
+                MoERebalanceRuntimeMode::Dynamic)
+                << "Only Dynamic residency maintenance may request device-gated "
+                   "maintenance coverage; current-batch LLEP is an independent "
+                   "prefill-assignment policy";
+            ASSERT_FALSE(usesCurrentBatchLLEP(test_case))
+                << "A maintenance-cadence fixture must keep routed assignment "
+                   "static so it tests exactly one policy axis";
+        }
+
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
         ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
@@ -4179,7 +4264,7 @@ namespace llaminar2::test::parity::qwen36
             MoEDeviceMaintenanceCoverage::
                 ExecutedAndSkippedInsideCapturedLoop)
         {
-            expectMoEDeviceGatedMaintenanceCadence(
+            expectMoEDynamicDeviceGatedMaintenanceCadence(
                 first_mtp_records,
                 test_case.name + " stochastic first request",
                 requested_draft_depth);
@@ -4282,7 +4367,7 @@ namespace llaminar2::test::parity::qwen36
                 MoEDeviceMaintenanceCoverage::
                     ExecutedAndSkippedInsideCapturedLoop)
             {
-                expectMoEDeviceGatedMaintenanceCadence(
+                expectMoEDynamicDeviceGatedMaintenanceCadence(
                     restored_records,
                     test_case.name + " stochastic restored-prefix request",
                     requested_draft_depth);
@@ -4386,7 +4471,7 @@ namespace llaminar2::test::parity::qwen36
             MoEDeviceMaintenanceCoverage::
                 ExecutedAndSkippedInsideCapturedLoop)
         {
-            expectMoEDeviceGatedMaintenanceCadence(
+            expectMoEDynamicDeviceGatedMaintenanceCadence(
                 phase138_records,
                 test_case.name + " stochastic post-clearCache request",
                 requested_draft_depth);
@@ -8975,11 +9060,22 @@ namespace llaminar2::test::parity::qwen36
                 : verifier_row_count;
         config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
-        const MoERebalanceRuntimeConfig resolved_rebalance =
-            test_case.moe_rebalance.value_or(config.moe_rebalance);
+        const RoutedExpertPrefillRuntimeConfig resolved_routed_prefill =
+            test_case.moe_routed_prefill.value_or(
+                config.moe_routed_prefill);
+        const bool least_loaded_prefill =
+            test_case.moe_routed_expert_plan &&
+            std::any_of(
+                test_case.moe_routed_expert_plan->domains.begin(),
+                test_case.moe_routed_expert_plan->domains.end(),
+                [](const RoutedExpertDomain &domain)
+                {
+                    return domain.routed_prefill_assignment_policy ==
+                           RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                });
         const int stable_llep_prefill_tokens =
-            resolved_rebalance.mode == MoERebalanceRuntimeMode::LLEP
-                ? resolved_rebalance.prefill_window_tokens
+            least_loaded_prefill
+                ? resolved_routed_prefill.assignment_window_tokens
                 : 0;
         ASSERT_GE(stable_llep_prefill_tokens, 0)
             << "focused verifier proof received a negative LLEP prefill window";

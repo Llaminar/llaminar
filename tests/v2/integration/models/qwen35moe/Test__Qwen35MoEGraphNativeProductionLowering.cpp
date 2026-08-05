@@ -943,17 +943,17 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedLeastLoadedTinyPrefillUsesStaticOwnerCostGate)
     {
-        ScopedDebugEnv env({
-            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
-            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "8192"},
-        });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan->domains[0].routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        config.moe.routed_prefill_config
+            .least_loaded_min_routed_rows = 8192;
+        config.moe.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -983,7 +983,7 @@ namespace llaminar2::test
                   RoutedExpertAssignmentPolicy::StaticOwner)
             << "Tiny prefill below the LLEP routed-row gate must lower as standard "
                "apportioned-expert work instead of paying transfer-backed current-batch movement.";
-        EXPECT_FALSE(expert_stage->usesRuntimePrefillGroupingForTesting());
+        EXPECT_FALSE(expert_stage->usesRuntimeRowGroupingForTesting());
         EXPECT_FALSE(expert_stage->hasPrefillLLEPTPContextForTesting());
         EXPECT_FALSE(expert_stage->hasTransferBackedPrefillLLEPForTesting());
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
@@ -992,17 +992,17 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedLeastLoadedAssignmentIsStampedOntoFastExpertStage)
     {
-        ScopedDebugEnv env({
-            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
-            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan->domains[0].routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        config.moe.routed_prefill_config
+            .least_loaded_min_routed_rows = 0;
+        config.moe.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -1032,7 +1032,7 @@ namespace llaminar2::test
                   RoutedExpertAssignmentPolicy::LeastLoadedResident)
             << "assignment=least-loaded-resident must reach the production expert stage; otherwise "
                "the graph can silently execute StaticOwner under an LLEP label.";
-        EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting())
+        EXPECT_TRUE(expert_stage->usesRuntimeRowGroupingForTesting())
             << "LLEP prefill must use runtime grouping so the device-side "
                "route-participant assignment kernel is reachable in production graphs.";
         EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting())
@@ -1052,27 +1052,30 @@ namespace llaminar2::test
      *
      * The production LLEP movement probe deliberately sets the routed-row
      * threshold to zero and requests full compact transport. That environment
-     * must still leave MTP verifier rows resident-only: moving an expert payload
-     * in every MoE layer for a three-row verifier batch is not an economical
-     * grouped implementation. Prefix rehydration has a separate graph-build
-     * flag and is therefore unaffected by this current-batch policy assertion.
+     * must still leave MTP verifier rows on the canonical decode assignment:
+     * moving an expert payload in every MoE layer for a three-row verifier batch
+     * is not economical, and treating grouped verifier M as prefill obscures the
+     * serial-row-equivalence contract. Prefix rehydration has an independent
+     * graph-build transaction and is unaffected by this assignment assertion.
     */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPGroupedVerifierUsesLogicalPositionResidentLLEPAssignment)
+         LocalTPGroupedVerifierUsesDecodeAssignmentAndNeverPrefillLLEP)
     {
-        ScopedDebugEnv env({
-            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
-            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].routed_assignment_policy =
+        plan->domains[0].routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        plan->domains[0].routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
+        config.moe.routed_prefill_config
+            .least_loaded_min_routed_rows = 0;
         config.compute_all_position_logits = true;
-        config.moe.routed_assignment_policy =
+        config.moe.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        config.moe.routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
@@ -1125,21 +1128,15 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             expert_stage->routedExpertAssignmentPolicyForTesting(),
-            RoutedExpertAssignmentPolicy::LeastLoadedResident);
-        EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting());
-        EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting());
-        EXPECT_EQ(
-            expert_stage->prefillLLEPAssignmentModeForTesting(),
-            PrefillLLEPAssignmentMode::
-                LogicalPositionResidentOnly);
+            RoutedExpertAssignmentPolicy::StaticOwner);
+        EXPECT_TRUE(expert_stage->usesRuntimeRowGroupingForTesting())
+            << "Grouped verifier rows must use the economical grouped runtime-table kernel; "
+               "the static-owner assignment below is what keeps that kernel out of current-batch LLEP.";
+        EXPECT_FALSE(expert_stage->hasPrefillLLEPTPContextForTesting());
         EXPECT_FALSE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
-            << "Grouped verifier rows must never execute current-batch expert "
-               "payload transport, even when long-prefill full mode is enabled.";
-        EXPECT_EQ(
-            expert_stage->absolutePositionIdsDeviceForTesting(),
-            absolute_positions_device)
-            << "Resident assignment must consume the exact graph-local "
-               "position row shared with RoPE.";
+            << "Grouped verifier rows must never enter current-batch prefill "
+               "assignment or expert-payload transport, even when ordinary "
+               "prefill uses least-loaded assignment.";
         EXPECT_TRUE(
             expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
@@ -1147,18 +1144,18 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedLeastLoadedPrefillTransferWorkspacesUseBoundedRollingLanes)
     {
-        ScopedDebugEnv env({
-            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
-            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
-        });
         constexpr int kLayerCount = 3;
         auto plan = makeLocalTPApportionedHotPlan(kLayerCount);
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan->domains[0].routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan, kLayerCount);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        config.moe.routed_prefill_config
+            .least_loaded_min_routed_rows = 0;
+        config.moe.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -1303,11 +1300,13 @@ namespace llaminar2::test
     {
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan->domains[0].routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        config.moe.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -1333,7 +1332,7 @@ namespace llaminar2::test
         ASSERT_NE(expert_stage, nullptr);
         EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
                   RoutedExpertAssignmentPolicy::LeastLoadedResident);
-        EXPECT_FALSE(expert_stage->usesRuntimePrefillGroupingForTesting())
+        EXPECT_FALSE(expert_stage->usesRuntimeRowGroupingForTesting())
             << "Single-token decode uses the runtime decode table, not the multi-token prefill grouper.";
         EXPECT_TRUE(expert_stage->hasMoERuntimeTableForTesting())
             << "LLEP decode must be given the runtime placement table; without it "

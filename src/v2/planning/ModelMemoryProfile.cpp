@@ -21,6 +21,11 @@ namespace llaminar2
     namespace
     {
 
+        /** @brief Stable marker preceding every serialized memory profile. */
+        constexpr uint32_t kProfileWireMagic = 0x4C4D5032U; // "LMP2"
+        /** @brief Current profile layout, including exact MoE geometry. */
+        constexpr uint32_t kProfileWireVersion = 2U;
+
         std::string ggufTypeToString(GGUFTensorType type)
         {
             switch (type)
@@ -129,6 +134,18 @@ namespace llaminar2
         profile.n_kv_heads = static_cast<int>(model.head_count_kv);
         profile.vocab_size = static_cast<int>(model.vocab_size);
         profile.max_seq_len = static_cast<int>(model.context_length);
+        profile.expert_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_count"});
+        profile.expert_used_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_used_count"});
+        profile.expert_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_feed_forward_length"});
+        profile.expert_shared_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_shared_feed_forward_length"});
         profile.mtp_layer_count = firstPositiveMetadataInt(
             model,
             {
@@ -335,6 +352,10 @@ namespace llaminar2
         std::vector<uint8_t> buf;
         buf.reserve(4096);
 
+        // Prefix scalars with a versioned identity so stale layouts fail hard.
+        writeVal<uint32_t>(buf, kProfileWireMagic);
+        writeVal<uint32_t>(buf, kProfileWireVersion);
+
         // Scalar fields
         writeStr(buf, architecture);
         writeVal<int32_t>(buf, n_layers);
@@ -345,6 +366,10 @@ namespace llaminar2
         writeVal<int32_t>(buf, head_dim);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
+        writeVal<int32_t>(buf, expert_count);
+        writeVal<int32_t>(buf, expert_used_count);
+        writeVal<int32_t>(buf, expert_feed_forward_length);
+        writeVal<int32_t>(buf, expert_shared_feed_forward_length);
         writeVal<int32_t>(buf, mtp_layer_count);
         writeVal<int32_t>(buf, full_attention_interval);
         writeVal<int32_t>(buf, gdn_conv_kernel_size);
@@ -375,6 +400,20 @@ namespace llaminar2
         const uint8_t *ptr = data;
         const uint8_t *end = data + size;
 
+        const uint32_t magic = readVal<uint32_t>(ptr, end);
+        if (magic != kProfileWireMagic)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: invalid wire-format magic");
+        }
+        const uint32_t version = readVal<uint32_t>(ptr, end);
+        if (version != kProfileWireVersion)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: unsupported wire-format version " +
+                std::to_string(version));
+        }
+
         p.architecture = readStr(ptr, end);
         p.n_layers = readVal<int32_t>(ptr, end);
         p.d_model = readVal<int32_t>(ptr, end);
@@ -384,6 +423,10 @@ namespace llaminar2
         p.head_dim = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
+        p.expert_count = readVal<int32_t>(ptr, end);
+        p.expert_used_count = readVal<int32_t>(ptr, end);
+        p.expert_feed_forward_length = readVal<int32_t>(ptr, end);
+        p.expert_shared_feed_forward_length = readVal<int32_t>(ptr, end);
         p.mtp_layer_count = readVal<int32_t>(ptr, end);
         p.full_attention_interval = readVal<int32_t>(ptr, end);
         p.gdn_conv_kernel_size = readVal<int32_t>(ptr, end);

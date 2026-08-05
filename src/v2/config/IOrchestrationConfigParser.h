@@ -103,10 +103,9 @@ namespace llaminar2
          *   base_model_domain: rocm_hot
          *   shared_expert_domain: rocm_hot
          *   domains:
-         *     - "rocm_hot=0:rocm:0,0:rocm:1;scope=local;routed_compute=replicated;routed_phase=prefill-apportioned-decode-replicated;routed_assignment=static-owner"
+         *     - "rocm_hot=0:rocm:0,0:rocm:1;scope=local;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident"
          *   routed_tiers:
          *     - "hot@rocm_hot;priority=0"
-         *     - "cold@cpu_cold;priority=1;fallback=true"
          * ```
          *
          * @param path Path to YAML file

@@ -1101,7 +1101,7 @@ TEST_F(MoEExpertPrefillGraphCapture,
             params.force_grouped_verifier_prefill_for_decode = true;
             params.moe_runtime_table = &runtime_table;
             params.layer_idx = 0;
-            params.use_runtime_prefill_grouping = verifier_rows > 1;
+            params.use_runtime_row_grouping = verifier_rows > 1;
 
             MoEExpertComputeStage stage(params);
             EXPECT_EQ(
@@ -1174,7 +1174,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RuntimeGroupedLLEPDoesNotRequireUnusedFixed
         params.prepared_up_gemm[3] = nullptr;
         params.prepared_down_gemm[3] = nullptr;
         params.moe_runtime_table = &runtime_table;
-        params.use_runtime_prefill_grouping = true;
+        params.use_runtime_row_grouping = true;
         params.routed_assignment_policy =
             RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
@@ -1227,11 +1227,11 @@ TEST_F(MoEExpertPrefillGraphCapture, RuntimeGroupedLLEPDoesNotRequireUnusedFixed
             << " warmed LLEP runtime table is the sole placement source and must be "
                "capture-ready without an unrelated fixed-mask publication";
         const std::string readiness = stage.graphCaptureReadinessDebugString();
-        EXPECT_NE(readiness.find("route=runtime_table_prefill"), std::string::npos)
+        EXPECT_NE(readiness.find("route=runtime_table_grouped_rows"), std::string::npos)
             << backend_name;
         EXPECT_NE(readiness.find("fixed_mask_consumed=false"), std::string::npos)
             << backend_name;
-        EXPECT_NE(readiness.find("runtime_prefill_ready=true"), std::string::npos)
+        EXPECT_NE(readiness.find("runtime_row_grouping_ready=true"), std::string::npos)
             << backend_name;
     };
 

@@ -1290,10 +1290,12 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
 }
 
 /**
- * @brief Time the exact Qwen3.6 LLEP decode-maintenance controller geometry.
+ * @brief Time Qwen3.6 Dynamic maintenance with least-loaded assignment.
  *
- * This regression deliberately isolates the general LLEP controller from
- * transfer payload movement.  The serving lane replays the controller on a
+ * This regression deliberately isolates the optional
+ * Dynamic-plus-LeastLoadedResident controller from transfer payload movement.
+ * Canonical current-batch LLEP keeps durable maintenance Off. The Dynamic lane
+ * replays the controller on a
  * dedicated stream while forward graphs execute elsewhere; an accidentally
  * serialized multi-millisecond planner therefore slows every forward stage,
  * even when the grouped expert kernels themselves are economical.
@@ -1302,7 +1304,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
  * uploaded before the timed region.  The timed region contains controller
  * launches only, with one event synchronization after the complete batch.
  */
-TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
+TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36DynamicLeastLoadedMaintenanceControllerEconomy)
 {
 #ifndef HAVE_ROCM
     GTEST_SKIP() << "ROCm support not compiled";
@@ -1318,15 +1320,15 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     const uint32_t layer_wave_count = static_cast<uint32_t>(
         std::min(
             4,
-            envInt("LLAMINAR_MOE_LLEP_MAINT_LAYER_WAVE", 4)));
+            envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_LAYER_WAVE", 4)));
     const DeviceMoERebalanceConfig config =
-        llepMaintenanceConfig(shape, num_layers, layer_wave_count);
+        dynamicLeastLoadedMaintenanceConfig(shape, num_layers, layer_wave_count);
     const uint32_t gathered_histogram_count =
         config.participant_count * config.layer_wave_count * config.num_experts;
     const int warmups =
-        envInt("LLAMINAR_MOE_LLEP_MAINT_WARMUPS", 2);
+        envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_WARMUPS", 2);
     const int iterations =
-        envInt("LLAMINAR_MOE_LLEP_MAINT_ITERS", 20);
+        envInt("LLAMINAR_MOE_DYNAMIC_LEAST_LOADED_MAINT_ITERS", 20);
 
     ROCmHarness harness(shape);
     harness.prepare(/*all_participants_resident=*/false,
@@ -1519,7 +1521,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
     const auto plan = harness.copyPlan(d_plan, plan_count);
     printTiming(
         "rocm",
-        "qwen36_llep_maintenance_controller",
+        "qwen36_dynamic_least_loaded_maintenance_controller",
         shape,
         iterations,
         elapsed_ms * 1000.0f / static_cast<float>(iterations),

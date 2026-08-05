@@ -4773,7 +4773,7 @@ namespace llaminar2
             graph_config.dense_tp_enabled &&
             graph_config.dense_tp_decode_mirrored_embedding;
         const bool requires_mirrored_mtp_head =
-            graph_config.mtp.mirror_full_head_for_local_tp &&
+            mtpTerminalHeadIsMirrored(graph_config.mtp.terminal_head_policy) &&
             graph_config.lm_head_column_parallel &&
             graph_config.tp_ctx &&
             graph_config.tp_ctx->isLocal();
@@ -6495,7 +6495,7 @@ namespace llaminar2
          * as a local shard would make RankOrchestrator gather or offset logits
          * that are already serial-decode equivalent.
          */
-        if (config.mtp.mirror_full_head_for_local_tp &&
+        if (mtpTerminalHeadIsMirrored(config.mtp.terminal_head_policy) &&
             config.tp_ctx &&
             config.tp_ctx->isLocal())
         {
@@ -6526,7 +6526,7 @@ namespace llaminar2
             config.dense_tp_decode_replicated)
             return false;
 
-        if (config.mtp.mirror_full_head_for_local_tp &&
+        if (mtpTerminalHeadIsMirrored(config.mtp.terminal_head_policy) &&
             config.tp_ctx &&
             config.tp_ctx->isLocal())
         {
@@ -8541,7 +8541,7 @@ namespace llaminar2
         }
 
         /*
-         * Dynamic/LLEP maintenance is a child transaction of the enclosing
+         * Dynamic residency maintenance is a child transaction of the enclosing
          * LocalTP graph family, not an independently communicating workload.
          * Every producer and consumer transition is represented by a typed
          * device event, so the maintenance stage must use the family's already
@@ -31775,7 +31775,7 @@ namespace llaminar2
             return false;
 
         const auto &config = graph_builder_->config();
-        return config.mtp.mirror_full_head_for_local_tp &&
+        return mtpTerminalHeadIsMirrored(config.mtp.terminal_head_policy) &&
                config.lm_head_column_parallel &&
                config.tp_ctx &&
                config.tp_ctx->isLocal();

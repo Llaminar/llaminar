@@ -140,7 +140,10 @@ namespace llaminar2
         /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
-        /// Decode histogram / dynamic rebalance settings.
+        /// Ordinary prefill assignment economy and graph-window policy.
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
+
+        /// Durable expert-residency observation and maintenance settings.
         MoERebalanceRuntimeConfig moe_rebalance;
 
         // Use mapped memory for GPU tensor allocation (zero-copy host access)
@@ -232,6 +235,7 @@ namespace llaminar2
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
             config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
             config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+            config.moe_routed_prefill = plan.runtime.moe_routed_prefill;
             config.moe_rebalance = plan.runtime.moe_rebalance;
             config.prefix_cache = plan.runtime.prefix_cache;
             config.mtp = plan.runtime.mtp;

@@ -253,6 +253,7 @@ namespace llaminar2
                 config_.fused_attention_backend,
                 config_.routed_expert_compute_policy,
                 config_.moe_hot_expert_cache,
+                config_.moe_routed_prefill,
                 config_.moe_rebalance,
                 config_.prefix_cache,
                 config_.mtp,
@@ -267,6 +268,7 @@ namespace llaminar2
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
             base_runner_cfg.routed_expert_compute_policy = runtime_cfg.routed_expert_compute_policy;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
+            base_runner_cfg.moe_routed_prefill = runtime_cfg.moe_routed_prefill;
             base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;
             base_runner_cfg.prefix_cache = runtime_cfg.prefix_cache;
             base_runner_cfg.mtp = runtime_cfg.mtp;

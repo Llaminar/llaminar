@@ -1,3 +1,14 @@
+/**
+ * @file Test__MoERoutedExpertPlacementPlan.cpp
+ * @brief Unit coverage for declarative routed-expert placement policy.
+ *
+ * These tests keep routed weight placement, phase scheduling, decode row
+ * assignment, and prefill row assignment independent.  That distinction is
+ * essential for the economical LLEP lane: tiny serial/grouped decode stays on
+ * canonical expert owners while ordinary prefill may distribute the current
+ * batch by least-loaded complete-expert residency.
+ */
+
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "models/GraphTypes.h"
 
@@ -111,11 +122,16 @@ namespace llaminar2::test
         EXPECT_TRUE(plan.isTieredOverlay());
     }
 
-    TEST(Test__MoERoutedExpertPlacementPlan, AcceptsLeastLoadedAssignmentOnApportionedDomainScopedTPDomains)
+    TEST(Test__MoERoutedExpertPlacementPlan, AcceptsIndependentLeastLoadedAssignmentsOnApportionedDomainScopedTPDomains)
     {
         auto plan = validTwoTierPlan();
         for (auto &domain : plan.domains)
-            domain.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        {
+            domain.routed_decode_assignment_policy =
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            domain.routed_prefill_assignment_policy =
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        }
 
         const auto result = validateMoERoutedExpertPlacementPlan(plan, twoLayerFourExpertOptions());
 
@@ -128,7 +144,9 @@ namespace llaminar2::test
         domain.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
         domain.routed_phase_policy =
             RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
-        domain.routed_assignment_policy =
+        domain.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        domain.routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         EXPECT_TRUE(domain.usesParticipantAssignedPrefill());
@@ -145,32 +163,69 @@ namespace llaminar2::test
         EXPECT_FALSE(domain.supportsLeastLoadedResidentAssignment());
     }
 
-    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedAssignmentOnSingleParticipantDomains)
+    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedPrefillAssignmentOnSingleParticipantDomains)
     {
         auto plan = validTwoTierPlan();
         plan.domains[0] = singleGpuDomain("gpu_hot");
-        plan.domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan.domains[0].routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         const auto result = validateMoERoutedExpertPlacementPlan(plan, twoLayerFourExpertOptions());
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_assignment=least-loaded-resident but is not a multi-participant collective domain"));
+            "routed_prefill_assignment=least-loaded-resident but is not a multi-participant collective domain"));
     }
 
-    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedAssignmentOnNonApportionedDomains)
+    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedDecodeAssignmentOnSingleParticipantDomains)
+    {
+        auto plan = validTwoTierPlan();
+        plan.domains[0] = singleGpuDomain("gpu_hot");
+        plan.domains[0].routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        const auto result = validateMoERoutedExpertPlacementPlan(
+            plan,
+            twoLayerFourExpertOptions());
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(hasErrorContaining(
+            result,
+            "routed_decode_assignment=least-loaded-resident but is not a multi-participant collective domain"));
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedPrefillAssignmentWhenWorkIsNotParticipantAssigned)
     {
         auto plan = validTwoTierPlan();
         plan.domains[0].routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
-        plan.domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+        plan.domains[0].routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         const auto result = validateMoERoutedExpertPlacementPlan(plan, twoLayerFourExpertOptions());
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(
             result,
-            "routed_assignment=least-loaded-resident but does not use routed_compute=apportioned"));
+            "routed_prefill_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlan, RejectsLeastLoadedDecodeAssignmentWhenWorkIsNotParticipantAssigned)
+    {
+        auto plan = validTwoTierPlan();
+        plan.domains[0].routed_compute_policy =
+            RoutedExpertComputePolicy::TensorSharded;
+        plan.domains[0].routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        const auto result = validateMoERoutedExpertPlacementPlan(
+            plan,
+            twoLayerFourExpertOptions());
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(hasErrorContaining(
+            result,
+            "routed_decode_assignment=least-loaded-resident but that workload does not use participant-assigned complete experts"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, AcceptsValidThreeTierTieredOverlayPlan)

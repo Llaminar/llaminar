@@ -2276,7 +2276,7 @@ namespace
      * clear, the mandatory transaction commits but its conditional tail leaves
      * the trace untouched. After resetting only device contents and setting the
      * predicate word, the identical executable must run the tail exactly once.
-     * This is the focused contract used to omit non-due LLEP maintenance and
+     * This is the focused contract used to omit non-due Dynamic maintenance and
      * its collective without host scheduling or graph recapture. Running the
      * same contract through WHILE and SWITCH/WHILE also proves fixed and
      * dynamic depth share one fragment-execution policy.

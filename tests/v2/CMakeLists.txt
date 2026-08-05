@@ -7254,20 +7254,20 @@ if(ZLIB_FOUND)
         Dynamic LLEP PyTorch GoldenReference FullModel
     )
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES
-        PrefillParity          CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
-        PrefillParity          ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
-        DecodeParity           CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
-        DecodeParity           ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
-        PrefillParity          CUDA2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_FP16Transport
-        PrefillParity          ROCm2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_FP16Transport
-        DecodeParity           CUDA2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_FP16Transport
-        DecodeParity           ROCm2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_FP16Transport
-        LongContextDecodeParity CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport
-        LongContextDecodeParity ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport
-        LongContextDecodeParity CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport
-        LongContextDecodeParity ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport
-        SnapshotInfrastructure CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
-        SnapshotInfrastructure ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
+        PrefillParity          CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
+        PrefillParity          ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
+        DecodeParity           CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
+        DecodeParity           ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
+        PrefillParity          CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
+        PrefillParity          ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
+        DecodeParity           CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
+        DecodeParity           ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
+        LongContextDecodeParity CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport
+        LongContextDecodeParity ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport
+        LongContextDecodeParity CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport
+        LongContextDecodeParity ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport
+        SnapshotInfrastructure CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
+        SnapshotInfrastructure ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
     )
     list(LENGTH QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT)
     math(EXPR QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST "${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT} - 1")

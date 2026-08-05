@@ -80,7 +80,13 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
     EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
-    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 0);
+    EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 0);
+    EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 8192u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 1u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 1u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_numerator, 13u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_denominator, 10u);
+    EXPECT_TRUE(config.moe_routed_prefill.llep_enable_balanced_skip);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 0u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor,
               moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor);
@@ -557,6 +563,7 @@ TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyKeepsAllAxesIndependent)
     const auto policy = makeMoEExecutionPolicy(
         DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
         RoutedExpertComputePolicy::Apportioned,
+        RoutedExpertAssignmentPolicy::StaticOwner,
         RoutedExpertAssignmentPolicy::LeastLoadedResident);
 
     EXPECT_EQ(
@@ -565,7 +572,10 @@ TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyKeepsAllAxesIndependent)
     EXPECT_EQ(policy.routed_compute, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(policy.routed_phase, RoutedExpertPhasePolicy::Uniform);
     EXPECT_EQ(
-        policy.routed_assignment,
+        policy.routed_decode_assignment,
+        RoutedExpertAssignmentPolicy::StaticOwner);
+    EXPECT_EQ(
+        policy.routed_prefill_assignment,
         RoutedExpertAssignmentPolicy::LeastLoadedResident);
 }
 
@@ -574,13 +584,15 @@ TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyDescriptionNamesEveryAxi
     const auto policy = makeMoEExecutionPolicy(
         DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
         RoutedExpertComputePolicy::TensorSharded,
+        RoutedExpertAssignmentPolicy::StaticOwner,
         RoutedExpertAssignmentPolicy::StaticOwner);
 
     EXPECT_EQ(
         describeMoEExecutionPolicy(policy),
         "dense=tensor-parallel-decode-mirrored-embedding,"
         "routed_compute=tensor-sharded,routed_phase=uniform,"
-        "routed_assignment=static-owner");
+        "routed_decode_assignment=static-owner,"
+        "routed_prefill_assignment=static-owner");
 }
 
 TEST(Test__OrchestrationConfigParser, AmbiguousCompositePolicyAliasesAreRejected)
@@ -607,7 +619,8 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesPhaseSplitIndependen
         "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;"
         "routed_compute=replicated;"
         "routed_phase=prefill-apportioned-decode-replicated;"
-        "routed_assignment=static-owner;owner=0",
+        "routed_decode_assignment=static-owner;"
+        "routed_prefill_assignment=static-owner;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
@@ -623,7 +636,10 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesPhaseSplitIndependen
         domain.routed_phase_policy,
         RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated);
     EXPECT_EQ(
-        domain.routed_assignment_policy,
+        domain.routed_decode_assignment_policy,
+        RoutedExpertAssignmentPolicy::StaticOwner);
+    EXPECT_EQ(
+        domain.routed_prefill_assignment_policy,
         RoutedExpertAssignmentPolicy::StaticOwner);
 
     const auto inventory = config.executionDomainDefinitions();
@@ -651,14 +667,14 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsPhaseSplitWithoutRe
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
 
-TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesLeastLoadedAssignmentSeparatelyFromCompute)
+TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesDecodeAndPrefillAssignmentIndependently)
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_assignment=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -667,13 +683,38 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesLeastLoadedAssignmen
     ASSERT_EQ(config.moe_routed_expert_plan->domains.size(), 1u);
     EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_compute_policy,
               RoutedExpertComputePolicy::Apportioned);
-    EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_assignment_policy,
+    EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_decode_assignment_policy,
+              RoutedExpertAssignmentPolicy::StaticOwner);
+    EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_prefill_assignment_policy,
               RoutedExpertAssignmentPolicy::LeastLoadedResident);
 
     const auto inventory = config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 1u);
     EXPECT_EQ(inventory[0].routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
-    EXPECT_EQ(inventory[0].routed_assignment_policy, RoutedExpertAssignmentPolicy::LeastLoadedResident);
+    EXPECT_EQ(inventory[0].routed_decode_assignment_policy,
+              RoutedExpertAssignmentPolicy::StaticOwner);
+    EXPECT_EQ(inventory[0].routed_prefill_assignment_policy,
+              RoutedExpertAssignmentPolicy::LeastLoadedResident);
+}
+
+TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsAmbiguousAllWorkAssignment)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-routed-expert-placement", "tiered-overlay",
+        "--moe-routed-expert-continuation-domain", "cuda_hot",
+        "--moe-routed-expert-shared-domain", "cuda_hot",
+        "--moe-routed-expert-domain",
+        "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;"
+        "routed_compute=apportioned;"
+        "routed_assignment=least-loaded-resident;owner=0",
+        "--moe-routed-expert-tier",
+        "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+
+    EXPECT_THROW(
+        parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComputeKind)
@@ -1077,16 +1118,25 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)
 moe:
     routed_expert_compute_policy: replicated
     hot_expert_cache: 12
-    rebalance: observe
-    rebalance_window: 64
-    rebalance_max_window: 512
-    rebalance_window_growth: 2.5
-    rebalance_prefill_window_tokens: 96
+    residency_maintenance: observe
+    residency_maintenance_window: 64
+    residency_maintenance_max_window: 512
+    residency_maintenance_window_growth: 2.5
+    routed_prefill_assignment_window_tokens: 96
+    routed_prefill_least_loaded_min_routed_rows: 2048
+    routed_prefill_llep_alpha_numerator: 3
+    routed_prefill_llep_alpha_denominator: 4
+    routed_prefill_llep_lambda_numerator: 7
+    routed_prefill_llep_lambda_denominator: 6
+    routed_prefill_llep_enable_balanced_skip: false
     dynamic_imbalance_threshold_permille: 1125
     dynamic_min_improvement_permille: 20
     dynamic_max_swaps_per_layer: 6
     dynamic_max_plan_entries_per_wave: 24
     dynamic_min_window_activations: 32
+    device_rebalance_maintenance_slack_tokens: 3
+    device_rebalance_min_maintenance_period_tokens: 67
+    device_rebalance_initial_maintenance_period_tokens: 35
     device_min_load_spread_improvement: 44
     device_min_load_spread_improvement_divisor: 15
     device_min_wave_spread_improvement_per_payload_slot: 192
@@ -1106,12 +1156,21 @@ moe:
     EXPECT_EQ(config.moe_rebalance.window_size, 64);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
-    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 96);
+    EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 96);
+    EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 2048u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 3u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 4u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_numerator, 7u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_denominator, 6u);
+    EXPECT_FALSE(config.moe_routed_prefill.llep_enable_balanced_skip);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1125u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 20u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 6u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 24u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 32u);
+    EXPECT_EQ(config.moe_rebalance.device_maintenance_slack_tokens, 3);
+    EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens, 67);
+    EXPECT_EQ(config.moe_rebalance.device_initial_maintenance_period_tokens, 35);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 44u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 15u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 192u);
@@ -1128,16 +1187,25 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_MoEFlatKeys)
     std::string yaml = R"(
 routed_expert_compute_policy: apportioned
 moe_hot_expert_cache: 25%
-moe_rebalance: off
-moe_rebalance_window: 128
-moe_rebalance_max_window: 1024
-moe_rebalance_window_growth: 1.25
-moe_rebalance_prefill_window_tokens: 192
+moe_residency_maintenance: off
+moe_residency_maintenance_window: 128
+moe_residency_maintenance_max_window: 1024
+moe_residency_maintenance_window_growth: 1.25
+moe_routed_prefill_assignment_window_tokens: 192
+moe_routed_prefill_least_loaded_min_routed_rows: 4096
+moe_routed_prefill_llep_alpha_numerator: 5
+moe_routed_prefill_llep_alpha_denominator: 8
+moe_routed_prefill_llep_lambda_numerator: 9
+moe_routed_prefill_llep_lambda_denominator: 7
+moe_routed_prefill_llep_enable_balanced_skip: false
 moe_dynamic_imbalance_threshold_permille: 1050
 moe_dynamic_min_improvement_permille: 0
 moe_dynamic_max_swaps_per_layer: 8
 moe_dynamic_max_plan_entries_per_wave: 32
 moe_dynamic_min_window_activations: 16
+moe_device_rebalance_maintenance_slack_tokens: 5
+moe_device_rebalance_min_maintenance_period_tokens: 133
+moe_device_rebalance_initial_maintenance_period_tokens: 69
 moe_device_rebalance_min_load_spread_improvement: 64
 moe_device_rebalance_min_load_spread_improvement_divisor: 20
 moe_device_rebalance_min_wave_spread_improvement_per_payload_slot: 256
@@ -1157,12 +1225,21 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
-    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 192);
+    EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 192);
+    EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 4096u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 5u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 8u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_numerator, 9u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_denominator, 7u);
+    EXPECT_FALSE(config.moe_routed_prefill.llep_enable_balanced_skip);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1050u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 0u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 8u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 32u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 16u);
+    EXPECT_EQ(config.moe_rebalance.device_maintenance_slack_tokens, 5);
+    EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens, 133);
+    EXPECT_EQ(config.moe_rebalance.device_initial_maintenance_period_tokens, 69);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 64u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 20u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 256u);
@@ -1183,7 +1260,7 @@ moe_routed_expert_placement:
     base_model_domain: gpu_hot
     shared_expert_domain: gpu_hot
     domains:
-        - "gpu_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_assignment=static-owner;owner=0"
+        - "gpu_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
     routed_tiers:
         - "hot@gpu_hot;priority=0;fallback=true"
     )";
@@ -1779,6 +1856,16 @@ TEST(Test__OrchestrationConfigParser, RejectsObsoleteRoutedExpertCliNamesAndValu
     EXPECT_THROW(
         parser.parseArgs(old_value.argc(), old_value.argv()),
         std::invalid_argument);
+
+    ArgvHelper old_llep_maintenance_option{
+        "llaminar2", "--moe-device-llep-alpha-numerator", "1"};
+    EXPECT_THROW(
+        parser.parseArgs(
+            old_llep_maintenance_option.argc(),
+            old_llep_maintenance_option.argv()),
+        std::invalid_argument)
+        << "Current-batch LLEP parameters must not be accepted through the "
+           "durable residency-maintenance namespace.";
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_MoEHotExpertCache)
@@ -1817,16 +1904,25 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoEHotExpertCache)
 TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
 {
     ArgvHelper args{"llaminar2",
-                    "--moe-rebalance", "observe",
-                    "--moe-rebalance-window", "128",
-                    "--moe-rebalance-max-window", "2048",
-                    "--moe-rebalance-window-growth", "2.0",
-                    "--moe-rebalance-prefill-window", "384",
+                    "--moe-residency-maintenance", "observe",
+                    "--moe-residency-maintenance-window", "128",
+                    "--moe-residency-maintenance-max-window", "2048",
+                    "--moe-residency-maintenance-window-growth", "2.0",
+                    "--moe-routed-prefill-assignment-window", "384",
+                    "--moe-routed-prefill-least-loaded-min-routed-rows", "1024",
+                    "--moe-routed-prefill-llep-alpha-numerator", "2",
+                    "--moe-routed-prefill-llep-alpha-denominator", "3",
+                    "--moe-routed-prefill-llep-lambda-numerator", "11",
+                    "--moe-routed-prefill-llep-lambda-denominator", "8",
+                    "--moe-routed-prefill-llep-disable-balanced-skip",
                     "--moe-dynamic-imbalance-threshold-permille", "1100",
                     "--moe-dynamic-min-improvement-permille", "10",
                     "--moe-dynamic-max-swaps-per-layer", "7",
                     "--moe-dynamic-max-plan-entries-per-wave", "28",
                     "--moe-dynamic-min-window-activations", "48",
+                    "--moe-device-rebalance-maintenance-slack-tokens", "2",
+                    "--moe-device-rebalance-min-maintenance-period-tokens", "130",
+                    "--moe-device-rebalance-initial-maintenance-period-tokens", "66",
                     "--moe-device-rebalance-min-load-spread-improvement", "72",
                     "--moe-device-rebalance-min-load-spread-improvement-divisor", "25",
                     "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot", "144",
@@ -1842,12 +1938,21 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
-    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 384);
+    EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 384);
+    EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 1024u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 2u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 3u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_numerator, 11u);
+    EXPECT_EQ(config.moe_routed_prefill.llep_lambda_denominator, 8u);
+    EXPECT_FALSE(config.moe_routed_prefill.llep_enable_balanced_skip);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1100u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 10u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 7u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 28u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 48u);
+    EXPECT_EQ(config.moe_rebalance.device_maintenance_slack_tokens, 2);
+    EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens, 130);
+    EXPECT_EQ(config.moe_rebalance.device_initial_maintenance_period_tokens, 66);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 72u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 25u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 144u);
@@ -1857,15 +1962,47 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
-TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalanceLLEP)
+TEST(Test__OrchestrationConfigParser,
+     ParseArgs_LLEPIsNotAResidencyMaintenanceMode)
 {
-    ArgvHelper args{"llaminar2", "--moe-rebalance", "llep"};
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-residency-maintenance",
+        "llep"};
     OrchestrationConfigParser parser;
 
-    auto config = parser.parseArgs(args.argc(), args.argv());
+    EXPECT_THROW(
+        parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument)
+        << "Current-batch LLEP belongs to routed_prefill_assignment, not "
+           "durable residency maintenance.";
+}
 
-    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::LLEP);
-    EXPECT_STREQ(moeRebalanceRuntimeModeToString(config.moe_rebalance.mode), "llep");
+TEST(Test__OrchestrationConfigParser,
+     Validate_RejectsUndefinedProgrammaticLLEPRatios)
+{
+    OrchestrationConfig config;
+    config.moe_routed_prefill.llep_alpha_numerator = 0;
+    config.moe_routed_prefill.llep_alpha_denominator = 0;
+    config.moe_routed_prefill.llep_lambda_numerator = 0;
+    config.moe_routed_prefill.llep_lambda_denominator = 0;
+
+    const auto errors = config.validate();
+    const auto contains = [&](const std::string &needle)
+    {
+        return std::any_of(
+            errors.begin(),
+            errors.end(),
+            [&](const std::string &error)
+            {
+                return error.find(needle) != std::string::npos;
+            });
+    };
+
+    EXPECT_TRUE(contains("LLEP alpha numerator must be > 0"));
+    EXPECT_TRUE(contains("LLEP alpha denominator must be > 0"));
+    EXPECT_TRUE(contains("LLEP lambda numerator must be > 0"));
+    EXPECT_TRUE(contains("LLEP lambda denominator must be > 0"));
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
@@ -1886,12 +2023,31 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }
     {
-        ArgvHelper args{"llaminar2", "--moe-rebalance", "mystery"};
+        ArgvHelper args{
+            "llaminar2",
+            "--moe-residency-maintenance",
+            "mystery"};
         OrchestrationConfigParser parser;
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }
     {
         ArgvHelper args{"llaminar2", "--moe-dynamic-max-swaps-per-layer", "-1"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{
+            "llaminar2",
+            "--moe-device-rebalance-maintenance-slack-tokens",
+            "-1"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{
+            "llaminar2",
+            "--moe-device-rebalance-min-maintenance-period-tokens",
+            "2147483648"};
         OrchestrationConfigParser parser;
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }

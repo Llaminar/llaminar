@@ -745,6 +745,7 @@ namespace llaminar2
         config.mtp = plan.runtime.mtp;
         config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
         config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+        config.moe_routed_prefill = plan.runtime.moe_routed_prefill;
         config.moe_rebalance = plan.runtime.moe_rebalance;
 
         if (plan.usesLocalPP())
@@ -1376,6 +1377,7 @@ namespace llaminar2
                                                  runner_config.mtp = config_.mtp;
                                                  runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
                                                  runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+                                                 runner_config.moe_routed_prefill = config_.moe_routed_prefill;
                                                  runner_config.moe_rebalance = config_.moe_rebalance;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
@@ -1661,6 +1663,7 @@ namespace llaminar2
             runner_config.mtp = config_.mtp;
             runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
             runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+            runner_config.moe_routed_prefill = config_.moe_routed_prefill;
             runner_config.moe_rebalance = config_.moe_rebalance;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
@@ -1705,6 +1708,7 @@ namespace llaminar2
                 nested_config.mtp = config_.mtp;
                 nested_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
                 nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+                nested_config.moe_routed_prefill = config_.moe_routed_prefill;
                 nested_config.moe_rebalance = config_.moe_rebalance;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;

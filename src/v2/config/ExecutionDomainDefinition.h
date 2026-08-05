@@ -83,7 +83,9 @@ namespace llaminar2
             RoutedExpertComputePolicy::Unspecified;
         RoutedExpertPhasePolicy routed_phase_policy =
             RoutedExpertPhasePolicy::Unspecified;
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::Unspecified;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::Unspecified;
 
         /**
@@ -119,10 +121,17 @@ namespace llaminar2
         {
             return routed_phase_policy != RoutedExpertPhasePolicy::Unspecified;
         }
-        /** @brief Return true when routed-row assignment was stated explicitly. */
-        bool hasRoutedExpertAssignmentPolicy() const
+        /** @brief Return true when decode row assignment was stated explicitly. */
+        bool hasRoutedExpertDecodeAssignmentPolicy() const
         {
-            return routed_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified;
+            return routed_decode_assignment_policy !=
+                   RoutedExpertAssignmentPolicy::Unspecified;
+        }
+        /** @brief Return true when prefill row assignment was stated explicitly. */
+        bool hasRoutedExpertPrefillAssignmentPolicy() const
+        {
+            return routed_prefill_assignment_policy !=
+                   RoutedExpertAssignmentPolicy::Unspecified;
         }
         /** @brief Return true when the domain contains more than one participant. */
         bool hasMultipleParticipants() const { return participants.size() > 1; }

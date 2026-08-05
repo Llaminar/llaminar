@@ -114,31 +114,31 @@ add_suite() {
     cmd+=(--suite "$1")
 }
 
-add_qwen36_moe_rebalance_prefix_mtp_suite() {
+add_qwen36_moe_policy_prefix_mtp_suite() {
     local model="$1"
     local accelerator="$2"
     local collective_backend="$3"
-    local rebalance_mode="$4"
+    local policy="$4"
     local domain_name="qwen36_moe_${accelerator}_hot"
     local tp_devices="${accelerator}:0,${accelerator}:1"
     local feature_flags
-    local routed_compute
-    local routed_phase
-    local routed_assignment
+    local routed_prefill_assignment
+    local residency_maintenance
+    local policy_window_flags
 
-    case "$rebalance_mode" in
+    case "$policy" in
         dynamic)
-            routed_compute="apportioned"
-            routed_phase="uniform"
-            routed_assignment="static-owner"
+            routed_prefill_assignment="static-owner"
+            residency_maintenance="dynamic"
+            policy_window_flags="--moe-residency-maintenance-window 4 --moe-residency-maintenance-max-window 4 --moe-residency-maintenance-window-growth 1"
             ;;
         llep)
-            routed_compute="replicated"
-            routed_phase="prefill-apportioned-decode-replicated"
-            routed_assignment="least-loaded-resident"
+            routed_prefill_assignment="least-loaded-resident"
+            residency_maintenance="off"
+            policy_window_flags="--moe-routed-prefill-assignment-window 4"
             ;;
         *)
-            die "unsupported Qwen3.6 MoE rebalance mode '$rebalance_mode'"
+            die "unsupported Qwen3.6 MoE execution policy '$policy'"
             ;;
     esac
 
@@ -148,17 +148,18 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     feature_flags+=" --mtp-depth-policy dynamic --mtp-depth-window 4"
     feature_flags+=" --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1"
     feature_flags+=" --mtp-verify-mode speculative-sampling"
+    feature_flags+=" --mtp-terminal-head-policy mirrored-full-vocabulary"
     feature_flags+=" --moe-routed-expert-placement tiered-overlay"
     feature_flags+=" --moe-routed-expert-continuation-domain ${domain_name}"
     feature_flags+=" --moe-routed-expert-base-model-domain ${domain_name}"
     feature_flags+=" --moe-routed-expert-shared-domain ${domain_name}"
     feature_flags+=" --moe-routed-expert-residency static-by-id"
-    feature_flags+=" --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated"
-    feature_flags+=" --moe-routed-expert-domain ${domain_name}=${tp_devices};scope=local;backend=${collective_backend};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_assignment=${routed_assignment};owner=0"
+    feature_flags+=" --moe-continuation-dense-policy tensor-parallel"
+    feature_flags+=" --moe-routed-expert-domain ${domain_name}=${tp_devices};scope=local;backend=${collective_backend};routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=${routed_prefill_assignment};owner=0"
     feature_flags+=" --moe-routed-expert-tier hot@${domain_name};priority=0;max-experts-per-layer=256;memory-mb=8192"
-    feature_flags+=" --moe-rebalance ${rebalance_mode}"
+    feature_flags+=" --moe-residency-maintenance ${residency_maintenance}"
     feature_flags+=" --moe-hot-expert-cache off"
-    feature_flags+=" --moe-rebalance-window 4 --moe-rebalance-max-window 4 --moe-rebalance-window-growth 1"
+    feature_flags+=" ${policy_window_flags}"
     feature_flags+=" --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0"
     feature_flags+=" --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20"
     feature_flags+=" --moe-dynamic-min-window-activations 0"
@@ -168,10 +169,10 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     feature_flags+=" --moe-device-rebalance-min-foreign-rows-per-transfer 0"
     feature_flags+=" --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0"
     feature_flags+=" --moe-device-rebalance-max-post-wave-load-spread-permille 1000"
-    feature_flags+=" --moe-device-llep-alpha-numerator 1 --moe-device-llep-alpha-denominator 2"
-    feature_flags+=" --moe-device-llep-disable-balanced-skip --moe-release-raw-expert-weights"
+    feature_flags+=" --moe-routed-prefill-llep-alpha-numerator 1 --moe-routed-prefill-llep-alpha-denominator 2"
+    feature_flags+=" --moe-routed-prefill-llep-disable-balanced-skip --moe-release-raw-expert-weights"
 
-    add_suite "${model}|tp|64|${feature_flags}|qwen36-moe-${rebalance_mode}-prefix-mtp-stochastic-d4to15-${accelerator}2tp-full|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe"
+    add_suite "${model}|tp|64|${feature_flags}|qwen36-moe-${policy}-prefix-mtp-stochastic-d4to15-${accelerator}2tp-full|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe"
 }
 
 cmd=(
@@ -233,9 +234,9 @@ case "$variant" in
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|cuda:0|200|--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy|qwen36-moe-mtp-cuda-full|no-long-context"
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|tp|200|--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto --prefix-cache-moe-policy placement-fingerprint --tp-devices cuda:0,cuda:1|qwen36-moe-prefix-cuda2tp-full|no-long-context,no-prefill-graph-buckets"
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|tp|200|--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy --tp-devices cuda:0,cuda:1|qwen36-moe-mtp-cuda2tp-full|no-long-context,no-prefill-graph-buckets"
-        add_qwen36_moe_rebalance_prefix_mtp_suite \
+        add_qwen36_moe_policy_prefix_mtp_suite \
             "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)" cuda nccl dynamic
-        add_qwen36_moe_rebalance_prefix_mtp_suite \
+        add_qwen36_moe_policy_prefix_mtp_suite \
             "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)" cuda nccl llep
         ;;
     rocm)
@@ -260,9 +261,9 @@ case "$variant" in
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|tp|200|--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy --tp-devices rocm:0,rocm:1|qwen36-moe-mtp-rocm2tp-full|no-long-context,no-prefill-graph-buckets"
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|tp|200|--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto --prefix-cache-moe-policy placement-fingerprint --tp-devices rocm:0,rocm:1,rocm:2,rocm:3|qwen36-moe-prefix-rocm4tp-full|no-long-context,no-prefill-graph-buckets"
         add_suite "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)|tp|200|--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy --tp-devices rocm:0,rocm:1,rocm:2,rocm:3|qwen36-moe-mtp-rocm4tp-full|no-long-context,no-prefill-graph-buckets"
-        add_qwen36_moe_rebalance_prefix_mtp_suite \
+        add_qwen36_moe_policy_prefix_mtp_suite \
             "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)" rocm rccl dynamic
-        add_qwen36_moe_rebalance_prefix_mtp_suite \
+        add_qwen36_moe_policy_prefix_mtp_suite \
             "$(model_path Qwen3.6-35B-A3B-UD-IQ3_S.gguf)" rocm rccl llep
         ;;
     hybrid)

@@ -584,9 +584,12 @@ namespace llaminar2
             RoutedExpertPhasePolicy routed_phase_policy =
                 RoutedExpertPhasePolicy::Uniform;
 
-            /// Explicit semantic policy for assigning router-selected rows to
-            /// participants that can execute the selected routed expert.
-            RoutedExpertAssignmentPolicy routed_assignment_policy =
+            /// M=1 decode and grouped-verifier row assignment policy.
+            RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
+
+            /// Ordinary prefill row assignment policy.
+            RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
 
             /// Explicit, non-combinatorial view of all MoE execution axes.
@@ -606,7 +609,10 @@ namespace llaminar2
             ExpertReplicaPolicy expert_replica_policy =
                 ExpertReplicaPolicy::HotExpertReplicaCache;
 
-            /// Runtime rebalance config carried for diagnostics and controller setup.
+            /// Ordinary prefill assignment economy and graph-window policy.
+            RoutedExpertPrefillRuntimeConfig routed_prefill_config;
+
+            /// Durable residency-maintenance controller configuration.
             MoERebalanceRuntimeConfig rebalance_config;
 
             /// Optional histogram for decode expert tracking.
@@ -623,9 +629,9 @@ namespace llaminar2
             /// default for models that do not specify this explicitly.
             int decode_histogram_token_boundary_layer = -1;
 
-            /// MoE rebalancing controller mode (OFF / OBSERVE / DYNAMIC).
-            /// Public LLEP strategy uses the dynamic maintenance clock with
-            /// LeastLoadedResident assignment selected in rebalance_config.
+            /// Durable residency controller mode (OFF / OBSERVE / DYNAMIC).
+            /// Current-batch LLEP is independently selected by the routed
+            /// prefill assignment policy and never changes this controller.
             /// Set by InferenceRunnerFactory from MoERebalanceController.
             MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
 
@@ -657,7 +663,8 @@ namespace llaminar2
             moe.execution_policy = makeMoEExecutionPolicy(
                 dense_parallel_policy,
                 moe.routed_compute_policy,
-                moe.routed_assignment_policy,
+                moe.routed_decode_assignment_policy,
+                moe.routed_prefill_assignment_policy,
                 moe.routed_phase_policy);
             moe.expert_replica_policy =
                 expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);

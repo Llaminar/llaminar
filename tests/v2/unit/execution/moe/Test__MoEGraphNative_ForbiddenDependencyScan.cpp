@@ -3535,7 +3535,7 @@ namespace llaminar2::test
                     "ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides)"),
                 std::string::npos)
                 << helper
-                << " must apply backend-specific cache, LLEP, and graph "
+                << " must apply backend-specific cache, routed-assignment, and graph "
                    "environment policy for the full proof-runner lifetime.";
         }
         const size_t generic_drain_helper =
@@ -3576,21 +3576,27 @@ namespace llaminar2::test
                 long_context_config_end - long_context_config_start);
         EXPECT_NE(
             long_context_config_body.find(
-                "rebalance_mode != MoERebalanceRuntimeMode::Dynamic"),
-            std::string::npos);
-        EXPECT_NE(
-            long_context_config_body.find(
-                "rebalance_mode != MoERebalanceRuntimeMode::LLEP"),
+                "ExpertOverlayPolicyScenario::DynamicResidencyMaintenance"),
             std::string::npos)
-            << "Long-context LLEP parity must enable the same committed-boundary "
-               "maintenance exercise that its PerfStats gate certifies.";
+            << "Only explicit Dynamic residency maintenance should enable "
+               "committed-boundary maintenance coverage.";
+        EXPECT_EQ(
+            expert_overlay_parity.find("MoERebalanceRuntimeMode::LLEP"),
+            std::string::npos)
+            << "Current-batch LLEP must never reappear as a residency-maintenance mode.";
+        EXPECT_EQ(
+            expert_overlay_parity.find(
+                "ExpertOverlayPolicyScenario::DynamicOwnership"),
+            std::string::npos)
+            << "Parity policy names must identify durable residency maintenance, "
+               "not the historical composite DynamicOwnership mode.";
         EXPECT_NE(
             long_context_config_body.find(
                 "config.moe_rebalance_exercise.enabled = true;"),
             std::string::npos);
         const size_t long_context_perf_start =
             expert_overlay_parity.find(
-                "void expectLongContextMoERebalancePerfPath(");
+                "void expectLongContextExpertOverlayPerfPath(");
         ASSERT_NE(long_context_perf_start, std::string::npos);
         const size_t long_context_perf_end =
             expert_overlay_parity.find(
@@ -3793,7 +3799,7 @@ namespace llaminar2::test
             dgo.substr(stable_predicate_start, stable_predicate_end - stable_predicate_start);
         EXPECT_NE(stable_predicate.find("config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC"),
                   std::string::npos)
-            << "Graph-stable GPU MoE rebalance must be disabled for --moe-rebalance off/static configs.";
+            << "Graph-stable GPU MoE rebalance must be disabled when durable residency maintenance is off.";
         EXPECT_NE(stable_predicate.find("domain.usesParticipantAssignedPrefill()"),
                   std::string::npos)
             << "Prefill graph admission must consume the routed domain's typed phase policy instead of reinterpreting raw compute-policy enums.";
@@ -4343,9 +4349,10 @@ namespace llaminar2::test
         EXPECT_NE(server_e2e.find("run_prefix_cache_rebalance_clear_probe"), std::string::npos);
         EXPECT_NE(server_e2e.find("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER"), std::string::npos)
             << "The HTTP regression should deterministically leave a prepared LocalTP MoE publish for cleanup.";
-        EXPECT_NE(server_e2e.find("moe_rebalance_window_from_flags()"),
+        EXPECT_NE(server_e2e.find("moe_policy_window_from_flags()"),
                   std::string::npos)
-            << "Completion and maintenance probes must share one exact CLI window parser.";
+            << "Completion and movement probes must share the parser that "
+               "selects the window belonging to the declared policy axis.";
         EXPECT_NE(server_e2e.find("mtp_draft_tokens_from_flags()"),
                   std::string::npos)
             << "MTP movement probes must derive their transaction capacity from the tested depth.";
@@ -4356,7 +4363,7 @@ namespace llaminar2::test
             << "The probe must request enough output to force one scheduler boundary per evidence-window token.";
         EXPECT_NE(
             server_e2e.find(
-                "probe_rebalance_window=$(moe_rebalance_window_from_flags \"$extra_flags\")"),
+                "probe_rebalance_window=$(moe_policy_window_from_flags \"$extra_flags\")"),
             std::string::npos)
             << "The movement probe must derive readiness cadence from the tested server policy.";
         EXPECT_NE(
@@ -4394,8 +4401,11 @@ namespace llaminar2::test
             << "The HTTP regression must accept both the IKVCache operation "
                "name and the request-boundary reset reason emitted by the "
                "device maintenance epilogue.";
-        EXPECT_NE(server_e2e.find("mode != \"llep\""), std::string::npos)
-            << "LLEP prefix-cache clear probes should not require dynamic publish drain/export counters.";
+        EXPECT_NE(
+            server_e2e.find("if (uses_dynamic_residency_maintenance and"),
+            std::string::npos)
+            << "Current-batch LLEP prefix-cache clear probes must not require "
+               "Dynamic maintenance drain/export counters.";
         EXPECT_NE(server_e2e.find("request-clear-cache"), std::string::npos)
             << "The HTTP regression must match the live-state mutation operation emitted by request-boundary cache clears.";
         EXPECT_NE(server_e2e.find("materialized_score = ("), std::string::npos)
@@ -7246,7 +7256,8 @@ namespace llaminar2::test
             << "ROCm fused grouped decode must fail hard when the explicit fused K-part path fails";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefillLLEPTransferModeIsExplicit)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         PrefillLLEPPolicyIsTypedAndAlwaysTransferBacked)
     {
         const fs::path root = findRepoRoot();
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
@@ -7260,21 +7271,22 @@ namespace llaminar2::test
         ASSERT_FALSE(graph.empty()) << graph_path;
         ASSERT_FALSE(stage.empty()) << stage_path;
 
-        EXPECT_NE(graph.find("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"),
+        EXPECT_EQ(graph.find("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"),
                   std::string::npos)
-            << "LLEP prefill movement must be an explicit mode, not an implicit fallback.";
-        EXPECT_NE(graph.find("parsedLLEPPrefillTransferMode"),
+            << "Production least-loaded prefill has no resident-only mode.";
+        EXPECT_EQ(graph.find("parsedLLEPPrefillTransferMode"),
                   std::string::npos)
-            << "Qwen35 MoE graph must consume a parsed LLEP prefill movement mode.";
-        EXPECT_NE(graph.find("mode < 0 || mode > 1"),
-                  std::string::npos)
-            << "Invalid LLEP prefill movement modes must fail during graph construction.";
-        EXPECT_NE(graph.find("const bool require_full_llep_prefill_transfer"),
-                  std::string::npos)
-            << "The graph must make full transfer-backed prefill an explicit requirement.";
-        EXPECT_NE(graph.find("require_full_llep_prefill_transfer &&"),
-                  std::string::npos)
-            << "Compact transfer binding must only be attached for explicit full mode.";
+            << "Transport semantics are intrinsic to typed prefill assignment.";
+        EXPECT_NE(
+            graph.find(
+                "least_loaded_min_routed_rows"),
+            std::string::npos)
+            << "Graph lowering must consume the typed prefill economy boundary.";
+        EXPECT_NE(
+            graph.find(
+                "if (llep_prefill_enabled && !llep_prefill_transport_supported)"),
+            std::string::npos)
+            << "Requested LLEP must fail hard when full graph transport is unavailable.";
         EXPECT_NE(graph.find("kPrefillLLEPTransferWorkspaceLanes"),
                   std::string::npos)
             << "Current-batch LLEP needs a bounded persistent workspace ring.";
@@ -7286,42 +7298,54 @@ namespace llaminar2::test
             << "Per-layer payload workspace lifetimes exhaust production GPU memory.";
 
         const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
+        const fs::path runtime_config_path =
+            root / "src/v2/execution/config/RuntimeConfig.h";
+        const fs::path parser_path =
+            root / "src/v2/config/OrchestrationConfigParser.cpp";
         ASSERT_TRUE(fs::exists(debug_env_path)) << debug_env_path;
+        ASSERT_TRUE(fs::exists(runtime_config_path)) << runtime_config_path;
+        ASSERT_TRUE(fs::exists(parser_path)) << parser_path;
         const std::string debug_env = readFile(debug_env_path);
+        const std::string runtime_config = readFile(runtime_config_path);
+        const std::string parser = readFile(parser_path);
         ASSERT_FALSE(debug_env.empty()) << debug_env_path;
-        EXPECT_NE(debug_env.find("int llep_prefill_transfer_mode = 1"),
-                  std::string::npos)
-            << "Production LLEP prefill must default to full transfer-backed movement; "
-               "resident-only is a diagnostic mode.";
-        EXPECT_NE(debug_env.find("moe_rebalance.llep_prefill_transfer_mode = 1"),
-                  std::string::npos)
-            << "DebugEnv reload/reset must preserve the full transfer-backed LLEP default.";
-        EXPECT_NE(debug_env.find("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS"),
-                  std::string::npos)
-            << "Prefill LLEP must expose an explicit current-batch cost gate.";
-        EXPECT_NE(debug_env.find("uint64_t llep_prefill_min_routed_rows = 8192"),
+        ASSERT_FALSE(runtime_config.empty()) << runtime_config_path;
+        ASSERT_FALSE(parser.empty()) << parser_path;
+        EXPECT_EQ(
+            debug_env.find("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"),
+            std::string::npos);
+        EXPECT_EQ(
+            debug_env.find("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS"),
+            std::string::npos);
+        EXPECT_NE(
+            runtime_config.find(
+                "uint64_t least_loaded_min_routed_rows = 8192"),
                   std::string::npos)
             << "Prefill LLEP should default to a chunky routed-row gate instead of "
                "paying transfer-backed movement on tiny batches.";
+        EXPECT_NE(
+            parser.find(
+                "--moe-routed-prefill-least-loaded-min-routed-rows"),
+            std::string::npos)
+            << "The economy boundary must be an explicit CLI/YAML runtime policy.";
         EXPECT_NE(debug_env.find("kDefaultDeviceMinLoadSpreadImprovementDivisor"),
                   std::string::npos)
             << "Device-side LLEP/Dynamic movement must share the relative "
                "load-spread default instead of silently disabling the gate.";
-        EXPECT_NE(stage.find("device_rebalance_llep_prefill_policy_skips"),
+        EXPECT_EQ(stage.find("device_rebalance_llep_prefill_policy_skips"),
                   std::string::npos)
-            << "Prefill LLEP cost-gate skips must be visible in perfstats.";
-        EXPECT_NE(stage.find("reason\", \"insufficient_routed_rows"),
-                  std::string::npos)
-            << "Prefill LLEP cost-gate skips must report why standard AE was selected.";
+            << "Economy selection happens before stage construction; the hot "
+               "stage must not change assignment policy during replay.";
+        EXPECT_EQ(stage.find("reason\", \"insufficient_routed_rows"),
+                  std::string::npos);
 
         EXPECT_NE(stage.find("assignPrefillRoutesLeastLoadedResident"),
                   std::string::npos)
-            << "Resident-only LLEP must use the planner whose candidate set is "
-               "limited to the active runtime bank's resident masks.";
+            << "Explicit decode least-loaded assignment remains limited to the "
+               "active runtime bank's resident masks.";
         EXPECT_EQ(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"),
                   std::string::npos)
-            << "Production resident-only LLEP must not first create a potentially "
-               "foreign transfer plan and then conditionally decline to apply it.";
+            << "Resident decode assignment must not create a foreign transfer plan.";
         EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"),
                   std::string::npos)
             << "Full transfer-backed prefill LLEP must use the after-transfer apply kernel.";
@@ -7333,7 +7357,7 @@ namespace llaminar2::test
                   std::string::npos)
             << "The graph must name current-batch migration independently from "
                "prefix-runtime payload rehydration.";
-        EXPECT_NE(graph.find("!grouped_main_verifier_layer"),
+        EXPECT_NE(graph.find("ordinary_prefill_graph &&"),
                   std::string::npos)
             << "Grouped verifier rows must be structurally excluded from "
                "current-batch expert payload migration.";

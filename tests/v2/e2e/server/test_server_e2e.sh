@@ -353,27 +353,27 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     # MoE mode is part of the behavioral contract of every matrix cell. Keep
     # static cells explicit because the production CLI default may evolve
     # independently of this regression matrix.
-    S9_STATIC_FLAGS="--moe-rebalance off"
+    S9_STATIC_FLAGS="--moe-residency-maintenance off"
     S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
     S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
     S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
-    S9_REBALANCE_FLAGS="--moe-rebalance dynamic --moe-hot-expert-cache 2 --moe-rebalance-window 8 --moe-rebalance-max-window 8 --moe-rebalance-window-growth 1 --moe-release-raw-expert-weights"
-    S9_REBALANCE_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-rebalance-window 4 --moe-rebalance-max-window 4 --moe-rebalance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-transfer 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-device-llep-alpha-numerator 1 --moe-device-llep-alpha-denominator 2 --moe-device-llep-disable-balanced-skip --moe-release-raw-expert-weights"
-    S9_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    S9_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    # LLEP is an execution strategy, not permission for the runner factory to
-    # mutate graph policy. These cells state all three routed axes explicitly:
-    # ordinary prefill apportions complete expert work, while decode and the
-    # grouped verifier execute from complete local replicas without a routed
-    # result collective.
-    S9_LLEP_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=replicated;routed_phase=prefill-apportioned-decode-replicated;routed_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    S9_LLEP_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=replicated;routed_phase=prefill-apportioned-decode-replicated;routed_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+    S9_DYNAMIC_RESIDENCY_FLAGS="--moe-residency-maintenance dynamic --moe-hot-expert-cache 2 --moe-residency-maintenance-window 8 --moe-residency-maintenance-max-window 8 --moe-residency-maintenance-window-growth 1 --moe-release-raw-expert-weights"
+    S9_DYNAMIC_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-residency-maintenance-window 4 --moe-residency-maintenance-max-window 4 --moe-residency-maintenance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-transfer 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-release-raw-expert-weights"
+    S9_LLEP_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-routed-prefill-assignment-window 4 --moe-routed-prefill-llep-alpha-numerator 1 --moe-routed-prefill-llep-alpha-denominator 2 --moe-routed-prefill-llep-disable-balanced-skip --moe-release-raw-expert-weights"
+    S9_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+    S9_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+    # Current-batch LLEP is the ordinary-prefill assignment axis. The
+    # economical target keeps whole experts apportioned, grouped verification
+    # on static owners, the dense/shared trunk tensor parallel, and the MTP
+    # terminal head mirrored. Durable residency maintenance remains off.
+    S9_LLEP_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --mtp-terminal-head-policy mirrored-full-vocabulary --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+    S9_LLEP_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --mtp-terminal-head-policy mirrored-full-vocabulary --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
     # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
     # but they must not run in the default gate until non-root participant ranks
     # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
-    S9_OVERLAY_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
-    S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
-    S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-routed-expert-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    S9_OVERLAY_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-routed-expert-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0;fallback=true"
     if [ -f "$S9_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS}|qwen36-moe-baseline")
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
@@ -385,26 +385,26 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,prefill-graph-probe")
         SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,prefill-graph-probe")
         if [[ "$QWEN36_MOE_REBALANCE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
         fi
         if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_DYNAMIC_RESIDENCY_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_DYNAMIC_RESIDENCY_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
         fi
         if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
@@ -1056,13 +1056,12 @@ is_mtp_case() {
     [[ " ${extra_flags} " == *" --mtp "* ]]
 }
 
-moe_rebalance_window_from_flags() {
+moe_policy_window_from_flags() {
     local extra_flags="$1"
 
-    # Parse the command exactly as the server will see it.  The E2E suite uses
-    # both "--option value" and "--option=value" spellings, and ad-hoc shell
-    # splitting would mis-handle quoted expert-domain arguments elsewhere in
-    # the same flag string.
+    # Current-batch LLEP and durable residency maintenance own independent
+    # windows. Parse the declared routed-prefill policy first, then read the
+    # matching typed option exactly as the server will see it.
     python3 - "$extra_flags" <<'PY'
 import shlex
 import sys
@@ -1072,11 +1071,29 @@ try:
 except Exception:
     tokens = sys.argv[1].split()
 
+def values(flag):
+    result = []
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            result.append(tokens[idx + 1])
+        elif token.startswith(flag + "="):
+            result.append(token.split("=", 1)[1])
+    return result
+
+current_batch_llep = any(
+    "routed_prefill_assignment=least-loaded-resident" in domain
+    for domain in values("--moe-routed-expert-domain")
+)
+window_flag = (
+    "--moe-routed-prefill-assignment-window"
+    if current_batch_llep
+    else "--moe-residency-maintenance-window"
+)
 for idx, token in enumerate(tokens):
-    if token == "--moe-rebalance-window" and idx + 1 < len(tokens):
+    if token == window_flag and idx + 1 < len(tokens):
         print(tokens[idx + 1])
         break
-    if token.startswith("--moe-rebalance-window="):
+    if token.startswith(window_flag + "="):
         print(token.split("=", 1)[1])
         break
 PY
@@ -1085,7 +1102,7 @@ PY
 mtp_draft_tokens_from_flags() {
     local extra_flags="$1"
 
-    # Keep this parser symmetric with moe_rebalance_window_from_flags(): both
+    # Keep this parser symmetric with moe_policy_window_from_flags(): both
     # values participate in the same transaction-budget calculation below.
     python3 - "$extra_flags" <<'PY'
 import shlex
@@ -2220,6 +2237,33 @@ def flag_value(flag):
             return token.split("=", 1)[1]
     return None
 
+def flag_values(flag):
+    try:
+        tokens = shlex.split(extra_flags)
+    except ValueError:
+        tokens = extra_flags.split()
+    values = []
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            values.append(tokens[idx + 1])
+        elif token.startswith(flag + "="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+uses_current_batch_llep = any(
+    "routed_prefill_assignment=least-loaded-resident" in domain
+    for domain in flag_values("--moe-routed-expert-domain")
+)
+residency_maintenance_mode = flag_value("--moe-residency-maintenance")
+uses_dynamic_residency_maintenance = residency_maintenance_mode == "dynamic"
+
+if uses_current_batch_llep and residency_maintenance_mode != "off":
+    print(
+        "FAIL: current-batch LLEP must declare durable residency maintenance "
+        "off so the two independent policy axes cannot be conflated"
+    )
+    sys.exit(0)
+
 expect_shared_moe_route_scratch = (
     is_gpu
     and is_mtp
@@ -2332,13 +2376,11 @@ if is_gpu and is_mtp:
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
         sys.exit(0)
 
-    # LLEP's grouped verifier has two economical typed policies. Sharded rows
-    # choose among resident experts using their device logical position. A
-    # mirrored verifier owns every expert and row locally, so assignment itself
-    # is absent and both transport and routed-result collectives must remain
-    # absent. The standalone validator rejects missing, mixed, or incomplete
-    # policy evidence.
-    if flag_value("--moe-rebalance") == "llep":
+    # LLEP is confined to ordinary prefill. Its grouped verifier must prove the
+    # canonical economical path independently: runtime-table grouping over
+    # static expert owners, with no current-batch expert transport. Mirroring
+    # the terminal MTP head does not replicate routed experts.
+    if uses_current_batch_llep:
         llep_validation = validate_llep_verifier_policy(records)
         if llep_validation.error:
             print(f"FAIL: {llep_validation.error}")
@@ -2454,9 +2496,11 @@ if require_prefix_rebalance_clear:
     if " --prefix-cache " not in f" {extra_flags} ":
         print("FAIL: prefix-cache rebalance clear probe requires --prefix-cache")
         sys.exit(0)
-    mode = flag_value("--moe-rebalance")
-    if mode not in {"dynamic", "llep"}:
-        print("FAIL: prefix-cache rebalance clear probe requires --moe-rebalance dynamic or llep")
+    if not uses_dynamic_residency_maintenance and not uses_current_batch_llep:
+        print(
+            "FAIL: prefix-cache MoE policy clear probe requires either dynamic "
+            "residency maintenance or explicit current-batch LLEP"
+        )
         sys.exit(0)
     prefix_lookup_score = record_value_sum(
         ("lookup_results",),
@@ -2524,7 +2568,7 @@ if require_prefix_rebalance_clear:
         "moe_rebalance",
     )
     effective_movement_score = payload_movement_score
-    if mode == "llep":
+    if uses_current_batch_llep:
         # Fully mirrored LLEP has no expert payload to migrate. Its economical
         # production action is to send routed rows to an already-resident
         # non-owner replica. The sticky counter comes from the real assignment
@@ -2566,7 +2610,8 @@ if require_prefix_rebalance_clear:
             and record_tags.get("window") == "request_reset"
         ):
             device_request_reset_exports += numeric(record.get("value", record.get("count", 0.0)))
-    if mode != "llep" and pending_publish_drains + device_request_reset_exports <= 0.0:
+    if (uses_dynamic_residency_maintenance and
+            pending_publish_drains + device_request_reset_exports <= 0.0):
         print("FAIL: prefix-cache rebalance clear probe did not observe clear-cache rebalance drain/export")
         sys.exit(0)
     runtime_movement_epoch = max(
@@ -2585,7 +2630,7 @@ if require_prefix_rebalance_clear:
         if runtime_movement_epoch <= 0.0:
             print("FAIL: prefix-cache rebalance clear probe applied payload movement without advancing moe_runtime_movement_epoch")
             sys.exit(0)
-    elif mode == "llep" and resident_row_assignment_score > 0.0:
+    elif uses_current_batch_llep and resident_row_assignment_score > 0.0:
         if runtime_movement_epoch != 0.0:
             print(
                 "FAIL: resident-only LLEP row redistribution changed the placement "
@@ -2597,15 +2642,17 @@ if require_moe_rebalance_movement:
     if not is_gpu:
         print("FAIL: MoE rebalance movement probe requires a GPU TP/PP backend")
         sys.exit(0)
-    mode = flag_value("--moe-rebalance")
-    if mode not in {"dynamic", "llep"}:
-        print("FAIL: MoE rebalance movement probe requires --moe-rebalance dynamic or llep")
+    if not uses_dynamic_residency_maintenance and not uses_current_batch_llep:
+        print(
+            "FAIL: MoE policy movement probe requires either dynamic residency "
+            "maintenance or explicit current-batch LLEP"
+        )
         sys.exit(0)
     if not has_record(domain="moe_rebalance"):
         print("FAIL: MoE rebalance movement probe emitted no moe_rebalance counters")
         sys.exit(0)
 
-    if mode == "llep":
+    if uses_current_batch_llep:
         if "cuda:" in extra_flags:
             expected_allgather_primitive = "ncclAllGather"
         elif "rocm:" in extra_flags:
@@ -2650,7 +2697,7 @@ if require_moe_rebalance_movement:
         ),
         "moe_rebalance",
     )
-    llep_applied_work = resident_row_assignment if mode == "llep" else 0.0
+    llep_applied_work = resident_row_assignment if uses_current_batch_llep else 0.0
     # Request-reset diagnostics run after the transient planner status has
     # advanced to WindowNotReady for the next window.  The controller's wave
     # state is the durable device-owned transaction record: a nonzero planned
@@ -3228,7 +3275,7 @@ run_prefix_cache_rebalance_clear_probe() {
     local min_completion_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS:-8}"
     local min_completion_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS+x}"
     local rebalance_window
-    rebalance_window=$(moe_rebalance_window_from_flags "$extra_flags")
+    rebalance_window=$(moe_policy_window_from_flags "$extra_flags")
     if [[ "$rebalance_window" =~ ^[0-9]+$ ]] && [ "$rebalance_window" -gt 0 ]; then
         local completion_tokens_for_window=$((rebalance_window + 1))
         if is_mtp_case "$extra_flags"; then
@@ -3404,6 +3451,10 @@ run_backend_tests() {
         server_env+=("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER=${probe_gpu_cache_experts}")
     fi
     if suite_runs_moe_rebalance_movement_probe "$suite_options"; then
+        # Make the graph-level economy decision explicit for this forced
+        # movement probe. Production defaults retain the 8192-routed-row floor;
+        # the probe lowers it through the public typed CLI, never DebugEnv.
+        extra_flags+=" --moe-routed-prefill-least-loaded-min-routed-rows 0"
         # One compact slot is sufficient to prove that the production LLEP
         # payload lane plans, publishes, transports, and applies a real expert
         # movement. Larger fixed capacities multiply the graph-captured
@@ -3415,7 +3466,7 @@ run_backend_tests() {
         local probe_initial_maintenance_period=1
         local probe_rebalance_window
         local probe_effective_window
-        probe_rebalance_window=$(moe_rebalance_window_from_flags "$extra_flags")
+        probe_rebalance_window=$(moe_policy_window_from_flags "$extra_flags")
         probe_effective_window="${LLAMINAR_E2E_MOE_REBALANCE_WINDOW:-4}"
         if [[ ! "$probe_effective_window" =~ ^[1-9][0-9]*$ ]]; then
             echo "Invalid LLAMINAR_E2E_MOE_REBALANCE_WINDOW='${probe_effective_window}'" >&2
@@ -3451,8 +3502,6 @@ run_backend_tests() {
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_SWAPS_PER_LAYER=20"
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE=20"
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_WINDOW_ACTIVATIONS=0"
-            "LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS=0"
-            "LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE=full"
             # The first replay waits for the complete evidence window derived
             # above.  Subsequent windows retain the ordinary window+slack
             # cadence, while request cleanup drains any prepared wave.

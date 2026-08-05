@@ -22,6 +22,39 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Prefix restore preserves graph addresses through producer events. GPU
   FFN/MTP APIs reject null publication streams.
 
+## Canonical CUDA2/ROCm2 LLEP Target
+
+`LLEP` is the ordinary large-prefill routed-row assignment axis, not a
+shorthand for an entire MoE execution mode. The active tuning target is this
+explicit tuple:
+
+| Axis | Required policy |
+|---|---|
+| Dense/shared trunk | tensor parallel |
+| Routed expert storage/compute | apportioned whole experts |
+| Routed phase | uniform |
+| Grouped verifier/decode assignment | static owner |
+| Ordinary large-prefill assignment | least-loaded resident (LLEP) |
+| Small-prefill regime | static owner below the explicit routed-row threshold |
+| MTP terminal norm/head | mirrored full vocabulary |
+| Durable residency maintenance | off |
+| Hot expert replica cache | off |
+| Transport | one fully captured NCCL/RCCL graph |
+
+The production large-prefill boundary is currently `M * top_k >= 8192` routed
+rows. Setting it to zero is reserved for focused transfer-path proof. This is a
+declared work-regime switch: grouped verifier/decode remains static-owner and
+must never inherit least-loaded prefill assignment. Dynamic whole-expert
+residency maintenance and hot replicas are independent experiments and are not
+part of the canonical LLEP economy row.
+
+Canonical tests must prove the tuple through PerfStats: static-owner grouped
+verifier calls, least-loaded current-batch prefill when the threshold is met,
+mirrored terminal-head execution, graph-captured NCCL/RCCL, no segmented
+execution, and no durable maintenance or hot-cache activity. Performance
+tuning starts with stochastic fixed depth 3 so graph/communication economics
+are isolated; dynamic depth is tuned only after that baseline is sound.
+
 ## Production Matrix
 
 | Mode | Device | Dense greedy/stoch | MoE greedy/stoch | Status |
@@ -29,11 +62,11 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 | SingleDevice | CPU | R/R | A/A | refresh paused |
 | SingleDevice | CUDA | A/G | A/R | dense d3 wins; d1/MoE need tuning |
 | SingleDevice | ROCm | A/A | A/A | dense d3 wins; d1/MoE need tuning |
-| LocalTP | CUDA2 | A/A | A/A | Dynamic/LLEP matrix green; perf active |
-| LocalTP | ROCm2 | A/A | A/A | Dynamic/LLEP matrix green; perf pending |
+| LocalTP | CUDA2 | A/A | A/A | Dynamic-maintenance/current-batch-LLEP matrix green; perf active |
+| LocalTP | ROCm2 | A/A | A/A | Dynamic-maintenance/current-batch-LLEP matrix green; perf pending |
 | LocalTP | ROCm4 | A/R | R/R | full refresh pending |
 | NodeLocalTP | CPU2 | A/A | R/R | dense E2E green; MoE/perf pending |
-| ExpertParallel | GPU+CPU | A/R | G/R | Dynamic/LLEP greedy+prefix green |
+| ExpertParallel | GPU+CPU | A/R | G/R | explicit Dynamic/LLEP greedy+prefix green |
 
 ## Correctness Proof
 
@@ -59,6 +92,13 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   wrappers cannot perform codebook upload, and no process-global ready flag can
   incorrectly alias initialization across devices. The complete Integration
   tree rebuilt cleanly and the device-free unit/source gate passed `585/585`.
+- Expert-overlay policy is now represented as independent typed axes throughout
+  config, graph lowering, fixtures, and E2E registration. The model-free
+  canonical-tuple regression proves dense TP, apportioned/uniform routed work,
+  static-owner grouped verification, least-loaded current-batch prefill,
+  mirrored MTP head, and both durable maintenance and hot replicas Off. The
+  complete Integration tree rebuilt all `1413/1413` edges and the device-free
+  unit/source gate passed `585/585` on 2026-08-04.
 
 ## CUDA LLEP Economy
 

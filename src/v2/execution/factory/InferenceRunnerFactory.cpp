@@ -408,8 +408,18 @@ namespace llaminar2
                              RoutedExpertComputePolicy::Apportioned);
         }
 
+        /**
+         * @brief Resolve one workload-specific assignment axis across routed tiers.
+         * @param plan Graph-native routed-expert placement plan.
+         * @param member Decode or prefill assignment member to inspect.
+         * @param workload_name Stable workload name used in diagnostics.
+         * @param error Optional actionable failure text.
+         * @return Uniform assignment policy, or no value when routed tiers disagree.
+         */
         std::optional<RoutedExpertAssignmentPolicy> routedOverlayAssignmentPolicy(
             const MoERoutedExpertPlacementPlan &plan,
+            RoutedExpertAssignmentPolicy RoutedExpertDomain::*member,
+            const char *workload_name,
             std::string *error)
         {
             RoutedExpertAssignmentPolicy policy = RoutedExpertAssignmentPolicy::StaticOwner;
@@ -423,19 +433,21 @@ namespace llaminar2
 
                 if (!saw_policy)
                 {
-                    policy = domain->routed_assignment_policy;
+                    policy = domain->*member;
                     saw_policy = true;
                     continue;
                 }
 
-                if (domain->routed_assignment_policy != policy)
+                if (domain->*member != policy)
                 {
                     if (error)
                     {
-                        *error = "mixed routed expert assignment policies are not supported in one graph-native overlay: " +
+                        *error = "mixed routed expert " +
+                                 std::string(workload_name) +
+                                 " assignment policies are not supported in one graph-native overlay: " +
                                  std::string(routedExpertAssignmentPolicyToString(policy)) +
                                  " and " +
-                                 routedExpertAssignmentPolicyToString(domain->routed_assignment_policy);
+                                 routedExpertAssignmentPolicyToString(domain->*member);
                     }
                     return std::nullopt;
                 }
@@ -486,7 +498,23 @@ namespace llaminar2
                              RoutedExpertPhasePolicy::Uniform);
         }
 
-        bool validateLLEPRoutedOverlayPolicy(
+        bool usesCurrentBatchLLEP(
+            const MoERoutedExpertPlacementPlan &plan)
+        {
+            return std::any_of(
+                plan.routed_tiers.begin(),
+                plan.routed_tiers.end(),
+                [&](const RoutedExpertTier &tier)
+                {
+                    const auto *domain =
+                        findMoEExpertDomain(plan, tier.domain);
+                    return domain &&
+                           domain->routed_prefill_assignment_policy ==
+                               RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                });
+        }
+
+        bool validateCurrentBatchLLEPOverlayPolicy(
             const MoERoutedExpertPlacementPlan &plan,
             std::string *error)
         {
@@ -507,7 +535,7 @@ namespace llaminar2
                     return false;
                 }
 
-                if (domain->routed_assignment_policy !=
+                if (domain->routed_prefill_assignment_policy !=
                     RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     if (error)
@@ -515,9 +543,23 @@ namespace llaminar2
                         *error =
                             "domain '" + domain->name +
                             "' must explicitly declare "
-                            "routed_assignment=least-loaded-resident for LLEP; "
-                            "--moe-rebalance selects the maintenance strategy "
-                            "and never rewrites graph scheduling policy";
+                            "routed_prefill_assignment=least-loaded-resident "
+                            "for current-batch LLEP";
+                    }
+                    return false;
+                }
+
+                if (domain->routed_decode_assignment_policy !=
+                    RoutedExpertAssignmentPolicy::StaticOwner)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "domain '" + domain->name +
+                            "' must explicitly declare "
+                            "routed_decode_assignment=static-owner for the "
+                            "economical LLEP target; verifier-sized work must "
+                            "not run current-batch least-loaded planning";
                     }
                     return false;
                 }
@@ -656,21 +698,17 @@ namespace llaminar2
             auto plan = resolveMoERoutedExpertPlacementPlanForModel(model_ctx, config);
             if (!plan)
             {
-                if (graph_config.moe.enabled() &&
-                    graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
-                {
-                    LOG_ERROR(log_prefix << " LLEP rebalance mode requires a multi-participant MoE expert overlay domain");
-                    return false;
-                }
                 return true;
             }
 
-            if (graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
+            if (usesCurrentBatchLLEP(*plan))
             {
                 std::string llep_error;
-                if (!validateLLEPRoutedOverlayPolicy(*plan, &llep_error))
+                if (!validateCurrentBatchLLEPOverlayPolicy(*plan, &llep_error))
                 {
-                    LOG_ERROR(log_prefix << " invalid LLEP overlay: " << llep_error);
+                    LOG_ERROR(log_prefix
+                              << " invalid current-batch LLEP overlay: "
+                              << llep_error);
                     return false;
                 }
             }
@@ -699,10 +737,25 @@ namespace llaminar2
                           << compute_error);
                 return false;
             }
-            auto assignment_policy = routedOverlayAssignmentPolicy(*plan, &assignment_error);
-            if (!assignment_policy)
+            auto decode_assignment_policy = routedOverlayAssignmentPolicy(
+                *plan,
+                &RoutedExpertDomain::routed_decode_assignment_policy,
+                "decode",
+                &assignment_error);
+            if (!decode_assignment_policy)
             {
-                LOG_ERROR(log_prefix << " invalid MoE overlay routed assignment policy: "
+                LOG_ERROR(log_prefix << " invalid MoE overlay routed decode assignment policy: "
+                                     << assignment_error);
+                return false;
+            }
+            auto prefill_assignment_policy = routedOverlayAssignmentPolicy(
+                *plan,
+                &RoutedExpertDomain::routed_prefill_assignment_policy,
+                "prefill",
+                &assignment_error);
+            if (!prefill_assignment_policy)
+            {
+                LOG_ERROR(log_prefix << " invalid MoE overlay routed prefill assignment policy: "
                                      << assignment_error);
                 return false;
             }
@@ -716,7 +769,10 @@ namespace llaminar2
 
             graph_config.moe.routed_compute_policy = *compute_policy;
             graph_config.moe.routed_phase_policy = *phase_policy;
-            graph_config.moe.routed_assignment_policy = *assignment_policy;
+            graph_config.moe.routed_decode_assignment_policy =
+                *decode_assignment_policy;
+            graph_config.moe.routed_prefill_assignment_policy =
+                *prefill_assignment_policy;
             graph_config.refreshMoEExecutionPolicy();
 
             if (plan->isTieredOverlay())
@@ -1299,7 +1355,7 @@ namespace llaminar2
      */
     bool needsLocalTPMirroredMTPHeadWeights(const GraphConfig &graph_config)
     {
-        return graph_config.mtp.mirror_full_head_for_local_tp &&
+        return mtpTerminalHeadIsMirrored(graph_config.mtp.terminal_head_policy) &&
                graph_config.lm_head_column_parallel &&
                graph_config.tp_config &&
                graph_config.tp_ctx &&
@@ -1677,7 +1733,6 @@ namespace llaminar2
         case MoERebalanceRuntimeMode::Observe:
             return MoERebalanceMode::OBSERVE;
         case MoERebalanceRuntimeMode::Dynamic:
-        case MoERebalanceRuntimeMode::LLEP:
             return MoERebalanceMode::DYNAMIC;
         case MoERebalanceRuntimeMode::Off:
         default:
@@ -1724,13 +1779,16 @@ namespace llaminar2
         if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
             result.dynamic_min_window_activations =
                 env.moe_rebalance.dynamic_min_window_activations;
-        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+        if (result.device_maintenance_slack_tokens < 0 &&
+            env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
             result.device_maintenance_slack_tokens =
                 env.moe_rebalance.device_rebalance_maintenance_slack_tokens;
-        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+        if (result.device_min_maintenance_period_tokens < 0 &&
+            env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
             result.device_min_maintenance_period_tokens =
                 env.moe_rebalance.device_rebalance_min_maintenance_period_tokens;
-        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+        if (result.device_initial_maintenance_period_tokens < 0 &&
+            env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
             result.device_initial_maintenance_period_tokens =
                 env.moe_rebalance.device_rebalance_initial_maintenance_period_tokens;
         result.release_raw_expert_weights = result.release_raw_expert_weights ||
@@ -2270,6 +2328,7 @@ namespace llaminar2
         config_builder->populateFromModelContext(*model_ctx, graph_config);
         graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
+        graph_config.moe.routed_prefill_config = config.moe_routed_prefill;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainTPContextMap owned_domain_tp_contexts;
         if (!applyMoEExpertOverlayConfigToGraph(
@@ -2287,7 +2346,12 @@ namespace llaminar2
                   << describeMoEExecutionPolicy(graph_config.moe.execution_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
                   << " routed=" << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
-                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_assignment_policy)
+                  << " decode_assignment="
+                  << routedExpertAssignmentPolicyToString(
+                         graph_config.moe.routed_decode_assignment_policy)
+                  << " prefill_assignment="
+                  << routedExpertAssignmentPolicyToString(
+                         graph_config.moe.routed_prefill_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try
@@ -3903,6 +3967,7 @@ namespace llaminar2
         config_builder->populateFromModelContext(*model_ctx, graph_config);
         graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
+        graph_config.moe.routed_prefill_config = config.moe_routed_prefill;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainTPContextMap owned_domain_tp_contexts;
         const auto overlay_runner_mpi_ctx = config.moe_expert_overlay_mpi_ctx;
@@ -3921,7 +3986,12 @@ namespace llaminar2
                   << describeMoEExecutionPolicy(graph_config.moe.execution_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
                   << " routed=" << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
-                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_assignment_policy)
+                  << " decode_assignment="
+                  << routedExpertAssignmentPolicyToString(
+                         graph_config.moe.routed_decode_assignment_policy)
+                  << " prefill_assignment="
+                  << routedExpertAssignmentPolicyToString(
+                         graph_config.moe.routed_prefill_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try

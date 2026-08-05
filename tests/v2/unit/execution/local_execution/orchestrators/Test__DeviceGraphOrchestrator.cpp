@@ -1645,7 +1645,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
     EXPECT_NE(predicate_body.find("return false"), std::string::npos)
         << "Decode-replicated all-position verifier rows must write full logits so "
            "their LM-head binding matches rowwise serial decode.";
-    EXPECT_NE(predicate_body.find("config.mtp.mirror_full_head_for_local_tp"), std::string::npos)
+    EXPECT_NE(predicate_body.find("mtpTerminalHeadIsMirrored(config.mtp.terminal_head_policy)"), std::string::npos)
         << "Mirrored LocalTP MTP sidecars must advertise full replicated logits.";
     EXPECT_EQ(predicate_body.find("config.tp_ctx->degree() > 1"), std::string::npos)
         << "Degree-based local shard advertisement reintroduces the serial-logit mismatch.";

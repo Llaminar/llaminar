@@ -563,10 +563,10 @@ namespace llaminar2
          * @brief Publish device MoE maintenance before launching a future MTP consumer.
          *
          * Accepted-state publication and the next speculative sidecar use
-         * independent GPU streams.  LLEP maintenance may flip the active
-         * placement bank between those operations, so a sidecar must never be
-         * submitted until the complete decode boundary has published its
-         * maintenance completion event.  This helper is the sole ordering gate
+         * independent GPU streams. Dynamic residency maintenance may flip the
+         * active placement bank between those operations, so a sidecar must
+         * never be submitted until the complete decode boundary has published
+         * its maintenance completion event. This helper is the sole ordering gate
          * for resident sidecar prelaunches: it enqueues maintenance once for the
          * current decode step and records that the ordinary outer-loop boundary
          * must acknowledge, rather than replay, the same transaction.
@@ -604,28 +604,29 @@ namespace llaminar2
         GenerationResult decodeStepMTP();
         void clearBatchedDecodeState();
         /**
-         * @brief Return true when LLEP prefill has current-window state semantics.
+         * @brief Return true when routed prefill uses current-batch least-loaded assignment.
          *
-         * LLEP route planning is deliberately a current-window policy:
+         * Least-loaded route planning is deliberately a current-window policy:
          * the same token span can produce different route assignments if it is
          * planned inside a larger prefill transaction.  This helper centralizes
-         * the mode check so cache-enabled and cache-disabled prefill paths share
-         * one request-boundary definition for KV, GDN, MTP, and MoE runtime
-         * state.
+         * the typed domain-policy check so cache-enabled and cache-disabled
+         * prefill paths share one request-boundary definition for KV, GDN, MTP,
+         * and MoE runtime state. Durable residency maintenance is intentionally
+         * irrelevant to this decision.
          *
-         * @return true when either the execution plan or user config selects
-         *         LLEP rebalance mode.
+         * @return true when an active routed domain explicitly selects
+         *         LeastLoadedResident for ordinary prefill.
          */
-        bool leastLoadedEPPrefillUsesStableWindows() const;
+        bool leastLoadedCurrentBatchPrefillUsesStableWindows() const;
 
         /**
-         * @brief Resolve the stable prefill transaction size for LLEP.
+         * @brief Resolve the stable current-batch routed-prefill transaction size.
          *
-         * A configured @c prefill_window_tokens value is the first-class owner
-         * of LLEP prefill state lifetime.  Prefix cache may supply an explicit
-         * block boundary only when that owner is unset and cache restore is
-         * active for the request.  Returning zero means the historical
-         * single-transaction prefill behavior is still in force.
+         * A configured @c assignment_window_tokens value is the first-class
+         * owner of current-batch assignment state lifetime. Prefix cache may
+         * supply an explicit block boundary only when that owner is unset and
+         * cache restore is active for the request. Returning zero means one
+         * ordinary prefill transaction remains in force.
          *
          * @param prefix_cache_block_size Coordinated prefix-cache block size for
          *        this request, or zero when prefix cache is not active.
@@ -633,7 +634,7 @@ namespace llaminar2
          *        for this request.
          * @return Positive stable transaction size, or zero for no segmentation.
          */
-        int stableLLEPPrefillWindowTokens(
+        int stableRoutedPrefillAssignmentWindowTokens(
             int prefix_cache_block_size,
             bool prefix_cache_enabled) const;
 

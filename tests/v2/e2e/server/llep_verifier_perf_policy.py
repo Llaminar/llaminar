@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Validate the typed LLEP verifier execution policy in PerfStats.
+"""Validate the canonical current-batch-LLEP verifier policy in PerfStats.
 
-LLEP has two economical grouped-verifier policies. Participant-assigned rows
-may select among already-resident experts using the device logical position.
-A mirrored verifier instead executes every row locally and therefore performs
-no participant assignment at all. The latter is not missing work: assignment,
-current-batch transport, and routed-result collectives would all be redundant.
+LLEP applies only to ordinary prefill. The canonical grouped verifier remains
+ordinary expert parallel: whole experts stay on static owners, grouped rows run
+through the runtime-table kernel, and no current-batch expert transfer occurs.
+The MTP terminal head may be mirrored independently; that does not replicate
+routed experts or alter verifier row assignment.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Iterable, Mapping, Optional
 
 @dataclass(frozen=True)
 class LLEPVerifierPolicyValidation:
-    """Result of validating one homogeneous LLEP verifier policy."""
+    """Result of validating the canonical grouped-verifier policy."""
 
     error: Optional[str]
     policy: Optional[str] = None
@@ -35,56 +35,44 @@ def _positive(record: Mapping[str, object]) -> bool:
 def validate_llep_verifier_policy(
     records: Iterable[Mapping[str, object]],
 ) -> LLEPVerifierPolicyValidation:
-    """Require exactly one complete, no-transport LLEP verifier policy.
+    """Require grouped static-owner verification and reject prefill policy bleed."""
 
-    Mixing policies inside one homogeneous graph is rejected because it makes
-    routed-result ownership ambiguous. Every matching record must carry the
-    complete policy tags; a counter name alone is not sufficient evidence.
-    """
-
-    resident = []
-    mirrored = []
+    static_owner = []
+    forbidden = []
     for record in records:
-        if (
-            record.get("domain") != "moe_rebalance"
-            or record.get("phase") != "verifier"
-            or not _positive(record)
-        ):
+        if record.get("phase") != "verifier" or not _positive(record):
             continue
         name = record.get("name")
-        if name == "device_rebalance_llep_resident_assignment_calls":
-            resident.append(record)
-        elif name == "fully_replicated_local_verifier_execution_calls":
-            mirrored.append(record)
+        if (
+            record.get("domain") == "moe_routed_execution"
+            and name == "static_owner_grouped_verifier_calls"
+        ):
+            static_owner.append(record)
+        elif name in {
+            "device_rebalance_llep_resident_assignment_calls",
+            "fully_replicated_local_verifier_execution_calls",
+        }:
+            forbidden.append(record)
 
-    if resident and mirrored:
+    if forbidden:
         return LLEPVerifierPolicyValidation(
-            "GPU LLEP+MTP emitted both participant-assigned and fully "
-            "replicated verifier policies"
+            "GPU current-batch LLEP leaked prefill assignment or replicated-"
+            "expert policy into grouped verification"
         )
-    if not resident and not mirrored:
+    if not static_owner:
         return LLEPVerifierPolicyValidation(
-            "GPU LLEP+MTP emitted no typed verifier execution-policy evidence"
+            "GPU current-batch LLEP emitted no grouped static-owner verifier evidence"
         )
 
-    if mirrored:
-        expected = {
-            "execution_policy": "fully_replicated_local",
-            "participant_assignment": "none",
-            "current_batch_transport": "none",
-            "routed_result_collective": "none",
-        }
-        policy = "fully_replicated_local"
-        selected = mirrored
-    else:
-        expected = {
-            "assignment": "logical_position_resident",
-            "current_batch_transport": "none",
-        }
-        policy = "logical_position_resident"
-        selected = resident
-
-    for record in selected:
+    expected = {
+        "execution_policy": "static_owner_grouped",
+        "assignment": "static_owner",
+        "runtime_grouping": "runtime_table",
+        "row_execution_policy": "participant_assigned",
+        "current_batch_transport": "none",
+    }
+    policy = "static_owner_grouped"
+    for record in static_owner:
         tags = record.get("tags") or {}
         if not isinstance(tags, Mapping):
             return LLEPVerifierPolicyValidation(

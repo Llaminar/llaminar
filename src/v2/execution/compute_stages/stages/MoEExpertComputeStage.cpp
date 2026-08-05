@@ -2061,8 +2061,8 @@ namespace llaminar2
                 return false;
         }
 
-        if (params_.use_runtime_prefill_grouping &&
-            !initializeMoERuntimeTableForGroupedPrefill())
+        if (params_.use_runtime_row_grouping &&
+            !initializeMoERuntimeTableForGroupedRows())
         {
             LOG_ERROR("[MoEExpertComputeStage] Failed to prepare persistent "
                       "runtime grouping state before graph capture"
@@ -4646,9 +4646,9 @@ namespace llaminar2
         return participant_count;
     }
 
-    bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedPrefill()
+    bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedRows()
     {
-        moe_prefill_runtime_grouping_available_ = false;
+        moe_runtime_row_grouping_available_ = false;
         const bool fully_replicated_local_runtime_grouping =
             params_.routed_row_execution_policy ==
                 RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
@@ -4665,7 +4665,7 @@ namespace llaminar2
                 RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
             hasFixedTopologyPrefillExpertMask();
-        if (!params_.use_runtime_prefill_grouping ||
+        if (!params_.use_runtime_row_grouping ||
             !params_.moe_runtime_table ||
             params_.layer_idx < 0 ||
             params_.seq_len <= 1 ||
@@ -4710,7 +4710,7 @@ namespace llaminar2
 
         moe_runtime_layer_ = runtime_table->deviceLayerState(params_.layer_idx);
         const auto &state = runtime_table->hostLayerState(params_.layer_idx);
-        moe_prefill_runtime_grouping_available_ =
+        moe_runtime_row_grouping_available_ =
             moe_runtime_layer_ &&
             state.expert_count == static_cast<uint32_t>(params_.num_experts) &&
             state.top_k == static_cast<uint32_t>(params_.top_k) &&
@@ -4723,7 +4723,7 @@ namespace llaminar2
             state.expert_offsets &&
             state.grouped_token_ids &&
             state.grouped_route_weights;
-        return moe_prefill_runtime_grouping_available_;
+        return moe_runtime_row_grouping_available_;
     }
 
     bool MoEExpertComputeStage::initializeFixedTopologyGroupedPrefill()
@@ -4914,7 +4914,7 @@ namespace llaminar2
 
         const bool supports_llep_prefill =
             params_.seq_len > 1 &&
-            params_.use_runtime_prefill_grouping &&
+            params_.use_runtime_row_grouping &&
             params_.moe_runtime_table &&
             params_.prefill_llep_tp_ctx &&
             supportsGroupedPrefillExecutionBackend(params_.device_id);
@@ -4930,10 +4930,10 @@ namespace llaminar2
                supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id);
     }
 
-    bool MoEExpertComputeStage::canUseRuntimePrefillGrouping() const
+    bool MoEExpertComputeStage::canUseRuntimeRowGrouping() const
     {
-        if (!params_.use_runtime_prefill_grouping ||
-            !moe_prefill_runtime_grouping_available_ ||
+        if (!params_.use_runtime_row_grouping ||
+            !moe_runtime_row_grouping_available_ ||
             !params_.moe_runtime_table ||
             !moe_runtime_layer_ ||
             params_.seq_len <= 1)
@@ -5642,17 +5642,17 @@ namespace llaminar2
                       "an explicit stage-owned compute stream is required");
             return false;
         }
-        if (params_.use_runtime_prefill_grouping && !canUseRuntimePrefillGrouping())
+        if (params_.use_runtime_row_grouping && !canUseRuntimeRowGrouping())
         {
             auto *self = const_cast<MoEExpertComputeStage *>(this);
-            if (!self->initializeMoERuntimeTableForGroupedPrefill())
+            if (!self->initializeMoERuntimeTableForGroupedRows())
             {
                 LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
                           "runtime prefill grouping requested but runtime scratch is unavailable");
                 return false;
             }
         }
-        const bool runtime_grouping = canUseRuntimePrefillGrouping();
+        const bool runtime_grouping = canUseRuntimeRowGrouping();
         uint64_t fixed_topology_trace_sequence = 0;
         IBackend *assignment_trace_backend = nullptr;
         void *assignment_trace_stream = nullptr;
@@ -5741,7 +5741,7 @@ namespace llaminar2
                             params_.routed_row_execution_policy)
                      << " runtime_grouping=" << perfBool(runtime_grouping)
                      << " masked_grouping=" << perfBool(masked_grouping)
-                     << " requested_runtime_grouping=" << perfBool(params_.use_runtime_prefill_grouping)
+                     << " requested_runtime_grouping=" << perfBool(params_.use_runtime_row_grouping)
                      << " has_full_local_ownership=" << perfBool(hasFullLocalExpertOwnership())
                      << " expert_mask_all_enabled=" << perfBool(expertMaskAllEnabled())
                      << " participant_id=" << params_.my_socket_id
@@ -5896,6 +5896,35 @@ namespace llaminar2
                      {"top_k", std::to_string(top_k)}});
             }
             if (groups_prepared &&
+                params_.force_grouped_verifier_prefill_for_decode &&
+                !fully_replicated_local_rows &&
+                params_.routed_assignment_policy ==
+                    RoutedExpertAssignmentPolicy::StaticOwner)
+            {
+                /*
+                 * Current-batch LLEP is an ordinary-prefill policy. The
+                 * economical verifier target keeps whole experts on their
+                 * static owners and runs the grouped runtime-table kernel,
+                 * with the graph's apportioned routed-expert result
+                 * collective combining participant outputs afterward.
+                 */
+                PerfStatsCollector::addCounter(
+                    "moe_routed_execution",
+                    "static_owner_grouped_verifier_calls",
+                    1.0,
+                    "verifier",
+                    params_.device_id.toString(),
+                    {{"stage", "moe_expert_grouped_rows"},
+                     {"execution_policy", "static_owner_grouped"},
+                     {"assignment", "static_owner"},
+                     {"runtime_grouping", "runtime_table"},
+                     {"row_execution_policy", "participant_assigned"},
+                     {"current_batch_transport", "none"},
+                     {"layer", std::to_string(params_.layer_idx)},
+                     {"seq_len", std::to_string(seq_len)},
+                     {"top_k", std::to_string(top_k)}});
+            }
+            if (groups_prepared &&
                 !trace_runtime_assignment("after_group"))
             {
                 return false;
@@ -5906,32 +5935,6 @@ namespace llaminar2
             {
                 const auto &runtime_state =
                     params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-                const auto &moe_env = debugEnv().moe_rebalance;
-                const uint64_t routed_rows =
-                    static_cast<uint64_t>(std::max(0, seq_len)) *
-                    static_cast<uint64_t>(std::max(0, top_k));
-                const uint64_t min_routed_rows =
-                    moe_env.llep_prefill_min_routed_rows;
-                if (!params_.force_grouped_verifier_prefill_for_decode &&
-                    min_routed_rows > 0ULL &&
-                    routed_rows < min_routed_rows)
-                {
-                    PerfStatsCollector::addCounter(
-                        "moe_rebalance",
-                        "device_rebalance_llep_prefill_policy_skips",
-                        1.0,
-                        "prefill",
-                        params_.device_id.toString(),
-                        {{"stage", "moe_expert_grouped_prefill"},
-                         {"reason", "insufficient_routed_rows"},
-                         {"layer", std::to_string(params_.layer_idx)},
-                         {"seq_len", std::to_string(seq_len)},
-                         {"top_k", std::to_string(top_k)},
-                         {"routed_rows", std::to_string(routed_rows)},
-                         {"min_routed_rows", std::to_string(min_routed_rows)}});
-                    return groups_prepared;
-                }
-
                 if (requestsTransferBackedCurrentBatchPrefillLLEP())
                 {
                     if (!hasTransferBackedPrefillLLEP())
@@ -6314,7 +6317,7 @@ namespace llaminar2
         // MoE kernel must exist and have pre-allocated grouping + scratch
         if (!moe_kernel_)
             return false;
-        if (params_.use_runtime_prefill_grouping && !canUseRuntimePrefillGrouping())
+        if (params_.use_runtime_row_grouping && !canUseRuntimeRowGrouping())
             return false;
         if (usesPublishedFixedTopologyMaskGrouping() &&
             fixed_topology_mask_publication_state_ !=
@@ -6396,7 +6399,7 @@ namespace llaminar2
     bool MoEExpertComputeStage::usesPublishedFixedTopologyMaskGrouping() const
     {
         /*
-         * `use_runtime_prefill_grouping` is a required route, not a preference:
+         * `use_runtime_row_grouping` is a required route, not a preference:
          * executeFixedTopologyGroupedPrefill() hard-fails if its persistent
          * runtime table or scratch is unavailable.  Therefore it is both safe
          * and necessary to choose the placement source from the requested
@@ -6404,7 +6407,7 @@ namespace llaminar2
          * to the fixed mask when runtime initialization fails would hide a
          * broken device-resident LLEP contract.
          */
-        return !params_.use_runtime_prefill_grouping &&
+        return !params_.use_runtime_row_grouping &&
                usesMaskedFixedTopologyPrefill();
     }
 
@@ -6756,10 +6759,10 @@ namespace llaminar2
             break;
         }
 
-        const bool runtime_prefill_requested =
-            params_.use_runtime_prefill_grouping;
-        const bool runtime_prefill_ready =
-            canUseRuntimePrefillGrouping();
+        const bool runtime_row_grouping_requested =
+            params_.use_runtime_row_grouping;
+        const bool runtime_row_grouping_ready =
+            canUseRuntimeRowGrouping();
         const bool fixed_preflight =
             supportsFixedTopologyPrefillGraphCapturePreflight();
         const bool runtime_decode_ready =
@@ -6776,8 +6779,8 @@ namespace llaminar2
             << " forced_grouped_verifier="
             << perfBool(params_.force_grouped_verifier_prefill_for_decode)
             << " route="
-            << (runtime_prefill_requested
-                    ? "runtime_table_prefill"
+            << (runtime_row_grouping_requested
+                    ? "runtime_table_grouped_rows"
                     : (params_.seq_len == 1 &&
                                !params_.force_grouped_verifier_prefill_for_decode
                            ? "runtime_table_decode"
@@ -6790,9 +6793,9 @@ namespace llaminar2
             << " fixed_mask_consumed="
             << perfBool(usesPublishedFixedTopologyMaskGrouping())
             << " fixed_mask_publication=" << mask_publication
-            << " runtime_prefill_requested="
-            << perfBool(runtime_prefill_requested)
-            << " runtime_prefill_ready=" << perfBool(runtime_prefill_ready)
+            << " runtime_row_grouping_requested="
+            << perfBool(runtime_row_grouping_requested)
+            << " runtime_row_grouping_ready=" << perfBool(runtime_row_grouping_ready)
             << " runtime_layer=" << perfBool(moe_runtime_layer_ != nullptr)
             << " runtime_table=" << perfBool(params_.moe_runtime_table != nullptr)
             << " runtime_decode_initialized="

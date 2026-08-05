@@ -4,9 +4,10 @@
  *
  * These tests are the quality gate for the GPU MoE rebalancing sprint target:
  * one LocalTP routed expert domain with two CUDA/NCCL or ROCm/RCCL
- * participants in the current fixtures, phase-split dense policy, and fp16 TP
- * allreduce transport. The runner path is generic for LocalTP domains with two
- * or more participants.
+ * participants in the current fixtures, dense tensor parallelism in both
+ * phases, apportioned routed experts, explicit assignment policies, and fp16
+ * TP allreduce transport. The runner path is generic for LocalTP domains with
+ * two or more participants.
  */
 
 #include <gtest/gtest.h>
@@ -97,8 +98,19 @@ namespace
         };
     }
 
+    enum class ExpertOverlayPolicyScenario
+    {
+        DynamicResidencyMaintenance,
+        CurrentBatchLLEP,
+    };
+
     struct ExpertOverlayParityConfig : TestConfig
     {
+        ExpertOverlayPolicyScenario policy_scenario =
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance;
+        /** Typed replica policy copied into both direct and rank runners. */
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
         MoERebalanceRuntimeConfig moe_rebalance;
         int max_seq_len = 4096;
         bool decode_snapshots_only = false;
@@ -106,25 +118,49 @@ namespace
     };
 
     /**
-     * @brief Require long-context parity to exercise its named rebalance path.
+     * @brief Require long-context parity to exercise its named overlay policy.
      *
-     * Token parity alone cannot distinguish a healthy Dynamic/LLEP lane from a
-     * graph that never planned or applied expert movement. These assertions
-     * consume request-local PerfStats after the generic parity epilogue has
-     * published the final device status. They deliberately validate planner,
-     * transport/apply, and health counters independently so a future failure
-     * identifies the missing phase.
+     * Token parity alone cannot distinguish a healthy Dynamic-maintenance or
+     * current-batch LLEP lane from a graph that never planned its named work.
+     * These assertions consume request-local PerfStats after the generic parity
+     * epilogue has published final device status. They deliberately validate
+     * the policy-specific planner plus shared transport/apply health so a future
+     * failure identifies the missing axis.
      *
      * @param config Concrete backend and MoE runtime policy under test.
-     * @param records Request-local maintenance records collected during the
+     * @param records Request-local overlay records collected during the
      *        prefill plus 32 committed decode steps.
      */
-    void expectLongContextMoERebalancePerfPath(
+    void expectLongContextExpertOverlayPerfPath(
         const ExpertOverlayParityConfig &config,
         const std::vector<PerfStatRecord> &records)
     {
         const std::string context =
-            config.name + " long-context rebalance";
+            config.name + " long-context expert overlay";
+
+        if (config.policy_scenario ==
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP)
+        {
+            expectLLEPPrefillWorkRedistributionPositive(records, context);
+            for (const char *error_counter : {
+                     "device_rebalance_copy_missing_source_descriptors",
+                     "device_rebalance_apply_missing_source_descriptors",
+                     "device_rebalance_copy_missing_destination_slots",
+                     "device_rebalance_apply_missing_destination_slots",
+                     "device_rebalance_copy_descriptor_mismatches",
+                     "device_rebalance_apply_descriptor_mismatches",
+                     "device_rebalance_copy_invalid_plan_entries",
+                     "device_rebalance_apply_invalid_plan_entries",
+                     "device_rebalance_controller_last_error_code"})
+            {
+                expectPerfCounterZero(
+                    records,
+                    "moe_rebalance",
+                    error_counter,
+                    context);
+            }
+            return;
+        }
 
         expectPerfCounterPositive(
             records,
@@ -169,29 +205,7 @@ namespace
             "device_rebalance_wave_applied_layer_count_total",
             context);
 
-        if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
-        {
-            expectDynamicRebalancePlacementPositive(records, context);
-        }
-        else if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP)
-        {
-            expectLLEPPrefillWorkRedistributionPositive(records, context);
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_planned_arrivals",
-                context);
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_copy_copied_arrivals",
-                context);
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_apply_applied_arrivals",
-                context);
-        }
+        expectDynamicRebalancePlacementPositive(records, context);
 
         for (const char *error_counter : {
                  "device_rebalance_copy_missing_source_descriptors",
@@ -217,7 +231,7 @@ namespace
         std::vector<ParityDeviceType> devices,
         Collective backend,
         const std::string &snapshot_dir,
-        MoERebalanceRuntimeMode rebalance_mode)
+        ExpertOverlayPolicyScenario policy_scenario)
     {
         ExpertOverlayParityConfig config;
         config.name = name;
@@ -230,24 +244,46 @@ namespace
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = KVCachePrecision::FP16;
         config.decode_steps = 3;
-        config.moe_rebalance.mode = rebalance_mode;
-        config.moe_rebalance.window_size = 4;
-        config.moe_rebalance.max_window_size = 4;
-        config.moe_rebalance.window_growth_factor = 1.0f;
-        config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
-        config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
-        config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
-        config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
-        config.moe_rebalance.dynamic_min_window_activations = 0;
-        config.moe_rebalance.device_min_load_spread_improvement = 0;
-        config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
-        config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
-        config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
-        config.moe_rebalance.device_maintenance_slack_tokens = 0;
-        config.moe_rebalance.device_min_maintenance_period_tokens = 4;
-        config.moe_rebalance.device_initial_maintenance_period_tokens = 4;
+        config.policy_scenario = policy_scenario;
+        config.moe_hot_expert_cache.kind =
+            MoEHotExpertCacheConfig::Kind::Off;
+        config.moe_rebalance.mode =
+            policy_scenario ==
+                    ExpertOverlayPolicyScenario::DynamicResidencyMaintenance
+                ? MoERebalanceRuntimeMode::Dynamic
+                : MoERebalanceRuntimeMode::Off;
+        if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+        {
+            config.moe_rebalance.window_size = 4;
+            config.moe_rebalance.max_window_size = 4;
+            config.moe_rebalance.window_growth_factor = 1.0f;
+            config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+            config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+            config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+            config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+            config.moe_rebalance.dynamic_min_window_activations = 0;
+            config.moe_rebalance.device_min_load_spread_improvement = 0;
+            config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+            config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+            config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+            config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+            config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+            config.moe_rebalance.device_maintenance_slack_tokens = 0;
+            config.moe_rebalance.device_min_maintenance_period_tokens = 4;
+            config.moe_rebalance.device_initial_maintenance_period_tokens = 4;
+        }
+        if (policy_scenario == ExpertOverlayPolicyScenario::CurrentBatchLLEP)
+        {
+            config.moe_routed_prefill = RoutedExpertPrefillRuntimeConfig{
+                .assignment_window_tokens = 0,
+                .least_loaded_min_routed_rows = 0,
+                .llep_alpha_numerator = 1,
+                .llep_alpha_denominator = 1,
+                .llep_lambda_numerator = 13,
+                .llep_lambda_denominator = 10,
+                .llep_enable_balanced_skip = true,
+            };
+        }
         config.moe_rebalance.release_raw_expert_weights = true;
         config.graph_snapshot_policy.enabled = true;
         config.graph_snapshot_policy.require_graph_execution_on_gpu = true;
@@ -278,90 +314,80 @@ namespace
         config.max_seq_len = 4096;
         config.decode_snapshots_only = true;
         config.require_prompt_metadata_match = true;
-        const auto rebalance_mode = config.moe_rebalance.mode;
-        if (rebalance_mode != MoERebalanceRuntimeMode::Dynamic &&
-            rebalance_mode != MoERebalanceRuntimeMode::LLEP)
+        if (config.policy_scenario ==
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance)
         {
-            throw std::invalid_argument(
-                "long-context expert-overlay parity requires Dynamic or LLEP rebalance mode");
+            config.moe_rebalance_exercise.enabled = true;
+            config.moe_rebalance_exercise.require_device_side_controller = true;
+            config.moe_rebalance_exercise.request_every_decode_steps = 4;
+            config.moe_rebalance_exercise.min_decode_steps = 8;
+            config.moe_rebalance_exercise.require_movement_epoch_advance = true;
+            config.moe_rebalance_exercise.min_movement_epoch_delta = 1;
         }
-
-        /*
-         * Both planners are maintained at the same committed decode boundary.
-         * Keeping this exercise mode-independent is important: a token-parity
-         * pass cannot prove that either planner launched, transferred payloads,
-         * or published its device-owned result.
-         */
-        config.moe_rebalance_exercise.enabled = true;
-        config.moe_rebalance_exercise.require_device_side_controller = true;
-        config.moe_rebalance_exercise.request_every_decode_steps = 4;
-        config.moe_rebalance_exercise.min_decode_steps = 8;
-        config.moe_rebalance_exercise.require_movement_epoch_advance = true;
-        config.moe_rebalance_exercise.min_movement_epoch_delta = 1;
         return config;
     }
 
     const std::vector<ExpertOverlayParityConfig> kQwen36MoEExpertOverlayConfigs = {
         baseConfig(
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport",
+            "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
             {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
             Collective::NCCL,
             "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-            MoERebalanceRuntimeMode::Dynamic),
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
         baseConfig(
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport",
+            "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
             {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
             Collective::RCCL,
             "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-            MoERebalanceRuntimeMode::Dynamic),
+            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
         baseConfig(
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_FP16Transport",
+            "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport",
             {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
             Collective::NCCL,
             "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-            MoERebalanceRuntimeMode::LLEP),
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP),
         baseConfig(
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_FP16Transport",
+            "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport",
             {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
             Collective::RCCL,
             "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-            MoERebalanceRuntimeMode::LLEP),
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP),
         longContextConfig(
             baseConfig(
-                "Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport",
+                "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
                 {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
                 Collective::NCCL,
-                "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_phase_split_long_decode_snapshots",
-                MoERebalanceRuntimeMode::Dynamic),
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_phase_split_long_decode_snapshots"),
+                "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_maintenance_dense_tp_long_decode_snapshots",
+                ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
+            "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
+            "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_maintenance_dense_tp_long_decode_snapshots"),
         longContextConfig(
             baseConfig(
-                "Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport",
+                "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
                 {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
                 Collective::RCCL,
-                "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_phase_split_long_decode_snapshots",
-                MoERebalanceRuntimeMode::Dynamic),
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_phase_split_long_decode_snapshots"),
+                "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_maintenance_dense_tp_long_decode_snapshots",
+                ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
+            "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
+            "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_maintenance_dense_tp_long_decode_snapshots"),
         longContextConfig(
             baseConfig(
-                "Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport",
+                "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
                 {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
                 Collective::NCCL,
-                "pytorch_qwen36_moe_expert_overlay_cuda2_llep_phase_split_long_decode_snapshots",
-                MoERebalanceRuntimeMode::LLEP),
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_cuda2_llep_phase_split_long_decode_snapshots"),
+                "pytorch_qwen36_moe_expert_overlay_cuda2_current_batch_llep_dense_tp_long_decode_snapshots",
+                ExpertOverlayPolicyScenario::CurrentBatchLLEP),
+            "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
+            "pytorch_qwen36_moe_expert_overlay_cuda2_current_batch_llep_dense_tp_long_decode_snapshots"),
         longContextConfig(
             baseConfig(
-                "Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport",
+                "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
                 {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
                 Collective::RCCL,
-                "pytorch_qwen36_moe_expert_overlay_rocm2_llep_phase_split_long_decode_snapshots",
-                MoERebalanceRuntimeMode::LLEP),
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_rocm2_llep_phase_split_long_decode_snapshots"),
+                "pytorch_qwen36_moe_expert_overlay_rocm2_current_batch_llep_dense_tp_long_decode_snapshots",
+                ExpertOverlayPolicyScenario::CurrentBatchLLEP),
+            "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
+            "pytorch_qwen36_moe_expert_overlay_rocm2_current_batch_llep_dense_tp_long_decode_snapshots"),
     };
 
     PlanFactory planFactoryForConfig(const TestConfig &config)
@@ -424,13 +450,24 @@ namespace
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> makePlannedOverlayPlan(
-        const TestConfig &config,
+        const ExpertOverlayParityConfig &config,
         const ModelContext &ctx)
     {
         const auto metadata = metadataFromModel(ctx);
         auto requested = planFactoryForConfig(config)();
         if (!requested)
             throw std::invalid_argument("overlay parity plan factory returned null");
+
+        for (auto &domain : requested->domains)
+        {
+            domain.routed_decode_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
+            domain.routed_prefill_assignment_policy =
+                config.policy_scenario ==
+                        ExpertOverlayPolicyScenario::CurrentBatchLLEP
+                    ? RoutedExpertAssignmentPolicy::LeastLoadedResident
+                    : RoutedExpertAssignmentPolicy::StaticOwner;
+        }
 
         auto planned = MoERoutedExpertPlacementPlanner::plan(*requested, metadata).planned_plan;
 
@@ -580,6 +617,7 @@ namespace
             << "|resolved_snapshot_dir=" << resolved_config.snapshot_dir
             << "|resolved_prefill_tokens=" << resolved_config.token_ids.size()
             << "|rebalance=" << static_cast<int>(config.moe_rebalance.mode)
+            << "|policy_scenario=" << static_cast<int>(config.policy_scenario)
             << "|backend=" << static_cast<int>(config.collective)
             << "|activation=" << static_cast<int>(config.activation_precision)
             << "|kv=" << static_cast<int>(config.kv_cache_precision)
@@ -729,13 +767,15 @@ protected:
             GTEST_SKIP() << "Qwen3.6 homogeneous LocalTP expert overlay parity "
                          << "must run with -np 1 (got " << world_size << ")";
         }
-        if (GetParam().moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP)
+        if (GetParam().policy_scenario ==
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP)
         {
-            setScopedParityEnvOverride("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full");
-            setScopedParityEnvOverride("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0");
             setScopedParityEnvOverride("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS", "32");
             setScopedParityEnvOverride("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS", "32");
         }
+        setScopedParityEnvOverride(
+            "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER",
+            "0");
         mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
 
         Base::SetUp();
@@ -916,6 +956,8 @@ protected:
         inf_config.use_mapped_memory = true;
         inf_config.moe_routed_expert_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
+        inf_config.moe_hot_expert_cache = GetParam().moe_hot_expert_cache;
+        inf_config.moe_routed_prefill = GetParam().moe_routed_prefill;
         inf_config.moe_rebalance = GetParam().moe_rebalance;
 
         const RoutedExpertDomain *domain = nullptr;
@@ -964,6 +1006,8 @@ protected:
         rank_config.use_mapped_memory = inf_config.use_mapped_memory;
         rank_config.moe_routed_expert_plan = overlay_plan_;
         rank_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
+        rank_config.moe_hot_expert_cache = GetParam().moe_hot_expert_cache;
+        rank_config.moe_routed_prefill = GetParam().moe_routed_prefill;
         rank_config.moe_rebalance = GetParam().moe_rebalance;
 
         {
@@ -1063,11 +1107,11 @@ TEST(Qwen36MoEExpertOverlayPerfStats, DynamicMovementAcceptsEitherProductionDeci
 TEST(Qwen36MoEExpertOverlayPipelineCacheKey, IncludesResolvedPrefillShapeAndGraphBucketPolicy)
 {
     auto config = baseConfig(
-        "Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport",
+        "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
         {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
         Collective::NCCL,
         "snapshots_a",
-        MoERebalanceRuntimeMode::Dynamic);
+        ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
 
     ParityConfig short_prompt;
     short_prompt.snapshot_dir = "snapshots_a";
@@ -1140,11 +1184,11 @@ TEST(Qwen36MoEExpertOverlayPipelineCacheKey, RunnerCacheClearDropsPotentiallyStr
 TEST(Qwen36MoEExpertOverlayPipelineCacheKey, RawExpertReleaseForbidsModelContextReuseForNewRunner)
 {
     auto config = baseConfig(
-        "Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport",
+        "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
         {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
         Collective::NCCL,
         "snapshots_a",
-        MoERebalanceRuntimeMode::Dynamic);
+        ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
 
     config.moe_rebalance.release_raw_expert_weights = true;
     EXPECT_FALSE(overlayModelContextCanSeedNewRunner(config))
@@ -1223,7 +1267,7 @@ TEST_P(Qwen36MoEExpertOverlayParityTest, LongContextDecodeParity)
     }
     const auto rebalance_records =
         PerfStatsCollector::snapshot({"moe_rebalance"});
-    expectLongContextMoERebalancePerfPath(
+    expectLongContextExpertOverlayPerfPath(
         GetParam(),
         rebalance_records);
     {

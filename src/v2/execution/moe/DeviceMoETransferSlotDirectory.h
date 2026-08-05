@@ -82,9 +82,12 @@ namespace llaminar2
          * @brief Compute durable transfer-slot demand for the runtime domain.
          *
          * Layer windows are scheduling cursors, not storage ownership domains.
-         * Prefill LLEP, prefix rehydration, and rolling decode maintenance all
-         * publish descriptors into the same runtime table and must therefore
-         * resolve one directory with one physical slot identity space. Basing
+         * Current-batch LLEP, prefix rehydration, and Dynamic durable residency
+         * maintenance all publish descriptors into the same runtime table and
+         * must therefore resolve one directory with one physical slot identity
+         * space. LLEP assignments are request-transient while Dynamic updates
+         * survive into future requests; sharing transfer storage does not merge
+         * those lifecycles. Basing
          * capacity on `layer_window_start` or `layer_window_count` lets two
          * graphs for the same table create differently sized directories and
          * later reinterpret a valid slot ID against the wrong allocation.

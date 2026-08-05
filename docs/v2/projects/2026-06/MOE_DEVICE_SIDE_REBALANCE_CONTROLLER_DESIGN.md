@@ -4,72 +4,71 @@
 
 For homogeneous GPU LocalTP MoE domains (`cuda+nccl` or `rocm+rccl`, degree
 2+), rebalance publish/apply must be graph-capturable and device-owned. The
-host may initialize topology, allocate slots, prewarm graphs, and poll
-diagnostics, but it must not participate in the steady-state histogram sync,
-placement decision, transfer publication, or runtime-table apply path.
+host may initialize topology, allocate persistent slots, and prewarm graphs,
+but it must not participate in histogram synchronization, policy decisions,
+transfer publication, runtime-table application, or request-time graph control.
 
 This design is for same-backend domains only. Cross-vendor movement and mixed
 CUDA/ROCm expert domains remain out of scope for this controller.
 
-## Policy Taxonomy
+## Active Policy Taxonomy
 
-Expert ownership, rebalance strategy, routed-row assignment, and optional cache
-residency are separate axes.
+This taxonomy supersedes the earlier composite `static | dynamic | llep`
+runtime-mode model. The axes below are independent and must remain separately
+typed in configuration, graph policy, PerfStats, and benchmark names.
 
-Base routed-expert storage for this sprint is `ApportionedExperts`: every routed
-expert has one whole-expert owner in the domain. `ReplicatedExperts` means every
-participant owns every expert. `ShardedExperts` means every participant owns a
-shard of each expert and must combine partial outputs. These are storage
-policies, not rebalance algorithms.
+| Axis | Choices | Canonical LLEP tuning choice |
+|---|---|---|
+| Dense/shared trunk placement | replicated, tensor parallel, phase-specific policies | tensor parallel |
+| Routed expert storage/compute | replicated whole experts, apportioned whole experts, tensor-sharded experts | apportioned whole experts |
+| Routed phase policy | uniform or an explicitly phase-split storage policy | uniform |
+| Grouped verifier/decode row assignment | static owner or another explicitly implemented decode policy | static owner |
+| Ordinary prefill row assignment | static owner or least-loaded resident | least-loaded resident |
+| MTP terminal norm/head | vocabulary sharded or mirrored full vocabulary | mirrored full vocabulary |
+| Durable residency maintenance | off, observe, dynamic | off |
+| Hot expert replica cache | off, count, percentage | off |
+| Same-backend collective transport | NCCL or RCCL | one complete captured graph |
 
-`Static`
-: Experts are apportioned once and never moved by runtime policy. Histograms may
-  still be collected for diagnostics. This is the correctness and performance
-  baseline.
+`LLEP` means only `RoutedExpertAssignmentPolicy::LeastLoadedResident` for the
+current ordinary-prefill batch. It preserves router top-k expert choices and
+route weights, assigns routed row spans under capacity and transfer-cost
+constraints, and makes any required foreign expert payload available for that
+batch. It does not imply durable ownership migration, decode-time balancing,
+expert replication, a hot cache, or a dense placement policy.
 
-`Dynamic`
-: One shared strategy across CPU, CUDA, and ROCm. It observes decode histogram
-  windows and periodically rebalances the hottest routed experts so participant
-  load is closer to even. CPU applies the policy through the host controller;
-  homogeneous GPU domains apply the same policy through the device-side
-  controller, async compact payload transfer, and arrival machinery. The current
-  controller defaults start with a 256-token window, grow by
-  `window_growth_factor=1.5`, and cap at `max_window_size=4096`. If we want a
-  strict quadratic/power schedule, make it an explicit `window_schedule`
-  setting. The current implementation uses the shared paired ownership-swap
-  helper and rejects empty/no-payback moves.
+The routed-prefill runtime configuration owns LLEP's assignment window, routed
+row threshold, alpha, lambda, and balanced-skip controls. The production
+threshold currently selects static-owner EP when `M * top_k < 8192` and
+current-batch least-loaded assignment at or above `8192`. This is an explicit
+work-regime policy, not error recovery. A zero threshold is only for focused
+tests that force the transfer path.
 
-`LLEP`
-: Least-Loaded Expert Parallelism from arXiv:2601.17111. LLEP preserves the
-  router's exact top-k expert choices and route weights, then assigns current
-  routed row spans to least-loaded participants under capacity, minimum-chunk,
-  and transfer-cost constraints. The paper-aligned prefill/batched path imports
-  foreign expert payloads for the current batch/window without changing
-  long-lived ownership. The current decode proxy uses the same shared LLEP
-  planner to choose durable whole-expert ownership transfers when
-  `HotExpertReplicaCache` is disabled, or additional resident arrivals when the
-  cache layer is enabled.
+Durable residency maintenance is separately `Off`, `Observe`, or `Dynamic`.
+`Observe` gathers the same evidence without mutating placement. `Dynamic`
+changes long-lived whole-expert residency from device-owned rolling histograms.
+Neither mode is LLEP, and neither is enabled in the canonical LLEP economy row.
+Likewise, `HotExpertReplicaCache` is an independent residency layer whose
+admission and retention economics require a separate benchmark.
 
-`Observe`
-: A measurement mode, not a rebalance strategy. It should exercise the same
-  histogram and perfstat path as the selected strategy but must not mutate
-  placement or cache state.
+The canonical CUDA2/ROCm2 LLEP target is therefore:
 
-`HotExpertReplicaCache`
-: An optional residency layer, not an algorithm choice. A top-10 or
-  percentage-based cache can retain additional whole-expert copies after Dynamic
-  or LLEP decides an expert is worth importing. The router may use resident cache
-  contents to choose the least-loaded valid participant for an already-selected
-  expert, but it must never change router top-k choices. Cache admission and
-  retention need separate payback thresholds.
+```text
+dense/shared=tensor-parallel
+routed-compute=apportioned
+routed-phase=uniform
+routed-decode-assignment=static-owner
+routed-prefill-assignment=least-loaded-resident
+mtp-terminal-head=mirrored-full-vocabulary
+residency-maintenance=off
+hot-expert-cache=off
+transport=full-graph NCCL/RCCL
+```
 
-The target configuration shape is:
+All measurements below this section predate parts of this disambiguation.
+Treat their mode labels as historical evidence only; the active policy tuple
+above and the code-owned typed configuration are normative.
 
-- `expert_rebalance_strategy = static | dynamic | llep`
-- `hot_expert_cache = off | top_k:N | percent:P`
-- `rebalance_observe = true|false`
-
-## Target Graph Shape
+## Durable Residency-Maintenance Graph Shape
 
 The controller is a graph-visible state machine split across decode and
 maintenance lanes.
@@ -85,11 +84,10 @@ maintenance lanes.
 3. `RootPlanAssignments`: the elected root participant consumes gathered state,
    computes the selected strategy on device, and publishes epoch-stamped command
    buffers. Non-root participants execute graph-symmetric no-op/validation work.
-4. `ScheduleTransferBucket`: the root/device scheduler chooses the smallest
-   pre-captured payload bucket that can hold the planned arrivals. Until device
-   graph launch or graph conditionals are available, host code may submit an
-   already-captured bucket graph from device-published scheduler state, but it
-   must not compute policy or mutate placement.
+4. `ScheduleTransferBucket`: the device scheduler chooses the smallest
+   pre-captured payload bucket that can hold the planned arrivals. Request-time
+   host observation or graph submission is forbidden; the complete same-backend
+   execution is represented inside the captured device transaction.
 5. `StageArrivals`: sources pack only planned, non-empty NativeVNNI payloads
    into compact staging slots. NCCL/RCCL grouped collectives move the selected
    bucket lane. Destinations unpack into local preallocated transfer slots.

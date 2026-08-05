@@ -591,6 +591,78 @@ namespace llaminar2
         return std::clamp(2, config.min_depth, effective_max_depth);
     }
 
+    /**
+     * @enum MTPTerminalHeadPolicy
+     * @brief Physical placement of final normalization and vocabulary projection weights.
+     *
+     * This policy names only the small terminal surface used to turn verifier
+     * hidden rows into logits. It does not replicate attention blocks, dense
+     * FFNs, shared MoE experts, or routed experts. Keeping that distinction in
+     * the type prevents a request for a mirrored MTP head from accidentally
+     * selecting the much larger replicated-dense or replicated-expert modes.
+     */
+    enum class MTPTerminalHeadPolicy
+    {
+        /** Keep the model's vocabulary-sharded final norm and LM-head layout. */
+        VocabularySharded,
+
+        /**
+         * Mirror the complete final norm and full-vocabulary LM head on every
+         * LocalTP participant so verifier sampling needs no tiny logits
+         * collective.
+         */
+        MirroredFullVocabulary,
+    };
+
+    /**
+     * @brief Return the canonical CLI/YAML spelling for an MTP head policy.
+     * @param policy Typed terminal-head placement policy.
+     * @return Stable lowercase configuration token.
+     */
+    inline const char *mtpTerminalHeadPolicyToString(
+        MTPTerminalHeadPolicy policy)
+    {
+        switch (policy)
+        {
+        case MTPTerminalHeadPolicy::VocabularySharded:
+            return "vocabulary-sharded";
+        case MTPTerminalHeadPolicy::MirroredFullVocabulary:
+            return "mirrored-full-vocabulary";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Parse one canonical MTP terminal-head placement policy.
+     * @param value CLI or YAML token.
+     * @return Typed policy, or `std::nullopt` for an unknown spelling.
+     */
+    inline std::optional<MTPTerminalHeadPolicy> parseMTPTerminalHeadPolicy(
+        const std::string &value)
+    {
+        const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "vocabulary-sharded")
+            return MTPTerminalHeadPolicy::VocabularySharded;
+        if (normalized == "mirrored-full-vocabulary")
+            return MTPTerminalHeadPolicy::MirroredFullVocabulary;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Return whether a policy binds a complete terminal head locally.
+     * @param policy Typed terminal-head placement policy.
+     * @return True only for the full-vocabulary mirrored policy.
+     */
+    inline bool mtpTerminalHeadIsMirrored(
+        MTPTerminalHeadPolicy policy) noexcept
+    {
+        return policy == MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    }
+
+    /**
+     * @struct MTPRuntimeConfig
+     * @brief Runtime and graph-layout policy for speculative MTP execution.
+     */
     struct MTPRuntimeConfig
     {
         bool enabled = false;
@@ -609,20 +681,15 @@ namespace llaminar2
         int max_request_batch = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
         /**
-         * @brief Mirror the full verifier LM/MTP head on every LocalTP device.
+         * @brief Placement of the verifier's final norm and LM-head weights.
          *
-         * LocalTP speculative verification normally inherits the primary
-         * column-parallel LM-head layout, which makes each child produce only a
-         * vocab shard and forces a tiny cross-device logits collective before
-         * sampling.  When this flag is enabled, LocalTP verifier/sidecar graphs
-         * bind a replicated full-vocab terminal head instead.  This is the
-         * production LocalTP MTP path: each participant can reduce and publish
-         * its own resident verifier outcome without rank-owned compact metadata
-         * uploads or tiny logits collectives.  The mode is intentionally
-         * LocalTP-only: GlobalTP still needs true cross-rank vocab ownership and
-         * candidate coordination.
+         * LocalTP defaults to a complete mirrored terminal head because a tiny
+         * vocabulary collective is generally less economical than duplicating
+         * this narrow projection. GlobalTP validates its own cross-rank
+         * vocabulary ownership and rejects an inapplicable LocalTP policy.
          */
-        bool mirror_full_head_for_local_tp = true;
+        MTPTerminalHeadPolicy terminal_head_policy =
+            MTPTerminalHeadPolicy::MirroredFullVocabulary;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
     };
@@ -811,7 +878,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Explicit composite of the four independent MoE execution axes.
+     * @brief Explicit composite of the five independent MoE execution axes.
      *
      * This is a value object rather than a combinatorial enum.  Callers can
      * inspect each policy directly, so adding a dense policy cannot accidentally
@@ -830,17 +897,22 @@ namespace llaminar2
         RoutedExpertPhasePolicy routed_phase =
             RoutedExpertPhasePolicy::Uniform;
 
-        ///< Scheduling among eligible complete routed-expert residents.
-        RoutedExpertAssignmentPolicy routed_assignment =
+        ///< Decode/grouped-verifier scheduling among complete residents.
+        RoutedExpertAssignmentPolicy routed_decode_assignment =
             RoutedExpertAssignmentPolicy::StaticOwner;
 
-        /** @brief Compare all three independent policy axes. */
+        ///< Ordinary prefill scheduling among complete residents.
+        RoutedExpertAssignmentPolicy routed_prefill_assignment =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+
+        /** @brief Compare all five independent policy axes. */
         bool operator==(const MoEExecutionPolicy &other) const
         {
             return dense == other.dense &&
                    routed_compute == other.routed_compute &&
                    routed_phase == other.routed_phase &&
-                   routed_assignment == other.routed_assignment;
+                   routed_decode_assignment == other.routed_decode_assignment &&
+                   routed_prefill_assignment == other.routed_prefill_assignment;
         }
 
         /** @brief Return true when any independent policy axis differs. */
@@ -945,13 +1017,17 @@ namespace llaminar2
      * @brief Build an explicit MoE execution policy without deriving aliases.
      * @param dense_policy Dense/shared-model distribution policy.
      * @param routed_compute Routed-expert weight and GEMM distribution policy.
-     * @param routed_assignment Complete-resident row scheduling policy.
-     * @return Value object containing the three arguments unchanged.
+     * @param routed_decode_assignment Decode/grouped-verifier row scheduling.
+     * @param routed_prefill_assignment Ordinary-prefill row scheduling.
+     * @param routed_phase Phase-specific execution over resident weights.
+     * @return Value object containing every argument unchanged.
      */
     inline MoEExecutionPolicy makeMoEExecutionPolicy(
         DenseParallelPolicy dense_policy,
         RoutedExpertComputePolicy routed_compute,
-        RoutedExpertAssignmentPolicy routed_assignment =
+        RoutedExpertAssignmentPolicy routed_decode_assignment =
+            RoutedExpertAssignmentPolicy::StaticOwner,
+        RoutedExpertAssignmentPolicy routed_prefill_assignment =
             RoutedExpertAssignmentPolicy::StaticOwner,
         RoutedExpertPhasePolicy routed_phase =
             RoutedExpertPhasePolicy::Uniform)
@@ -960,14 +1036,15 @@ namespace llaminar2
             .dense = dense_policy,
             .routed_compute = routed_compute,
             .routed_phase = routed_phase,
-            .routed_assignment = routed_assignment,
+            .routed_decode_assignment = routed_decode_assignment,
+            .routed_prefill_assignment = routed_prefill_assignment,
         };
     }
 
     /**
      * @brief Render every MoE execution axis for logs and diagnostics.
      * @param policy Explicit policy value object to describe.
-     * @return Comma-separated canonical key/value pairs for all four axes.
+     * @return Comma-separated canonical key/value pairs for all five axes.
      */
     inline std::string describeMoEExecutionPolicy(const MoEExecutionPolicy &policy)
     {
@@ -977,8 +1054,12 @@ namespace llaminar2
             << routedExpertComputePolicyToString(policy.routed_compute)
             << ",routed_phase="
             << routedExpertPhasePolicyToString(policy.routed_phase)
-            << ",routed_assignment="
-            << routedExpertAssignmentPolicyToString(policy.routed_assignment);
+            << ",routed_decode_assignment="
+            << routedExpertAssignmentPolicyToString(
+                   policy.routed_decode_assignment)
+            << ",routed_prefill_assignment="
+            << routedExpertAssignmentPolicyToString(
+                   policy.routed_prefill_assignment);
         return out.str();
     }
 
@@ -1061,14 +1142,86 @@ namespace llaminar2
     }
 
     /**
-     * @brief MoE decode histogram and dynamic rebalance configuration.
+     * @brief Runtime policy for ordinary routed-expert prefill assignment.
+     *
+     * This policy is deliberately independent of durable expert-residency
+     * maintenance. Paper-style LLEP assigns the current batch; Dynamic
+     * maintenance alters future residency. Neither policy may implicitly
+     * enable, disable, or configure the other.
+     */
+    struct RoutedExpertPrefillRuntimeConfig
+    {
+        /**
+         * @brief Stable token window used by current-batch assignment.
+         *
+         * Zero keeps one ordinary prefill transaction unless prefix cache
+         * supplies a block boundary. Positive values split prefill into fixed
+         * graph-stable windows of this many real tokens.
+         */
+        int assignment_window_tokens = 0;
+
+        /**
+         * @brief Minimum routed rows required for least-loaded prefill.
+         *
+         * Ordinary prefill contributes `M * top_k` routed rows. Below this
+         * explicit economy boundary graph lowering selects canonical
+         * StaticOwner expert parallelism; at or above it a requested
+         * LeastLoadedResident policy is always full, graph-captured,
+         * transfer-backed current-batch LLEP. Zero forces LLEP for every
+         * ordinary prefill shape and is useful for focused integration tests.
+         */
+        uint64_t least_loaded_min_routed_rows = 8192;
+
+        /**
+         * @brief Numerator of the current-batch LLEP capacity multiplier.
+         *
+         * Together with `llep_alpha_denominator`, this bounds the routed rows
+         * assigned to one participant relative to the balanced batch load.
+         * Both terms must be positive so the planner has one defined capacity.
+         */
+        uint32_t llep_alpha_numerator = 1;
+        /**
+         * @brief Denominator of the current-batch LLEP capacity multiplier.
+         *
+         * The ratio is represented as integers to keep CUDA and ROCm planning
+         * decisions exact and independent of floating-point contraction.
+         */
+        uint32_t llep_alpha_denominator = 1;
+        /**
+         * @brief Numerator of the balanced-static-owner skip threshold.
+         *
+         * This ratio defines when current owner load is already economical
+         * enough that transport cannot repay its cost for the current batch.
+         */
+        uint32_t llep_lambda_numerator = 13;
+        /**
+         * @brief Denominator of the balanced-static-owner skip threshold.
+         *
+         * Both lambda terms must be positive. Integer comparison preserves the
+         * same branch decision on CPU, CUDA, and ROCm.
+         */
+        uint32_t llep_lambda_denominator = 10;
+        /**
+         * @brief Permit standard static-owner EP when current-batch loads are balanced.
+         *
+         * Focused movement tests may disable this to require a non-owner span,
+         * but production keeps the economical no-movement decision available.
+         */
+        bool llep_enable_balanced_skip = true;
+    };
+
+    /**
+     * @brief Durable routed-expert residency maintenance mode.
+     *
+     * Current-batch least-loaded prefill (LLEP) is deliberately absent: it is
+     * selected by `RoutedExpertAssignmentPolicy` on the routed domain and does
+     * not imply persistent ownership mutation.
      */
     enum class MoERebalanceRuntimeMode
     {
         Off,
         Observe,
-        Dynamic,
-        LLEP
+        Dynamic
     };
 
     inline const char *moeRebalanceRuntimeModeToString(MoERebalanceRuntimeMode mode)
@@ -1081,8 +1234,6 @@ namespace llaminar2
             return "observe";
         case MoERebalanceRuntimeMode::Dynamic:
             return "dynamic";
-        case MoERebalanceRuntimeMode::LLEP:
-            return "llep";
         default:
             return "unknown";
         }
@@ -1102,11 +1253,16 @@ namespace llaminar2
             return MoERebalanceRuntimeMode::Observe;
         if (lower == "dynamic" || lower == "on" || lower == "true")
             return MoERebalanceRuntimeMode::Dynamic;
-        if (lower == "llep" || lower == "least-loaded-resident")
-            return MoERebalanceRuntimeMode::LLEP;
         return std::nullopt;
     }
 
+    /**
+     * @brief Durable ownership observation and migration configuration.
+     *
+     * These settings control cross-window expert residency maintenance. They
+     * never choose decode/grouped row assignment or current-batch prefill LLEP;
+     * those are independent typed domain policies.
+     */
     struct MoERebalanceRuntimeConfig
     {
         MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Dynamic;
@@ -1131,49 +1287,29 @@ namespace llaminar2
         uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
         uint32_t device_max_post_wave_load_spread_per_mille = 100;
         /**
-         * @brief Least-loaded-resident capacity multiplier numerator.
+         * @brief Tokens added to a full routing window before maintenance is due.
          *
-         * LLEP computes a per-participant routed-row capacity of
-         * ceil(total_rows * alpha_numerator / (participants * alpha_denominator)).
-         * The production default of 1/1 keeps the original mean-load capacity;
-         * integration probes can tighten alpha to force real transfer-backed
-         * migrations when they explicitly validate that path.
+         * `-1` delegates to the process-wide diagnostic default.  Any
+         * non-negative CLI/YAML value is graph policy and therefore takes
+         * precedence over environment diagnostics.
          */
-        uint32_t device_llep_alpha_numerator = 1;
-        /**
-         * @brief Least-loaded-resident capacity multiplier denominator.
-         *
-         * Must remain non-zero.  Larger denominators make the planner spill more
-         * rows to non-owner participants, which is useful for deterministic
-         * migration coverage but should be tuned carefully for production.
-         */
-        uint32_t device_llep_alpha_denominator = 1;
-        /// Lambda numerator used by the balanced-static-owner skip check.
-        uint32_t device_llep_lambda_numerator = 13;
-        /// Lambda denominator used by the balanced-static-owner skip check.
-        uint32_t device_llep_lambda_denominator = 10;
-        /**
-         * @brief Permit LLEP to select the standard owner policy when loads are already balanced.
-         *
-         * The default preserves the economical production behavior.  Tests that
-         * are specifically named as LLEP migration coverage disable this so a
-         * green result cannot silently be a static-owner no-op.
-         */
-        bool device_llep_enable_balanced_skip = true;
         int device_maintenance_slack_tokens = -1;
-        int device_min_maintenance_period_tokens = -1;
-        int device_initial_maintenance_period_tokens = -1;
         /**
-         * @brief Fixed request-local prefill assignment window for LLEP.
+         * @brief Lower bound for recurring device-owned maintenance cadence.
          *
-         * A value greater than zero makes OrchestrationRunner split LLEP
-         * prefill into deterministic windows of this many real tokens.  The
-         * window is the first-class owner of current-window LLEP model-runtime
-         * state; prefix cache restores must align cached blocks to it.  Zero
-         * preserves the historical single-forward window unless prefix cache
-         * supplies an explicit block boundary.
+         * Zero disables the additional floor, leaving `window_size + slack`
+         * as the recurring period. `-1` delegates to the diagnostic default.
          */
-        int prefill_window_tokens = 0;
+        int device_min_maintenance_period_tokens = -1;
+        /**
+         * @brief Token period for the first device-owned maintenance decision.
+         *
+         * Zero selects the recurring period. `-1` delegates to the diagnostic
+         * default. A benchmark that claims to exercise Dynamic residency
+         * maintenance must set this explicitly so a short decode cannot
+         * silently miss maintenance.
+         */
+        int device_initial_maintenance_period_tokens = -1;
         bool release_raw_expert_weights = false;
     };
 
@@ -1230,6 +1366,9 @@ namespace llaminar2
         /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
+        /// Ordinary prefill assignment economy and graph-window policy.
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
+
         /// MoE rebalance runtime configuration.
         MoERebalanceRuntimeConfig moe_rebalance;
 
@@ -1254,6 +1393,7 @@ namespace llaminar2
             FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
             RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned,
             MoEHotExpertCacheConfig moe_hot_expert_cache = {},
+            RoutedExpertPrefillRuntimeConfig moe_routed_prefill = {},
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
             MTPRuntimeConfig mtp = {},
@@ -1268,6 +1408,7 @@ namespace llaminar2
             rc.fused_attention_backend = fused_backend;
             rc.routed_expert_compute_policy = routed_expert_compute_policy;
             rc.moe_hot_expert_cache = moe_hot_expert_cache;
+            rc.moe_routed_prefill = moe_routed_prefill;
             rc.moe_rebalance = moe_rebalance;
             rc.prefix_cache = prefix_cache;
             rc.mtp = mtp;

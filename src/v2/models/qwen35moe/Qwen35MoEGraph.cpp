@@ -1160,7 +1160,8 @@ namespace llaminar2
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
             fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
             fields.push_back({prefix + ".routed_phase_policy", routedExpertPhasePolicyToString(domain.routed_phase_policy)});
-            fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
+            fields.push_back({prefix + ".routed_decode_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_decode_assignment_policy)});
+            fields.push_back({prefix + ".routed_prefill_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_prefill_assignment_policy)});
             fields.push_back({prefix + ".owner_rank", domain.owner_rank ? std::to_string(*domain.owner_rank) : "-1"});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.ranks);
@@ -1177,7 +1178,8 @@ namespace llaminar2
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
             fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
             fields.push_back({prefix + ".routed_phase_policy", routedExpertPhasePolicyToString(domain.routed_phase_policy)});
-            fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
+            fields.push_back({prefix + ".routed_decode_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_decode_assignment_policy)});
+            fields.push_back({prefix + ".routed_prefill_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_prefill_assignment_policy)});
             fields.push_back({prefix + ".owner_rank", std::to_string(domain.owner_rank)});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.world_ranks);
@@ -1265,7 +1267,8 @@ namespace llaminar2
                 fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
                 fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
                 fields.push_back({prefix + ".routed_phase_policy", routedExpertPhasePolicyToString(domain.routed_phase_policy)});
-                fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
+                fields.push_back({prefix + ".routed_decode_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_decode_assignment_policy)});
+                fields.push_back({prefix + ".routed_prefill_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_prefill_assignment_policy)});
                 fields.push_back({prefix + ".primary_participant", domain.primary_participant.toString()});
                 fields.push_back({prefix + ".primary_device", domain.primary_device.to_string()});
                 fields.push_back({prefix + ".primary_world_rank", std::to_string(domain.primary_world_rank)});
@@ -1619,18 +1622,6 @@ namespace llaminar2
             if (moe_env.device_rebalance_maintenance_graph)
                 return tp_ctx.supportsRawAllgatherOnStreamGraphCapture();
             return false;
-        }
-
-        int parsedLLEPPrefillTransferMode()
-        {
-            const int mode = debugEnv().moe_rebalance.llep_prefill_transfer_mode;
-            if (mode < 0 || mode > 1)
-            {
-                throw std::runtime_error(
-                    "Invalid LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE "
-                    "(valid: resident-only, full)");
-            }
-            return mode;
         }
 
         bool isHomogeneousGpuLocalTPRebalanceDomain(
@@ -1987,12 +1978,13 @@ namespace llaminar2
     /**
      * @brief Locate the domain-wide decode maintenance binding for a device.
      *
-     * The graph builder creates two different classes of graph-side rebalance
-     * binding when long-context prefix-cache MTP runs with phase-split LLEP:
-     * a decode-maintenance binding and one or more layer-local prefill LLEP
-     * transfer bindings.  The async maintenance graph is a decode-time control
-     * loop, so it must use the decode binding even when a prefill binding was
-     * inserted later into the unordered binding map.
+     * The graph builder can create two independent classes of graph-side
+     * transfer binding when Dynamic residency maintenance and current-batch
+     * LLEP are both selected explicitly: one domain-wide decode-maintenance
+     * binding and one or more layer-local prefill-transfer bindings. The async
+     * maintenance graph is a decode-time control loop, so it must use the
+     * decode binding even when a prefill binding was inserted later into the
+     * unordered binding map.
      */
     const Qwen35MoEGraph::GraphSideRebalanceBinding *
     Qwen35MoEGraph::findDeviceMoERebalanceMaintenanceBinding(DeviceId device) const
@@ -2952,10 +2944,6 @@ namespace llaminar2
             config_.moe.num_experts,
             /*dynamic_rebalance_enabled=*/true);
         const auto &env = debugEnv();
-        const int llep_prefill_transfer_mode =
-            parsedLLEPPrefillTransferMode();
-        const bool require_full_llep_prefill_transfer =
-            llep_prefill_transfer_mode == 1;
         const bool prefix_runtime_device_rehydration =
             prefixRuntimeRehydrationGraphActive() &&
             !mtp_sidecar_context &&
@@ -2970,21 +2958,21 @@ namespace llaminar2
                      << " first_layer=" << layer_idx);
         }
         const bool llep_prefill_requested =
-            !mtp_sidecar_context &&
-            total_tokens > 1 &&
+            ordinary_prefill_graph &&
             routed_row_execution_policy ==
                 RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
-            config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            config_.moe.routed_prefill_assignment_policy ==
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
         const uint64_t llep_prefill_routed_rows =
             llep_prefill_requested
                 ? static_cast<uint64_t>(std::max(0, total_tokens)) *
                       static_cast<uint64_t>(std::max(0, config_.moe.top_k))
                 : 0ULL;
         const uint64_t llep_prefill_min_routed_rows =
-            env.moe_rebalance.llep_prefill_min_routed_rows;
+            config_.moe.routed_prefill_config
+                .least_loaded_min_routed_rows;
         const bool llep_prefill_cost_gate_passed =
             !llep_prefill_requested ||
-            grouped_main_verifier_layer ||
             llep_prefill_min_routed_rows == 0ULL ||
             llep_prefill_routed_rows >= llep_prefill_min_routed_rows;
         const bool llep_prefill_enabled =
@@ -3005,15 +2993,12 @@ namespace llaminar2
                 *local_tp_ctx,
                 device,
                 config_.tp_device_idx);
-        if (llep_prefill_enabled &&
-            require_full_llep_prefill_transfer &&
-            !grouped_main_verifier_layer &&
-            !llep_prefill_transport_supported)
+        if (llep_prefill_enabled && !llep_prefill_transport_supported)
         {
             throw std::runtime_error(
-                "Qwen35 MoE LLEP prefill transfer mode 'full' requires "
+                "Qwen35 MoE least-loaded prefill requires "
                 "a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
-                device.to_string() + "; refusing resident-only or host fallback");
+                device.to_string());
         }
         if (prefix_runtime_device_rehydration &&
             !prefix_runtime_rehydration_transport_supported)
@@ -3028,7 +3013,9 @@ namespace llaminar2
              total_tokens > 1 &&
              !llep_prefill_enabled)
                 ? RoutedExpertAssignmentPolicy::StaticOwner
-                : config_.moe.routed_assignment_policy;
+                : (grouped_main_verifier_layer || total_tokens == 1
+                       ? config_.moe.routed_decode_assignment_policy
+                       : config_.moe.routed_prefill_assignment_policy);
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
         const bool device_side_graph_rebalance_candidate =
@@ -3051,9 +3038,7 @@ namespace llaminar2
          * resident-only.
          */
         const bool current_batch_llep_transfer_candidate =
-            (require_full_llep_prefill_transfer &&
-             llep_prefill_transport_supported &&
-             !grouped_main_verifier_layer);
+            llep_prefill_transport_supported;
         const bool prefill_llep_transfer_candidate =
             current_batch_llep_transfer_candidate ||
             prefix_runtime_rehydration_transport_supported;
@@ -3385,8 +3370,16 @@ namespace llaminar2
             rebalance_config.participant_count = static_cast<uint32_t>(local_tp_ctx ? local_tp_ctx->degree() : 0);
             rebalance_config.root_participant = static_cast<uint32_t>(
                 overlay_plan ? continuationRootParticipant(*overlay_plan) : 0);
+            const int current_batch_assignment_window =
+                config_.moe.routed_prefill_config.assignment_window_tokens > 0
+                    ? config_.moe.routed_prefill_config.assignment_window_tokens
+                    : total_tokens;
             rebalance_config.window_size_tokens = static_cast<uint32_t>(
-                std::max(1, config_.moe.rebalance_config.window_size));
+                std::max(
+                    1,
+                    current_batch_llep_transfer_candidate
+                        ? current_batch_assignment_window
+                        : config_.moe.rebalance_config.window_size));
             const int maintenance_slack =
                 config_.moe.rebalance_config.device_maintenance_slack_tokens >= 0
                     ? std::max(
@@ -3452,7 +3445,8 @@ namespace llaminar2
                     config_.moe.rebalance_config.dynamic_min_window_activations,
                     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
             rebalance_config.routed_assignment_policy =
-                config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident
+                config_.moe.routed_decode_assignment_policy ==
+                        RoutedExpertAssignmentPolicy::LeastLoadedResident
                     ? kDeviceMoERebalanceAssignmentLeastLoadedResident
                     : kDeviceMoERebalanceAssignmentStaticOwner;
             rebalance_config.min_load_spread_improvement = deviceRebalanceConfigOrEnv(
@@ -3483,15 +3477,15 @@ namespace llaminar2
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
                 env.moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille);
             rebalance_config.llep_alpha_numerator =
-                std::max<uint32_t>(1u, config_.moe.rebalance_config.device_llep_alpha_numerator);
+                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_alpha_numerator);
             rebalance_config.llep_alpha_denominator =
-                std::max<uint32_t>(1u, config_.moe.rebalance_config.device_llep_alpha_denominator);
+                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_alpha_denominator);
             rebalance_config.llep_lambda_numerator =
-                std::max<uint32_t>(1u, config_.moe.rebalance_config.device_llep_lambda_numerator);
+                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_lambda_numerator);
             rebalance_config.llep_lambda_denominator =
-                std::max<uint32_t>(1u, config_.moe.rebalance_config.device_llep_lambda_denominator);
+                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_lambda_denominator);
             rebalance_config.llep_enable_balanced_skip =
-                config_.moe.rebalance_config.device_llep_enable_balanced_skip ? 1u : 0u;
+                config_.moe.routed_prefill_config.llep_enable_balanced_skip ? 1u : 0u;
             rebalance_config.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
             if (rebalance_config.max_hot_replicas_per_participant > 0)
@@ -3578,7 +3572,9 @@ namespace llaminar2
                 const bool dynamic_ownership_transfers =
                     config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
                 const bool routed_assignment_payload_transfers =
-                    config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                    config_.moe.routed_decode_assignment_policy ==
+                        RoutedExpertAssignmentPolicy::LeastLoadedResident ||
+                    current_batch_llep_transfer_candidate;
                 graph_rebalance_transfer_mode =
                     selectGraphRebalanceTransferMode(
                         *local_tp_ctx,
@@ -5122,11 +5118,11 @@ namespace llaminar2
                             "Qwen35 MoE graph failed to initialize masked LocalTP LLEP prefill runtime table for layer " +
                             std::to_string(layer_idx) + " on " + device.to_string());
                     }
-                    expert_params.use_runtime_prefill_grouping = true;
+                    expert_params.use_runtime_row_grouping = true;
                 }
 
                 if (prefill_llep_transfer_candidate &&
-                    (expert_params.use_runtime_prefill_grouping ||
+                    (expert_params.use_runtime_row_grouping ||
                      prefix_runtime_device_rehydration))
                 {
                     attachPrefillLLEPTransferBinding(
@@ -5168,7 +5164,7 @@ namespace llaminar2
                     }
                     if (total_tokens > 1 && forceGroupedMoEVerifierPrefill(device))
                     {
-                        expert_params.use_runtime_prefill_grouping = true;
+                        expert_params.use_runtime_row_grouping = true;
                     }
                 }
                 else if (moe_runtime_table &&
@@ -5205,7 +5201,7 @@ namespace llaminar2
                     if (total_tokens > 1 &&
                         forceGroupedMoEVerifierPrefill(device))
                     {
-                        expert_params.use_runtime_prefill_grouping = true;
+                        expert_params.use_runtime_row_grouping = true;
                     }
                 }
 
@@ -5871,7 +5867,7 @@ namespace llaminar2
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
                 if (prefill_llep_transfer_candidate &&
-                    (expert_params.use_runtime_prefill_grouping ||
+                    (expert_params.use_runtime_row_grouping ||
                      prefix_runtime_device_rehydration))
                 {
                     attachPrefillLLEPTransferBinding(

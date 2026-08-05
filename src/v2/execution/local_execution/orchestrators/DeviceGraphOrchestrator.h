@@ -4952,8 +4952,10 @@ namespace llaminar2
         /**
          * @brief Materialize the production MoE maintenance graph before workspace publication.
          *
-         * Dynamic/LLEP maintenance is a real member of the device graph family,
-         * even though its scheduler launches it only after a decode window closes.
+         * Dynamic residency maintenance is a real member of the device graph
+         * family, even though its scheduler launches it only after a decode
+         * window closes. Current-batch LLEP is ordinary prefill graph work and
+         * does not enter this maintenance family.
          * Building and retaining that exact graph during eager family declaration
          * makes every workspace name, capacity, collective node, and captured
          * pointer visible before generation one is allocated.

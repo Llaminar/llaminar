@@ -136,7 +136,9 @@ namespace llaminar2
             RoutedExpertComputePolicy::Unspecified;
         RoutedExpertPhasePolicy routed_phase_policy =
             RoutedExpertPhasePolicy::Unspecified;
-        RoutedExpertAssignmentPolicy routed_assignment_policy =
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::Unspecified;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
             RoutedExpertAssignmentPolicy::Unspecified;
 
         // Phase 5: domain scope and rank ownership
@@ -445,7 +447,10 @@ namespace llaminar2
         /// Bounded hot remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
-        /// Decode histogram / dynamic rebalance settings promoted from env knobs.
+        /// Ordinary prefill assignment economy and graph-window policy.
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
+
+        /// Durable expert-residency observation and maintenance policy.
         MoERebalanceRuntimeConfig moe_rebalance;
 
         /// Optional same-layer routed-expert placement plan.

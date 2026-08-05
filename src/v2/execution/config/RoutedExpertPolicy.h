@@ -9,12 +9,14 @@
  * weight layouts, collective requirements, and state-publication lifetimes, so
  * they must never share an enum value or rely on a caller-specific meaning.
  *
- * This header defines the two orthogonal routed-expert policy axes used by
+ * This header defines the orthogonal routed-expert policy axes used by
  * configuration, graph construction, and runtime execution:
  *
  * 1. RoutedExpertComputePolicy says where an expert's weights and GEMMs live.
- * 2. RoutedExpertAssignmentPolicy says which eligible resident participant
- *    executes a router-selected row.
+ * 2. RoutedExpertPhasePolicy says whether a phase executes one assigned copy
+ *    or every complete local replica.
+ * 3. RoutedExpertWorkloadAssignmentPolicy says which eligible complete
+ *    resident executes a row independently for decode and prefill work.
  *
  * Dense/shared-model tensor parallelism is intentionally not represented here;
  * it is described independently by DenseParallelPolicy.
@@ -106,6 +108,45 @@ namespace llaminar2
          */
         LeastLoadedResident,
     };
+
+    /**
+     * @struct RoutedExpertWorkloadAssignmentPolicy
+     * @brief Independent row-assignment policy for decode and prefill graphs.
+     *
+     * Grouped MTP verification is decode work even though one verifier graph
+     * carries several rows. Treating every `M > 1` graph as prefill used to
+     * lower costly LLEP planning into tiny speculative transactions. This
+     * value object makes the semantic phase explicit before graph lowering:
+     * serial decode and grouped verifier rows use @ref decode, while ordinary
+     * prompt/batched-prefill rows use @ref prefill.
+     */
+    struct RoutedExpertWorkloadAssignmentPolicy
+    {
+        ///< Assignment for M=1 decode and grouped serial-equivalent verification.
+        RoutedExpertAssignmentPolicy decode =
+            RoutedExpertAssignmentPolicy::Unspecified;
+
+        ///< Assignment for ordinary prefill and explicitly batched prompt work.
+        RoutedExpertAssignmentPolicy prefill =
+            RoutedExpertAssignmentPolicy::Unspecified;
+
+        /** @brief Compare both workload-specific assignment axes. */
+        bool operator==(
+            const RoutedExpertWorkloadAssignmentPolicy &other) const = default;
+    };
+
+    /**
+     * @brief Resolve an omitted assignment to canonical-owner expert parallelism.
+     * @param policy Possibly unspecified assignment policy.
+     * @return `StaticOwner` for an omitted policy; otherwise the input value.
+     */
+    inline RoutedExpertAssignmentPolicy resolveRoutedExpertAssignmentPolicy(
+        RoutedExpertAssignmentPolicy policy) noexcept
+    {
+        return policy == RoutedExpertAssignmentPolicy::Unspecified
+                   ? RoutedExpertAssignmentPolicy::StaticOwner
+                   : policy;
+    }
 
     /**
      * @enum RoutedExpertRowExecutionPolicy

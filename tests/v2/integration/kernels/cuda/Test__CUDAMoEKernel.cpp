@@ -18284,7 +18284,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPre
         params.routing_weights = routing_weights.get();
         params.output = output;
         params.moe_runtime_table = runtime_table;
-        params.use_runtime_prefill_grouping = runtime_table != nullptr;
+        params.use_runtime_row_grouping = runtime_table != nullptr;
         params.prepared_gate_gemm.assign(num_experts, nullptr);
         params.prepared_up_gemm.assign(num_experts, nullptr);
         params.prepared_down_gemm.assign(num_experts, nullptr);
