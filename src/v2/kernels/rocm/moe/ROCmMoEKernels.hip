@@ -240,6 +240,76 @@ namespace
         llaminar2::moe_runtime_abi::
             kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
+    /**
+     * @brief Publish request-final LLEP evidence without a host runtime mirror.
+     *
+     * The fixed one-block reduction scans each layer marker exactly once and
+     * combines integer counts through a deterministic shared-memory tree. It
+     * writes domain evidence into request row zero and clears the corresponding
+     * fields in all later rows, avoiding atomics and ambiguous batch accounting.
+     */
+    __global__ void
+    publish_current_batch_llep_evidence_to_generation_control_kernel(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
+        int layer_count,
+        int *__restrict__ generation_control,
+        int generation_control_stride,
+        int request_count,
+        int movement_layer_count_index,
+        int non_owner_assignment_layer_count_index)
+    {
+        constexpr int kEvidenceThreads = 256;
+        __shared__ uint32_t movement_counts[kEvidenceThreads];
+        __shared__ uint32_t non_owner_counts[kEvidenceThreads];
+
+        uint32_t movement_count = 0;
+        uint32_t non_owner_count = 0;
+        for (int layer = static_cast<int>(threadIdx.x);
+             layer < layer_count;
+             layer += static_cast<int>(blockDim.x))
+        {
+            const auto &runtime = runtime_layers[layer];
+            movement_count +=
+                runtime.current_batch_llep_movement_observed != 0u ? 1u : 0u;
+            non_owner_count +=
+                runtime.current_batch_llep_non_owner_assignment_observed != 0u
+                    ? 1u
+                    : 0u;
+        }
+
+        movement_counts[threadIdx.x] = movement_count;
+        non_owner_counts[threadIdx.x] = non_owner_count;
+        __syncthreads();
+        for (int offset = kEvidenceThreads / 2; offset > 0; offset >>= 1)
+        {
+            if (static_cast<int>(threadIdx.x) < offset)
+            {
+                movement_counts[threadIdx.x] +=
+                    movement_counts[threadIdx.x + offset];
+                non_owner_counts[threadIdx.x] +=
+                    non_owner_counts[threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+        {
+            for (int request = 0; request < request_count; ++request)
+            {
+                int *const control =
+                    generation_control + request * generation_control_stride;
+                control[movement_layer_count_index] =
+                    request == 0
+                        ? static_cast<int>(movement_counts[0])
+                        : 0;
+                control[non_owner_assignment_layer_count_index] =
+                    request == 0
+                        ? static_cast<int>(non_owner_counts[0])
+                        : 0;
+            }
+        }
+    }
+
     struct DeviceMoERebalanceConfigView
     {
         uint32_t magic;
@@ -13341,6 +13411,57 @@ __global__ void rocm_moe_weighted_add_kernel(
 
 extern "C"
 {
+
+bool hipMoE_publish_current_batch_llep_evidence_to_generation_control(
+    const void *runtime_layers,
+    int layer_count,
+    int *generation_control,
+    int generation_control_stride,
+    int request_count,
+    int movement_layer_count_index,
+    int non_owner_assignment_layer_count_index,
+    int device_idx,
+    void *stream)
+{
+    if (!runtime_layers || layer_count <= 0 || !generation_control ||
+        generation_control_stride <= 0 || request_count <= 0 ||
+        movement_layer_count_index < 0 ||
+        movement_layer_count_index >= generation_control_stride ||
+        non_owner_assignment_layer_count_index < 0 ||
+        non_owner_assignment_layer_count_index >= generation_control_stride ||
+        movement_layer_count_index == non_owner_assignment_layer_count_index ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    constexpr int kEvidenceThreads = 256;
+    hipLaunchKernelGGL(
+        publish_current_batch_llep_evidence_to_generation_control_kernel,
+        dim3(1),
+        dim3(kEvidenceThreads),
+        0,
+        static_cast<hipStream_t>(stream),
+        static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+        layer_count,
+        generation_control,
+        generation_control_stride,
+        request_count,
+        movement_layer_count_index,
+        non_owner_assignment_layer_count_index);
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "HIP current-batch LLEP evidence publication failed: %s\n",
+            hipGetErrorString(error));
+        return false;
+    }
+    return true;
+}
 
 bool hipMoE_gate_logits_single_token(
     const float *hidden, const float *gate_weights, float *logits,

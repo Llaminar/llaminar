@@ -52,7 +52,13 @@ namespace llaminar2
     namespace
     {
         constexpr char kMoEPrefixRuntimeMagic[8] = {'L', 'M', 'O', 'E', 'R', 'U', 'N', '1'};
-        constexpr uint32_t kMoEPrefixRuntimeVersion = 3;
+        /*
+         * Version 4 gives request-transient CurrentBatchLLEP prefill placement
+         * its own table key. Version 3 could serialize that placement under the
+         * durable decode key, so accepting it would reintroduce the exact
+         * cross-phase alias this schema revision makes structurally impossible.
+         */
+        constexpr uint32_t kMoEPrefixRuntimeVersion = 4;
 
         /**
          * @brief Return whether graph-captured mirrored-layer diagnostics are armed.
@@ -2022,6 +2028,63 @@ namespace llaminar2
         return selected;
     }
 
+    DeviceMoECurrentBatchLLEPEvidenceSource
+    Qwen35MoEGraph::deviceMoECurrentBatchLLEPEvidenceSource(
+        DeviceId device) const
+    {
+        DeviceMoECurrentBatchLLEPEvidenceSource selected{};
+        const IMoERuntimeTable *selected_table = nullptr;
+
+        for (const auto &[key, binding] : moe_graph_rebalance_bindings_)
+        {
+            (void)key;
+            if (binding.device_id != device ||
+                binding.role !=
+                    GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer)
+            {
+                continue;
+            }
+            if (!binding.moe_runtime_table ||
+                binding.moe_runtime_table->layerCount() <= 0)
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE current-batch LLEP evidence binding has no "
+                    "complete runtime table for " +
+                    device.to_string());
+            }
+
+            const auto *runtime_layers =
+                binding.moe_runtime_table->deviceLayerState(0);
+            const int layer_count =
+                binding.moe_runtime_table->layerCount();
+            if (!runtime_layers)
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE current-batch LLEP evidence binding has a "
+                    "null device runtime table for " +
+                    device.to_string());
+            }
+            if (selected_table &&
+                (selected_table != binding.moe_runtime_table ||
+                 selected.runtime_layers_device != runtime_layers ||
+                 selected.layer_count != layer_count))
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE current-batch LLEP bindings disagree on the "
+                    "canonical runtime table for " +
+                    device.to_string());
+            }
+
+            selected_table = binding.moe_runtime_table;
+            selected = DeviceMoECurrentBatchLLEPEvidenceSource{
+                .runtime_layers_device = runtime_layers,
+                .layer_count = layer_count,
+            };
+        }
+
+        return selected;
+    }
+
     ComputeGraph Qwen35MoEGraph::buildDeviceMoERebalanceMaintenanceGraph(
         DeviceId device)
     {
@@ -2370,7 +2433,8 @@ namespace llaminar2
             }
 
             /*
-             * Portable version 3 contains pointer-free logical placement.
+             * Portable version 4 contains pointer-free, role-scoped logical
+             * placement.
              * Transfer-slot descriptors are reconstructed from immutable owner
              * payloads by the dedicated captured rehydration transaction; blob
              * parsing must never consult a rolling slot directory whose bytes
@@ -2447,16 +2511,49 @@ namespace llaminar2
             config_.default_device.toString());
     }
 
-    IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
-                                                               int prefill_token_capacity,
-                                                               const std::string &key_suffix,
-                                                               int num_layers_override,
-                                                               bool register_decode_histogram)
+    std::string Qwen35MoEGraph::moeRuntimeTableKey(
+        DeviceId device,
+        const MoERuntimeTableIdentity &identity)
+    {
+        switch (identity.role)
+        {
+        case MoERuntimeTableRole::MainDecodeDurablePlacement:
+            if (identity.mtp_depth >= 0)
+            {
+                throw std::invalid_argument(
+                    "Durable main-decode MoE runtime identity cannot carry an MTP depth");
+            }
+            return device.to_string();
+        case MoERuntimeTableRole::CurrentBatchLLEPPrefill:
+            if (identity.mtp_depth >= 0)
+            {
+                throw std::invalid_argument(
+                    "Current-batch LLEP prefill runtime identity cannot carry an MTP depth");
+            }
+            return device.to_string() + "#current_batch_llep_prefill";
+        case MoERuntimeTableRole::MTPDepth:
+            if (identity.mtp_depth < 0)
+            {
+                throw std::invalid_argument(
+                    "MTP MoE runtime identity requires a non-negative depth");
+            }
+            return device.to_string() + "#mtp_depth" +
+                   std::to_string(identity.mtp_depth);
+        }
+        throw std::logic_error("Unknown MoE runtime table role");
+    }
+
+    IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(
+        DeviceId device,
+        const MoERuntimeTableIdentity &identity,
+        int prefill_token_capacity,
+        int num_layers_override,
+        bool register_decode_histogram)
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         (void)device;
+        (void)identity;
         (void)prefill_token_capacity;
-        (void)key_suffix;
         return nullptr;
 #else
         // Device-routed grouped MoE (decode + grouped prefill) is supported on any
@@ -2524,9 +2621,7 @@ namespace llaminar2
                         : 0));
         }
 
-        const std::string key = key_suffix.empty()
-                                    ? device.to_string()
-                                    : device.to_string() + "#" + key_suffix;
+        const std::string key = moeRuntimeTableKey(device, identity);
         auto it = moe_runtime_tables_.find(key);
         if (it != moe_runtime_tables_.end())
         {
@@ -2536,7 +2631,7 @@ namespace llaminar2
                 key,
                 it->second.get(),
                 register_decode_histogram);
-            if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
+            if (identity.role == MoERuntimeTableRole::MTPDepth)
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -2544,7 +2639,7 @@ namespace llaminar2
                     1.0,
                     "graph",
                     device.to_string(),
-                    {{"key_suffix", key_suffix},
+                    {{"runtime_table", key},
                      {"layers", std::to_string(table_layers)},
                      {"histogram_sync", "disabled"}});
             }
@@ -2559,7 +2654,10 @@ namespace llaminar2
         table_config.mirror_to_device = true;
         table_config.prefill_token_capacity = planned_route_rows;
         table_config.deferred_verifier_token_capacity =
-            key_suffix.empty() && config_.mtp.enabled ? verifier_rows : 0;
+            identity.role == MoERuntimeTableRole::MainDecodeDurablePlacement &&
+                    config_.mtp.enabled
+                ? verifier_rows
+                : 0;
         table_config.serial_route_scratch_arena = scratch_it->second;
 
         auto table = std::make_unique<MoERuntimeTable>(table_config);
@@ -2569,7 +2667,7 @@ namespace llaminar2
             ptr,
             register_decode_histogram);
         moe_runtime_tables_.emplace(key, std::move(table));
-        if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
+        if (identity.role == MoERuntimeTableRole::MTPDepth)
         {
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -2577,7 +2675,7 @@ namespace llaminar2
                 1.0,
                 "graph",
                 device.to_string(),
-                {{"key_suffix", key_suffix},
+                {{"runtime_table", key},
                  {"layers", std::to_string(table_layers)},
                  {"num_experts", std::to_string(config_.moe.num_experts)},
                  {"top_k", std::to_string(config_.moe.top_k)},
@@ -2887,9 +2985,6 @@ namespace llaminar2
         const int runtime_table_layers = use_mtp_runtime_table
                                              ? std::max(config_.n_layers, layer_idx + 1)
                                              : config_.n_layers;
-        const std::string runtime_table_suffix = use_mtp_runtime_table
-                                                     ? "mtp_depth" + std::to_string(mtp_depth_idx)
-                                                     : std::string{};
         const bool register_runtime_histogram = !use_mtp_runtime_table;
         const bool local_decode_layer =
             !mtp_sidecar_context &&
@@ -3050,6 +3145,10 @@ namespace llaminar2
         const bool prefill_llep_transfer_candidate =
             current_batch_llep_transfer_candidate ||
             prefix_runtime_rehydration_transport_supported;
+        const GraphSideRebalanceBindingRole prefill_transfer_binding_role =
+            current_batch_llep_transfer_candidate
+                ? GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer
+                : GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer;
         const bool graph_rebalance_transport_candidate =
             device_side_graph_rebalance_candidate ||
             prefill_llep_transfer_candidate;
@@ -3117,6 +3216,14 @@ namespace llaminar2
             masked_local_tp_overlay_decode_runtime_table ||
             full_local_tp_replicated_overlay_decode_runtime_table ||
             masked_local_tp_apportioned_decode_runtime_table;
+        const MoERuntimeTableIdentity runtime_table_identity{
+            .role = use_mtp_runtime_table
+                        ? MoERuntimeTableRole::MTPDepth
+                        : (current_batch_llep_transfer_candidate
+                               ? MoERuntimeTableRole::CurrentBatchLLEPPrefill
+                               : MoERuntimeTableRole::MainDecodeDurablePlacement),
+            .mtp_depth = use_mtp_runtime_table ? mtp_depth_idx : -1,
+        };
         if (total_tokens == 1 &&
             rocm_env.moe_grouped_decode &&
             rocm_env.moe_device_routed_decode &&
@@ -3124,8 +3231,8 @@ namespace llaminar2
         {
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
+                runtime_table_identity,
                 total_tokens,
-                runtime_table_suffix,
                 runtime_table_layers,
                 register_runtime_histogram_for_decode);
         }
@@ -3137,14 +3244,15 @@ namespace llaminar2
             // if an old environment still tries to disable grouped prefill;
             // otherwise the strict verifier row proof would fail closed before
             // reaching the rows under test.
-            // This table is prefill-only. It must not register as a decode
-            // histogram source, because hot-cache overlay decode may use the
-            // legacy host histogram path and never publish a runtime-table
-            // decode producer stream.
+            // Current-batch LLEP receives a prefill-only typed identity because
+            // its transfer-backed placement must not leak into static decode.
+            // Other main-prefill graphs may share the durable main table, but
+            // this construction path must never register a decode histogram
+            // producer: only a real decode/verifier graph owns that stream.
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
+                runtime_table_identity,
                 total_tokens,
-                runtime_table_suffix,
                 runtime_table_layers,
                 /*register_decode_histogram=*/false);
         }
@@ -3310,7 +3418,26 @@ namespace llaminar2
             std::string key = graphRebalanceDomainKey();
             if (prefill_llep_transfer_candidate)
             {
-                key += ":prefill_layer=";
+                /*
+                 * Prefix rehydration and current-batch LLEP intentionally
+                 * share the immutable transfer directory, but they are
+                 * different graph transactions with different evidence and
+                 * event lifetimes.  Giving each use an explicit logical key
+                 * prevents whichever graph happens to build first from
+                 * donating its policy or publication semantics to the other.
+                 */
+                switch (prefill_transfer_binding_role)
+                {
+                case GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer:
+                    key += ":current_batch_llep_layer=";
+                    break;
+                case GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer:
+                    key += ":prefix_runtime_rehydration_layer=";
+                    break;
+                case GraphSideRebalanceBindingRole::DecodeMaintenance:
+                    throw std::logic_error(
+                        "Qwen35 MoE prefill transfer key received decode-maintenance policy");
+                }
                 key += std::to_string(layer_idx);
             }
             return key;
@@ -3360,8 +3487,24 @@ namespace llaminar2
             }
             return workspace;
         };
-        auto makeGraphRebalanceConfig = [&]() -> DeviceMoERebalanceConfig
+        auto makeGraphRebalanceConfig =
+            [&](GraphSideRebalanceBindingRole purpose)
+            -> DeviceMoERebalanceConfig
         {
+            const bool current_batch_llep_policy =
+                purpose ==
+                GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer;
+            const bool decode_maintenance_policy =
+                purpose == GraphSideRebalanceBindingRole::DecodeMaintenance;
+            if (current_batch_llep_policy &&
+                config_.moe.routed_prefill_assignment_policy !=
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident)
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE current-batch LLEP binding requires the "
+                    "declarative least-loaded-resident prefill policy");
+            }
+
             auto deviceRebalanceConfigOrEnv =
                 [&](uint32_t config_value, const char *env_name, int env_value) -> uint32_t
             {
@@ -3385,11 +3528,16 @@ namespace llaminar2
             rebalance_config.window_size_tokens = static_cast<uint32_t>(
                 std::max(
                     1,
-                    current_batch_llep_transfer_candidate
+                    current_batch_llep_policy
                         ? current_batch_assignment_window
-                        : config_.moe.rebalance_config.window_size));
+                        : (decode_maintenance_policy
+                               ? config_.moe.rebalance_config.window_size
+                               : total_tokens)));
             const int maintenance_slack =
-                config_.moe.rebalance_config.device_maintenance_slack_tokens >= 0
+                !decode_maintenance_policy
+                    ? 0
+                    : config_.moe.rebalance_config
+                                  .device_maintenance_slack_tokens >= 0
                     ? std::max(
                           0,
                           config_.moe.rebalance_config
@@ -3404,7 +3552,9 @@ namespace llaminar2
                     static_cast<int>(rebalance_config.window_size_tokens) +
                         maintenance_slack);
             const int configured_minimum_period =
-                config_.moe.rebalance_config
+                !decode_maintenance_policy
+                    ? 0
+                    : config_.moe.rebalance_config
                             .device_min_maintenance_period_tokens >= 0
                     ? std::max(
                           0,
@@ -3421,7 +3571,9 @@ namespace llaminar2
                           configured_minimum_period)
                     : requested_maintenance_period;
             const int configured_initial_period =
-                config_.moe.rebalance_config
+                !decode_maintenance_policy
+                    ? 0
+                    : config_.moe.rebalance_config
                             .device_initial_maintenance_period_tokens >= 0
                     ? std::max(
                           0,
@@ -3439,61 +3591,151 @@ namespace llaminar2
                         ? configured_initial_period
                         : maintenance_period);
             rebalance_config.max_hot_replicas_per_participant = static_cast<uint32_t>(
-                std::min(hot_replica_cap, config_.moe.num_experts));
+                decode_maintenance_policy
+                    ? std::min(hot_replica_cap, config_.moe.num_experts)
+                    : 0);
             rebalance_config.dynamic_imbalance_threshold_per_mille =
-                config_.moe.rebalance_config.dynamic_imbalance_threshold_per_mille;
+                decode_maintenance_policy
+                    ? config_.moe.rebalance_config
+                          .dynamic_imbalance_threshold_per_mille
+                    : 0u;
             rebalance_config.dynamic_min_improvement_per_mille =
-                config_.moe.rebalance_config.dynamic_min_improvement_per_mille;
+                decode_maintenance_policy
+                    ? config_.moe.rebalance_config
+                          .dynamic_min_improvement_per_mille
+                    : 0u;
             rebalance_config.dynamic_max_swaps_per_layer =
-                config_.moe.rebalance_config.dynamic_max_swaps_per_layer;
+                decode_maintenance_policy
+                    ? config_.moe.rebalance_config.dynamic_max_swaps_per_layer
+                    : 0u;
             rebalance_config.dynamic_max_plan_entries_per_wave =
-                config_.moe.rebalance_config.dynamic_max_plan_entries_per_wave;
+                decode_maintenance_policy
+                    ? config_.moe.rebalance_config
+                          .dynamic_max_plan_entries_per_wave
+                    : 0u;
             rebalance_config.dynamic_min_window_activations =
                 static_cast<uint32_t>(std::min<uint64_t>(
-                    config_.moe.rebalance_config.dynamic_min_window_activations,
+                    decode_maintenance_policy
+                        ? config_.moe.rebalance_config
+                              .dynamic_min_window_activations
+                        : 0ULL,
                     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
-            rebalance_config.routed_assignment_policy =
-                config_.moe.routed_decode_assignment_policy ==
-                        RoutedExpertAssignmentPolicy::LeastLoadedResident
-                    ? kDeviceMoERebalanceAssignmentLeastLoadedResident
-                    : kDeviceMoERebalanceAssignmentStaticOwner;
-            rebalance_config.min_load_spread_improvement = deviceRebalanceConfigOrEnv(
-                config_.moe.rebalance_config.device_min_load_spread_improvement,
-                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT",
-                env.moe_rebalance.device_rebalance_min_load_spread_improvement);
-            rebalance_config.min_load_spread_improvement_divisor = deviceRebalanceConfigOrEnv(
-                config_.moe.rebalance_config.device_min_load_spread_improvement_divisor,
-                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR",
-                env.moe_rebalance.device_rebalance_min_load_spread_improvement_divisor);
-            rebalance_config.min_wave_spread_improvement_per_payload_slot =
-                deviceRebalanceConfigOrEnv(
-                    config_.moe.rebalance_config.device_min_wave_spread_improvement_per_payload_slot,
-                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
-                    env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot);
-            rebalance_config.min_foreign_rows_per_transfer =
-                deviceRebalanceConfigOrEnv(
-                    config_.moe.rebalance_config.device_min_foreign_rows_per_transfer,
-                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER",
-                    env.moe_rebalance.device_rebalance_min_foreign_rows_per_transfer);
+            switch (purpose)
+            {
+            case GraphSideRebalanceBindingRole::DecodeMaintenance:
+                rebalance_config.routed_assignment_policy =
+                    config_.moe.routed_decode_assignment_policy ==
+                            RoutedExpertAssignmentPolicy::LeastLoadedResident
+                        ? kDeviceMoERebalanceAssignmentLeastLoadedResident
+                        : kDeviceMoERebalanceAssignmentStaticOwner;
+                rebalance_config.min_load_spread_improvement =
+                    deviceRebalanceConfigOrEnv(
+                        config_.moe.rebalance_config
+                            .device_min_load_spread_improvement,
+                        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT",
+                        env.moe_rebalance
+                            .device_rebalance_min_load_spread_improvement);
+                rebalance_config.min_load_spread_improvement_divisor =
+                    deviceRebalanceConfigOrEnv(
+                        config_.moe.rebalance_config
+                            .device_min_load_spread_improvement_divisor,
+                        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR",
+                        env.moe_rebalance
+                            .device_rebalance_min_load_spread_improvement_divisor);
+                rebalance_config
+                    .min_wave_spread_improvement_per_payload_slot =
+                    deviceRebalanceConfigOrEnv(
+                        config_.moe.rebalance_config
+                            .device_min_wave_spread_improvement_per_payload_slot,
+                        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                        env.moe_rebalance
+                            .device_rebalance_min_wave_spread_improvement_per_payload_slot);
+                rebalance_config.min_foreign_rows_per_transfer =
+                    deviceRebalanceConfigOrEnv(
+                        config_.moe.rebalance_config
+                            .device_min_foreign_rows_per_transfer,
+                        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER",
+                        env.moe_rebalance
+                            .device_rebalance_min_foreign_rows_per_transfer);
+                break;
+            case GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer:
+                /*
+                 * Paper-style LLEP owns only this batch's row assignment. Its
+                 * alpha/lambda economics are declared by routed_prefill_config;
+                 * durable residency-maintenance floors must never suppress or
+                 * reshape the current-batch planner. A movement-positive test
+                 * can therefore disable the lambda skip without also enabling
+                 * Dynamic residency maintenance or mutating unrelated knobs.
+                 */
+                rebalance_config.routed_assignment_policy =
+                    kDeviceMoERebalanceAssignmentLeastLoadedResident;
+                rebalance_config.min_load_spread_improvement = 0u;
+                rebalance_config.min_load_spread_improvement_divisor = 0u;
+                rebalance_config
+                    .min_wave_spread_improvement_per_payload_slot = 0u;
+                rebalance_config.min_foreign_rows_per_transfer = 0u;
+                break;
+            case GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer:
+                /*
+                 * Prefix restore rehydrates an already selected placement. It
+                 * never performs a fresh least-loaded assignment and therefore
+                 * carries no decode-maintenance economy thresholds.
+                 */
+                rebalance_config.routed_assignment_policy =
+                    kDeviceMoERebalanceAssignmentStaticOwner;
+                rebalance_config.min_load_spread_improvement = 0u;
+                rebalance_config.min_load_spread_improvement_divisor = 0u;
+                rebalance_config
+                    .min_wave_spread_improvement_per_payload_slot = 0u;
+                rebalance_config.min_foreign_rows_per_transfer = 0u;
+                break;
+            }
             rebalance_config.min_router_spread_improvement_per_payload_slot =
-                deviceRebalanceConfigOrEnv(
-                    config_.moe.rebalance_config.device_min_router_spread_improvement_per_payload_slot,
-                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
-                    env.moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot);
-            rebalance_config.max_post_wave_load_spread_per_mille = deviceRebalanceConfigOrEnv(
-                config_.moe.rebalance_config.device_max_post_wave_load_spread_per_mille,
-                "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
-                env.moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille);
-            rebalance_config.llep_alpha_numerator =
-                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_alpha_numerator);
-            rebalance_config.llep_alpha_denominator =
-                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_alpha_denominator);
-            rebalance_config.llep_lambda_numerator =
-                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_lambda_numerator);
-            rebalance_config.llep_lambda_denominator =
-                std::max<uint32_t>(1u, config_.moe.routed_prefill_config.llep_lambda_denominator);
-            rebalance_config.llep_enable_balanced_skip =
-                config_.moe.routed_prefill_config.llep_enable_balanced_skip ? 1u : 0u;
+                decode_maintenance_policy
+                    ? deviceRebalanceConfigOrEnv(
+                          config_.moe.rebalance_config
+                              .device_min_router_spread_improvement_per_payload_slot,
+                          "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                          env.moe_rebalance
+                              .device_rebalance_min_router_spread_improvement_per_payload_slot)
+                    : 0u;
+            rebalance_config.max_post_wave_load_spread_per_mille =
+                decode_maintenance_policy
+                    ? deviceRebalanceConfigOrEnv(
+                          config_.moe.rebalance_config
+                              .device_max_post_wave_load_spread_per_mille,
+                          "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
+                          env.moe_rebalance
+                              .device_rebalance_max_post_wave_load_spread_per_mille)
+                    : 0u;
+            if (current_batch_llep_policy)
+            {
+                rebalance_config.llep_alpha_numerator =
+                    std::max<uint32_t>(
+                        1u,
+                        config_.moe.routed_prefill_config
+                            .llep_alpha_numerator);
+                rebalance_config.llep_alpha_denominator =
+                    std::max<uint32_t>(
+                        1u,
+                        config_.moe.routed_prefill_config
+                            .llep_alpha_denominator);
+                rebalance_config.llep_lambda_numerator =
+                    std::max<uint32_t>(
+                        1u,
+                        config_.moe.routed_prefill_config
+                            .llep_lambda_numerator);
+                rebalance_config.llep_lambda_denominator =
+                    std::max<uint32_t>(
+                        1u,
+                        config_.moe.routed_prefill_config
+                            .llep_lambda_denominator);
+                rebalance_config.llep_enable_balanced_skip =
+                    config_.moe.routed_prefill_config
+                            .llep_enable_balanced_skip
+                        ? 1u
+                        : 0u;
+            }
             rebalance_config.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
             if (rebalance_config.max_hot_replicas_per_participant > 0)
@@ -3501,7 +3743,8 @@ namespace llaminar2
                 rebalance_config.flags |=
                     static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache);
             }
-            if (env.moe_rebalance.device_rebalance_maintenance_graph)
+            if (decode_maintenance_policy &&
+                env.moe_rebalance.device_rebalance_maintenance_graph)
             {
                 rebalance_config.flags |=
                     static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply);
@@ -3754,11 +3997,8 @@ namespace llaminar2
             }
 
             const std::string binding_key = graphRebalanceBindingKey();
-            const auto existing = moe_graph_rebalance_bindings_.find(binding_key);
-            if (existing != moe_graph_rebalance_bindings_.end())
-                return &existing->second;
-
-            DeviceMoERebalanceConfig rebalance_config = makeGraphRebalanceConfig();
+            DeviceMoERebalanceConfig rebalance_config =
+                makeGraphRebalanceConfig(prefill_transfer_binding_role);
             if (!validateDeviceMoERebalanceConfig(rebalance_config))
                 return nullptr;
             if (!ensureGraphRebalanceTransferMode())
@@ -3773,6 +4013,28 @@ namespace llaminar2
                     "Qwen35 MoE LLEP prefill requires compact transfer-slot payload movement for " +
                     device.to_string() + "; refusing fixed-payload/host fallback");
             }
+
+            const auto existing =
+                moe_graph_rebalance_bindings_.find(binding_key);
+            if (existing != moe_graph_rebalance_bindings_.end())
+            {
+                const auto &binding = existing->second;
+                if (binding.role != prefill_transfer_binding_role ||
+                    binding.device_id != device ||
+                    binding.collective_tp_ctx != local_tp_ctx ||
+                    binding.moe_runtime_table != moe_runtime_table ||
+                    binding.tp_device_idx != config_.tp_device_idx ||
+                    binding.transfer_mode !=
+                        graph_rebalance_transfer_mode.value())
+                {
+                    throw std::logic_error(
+                        "Qwen35 MoE prefill transfer binding identity changed "
+                        "while reusing " +
+                        binding_key);
+                }
+                return &binding;
+            }
+
             if (deviceMoERebalanceModePlansMissingArrivals(
                     graph_rebalance_transfer_mode.value()))
             {
@@ -3857,7 +4119,7 @@ namespace llaminar2
             moe_graph_rebalance_bindings_[binding_key] = GraphSideRebalanceBinding{
                 .transfer_key = transfer_key,
                 .workspace_name = rebalance_workspace,
-                .role = GraphSideRebalanceBindingRole::PrefillLLEPTransfer,
+                .role = prefill_transfer_binding_role,
                 .device_id = device,
                 .collective_tp_ctx = local_tp_ctx,
                 .moe_runtime_table = moe_runtime_table,
@@ -3907,8 +4169,34 @@ namespace llaminar2
                 expert_params.prefix_runtime_rehydration_transfer_state =
                     std::make_shared<DeviceMoERebalanceTransferState>();
             }
-            expert_params.prefill_llep_rebalance_config =
-                binding->config;
+            /*
+             * The binding owns persistent physical resources.  Window size,
+             * maintenance period, and other policy fields belong to this
+             * exact graph invocation and may vary with its prefill bucket.
+             * Rebuild those fields from the declarative graph policy, then
+             * project only the proven physical capacities from the binding.
+             */
+            DeviceMoERebalanceConfig invocation_config =
+                makeGraphRebalanceConfig(prefill_transfer_binding_role);
+            invocation_config.active_transfer_slot_capacity =
+                binding->config.active_transfer_slot_capacity;
+            invocation_config.transfer_slot_directory_capacity =
+                binding->config.transfer_slot_directory_capacity;
+            if (deviceMoERebalanceModePlansMissingArrivals(
+                    binding->transfer_mode))
+            {
+                invocation_config.flags |= static_cast<uint32_t>(
+                    DeviceMoERebalanceFlags::PlanMissingArrivals);
+            }
+            if (!validateDeviceMoERebalanceConfig(invocation_config))
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE prefill transfer invocation produced an "
+                    "invalid graph-owned rebalance policy for layer " +
+                    std::to_string(layer_idx) + " on " +
+                    device.to_string());
+            }
+            expert_params.prefill_llep_rebalance_config = invocation_config;
             expert_params.prefill_llep_transfer_state =
                 binding->transfer_state;
             expert_params.prefill_llep_workspace_name =
@@ -4242,7 +4530,9 @@ namespace llaminar2
             if (!graph_rebalance_apply_node.empty())
                 return graph_rebalance_apply_node;
 
-            DeviceMoERebalanceConfig rebalance_config = makeGraphRebalanceConfig();
+            DeviceMoERebalanceConfig rebalance_config =
+                makeGraphRebalanceConfig(
+                    GraphSideRebalanceBindingRole::DecodeMaintenance);
             if (!validateDeviceMoERebalanceConfig(rebalance_config))
             {
                 return {};

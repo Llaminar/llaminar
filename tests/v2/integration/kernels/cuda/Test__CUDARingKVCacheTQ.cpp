@@ -243,8 +243,8 @@ TEST(Test__CUDARingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
 
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
     stream.synchronize();
@@ -322,14 +322,14 @@ TEST(Test__CUDARingKVCacheTQ, WrapAround_PreservesNewest)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto k1 = std::make_unique<GpuTensorView>(d_K, 8, kv_dim, TensorType::FP32, 0);
-    auto v1 = std::make_unique<GpuTensorView>(d_V, 8, kv_dim, TensorType::FP32, 0);
+    auto k1 = std::make_unique<GpuTensorView>(d_K, 8, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto v1 = std::make_unique<GpuTensorView>(d_V, 8, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k1.get(), v1.get(), 8, stream));
 
     auto k2 = std::make_unique<GpuTensorView>(
-        d_K + 8 * kv_dim, 4, kv_dim, TensorType::FP32, 0);
+        d_K + 8 * kv_dim, 4, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     auto v2 = std::make_unique<GpuTensorView>(
-        d_V + 8 * kv_dim, 4, kv_dim, TensorType::FP32, 0);
+        d_V + 8 * kv_dim, 4, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k2.get(), v2.get(), 4, stream));
     stream.synchronize();
 
@@ -381,8 +381,8 @@ TEST(Test__CUDARingKVCacheTQ, IncrementalAppend_DecodeLike)
         float *d_K = uploadToGPU(h_K);
         float *d_V = uploadToGPU(h_V);
 
-        auto kv = std::make_unique<GpuTensorView>(d_K, 1, kv_dim, TensorType::FP32, 0);
-        auto vv = std::make_unique<GpuTensorView>(d_V, 1, kv_dim, TensorType::FP32, 0);
+        auto kv = std::make_unique<GpuTensorView>(d_K, 1, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+        auto vv = std::make_unique<GpuTensorView>(d_V, 1, kv_dim, TensorType::FP32, DeviceId::cuda(0));
 
         ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), 1, stream));
         stream.synchronize();
@@ -439,8 +439,8 @@ TEST(Test__CUDARingKVCacheTQ, MultiLayer_IndependentData)
         float *d_K = uploadToGPU(h_K);
         float *d_V = uploadToGPU(h_V);
 
-        auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-        auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+        auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+        auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
 
         ASSERT_TRUE(appendWithTestStream(cache, layer, 0, kv.get(), vv.get(), num_tokens, stream));
         stream.synchronize();
@@ -499,8 +499,8 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, 5, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, 5, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, 5, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, 5, kv_dim, TensorType::FP32, DeviceId::cuda(0));
 
     for (int l = 0; l < n_layers; ++l)
         ASSERT_TRUE(appendWithTestStream(cache, l, 0, kv.get(), vv.get(), 5, stream));
@@ -542,8 +542,8 @@ TEST(Test__CUDARingKVCacheTQ, AppendRequiresExplicitNonNullStream)
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 701);
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
-    auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
 
     EXPECT_FALSE(cache.append(0, 0, k_view.get(), v_view.get(), num_tokens));
     EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
@@ -589,8 +589,8 @@ TEST(Test__CUDARingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch
         auto h_V = generateRandomFP32(num_tokens * kv_dim, seed + 1000);
         float *d_K = uploadToGPU(h_K);
         float *d_V = uploadToGPU(h_V);
-        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
         ASSERT_TRUE(appendWithTestStream(cache, layer, seq_idx, k_view.get(), v_view.get(), num_tokens, stream));
         stream.synchronize();
         cudaFree(d_K);
@@ -651,8 +651,8 @@ TEST(Test__CUDARingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
     {
         float *d_K = uploadToGPU(h_K);
         float *d_V = uploadToGPU(h_V);
-        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
         ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
         stream.synchronize();
         cudaFree(d_K);
@@ -718,8 +718,8 @@ TEST(Test__CUDARingKVCacheTQ, QuantizationError_WithinBounds)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -763,7 +763,7 @@ TEST(Test__CUDARingKVCacheTQ, KQuality_StrictlyBetterThan_V)
     auto h_data = generateRandomFP32(num_tokens * kv_dim, 999);
     float *d_data = uploadToGPU(h_data);
 
-    auto view = std::make_unique<GpuTensorView>(d_data, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto view = std::make_unique<GpuTensorView>(d_data, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, view.get(), view.get(), num_tokens, stream)); // Same data for K and V
     stream.synchronize();
 
@@ -805,8 +805,8 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_WithRoPE)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -877,8 +877,8 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_DequantOnly)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -927,8 +927,8 @@ TEST(Test__CUDARingKVCacheTQ, Eviction_ReducesCount)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -970,8 +970,8 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
     float *d_K1 = uploadToGPU(h_K1);
     float *d_V1 = uploadToGPU(h_V1);
 
-    auto kv1 = std::make_unique<GpuTensorView>(d_K1, 5, kv_dim, TensorType::FP32, 0);
-    auto vv1 = std::make_unique<GpuTensorView>(d_V1, 5, kv_dim, TensorType::FP32, 0);
+    auto kv1 = std::make_unique<GpuTensorView>(d_K1, 5, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv1 = std::make_unique<GpuTensorView>(d_V1, 5, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv1.get(), vv1.get(), 5, stream));
     stream.synchronize();
 
@@ -986,8 +986,8 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
     float *d_K2 = uploadToGPU(h_K2);
     float *d_V2 = uploadToGPU(h_V2);
 
-    auto kv2 = std::make_unique<GpuTensorView>(d_K2, 3, kv_dim, TensorType::FP32, 0);
-    auto vv2 = std::make_unique<GpuTensorView>(d_V2, 3, kv_dim, TensorType::FP32, 0);
+    auto kv2 = std::make_unique<GpuTensorView>(d_K2, 3, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv2 = std::make_unique<GpuTensorView>(d_V2, 3, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv2.get(), vv2.get(), 3, stream));
     stream.synchronize();
 
@@ -1026,8 +1026,8 @@ TEST(Test__CUDARingKVCacheTQ, HeadDim128_BasicRoundtrip)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -1078,8 +1078,8 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
     float *d_K = uploadToGPU(h_K);
     float *d_V = uploadToGPU(h_V);
 
-    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
-    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
     ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
     stream.synchronize();
 
@@ -1303,9 +1303,9 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
             allocations.push_back(device_k);
             allocations.push_back(device_v);
             GpuTensorView k_view(
-                device_k, rows, kv_dim, TensorType::FP32, /*device_id=*/0);
+                device_k, rows, kv_dim, TensorType::FP32, DeviceId::cuda(0));
             GpuTensorView v_view(
-                device_v, rows, kv_dim, TensorType::FP32, /*device_id=*/0);
+                device_v, rows, kv_dim, TensorType::FP32, DeviceId::cuda(0));
             return appendWithTestStream(
                 cache, /*layer=*/0, request, &k_view, &v_view, rows, stream);
         };
@@ -1561,11 +1561,11 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
             GpuTensorView initial_k(
                 k_base + request_offset,
                 initial_counts[request], kv_dim,
-                TensorType::FP32, /*device_id=*/0);
+                TensorType::FP32, DeviceId::cuda(0));
             GpuTensorView initial_v(
                 v_base + request_offset,
                 initial_counts[request], kv_dim,
-                TensorType::FP32, /*device_id=*/0);
+                TensorType::FP32, DeviceId::cuda(0));
             ASSERT_TRUE(appendWithTestStream(
                 reference, 0, request,
                 &initial_k, &initial_v,
@@ -1574,11 +1574,11 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
             GpuTensorView continuation_k(
                 k_base + request_offset,
                 /*rows=*/1, kv_dim,
-                TensorType::FP32, /*device_id=*/0);
+                TensorType::FP32, DeviceId::cuda(0));
             GpuTensorView continuation_v(
                 v_base + request_offset,
                 /*rows=*/1, kv_dim,
-                TensorType::FP32, /*device_id=*/0);
+                TensorType::FP32, DeviceId::cuda(0));
             ASSERT_TRUE(appendWithTestStream(
                 reference, 0, request,
                 &continuation_k, &continuation_v,

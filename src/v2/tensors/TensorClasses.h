@@ -829,7 +829,7 @@ namespace llaminar2
          * pointer delegation. Otherwise a wrapper can expose its inner device
          * pointer while reporting no owning device.
          */
-        virtual std::optional<DeviceId> current_device() const { return gpu_device_; }
+        std::optional<DeviceId> current_device() const override { return gpu_device_; }
 
         /**
          * @brief Return the concrete tensor that owns transfer storage and coherence.

@@ -1223,6 +1223,17 @@ namespace llaminar2
         int *control,
         int device_idx,
         void *stream);
+    extern "C" bool
+    hipMoE_publish_current_batch_llep_evidence_to_generation_control(
+        const void *runtime_layers,
+        int layer_count,
+        int *generation_control,
+        int generation_control_stride,
+        int request_count,
+        int movement_layer_count_index,
+        int non_owner_assignment_layer_count_index,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_prepare_device_generation_transaction_budget(
         int *control,
         int control_stride,
@@ -2756,6 +2767,41 @@ namespace llaminar2
             response_token_stride,
             control_stride,
             static_cast<int *>(control_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::
+        enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            const void *runtime_layers_device,
+            int layer_count,
+            void *generation_control_device,
+            int generation_control_stride,
+            int request_count,
+            int device_id,
+            void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !runtime_layers_device || layer_count <= 0 ||
+            !generation_control_device ||
+            generation_control_stride <
+                sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return hipMoE_publish_current_batch_llep_evidence_to_generation_control(
+            runtime_layers_device,
+            layer_count,
+            static_cast<int *>(generation_control_device),
+            generation_control_stride,
+            request_count,
+            sampling_math::
+                kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount,
+            sampling_math::
+                kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount,
             device_id,
             stream);
     }

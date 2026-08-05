@@ -328,6 +328,32 @@ namespace llaminar2
         }
 
         /*
+         * Canonical LocalTP publication owns three semantically distinct values
+         * at one rooted finalizer. Route each named output explicitly so the
+         * snapshot contract follows the graph's real producer rather than a
+         * historical stage-name convention.
+         */
+        if (name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            const size_t pos =
+                name.find("_moe_canonical_publication_finalize");
+            const std::string prefix = name.substr(0, pos);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "routed_output" && output.data)
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                else if (output_name == "shared_output" && output.data)
+                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "combined_output" && output.data)
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+            }
+            return;
+        }
+
+        /*
          * The Qwen3.6 MoE combined shared-verifier path can fuse routed expert
          * and shared expert output inside MoEExpertComputeStage.  The stage name
          * is still `_moe_expert_ffn`, so route by output name before the generic
@@ -337,15 +363,31 @@ namespace llaminar2
         {
             size_t pos = name.find("_moe_expert_ffn");
             std::string prefix = name.substr(0, pos);
+            bool handled_named_output = false;
             for (const auto &output : dump.outputs)
             {
                 const std::string output_name = output.name ? output.name : "";
                 if (output_name == "combined_output" && output.data)
                 {
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
-                    return;
+                    handled_named_output = true;
+                }
+                else if (output_name == "canonical_route_contributions" &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS",
+                        output);
+                    handled_named_output = true;
+                }
+                else if (output_name == "output" && output.data)
+                {
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                    handled_named_output = true;
                 }
             }
+            if (handled_named_output)
+                return;
         }
 
         // Handle shared-expert gate. In the ordinary path the stage has one
@@ -602,6 +644,7 @@ namespace llaminar2
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
             {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_canonical_publication_finalize", "_MOE_COMBINED_OUTPUT"},
             {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
@@ -765,6 +808,15 @@ namespace llaminar2
             return {prefix + "_MOE_EXPERT_OUTPUT",
                     prefix + "_MOE_COMBINED_OUTPUT"};
         }
+        if (stage_name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            const std::string prefix =
+                prefixBefore("_moe_canonical_publication_finalize");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_SHARED_GATE_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
         if (stage_name.find("_shared_expert_gate") != std::string::npos)
         {
             const std::string prefix = prefixBefore("_shared_expert_gate");
@@ -780,6 +832,83 @@ namespace llaminar2
         }
 
         return {convertStageNameToSnapshotKey(stage_name)};
+    }
+
+    std::vector<std::string> SnapshotCapture::possibleKeysForStage(
+        const std::string &stage_name,
+        const StageDumpInfo &dump_info)
+    {
+        auto prefixBefore = [&](const std::string &needle) -> std::string
+        {
+            const size_t pos = stage_name.find(needle);
+            return pos == std::string::npos
+                       ? stage_name
+                       : stage_name.substr(0, pos);
+        };
+
+        auto outputNamesToKeys = [&](const std::string &prefix,
+                                     const bool canonical_finalizer)
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "combined_output")
+                    keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+                else if (output_name == "canonical_route_contributions")
+                {
+                    keys.push_back(
+                        prefix + "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS");
+                }
+                else if (canonical_finalizer &&
+                         output_name == "routed_output")
+                {
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+                }
+                else if (canonical_finalizer &&
+                         output_name == "shared_output")
+                {
+                    keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+                }
+                else if (!canonical_finalizer && output_name == "output")
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+            }
+            return keys;
+        };
+
+        if (stage_name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            return outputNamesToKeys(
+                prefixBefore("_moe_canonical_publication_finalize"),
+                /*canonical_finalizer=*/true);
+        }
+        if (stage_name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            return outputNamesToKeys(
+                prefixBefore("_moe_expert_ffn"),
+                /*canonical_finalizer=*/false);
+        }
+        if (stage_name.find("_shared_expert_gate") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_shared_expert_gate");
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "shared_output" || output_name == "output")
+                    keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+                else if (output_name == "combined_output")
+                    keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+            }
+            return keys;
+        }
+
+        return possibleKeysForStageName(stage_name);
     }
 
     // =========================================================================

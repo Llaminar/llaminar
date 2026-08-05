@@ -97,8 +97,6 @@ NON_PRODUCTION_PATH_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("src/v2/backends/benchmarks/", "benchmark"),
     ("src/v2/utils/CUDAKernelProfiler.cu", "profiler"),
     ("src/v2/utils/ROCmKernelProfiler.hip", "profiler"),
-    ("src/v2/backends/cuda/CUDATensorValidation.cu", "validation"),
-    ("src/v2/backends/rocm/ROCmTensorValidation.cpp", "validation"),
 )
 
 
@@ -251,8 +249,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "diagnostic",
+        ("src/v2/backends/cuda/CUDATensorValidation.cu", "validate", "raw_event", 1),
         ("src/v2/backends/cuda/NvidiaDeviceContext.cu", "NvidiaDeviceContext::debugSynchronize", "raw_device", 1),
         ("src/v2/backends/rocm/AMDDeviceContext.cpp", "AMDDeviceContext::debugSynchronize", "raw_device", 1),
+        ("src/v2/backends/rocm/ROCmTensorValidation.cpp", "validate", "raw_event", 1),
         ("src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp", "tracePrefillAssignmentRuntime", "worker_stream", 1),
         ("src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp", "tracePrefillLLEPStatus", "worker_stream", 1),
         ("src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp", "ForwardExecutionEngine::executePrefillWithGraphCache", "worker_event", 1),

@@ -513,7 +513,7 @@ namespace llaminar2
 
         info.addInput("input", params_.input, seq_len, hidden_dim);
         info.addInput("residual", params_.residual, seq_len, hidden_dim);
-        info.addInput("gamma", params_.gamma, 1, hidden_dim);
+        info.addWeight("gamma", params_.gamma);
         info.addOutput("residual_out", params_.residual, seq_len, hidden_dim);
         info.addOutput("norm_output", params_.norm_output, seq_len, hidden_dim);
         info.addScalar("eps", params_.eps);

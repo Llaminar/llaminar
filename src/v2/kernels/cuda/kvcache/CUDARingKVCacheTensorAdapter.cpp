@@ -385,7 +385,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 view_cols,
                 tensor_type,
-                device_id_);
+                DeviceId::cuda(device_id_));
 
             LOG_TRACE("[CUDARingKVCache::get_k] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -463,7 +463,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 view_cols,
                 tensor_type,
-                device_id_);
+                DeviceId::cuda(device_id_));
 
             LOG_TRACE("[CUDARingKVCache::get_v] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -533,7 +533,8 @@ namespace llaminar2
         if (!k_view || k_view->gpu_data_ptr() != d_k || k_view->rows() != rows)
         {
             k_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_k), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_k), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         // Update V view (index 1)
@@ -541,7 +542,8 @@ namespace llaminar2
         if (!v_view || v_view->gpu_data_ptr() != d_v || v_view->rows() != rows)
         {
             v_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_v), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_v), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         if (out_k)
@@ -637,14 +639,16 @@ namespace llaminar2
         if (!k_view || k_view->gpu_data_ptr() != entry.d_K || k_view->rows() != rows)
         {
             k_view = std::make_unique<GpuTensorView>(
-                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type, device_id_);
+                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         auto &v_view = snapshot_tensor_views_[layer][seq_idx][1];
         if (!v_view || v_view->gpu_data_ptr() != entry.d_V || v_view->rows() != rows)
         {
             v_view = std::make_unique<GpuTensorView>(
-                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type, device_id_);
+                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         if (out_k)
@@ -922,13 +926,13 @@ namespace llaminar2
         {
             shadow.k_view = std::make_unique<GpuTensorView>(
                 shadow.d_K, read_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.v_view = std::make_unique<GpuTensorView>(
                 shadow.d_V, read_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
 
         if (out_k)

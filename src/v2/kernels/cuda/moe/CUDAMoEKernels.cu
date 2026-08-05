@@ -267,6 +267,77 @@ namespace
         llaminar2::moe_runtime_abi::
             kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
 
+    /**
+     * @brief Publish request-final LLEP evidence without reading live state on the host.
+     *
+     * One block scans the complete contiguous runtime table. Integer marker
+     * counts use a fixed shared-memory tree, so publication is deterministic
+     * and does not require atomics. Row zero owns this model-domain evidence;
+     * later request rows are explicitly cleared to keep terminal aggregation
+     * total for request-batched generation.
+     */
+    __global__ void
+    publish_current_batch_llep_evidence_to_generation_control_kernel(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
+        int layer_count,
+        int *__restrict__ generation_control,
+        int generation_control_stride,
+        int request_count,
+        int movement_layer_count_index,
+        int non_owner_assignment_layer_count_index)
+    {
+        constexpr int kEvidenceThreads = 256;
+        __shared__ uint32_t movement_counts[kEvidenceThreads];
+        __shared__ uint32_t non_owner_counts[kEvidenceThreads];
+
+        uint32_t movement_count = 0;
+        uint32_t non_owner_count = 0;
+        for (int layer = static_cast<int>(threadIdx.x);
+             layer < layer_count;
+             layer += static_cast<int>(blockDim.x))
+        {
+            const auto &runtime = runtime_layers[layer];
+            movement_count +=
+                runtime.current_batch_llep_movement_observed != 0u ? 1u : 0u;
+            non_owner_count +=
+                runtime.current_batch_llep_non_owner_assignment_observed != 0u
+                    ? 1u
+                    : 0u;
+        }
+
+        movement_counts[threadIdx.x] = movement_count;
+        non_owner_counts[threadIdx.x] = non_owner_count;
+        __syncthreads();
+        for (int offset = kEvidenceThreads / 2; offset > 0; offset >>= 1)
+        {
+            if (static_cast<int>(threadIdx.x) < offset)
+            {
+                movement_counts[threadIdx.x] +=
+                    movement_counts[threadIdx.x + offset];
+                non_owner_counts[threadIdx.x] +=
+                    non_owner_counts[threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+        {
+            for (int request = 0; request < request_count; ++request)
+            {
+                int *const control =
+                    generation_control + request * generation_control_stride;
+                control[movement_layer_count_index] =
+                    request == 0
+                        ? static_cast<int>(movement_counts[0])
+                        : 0;
+                control[non_owner_assignment_layer_count_index] =
+                    request == 0
+                        ? static_cast<int>(non_owner_counts[0])
+                        : 0;
+            }
+        }
+    }
+
     struct DeviceMoERebalanceConfigView
     {
         uint32_t magic;
@@ -16968,6 +17039,49 @@ namespace
 
 extern "C"
 {
+    bool cudaMoE_publish_current_batch_llep_evidence_to_generation_control(
+        const void *runtime_layers,
+        int layer_count,
+        int *generation_control,
+        int generation_control_stride,
+        int request_count,
+        int movement_layer_count_index,
+        int non_owner_assignment_layer_count_index,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || layer_count <= 0 || !generation_control ||
+            generation_control_stride <= 0 || request_count <= 0 ||
+            movement_layer_count_index < 0 ||
+            movement_layer_count_index >= generation_control_stride ||
+            non_owner_assignment_layer_count_index < 0 ||
+            non_owner_assignment_layer_count_index >=
+                generation_control_stride ||
+            movement_layer_count_index ==
+                non_owner_assignment_layer_count_index ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int kEvidenceThreads = 256;
+        publish_current_batch_llep_evidence_to_generation_control_kernel<<<
+            1,
+            kEvidenceThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+            layer_count,
+            generation_control,
+            generation_control_stride,
+            request_count,
+            movement_layer_count_index,
+            non_owner_assignment_layer_count_index);
+        return finishLaunch(
+            "cudaMoE_publish_current_batch_llep_evidence_to_generation_control");
+    }
+
     bool cudaMoE_quantize_router_gate_q8(
         const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
         int d_model, int num_experts,

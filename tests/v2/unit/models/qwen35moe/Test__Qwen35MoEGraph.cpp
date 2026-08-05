@@ -3178,6 +3178,51 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
         << "Prefill runtime tables must not register stale decode histogram sync callbacks";
 }
 
+TEST(Test__Qwen35MoEGraph, CurrentBatchLLEPPrefillCannotAliasDurableDecodeRuntime)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t identity_begin = source.find(
+        "const MoERuntimeTableIdentity runtime_table_identity");
+    ASSERT_NE(identity_begin, std::string::npos)
+        << "MoE graph construction must select runtime ownership through a typed identity";
+    const size_t decode_branch = source.find(
+        "if (total_tokens == 1 &&", identity_begin);
+    ASSERT_NE(decode_branch, std::string::npos);
+    const std::string identity_policy =
+        source.substr(identity_begin, decode_branch - identity_begin);
+    EXPECT_NE(
+        identity_policy.find("current_batch_llep_transfer_candidate"),
+        std::string::npos);
+    EXPECT_NE(
+        identity_policy.find("MoERuntimeTableRole::CurrentBatchLLEPPrefill"),
+        std::string::npos)
+        << "Request-transient LLEP placement requires a prefill-only runtime table";
+    EXPECT_NE(
+        identity_policy.find("MoERuntimeTableRole::MainDecodeDurablePlacement"),
+        std::string::npos)
+        << "Static decode and Dynamic maintenance require the durable runtime table";
+
+    const size_t key_function = source.find(
+        "std::string Qwen35MoEGraph::moeRuntimeTableKey(");
+    ASSERT_NE(key_function, std::string::npos);
+    const size_t table_function = source.find(
+        "IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(",
+        key_function);
+    ASSERT_NE(table_function, std::string::npos);
+    const std::string key_policy =
+        source.substr(key_function, table_function - key_function);
+    EXPECT_NE(
+        key_policy.find("#current_batch_llep_prefill"),
+        std::string::npos);
+    EXPECT_EQ(source.find("runtime_table_suffix"), std::string::npos)
+        << "An untyped empty suffix can alias prefill and decode placement banks";
+}
+
 TEST(Test__Qwen35MoEGraph, PhaseSplitMTPSidecarDisablesGroupedSharedExpertDecodeShortcut)
 {
     std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
@@ -3502,9 +3547,24 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByR
     ASSERT_NE(prefill_binding_end, std::string::npos);
     const std::string prefill_binding_body =
         source.substr(prefill_binding, prefill_binding_end - prefill_binding);
-    EXPECT_NE(prefill_binding_body.find("GraphSideRebalanceBindingRole::PrefillLLEPTransfer"),
+    EXPECT_NE(prefill_binding_body.find(".role = prefill_transfer_binding_role"),
               std::string::npos)
-        << "Prefill LLEP transfer bindings must be tagged as layer-local prefill bindings.";
+        << "Layer-local prefill bindings must retain their exact current-batch or prefix-rehydration role.";
+
+    const size_t prefill_role =
+        source.find("const GraphSideRebalanceBindingRole prefill_transfer_binding_role");
+    ASSERT_NE(prefill_role, std::string::npos);
+    const size_t transport_candidate =
+        source.find("const bool graph_rebalance_transport_candidate", prefill_role);
+    ASSERT_NE(transport_candidate, std::string::npos);
+    const std::string prefill_role_body =
+        source.substr(prefill_role, transport_candidate - prefill_role);
+    EXPECT_NE(prefill_role_body.find("GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer"),
+              std::string::npos)
+        << "A real current-batch LLEP transaction needs its own typed binding role.";
+    EXPECT_NE(prefill_role_body.find("GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer"),
+              std::string::npos)
+        << "Prefix rehydration must not alias current-batch row-assignment policy or evidence.";
 
     const size_t decode_binding =
         source.find("moe_graph_rebalance_bindings_[domain_key] = GraphSideRebalanceBinding{");
@@ -3517,7 +3577,73 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByR
     EXPECT_NE(decode_binding_body.find("GraphSideRebalanceBindingRole::DecodeMaintenance"),
               std::string::npos)
         << "Decode graph-side rebalance bindings must be tagged as maintenance bindings.";
-    EXPECT_EQ(decode_binding_body.find("GraphSideRebalanceBindingRole::PrefillLLEPTransfer"),
+    EXPECT_EQ(decode_binding_body.find("GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer"),
               std::string::npos)
-        << "The domain-wide decode binding must not be tagged as a prefill transfer binding.";
+        << "The domain-wide decode binding must not be tagged as current-batch LLEP.";
+    EXPECT_EQ(decode_binding_body.find("GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer"),
+              std::string::npos)
+        << "The domain-wide decode binding must not be tagged as prefix rehydration.";
+}
+
+TEST(Test__Qwen35MoEGraph,
+     CurrentBatchLLEPEconomyPolicyIsIndependentOfDurableResidencyMaintenance)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t config_builder = source.find("auto makeGraphRebalanceConfig =");
+    ASSERT_NE(config_builder, std::string::npos);
+    const size_t config_builder_end =
+        source.find("auto graphRebalanceMovesFixedPayloadCapacity", config_builder);
+    ASSERT_NE(config_builder_end, std::string::npos);
+    const std::string config_body =
+        source.substr(config_builder, config_builder_end - config_builder);
+
+    EXPECT_NE(config_body.find("[&](GraphSideRebalanceBindingRole purpose)"),
+              std::string::npos)
+        << "Rebalance policy construction must require an explicit transaction role.";
+    EXPECT_NE(config_body.find("if (current_batch_llep_policy &&"),
+              std::string::npos)
+        << "Current-batch LLEP must reject a graph without the declarative least-loaded policy.";
+
+    const size_t decode_case = config_body.find(
+        "case GraphSideRebalanceBindingRole::DecodeMaintenance:");
+    const size_t current_batch_case = config_body.find(
+        "case GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer:",
+        decode_case);
+    const size_t prefix_case = config_body.find(
+        "case GraphSideRebalanceBindingRole::PrefixRuntimeRehydrationTransfer:",
+        current_batch_case);
+    ASSERT_NE(decode_case, std::string::npos);
+    ASSERT_NE(current_batch_case, std::string::npos);
+    ASSERT_NE(prefix_case, std::string::npos);
+
+    const std::string decode_policy =
+        config_body.substr(decode_case, current_batch_case - decode_case);
+    const std::string current_batch_policy =
+        config_body.substr(current_batch_case, prefix_case - current_batch_case);
+    EXPECT_NE(decode_policy.find("deviceRebalanceConfigOrEnv("),
+              std::string::npos)
+        << "Durable decode maintenance must retain its configured economy floors.";
+    EXPECT_EQ(current_batch_policy.find("deviceRebalanceConfigOrEnv("),
+              std::string::npos)
+        << "Durable residency thresholds must never suppress current-batch LLEP.";
+    EXPECT_NE(current_batch_policy.find(".min_load_spread_improvement = 0u"),
+              std::string::npos);
+    EXPECT_NE(current_batch_policy.find(".min_load_spread_improvement_divisor = 0u"),
+              std::string::npos);
+    EXPECT_NE(current_batch_policy.find(".min_wave_spread_improvement_per_payload_slot = 0u"),
+              std::string::npos);
+    EXPECT_NE(current_batch_policy.find(".min_foreign_rows_per_transfer = 0u"),
+              std::string::npos);
+
+    EXPECT_NE(config_body.find("if (current_batch_llep_policy)"),
+              std::string::npos)
+        << "LLEP alpha/lambda policy belongs exclusively to current-batch assignment.";
+    EXPECT_NE(config_body.find("if (decode_maintenance_policy &&"),
+              std::string::npos)
+        << "Deferred runtime application must remain exclusive to decode maintenance.";
 }

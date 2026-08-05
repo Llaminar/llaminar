@@ -7032,7 +7032,23 @@ namespace llaminar2
             info.addWeight("up_exps", params_.up_exps);
         if (params_.down_exps)
             info.addWeight("down_exps", params_.down_exps);
-        if (params_.output)
+        if (params_.canonical_route_contributions)
+        {
+            /*
+             * Canonical LocalTP publication defers routed-row reduction and the
+             * shared-expert add to the rooted finalizer. This stage therefore
+             * owns route slots, not the final MoE output tensor. Keep diagnostics
+             * identical to the arena contract so graph snapshots cannot capture
+             * a stale alias from a previous request.
+             */
+            info.addOutput(
+                "canonical_route_contributions",
+                params_.canonical_route_contributions,
+                static_cast<size_t>(params_.seq_len) *
+                    static_cast<size_t>(params_.top_k),
+                params_.d_model);
+        }
+        else if (params_.output)
         {
             /*
              * The combined shared-verifier path writes the final routed+shared

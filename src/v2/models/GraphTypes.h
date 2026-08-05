@@ -184,6 +184,9 @@ namespace llaminar2
          * verifier and sidecar graphs. The two phase-split dense policies
          * contribute a prefill topology backed by sharded weights and a compact
          * decode topology backed by mirrored or fully replicated weights.
+         * Dynamic MoE residency adds an asynchronous maintenance graph plus
+         * decode-only ready-wave application buffers, so it independently
+         * requires the same complete family declaration.
          *
          * Keeping this predicate on the declarative graph configuration prevents
          * factory call sites from accidentally treating MTP as the only source of
@@ -193,14 +196,7 @@ namespace llaminar2
          *
          * @return true when graph-family workspace planning must run eagerly.
          */
-        [[nodiscard]] bool requiresEagerGPUWorkspaceFamilyManifest() const noexcept
-        {
-            const bool phase_split_dense_graphs =
-                dense_tp_enabled &&
-                (dense_tp_decode_replicated ||
-                 dense_tp_decode_mirrored_embedding);
-            return mtp.enabled || phase_split_dense_graphs;
-        }
+        [[nodiscard]] bool requiresEagerGPUWorkspaceFamilyManifest() const noexcept;
 
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.

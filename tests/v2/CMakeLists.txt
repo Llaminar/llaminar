@@ -5666,6 +5666,39 @@ add_v2_test(V2_Integration_CUDAEventSynchronization
 )
 message(STATUS "V2 Tests: Added CUDA Event Synchronization tests")
 
+# Stream-ordered tensor validation is shared by stage-entry and stage-exit
+# diagnostics. Register backend-specific cells so unit tests remain device-free
+# and each integration lane owns only its selected accelerator.
+add_executable(v2_integration_gpu_tensor_validation
+    integration/tensors/Test__GPUTensorValidation.cpp
+)
+target_link_libraries(v2_integration_gpu_tensor_validation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_CUDA)
+    target_link_libraries(v2_integration_gpu_tensor_validation CUDA::cudart)
+    add_v2_test(V2_Integration_CUDATensorValidation
+        COMMAND $<TARGET_FILE:v2_integration_gpu_tensor_validation>
+                --gtest_filter=Test__GPUTensorValidation.CUDAExactProducerStreamCoversAllFloatingTypes
+        LABELS "V2;Integration;CUDA;TensorValidation;ExplicitStream;EventOrdered;FP32;BF16;FP16;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK cuda_gpu_0
+        TIMEOUT 30
+    )
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmTensorValidation
+        COMMAND $<TARGET_FILE:v2_integration_gpu_tensor_validation>
+                --gtest_filter=Test__GPUTensorValidation.ROCmExactProducerStreamCoversAllFloatingTypes
+        LABELS "V2;Integration;ROCm;TensorValidation;ExplicitStream;EventOrdered;FP32;BF16;FP16;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK rocm_gpu_0
+        TIMEOUT 30
+    )
+endif()
+
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)
 # Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
 # with cosine similarity metrics against CPU reference kernels

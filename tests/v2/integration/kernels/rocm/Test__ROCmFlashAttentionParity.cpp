@@ -513,6 +513,135 @@ protected:
 
 #ifdef HAVE_ROCM
 
+/**
+ * @brief Prove HIP device-count publication covers every attention regime.
+ *
+ * One `AttentionDeviceParams` record is shared by ordinary prefill and M=1
+ * decode, while grouped verification owns one record per serial-equivalent row.
+ * The distinction is part of the device-resident graph contract: the shared
+ * record carries the full post-append KV horizon, whereas grouped records expose
+ * successively longer row-local prefixes. Padded prefill additionally derives
+ * its absolute start from the device-owned active-row count.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    DeviceCountParamsCoverPrefillDecodeAndGroupedRows)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    using Params = llaminar2::attention::AttentionDeviceParams;
+    struct ParamCase
+    {
+        const char *label;
+        int cached_tokens;
+        int seq_len;
+        int query_rows;
+        int kv_stride;
+        int active_query_rows;
+        std::vector<Params> expected;
+    };
+
+    const std::vector<ParamCase> cases{
+        {"initial prefill", 9, 9, 1, 18, 0, {{9, 18, 0, 9}}},
+        {"continuation prefill", 18, 9, 1, 18, 0, {{18, 18, 9, 18}}},
+        {"padded prefill", 135, 256, 1, 512, 7, {{135, 512, 128, 135}}},
+        {"M=1 decode", 599, 1, 1, 640, 0, {{599, 640, 598, 599}}},
+        {"M=4 grouped verifier",
+         599,
+         4,
+         4,
+         640,
+         0,
+         {{596, 640, 595, 599},
+          {597, 640, 596, 599},
+          {598, 640, 597, 599},
+          {599, 640, 598, 599}}},
+    };
+
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    int *device_cached_tokens = nullptr;
+    int *device_active_rows = nullptr;
+    ASSERT_EQ(hipMalloc(&device_cached_tokens, sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&device_active_rows, sizeof(int)), hipSuccess);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> kernel(0);
+    kernel.setGPUStream(stream);
+    const WorkspaceRequirements requirements =
+        kernel.getWorkspaceRequirements(/*m=*/4, /*n=*/4, /*k=*/64);
+    DeviceWorkspaceManager workspace(
+        device, requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    kernel.bindWorkspace(&workspace);
+    auto *device_params = static_cast<Params *>(
+        workspace.getBuffer(
+            llaminar2::rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS));
+    ASSERT_NE(device_params, nullptr);
+
+    for (const ParamCase &test_case : cases)
+    {
+        SCOPED_TRACE(test_case.label);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_cached_tokens,
+                &test_case.cached_tokens,
+                sizeof(int),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        const int *active_rows = nullptr;
+        if (test_case.active_query_rows > 0)
+        {
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    device_active_rows,
+                    &test_case.active_query_rows,
+                    sizeof(int),
+                    hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+            active_rows = device_active_rows;
+        }
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+            device_cached_tokens,
+            test_case.seq_len,
+            test_case.query_rows,
+            stream,
+            test_case.kv_stride,
+            active_rows));
+        std::vector<Params> actual(test_case.expected.size());
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual.data(),
+                device_params,
+                actual.size() * sizeof(Params),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        for (size_t row = 0; row < actual.size(); ++row)
+        {
+            SCOPED_TRACE("row=" + std::to_string(row));
+            EXPECT_EQ(actual[row].kv_len, test_case.expected[row].kv_len);
+            EXPECT_EQ(actual[row].kv_stride, test_case.expected[row].kv_stride);
+            EXPECT_EQ(
+                actual[row].position_offset,
+                test_case.expected[row].position_offset);
+            EXPECT_EQ(actual[row].mask_stride, test_case.expected[row].mask_stride);
+        }
+    }
+
+    EXPECT_EQ(hipFree(device_active_rows), hipSuccess);
+    EXPECT_EQ(hipFree(device_cached_tokens), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
 // ============================================================================
 // Flash Attention 2 (Prefill) Parity Tests
 // ============================================================================
@@ -4497,13 +4626,13 @@ TEST_F(
                 /*rows=*/1,
                 q_cols,
                 TensorType::FP32,
-                /*device_id=*/0);
+                device);
             GpuTensorView output_view(
                 serial_device + static_cast<size_t>(request) * q_cols,
                 /*rows=*/1,
                 q_cols,
                 TensorType::FP32,
-                /*device_id=*/0);
+                device);
 
             ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(
                 kv_lens[request],

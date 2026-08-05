@@ -17,24 +17,167 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include <cmath>
+#include <optional>
+#include <sstream>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
     namespace
     {
-        bool fp32BufferIsAllZero(const float *data, size_t numel)
+        struct BufferValidation
         {
-            if (!data || numel == 0)
-                return false;
+            verification::VerificationResult result;
+            bool used_device_validator = false;
+        };
 
-            for (size_t i = 0; i < numel; ++i)
+        [[nodiscard]] const char *bufferName(const char *name) noexcept
+        {
+            return name ? name : "<unnamed>";
+        }
+
+        [[nodiscard]] std::optional<TensorValidationDataType>
+        gpuValidationDataType(const char *dtype)
+        {
+            const std::string_view name = dtype ? std::string_view(dtype) : std::string_view{};
+            if (name == "FP32")
+                return TensorValidationDataType::FP32;
+            if (name == "BF16")
+                return TensorValidationDataType::BF16;
+            if (name == "FP16")
+                return TensorValidationDataType::FP16;
+            return std::nullopt;
+        }
+
+        [[nodiscard]] verification::VerificationResult gpuResultToVerification(
+            const char *name,
+            const TensorValidationResult &gpu_result,
+            const verification::VerificationConfig &config)
+        {
+            std::ostringstream reason;
+            bool passed = true;
+
+            if (config.check_nan && gpu_result.has_nan)
             {
-                if (data[i] != 0.0f)
-                    return false;
+                passed = false;
+                reason << "Contains " << gpu_result.nan_count << " NaN values";
+            }
+            if (config.check_inf && gpu_result.has_inf)
+            {
+                if (!passed)
+                    reason << "; ";
+                passed = false;
+                reason << "contains " << gpu_result.inf_count << " Inf values";
+            }
+            if (config.check_all_zero && gpu_result.appears_zero)
+            {
+                if (!passed)
+                    reason << "; ";
+                passed = false;
+                reason << "all " << gpu_result.total_checked
+                       << " device elements are zero (likely uninitialized)";
             }
 
-            return true;
+            return verification::VerificationResult::withDiagnostics(
+                passed,
+                bufferName(name),
+                reason.str(),
+                gpu_result.nan_count,
+                gpu_result.inf_count,
+                gpu_result.zero_count,
+                gpu_result.total_checked);
+        }
+
+        /**
+         * Validate one stage buffer without changing its residency authority.
+         *
+         * GPU tensors are scanned in place on the exact stage stream. A missing
+         * validator, stream, current device, or device pointer is an
+         * infrastructure failure and is reported as a failed verification; the
+         * caller never attempts to repair it by materializing the tensor on the
+         * host. Non-floating formats have no NaN/Inf semantics and retain the
+         * same explicit no-op validation contract as verifyRawBuffer().
+         */
+        template <typename Buffer>
+        [[nodiscard]] BufferValidation validateBuffer(
+            const Buffer &buffer,
+            IComputeStage &stage,
+            const verification::VerificationConfig &config)
+        {
+            const size_t numel = buffer.rows * buffer.cols;
+            if (numel == 0)
+                return {verification::VerificationResult::ok(), false};
+
+            ITensor *tensor = buffer.tensor;
+            if (tensor && tensor->isDeviceValid())
+            {
+                const auto device = tensor->current_device();
+                if (!device || !device->is_gpu())
+                {
+                    return {verification::VerificationResult::fail(
+                                bufferName(buffer.name),
+                                "device-valid tensor has no owning GPU device"),
+                            true};
+                }
+
+                if (*device != stage.device())
+                {
+                    return {verification::VerificationResult::fail(
+                                bufferName(buffer.name),
+                                "authoritative tensor device " + device->to_string() +
+                                    " does not match stage device " + stage.device().to_string()),
+                            true};
+                }
+
+                const auto data_type = gpuValidationDataType(buffer.dtype);
+                if (!data_type)
+                    return {verification::VerificationResult::ok(), true};
+
+                const void *device_ptr = tensor->gpu_data_ptr();
+                if (!device_ptr)
+                {
+                    return {verification::VerificationResult::fail(
+                                bufferName(buffer.name),
+                                "device-valid tensor exposes a null device pointer"),
+                            true};
+                }
+
+                ITensorValidator *validator = getTensorValidator(device->type, device->ordinal);
+                if (!validator)
+                {
+                    return {verification::VerificationResult::fail(
+                                bufferName(buffer.name),
+                                "no device validator is installed for " + device->to_string()),
+                            true};
+                }
+
+                try
+                {
+                    const auto gpu_result = validator->validate(
+                        device_ptr,
+                        numel,
+                        *data_type,
+                        ExplicitGPUStream{stage.gpuStream()});
+                    return {gpuResultToVerification(buffer.name, gpu_result, config), true};
+                }
+                catch (const std::exception &error)
+                {
+                    return {verification::VerificationResult::fail(
+                                bufferName(buffer.name),
+                                std::string("device validation failed fatally: ") + error.what()),
+                            true};
+                }
+            }
+
+            return {verification::verifyRawBuffer(
+                        buffer.data,
+                        buffer.rows,
+                        buffer.cols,
+                        bufferName(buffer.name),
+                        buffer.dtype,
+                        config),
+                    false};
         }
     } // namespace
 
@@ -54,15 +197,12 @@ namespace llaminar2
         vconfig.check_all_zero = false;             // Zero inputs may be valid (first layer residual)
         vconfig.dump_on_failure = validation.dump_on_failure;
 
-        // Verify all inputs (NaN/Inf/null checks)
+        // Verify inputs without changing residency. GPU inputs are already
+        // ordered onto the consumer stage stream by the arena dependency DAG.
         for (const auto &input : dump_info.inputs)
         {
-            if (!input.data)
-                continue; // Null inputs checked separately if needed
-
-            auto result = verifyRawBuffer(
-                input.data, input.rows, input.cols,
-                input.name, input.dtype, vconfig);
+            auto validation_result = validateBuffer(input, *node.stage, vconfig);
+            const auto &result = validation_result.result;
 
             if (!result.passed)
             {
@@ -73,7 +213,7 @@ namespace llaminar2
 
                 // Dump all buffers for debugging
                 std::string dump_path;
-                if (vconfig.dump_on_failure)
+                if (vconfig.dump_on_failure && !validation_result.used_device_validator)
                 {
                     dump_path = dumpStageBuffers(node.name, layer_idx, "ENTRY", dump_info,
                                                  result.tensor_name, result.error_reason);
@@ -152,18 +292,12 @@ namespace llaminar2
         // Stages like KVCacheGatherStage can override allowsZeroOutput() to return true.
         vconfig.check_all_zero = validation.fail_on_zero && !node.stage->allowsZeroOutput();
 
-        // Verify all outputs (NaN/Inf/null checks)
-        // IMPORTANT: Sync outputs from GPU BEFORE reading data
-        dump_info.ensureOutputsOnHost(node.stage->gpuStream());
-
+        // Verify outputs at their authoritative residency. Ordinary GPU
+        // validation never downloads the tensor payload or changes coherence.
         for (const auto &output : dump_info.outputs)
         {
-            if (!output.data)
-                continue;
-
-            auto result = verifyRawBuffer(
-                output.data, output.rows, output.cols,
-                output.name, output.dtype, vconfig);
+            auto validation_result = validateBuffer(output, *node.stage, vconfig);
+            const auto &result = validation_result.result;
 
             if (!result.passed)
             {
@@ -176,6 +310,10 @@ namespace llaminar2
                 std::string dump_path;
                 if (vconfig.dump_on_failure)
                 {
+                    // Failure dumping is an explicit terminal diagnostic. It is
+                    // never used as validation or as a recovery path.
+                    if (validation_result.used_device_validator)
+                        dump_info.ensureOutputsOnHost(node.stage->gpuStream());
                     dump_path = dumpStageBuffers(node.name, layer_idx, "EXIT", dump_info,
                                                  result.tensor_name, result.error_reason);
                     LOG_ERROR("[VERIFY] Buffers dumped to: " << dump_path);
@@ -231,181 +369,6 @@ namespace llaminar2
                 }
             }
         }
-    }
-
-    bool validateStageOutputs(const ComputeNode &node)
-    {
-        if (!node.stage)
-            return true;
-
-        const auto &validation = debugEnv().validation;
-
-        // Get stage's dump info to access output buffers
-        // NOTE: We intentionally access getDumpInfo() here even though it may trigger
-        // GPU→host sync, because we only call this in Debug/Integration builds anyway.
-        // The StageDumpInfo provides tensor pointers that we can use for GPU validation.
-        StageDumpInfo dump_info = node.stage->getDumpInfoSnapshot();
-        const bool zero_output_allowed = node.stage->allowsZeroOutput();
-
-        bool all_valid = true;
-
-        // Validate output buffers
-        for (const auto &output : dump_info.outputs)
-        {
-            if (output.rows == 0 || output.cols == 0)
-                continue;
-
-            size_t numel = output.rows * output.cols;
-
-            // Check if we have a tensor pointer with GPU data
-            // If so, use GPU-side validation to avoid expensive D2H sync
-            if (output.tensor)
-            {
-                auto *base_tensor = dynamic_cast<TensorBase *>(output.tensor);
-                if (base_tensor && base_tensor->deviceValid())
-                {
-                    // Get GPU validator for this device type
-                    auto device_opt = base_tensor->current_device();
-                    if (device_opt.has_value())
-                    {
-                        ITensorValidator *validator = getTensorValidator(device_opt->type, device_opt->ordinal);
-                        if (validator)
-                        {
-                            const void *device_ptr = base_tensor->gpu_data_ptr();
-                            int device_id = device_opt->ordinal;
-
-                            // Launch GPU validation kernel (async)
-                            bool launched = false;
-                            if (std::string(output.dtype) == "FP32")
-                            {
-                                launched = validator->validateFP32Async(device_ptr, numel, device_id);
-                            }
-                            else if (std::string(output.dtype) == "BF16")
-                            {
-                                launched = validator->validateBF16Async(device_ptr, numel, device_id);
-                            }
-                            else if (std::string(output.dtype) == "FP16")
-                            {
-                                launched = validator->validateFP16Async(device_ptr, numel, device_id);
-                            }
-
-                            if (launched)
-                            {
-                                TensorValidationResult result;
-                                if (validator->getResult(result))
-                                {
-                                    if (result.appears_zero && numel > 10 && !zero_output_allowed)
-                                    {
-                                        LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                                           << "' appears to be all zeros (GPU validation)");
-                                        if (validation.fail_on_zero)
-                                        {
-                                            LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
-                                            all_valid = false;
-                                        }
-                                    }
-
-                                    if (result.has_nan || result.has_inf)
-                                    {
-                                        LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                                           << "' contains " << result.nan_count << " NaN, "
-                                                                           << result.inf_count << " Inf values (GPU validation)");
-                                        if (validation.fail_on_nan)
-                                        {
-                                            LOG_ERROR("[StageVerifier] Buffer validation failed: NaN/Inf detected");
-                                            all_valid = false;
-                                        }
-                                    }
-
-                                    // Successfully validated on GPU, continue to next output
-                                    continue;
-                                }
-                            }
-                            // Fall through to host validation if GPU validation failed to launch
-                        }
-                    }
-                }
-            }
-
-            // Fallback: Host-side validation (for CPU tensors or when GPU validation unavailable)
-            // Need to ensure output is synced to host before reading
-            if (output.tensor)
-            {
-                if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
-                {
-                    cpu_tensor->ensureOnHost(node.stage->gpuStream());
-                }
-            }
-            if (!output.data)
-                continue;
-
-            if (std::string(output.dtype) == "FP32")
-            {
-                const float *fp32_data = static_cast<const float *>(output.data);
-
-                // Quick zero check: sample first, middle, last elements
-                bool appears_zero = true;
-                if (numel > 0 && fp32_data[0] != 0.0f)
-                    appears_zero = false;
-                if (numel > 1 && fp32_data[numel / 2] != 0.0f)
-                    appears_zero = false;
-                if (numel > 2 && fp32_data[numel - 1] != 0.0f)
-                    appears_zero = false;
-
-                // Full check if samples all zero
-                if (appears_zero && numel > 3)
-                {
-                    size_t sample_stride = std::max(size_t(1), numel / 100);
-                    for (size_t i = 0; i < numel; i += sample_stride)
-                    {
-                        if (fp32_data[i] != 0.0f)
-                        {
-                            appears_zero = false;
-                            break;
-                        }
-                    }
-                }
-
-                if (appears_zero)
-                    appears_zero = fp32BufferIsAllZero(fp32_data, numel);
-
-                if (appears_zero && !zero_output_allowed)
-                {
-                    LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                       << "' appears to be all zeros (likely uninitialized)");
-
-                    if (validation.fail_on_zero)
-                    {
-                        LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
-                        all_valid = false;
-                    }
-                }
-
-                // Check for NaN/Inf
-                bool has_nan_inf = false;
-                for (size_t i = 0; i < numel && !has_nan_inf; i += std::max(size_t(1), numel / 100))
-                {
-                    if (std::isnan(fp32_data[i]) || std::isinf(fp32_data[i]))
-                    {
-                        has_nan_inf = true;
-                    }
-                }
-
-                if (has_nan_inf)
-                {
-                    LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
-                                                       << "' contains NaN or Inf values");
-
-                    if (validation.fail_on_nan)
-                    {
-                        LOG_ERROR("[StageVerifier] Buffer validation failed: NaN/Inf detected");
-                        all_valid = false;
-                    }
-                }
-            }
-        }
-
-        return all_valid;
     }
 
 } // namespace llaminar2

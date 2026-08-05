@@ -1155,6 +1155,134 @@ TEST_F(Test__CUDAFlashAttentionParity, WorkspaceDeviceParamsSupportsSmallMVerifi
 }
 
 /**
+ * @brief Prove CUDA device-count publication distinguishes shared and row-local records.
+ *
+ * `AttentionDeviceParams` has two deliberately different consumers. Ordinary
+ * prefill and M=1 decode use one shared record whose KV length covers the full
+ * resident cache; grouped verification uses one record per query row whose KV
+ * prefixes grow exactly as serial decode would. Confusing the one-record count
+ * with the logical prefill span made only prefill row zero correct.
+ *
+ * This test drives the production device writer directly and validates initial
+ * prefill, continuation prefill, padded-prefill activity, M=1 decode, and an M=4
+ * grouped verifier. The host copies below are integration-test observation only;
+ * production publication and consumption remain stream-ordered on device.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, DeviceCountParamsCoverPrefillDecodeAndGroupedRows)
+{
+    SKIP_IF_NO_CUDA();
+
+    using Params = llaminar2::attention::AttentionDeviceParams;
+    struct ParamCase
+    {
+        const char *label;
+        int cached_tokens;
+        int seq_len;
+        int query_rows;
+        int kv_stride;
+        int active_query_rows;
+        std::vector<Params> expected;
+    };
+
+    const std::vector<ParamCase> cases{
+        {"initial prefill", 9, 9, 1, 18, 0, {{9, 18, 0, 9}}},
+        {"continuation prefill", 18, 9, 1, 18, 0, {{18, 18, 9, 18}}},
+        {"padded prefill", 135, 256, 1, 512, 7, {{135, 512, 128, 135}}},
+        {"M=1 decode", 599, 1, 1, 640, 0, {{599, 640, 598, 599}}},
+        {"M=4 grouped verifier",
+         599,
+         4,
+         4,
+         640,
+         0,
+         {{596, 640, 595, 599},
+          {597, 640, 596, 599},
+          {598, 640, 597, 599},
+          {599, 640, 598, 599}}},
+    };
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    int *device_cached_tokens = nullptr;
+    int *device_active_rows = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_cached_tokens, sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&device_active_rows, sizeof(int)), cudaSuccess);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> kernel(
+        cuda_ordinal_);
+    kernel.setGPUStream(stream);
+    const WorkspaceRequirements requirements =
+        kernel.getWorkspaceRequirements(/*m=*/4, /*n=*/4, /*k=*/64);
+    DeviceWorkspaceManager workspace(
+        gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    kernel.bindWorkspace(&workspace);
+    auto *device_params = static_cast<Params *>(
+        workspace.getBuffer(
+            llaminar2::cuda::AttentionWorkspaceBuffers::DEVICE_PARAMS));
+    ASSERT_NE(device_params, nullptr);
+
+    for (const ParamCase &test_case : cases)
+    {
+        SCOPED_TRACE(test_case.label);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                device_cached_tokens,
+                &test_case.cached_tokens,
+                sizeof(int),
+                cudaMemcpyHostToDevice,
+                stream),
+            cudaSuccess);
+        const int *active_rows = nullptr;
+        if (test_case.active_query_rows > 0)
+        {
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    device_active_rows,
+                    &test_case.active_query_rows,
+                    sizeof(int),
+                    cudaMemcpyHostToDevice,
+                    stream),
+                cudaSuccess);
+            active_rows = device_active_rows;
+        }
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+            device_cached_tokens,
+            test_case.seq_len,
+            test_case.query_rows,
+            stream,
+            test_case.kv_stride,
+            active_rows));
+        std::vector<Params> actual(test_case.expected.size());
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                actual.data(),
+                device_params,
+                actual.size() * sizeof(Params),
+                cudaMemcpyDeviceToHost,
+                stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        for (size_t row = 0; row < actual.size(); ++row)
+        {
+            SCOPED_TRACE("row=" + std::to_string(row));
+            EXPECT_EQ(actual[row].kv_len, test_case.expected[row].kv_len);
+            EXPECT_EQ(actual[row].kv_stride, test_case.expected[row].kv_stride);
+            EXPECT_EQ(
+                actual[row].position_offset,
+                test_case.expected[row].position_offset);
+            EXPECT_EQ(actual[row].mask_stride, test_case.expected[row].mask_stride);
+        }
+    }
+
+    EXPECT_EQ(cudaFree(device_active_rows), cudaSuccess);
+    EXPECT_EQ(cudaFree(device_cached_tokens), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+/**
  * @brief Prove a captured CUDA decode consumes a later device-parameter update.
  *
  * The graph is captured once with a cache-capacity-sized physical split
@@ -4736,13 +4864,13 @@ TEST_F(
                         visible_rows,
                         kv_cols,
                         TensorType::FP16,
-                        cuda_ordinal_);
+                        gpu_device_);
                     GpuTensorView v_prefix(
                         converted_v->gpu_data_ptr(),
                         visible_rows,
                         kv_cols,
                         TensorType::FP16,
-                        cuda_ordinal_);
+                        gpu_device_);
                     ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(
                         visible_rows,
                         visible_rows - 1,
@@ -5056,13 +5184,13 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedVariableLengthRequestBatchFP16Dec
             /*rows=*/1,
             q_cols,
             TensorType::FP32,
-            cuda_ordinal_);
+            gpu_device_);
         GpuTensorView output_view(
             serial_device + static_cast<size_t>(request) * q_cols,
             /*rows=*/1,
             q_cols,
             TensorType::FP32,
-            cuda_ordinal_);
+            gpu_device_);
 
         ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(
             kv_lens[request],

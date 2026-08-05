@@ -2314,7 +2314,13 @@ TEST(Test__GDNKernels, Projection_DumpInfo)
     GDNProjectionStage stage(p);
     auto info = stage.buildDumpInfoImpl();
 
-    EXPECT_EQ(info.inputs.size(), 5u);  // input + 4 weights
+    ASSERT_EQ(info.inputs.size(), 1u);
+    EXPECT_STREQ(info.inputs.front().name, "input");
+    ASSERT_EQ(info.weights.size(), 4u);
+    EXPECT_STREQ(info.weights[0].name, "w_qkv");
+    EXPECT_STREQ(info.weights[1].name, "w_z");
+    EXPECT_STREQ(info.weights[2].name, "w_a");
+    EXPECT_STREQ(info.weights[3].name, "w_b");
     EXPECT_EQ(info.outputs.size(), 4u); // 4 outputs
 }
 

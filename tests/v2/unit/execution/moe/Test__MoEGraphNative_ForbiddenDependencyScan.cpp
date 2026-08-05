@@ -2193,7 +2193,9 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("\"mtp_depth\" + std::to_string(mtp_depth_idx)"),
+        EXPECT_NE(ffn_body.find("MoERuntimeTableRole::MTPDepth"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find(".mtp_depth = use_mtp_runtime_table ? mtp_depth_idx : -1"),
                   std::string::npos);
         EXPECT_NE(ffn_body.find("register_runtime_histogram = !use_mtp_runtime_table"),
                   std::string::npos);
@@ -6561,6 +6563,13 @@ namespace llaminar2::test
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
         const fs::path orchestrator_path =
             root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        const fs::path graph_interface_path =
+            root / "src/v2/execution/local_execution/graph/IGraphBuilder.h";
+        const fs::path qwen_graph_path =
+            root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        const fs::path backend_path = root / "src/v2/backends/IBackend.h";
+        const fs::path sampling_path =
+            root / "src/v2/kernels/common/SamplingMath.h";
         const fs::path cuda_path =
             root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         const fs::path rocm_path =
@@ -6574,6 +6583,10 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(runtime_path)) << runtime_path;
         ASSERT_TRUE(fs::exists(expert_stage_path)) << expert_stage_path;
         ASSERT_TRUE(fs::exists(orchestrator_path)) << orchestrator_path;
+        ASSERT_TRUE(fs::exists(graph_interface_path)) << graph_interface_path;
+        ASSERT_TRUE(fs::exists(qwen_graph_path)) << qwen_graph_path;
+        ASSERT_TRUE(fs::exists(backend_path)) << backend_path;
+        ASSERT_TRUE(fs::exists(sampling_path)) << sampling_path;
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
         ASSERT_TRUE(fs::exists(e2e_path)) << e2e_path;
@@ -6584,6 +6597,10 @@ namespace llaminar2::test
         const std::string runtime = readFile(runtime_path);
         const std::string expert_stage = readFile(expert_stage_path);
         const std::string orchestrator = readFile(orchestrator_path);
+        const std::string graph_interface = readFile(graph_interface_path);
+        const std::string qwen_graph = readFile(qwen_graph_path);
+        const std::string backend = readFile(backend_path);
+        const std::string sampling = readFile(sampling_path);
         const std::string cuda = readFile(cuda_path);
         const std::string rocm = readFile(rocm_path);
         const std::string e2e = readFile(e2e_path);
@@ -6611,11 +6628,65 @@ namespace llaminar2::test
         EXPECT_NE(orchestrator.find(
                       "\"device_rebalance_prefill_current_batch_movement_layers\""),
                   std::string::npos)
-            << "Current-batch movement history must use the existing status readback";
+            << "Current-batch movement history must reach request-final PerfStats";
         EXPECT_NE(orchestrator.find(
                       "\"device_rebalance_prefill_current_batch_non_owner_assignment_layers\""),
                   std::string::npos)
-            << "Resident row evidence must use the existing status readback";
+            << "Resident row evidence must reach request-final PerfStats";
+        EXPECT_NE(
+            graph_interface.find(
+                "DeviceMoECurrentBatchLLEPEvidenceSource"),
+            std::string::npos)
+            << "Model graphs must expose one typed device-owned evidence source";
+        EXPECT_NE(
+            qwen_graph.find(
+                "GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer"),
+            std::string::npos)
+            << "Current-batch LLEP evidence must be selected through an exact typed role";
+        EXPECT_EQ(
+            qwen_graph.find(
+                "publishes_current_batch_llep_evidence"),
+            std::string::npos)
+            << "A secondary evidence boolean can drift from the binding's transaction role";
+        EXPECT_NE(
+            qwen_graph.find(":current_batch_llep_layer="),
+            std::string::npos)
+            << "Current-batch LLEP needs an explicit logical binding identity";
+        EXPECT_NE(
+            qwen_graph.find(":prefix_runtime_rehydration_layer="),
+            std::string::npos)
+            << "Prefix rehydration must not alias current-batch evidence ownership";
+        EXPECT_NE(
+            qwen_graph.find(
+                "DeviceMoERebalanceConfig invocation_config ="),
+            std::string::npos)
+            << "Each graph bucket must derive its policy at construction time";
+        EXPECT_NE(
+            qwen_graph.find(
+                "invocation_config.active_transfer_slot_capacity ="),
+            std::string::npos)
+            << "Fresh invocation policy must retain the persistent binding capacity";
+        EXPECT_NE(
+            qwen_graph.find("bindings disagree on the "),
+            std::string::npos)
+            << "Ambiguous current-batch evidence sources must be diagnosed";
+        EXPECT_NE(
+            qwen_graph.find("canonical runtime table for "),
+            std::string::npos)
+            << "Unordered or ambiguous runtime-table selection must fail hard";
+        EXPECT_NE(
+            backend.find(
+                "enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl"),
+            std::string::npos)
+            << "Both GPU backends need one explicit-stream publication contract";
+        EXPECT_NE(
+            sampling.find(
+                "kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount"),
+            std::string::npos);
+        EXPECT_NE(
+            sampling.find(
+                "kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount"),
+            std::string::npos);
         EXPECT_NE(e2e.find(
                       "prefill_applied_movement = record_value_sum("),
                   std::string::npos)
@@ -6691,6 +6762,10 @@ namespace llaminar2::test
                       std::string::npos)
                 << backend << " must aggregate the assignment consumer's sticky marker";
             EXPECT_NE(source->find(
+                          "publish_current_batch_llep_evidence_to_generation_control_kernel"),
+                      std::string::npos)
+                << backend << " must reduce the complete runtime table directly on device";
+            EXPECT_NE(source->find(
                           "containsNonOwnerAssignmentRows("),
                       std::string::npos)
                 << backend << " production assignment consumer must publish exact resident-row evidence";
@@ -6711,7 +6786,50 @@ namespace llaminar2::test
         EXPECT_EQ(orchestrator.find(
                       "deviceToHostOnStream(&prefill_current_batch_non_owner_assignment_layers"),
                   std::string::npos)
-            << "Resident-row evidence must share the request-boundary status copy, not add hot-path D2H";
+            << "Resident-row evidence must share terminal control, not add a dedicated production D2H";
+
+        const size_t terminal_start = orchestrator.find(
+            "bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(");
+        ASSERT_NE(terminal_start, std::string::npos);
+        const size_t terminal_end = orchestrator.find(
+            "bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(",
+            terminal_start);
+        ASSERT_NE(terminal_end, std::string::npos);
+        const std::string terminal = orchestrator.substr(
+            terminal_start,
+            terminal_end - terminal_start);
+        const size_t evidence_enqueue = terminal.find(
+            "enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(");
+        const size_t first_terminal_d2h = terminal.find(
+            "deviceToHostOnStream(");
+        ASSERT_NE(evidence_enqueue, std::string::npos);
+        ASSERT_NE(first_terminal_d2h, std::string::npos);
+        EXPECT_LT(evidence_enqueue, first_terminal_d2h)
+            << "Device evidence must be stream-ordered before the existing terminal copies";
+        EXPECT_EQ(countOccurrences(terminal, "deviceToHostOnStream("), 2u)
+            << "LLEP observability must not add a third production D2H";
+        EXPECT_EQ(countOccurrences(terminal, "synchronizeStream("), 1u)
+            << "LLEP observability must reuse the sole terminal result wait";
+
+        const size_t diagnostic_start = orchestrator.find(
+            "publishSnapshotCurrentBatchLLEPEvidenceDiagnostics()");
+        ASSERT_NE(diagnostic_start, std::string::npos);
+        const size_t diagnostic_end = orchestrator.find(
+            "drainCompletedDecodeBoundaryMaintenanceDiagnostics()",
+            diagnostic_start);
+        ASSERT_NE(diagnostic_end, std::string::npos);
+        const std::string diagnostic = orchestrator.substr(
+            diagnostic_start,
+            diagnostic_end - diagnostic_start);
+        EXPECT_NE(
+            diagnostic.find(
+                "!snapshot_enabled_ || !PerfStatsCollector::isEnabled()"),
+            std::string::npos)
+            << "The extra diagnostic readback must be impossible in production";
+        EXPECT_NE(
+            diagnostic.find("DeviceTimelineRole::Diagnostics"),
+            std::string::npos)
+            << "Snapshot evidence must consume the explicit forward-output event";
     }
 
     /**
@@ -8094,10 +8212,10 @@ namespace llaminar2::test
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
                "payloads through a resolver after those bytes may be reused.";
-        EXPECT_NE(graph.find("Portable version 3 contains pointer-free logical placement"),
+        EXPECT_NE(graph.find("Portable version 4 contains pointer-free, role-scoped logical"),
                   std::string::npos)
             << "The graph must document the durable placement boundary enforced "
-               "by portable runtime version 3.";
+               "by portable runtime version 4.";
         EXPECT_NE(graph.find("resetPrefixCacheRuntimeStateWithoutSnapshot"),
                   std::string::npos)
             << "MoE prefix restore without a runtime payload must have its own "

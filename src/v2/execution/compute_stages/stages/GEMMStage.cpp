@@ -620,11 +620,21 @@ namespace llaminar2
             info.addOutput("C", params_.C, params_.m, params_.n);
         }
 
-        // Optional inputs - use unified interface for bias
-        const float *bias_data = params_.getBiasData();
-        if (bias_data)
+        // Bias is immutable model state, not a per-execution activation. Prefer
+        // the typed tensor so device-only prepared ownership remains visible.
+        if (params_.bias_tensor)
         {
-            info.addInput("bias", bias_data, 1, params_.n);
+            info.addWeight("bias", params_.bias_tensor);
+        }
+        else if (params_.bias)
+        {
+            info.addRawWeight(
+                "bias",
+                params_.bias,
+                static_cast<size_t>(params_.n) * sizeof(float),
+                /*rows=*/1,
+                static_cast<size_t>(params_.n),
+                "FP32");
         }
         if (params_.gate_input)
         {

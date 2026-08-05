@@ -6,6 +6,7 @@
 
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/common/SamplingMath.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "tensors/Tensors.h"
 
@@ -35,6 +36,7 @@
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
+#include "../moe/NativeVNNIExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 
 #include <algorithm>
@@ -1932,6 +1934,133 @@ namespace
         llaminar2::CUDAMoEKernel *cuda_kernel_ = nullptr;
         llaminar2::IMoEKernel *cpu_kernel_ = nullptr;
     };
+}
+
+/**
+ * @brief Prove terminal LLEP evidence is reduced from the complete CUDA table.
+ *
+ * Movement and non-owner execution are independent sticky markers, so this
+ * test seeds overlapping but non-identical layer sets. The public backend API
+ * must publish their exact counts into request row zero, clear later request
+ * rows, and leave every unrelated generation-control word untouched.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       CurrentBatchLLEPEvidencePublishesExactTerminalControlCounts)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    using namespace llaminar2::sampling_math;
+    constexpr int layer_count = 7;
+    constexpr int request_count = 2;
+    constexpr int control_stride = kDeviceGenerationControlCount;
+    constexpr int sentinel = -17;
+
+    llaminar2::DeviceMoERuntimeTable::Config config;
+    config.device_id = llaminar2::DeviceId::cuda(0);
+    config.num_layers = layer_count;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    config.prefill_token_capacity = 1;
+    llaminar2::MoERuntimeTable runtime_table(config);
+
+    int expected_movement_layers = 0;
+    int expected_non_owner_layers = 0;
+    for (int layer = 0; layer < layer_count; ++layer)
+    {
+        auto runtime = runtime_table.hostLayerState(layer);
+        const bool moved = layer == 0 || layer == 2 || layer == 6;
+        const bool non_owner =
+            layer == 1 || layer == 2 || layer == 5 || layer == 6;
+        runtime.current_batch_llep_movement_observed = moved ? 1u : 0u;
+        runtime.current_batch_llep_non_owner_assignment_observed =
+            non_owner ? 1u : 0u;
+        expected_movement_layers += moved ? 1 : 0;
+        expected_non_owner_layers += non_owner ? 1 : 0;
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                runtime_table.deviceLayerState(layer),
+                &runtime,
+                sizeof(runtime),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+    }
+
+    std::array<int, request_count * control_stride> host_control{};
+    host_control.fill(sentinel);
+    int *device_control = nullptr;
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&device_control),
+            sizeof(host_control)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            device_control,
+            host_control.data(),
+            sizeof(host_control),
+            cudaMemcpyHostToDevice,
+            stream_),
+        cudaSuccess);
+
+    auto *backend = llaminar2::getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ASSERT_TRUE(
+        backend->enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            runtime_table.deviceLayerState(0),
+            layer_count,
+            device_control,
+            control_stride,
+            request_count,
+            /*device_id=*/0,
+            stream_));
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            host_control.data(),
+            device_control,
+            sizeof(host_control),
+            cudaMemcpyDeviceToHost,
+            stream_),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    EXPECT_EQ(
+        host_control[
+            kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount],
+        expected_movement_layers);
+    EXPECT_EQ(
+        host_control[
+            kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount],
+        expected_non_owner_layers);
+    EXPECT_EQ(host_control[kDeviceGenerationControlOk], sentinel);
+
+    const int second_row = control_stride;
+    EXPECT_EQ(
+        host_control[
+            second_row +
+            kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount],
+        0);
+    EXPECT_EQ(
+        host_control[
+            second_row +
+            kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount],
+        0);
+    EXPECT_EQ(
+        host_control[second_row + kDeviceGenerationControlOk], sentinel);
+
+    EXPECT_FALSE(
+        backend->enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            runtime_table.deviceLayerState(0),
+            layer_count,
+            device_control,
+            control_stride,
+            request_count,
+            /*device_id=*/0,
+            nullptr));
+    EXPECT_EQ(cudaFree(device_control), cudaSuccess);
+#endif
 }
 
 /**
@@ -20515,6 +20644,17 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     constexpr int intermediate = 256;
     const auto device = llaminar2::DeviceId::cuda(0);
 
+    std::vector<int> row_inventory(
+        kGroupedVerifierRuntimeRows.begin(),
+        kGroupedVerifierRuntimeRows.end());
+    /*
+     * Four routes per row leave M=31 below the production grouping kernel's
+     * 256-slot one-block capacity. M=65 is the first row count above that
+     * boundary and keeps this all-codebook regression small enough to remain a
+     * focused integration test.
+     */
+    row_inventory.push_back(65);
+
     const auto formats = cudaMoEGroupedNativeFormats();
     for (size_t format_index = 0; format_index < formats.size(); ++format_index)
     {
@@ -20523,7 +20663,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         llaminar2::PerfStatsCollector::reset();
 
         auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
-            /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
+            /*max_seq_len=*/row_inventory.back(),
             d_model,
             intermediate,
             num_experts,
@@ -20610,7 +20750,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         runtime_config.num_experts = num_experts;
         runtime_config.top_k = top_k;
         runtime_config.mirror_to_device = true;
-        runtime_config.prefill_token_capacity = kGroupedVerifierRuntimeRows.back();
+        runtime_config.prefill_token_capacity = row_inventory.back();
         llaminar2::DeviceMoERuntimeTable runtime_table(runtime_config);
 
         llaminar2::MoEPlacementUpdate update;
@@ -20661,7 +20801,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             router_gate_values);
         ASSERT_TRUE(router_gate->ensureOnDevice(device, stream_));
 
-        for (const int seq_len : kGroupedVerifierRuntimeRows)
+        for (const int seq_len : row_inventory)
         {
             std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
             for (size_t i = 0; i < hidden_values.size(); ++i)
@@ -23783,5 +23923,29 @@ TEST(Test__CUDAMoERequestReset,
     EXPECT_EQ(cudaEventDestroy(reset_ready), cudaSuccess);
     EXPECT_EQ(cudaStreamDestroy(consumer_stream), cudaSuccess);
     EXPECT_EQ(cudaStreamDestroy(reset_stream), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Prove transferred CurrentBatchLLEP expert execution across all formats.
+ *
+ * This is the CUDA endpoint of the backend-neutral production-ABI regression.
+ * The shared helper owns the complete format and M inventory so CUDA and ROCm
+ * cannot accidentally certify different transfer or grouped-execution domains.
+ */
+TEST_F(
+    Test__CUDAMoEKernel,
+    TransferredCurrentBatchLLEPAllNativeFormatsMatchStaticOwnerBytes)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+        "CUDA",
+        llaminar2::DeviceId::cuda(0),
+        stream_);
 #endif
 }

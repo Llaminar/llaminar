@@ -2304,6 +2304,48 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reduce device-owned current-batch LLEP markers into terminal control.
+         *
+         * The complete MoE runtime table is scanned once after its final
+         * producer event. The backend writes the number of layers that moved a
+         * payload and the number that executed non-owner rows into the named
+         * generation-control fields. Request row zero owns this domain-wide
+         * evidence; the same fields in later request rows are cleared.
+         *
+         * Implementations must enqueue one deterministic, graph-capturable
+         * kernel on @p stream. Atomics, allocation, host/device transfer, and
+         * stream or device synchronization are forbidden.
+         *
+         * @param runtime_layers_device Contiguous DeviceMoELayerRuntime table.
+         * @param layer_count Number of complete layer records in the table.
+         * @param generation_control_device Persistent INT32 control-row base.
+         * @param generation_control_stride INT32 words between request rows.
+         * @param request_count Number of request rows to initialize.
+         * @param device_id GPU ordinal.
+         * @param stream Exact non-null consumer stream ordered after producers.
+         * @return true only when the publication kernel was enqueued.
+         */
+        virtual bool
+        enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            const void *runtime_layers_device,
+            int layer_count,
+            void *generation_control_device,
+            int generation_control_stride,
+            int request_count,
+            int device_id,
+            void *stream)
+        {
+            (void)runtime_layers_device;
+            (void)layer_count;
+            (void)generation_control_device;
+            (void)generation_control_stride;
+            (void)request_count;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Derive the next verifier commit budget from resident request state.
          *
          * The generated scalar is consumed directly by the compact verifier

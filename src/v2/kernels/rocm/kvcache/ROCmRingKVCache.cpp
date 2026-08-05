@@ -2218,7 +2218,8 @@ namespace llaminar2
             batched_k_view_->shape()[1] != columns)
         {
             batched_k_view_ = std::make_unique<GpuTensorView>(
-                conv_scratch_k_, rows, columns, tensor_type, device_id_);
+                conv_scratch_k_, rows, columns, tensor_type,
+                DeviceId::rocm(device_id_));
         }
         if (!batched_v_view_ ||
             batched_v_view_->gpu_data_ptr() != conv_scratch_v_ ||
@@ -2227,7 +2228,8 @@ namespace llaminar2
             batched_v_view_->shape()[1] != columns)
         {
             batched_v_view_ = std::make_unique<GpuTensorView>(
-                conv_scratch_v_, rows, columns, tensor_type, device_id_);
+                conv_scratch_v_, rows, columns, tensor_type,
+                DeviceId::rocm(device_id_));
         }
 
         if (out_k)
@@ -2353,7 +2355,7 @@ namespace llaminar2
         {
             converted_batched_k_view_ = std::make_unique<GpuTensorView>(
                 k_output, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         if (!converted_batched_v_view_ ||
             converted_batched_v_view_->gpu_data_ptr() != v_output ||
@@ -2362,7 +2364,7 @@ namespace llaminar2
         {
             converted_batched_v_view_ = std::make_unique<GpuTensorView>(
                 v_output, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         if (out_k)
             *out_k = converted_batched_k_view_.get();
@@ -2433,7 +2435,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 static_cast<size_t>(kv_dim_),
                 tensor_type,
-                device_id_);
+                DeviceId::rocm(device_id_));
 
             LOG_TRACE("[ROCmRingKVCache::get_k] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -2507,7 +2509,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 static_cast<size_t>(kv_dim_),
                 tensor_type,
-                device_id_);
+                DeviceId::rocm(device_id_));
 
             LOG_TRACE("[ROCmRingKVCache::get_v] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -2716,7 +2718,8 @@ namespace llaminar2
         if (!k_view || k_view->gpu_data_ptr() != d_k || k_view->rows() != rows)
         {
             k_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_k), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_k), rows, view_cols, tensor_type,
+                DeviceId::rocm(device_id_));
         }
 
         // Update V view (index 1)
@@ -2724,7 +2727,8 @@ namespace llaminar2
         if (!v_view || v_view->gpu_data_ptr() != d_v || v_view->rows() != rows)
         {
             v_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_v), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_v), rows, view_cols, tensor_type,
+                DeviceId::rocm(device_id_));
         }
 
         if (out_k)
@@ -2810,14 +2814,16 @@ namespace llaminar2
         if (!k_view || k_view->gpu_data_ptr() != entry.d_K || k_view->rows() != rows)
         {
             k_view = std::make_unique<GpuTensorView>(
-                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type, device_id_);
+                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type,
+                DeviceId::rocm(device_id_));
         }
 
         auto &v_view = snapshot_tensor_views_[layer][seq_idx][1];
         if (!v_view || v_view->gpu_data_ptr() != entry.d_V || v_view->rows() != rows)
         {
             v_view = std::make_unique<GpuTensorView>(
-                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type, device_id_);
+                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type,
+                DeviceId::rocm(device_id_));
         }
 
         if (out_k)
@@ -2989,13 +2995,13 @@ namespace llaminar2
         {
             shadow.k_view = std::make_unique<GpuTensorView>(
                 shadow.d_K, read_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.v_view = std::make_unique<GpuTensorView>(
                 shadow.d_V, read_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
 
         if (out_k)

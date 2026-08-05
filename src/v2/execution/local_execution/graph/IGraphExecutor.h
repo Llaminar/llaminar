@@ -57,8 +57,18 @@ namespace llaminar2
         const std::string &node_name,
         const StageDumpInfo &dump_info)>;
 
+    /**
+     * @brief Decide whether one concrete stage publication belongs in a snapshot.
+     *
+     * A graph node name identifies the operation, but it does not necessarily
+     * identify the semantic value produced by that operation. Fused and
+     * policy-selected stages can publish different named outputs while retaining
+     * the same graph node name. Requiring the immutable output descriptor here
+     * prevents a filter from selecting a stale or merely possible producer.
+     */
     using StageSnapshotFilter = std::function<bool(
-        const std::string &node_name)>;
+        const std::string &node_name,
+        const StageDumpInfo &dump_info)>;
 
     using StageFailureCallback = std::function<void(
         const std::string &node_name,
@@ -79,7 +89,7 @@ namespace llaminar2
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;
 
-        /// Optional stage-level filter for snapshot capture. Empty means all stages.
+        /// Optional concrete-publication filter for snapshot capture. Empty means all stages.
         StageSnapshotFilter snapshot_stage_filter = nullptr;
 
         /// Callback invoked immediately when a stage fails. TP runners use this

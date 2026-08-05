@@ -256,6 +256,7 @@ TEST_F(StageDumpInfoTest, GEMMStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "C"));
+    EXPECT_TRUE(hasWeight(info, "B"));
 }
 
 // =============================================================================
@@ -376,6 +377,8 @@ TEST_F(StageDumpInfoTest, RMSNormStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "output"));
+    EXPECT_TRUE(hasWeight(info, "gamma"));
+    EXPECT_FALSE(hasInput(info, "gamma"));
 }
 
 TEST_F(StageDumpInfoTest, GatedRMSNormStage_DumpInfoUsesFeatureDim)

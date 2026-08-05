@@ -172,6 +172,30 @@ namespace llaminar2
          */
         virtual DeviceId home_device() const = 0;
 
+        /**
+         * @brief Return the GPU device that currently owns authoritative storage.
+         *
+         * Tensor placement and current residency are different concepts. A
+         * host-owned tensor may be uploaded to a GPU, while a non-owning GPU
+         * view has no host allocation at all. Generic execution and diagnostic
+         * code must use this method instead of downcasting to one concrete
+         * tensor hierarchy or assuming home_device() describes live storage.
+         *
+         * The conservative default recognizes device-only implementations whose
+         * home device is a GPU. Coherence-aware tensors override this method to
+         * report their exact current allocation device.
+         *
+         * @return Current authoritative GPU device, or std::nullopt when device
+         *         storage is not authoritative.
+         */
+        virtual std::optional<DeviceId> current_device() const
+        {
+            const DeviceId home = home_device();
+            if (home.is_gpu() && isDeviceValid() && gpu_data_ptr() != nullptr)
+                return home;
+            return std::nullopt;
+        }
+
         // =========================================================================
         // Device Location Convenience Methods
         // =========================================================================

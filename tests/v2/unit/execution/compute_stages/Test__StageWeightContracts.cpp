@@ -29,6 +29,9 @@
 #include "memory/StageBufferContract.h"
 #include "backends/DeviceId.h"
 
+#include <algorithm>
+#include <string_view>
+
 using namespace llaminar2;
 using namespace llaminar2::test;
 
@@ -98,6 +101,28 @@ protected:
                 return true;
         }
         return false;
+    }
+
+    /** @brief Report whether dump metadata classifies @p name as an activation input. */
+    static bool dumpHasInput(const StageDumpInfo &dump, const char *name)
+    {
+        return std::any_of(
+            dump.inputs.begin(), dump.inputs.end(),
+            [name](const StageDumpInfo::InputBuffer &input)
+            {
+                return input.name && std::string_view(input.name) == name;
+            });
+    }
+
+    /** @brief Report whether dump metadata classifies @p name as immutable model state. */
+    static bool dumpHasWeight(const StageDumpInfo &dump, const char *name)
+    {
+        return std::any_of(
+            dump.weights.begin(), dump.weights.end(),
+            [name](const StageDumpInfo::WeightBuffer &weight)
+            {
+                return weight.name && std::string_view(weight.name) == name;
+            });
     }
 
     // Typical model dimensions (Qwen2.5-0.5B-like)
@@ -205,6 +230,9 @@ TEST_F(Test__StageWeightContracts, GEMMStage_DeclaresWeightBAndBias)
     EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, B.get()));
     EXPECT_TRUE(contractContainsWeight(contract, bias.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "bias"));
+    EXPECT_FALSE(dumpHasInput(dump, "bias"));
 }
 
 TEST_F(Test__StageWeightContracts, GEMMStage_NullB_EmptyWeights)
@@ -368,6 +396,9 @@ TEST_F(Test__StageWeightContracts, RMSNormStage_DeclaresGamma)
     EXPECT_FALSE(contract.empty());
     EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 TEST_F(Test__StageWeightContracts, RMSNormStage_InPlace_HasInOutBinding)
@@ -661,6 +692,9 @@ TEST_F(Test__StageWeightContracts, FusedResidualNormStage_DeclaresGamma)
     EXPECT_FALSE(contract.empty());
     EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 // =============================================================================
@@ -689,6 +723,9 @@ TEST_F(Test__StageWeightContracts, QKNormStage_DeclaresGamma)
     EXPECT_FALSE(contract.empty());
     EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 // =============================================================================

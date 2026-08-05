@@ -1528,6 +1528,75 @@ TEST_F(
 
 TEST_F(
     Test__TransferEngine_EventFailure,
+    CaptureLedgerAdmitsSameStageScratchOnlyAfterExactPublication)
+{
+    auto scratch = TestTensorFactory::createFP32Ones({4, 4});
+    scratch->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(scratch.get(), DeviceId::cuda(0));
+    ASSERT_FALSE(scratch->deviceValid());
+
+    int compound_stage = 0;
+    void *capture_stream = reinterpret_cast<void *>(0xCA970005);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {{
+        .stage_identity = &compound_stage,
+        .stage_name = "compound_gate_up_down",
+        .outputs = {scratch->transferStorageOwner()},
+    }};
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0), capture_stream, std::move(stages),
+        "same_stage_scratch");
+
+    GraphCaptureGuard capture_guard(&ledger);
+    ScopedGraphCaptureStage stage_scope(&compound_stage);
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            scratch.get(), DeviceId::cuda(0), capture_stream),
+        std::logic_error)
+        << "A pure stage output cannot be consumed before its producer is recorded";
+    EXPECT_NO_THROW(TransferEngine::publishDeviceWrite(
+        scratch.get(), DeviceId::cuda(0), capture_stream));
+    EXPECT_NO_THROW(TransferEngine::requireDeviceInput(
+        scratch.get(), DeviceId::cuda(0), capture_stream));
+    EXPECT_FALSE(scratch->deviceValid())
+        << "Intra-stage capture ordering must not publish unexecuted bytes globally";
+    EXPECT_EQ(mock_->getEventRecordCount(), 0u)
+        << "Intra-stage capture ordering must not add event nodes";
+    stage_scope.complete();
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureLedgerRejectsPublicationOutsideDeclaredStageOutputs)
+{
+    auto declared = TestTensorFactory::createFP32Ones({4, 4});
+    auto undeclared = TestTensorFactory::createFP32Ones({4, 4});
+    declared->setBackendForTesting(mock_.get());
+    undeclared->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(declared.get(), DeviceId::cuda(0));
+    TransferEngine::allocateDeviceStorage(undeclared.get(), DeviceId::cuda(0));
+
+    int stage = 0;
+    void *capture_stream = reinterpret_cast<void *>(0xCA970006);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {{
+        .stage_identity = &stage,
+        .stage_name = "strict_publication_contract",
+        .outputs = {declared->transferStorageOwner()},
+    }};
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0), capture_stream, std::move(stages),
+        "undeclared_publication");
+
+    GraphCaptureGuard capture_guard(&ledger);
+    ScopedGraphCaptureStage stage_scope(&stage);
+    EXPECT_THROW(
+        TransferEngine::publishDeviceWrite(
+            undeclared.get(), DeviceId::cuda(0), capture_stream),
+        std::logic_error);
+    stage_scope.complete();
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
     CaptureLedgerRejectsInternalInputWhoseProducerIsNotEarlier)
 {
     auto tensor = TestTensorFactory::createFP32Ones({4, 4});

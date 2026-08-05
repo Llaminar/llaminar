@@ -556,6 +556,14 @@ namespace llaminar2
             void *control_device,
             int device_id,
             void *stream) override;
+        bool enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            const void *runtime_layers_device,
+            int layer_count,
+            void *generation_control_device,
+            int generation_control_stride,
+            int request_count,
+            int device_id,
+            void *stream) override;
         bool enqueuePrepareDeviceGenerationTransactionBudget(
             void *control_device,
             int control_stride,

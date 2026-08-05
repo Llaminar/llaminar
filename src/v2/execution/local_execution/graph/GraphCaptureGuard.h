@@ -28,6 +28,8 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../utils/Logger.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <optional>
@@ -105,7 +107,10 @@ namespace llaminar2
                 if (!stage.stage_identity)
                     throw std::invalid_argument(
                         "GraphCaptureDependencyLedger contains a null stage identity");
+                max_stage_outputs_ =
+                    std::max(max_stage_outputs_, stage.outputs.size());
             }
+            current_stage_publications_.resize(max_stage_outputs_, 0);
         }
 
         /** @brief Arm the frozen plan for one recording pass. */
@@ -144,6 +149,11 @@ namespace llaminar2
                     "Graph capture stage order mismatch: expected '" +
                     expected.stage_name + "' in " + context_);
             }
+            std::fill(
+                current_stage_publications_.begin(),
+                current_stage_publications_.begin() +
+                    static_cast<std::ptrdiff_t>(expected.outputs.size()),
+                uint8_t{0});
             current_stage_active_ = true;
         }
 
@@ -168,9 +178,11 @@ namespace llaminar2
         /**
          * @brief Classify one tensor read made by the currently recording stage.
          *
-         * An internal input is accepted only when its producer index is strictly
-         * earlier than the current stage.  Unknown tensors, including weights and
-         * stage-owned metadata, remain strict external inputs.
+         * An internal input is accepted when either an earlier stage owns its
+         * producer edge or the current compound stage has already published that
+         * exact declared output after recording its producer sub-operation.
+         * Unknown tensors, including weights and stage-owned metadata, remain
+         * strict external inputs.
          */
         InputDisposition classifyInput(
             const TensorBase *tensor,
@@ -183,6 +195,42 @@ namespace llaminar2
                     "Graph capture input was requested outside a stage: " + context_);
 
             const auto &stage = stages_[stage_cursor_];
+            for (size_t output_index = 0;
+                 output_index < stage.outputs.size();
+                 ++output_index)
+            {
+                if (stage.outputs[output_index] != tensor)
+                    continue;
+                if (current_stage_publications_[output_index] != 0)
+                    return InputDisposition::InternalRecorded;
+
+                /*
+                 * Inouts legitimately read their prior generation before the
+                 * current stage publishes a replacement. Pure outputs do not:
+                 * consuming one before publication is an invalid intra-stage
+                 * producer/consumer ordering, not an external dependency.
+                 */
+                const bool declared_read =
+                    std::find(stage.external_inputs.begin(),
+                              stage.external_inputs.end(),
+                              tensor) != stage.external_inputs.end() ||
+                    std::any_of(
+                        stage.internal_inputs.begin(),
+                        stage.internal_inputs.end(),
+                        [tensor](const InternalInput &input)
+                        {
+                            return input.tensor == tensor;
+                        });
+                if (!declared_read)
+                {
+                    throw std::logic_error(
+                        "Graph capture stage '" + stage.stage_name +
+                        "' consumed a declared output before publishing its "
+                        "producer sub-operation (" + context_ + ")");
+                }
+                break;
+            }
+
             for (const auto &input : stage.internal_inputs)
             {
                 if (input.tensor != tensor)
@@ -199,22 +247,40 @@ namespace llaminar2
         }
 
         /**
-         * @brief Validate a stage-local publication without recording an event.
+         * @brief Record one declared stage-local publication without an event.
          *
          * Stage kernels historically called publishDeviceWrite() immediately
          * after enqueueing work.  Inside native capture that work has only been
-         * recorded, so the transaction validates provenance here and defers real
-         * authority/event publication to the post-launch graph boundary.
+         * recorded, so the transaction records the exact intra-stage producer
+         * edge and defers real authority/event publication to the post-launch
+         * graph boundary. The preallocated publication bitmap makes this legal in
+         * a native capture window without dynamic storage or event nodes.
          */
-        void validateRecordedPublication(
-            const TensorBase *,
+        void recordStagePublication(
+            const TensorBase *tensor,
             DeviceId device,
-            void *stream) const
+            void *stream)
         {
             requireCurrentTransaction(device, stream);
             if (!current_stage_active_ || stage_cursor_ >= stages_.size())
                 throw std::logic_error(
                     "Graph capture publication occurred outside a stage: " + context_);
+
+            const auto &stage = stages_[stage_cursor_];
+            for (size_t output_index = 0;
+                 output_index < stage.outputs.size();
+                 ++output_index)
+            {
+                if (stage.outputs[output_index] != tensor)
+                    continue;
+                current_stage_publications_[output_index] = 1;
+                return;
+            }
+
+            throw std::logic_error(
+                "Graph capture stage '" + stage.stage_name +
+                "' published a tensor absent from its declared output contract (" +
+                context_ + ")");
         }
 
         /** @brief True when every planned stage was recorded successfully. */
@@ -255,6 +321,8 @@ namespace llaminar2
         void *stream_ = nullptr;
         std::vector<StagePlan> stages_;
         std::string context_;
+        std::vector<uint8_t> current_stage_publications_;
+        size_t max_stage_outputs_ = 0;
         size_t stage_cursor_ = 0;
         bool active_ = false;
         bool current_stage_active_ = false;

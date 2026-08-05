@@ -441,7 +441,7 @@ namespace llaminar2
 
         if (auto *ledger = currentGraphCaptureDependencyLedger())
         {
-            ledger->validateRecordedPublication(
+            ledger->recordStagePublication(
                 tensor, device, producer_stream);
             std::lock_guard<std::mutex> lock(tensor->coherence_mutex_);
             if (!tensor->gpu_data_ptr_ ||

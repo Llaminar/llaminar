@@ -27,6 +27,19 @@ namespace llaminar2::test
         10, 11, 12, 13, 14, 15, 16, 31};
 
     /**
+     * @brief Runtime-M inventory plus the first scalable Qwen MoE route group.
+     *
+     * Qwen3.6 routes eight experts per token. M=31 therefore publishes 248
+     * route slots and remains inside the one-block runtime planner's 256-slot
+     * capacity. M=33 is the smallest odd row count that crosses that boundary,
+     * so production-shape all-format tests use this inventory to prove the
+     * scalable count/scan/scatter path as well as the verifier-sized path.
+     */
+    inline constexpr std::array<int, 17> kGroupedVerifierQwenScalableRows = {
+        2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 12, 13, 14, 15, 16, 31, 33};
+
+    /**
      * @brief Tile and capacity boundaries for expensive production-size cases.
      */
     inline constexpr std::array<int, 6> kGroupedVerifierBoundaryRows = {

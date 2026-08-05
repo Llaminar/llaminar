@@ -163,7 +163,7 @@ namespace llaminar2
 
         if (params_.gamma)
         {
-            info.addInput("gamma", params_.gamma, 1, params_.head_dim);
+            info.addWeight("gamma", params_.gamma);
         }
 
         info.addOutput("output", params_.output, total_tokens, total_cols);

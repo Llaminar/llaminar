@@ -116,6 +116,14 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
             EXPECT_EQ(
                 control[kDeviceGenerationControlErrorCode],
                 static_cast<int>(DeviceGenerationError::None));
+            EXPECT_EQ(
+                control[
+                    kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount],
+                0);
+            EXPECT_EQ(
+                control[
+                    kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount],
+                0);
 
             for (int maintenance_rows = 1; maintenance_rows <= 16;
                  ++maintenance_rows)
@@ -138,6 +146,20 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
             }
         }
     }
+}
+
+TEST(Test__DeviceGenerationController,
+     CurrentBatchLLEPEvidenceFieldsAreContiguousTerminalControlWords)
+{
+    using namespace llaminar2::sampling_math;
+
+    EXPECT_EQ(
+        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount + 1,
+        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount);
+    EXPECT_EQ(
+        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount +
+            1,
+        kDeviceGenerationControlCount);
 }
 
 TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEveryDepth)

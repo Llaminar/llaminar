@@ -315,6 +315,20 @@ namespace
         config.decode_snapshots_only = true;
         config.require_prompt_metadata_match = true;
         if (config.policy_scenario ==
+            ExpertOverlayPolicyScenario::CurrentBatchLLEP)
+        {
+            /*
+             * This is the movement-positive production-path regression, not a
+             * policy eligibility smoke. A naturally balanced router histogram
+             * must not let the fixture silently execute StaticOwner while its
+             * name and assertions claim transfer-backed CurrentBatchLLEP.
+             * Match the canonical E2E movement probe's half-capacity target and
+             * require the planner to publish the best available LLEP assignment.
+             */
+            config.moe_routed_prefill.llep_alpha_denominator = 2;
+            config.moe_routed_prefill.llep_enable_balanced_skip = false;
+        }
+        if (config.policy_scenario ==
             ExpertOverlayPolicyScenario::DynamicResidencyMaintenance)
         {
             config.moe_rebalance_exercise.enabled = true;
@@ -817,6 +831,7 @@ protected:
         {
             policy.required_prefill_snapshot_keys = {
                 "layer0_MOE_COMBINED_OUTPUT",
+                "layer1_MOE_COMBINED_OUTPUT",
             };
             policy.prefill_snapshot_capture_filter = policy.required_prefill_snapshot_keys;
         }

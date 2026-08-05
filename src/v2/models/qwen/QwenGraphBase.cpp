@@ -29,6 +29,7 @@
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
+#include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/mtp/MTPSpecDecodeMetadata.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
@@ -1373,6 +1374,17 @@ namespace llaminar2
     // =============================================================================
     // GraphConfig Helper Methods
     // =============================================================================
+
+    bool GraphConfig::requiresEagerGPUWorkspaceFamilyManifest() const noexcept
+    {
+        const bool phase_split_dense_graphs =
+            dense_tp_enabled &&
+            (dense_tp_decode_replicated ||
+             dense_tp_decode_mirrored_embedding);
+        const bool dynamic_moe_graphs =
+            moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
+        return mtp.enabled || phase_split_dense_graphs || dynamic_moe_graphs;
+    }
 
     bool GraphConfig::hasUnifiedPP() const
     {

@@ -92,16 +92,37 @@ namespace
 
         const int raw_kv_len = *post_append_cached_tokens;
         const int kv_len = raw_kv_len > 1 ? raw_kv_len : 1;
+        const int launch_seq_len = seq_len > 1 ? seq_len : 1;
         const int raw_logical_seq_len = active_query_rows_device
                                             ? *active_query_rows_device
-                                            : seq_len;
+                                            : launch_seq_len;
         const int logical_seq_len =
             raw_logical_seq_len > 1
-                ? (raw_logical_seq_len < query_rows
+                ? (raw_logical_seq_len < launch_seq_len
                        ? raw_logical_seq_len
-                       : query_rows)
+                       : launch_seq_len)
                 : 1;
-        if (row >= logical_seq_len)
+
+        /*
+         * Ordinary prefill and M=1 decode share one parameter record across the
+         * launch.  The attention kernel owns per-query causal masking, so this
+         * record exposes the full resident KV span and identifies only the first
+         * query's absolute position.  Multiple records instead denote grouped
+         * verifier rows and intentionally shorten the visible prefix per row.
+         */
+        if (query_rows == 1)
+        {
+            out[0].kv_len = kv_len;
+            out[0].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+            const int base_position = kv_len - logical_seq_len;
+            out[0].position_offset = base_position > 0 ? base_position : 0;
+            out[0].mask_stride = kv_len;
+            return;
+        }
+
+        const int grouped_logical_seq_len =
+            logical_seq_len < query_rows ? logical_seq_len : query_rows;
+        if (row >= grouped_logical_seq_len)
         {
             out[row].kv_len = 1;
             out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
@@ -109,10 +130,10 @@ namespace
             out[row].mask_stride = 1;
             return;
         }
-        const int base_position_raw = kv_len - logical_seq_len;
+        const int base_position_raw = kv_len - grouped_logical_seq_len;
         const int base_position = base_position_raw > 0 ? base_position_raw : 0;
         const int row_kv_len_raw =
-            kv_len - (logical_seq_len - 1 - row);
+            kv_len - (grouped_logical_seq_len - 1 - row);
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
         out[row].kv_len = row_kv_len;
         out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;

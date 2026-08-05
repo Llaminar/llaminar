@@ -216,7 +216,7 @@ namespace llaminar2
         // Gamma weights
         if (params_.gamma)
         {
-            info.addInput("gamma", params_.gamma, 1, hidden_dim);
+            info.addWeight("gamma", params_.gamma);
         }
 
         // Output - use TensorBase* overload

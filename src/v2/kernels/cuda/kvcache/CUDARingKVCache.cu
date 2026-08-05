@@ -3184,7 +3184,7 @@ namespace llaminar2
         {
             batched_k_view_ = std::make_unique<GpuTensorView>(
                 conv_scratch_k_, rows, static_cast<size_t>(kv_storage_dim_),
-                tensor_type, device_id_);
+                tensor_type, DeviceId::cuda(device_id_));
         }
         if (!batched_v_view_ ||
             batched_v_view_->gpu_data_ptr() != conv_scratch_v_ ||
@@ -3193,7 +3193,7 @@ namespace llaminar2
         {
             batched_v_view_ = std::make_unique<GpuTensorView>(
                 conv_scratch_v_, rows, static_cast<size_t>(kv_storage_dim_),
-                tensor_type, device_id_);
+                tensor_type, DeviceId::cuda(device_id_));
         }
 
         if (out_k)
@@ -3333,7 +3333,7 @@ namespace llaminar2
                 rows,
                 static_cast<size_t>(kv_dim_),
                 TensorType::FP16,
-                device_id_);
+                DeviceId::cuda(device_id_));
         }
         if (!converted_batched_v_view_ ||
             converted_batched_v_view_->gpu_data_ptr() != v_output ||
@@ -3345,7 +3345,7 @@ namespace llaminar2
                 rows,
                 static_cast<size_t>(kv_dim_),
                 TensorType::FP16,
-                device_id_);
+                DeviceId::cuda(device_id_));
         }
         if (out_k)
             *out_k = converted_batched_k_view_.get();

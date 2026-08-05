@@ -3622,11 +3622,7 @@ namespace llaminar2
                 InferenceStateResetRequest::requestBoundary("clear_cache"));
         }
 
-        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override
-        {
-            drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(
-                "request_epilogue");
-        }
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
         /**
          * @brief Schedule graph-captured device MoE maintenance after a committed decode step.
@@ -3828,11 +3824,21 @@ namespace llaminar2
             return SnapshotCapture::convertStageNameToSnapshotKey(stage_name);
         }
 
-        bool snapshotStageMatchesFilter(const std::string &stage_name) const
+        /**
+         * @brief Match requested semantic keys against one concrete stage output.
+         *
+         * Stage names alone are insufficient for fused and policy-selected MoE
+         * producers. The output descriptor makes the real producer explicit and
+         * prevents graph capture from allocating a slot for stale tensor state.
+         */
+        bool snapshotStageMatchesFilter(
+            const std::string &stage_name,
+            const StageDumpInfo &dump_info) const
         {
             if (snapshot_capture_filter_.empty())
                 return true;
-            for (const auto &key : SnapshotCapture::possibleKeysForStageName(stage_name))
+            for (const auto &key :
+                 SnapshotCapture::possibleKeysForStage(stage_name, dump_info))
             {
                 if (snapshot_capture_filter_.count(key) > 0)
                     return true;
@@ -3848,9 +3854,10 @@ namespace llaminar2
                 return;
             }
             executor_.setSnapshotStageFilter(
-                [this](const std::string &stage_name)
+                [this](const std::string &stage_name,
+                       const StageDumpInfo &dump_info)
                 {
-                    return snapshotStageMatchesFilter(stage_name);
+                    return snapshotStageMatchesFilter(stage_name, dump_info);
                 });
         }
 
@@ -5224,6 +5231,17 @@ namespace llaminar2
         void drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(
             const char *boundary,
             const char *reset_operation = nullptr);
+
+        /**
+         * @brief Export current-batch LLEP evidence at a snapshot-only epilogue.
+         *
+         * Production generation appends the same device reduction to its
+         * existing terminal-control bridge. Manual parity does not launch that
+         * generation controller, so snapshot mode may perform one explicitly
+         * ordered diagnostic readback after the latest forward publication.
+         * This method is a no-op outside snapshot+PerfStats diagnostics.
+         */
+        void publishSnapshotCurrentBatchLLEPEvidenceDiagnostics();
 
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(

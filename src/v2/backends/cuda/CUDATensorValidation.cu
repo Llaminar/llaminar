@@ -1,8 +1,10 @@
 /**
  * @file CUDATensorValidation.cu
- * @brief CUDA GPU-accelerated tensor validation kernels
+ * @brief Stream-ordered CUDA tensor validation kernels.
  *
- * CUDA kernels for NaN/Inf/Zero detection without D2H transfer.
+ * CUDA kernels for NaN/Inf/zero detection without tensor materialization on
+ * the host. Validation uses persistent per-device diagnostic storage and the
+ * exact producer stream; only the compact result crosses D2H after an event.
  *
  * @author David Sanftenberg
  */
@@ -15,6 +17,8 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace llaminar2
@@ -35,6 +39,46 @@ namespace llaminar2
         float sample_min;
         float sample_max;
     };
+
+    /** Initialize one persistent validation record on its execution stream. */
+    __global__ void initializeValidationResultCUDA(DeviceValidationResult *result)
+    {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            *result = {};
+            result->appears_zero = 1;
+            result->sample_min = FLT_MAX;
+            result->sample_max = -FLT_MAX;
+        }
+    }
+
+    /** Atomic float minimum with correct ordering for negative values. */
+    __device__ void atomicMinFloatCUDA(float *address, float value)
+    {
+        int *bits = reinterpret_cast<int *>(address);
+        int observed = *bits;
+        while (value < __int_as_float(observed))
+        {
+            const int assumed = observed;
+            observed = atomicCAS(bits, assumed, __float_as_int(value));
+            if (observed == assumed)
+                break;
+        }
+    }
+
+    /** Atomic float maximum with correct ordering for negative values. */
+    __device__ void atomicMaxFloatCUDA(float *address, float value)
+    {
+        int *bits = reinterpret_cast<int *>(address);
+        int observed = *bits;
+        while (value > __int_as_float(observed))
+        {
+            const int assumed = observed;
+            observed = atomicCAS(bits, assumed, __float_as_int(value));
+            if (observed == assumed)
+                break;
+        }
+    }
 
     // =========================================================================
     // CUDA Validation Kernels
@@ -69,6 +113,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
         float local_min = FLT_MAX;
         float local_max = -FLT_MAX;
 
@@ -93,6 +138,10 @@ namespace llaminar2
                 {
                     local_zero++;
                 }
+                else
+                {
+                    local_nonzero = true;
+                }
                 local_min = fminf(local_min, val);
                 local_max = fmaxf(local_max, val);
             }
@@ -104,19 +153,17 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_min < FLT_MAX || local_max > -FLT_MAX)
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         // Atomic min/max for floats using integer reinterpretation
         if (local_min < FLT_MAX)
         {
-            atomicMin(reinterpret_cast<int *>(&s_min), __float_as_int(local_min));
+            atomicMinFloatCUDA(&s_min, local_min);
         }
         if (local_max > -FLT_MAX)
         {
-            atomicMax(reinterpret_cast<int *>(&s_max), __float_as_int(local_max));
+            atomicMaxFloatCUDA(&s_max, local_max);
         }
 
         __syncthreads();
@@ -134,8 +181,8 @@ namespace llaminar2
             if (s_has_nonzero > 0)
                 atomicAnd(&result->appears_zero, 0u);
 
-            atomicMin(reinterpret_cast<int *>(&result->sample_min), __float_as_int(s_min));
-            atomicMax(reinterpret_cast<int *>(&result->sample_max), __float_as_int(s_max));
+            atomicMinFloatCUDA(&result->sample_min, s_min);
+            atomicMaxFloatCUDA(&result->sample_max, s_max);
         }
     }
 
@@ -164,6 +211,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
 
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         size_t stride = blockDim.x * gridDim.x;
@@ -185,6 +233,10 @@ namespace llaminar2
             {
                 local_zero++;
             }
+            else
+            {
+                local_nonzero = true;
+            }
         }
 
         if (local_nan > 0)
@@ -193,10 +245,8 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_nan == 0 && local_inf == 0 && local_zero < (num_elements / (blockDim.x * gridDim.x) + 1))
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         __syncthreads();
 
@@ -240,6 +290,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
 
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         size_t stride = blockDim.x * gridDim.x;
@@ -261,6 +312,10 @@ namespace llaminar2
             {
                 local_zero++;
             }
+            else
+            {
+                local_nonzero = true;
+            }
         }
 
         if (local_nan > 0)
@@ -269,10 +324,8 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_nan == 0 && local_inf == 0 && local_zero < (num_elements / (blockDim.x * gridDim.x) + 1))
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         __syncthreads();
 
@@ -300,188 +353,128 @@ namespace llaminar2
     public:
         explicit CUDATensorValidator(int device_id) : device_id_(device_id)
         {
-            // Set device before allocation to ensure buffer is on correct device
-            cudaError_t err = cudaSetDevice(device_id);
-            if (err != cudaSuccess)
+            requireSuccess(cudaSetDevice(device_id_), "cudaSetDevice during construction");
+            requireSuccess(
+                cudaMalloc(&d_result_, sizeof(DeviceValidationResult)),
+                "cudaMalloc persistent device result");
+
+            cudaError_t host_error = cudaMallocHost(
+                reinterpret_cast<void **>(&h_result_),
+                sizeof(DeviceValidationResult));
+            if (host_error != cudaSuccess)
             {
-                LOG_ERROR("[CUDATensorValidator] Failed to set device " << device_id);
+                (void)cudaFree(d_result_);
                 d_result_ = nullptr;
-                return;
+                requireSuccess(host_error, "cudaMallocHost persistent host result");
             }
 
-            // Allocate device-side result buffer ON THIS DEVICE
-            err = cudaMalloc(&d_result_, sizeof(DeviceValidationResult));
-            if (err != cudaSuccess)
+            cudaError_t event_error = cudaEventCreateWithFlags(
+                &completion_event_,
+                cudaEventDisableTiming);
+            if (event_error != cudaSuccess)
             {
-                LOG_ERROR("[CUDATensorValidator] Failed to allocate device result buffer on device " << device_id);
+                (void)cudaFreeHost(h_result_);
+                h_result_ = nullptr;
+                (void)cudaFree(d_result_);
                 d_result_ = nullptr;
+                requireSuccess(event_error, "cudaEventCreateWithFlags completion event");
             }
         }
 
         ~CUDATensorValidator() override
         {
+            (void)cudaSetDevice(device_id_);
+            if (completion_event_)
+                (void)cudaEventDestroy(completion_event_);
+            if (h_result_)
+                (void)cudaFreeHost(h_result_);
             if (d_result_)
-            {
-                // Set device before freeing
-                (void)cudaSetDevice(device_id_);
-                cudaFree(d_result_);
-                d_result_ = nullptr;
-            }
+                (void)cudaFree(d_result_);
         }
 
-        bool validateFP32Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
+        [[nodiscard]] TensorValidationResult validate(
+            const void *device_ptr,
+            size_t num_elements,
+            TensorValidationDataType data_type,
+            ExplicitGPUStream producer_stream) override
         {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
+            if (!device_ptr)
+                throw std::invalid_argument("CUDATensorValidator requires a non-null device pointer");
+            if (num_elements == 0)
+                throw std::invalid_argument("CUDATensorValidator requires a positive element count");
 
-            // Verify we're validating on the device this validator was created for
-            if (device_id != device_id_)
-            {
-                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
-                         << " but asked to validate on device " << device_id);
-                return false;
-            }
-
-            cudaError_t err = cudaSetDevice(device_id);
-            if (err != cudaSuccess)
-                return false;
-
-            DeviceValidationResult init = {};
-            init.appears_zero = 1;
-            init.sample_min = FLT_MAX;
-            init.sample_max = -FLT_MAX;
-
-            err = cudaMemcpy(d_result_, &init, sizeof(DeviceValidationResult), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess)
-                return false;
-
+            std::lock_guard<std::mutex> invocation_lock(invocation_mutex_);
+            requireSuccess(cudaSetDevice(device_id_), "cudaSetDevice before validation");
+            auto stream = reinterpret_cast<cudaStream_t>(producer_stream.get());
             const int block_size = 256;
             const int max_blocks = 1024;
             int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
 
-            validateFP32KernelCUDA<<<num_blocks, block_size>>>(
-                static_cast<const float *>(device_ptr),
-                num_elements,
-                d_result_);
+            initializeValidationResultCUDA<<<1, 1, 0, stream>>>(d_result_);
+            requireSuccess(cudaGetLastError(), "initialize validation result launch");
 
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool validateBF16Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
-        {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
-
-            if (device_id != device_id_)
+            switch (data_type)
             {
-                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
-                         << " but asked to validate on device " << device_id);
-                return false;
+            case TensorValidationDataType::FP32:
+                validateFP32KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
+                    static_cast<const float *>(device_ptr), num_elements, d_result_);
+                break;
+            case TensorValidationDataType::BF16:
+                validateBF16KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
+                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_);
+                break;
+            case TensorValidationDataType::FP16:
+                validateFP16KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
+                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_);
+                break;
             }
+            requireSuccess(cudaGetLastError(), "tensor validation kernel launch");
 
-            cudaError_t err = cudaSetDevice(device_id);
-            if (err != cudaSuccess)
-                return false;
+            requireSuccess(
+                cudaMemcpyAsync(
+                    h_result_,
+                    d_result_,
+                    sizeof(DeviceValidationResult),
+                    cudaMemcpyDeviceToHost,
+                    stream),
+                "compact validation result D2H");
+            requireSuccess(
+                cudaEventRecord(completion_event_, stream),
+                "validation completion event publication");
+            requireSuccess(
+                cudaEventSynchronize(completion_event_),
+                "validation completion event wait");
 
-            DeviceValidationResult init = {};
-            init.appears_zero = 1;
-
-            err = cudaMemcpy(d_result_, &init, sizeof(DeviceValidationResult), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess)
-                return false;
-
-            const int block_size = 256;
-            const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
-
-            validateBF16KernelCUDA<<<num_blocks, block_size>>>(
-                static_cast<const uint16_t *>(device_ptr),
-                num_elements,
-                d_result_);
-
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool validateFP16Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
-        {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
-
-            if (device_id != device_id_)
-            {
-                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
-                         << " but asked to validate on device " << device_id);
-                return false;
-            }
-
-            cudaError_t err = cudaSetDevice(device_id);
-            if (err != cudaSuccess)
-                return false;
-
-            DeviceValidationResult init = {};
-            init.appears_zero = 1;
-
-            err = cudaMemcpy(d_result_, &init, sizeof(DeviceValidationResult), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess)
-                return false;
-
-            const int block_size = 256;
-            const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
-
-            validateFP16KernelCUDA<<<num_blocks, block_size>>>(
-                static_cast<const uint16_t *>(device_ptr),
-                num_elements,
-                d_result_);
-
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool getResult(TensorValidationResult &result) override
-        {
-            if (!d_result_)
-                return false;
-
-            cudaError_t err = cudaSetDevice(device_id_);
-            if (err != cudaSuccess)
-                return false;
-
-            err = cudaDeviceSynchronize();
-            if (err != cudaSuccess)
-                return false;
-
-            DeviceValidationResult d_res;
-            err = cudaMemcpy(&d_res, d_result_, sizeof(DeviceValidationResult), cudaMemcpyDeviceToHost);
-            if (err != cudaSuccess)
-                return false;
-
-            result.has_nan = (d_res.has_nan != 0);
-            result.has_inf = (d_res.has_inf != 0);
-            result.appears_zero = (d_res.appears_zero != 0);
+            TensorValidationResult result;
+            result.has_nan = (h_result_->has_nan != 0);
+            result.has_inf = (h_result_->has_inf != 0);
+            result.appears_zero = (h_result_->appears_zero != 0);
             result.valid = !result.has_nan && !result.has_inf;
-            result.nan_count = d_res.nan_count;
-            result.inf_count = d_res.inf_count;
-            result.zero_count = d_res.zero_count;
-            result.total_checked = static_cast<uint32_t>(last_num_elements_);
-            result.sample_min = d_res.sample_min;
-            result.sample_max = d_res.sample_max;
-
-            return true;
+            result.nan_count = h_result_->nan_count;
+            result.inf_count = h_result_->inf_count;
+            result.zero_count = h_result_->zero_count;
+            result.total_checked = static_cast<uint32_t>(
+                std::min(num_elements, static_cast<size_t>(UINT32_MAX)));
+            result.sample_min = h_result_->sample_min;
+            result.sample_max = h_result_->sample_max;
+            return result;
         }
 
     private:
+        static void requireSuccess(cudaError_t error, const char *operation)
+        {
+            if (error == cudaSuccess)
+                return;
+            throw std::runtime_error(
+                std::string("CUDATensorValidator ") + operation + " failed: " +
+                cudaGetErrorString(error));
+        }
+
         DeviceValidationResult *d_result_ = nullptr;
-        size_t last_num_elements_ = 0;
+        DeviceValidationResult *h_result_ = nullptr;
+        cudaEvent_t completion_event_ = nullptr;
         int device_id_ = -1;
+        std::mutex invocation_mutex_;
     };
 
     // =========================================================================

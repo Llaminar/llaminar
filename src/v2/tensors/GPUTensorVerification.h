@@ -1,17 +1,18 @@
 /**
  * @file GPUTensorVerification.h
- * @brief GPU-accelerated tensor validation (NaN/Inf/Zero detection)
+ * @brief Stream-ordered GPU tensor validation (NaN/Inf/zero detection).
  *
- * Provides device-side tensor validation to avoid expensive D2H transfers
- * during Debug/Integration builds. Instead of copying entire tensors to host,
- * we run a reduction kernel on GPU and transfer only the validation result.
+ * Provides device-side tensor validation for Debug/Integration builds without
+ * materializing tensor payloads on the host. The validator consumes the exact
+ * producer stream, performs the scan on that stream, and transfers only its
+ * small diagnostic result after an event has published completion.
  *
  * Performance impact:
  * - Traditional: 10+ seconds per large tensor (hipMemcpy D2H + host scan)
  * - GPU-side: ~1ms per tensor (kernel launch + 32 byte D2H)
  *
  * @author David Sanftenberg
- * 
+ *
  * @see TensorVerification.h (related host-side validation)
  */
 
@@ -20,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "../backends/DeviceType.h"
+#include "../backends/ExplicitGPUStream.h"
 
 namespace llaminar2
 {
@@ -49,9 +51,27 @@ namespace llaminar2
     };
 
     /**
+     * @brief Floating-point storage representations supported by GPU validation.
+     *
+     * Keeping the representation typed prevents string parsing and accidental
+     * reinterpretation after the stage verifier has selected a device pointer.
+     */
+    enum class TensorValidationDataType : uint8_t
+    {
+        FP32,
+        BF16,
+        FP16,
+    };
+
+    /**
      * @brief GPU-side tensor validation interface
      *
-     * Implemented by CUDA and ROCm backends to provide device-side NaN/Inf checking.
+     * Implemented by CUDA and ROCm backends to provide device-side NaN/Inf and
+     * exact all-zero checking. One call is one complete diagnostic transaction:
+     * initialization, scan, result publication, and the small terminal D2H all
+     * remain ordered on the supplied producer stream. Implementations throw on
+     * infrastructure or launch failure; they never substitute a default stream
+     * or request a host copy of the source tensor.
      */
     class ITensorValidator
     {
@@ -59,76 +79,23 @@ namespace llaminar2
         virtual ~ITensorValidator() = default;
 
         /**
-         * @brief Validate FP32 tensor on GPU
+         * @brief Validate one floating-point tensor on its producer stream.
          *
-         * Launches a reduction kernel to scan for NaN/Inf/zero values.
-         * Returns immediately after kernel launch; call getResult() to
-         * synchronize and retrieve the result.
-         *
-         * @param device_ptr Pointer to FP32 data on GPU
-         * @param num_elements Number of float elements to check
-         * @param device_id GPU device ordinal
-         * @return true if validation kernel launched successfully
+         * @param device_ptr Non-null pointer to tensor storage on this
+         *        validator's device.
+         * @param num_elements Positive number of logical elements to scan.
+         * @param data_type Physical floating-point representation.
+         * @param producer_stream Exact non-null stream that produced the tensor.
+         * @return Completed validation result after only the compact diagnostic
+         *         record has crossed to the host.
+         * @throws std::runtime_error if validation cannot complete exactly as
+         *         requested.
          */
-        virtual bool validateFP32Async(const void *device_ptr,
-                                       size_t num_elements,
-                                       int device_id) = 0;
-
-        /**
-         * @brief Validate BF16 tensor on GPU
-         *
-         * @param device_ptr Pointer to BF16 data on GPU (uint16_t*)
-         * @param num_elements Number of BF16 elements to check
-         * @param device_id GPU device ordinal
-         * @return true if validation kernel launched successfully
-         */
-        virtual bool validateBF16Async(const void *device_ptr,
-                                       size_t num_elements,
-                                       int device_id) = 0;
-
-        /**
-         * @brief Validate FP16 tensor on GPU
-         *
-         * @param device_ptr Pointer to FP16 data on GPU (uint16_t*)
-         * @param num_elements Number of FP16 elements to check
-         * @param device_id GPU device ordinal
-         * @return true if validation kernel launched successfully
-         */
-        virtual bool validateFP16Async(const void *device_ptr,
-                                       size_t num_elements,
-                                       int device_id) = 0;
-
-        /**
-         * @brief Get validation result (synchronizes with GPU)
-         *
-         * Waits for the validation kernel to complete and transfers
-         * the result struct from GPU to host (~32 bytes).
-         *
-         * @param result Output validation result
-         * @return true if result was successfully retrieved
-         */
-        virtual bool getResult(TensorValidationResult &result) = 0;
-
-        /**
-         * @brief Synchronous validation (launch + wait + get result)
-         *
-         * Convenience method that combines validateFP32Async + getResult.
-         *
-         * @param device_ptr Pointer to FP32 data on GPU
-         * @param num_elements Number of float elements to check
-         * @param device_id GPU device ordinal
-         * @param result Output validation result
-         * @return true if validation completed successfully
-         */
-        virtual bool validateFP32(const void *device_ptr,
-                                  size_t num_elements,
-                                  int device_id,
-                                  TensorValidationResult &result)
-        {
-            if (!validateFP32Async(device_ptr, num_elements, device_id))
-                return false;
-            return getResult(result);
-        }
+        [[nodiscard]] virtual TensorValidationResult validate(
+            const void *device_ptr,
+            size_t num_elements,
+            TensorValidationDataType data_type,
+            ExplicitGPUStream producer_stream) = 0;
     };
 
     /**

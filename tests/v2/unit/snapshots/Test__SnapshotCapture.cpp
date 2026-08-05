@@ -139,6 +139,76 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludeFusedMoECombinedOut
     EXPECT_NE(std::find(shared_gate_keys.begin(), shared_gate_keys.end(), "layer0_MOE_COMBINED_OUTPUT"), shared_gate_keys.end());
 }
 
+/**
+ * @brief Descriptor-aware filtering follows the concrete canonical producer.
+ *
+ * LocalTP canonical publication leaves the expert stage name intact while
+ * moving routed/shared/combined ownership to a rooted finalizer. The filter
+ * must therefore reject the stale final-output alias on the expert stage and
+ * select all three real finalizer outputs.
+ */
+TEST(Test__SnapshotCapture_KeyConversion,
+     ConcreteMoEOutputsDisambiguateCanonicalPublicationOwnership)
+{
+    StageDumpInfo route_dump;
+    route_dump.outputs.push_back(
+        makeFP32Output(
+            "canonical_route_contributions", nullptr, 16, 32));
+    const auto route_keys = SnapshotCapture::possibleKeysForStage(
+        "layer0_moe_expert_ffn_overlay_fast", route_dump);
+    EXPECT_EQ(route_keys,
+              std::vector<std::string>{
+                  "layer0_MOE_CANONICAL_ROUTE_CONTRIBUTIONS"});
+    EXPECT_EQ(std::find(route_keys.begin(),
+                        route_keys.end(),
+                        "layer0_MOE_COMBINED_OUTPUT"),
+              route_keys.end());
+
+    StageDumpInfo finalize_dump;
+    finalize_dump.outputs.push_back(
+        makeFP32Output("routed_output", nullptr, 2, 32));
+    finalize_dump.outputs.push_back(
+        makeFP32Output("shared_output", nullptr, 2, 32));
+    finalize_dump.outputs.push_back(
+        makeFP32Output("combined_output", nullptr, 2, 32));
+    const auto final_keys = SnapshotCapture::possibleKeysForStage(
+        "layer0_moe_canonical_publication_finalize", finalize_dump);
+    EXPECT_EQ(final_keys,
+              (std::vector<std::string>{
+                  "layer0_MOE_EXPERT_OUTPUT",
+                  "layer0_MOE_SHARED_GATE_OUTPUT",
+                  "layer0_MOE_COMBINED_OUTPUT"}));
+}
+
+/**
+ * @brief Canonical finalizer snapshots preserve all three semantic outputs.
+ */
+TEST(Test__SnapshotCapture_CanonicalMoERouting,
+     FinalizerPublishesNamedOutputs)
+{
+    const std::vector<float> routed = {1.0f, 2.0f};
+    const std::vector<float> shared = {3.0f, 4.0f};
+    const std::vector<float> combined = {4.0f, 6.0f};
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("routed_output", routed.data(), 1, routed.size()));
+    dump.outputs.push_back(
+        makeFP32Output("shared_output", shared.data(), 1, shared.size()));
+    dump.outputs.push_back(
+        makeFP32Output("combined_output", combined.data(), 1, combined.size()));
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "layer0_moe_canonical_publication_finalize", dump);
+
+    ASSERT_NE(capture.get("layer0_MOE_EXPERT_OUTPUT"), nullptr);
+    ASSERT_NE(capture.get("layer0_MOE_SHARED_GATE_OUTPUT"), nullptr);
+    ASSERT_NE(capture.get("layer0_MOE_COMBINED_OUTPUT"), nullptr);
+    EXPECT_EQ(capture.get("layer0_MOE_EXPERT_OUTPUT")->data, routed);
+    EXPECT_EQ(capture.get("layer0_MOE_SHARED_GATE_OUTPUT")->data, shared);
+    EXPECT_EQ(capture.get("layer0_MOE_COMBINED_OUTPUT")->data, combined);
+}
+
 TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutputs)
 {
     const auto gdn_wo_keys =

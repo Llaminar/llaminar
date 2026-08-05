@@ -552,9 +552,10 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
  *
  * The serial stochastic oracle intentionally disables MTP while preserving the
  * production phase-split dense policy. This matrix locks in that replicated or
- * mirrored decode topology is independently sufficient to require eager graph
- * family planning; otherwise sharded prefill can capture a smaller workspace
- * before compact decode publishes its full-width projection requirements.
+ * mirrored decode topology and Dynamic MoE maintenance are independently
+ * sufficient to require eager graph family planning; otherwise prefill can
+ * capture a smaller workspace before compact decode or the maintenance graph
+ * publishes its additional requirements.
  */
 TEST(Test__PrefixMTPConfig, ShapeDependentGPUForwardPoliciesRequireEagerFamilyManifest)
 {
@@ -577,4 +578,12 @@ TEST(Test__PrefixMTPConfig, ShapeDependentGPUForwardPoliciesRequireEagerFamilyMa
     config.dense_tp_enabled = false;
     EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest())
         << "A replicated single-device graph has no phase-split TP topology";
+
+    config.moe.rebalance_mode = MoERebalanceMode::DYNAMIC;
+    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest())
+        << "Dynamic MoE adds maintenance and decode route-apply participants";
+
+    config.moe.rebalance_mode = MoERebalanceMode::OBSERVE;
+    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest())
+        << "Observe mode does not add a maintenance or route-apply graph";
 }

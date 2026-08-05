@@ -501,7 +501,11 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlAttemptedDraftTokenCount = 40,
         /** Sum of logical verifier widths, including each condition row. */
         kDeviceGenerationControlVerifierTokenCount = 41,
-        kDeviceGenerationControlCount = 42,
+        /** Number of MoE layers that moved current-batch LLEP payloads. */
+        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 42,
+        /** Number of MoE layers that executed rows away from their static owner. */
+        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 43,
+        kDeviceGenerationControlCount = 44,
     };
 
     /**

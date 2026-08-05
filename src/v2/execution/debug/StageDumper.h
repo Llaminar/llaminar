@@ -261,7 +261,7 @@ namespace llaminar2
 
             for (const auto &weight : dump_info.weights)
             {
-                if (!weight.tensor)
+                if (!weight.tensor && !weight.raw_data)
                     continue;
 
                 TensorDumpMeta meta;

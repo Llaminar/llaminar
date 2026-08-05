@@ -119,6 +119,29 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   source policy also forbids compute stages from inspecting raw tensor
   coherence after exact-stream publication; graph capture records that edge in
   its dependency ledger and replay owns the authority transition.
+- The 2026-08-05 CurrentBatchLLEP long-context failure was a runtime-table
+  identity defect, not a collective timeout. Ordinary prefill and durable
+  static decode had aliased one placement table, allowing transient
+  least-loaded assignment to leak into the next decode layer. Qwen3.5 MoE now
+  declares typed `MainDecodeDurablePlacement`, `CurrentBatchLLEPPrefill`, and
+  `MTPDepth` table roles; graph keys, prefix runtime state v4, bindings, and
+  source/unit tests preserve those identities independently. CUDA2 and ROCm2
+  CurrentBatchLLEP long-context cells passed after the change in `239.50 s` and
+  `455.36 s`, respectively, with their canonical full-capture and PerfStats
+  assertions enabled.
+- A full CUDA FlashAttention fixture then exposed a second device-state defect:
+  the cached-token parameter writer treated one shared FA2 parameter record as
+  one logical query row, publishing `kv_len=1` for ordinary multirow prefill.
+  CUDA and ROCm now distinguish shared prefill/M=1 records from row-local
+  grouped-verifier records. Focused device-memory regressions cover initial and
+  continuation prefill, active-row padded prefill, M=1 decode, and M=4 grouped
+  verification. The complete CUDA and ROCm FlashAttention fixtures passed in
+  `69.60 s` and `64.05 s`; CUDA captured cache growth/reset and ROCm all-format
+  captured request-cache proofs remain byte exact. GPU cache views also require
+  an explicit backend-qualified `DeviceId`, preventing a HIP allocation from
+  being silently labeled as CUDA storage. The final Integration tree rebuilt
+  all 784 affected targets and the device-free unit/source gate passed
+  `585/585` in `135.90 s`.
 
 ## CUDA LLEP Economy
 
@@ -175,6 +198,14 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   541 GB/s, and zero spills.
 - This RTX 3090 pair has no peer access; mirrored verification avoids its
   measured `941 us/layer` rooted M=5 NCCL collective.
+- The post-fix long-context parity harness remains unsuitable as an economy
+  result: CUDA2 CurrentBatchLLEP takes `239.50 s` and ROCm2 takes `455.36 s`,
+  versus `31.72 s` for the earlier CUDA2 dynamic-maintenance control. The ROCm
+  trace attributes roughly `194 s` to CPU-bound model preparation/loading and
+  includes one `131.6 s` mapped-download wait plus per-step snapshot downloads.
+  The next profile must separate test-only parity observation from the Release
+  production graph before attributing those waits to LLEP itself; neither cost
+  is accepted as part of the target device-resident inference transaction.
 
 Matched llama.cpp master comparison, tok/s:
 

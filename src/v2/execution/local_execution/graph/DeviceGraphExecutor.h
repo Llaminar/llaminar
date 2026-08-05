@@ -213,11 +213,19 @@ namespace llaminar2
         {
             std::unordered_map<std::string, GraphSnapshotStageCopies> stage_copies;
             std::unordered_set<std::string> outputless_stages;
+            /**
+             * Stages rejected by the descriptor-aware filter during preflight.
+             *
+             * Replay must use this frozen decision instead of re-entering a live
+             * stage or repeating name-only inference after graph launch.
+             */
+            std::unordered_set<std::string> filtered_stages;
 
             void clear()
             {
                 stage_copies.clear();
                 outputless_stages.clear();
+                filtered_stages.clear();
             }
         };
 
@@ -1232,7 +1240,15 @@ namespace llaminar2
                                                 void *producer_stream,
                                                 bool record_device_copy,
                                                 GraphSnapshotManifest &snapshot_manifest);
-        bool shouldCaptureSnapshotStage(const std::string &node_name) const;
+        /**
+         * @brief Evaluate the configured filter against one concrete publication.
+         *
+         * @param node_name Graph-local producer name.
+         * @param dump_info Stable output descriptor exposed by that producer.
+         * @return True when this exact publication must be captured.
+         */
+        bool shouldCaptureSnapshotStage(const std::string &node_name,
+                                        const StageDumpInfo &dump_info) const;
 
         /**
          * @brief Prepare immutable graph-stable snapshot descriptors/storage.

@@ -3,8 +3,8 @@
  * @brief Lightweight tensor view for external GPU memory
  *
  * This class provides an ITensor interface around existing GPU memory,
- * without owning or managing the memory lifetime. Used primarily by
- * CUDA KV cache to return tensor pointers for attention computation.
+ * without owning or managing the memory lifetime. It is used by CUDA and
+ * ROCm cache adapters to expose persistent device storage to graph stages.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -36,31 +36,18 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Construct a GPU tensor view
-         *
-         * @param gpu_ptr Pointer to GPU memory (must remain valid!)
-         * @param rows Number of rows (e.g., seq_len for KV cache)
-         * @param cols Number of columns (e.g., kv_dim for KV cache)
-         * @param tensor_type Data type (TensorType::FP32, TensorType::FP16, TensorType::BF16)
-         * @param device_id CUDA device ID where the memory resides
-         */
-        GpuTensorView(void *gpu_ptr, size_t rows, size_t cols,
-                      TensorType tensor_type, int device_id = 0)
-            : GpuTensorView(
-                  gpu_ptr,
-                  rows,
-                  cols,
-                  tensor_type,
-                  DeviceId::cuda(device_id))
-        {
-        }
-
-        /**
          * @brief Construct a backend-qualified pure-device tensor view.
          *
-         * The older ordinal-only constructor remains CUDA-compatible. ROCm and
-         * heterogeneous infrastructure must use this overload so arena
-         * placement never misidentifies a HIP allocation as CUDA memory.
+         * A bare integer ordinal is deliberately not accepted. CUDA and ROCm
+         * ordinals overlap, so accepting an integer lets a valid HIP pointer be
+         * mislabeled as CUDA memory. Requiring DeviceId makes backend ownership
+         * part of the view's type-level construction contract.
+         *
+         * @param gpu_ptr Pointer to persistent GPU memory owned by the caller.
+         * @param rows Number of logical rows exposed by the view.
+         * @param cols Number of logical columns exposed by the view.
+         * @param tensor_type Tensor element or block type.
+         * @param device Backend-qualified device that owns @p gpu_ptr.
          */
         GpuTensorView(void *gpu_ptr, size_t rows, size_t cols,
                       TensorType tensor_type, DeviceId device)
@@ -71,7 +58,22 @@ namespace llaminar2
               device_(device),
               shape_({rows, cols})
         {
+            if (!gpu_ptr || !device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    "GpuTensorView requires non-null device storage and an "
+                    "explicit CUDA or ROCm DeviceId");
+            }
         }
+
+        /**
+         * @brief Reject backend-ambiguous device ordinals at compile time.
+         *
+         * Callers must spell DeviceId::cuda(ordinal) or
+         * DeviceId::rocm(ordinal), making it impossible to silently attach the
+         * wrong backend identity to otherwise valid device storage.
+         */
+        GpuTensorView(void *, size_t, size_t, TensorType, int) = delete;
 
         ~GpuTensorView() override = default;
 
@@ -110,6 +112,7 @@ namespace llaminar2
 
         // Device
         DeviceId home_device() const override { return device_; }
+        std::optional<DeviceId> current_device() const override { return device_; }
         bool is_on_cpu() const override { return false; }
         bool is_on_gpu() const override { return true; }
 

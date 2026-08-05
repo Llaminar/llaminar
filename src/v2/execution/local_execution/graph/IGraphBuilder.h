@@ -41,6 +41,28 @@ namespace llaminar2
     class PreparedWeightStore;
     class IModelContext;
     struct PrefixFingerprintMaterial;
+    struct DeviceMoELayerRuntime;
+
+    /**
+     * @brief Device-owned source for request-final current-batch LLEP evidence.
+     *
+     * A model graph that performs current-batch LLEP keeps one sticky movement
+     * and non-owner-assignment marker in every layer runtime.  The orchestrator
+     * borrows this contiguous table only to enqueue a backend reduction on an
+     * explicitly ordered stream.  It must never inspect or mirror the table on
+     * the host during production execution.
+     */
+    struct DeviceMoECurrentBatchLLEPEvidenceSource
+    {
+        const DeviceMoELayerRuntime *runtime_layers_device = nullptr;
+        int layer_count = 0;
+
+        /** @return true when the complete contiguous runtime table is bound. */
+        constexpr bool valid() const noexcept
+        {
+            return runtime_layers_device != nullptr && layer_count > 0;
+        }
+    };
 
     /**
      * @brief Semantic placement effect of importing model-owned prefix state.
@@ -819,6 +841,23 @@ namespace llaminar2
          */
         virtual ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device)
+        {
+            (void)device;
+            return {};
+        }
+
+        /**
+         * @brief Return the canonical current-batch LLEP evidence table.
+         *
+         * Non-MoE graphs and MoE policies without current-batch LLEP return an
+         * empty source. Implementations must reject ambiguous sources rather
+         * than selecting one by container iteration order.
+         *
+         * @param device Participant whose device-owned runtime table is needed.
+         * @return Stable table pointer and complete layer count, or an empty source.
+         */
+        virtual DeviceMoECurrentBatchLLEPEvidenceSource
+        deviceMoECurrentBatchLLEPEvidenceSource(DeviceId device) const
         {
             (void)device;
             return {};

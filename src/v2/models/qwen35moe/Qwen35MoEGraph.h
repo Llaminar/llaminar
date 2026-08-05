@@ -119,6 +119,16 @@ namespace llaminar2
         void completePrefixCacheRuntimeStateDeviceRehydration() override;
 
         /**
+         * @brief Return the unique main-graph runtime table carrying LLEP evidence.
+         *
+         * Prefix-only transport bindings and MTP sidecar runtime tables are not
+         * evidence sources. Every selected layer binding must agree on one
+         * contiguous table; disagreement is a fatal graph-policy error.
+         */
+        DeviceMoECurrentBatchLLEPEvidenceSource
+        deviceMoECurrentBatchLLEPEvidenceSource(DeviceId device) const override;
+
+        /**
          * @brief Describe device-retained main-graph layer checkpoints.
          *
          * Checkpoints exist only when
@@ -241,16 +251,52 @@ namespace llaminar2
          * @brief Role of a graph-side rebalance binding.
          *
          * Decode maintenance bindings are long-lived, domain-wide control lanes
-         * used by the async device-resident rebalance maintenance graph.  Prefill
-         * LLEP transfer bindings are short-lived, layer-local lanes used while a
-         * phase-split prompt is publishing transient expert payloads.  Both can
-         * exist for the same device during prefix-cache+MTP runs, so selection
-         * must be role-based rather than map-order-based.
+         * used by the async device-resident rebalance maintenance graph.
+         * Current-batch LLEP and prefix-runtime rehydration are independent,
+         * layer-local transfer transactions: the former chooses this prefill's
+         * routed-row placement, while the latter reconstructs placement already
+         * selected by a prefix snapshot. All three may exist for the same device,
+         * so policy, evidence, and lifecycle selection must be role-based rather
+         * than inferred from map order or an auxiliary boolean.
          */
         enum class GraphSideRebalanceBindingRole
         {
             DecodeMaintenance,
-            PrefillLLEPTransfer
+            CurrentBatchLLEPTransfer,
+            PrefixRuntimeRehydrationTransfer
+        };
+
+        /**
+         * @brief Ownership role of one persistent MoE runtime metadata table.
+         *
+         * Durable decode placement may be changed by Dynamic maintenance and
+         * restored from prefix state. Current-batch LLEP placement instead
+         * exists only to execute one ordinary prefill transaction and must not
+         * become visible to a later static-decode graph. MTP sidecars retain a
+         * third, depth-scoped metadata lifetime. Encoding those lifetimes in a
+         * typed identity prevents graph construction order or an empty string
+         * suffix from accidentally aliasing incompatible placement banks.
+         */
+        enum class MoERuntimeTableRole
+        {
+            MainDecodeDurablePlacement,
+            CurrentBatchLLEPPrefill,
+            MTPDepth
+        };
+
+        /**
+         * @brief Complete logical identity for one graph-owned runtime table.
+         *
+         * `mtp_depth` is required only for @ref MoERuntimeTableRole::MTPDepth;
+         * all other roles reject a non-negative depth. The physical device is
+         * supplied separately because it is already an explicit graph policy
+         * input at every construction site.
+         */
+        struct MoERuntimeTableIdentity
+        {
+            MoERuntimeTableRole role =
+                MoERuntimeTableRole::MainDecodeDurablePlacement;
+            int mtp_depth = -1;
         };
 
         struct GraphSideRebalanceBinding
@@ -284,11 +330,15 @@ namespace llaminar2
             bool state_sideband_enabled = false;
         };
 
-        IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
-                                                   int prefill_token_capacity = 0,
-                                                   const std::string &key_suffix = {},
-                                                   int num_layers_override = -1,
-                                                   bool register_decode_histogram = true);
+        static std::string moeRuntimeTableKey(
+            DeviceId device,
+            const MoERuntimeTableIdentity &identity);
+        IMoERuntimeTable *moeRuntimeTableForDevice(
+            DeviceId device,
+            const MoERuntimeTableIdentity &identity,
+            int prefill_token_capacity = 0,
+            int num_layers_override = -1,
+            bool register_decode_histogram = true);
         /**
          * @brief Return the device-local decode maintenance binding for async
          * graph-side rebalance.

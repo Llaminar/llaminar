@@ -976,9 +976,12 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphExecutor::shouldCaptureSnapshotStage(const std::string &node_name) const
+    bool DeviceGraphExecutor::shouldCaptureSnapshotStage(
+        const std::string &node_name,
+        const StageDumpInfo &dump_info) const
     {
-        return !config_.snapshot_stage_filter || config_.snapshot_stage_filter(node_name);
+        return !config_.snapshot_stage_filter ||
+               config_.snapshot_stage_filter(node_name, dump_info);
     }
 
     bool DeviceGraphExecutor::prepareGraphSnapshotCopies(
@@ -1018,8 +1021,6 @@ namespace llaminar2
     {
         if (!config_.snapshot_callback || !node.stage)
             return true;
-        if (!shouldCaptureSnapshotStage(node.name))
-            return true;
         if (!target_device.is_gpu())
             return true;
         if (!producer_stream)
@@ -1031,9 +1032,37 @@ namespace llaminar2
             return false;
         }
 
-        const bool capture_active = isGraphCaptureActive();
-
         StageDumpInfo dump_info = node.stage->refreshDumpInfoSnapshot();
+        const bool capture_active = isGraphCaptureActive();
+        const bool selected =
+            shouldCaptureSnapshotStage(node.name, dump_info);
+        if (!selected)
+        {
+            if (capture_active &&
+                !snapshot_manifest.filtered_stages.contains(node.name))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Stage '"
+                          << node.name
+                          << "' changed snapshot filter selection during graph capture");
+                return false;
+            }
+
+            snapshot_manifest.stage_copies.erase(node.name);
+            snapshot_manifest.outputless_stages.erase(node.name);
+            snapshot_manifest.filtered_stages.insert(node.name);
+            return true;
+        }
+
+        if (capture_active &&
+            snapshot_manifest.filtered_stages.contains(node.name))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage '"
+                      << node.name
+                      << "' changed snapshot filter selection during graph capture");
+            return false;
+        }
+        snapshot_manifest.filtered_stages.erase(node.name);
+
         std::vector<size_t> graph_output_indices;
         graph_output_indices.reserve(dump_info.outputs.size());
         for (size_t i = 0; i < dump_info.outputs.size(); ++i)
@@ -1342,14 +1371,11 @@ namespace llaminar2
             return true;
 
         /*
-         * Snapshot selection is one immutable contract shared by warmup,
-         * graph recording, and post-launch publication. Fast collective stages
-         * return through an abbreviated execution branch and invoke this
-         * helper directly; without the guard here, an intentionally filtered
-         * stage was treated as a missing-manifest error even though preparation
-         * and recording had correctly skipped it.
+         * Snapshot selection is frozen from the concrete output descriptor
+         * during graph preflight. Replay publication must not re-enter mutable
+         * stage state or repeat a name-only approximation of that decision.
          */
-        if (!shouldCaptureSnapshotStage(stage_name))
+        if (snapshot_manifest.filtered_stages.contains(stage_name))
             return true;
 
         if (snapshot_manifest.outputless_stages.contains(stage_name))
@@ -1435,9 +1461,6 @@ namespace llaminar2
 
         for (const auto &name : order)
         {
-            if (!shouldCaptureSnapshotStage(name))
-                continue;
-
             ComputeNode *node = graph.getNode(name);
             if (!node || !node->stage)
                 continue;
@@ -2702,7 +2725,6 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
             verifyStageExit(node, layer_idx);
-            success = validateStageOutputs(node);
             if (profiling)
             {
                 phase_end = std::chrono::high_resolution_clock::now();
@@ -2716,8 +2738,7 @@ namespace llaminar2
         // =====================================================================
         if (success &&
             policy.snapshot_callback &&
-            config_.snapshot_callback &&
-            shouldCaptureSnapshotStage(node.name))
+            config_.snapshot_callback)
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
@@ -2767,9 +2788,16 @@ namespace llaminar2
             {
                 StageDumpInfo snapshot_dump_info =
                     node.stage->refreshDumpInfoSnapshot();
-                snapshot_dump_info.ensureOutputsOnHost(node.stage->gpuStream());
-                LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
-                config_.snapshot_callback(node.name, snapshot_dump_info);
+                if (shouldCaptureSnapshotStage(
+                        node.name, snapshot_dump_info))
+                {
+                    snapshot_dump_info.ensureOutputsOnHost(
+                        node.stage->gpuStream());
+                    LOG_DEBUG(
+                        "[DeviceGraphExecutor::runStage] Invoking callback for "
+                        << node.name);
+                    config_.snapshot_callback(node.name, snapshot_dump_info);
+                }
             }
             if (profiling)
             {

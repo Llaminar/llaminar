@@ -1177,7 +1177,7 @@ namespace llaminar2
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
                 scratch.d_K, count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         else
         {
@@ -1211,7 +1211,7 @@ namespace llaminar2
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
                 scratch.d_V, count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         else
         {
@@ -1340,7 +1340,7 @@ namespace llaminar2
         {
             batched_k_view_ = std::make_unique<GpuTensorView>(
                 scratch.d_K, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         if (!batched_v_view_ ||
             batched_v_view_->gpu_data_ptr() != scratch.d_V ||
@@ -1349,7 +1349,7 @@ namespace llaminar2
         {
             batched_v_view_ = std::make_unique<GpuTensorView>(
                 scratch.d_V, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         if (out_k)
             *out_k = batched_k_view_.get();
@@ -1445,7 +1445,7 @@ namespace llaminar2
         {
             batched_k_view_ = std::make_unique<GpuTensorView>(
                 scratch.d_K, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         if (!batched_v_view_ ||
             batched_v_view_->gpu_data_ptr() != scratch.d_V ||
@@ -1454,7 +1454,7 @@ namespace llaminar2
         {
             batched_v_view_ = std::make_unique<GpuTensorView>(
                 scratch.d_V, rows, static_cast<size_t>(kv_dim_),
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         if (out_k)
             *out_k = batched_k_view_.get();
@@ -1516,7 +1516,7 @@ namespace llaminar2
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
                 scratch.d_K, count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         else
         {
@@ -1526,7 +1526,7 @@ namespace llaminar2
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
                 scratch.d_V, count, kv_dim_,
-                TensorType::FP16, device_id_);
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
         else
         {

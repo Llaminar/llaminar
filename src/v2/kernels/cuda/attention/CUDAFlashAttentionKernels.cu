@@ -155,11 +155,31 @@ namespace
             return;
 
         const int kv_len = max(1, *post_append_cached_tokens);
+        const int launch_seq_len = max(1, seq_len);
         const int logical_seq_len = active_query_rows_device
-                                        ? max(1, min(query_rows,
+                                        ? max(1, min(launch_seq_len,
                                                      *active_query_rows_device))
-                                        : max(1, seq_len);
-        if (row >= logical_seq_len)
+                                        : launch_seq_len;
+
+        /*
+         * A single parameter record describes an entire ordinary prefill or an
+         * M=1 decode.  FA2 applies the causal boundary per query row, so this
+         * shared record must expose the complete post-append KV span and only
+         * carry the absolute starting position.  The row-shortening rule below
+         * belongs exclusively to grouped verifier records, where each record
+         * represents one independently replayable serial-decode row.
+         */
+        if (query_rows == 1)
+        {
+            out[0].kv_len = kv_len;
+            out[0].kv_stride = max(kv_len, kv_stride);
+            out[0].position_offset = max(0, kv_len - logical_seq_len);
+            out[0].mask_stride = kv_len;
+            return;
+        }
+
+        const int grouped_logical_seq_len = min(query_rows, logical_seq_len);
+        if (row >= grouped_logical_seq_len)
         {
             out[row].kv_len = 1;
             out[row].kv_stride = max(kv_len, kv_stride);
@@ -167,9 +187,9 @@ namespace
             out[row].mask_stride = 1;
             return;
         }
-        const int base_position = max(0, kv_len - logical_seq_len);
+        const int base_position = max(0, kv_len - grouped_logical_seq_len);
         const int row_kv_len =
-            max(1, kv_len - (logical_seq_len - 1 - row));
+            max(1, kv_len - (grouped_logical_seq_len - 1 - row));
         out[row].kv_len = row_kv_len;
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = base_position + row;

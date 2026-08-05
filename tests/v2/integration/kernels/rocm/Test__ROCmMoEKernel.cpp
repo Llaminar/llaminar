@@ -23,6 +23,7 @@
 
 #include "tensors/Tensors.h"
 #include "utils/Assertions.h"
+#include "kernels/common/SamplingMath.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -59,6 +60,7 @@
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
+#include "../moe/NativeVNNIExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 
 #include <vector>
@@ -1205,6 +1207,139 @@ namespace
     }
 
 } // namespace
+
+/**
+ * @brief Prove terminal LLEP evidence is reduced from the complete ROCm table.
+ *
+ * The seeded marker sets intentionally differ, proving the backend does not
+ * infer one signal from the other. Publication must touch only the two named
+ * control words in row zero and clear those words in every later request row.
+ */
+TEST(Test__ROCmMoEKernel,
+     CurrentBatchLLEPEvidencePublishesExactTerminalControlCounts)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    using namespace llaminar2::sampling_math;
+    constexpr int layer_count = 7;
+    constexpr int request_count = 2;
+    constexpr int control_stride = kDeviceGenerationControlCount;
+    constexpr int sentinel = -19;
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+              hipSuccess);
+
+    DeviceMoERuntimeTable::Config config;
+    config.device_id = DeviceId::rocm(0);
+    config.num_layers = layer_count;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    config.prefill_token_capacity = 1;
+    MoERuntimeTable runtime_table(config);
+
+    int expected_movement_layers = 0;
+    int expected_non_owner_layers = 0;
+    for (int layer = 0; layer < layer_count; ++layer)
+    {
+        auto runtime = runtime_table.hostLayerState(layer);
+        const bool moved = layer == 0 || layer == 3 || layer == 6;
+        const bool non_owner =
+            layer == 1 || layer == 3 || layer == 4 || layer == 6;
+        runtime.current_batch_llep_movement_observed = moved ? 1u : 0u;
+        runtime.current_batch_llep_non_owner_assignment_observed =
+            non_owner ? 1u : 0u;
+        expected_movement_layers += moved ? 1 : 0;
+        expected_non_owner_layers += non_owner ? 1 : 0;
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime_table.deviceLayerState(layer),
+                &runtime,
+                sizeof(runtime),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+    }
+
+    std::array<int, request_count * control_stride> host_control{};
+    host_control.fill(sentinel);
+    int *device_control = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_control),
+            sizeof(host_control)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_control,
+            host_control.data(),
+            sizeof(host_control),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ASSERT_TRUE(
+        backend->enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            runtime_table.deviceLayerState(0),
+            layer_count,
+            device_control,
+            control_stride,
+            request_count,
+            /*device_id=*/0,
+            stream));
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            host_control.data(),
+            device_control,
+            sizeof(host_control),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    EXPECT_EQ(
+        host_control[
+            kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount],
+        expected_movement_layers);
+    EXPECT_EQ(
+        host_control[
+            kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount],
+        expected_non_owner_layers);
+    EXPECT_EQ(host_control[kDeviceGenerationControlOk], sentinel);
+
+    const int second_row = control_stride;
+    EXPECT_EQ(
+        host_control[
+            second_row +
+            kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount],
+        0);
+    EXPECT_EQ(
+        host_control[
+            second_row +
+            kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount],
+        0);
+    EXPECT_EQ(
+        host_control[second_row + kDeviceGenerationControlOk], sentinel);
+
+    EXPECT_FALSE(
+        backend->enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            runtime_table.deviceLayerState(0),
+            layer_count,
+            device_control,
+            control_stride,
+            request_count,
+            /*device_id=*/0,
+            nullptr));
+    EXPECT_EQ(hipFree(device_control), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
 
 #ifdef HAVE_ROCM
 
@@ -22228,6 +22363,10 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
 {
     SKIP_IF_NO_ROCM();
 
+    ASSERT_FALSE(row_inventory.empty());
+    const int max_row_count =
+        *std::max_element(row_inventory.begin(), row_inventory.end());
+
     const DeviceId device = DeviceId::rocm(0);
     const std::string format_name = format_label ? format_label : "unknown_format";
     constexpr int d_model = 2048;
@@ -22259,7 +22398,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
+        /*max_seq_len=*/max_row_count,
         d_model,
         intermediate,
         num_experts,
@@ -22325,18 +22464,18 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     ASSERT_NE(workspace_probe, nullptr);
     WorkspaceRequirements gemm_reqs;
     gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(
-        kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
+        max_row_count, intermediate, d_model));
     gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(1, intermediate, d_model));
     if (auto *up_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].up))
     {
         gemm_reqs.merge(up_workspace->getWorkspaceRequirements(
-            kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
+            max_row_count, intermediate, d_model));
         gemm_reqs.merge(up_workspace->getWorkspaceRequirements(1, intermediate, d_model));
     }
     if (auto *down_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].down))
     {
         gemm_reqs.merge(down_workspace->getWorkspaceRequirements(
-            kGroupedVerifierRuntimeRows.back(), d_model, intermediate));
+            max_row_count, d_model, intermediate));
         gemm_reqs.merge(down_workspace->getWorkspaceRequirements(1, d_model, intermediate));
     }
     auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 256 * 1024 * 1024);
@@ -22809,7 +22948,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
 
     auto rebound_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
+        /*max_seq_len=*/max_row_count,
         d_model,
         intermediate,
         num_experts,
@@ -22858,7 +22997,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         runtime_config.num_experts = num_experts;
         runtime_config.top_k = top_k;
         runtime_config.mirror_to_device = true;
-        runtime_config.prefill_token_capacity = kGroupedVerifierRuntimeRows.back();
+        runtime_config.prefill_token_capacity = max_row_count;
         DeviceMoERuntimeTable runtime_table(runtime_config);
         auto &runtime_host_state = runtime_table.hostLayerState(0);
         populateRuntimeDescriptors(
@@ -23811,7 +23950,8 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_Ru
             format.make,
             format.make,
             /*masked_local_tp=*/false,
-            /*exercise_router_q8_publication=*/true);
+            /*exercise_router_q8_publication=*/true,
+            kGroupedVerifierQwenScalableRows);
     }
 }
 
@@ -23831,7 +23971,8 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats
             format.make,
             format.make,
             /*masked_local_tp=*/true,
-            /*exercise_router_q8_publication=*/true);
+            /*exercise_router_q8_publication=*/true,
+            kGroupedVerifierQwenScalableRows);
     }
 }
 
@@ -25074,6 +25215,28 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
               << " sum_counts=" << sum_counts
               << " all_tokens_accounted=" << (all_tokens_accounted ? "true" : "false")
               << " weights_match=" << (weights_match ? "true" : "false") << std::endl;
+}
+
+/**
+ * @brief Prove transferred CurrentBatchLLEP expert execution across all formats.
+ *
+ * This invokes the exact same production-ABI regression as CUDA, including the
+ * canonical format registry and M=2/4/8/16 grouped inventory.
+ */
+TEST(
+    Test__ROCmMoEKernel,
+    TransferredCurrentBatchLLEPAllNativeFormatsMatchStaticOwnerBytes)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+        "ROCm",
+        llaminar2::DeviceId::rocm(0),
+        rocmMoETestStream());
 }
 
 #else // !HAVE_ROCM

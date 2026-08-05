@@ -149,6 +149,21 @@ namespace llaminar2
          */
         static std::vector<std::string> possibleKeysForStageName(const std::string &stage_name);
 
+        /**
+         * @brief Return semantic snapshot keys for one concrete publication.
+         *
+         * Fused and policy-selected stages can retain a node name while changing
+         * which value they own. This descriptor-aware form narrows the
+         * conservative name map to outputs that the current graph actually
+         * publishes.
+         *
+         * @param stage_name Graph-local producer name.
+         * @param dump_info Stable named output descriptors for that producer.
+         */
+        static std::vector<std::string> possibleKeysForStage(
+            const std::string &stage_name,
+            const StageDumpInfo &dump_info);
+
     private:
         void storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out);
 

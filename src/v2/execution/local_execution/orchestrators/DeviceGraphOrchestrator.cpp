@@ -8409,6 +8409,196 @@ namespace llaminar2
         drain_one(cache, "atomic");
     }
 
+    void DeviceGraphOrchestrator::
+        publishSnapshotCurrentBatchLLEPEvidenceDiagnostics()
+    {
+        using namespace sampling_math;
+        if (!snapshot_enabled_ || !PerfStatsCollector::isEnabled() ||
+            !state_.device_id.is_gpu() || !graph_builder_)
+        {
+            return;
+        }
+
+        const DeviceMoECurrentBatchLLEPEvidenceSource source =
+            graph_builder_->deviceMoECurrentBatchLLEPEvidenceSource(
+                state_.device_id);
+        if (!source.valid())
+            return;
+        if (!device_generation_storage_.control_device ||
+            device_generation_storage_.control_stride <
+                kDeviceGenerationControlCount)
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence has no persistent "
+                "device generation-control row on " +
+                state_.device_id.toString());
+        }
+
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence could not resolve the "
+                "GPU backend for " +
+                state_.device_id.toString());
+        }
+
+        IWorkerGPUContext &gpu_context =
+            GPUDeviceContextPool::instance().getContext(state_.device_id);
+        void *const diagnostic_stream =
+            gpu_context.getOrCreateAuxiliaryStream(
+                "moe_current_batch_llep_diagnostics");
+        if (!diagnostic_stream)
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence could not acquire its "
+                "named diagnostics stream on " +
+                state_.device_id.toString());
+        }
+        if (!waitForForwardGraphOutputReady(
+                diagnostic_stream,
+                DeviceTimelineRole::Diagnostics,
+                ForwardGraphOutputKind::Any,
+                "current_batch_llep_snapshot_evidence"))
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence could not consume the "
+                "latest forward publication on " +
+                state_.device_id.toString());
+        }
+        if (!backend->
+                enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+                    source.runtime_layers_device,
+                    source.layer_count,
+                    device_generation_storage_.control_device,
+                    device_generation_storage_.control_stride,
+                    /*request_count=*/1,
+                    state_.device_id.gpu_ordinal(),
+                    diagnostic_stream))
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence reduction failed on " +
+                state_.device_id.toString());
+        }
+
+        std::array<int, 2> evidence{};
+        const bool trace_assignment_runtime =
+            !DebugEnv::isFalseyEnv("LLAMINAR_MOE_PREFILL_ASSIGNMENT_TRACE");
+        std::vector<DeviceMoELayerRuntime> traced_runtime_layers;
+        if (trace_assignment_runtime)
+        {
+            /*
+             * Stage-local assignment tracing is deliberately deferred while a
+             * native CUDA/HIP graph is being recorded.  Complete that explicit
+             * diagnostic request here, after the latest forward publication has
+             * been consumed and outside captured inference.  Reading the full
+             * table lets one observation distinguish a planner that published no
+             * spans from a consumer marker that was never set or was later
+             * overwritten.  Ordinary inference never allocates or transfers this
+             * diagnostic vector.
+             */
+            traced_runtime_layers.resize(
+                static_cast<size_t>(source.layer_count));
+            if (!backend->deviceToHostOnStream(
+                    traced_runtime_layers.data(),
+                    source.runtime_layers_device,
+                    traced_runtime_layers.size() *
+                        sizeof(DeviceMoELayerRuntime),
+                    state_.device_id.gpu_ordinal(),
+                    diagnostic_stream))
+            {
+                throw std::runtime_error(
+                    "Snapshot current-batch LLEP runtime trace readback failed on " +
+                    state_.device_id.toString());
+            }
+        }
+        const int *const evidence_device =
+            device_generation_storage_.control_device +
+            kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount;
+        if (!backend->deviceToHostOnStream(
+                evidence.data(),
+                evidence_device,
+                sizeof(evidence),
+                state_.device_id.gpu_ordinal(),
+                diagnostic_stream))
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence readback enqueue failed on " +
+                state_.device_id.toString());
+        }
+        completeMTPDiagnosticObservation(
+            *backend,
+            state_.device_id,
+            diagnostic_stream,
+            "snapshot current-batch LLEP evidence readback");
+
+        const int movement_layers = evidence[0];
+        const int non_owner_assignment_layers = evidence[1];
+        if (movement_layers < 0 || movement_layers > source.layer_count ||
+            non_owner_assignment_layers < 0 ||
+            non_owner_assignment_layers > source.layer_count)
+        {
+            throw std::runtime_error(
+                "Snapshot current-batch LLEP evidence contains an invalid "
+                "layer count on " +
+                state_.device_id.toString());
+        }
+
+        for (size_t layer = 0; layer < traced_runtime_layers.size(); ++layer)
+        {
+            const DeviceMoELayerRuntime &runtime =
+                traced_runtime_layers[layer];
+            const uint32_t active_bank = runtime.active_bank;
+            const uint32_t transient_placement =
+                active_bank <= 1u
+                    ? runtime.banks[active_bank].transient_placement_observed
+                    : 0u;
+            LOG_INFO(
+                "[DeviceGraphOrchestrator] current-batch LLEP terminal runtime trace"
+                << " device=" << state_.device_id.toString()
+                << " layer=" << layer
+                << " active_bank=" << active_bank
+                << " active_epoch=" << runtime.active_epoch
+                << " participant_id=" << runtime.participant_id
+                << " participant_count=" << runtime.participant_count
+                << " span_count=" << runtime.reserved_u64[2]
+                << " transfer_count=" << runtime.reserved_u64[3]
+                << " movement_observed="
+                << runtime.current_batch_llep_movement_observed
+                << " non_owner_assignment_observed="
+                << runtime.current_batch_llep_non_owner_assignment_observed
+                << " transient_placement_observed="
+                << transient_placement);
+        }
+
+        const PerfStatsCollector::Tags tags{
+            {"source", "snapshot_diagnostic_terminal_control"},
+            {"diagnostic_only", "true"},
+            {"layer_count", std::to_string(source.layer_count)}};
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_rebalance_prefill_current_batch_movement_layers",
+            static_cast<double>(movement_layers),
+            "prefill",
+            state_.device_id.toString(),
+            tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+            static_cast<double>(non_owner_assignment_layers),
+            "prefill",
+            state_.device_id.toString(),
+            tags);
+    }
+
+    void DeviceGraphOrchestrator::
+        drainCompletedDecodeBoundaryMaintenanceDiagnostics()
+    {
+        drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(
+            "request_epilogue");
+        publishSnapshotCurrentBatchLLEPEvidenceDiagnostics();
+    }
+
     bool DeviceGraphOrchestrator::waitForPendingDeviceMoERebalanceMaintenance(
         void *consumer_stream,
         DeviceTimelineRole consumer_role,
@@ -40306,6 +40496,27 @@ namespace llaminar2
             return false;
         }
 
+        const DeviceMoECurrentBatchLLEPEvidenceSource llep_evidence_source =
+            graph_builder_
+                ? graph_builder_->deviceMoECurrentBatchLLEPEvidenceSource(
+                      state_.device_id)
+                : DeviceMoECurrentBatchLLEPEvidenceSource{};
+        if (llep_evidence_source.valid() &&
+            !backend->
+                enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+                    llep_evidence_source.runtime_layers_device,
+                    llep_evidence_source.layer_count,
+                    device_generation_storage_.control_device,
+                    device_generation_storage_.control_stride,
+                    request_count,
+                    state_.device_id.gpu_ordinal(),
+                    result_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Terminal response failed to enqueue current-batch LLEP evidence publication on "
+                      << state_.device_id.toString());
+            return false;
+        }
+
         const size_t response_elements =
             static_cast<size_t>(request_count) *
             static_cast<size_t>(
@@ -40371,6 +40582,8 @@ namespace llaminar2
         int total_published_state_commits = 0;
         int total_attempted_draft_tokens = 0;
         int total_verifier_tokens = 0;
+        int total_current_batch_llep_movement_layers = 0;
+        int total_current_batch_llep_non_owner_assignment_layers = 0;
         int total_depth_evaluated_windows = 0;
         int total_depth_updates = 0;
         int total_depth_promotions = 0;
@@ -40417,6 +40630,12 @@ namespace llaminar2
                     kDeviceGenerationControlAttemptedDraftTokenCount];
             const int verifier_tokens =
                 control[kDeviceGenerationControlVerifierTokenCount];
+            const int current_batch_llep_movement_layers =
+                control[
+                    kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount];
+            const int current_batch_llep_non_owner_assignment_layers =
+                control[
+                    kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount];
             const int final_draft_depth =
                 control[kDeviceGenerationControlCurrentDraftDepth];
             const int minimum_draft_depth =
@@ -40474,6 +40693,19 @@ namespace llaminar2
                     transaction_count * maximum_draft_depth &&
                 verifier_tokens ==
                     attempted_draft_tokens + transaction_count &&
+                current_batch_llep_movement_layers >= 0 &&
+                current_batch_llep_non_owner_assignment_layers >= 0 &&
+                (!llep_evidence_source.valid() ||
+                 (current_batch_llep_movement_layers <=
+                      llep_evidence_source.layer_count &&
+                  current_batch_llep_non_owner_assignment_layers <=
+                      llep_evidence_source.layer_count)) &&
+                (llep_evidence_source.valid() ||
+                 (current_batch_llep_movement_layers == 0 &&
+                  current_batch_llep_non_owner_assignment_layers == 0)) &&
+                (request_index == 0 ||
+                 (current_batch_llep_movement_layers == 0 &&
+                  current_batch_llep_non_owner_assignment_layers == 0)) &&
                 depth_evaluated_windows >= 0 && depth_updates >= 0 &&
                 depth_updates <= depth_evaluated_windows &&
                 depth_promotions >= 0 &&
@@ -40504,6 +40736,10 @@ namespace llaminar2
                           << " state_commits=" << published_state_commits
                           << " attempted_drafts=" << attempted_draft_tokens
                           << " verifier_tokens=" << verifier_tokens
+                          << " llep_movement_layers="
+                          << current_batch_llep_movement_layers
+                          << " llep_non_owner_assignment_layers="
+                          << current_batch_llep_non_owner_assignment_layers
                           << " final_depth=" << final_draft_depth
                           << " depth_range=[" << minimum_draft_depth << ','
                           << maximum_draft_depth << ']'
@@ -40565,6 +40801,10 @@ namespace llaminar2
             total_published_state_commits += published_state_commits;
             total_attempted_draft_tokens += attempted_draft_tokens;
             total_verifier_tokens += verifier_tokens;
+            total_current_batch_llep_movement_layers +=
+                current_batch_llep_movement_layers;
+            total_current_batch_llep_non_owner_assignment_layers +=
+                current_batch_llep_non_owner_assignment_layers;
             total_depth_evaluated_windows += depth_evaluated_windows;
             total_depth_updates += depth_updates;
             total_depth_promotions += depth_promotions;
@@ -40692,6 +40932,30 @@ namespace llaminar2
             "decode",
             state_.device_id.toString(),
             terminal_multiplier_tags);
+        if (llep_evidence_source.valid())
+        {
+            const PerfStatsCollector::Tags llep_evidence_tags{
+                {"source", "device_generation_terminal_control"},
+                {"layer_count",
+                 std::to_string(llep_evidence_source.layer_count)},
+                {"ordering", "device_generation_state_ready_event"}};
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_prefill_current_batch_movement_layers",
+                static_cast<double>(
+                    total_current_batch_llep_movement_layers),
+                "prefill",
+                state_.device_id.toString(),
+                llep_evidence_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+                static_cast<double>(
+                    total_current_batch_llep_non_owner_assignment_layers),
+                "prefill",
+                state_.device_id.toString(),
+                llep_evidence_tags);
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_terminal_depth_evaluated_windows",

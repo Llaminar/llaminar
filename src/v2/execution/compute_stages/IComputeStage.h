@@ -226,6 +226,33 @@ namespace llaminar2
 
         StageDumpInfo &addWeight(const char *name, const ITensor *tensor);
 
+        /**
+         * @brief Describe immutable raw parameter storage without calling it an activation.
+         *
+         * Legacy stage APIs may still expose a read-only parameter as an unowned
+         * host pointer. Keeping that storage in the weight collection prevents
+         * per-execution activation validation while preserving diagnostic shape
+         * and type metadata.
+         *
+         * @param name Stable diagnostic name.
+         * @param data Immutable raw parameter bytes.
+         * @param bytes Exact byte count available at @p data.
+         * @param rows Logical row count.
+         * @param cols Logical column count.
+         * @param dtype Native element type label.
+         */
+        StageDumpInfo &addRawWeight(
+            const char *name,
+            const void *data,
+            size_t bytes,
+            size_t rows,
+            size_t cols,
+            const char *dtype)
+        {
+            weights.push_back({name, nullptr, data, bytes, rows, cols, dtype});
+            return *this;
+        }
+
         StageDumpInfo &addScalar(const char *name, double value, const char *dtype = "float")
         {
             scalars.push_back({name, value, dtype});

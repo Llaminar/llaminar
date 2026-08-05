@@ -425,6 +425,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheBatchSlicesCarryExactDeviceAndSt
         prepared_view.find("friend class KVCacheAppendStage"),
         std::string::npos)
         << "Only KVCacheAppendStage may mint prepared device-slice authority";
+    EXPECT_NE(
+        prepared_view.find(
+            "GpuTensorView(void *, size_t, size_t, TensorType, int) = delete"),
+        std::string::npos)
+        << "GpuTensorView must reject backend-ambiguous integer ordinals; "
+           "every view must carry an explicit CUDA or ROCm DeviceId";
     for (const auto &[backend, source] : {
              std::pair{"CUDA", &cuda_adapter},
              std::pair{"ROCm", &rocm_adapter}})
@@ -1562,13 +1568,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StageVerifierUsesTensorDeviceOrdinalFor
 {
     const auto source =
         readFile(repoRoot() / "src/v2/execution/local_execution/graph/StageVerifier.cpp");
-    const auto executable_source = stripCommentsAndStringLiterals(source);
+    const auto executable_source = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(source));
 
-    EXPECT_NE(executable_source.find("getTensorValidator(device_opt->type, device_opt->ordinal)"),
+    EXPECT_NE(executable_source.find("constautodevice=tensor->current_device();"),
+              std::string::npos)
+        << "GPU validation must derive ownership from the exact tensor view";
+    EXPECT_NE(executable_source.find("if(*device!=stage.device())"),
+              std::string::npos)
+        << "A backend-qualified tensor/stage mismatch must fail before launch";
+    EXPECT_NE(executable_source.find("getTensorValidator(device->type,device->ordinal)"),
               std::string::npos)
         << "Multi-GPU validation must fetch the validator for the tensor's actual "
            "device ordinal, not the ambient CUDA/HIP current device.";
-    EXPECT_EQ(executable_source.find("getTensorValidator(device_opt->type);"),
+    EXPECT_EQ(executable_source.find("getTensorValidator(device->type);"),
               std::string::npos);
 }
 
@@ -10203,7 +10216,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
 
     const auto compact_ffn =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(ffn_body));
-    const auto compact_raw_ffn = removeAsciiWhitespace(ffn_body);
+    const auto compact_graph = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(graph_source));
+    const auto compact_raw_graph = removeAsciiWhitespace(graph_source);
     const auto compact_replay =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(shifted_replay_body));
     const auto compact_spec_publication_support =
@@ -10213,12 +10228,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
               std::string::npos)
         << "Every MTP sidecar MoE fragment needs its own runtime table, even "
            "when the logical layer index aliases a main-model layer.";
-    EXPECT_NE(compact_ffn.find("runtime_table_suffix=use_mtp_runtime_table?"),
+    EXPECT_NE(compact_ffn.find("constMoERuntimeTableIdentityruntime_table_identity{"),
+              std::string::npos)
+        << "Runtime metadata ownership must be selected through a typed identity";
+    EXPECT_NE(compact_ffn.find(".role=use_mtp_runtime_table?MoERuntimeTableRole::MTPDepth:"),
+              std::string::npos)
+        << "MTP sidecars must select the depth-scoped runtime-table role";
+    EXPECT_NE(compact_ffn.find(".mtp_depth=use_mtp_runtime_table?mtp_depth_idx:-1"),
               std::string::npos);
-    EXPECT_NE(compact_raw_ffn.find("\"mtp_depth\"+std::to_string(mtp_depth_idx)"),
+    EXPECT_NE(compact_raw_graph.find("returndevice.to_string()+\"#mtp_depth\"+std::to_string(identity.mtp_depth);"),
               std::string::npos)
         << "Sidecar metadata must be depth-scoped so captured graphs do not "
            "share main-decode top-k/runtime slots.";
+    EXPECT_NE(compact_ffn.find("device,runtime_table_identity,total_tokens"),
+              std::string::npos)
+        << "Every runtime-table lookup must consume the typed identity";
     EXPECT_NE(compact_ffn.find("register_runtime_histogram=!use_mtp_runtime_table"),
               std::string::npos)
         << "Sidecar routing metadata is transient runtime state and must not "
@@ -12355,9 +12379,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, NativeCaptureUsesFrozenDependencyTransa
     EXPECT_NE(publish_write.find("currentGraphCaptureDependencyLedger()"),
               std::string::npos)
         << "Recorded outputs must validate against the exact active stage.";
-    EXPECT_NE(publish_write.find("validateRecordedPublication("),
+    EXPECT_NE(publish_write.find("recordStagePublication("),
               std::string::npos)
-        << "Capture-time publication is validation, not global authority mutation.";
+        << "Capture-time publication must be recorded against the exact active "
+           "stage contract, never installed as global authority.";
 }
 
 /**
