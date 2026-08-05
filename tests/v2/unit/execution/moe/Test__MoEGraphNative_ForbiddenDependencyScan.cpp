@@ -16,6 +16,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -100,6 +101,49 @@ namespace llaminar2::test
             return contents.substr(
                 start,
                 end == std::string::npos ? std::string::npos : end - start);
+        }
+
+        /**
+         * @brief Extract one brace-balanced class declaration for source-contract checks.
+         *
+         * A whole-header occurrence count can prove the total number of private
+         * backend owners, but it cannot prove which stage owns each one. Walking
+         * the declaration's braces lets ownership tests inspect every named stage
+         * independently without depending on line numbers or on the order of
+         * nested parameter structures.
+         *
+         * @param contents Complete source file contents.
+         * @param declaration Exact class-declaration prefix to locate.
+         * @return The complete class declaration, or an empty string when the
+         *         declaration is absent or has unbalanced braces.
+         */
+        std::string classDeclarationRegion(
+            const std::string &contents,
+            const std::string &declaration)
+        {
+            const size_t start = contents.find(declaration);
+            if (start == std::string::npos)
+                return {};
+
+            const size_t opening_brace = contents.find('{', start + declaration.size());
+            if (opening_brace == std::string::npos)
+                return {};
+
+            size_t depth = 0u;
+            for (size_t cursor = opening_brace; cursor < contents.size(); ++cursor)
+            {
+                if (contents[cursor] == '{')
+                {
+                    ++depth;
+                }
+                else if (contents[cursor] == '}')
+                {
+                    if (--depth == 0u)
+                        return contents.substr(start, cursor - start + 1u);
+                }
+            }
+
+            return {};
         }
 
         std::vector<fs::path> graphNativeFiles(const fs::path &root)
@@ -1381,6 +1425,12 @@ namespace llaminar2::test
      * executor-bound stage state. Every compute stage must prepare inputs,
      * prepare outputs, and publish writes through that token; only
      * ComputeStageBase may translate it into raw TransferEngine primitives.
+     *
+     * Capture-time publication records an internal dependency edge rather than
+     * mutating live tensor authority. Raw coherence inspection in a stage would
+     * therefore observe intentionally pre-execution state and reject a valid
+     * capture. Keeping all coherence decisions behind StageGPUExecution makes
+     * eager execution and graph recording obey the same stage contract.
      */
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ComputeStagesCannotChoosePublicationStream)
     {
@@ -1420,6 +1470,22 @@ namespace llaminar2::test
                 << fs::relative(entry.path(), root)
                 << " must prepare outputs through IComputeStage::gpuExecution(); "
                    "a raw stream argument can diverge from the producer stream";
+
+            const std::vector<std::string_view> forbidden_coherence_operations = {
+                "needsUpload(",
+                "needsDownload(",
+                "coherenceState(",
+                "getAuthoritativeDevice(",
+                "transitionTo(",
+            };
+            for (const std::string_view operation : forbidden_coherence_operations)
+            {
+                EXPECT_EQ(source.find(operation), std::string::npos)
+                    << fs::relative(entry.path(), root)
+                    << " must not inspect or mutate raw tensor coherence through "
+                    << operation
+                    << "; StageGPUExecution publication is capture-aware and authoritative";
+            }
         }
 
         const fs::path interface_path =
@@ -4584,17 +4650,17 @@ namespace llaminar2::test
         const size_t gate_call = execute_body.find("kernel->sharedExpertGateFromTensors(");
         const size_t publish = execute_body.find("gpuExecution().publish(params_.shared_output)",
                                                  gate_call);
-        const size_t upload_fallback = execute_body.find("params_.shared_output->needsUpload()", publish);
         ASSERT_NE(fused_gate_call, std::string::npos);
         ASSERT_NE(fused_publish, std::string::npos);
         ASSERT_NE(fused_combined_publish, std::string::npos);
         ASSERT_NE(gate_call, std::string::npos);
         ASSERT_NE(publish, std::string::npos);
-        ASSERT_NE(upload_fallback, std::string::npos);
         EXPECT_LT(fused_gate_call, fused_publish);
         EXPECT_LT(fused_gate_call, fused_combined_publish);
         EXPECT_LT(gate_call, publish);
-        EXPECT_LT(publish, upload_fallback);
+        EXPECT_EQ(execute_body.find("needsUpload("), std::string::npos)
+            << "A successful stage publication is the complete capture-aware "
+               "contract; inspecting pre-execution coherence after it is invalid";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SharedExpertGroupedDecodePublishesOutputBeforeReturning)
@@ -7667,13 +7733,35 @@ namespace llaminar2::test
                   std::string::npos)
             << "The router must accept an explicit graph-local producer/consumer owner.";
 
-        const std::regex expert_owner_regex(
-            "std::unique_ptr<IMoEKernel> owned_moe_kernel_");
-        const auto expert_owner_begin =
-            std::sregex_iterator(expert_header.begin(), expert_header.end(), expert_owner_regex);
-        const auto expert_owner_end = std::sregex_iterator();
-        EXPECT_EQ(std::distance(expert_owner_begin, expert_owner_end), 4)
-            << "Routed experts, shared FFN, shared gate, and canonical route reduction require separate kernels.";
+        constexpr std::array<const char *, 6> kStageLocalMoEKernelOwners = {
+            "class MoEExpertComputeStage",
+            "class SharedExpertFFNStage",
+            "class SharedExpertGateStage",
+            "class MoECanonicalRouteReduceStage",
+            "class MoESharedExpertRankBankPublishStage",
+            "class MoECanonicalPublicationFinalizeStage",
+        };
+        for (const char *stage_declaration : kStageLocalMoEKernelOwners)
+        {
+            const std::string stage_region =
+                classDeclarationRegion(expert_header, stage_declaration);
+            ASSERT_FALSE(stage_region.empty()) << stage_declaration;
+            EXPECT_EQ(
+                countOccurrences(
+                    stage_region,
+                    "std::unique_ptr<IMoEKernel> owned_moe_kernel_"),
+                1u)
+                << stage_declaration
+                << " must own exactly one private backend launch-state object.";
+        }
+        EXPECT_EQ(
+            countOccurrences(
+                expert_header,
+                "std::unique_ptr<IMoEKernel> owned_moe_kernel_"),
+            kStageLocalMoEKernelOwners.size())
+            << "Every MoE backend owner must belong to the explicit stage inventory; "
+               "routed, shared, reduction, rank-bank publication, and root "
+               "finalization stages may never share mutable launch state.";
         EXPECT_NE(expert_source.find("owned_moe_kernel_ = KernelFactory::createMoEKernel"),
                   std::string::npos);
         EXPECT_NE(expert_header.find(

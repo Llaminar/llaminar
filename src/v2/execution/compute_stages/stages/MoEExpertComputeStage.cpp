@@ -8711,12 +8711,6 @@ namespace llaminar2
         }
         if (params_.device_id.is_gpu())
             gpuExecution().publish(params_.shared_output);
-        if (params_.device_id.is_gpu() && params_.shared_output->needsUpload())
-        {
-            throw std::runtime_error(
-                "SharedExpertGateStage GPU kernel returned with a host-authoritative "
-                "output; host repair/upload is forbidden");
-        }
 
         return true;
     }
@@ -8986,12 +8980,6 @@ namespace llaminar2
 
         const StageGPUExecution execution = gpuExecution();
         execution.publish(params_.output);
-        if (params_.output->needsUpload())
-        {
-            throw std::runtime_error(
-                "MoE canonical route reducer returned a host-authoritative "
-                "output; GPU repair/upload is forbidden");
-        }
         return true;
     }
 
@@ -9150,6 +9138,503 @@ namespace llaminar2
             params_.participant_device_index);
         info.addScalarInt("root_device_index", params_.root_device_index);
         info.addScalarBool("owns_reduction", owns_reduction);
+        return info;
+    }
+
+    // =========================================================================
+    // MoESharedExpertRankBankPublishStage
+    // =========================================================================
+
+    MoESharedExpertRankBankPublishStage::
+        MoESharedExpertRankBankPublishStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+    }
+
+    bool MoESharedExpertRankBankPublishStage::execute(
+        IDeviceContext *ctx)
+    {
+        if (!ctx || !params_.shared_output ||
+            !params_.canonical_publication || params_.seq_len <= 0 ||
+            params_.top_k <= 0 || params_.d_model <= 0 ||
+            params_.participant_count <= 0 ||
+            params_.participant_device_index < 0 ||
+            params_.participant_device_index >= params_.participant_count)
+        {
+            LOG_ERROR(
+                "[MoESharedExpertRankBankPublishStage] Invalid execution "
+                "contract device="
+                << params_.device_id.to_string()
+                << " seq_len=" << params_.seq_len
+                << " top_k=" << params_.top_k
+                << " d_model=" << params_.d_model
+                << " participant=" << params_.participant_device_index
+                << " participants=" << params_.participant_count);
+            return false;
+        }
+
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        IMoEKernel *kernel = bindStageStream(moe_kernel_);
+        if (!kernel ||
+            !kernel->publishSharedExpertRankBank(
+                params_.shared_output,
+                params_.canonical_publication,
+                params_.seq_len,
+                params_.top_k,
+                params_.d_model,
+                params_.participant_device_index,
+                params_.participant_count,
+                reinterpret_cast<const int *>(
+                    params_.active_row_count_device)))
+        {
+            LOG_ERROR(
+                "[MoESharedExpertRankBankPublishStage] Device publication "
+                "failed device="
+                << params_.device_id.to_string()
+                << " participant=" << params_.participant_device_index
+                << " participants=" << params_.participant_count);
+            return false;
+        }
+
+        const StageGPUExecution execution = gpuExecution();
+        execution.publish(params_.canonical_publication);
+        return true;
+    }
+
+    bool MoESharedExpertRankBankPublishStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+#if defined(HAVE_CUDA)
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#if defined(HAVE_ROCM)
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    bool MoESharedExpertRankBankPublishStage::isGraphCapturable() const
+    {
+        return supportsGraphCaptureAfterLaunchPreparation() &&
+               moe_kernel_ != nullptr;
+    }
+
+    bool MoESharedExpertRankBankPublishStage::
+        supportsGraphCaptureAfterLaunchPreparation() const
+    {
+        return params_.device_id.is_gpu() && params_.shared_output &&
+               params_.canonical_publication && params_.seq_len > 0 &&
+               params_.top_k > 0 && params_.d_model > 0 &&
+               params_.participant_count > 0 &&
+               params_.participant_device_index >= 0 &&
+               params_.participant_device_index < params_.participant_count;
+    }
+
+    bool MoESharedExpertRankBankPublishStage::
+        supportsLazyPrefillGraphCapturePreflight() const
+    {
+        if (!supportsGraphCaptureAfterLaunchPreparation())
+            return false;
+        if (params_.device_id.is_cuda())
+            return supportsBackend(ComputeBackendType::GPU_CUDA);
+        if (params_.device_id.is_rocm())
+            return supportsBackend(ComputeBackendType::GPU_ROCM);
+        return false;
+    }
+
+    bool MoESharedExpertRankBankPublishStage::
+        supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
+    }
+
+    bool MoESharedExpertRankBankPublishStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR(
+                "[MoESharedExpertRankBankPublishStage] Graph preparation "
+                "requires the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        return bindStageStream(moe_kernel_) != nullptr;
+    }
+
+    StageBufferRequirements
+    MoESharedExpertRankBankPublishStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.shared_output)
+        {
+            reqs.addInput(
+                "shared_output",
+                params_.shared_output->shape(),
+                toBufferTensorType(params_.shared_output->native_type()));
+        }
+        if (params_.canonical_publication)
+        {
+            reqs.addOutput(
+                "canonical_publication",
+                params_.canonical_publication->shape(),
+                toBufferTensorType(
+                    params_.canonical_publication->native_type()));
+        }
+        return reqs;
+    }
+
+    StageBufferContract
+    MoESharedExpertRankBankPublishStage::bufferContract() const
+    {
+        return StageBufferContract::build()
+            .addInput(params_.shared_output_buffer_id)
+            .addInOut(params_.canonical_publication_buffer_id);
+    }
+
+    StageDumpInfo
+    MoESharedExpertRankBankPublishStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.shared_output)
+        {
+            info.addInput(
+                "shared_output",
+                params_.shared_output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        if (params_.canonical_publication)
+        {
+            info.addOutput(
+                "canonical_publication",
+                params_.canonical_publication,
+                static_cast<size_t>(params_.seq_len) *
+                    static_cast<size_t>(
+                        params_.top_k + params_.participant_count),
+                params_.d_model);
+        }
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("top_k", params_.top_k);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt(
+            "participant_device_index",
+            params_.participant_device_index);
+        info.addScalarInt("participant_count", params_.participant_count);
+        return info;
+    }
+
+    // =========================================================================
+    // MoECanonicalPublicationFinalizeStage
+    // =========================================================================
+
+    MoECanonicalPublicationFinalizeStage::
+        MoECanonicalPublicationFinalizeStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::execute(
+        IDeviceContext *ctx)
+    {
+        if (!ctx || !params_.input || !params_.gate_inp ||
+            !params_.canonical_publication || !params_.routed_output ||
+            !params_.shared_output || !params_.combined_output ||
+            params_.seq_len <= 0 || params_.top_k <= 0 ||
+            params_.d_model <= 0 || params_.participant_count <= 0 ||
+            params_.participant_device_index < 0 ||
+            params_.participant_device_index >= params_.participant_count ||
+            params_.root_device_index < 0 ||
+            params_.root_device_index >= params_.participant_count)
+        {
+            LOG_ERROR(
+                "[MoECanonicalPublicationFinalizeStage] Invalid execution "
+                "contract device="
+                << params_.device_id.to_string()
+                << " seq_len=" << params_.seq_len
+                << " top_k=" << params_.top_k
+                << " d_model=" << params_.d_model
+                << " participant=" << params_.participant_device_index
+                << " root=" << params_.root_device_index
+                << " participants=" << params_.participant_count);
+            return false;
+        }
+
+        // The rooted reduction owns valid publication bytes only on this rank.
+        if (params_.participant_device_index != params_.root_device_index)
+            return true;
+
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        IMoEKernel *kernel = bindStageStream(moe_kernel_);
+        if (!kernel ||
+            !kernel->finalizeCanonicalMoEPublication(
+                params_.input,
+                params_.gate_inp,
+                params_.canonical_publication,
+                params_.routed_output,
+                params_.shared_output,
+                params_.combined_output,
+                params_.seq_len,
+                params_.top_k,
+                params_.d_model,
+                params_.participant_count,
+                reinterpret_cast<const int *>(
+                    params_.active_row_count_device)))
+        {
+            LOG_ERROR(
+                "[MoECanonicalPublicationFinalizeStage] Device finalizer "
+                "failed device="
+                << params_.device_id.to_string()
+                << " root=" << params_.root_device_index);
+            return false;
+        }
+
+        const StageGPUExecution execution = gpuExecution();
+        execution.publish(params_.routed_output);
+        execution.publish(params_.shared_output);
+        execution.publish(params_.combined_output);
+        return true;
+    }
+
+    size_t MoECanonicalPublicationFinalizeStage::estimatedFlops() const
+    {
+        if (params_.participant_device_index != params_.root_device_index)
+            return 0;
+        const size_t rows = static_cast<size_t>(params_.seq_len);
+        const size_t columns = static_cast<size_t>(params_.d_model);
+        const size_t route_adds = static_cast<size_t>(
+            std::max(0, params_.top_k - 1));
+        const size_t rank_adds = static_cast<size_t>(
+            std::max(0, params_.participant_count - 1));
+        return rows * columns *
+               (size_t{4} + route_adds + rank_adds);
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+#if defined(HAVE_CUDA)
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#if defined(HAVE_ROCM)
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::isGraphCapturable() const
+    {
+        if (!supportsGraphCaptureAfterLaunchPreparation())
+            return false;
+        return params_.participant_device_index !=
+                   params_.root_device_index ||
+               moe_kernel_ != nullptr;
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::
+        supportsGraphCaptureAfterLaunchPreparation() const
+    {
+        return params_.device_id.is_gpu() && params_.input &&
+               params_.gate_inp && params_.canonical_publication &&
+               params_.routed_output && params_.shared_output &&
+               params_.combined_output && params_.seq_len > 0 &&
+               params_.top_k > 0 && params_.d_model > 0 &&
+               params_.participant_count > 0 &&
+               params_.participant_device_index >= 0 &&
+               params_.participant_device_index < params_.participant_count &&
+               params_.root_device_index >= 0 &&
+               params_.root_device_index < params_.participant_count;
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::
+        supportsLazyPrefillGraphCapturePreflight() const
+    {
+        if (!supportsGraphCaptureAfterLaunchPreparation())
+            return false;
+        if (params_.device_id.is_cuda())
+            return supportsBackend(ComputeBackendType::GPU_CUDA);
+        if (params_.device_id.is_rocm())
+            return supportsBackend(ComputeBackendType::GPU_ROCM);
+        return false;
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::
+        supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
+    }
+
+    bool MoECanonicalPublicationFinalizeStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR(
+                "[MoECanonicalPublicationFinalizeStage] Graph preparation "
+                "requires the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+        if (params_.participant_device_index != params_.root_device_index)
+            return true;
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        return bindStageStream(moe_kernel_) != nullptr;
+    }
+
+    StageBufferRequirements
+    MoECanonicalPublicationFinalizeStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.participant_device_index != params_.root_device_index)
+            return reqs;
+        if (params_.input)
+        {
+            reqs.addInput(
+                "input",
+                params_.input->shape(),
+                toBufferTensorType(params_.input->native_type()));
+        }
+        if (params_.canonical_publication)
+        {
+            reqs.addInput(
+                "canonical_publication",
+                params_.canonical_publication->shape(),
+                toBufferTensorType(
+                    params_.canonical_publication->native_type()));
+        }
+        if (params_.routed_output)
+        {
+            reqs.addOutput(
+                "routed_output",
+                params_.routed_output->shape(),
+                toBufferTensorType(params_.routed_output->native_type()));
+        }
+        if (params_.shared_output)
+        {
+            reqs.addOutput(
+                "shared_output",
+                params_.shared_output->shape(),
+                toBufferTensorType(params_.shared_output->native_type()));
+        }
+        if (params_.combined_output)
+        {
+            reqs.addOutput(
+                "combined_output",
+                params_.combined_output->shape(),
+                toBufferTensorType(params_.combined_output->native_type()));
+        }
+        return reqs;
+    }
+
+    StageBufferContract
+    MoECanonicalPublicationFinalizeStage::bufferContract() const
+    {
+        if (params_.participant_device_index != params_.root_device_index)
+            return {};
+        return StageBufferContract::build()
+            .addInput(params_.input_buffer_id)
+            .addWeight(params_.gate_inp)
+            .addInput(params_.canonical_publication_buffer_id)
+            .addOutput(params_.routed_output_buffer_id)
+            .addOutput(params_.shared_output_buffer_id)
+            .addOutput(params_.combined_output_buffer_id);
+    }
+
+    StageDumpInfo
+    MoECanonicalPublicationFinalizeStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        const bool owns_finalization =
+            params_.participant_device_index == params_.root_device_index;
+        if (owns_finalization && params_.input)
+        {
+            info.addInput(
+                "input", params_.input, params_.seq_len, params_.d_model);
+        }
+        if (owns_finalization && params_.gate_inp)
+            info.addWeight("gate_inp", params_.gate_inp);
+        if (owns_finalization && params_.canonical_publication)
+        {
+            info.addInput(
+                "canonical_publication",
+                params_.canonical_publication,
+                static_cast<size_t>(params_.seq_len) *
+                    static_cast<size_t>(
+                        params_.top_k + params_.participant_count),
+                params_.d_model);
+        }
+        if (owns_finalization && params_.routed_output)
+        {
+            info.addOutput(
+                "routed_output",
+                params_.routed_output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        if (owns_finalization && params_.shared_output)
+        {
+            info.addOutput(
+                "shared_output",
+                params_.shared_output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        if (owns_finalization && params_.combined_output)
+        {
+            info.addOutput(
+                "combined_output",
+                params_.combined_output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("top_k", params_.top_k);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt(
+            "participant_device_index",
+            params_.participant_device_index);
+        info.addScalarInt("root_device_index", params_.root_device_index);
+        info.addScalarInt("participant_count", params_.participant_count);
+        info.addScalarBool("owns_finalization", owns_finalization);
         return info;
     }
 

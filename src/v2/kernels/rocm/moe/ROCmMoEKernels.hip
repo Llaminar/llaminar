@@ -28,6 +28,7 @@
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../gemm/ROCmNativeVNNIDecodeEquivalentMath.h"
 
 namespace
 {
@@ -40,6 +41,15 @@ namespace
     constexpr int kDeviceMoESmallGroupMaxSlots = 64;
     constexpr int kDeviceMoERuntimeSmallGroupMaxSlots = 256;
     constexpr int kDeviceMoEMaxParticipants = 8;
+    /**
+     * Number of scalar output columns owned by one canonical finalizer block.
+     *
+     * Grouped verifier M is intentionally small. Splitting every hidden row
+     * into 128-column tiles exposes enough independent workgroups to occupy a
+     * gfx906 device while retaining one fixed 256-thread gate reduction per
+     * tile and therefore the serial-row arithmetic contract.
+     */
+    constexpr int kCanonicalMoEOutputTileColumns = 128;
     constexpr int kGateLogitsExpertsPerBlock = 4;
     constexpr int kGateLogitsGroupedThreads = 256;
     constexpr int kDeviceMoERebalanceApplyThreads = kGateLogitsGroupedThreads;
@@ -12972,6 +12982,321 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
     }
 }
 
+/**
+ * @brief Publish one shared partial into a rank-addressed canonical bank.
+ *
+ * Route slots occupy the prefix of @p canonical_publication and are owned by
+ * the routed-expert pipeline. This kernel overwrites the complete participant
+ * suffix: the local participant bank receives @p shared_output and every peer
+ * bank receives exact zero. A following RCCL reduce therefore transports
+ * shared evidence without allowing RCCL to select its FP32 addition order.
+ */
+__global__ __launch_bounds__(256)
+void rocm_moe_publish_shared_expert_rank_bank_kernel(
+    const float *__restrict__ shared_output,
+    float *__restrict__ canonical_publication,
+    int seq_len,
+    int top_k,
+    int d_model,
+    int participant_index,
+    int participant_count,
+    const int *__restrict__ device_effective_seq_len)
+{
+    const int bank_row = blockIdx.y;
+    const int participant = bank_row / seq_len;
+    const int token = bank_row - participant * seq_len;
+    if (participant >= participant_count || token >= seq_len)
+        return;
+
+    const int effective_seq_len =
+        rocm_moe_clamp_effective_seq_len(
+            seq_len, device_effective_seq_len);
+    const bool copy_local =
+        participant == participant_index && token < effective_seq_len;
+    const size_t row_elements =
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+    const size_t route_elements =
+        row_elements * static_cast<size_t>(top_k);
+    const size_t source_offset =
+        static_cast<size_t>(token) * static_cast<size_t>(d_model);
+    const size_t destination_offset =
+        route_elements +
+        static_cast<size_t>(participant) * row_elements + source_offset;
+
+    if ((d_model & 3) == 0)
+    {
+        const int d4 = d_model >> 2;
+        const float4 *__restrict__ source4 =
+            reinterpret_cast<const float4 *>(shared_output + source_offset);
+        float4 *__restrict__ destination4 =
+            reinterpret_cast<float4 *>(
+                canonical_publication + destination_offset);
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+             index < d4;
+             index += gridDim.x * blockDim.x)
+        {
+            destination4[index] = copy_local ? source4[index] : zero;
+        }
+        return;
+    }
+
+    for (int column = blockIdx.x * blockDim.x + threadIdx.x;
+         column < d_model;
+         column += gridDim.x * blockDim.x)
+    {
+        canonical_publication[destination_offset + column] =
+            copy_local ? shared_output[source_offset + column] : 0.0f;
+    }
+}
+
+/**
+ * @brief Finalize routed slots and shared rank banks in deterministic order.
+ *
+ * The gate-dot geometry and wave reduction exactly match
+ * rocm_moe_shared_expert_gate_add_kernel. A two-dimensional launch gives each
+ * token/output-column tile its own workgroup. Every tile recomputes the same
+ * fixed-order gate value, avoiding both inter-workgroup publication and a
+ * second launch while preserving a bit-identical gate. Route slots are then
+ * folded in router order and participant banks in ascending rank order using
+ * explicit round-to-nearest FP32 operations. The operation is atomic-free,
+ * allocation-free, transfer-free, and graph-capturable.
+ */
+__global__ __launch_bounds__(256)
+void rocm_moe_finalize_canonical_publication_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ gate_inp,
+    const float *__restrict__ canonical_publication,
+    float *__restrict__ routed_output,
+    float *__restrict__ shared_output,
+    float *__restrict__ combined_output,
+    int seq_len,
+    int top_k,
+    int d_model,
+    int participant_count,
+    const int *__restrict__ device_effective_seq_len)
+{
+    const int output_tile = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    const int first_column =
+        output_tile * kCanonicalMoEOutputTileColumns;
+    const int unbounded_last_column =
+        first_column + kCanonicalMoEOutputTileColumns;
+    const int last_column =
+        unbounded_last_column < d_model
+            ? unbounded_last_column
+            : d_model;
+    if (token >= seq_len || first_column >= d_model)
+        return;
+
+    const size_t row_offset =
+        static_cast<size_t>(token) * static_cast<size_t>(d_model);
+    const int effective_seq_len =
+        rocm_moe_clamp_effective_seq_len(
+            seq_len, device_effective_seq_len);
+    if (token >= effective_seq_len)
+    {
+        if ((d_model & 3) == 0)
+        {
+            const int first4 = first_column >> 2;
+            const int last4 = last_column >> 2;
+            float4 *__restrict__ routed4 =
+                reinterpret_cast<float4 *>(routed_output + row_offset);
+            float4 *__restrict__ shared4 =
+                reinterpret_cast<float4 *>(shared_output + row_offset);
+            float4 *__restrict__ combined4 =
+                reinterpret_cast<float4 *>(combined_output + row_offset);
+            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int index = first4 + threadIdx.x;
+                 index < last4;
+                 index += blockDim.x)
+            {
+                routed4[index] = zero;
+                shared4[index] = zero;
+                combined4[index] = zero;
+            }
+        }
+        else
+        {
+            for (int column = first_column + threadIdx.x;
+                 column < last_column;
+                 column += blockDim.x)
+            {
+                const size_t output_index =
+                    row_offset + static_cast<size_t>(column);
+                routed_output[output_index] = 0.0f;
+                shared_output[output_index] = 0.0f;
+                combined_output[output_index] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const float *row_input = input + row_offset;
+    float gate_dot = 0.0f;
+    if ((d_model & 3) == 0)
+    {
+        const int d4 = d_model >> 2;
+        const float4 *__restrict__ input4 =
+            reinterpret_cast<const float4 *>(row_input);
+        const float4 *__restrict__ gate4 =
+            reinterpret_cast<const float4 *>(gate_inp);
+        for (int index = threadIdx.x; index < d4; index += blockDim.x)
+        {
+            const float4 x = input4[index];
+            const float4 g = gate4[index];
+            gate_dot +=
+                x.x * g.x + x.y * g.y + x.z * g.z + x.w * g.w;
+        }
+    }
+    else
+    {
+        for (int column = threadIdx.x;
+             column < d_model;
+             column += blockDim.x)
+        {
+            gate_dot += row_input[column] * gate_inp[column];
+        }
+    }
+
+    gate_dot = rocm_moe_wave_reduce_sum_f32(gate_dot);
+    __shared__ float wave_sums[16];
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    if (lane == 0)
+        wave_sums[wave] = gate_dot;
+    __syncthreads();
+
+    if (wave == 0)
+    {
+        const int wave_count =
+            (blockDim.x + warpSize - 1) / warpSize;
+        float block_sum = lane < wave_count ? wave_sums[lane] : 0.0f;
+        block_sum = rocm_moe_wave_reduce_sum_f32(block_sum);
+        if (lane == 0)
+            wave_sums[0] = 1.0f / (1.0f + expf(-block_sum));
+    }
+    __syncthreads();
+    const float gate = wave_sums[0];
+
+    const size_t row_elements =
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+    const size_t route_elements =
+        row_elements * static_cast<size_t>(top_k);
+    const float *rank_banks = canonical_publication + route_elements;
+
+    if ((d_model & 3) == 0)
+    {
+        const int first4 = first_column >> 2;
+        const int last4 = last_column >> 2;
+        float4 *__restrict__ routed4 =
+            reinterpret_cast<float4 *>(routed_output + row_offset);
+        float4 *__restrict__ shared4 =
+            reinterpret_cast<float4 *>(shared_output + row_offset);
+        float4 *__restrict__ combined4 =
+            reinterpret_cast<float4 *>(combined_output + row_offset);
+        for (int index = first4 + threadIdx.x;
+             index < last4;
+             index += blockDim.x)
+        {
+            float4 routed = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 1
+            for (int route = 0; route < top_k; ++route)
+            {
+                const size_t route_row =
+                    (static_cast<size_t>(token) *
+                         static_cast<size_t>(top_k) +
+                     static_cast<size_t>(route)) *
+                    static_cast<size_t>(d_model);
+                const float4 contribution =
+                    reinterpret_cast<const float4 *>(
+                        canonical_publication + route_row)[index];
+                routed.x = rocm_native_vnni_accumulate_rn(
+                    routed.x, contribution.x);
+                routed.y = rocm_native_vnni_accumulate_rn(
+                    routed.y, contribution.y);
+                routed.z = rocm_native_vnni_accumulate_rn(
+                    routed.z, contribution.z);
+                routed.w = rocm_native_vnni_accumulate_rn(
+                    routed.w, contribution.w);
+            }
+
+            float4 shared = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 1
+            for (int participant = 0;
+                 participant < participant_count;
+                 ++participant)
+            {
+                const size_t bank_row =
+                    static_cast<size_t>(participant) * row_elements +
+                    row_offset;
+                const float4 contribution =
+                    reinterpret_cast<const float4 *>(
+                        rank_banks + bank_row)[index];
+                shared.x = rocm_native_vnni_accumulate_rn(
+                    shared.x, contribution.x);
+                shared.y = rocm_native_vnni_accumulate_rn(
+                    shared.y, contribution.y);
+                shared.z = rocm_native_vnni_accumulate_rn(
+                    shared.z, contribution.z);
+                shared.w = rocm_native_vnni_accumulate_rn(
+                    shared.w, contribution.w);
+            }
+
+            const float4 gated = make_float4(
+                __fmul_rn(gate, shared.x),
+                __fmul_rn(gate, shared.y),
+                __fmul_rn(gate, shared.z),
+                __fmul_rn(gate, shared.w));
+            routed4[index] = routed;
+            shared4[index] = gated;
+            combined4[index] = make_float4(
+                __fadd_rn(routed.x, gated.x),
+                __fadd_rn(routed.y, gated.y),
+                __fadd_rn(routed.z, gated.z),
+                __fadd_rn(routed.w, gated.w));
+        }
+        return;
+    }
+
+    for (int column = first_column + threadIdx.x;
+         column < last_column;
+         column += blockDim.x)
+    {
+        float routed = 0.0f;
+#pragma unroll 1
+        for (int route = 0; route < top_k; ++route)
+        {
+            const size_t route_index =
+                (static_cast<size_t>(token) *
+                     static_cast<size_t>(top_k) +
+                 static_cast<size_t>(route)) *
+                    static_cast<size_t>(d_model) +
+                static_cast<size_t>(column);
+            routed = rocm_native_vnni_accumulate_rn(
+                routed, canonical_publication[route_index]);
+        }
+        float shared = 0.0f;
+#pragma unroll 1
+        for (int participant = 0;
+             participant < participant_count;
+             ++participant)
+        {
+            const size_t shared_index =
+                static_cast<size_t>(participant) * row_elements +
+                row_offset + static_cast<size_t>(column);
+            shared = rocm_native_vnni_accumulate_rn(
+                shared, rank_banks[shared_index]);
+        }
+        const size_t output_index =
+            row_offset + static_cast<size_t>(column);
+        const float gated = __fmul_rn(gate, shared);
+        routed_output[output_index] = routed;
+        shared_output[output_index] = gated;
+        combined_output[output_index] = __fadd_rn(routed, gated);
+    }
+}
+
 // =========================================================================
 // Kernel 6: SwiGLU — silu(gate) * up
 //
@@ -14126,6 +14451,131 @@ bool hipMoE_shared_expert_gate_add_effective_seq_len(
         return false;
     }
 
+    return true;
+}
+
+bool rocmMoE_publish_shared_expert_rank_bank(
+    const float *shared_output,
+    float *canonical_publication,
+    int seq_len,
+    int top_k,
+    int d_model,
+    int participant_index,
+    int participant_count,
+    const int *device_effective_seq_len,
+    int device_idx,
+    void *stream)
+{
+    if (!shared_output || !canonical_publication || !stream ||
+        seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+        participant_count <= 0 || participant_index < 0 ||
+        participant_index >= participant_count)
+    {
+        fprintf(
+            stderr,
+            "HIP MoE canonical shared rank-bank publication has invalid arguments\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    constexpr int kThreads = 256;
+    const int column_work =
+        (d_model & 3) == 0 ? (d_model >> 2) : d_model;
+    const int column_blocks =
+        (column_work + kThreads - 1) / kThreads;
+    const dim3 grid(
+        column_blocks > 0 ? column_blocks : 1,
+        seq_len * participant_count);
+    hipLaunchKernelGGL(
+        rocm_moe_publish_shared_expert_rank_bank_kernel,
+        grid,
+        dim3(kThreads),
+        0,
+        static_cast<hipStream_t>(stream),
+        shared_output,
+        canonical_publication,
+        seq_len,
+        top_k,
+        d_model,
+        participant_index,
+        participant_count,
+        device_effective_seq_len);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "HIP MoE canonical shared rank-bank publication launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmMoE_finalize_canonical_publication(
+    const float *input,
+    const float *gate_inp,
+    const float *canonical_publication,
+    float *routed_output,
+    float *shared_output,
+    float *combined_output,
+    int seq_len,
+    int top_k,
+    int d_model,
+    int participant_count,
+    const int *device_effective_seq_len,
+    int device_idx,
+    void *stream)
+{
+    if (!input || !gate_inp || !canonical_publication ||
+        !routed_output || !shared_output || !combined_output || !stream ||
+        seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+        participant_count <= 0)
+    {
+        fprintf(
+            stderr,
+            "HIP MoE canonical publication finalizer has invalid arguments\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    constexpr int kThreads = 256;
+    const dim3 grid(
+        (d_model + kCanonicalMoEOutputTileColumns - 1) /
+            kCanonicalMoEOutputTileColumns,
+        seq_len);
+    hipLaunchKernelGGL(
+        rocm_moe_finalize_canonical_publication_kernel,
+        grid,
+        dim3(kThreads),
+        0,
+        static_cast<hipStream_t>(stream),
+        input,
+        gate_inp,
+        canonical_publication,
+        routed_output,
+        shared_output,
+        combined_output,
+        seq_len,
+        top_k,
+        d_model,
+        participant_count,
+        device_effective_seq_len);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "HIP MoE canonical publication finalizer launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
     return true;
 }
 

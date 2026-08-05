@@ -173,6 +173,30 @@ namespace llaminar2
     };
 
     /**
+     * @enum MoEParticipantPublicationPolicy
+     * @brief Graph-lowered publication transaction for partial MoE branches.
+     *
+     * This policy is derived from model topology after routed-row execution and
+     * dense/shared placement are known. It is not a user-facing expert-placement
+     * axis: it says how already-computed participant evidence becomes one visible
+     * FFN result. Keeping the choice typed prevents graph construction from
+     * independently deciding routed and shared collectives and accidentally
+     * changing their arithmetic or communication transaction.
+     */
+    enum class MoEParticipantPublicationPolicy : uint8_t
+    {
+        /** Routed and shared branches each publish through their own collective. */
+        IndependentBranchCollectives = 0,
+
+        /**
+         * Routed slots and rank-addressed shared banks use one rooted reduction.
+         * The root folds both banks in fixed order, applies the shared gate, and
+         * broadcasts only the final combined row.
+         */
+        CanonicalRootedRankBanks,
+    };
+
+    /**
      * @brief Return the canonical configuration spelling for a compute policy.
      * @param policy Typed compute-distribution value to render.
      * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
@@ -248,6 +272,24 @@ namespace llaminar2
             return "participant-assigned";
         case RoutedExpertRowExecutionPolicy::FullyReplicatedLocal:
             return "fully-replicated-local";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the stable diagnostic spelling for MoE publication policy.
+     * @param policy Graph-lowered participant publication transaction.
+     * @return Lowercase spelling used by graph diagnostics and PerfStats.
+     */
+    inline const char *moeParticipantPublicationPolicyToString(
+        MoEParticipantPublicationPolicy policy)
+    {
+        switch (policy)
+        {
+        case MoEParticipantPublicationPolicy::IndependentBranchCollectives:
+            return "independent-branch-collectives";
+        case MoEParticipantPublicationPolicy::CanonicalRootedRankBanks:
+            return "canonical-rooted-rank-banks";
         }
         return "unknown";
     }

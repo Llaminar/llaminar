@@ -1386,6 +1386,33 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool cudaMoE_publish_shared_expert_rank_bank(
+        const float *d_shared_output,
+        float *d_canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_finalize_canonical_publication(
+        const float *d_input,
+        const float *d_gate_inp,
+        const float *d_canonical_publication,
+        float *d_routed_output,
+        float *d_shared_output,
+        float *d_combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream);
+
 }
 
 namespace llaminar2
@@ -6939,6 +6966,176 @@ namespace llaminar2
             {{"seq_len", std::to_string(seq_len)},
              {"top_k", std::to_string(top_k)},
              {"d_model", std::to_string(d_model)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::publishSharedExpertRankBank(
+        ITensor *shared_output,
+        ITensor *canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!shared_output || !canonical_publication ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0 || participant_index < 0 ||
+            participant_index >= participant_count)
+        {
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishSharedExpertRankBank");
+        const DeviceId device = deviceId();
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_elements =
+            row_elements *
+            (static_cast<size_t>(top_k) +
+             static_cast<size_t>(participant_count));
+        if (shared_output->numel() < row_elements ||
+            canonical_publication->numel() < required_elements ||
+            !setMoEDevice(device_ordinal_, "publishSharedExpertRankBank") ||
+            !requireTensorOnDevice(
+                shared_output,
+                device,
+                stream,
+                "shared_output") ||
+            !requireTensorOnDevice(
+                canonical_publication,
+                device,
+                stream,
+                "canonical_publication"))
+        {
+            return false;
+        }
+
+        if (!cudaMoE_publish_shared_expert_rank_bank(
+                static_cast<const float *>(shared_output->gpu_data_ptr()),
+                static_cast<float *>(canonical_publication->gpu_data_ptr()),
+                seq_len,
+                top_k,
+                d_model,
+                participant_index,
+                participant_count,
+                device_effective_seq_len,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(canonical_publication, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_shared_rank_bank_publish_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"participants", std::to_string(participant_count)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::finalizeCanonicalMoEPublication(
+        ITensor *input,
+        ITensor *gate_inp,
+        ITensor *canonical_publication,
+        ITensor *routed_output,
+        ITensor *shared_output,
+        ITensor *combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!input || !gate_inp || !canonical_publication ||
+            !routed_output || !shared_output || !combined_output ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0)
+        {
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::finalizeCanonicalMoEPublication");
+        const DeviceId device = deviceId();
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_elements =
+            row_elements *
+            (static_cast<size_t>(top_k) +
+             static_cast<size_t>(participant_count));
+        if (input->numel() < row_elements ||
+            gate_inp->numel() < static_cast<size_t>(d_model) ||
+            canonical_publication->numel() < required_elements ||
+            routed_output->numel() < row_elements ||
+            shared_output->numel() < row_elements ||
+            combined_output->numel() < row_elements ||
+            !setMoEDevice(
+                device_ordinal_,
+                "finalizeCanonicalMoEPublication") ||
+            !requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(
+                canonical_publication,
+                device,
+                stream,
+                "canonical_publication") ||
+            !requireOutputOnDevice(
+                routed_output,
+                device,
+                stream,
+                "routed_output") ||
+            !requireOutputOnDevice(
+                shared_output,
+                device,
+                stream,
+                "shared_output") ||
+            !requireOutputOnDevice(
+                combined_output,
+                device,
+                stream,
+                "combined_output"))
+        {
+            return false;
+        }
+
+        if (!cudaMoE_finalize_canonical_publication(
+                static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<const float *>(gate_inp->gpu_data_ptr()),
+                static_cast<const float *>(
+                    canonical_publication->gpu_data_ptr()),
+                static_cast<float *>(routed_output->gpu_data_ptr()),
+                static_cast<float *>(shared_output->gpu_data_ptr()),
+                static_cast<float *>(combined_output->gpu_data_ptr()),
+                seq_len,
+                top_k,
+                d_model,
+                participant_count,
+                device_effective_seq_len,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(routed_output, device, stream);
+        markDeviceWritten(shared_output, device, stream);
+        markDeviceWritten(combined_output, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_canonical_publication_finalize_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"participants", std::to_string(participant_count)}});
         return true;
     }
 

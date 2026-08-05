@@ -99,6 +99,26 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   mirrored MTP head, and both durable maintenance and hot replicas Off. The
   complete Integration tree rebuilt all `1413/1413` edges and the device-free
   unit/source gate passed `585/585` on 2026-08-04.
+- LocalTP routed-plus-shared publication now has one typed canonical transaction:
+  every participant publishes router slots plus one rank-indexed shared bank,
+  one rooted sum transports that payload, the root finalizes routes, shared
+  banks, sigmoid gate, and residual in fixed serial order, and one broadcast
+  publishes the terminal hidden rows. The previous routed reduce/broadcast plus
+  independent shared allreduce/gate/combine transaction is absent from this
+  policy. The production graph-lowering regression proves one reduce and one
+  broadcast, exact producer dependencies, root-only finalization, and no old
+  shared collective or epilogue nodes.
+- The canonical publication kernels are byte exact against repeated production
+  M=1 arithmetic for every `M=1..16,31`, full Qwen width 2048, and ragged/vector
+  boundary widths `1,3,4,5,255,256,257,512,513`. Captured M=16 graphs replay at
+  live M=11 without changing inactive rows. The complete CUDA and ROCm MoE
+  grouped-verifier suites, including all native expert formats and real-path
+  graph capture, passed in `189.83 s` and `109.47 s`, respectively. The full
+  Integration tree then rebuilt all 971 affected targets and the complete
+  device-free unit/source gate passed `585/585` in `143.32 s`. The strengthened
+  source policy also forbids compute stages from inspecting raw tensor
+  coherence after exact-stream publication; graph capture records that edge in
+  its dependency ledger and replay owns the authority transition.
 
 ## CUDA LLEP Economy
 
@@ -114,6 +134,24 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   per-expert scan and second publication phase. Across M=2..31 the fused plan is
   `1.14x..1.26x` faster on CUDA and `1.16x..1.72x` faster on ROCm; at M=4 it
   moved `12.16 -> 9.76 us` and `30.28 -> 19.43 us`, respectively.
+- The canonical routed-plus-shared transport transaction is `1.075x..1.151x`
+  faster than the former three-collective transaction for M=2..16 in the
+  isolated CUDA2 NCCL harness. Its fixed-order finalizer moved from `12.86` to
+  `9.82 us` on CUDA with a 256-column tile and from `19.84` to `15.36 us` on
+  ROCm with a 128-column tile. CUDA uses 30 registers/thread, 1.02 KiB shared
+  memory, and zero spills; ROCm uses 24 VGPR, 48 SGPR, 512 bytes LDS, and zero
+  scratch/spills. Narrower CUDA and wider ROCm alternatives were measured and
+  rejected.
+- The matched Release CUDA2 fixed-d3 benchmark validates the complete graph
+  win: prefill improved `583.34 -> 654.43 tok/s` (`1.122x`) and decode improved
+  `172.99 -> 180.43 tok/s` (`1.043x`). Generated token IDs, generated text
+  bytes, and `79.25%` stochastic acceptance are identical to the baseline;
+  verifier transaction validation failures remain zero. Both participants
+  captured one complete prefill graph (`6387/6347` nodes), replayed it without
+  recapture or segmentation, and all decode contexts report full-graph replay
+  with deferred event completion. The mirrored LocalTP PerfStats records show
+  participant-local outcomes with no outcome collective and no host shadow;
+  the only D2H boundary is terminal response materialization.
 - The M=4 CUDA fused kernel uses 40 registers/thread and 4.23 KiB shared memory,
   has zero spills, and retains 100% theoretical occupancy. The ROCm wave64
   kernel uses 45 VGPR, 89 SGPR, and 4,232 bytes LDS with zero private segment
@@ -167,10 +205,17 @@ On llama.cpp `5788b51`, three runs gave a `155.4 tok/s` decode median and
 
 ## Next Gates
 
-1. Keep native geometry for large kernels and fuse adjacent tiny/control work.
+1. Profile the complete canonical CUDA2 d3 graph with `nsys`, then use `ncu` on
+   its hottest non-collective kernels. Attribute NCCL primitives, verifier
+   compute, prefill expert movement, and tiny control launches separately;
+   retain full graph capture and exact output bytes throughout.
+2. Close the prefill gap from `654.43 tok/s` to at least llama.cpp's current
+   `1122.5 tok/s` median, then pursue the `2245 tok/s` two-times target with
+   longer prompts that expose LLEP's theoretical crossover.
+3. Keep native geometry for large kernels and fuse adjacent tiny/control work.
    `V2_Perf_CUDAPersistentVerifierGeometry` found a one-kernel CTA proxy `1.25x`
    faster, but full-lane/ALU8 proxies only `0.964x/0.952x`; ncu attributes
    `63-68%` of issue stalls to cooperative barriers. Zero spills.
-2. Exceed `171.81 tok/s` on fixed d3, then tune dynamic depth/hysteresis through
-   depth 15 under deterministic prompt scenarios.
-3. Repeat the economy pass for ROCm and the remaining SingleDevice/EP lanes.
+4. Tune dynamic depth/hysteresis through depth 15 under deterministic prompt
+   scenarios without regressing the fixed-d3 `180.43 tok/s` reference.
+5. Repeat the economy pass for ROCm and the remaining SingleDevice/EP lanes.

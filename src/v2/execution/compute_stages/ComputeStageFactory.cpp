@@ -169,6 +169,20 @@ namespace llaminar2
         return std::make_unique<MoECanonicalRouteReduceStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoESharedExpertRankBankPublish(
+        const MoESharedExpertRankBankPublishStage::Params &params)
+    {
+        return std::make_unique<MoESharedExpertRankBankPublishStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoECanonicalPublicationFinalize(
+        const MoECanonicalPublicationFinalizeStage::Params &params)
+    {
+        return std::make_unique<MoECanonicalPublicationFinalizeStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllreduce(
         const AllreduceStage::Params &params)
     {

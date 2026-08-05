@@ -242,6 +242,16 @@ namespace llaminar2
         static std::unique_ptr<IComputeStage> createMoECanonicalRouteReduce(
             const MoECanonicalRouteReduceStage::Params &params);
 
+        /** @brief Create the canonical shared-partial rank-bank publisher. */
+        static std::unique_ptr<IComputeStage>
+        createMoESharedExpertRankBankPublish(
+            const MoESharedExpertRankBankPublishStage::Params &params);
+
+        /** @brief Create the root-only fixed-order MoE publication finalizer. */
+        static std::unique_ptr<IComputeStage>
+        createMoECanonicalPublicationFinalize(
+            const MoECanonicalPublicationFinalizeStage::Params &params);
+
         // =====================================================================
         // GDN (Gated Delta Net) Stages
         // =====================================================================

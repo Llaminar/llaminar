@@ -12708,17 +12708,66 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
     EXPECT_NE(compact_shared_dependency.find(
                   "constboolshared_verifier_owns_branch_local_math="
                   "main_verifier_rows&&(shared_gpu_table_verifier_prefill||"
-                  "shared_params.force_decode_equivalent_verifier_prefill);"),
+                  "shared_params.force_decode_equivalent_verifier_prefill||"
+                  "canonical_publication_lowering.usesRankBanks());"),
               std::string::npos)
-        << "The promoted standalone shared verifier route must stay separated "
-           "from backend MoE scratch ownership so routed and shared branches can "
-           "be optimized independently.";
+        << "The standalone and canonical rank-bank shared verifier routes own "
+           "branch-local storage and must remain parallel with routed expert "
+           "execution until their explicit publication join.";
     EXPECT_NE(compact_shared_dependency.find(
                   "if(main_verifier_rows&&!shared_verifier_owns_branch_local_math&&"
                   "!ffn_terminal.empty())"),
               std::string::npos)
         << "Do not restore a blanket routed->shared verifier dependency. Only "
            "routes without branch-local shared verifier ownership should serialize.";
+
+    const auto canonical_rank_bank_section = sliceBetween(
+        graph_source,
+        "if (canonical_publication_lowering.usesRankBanks())",
+        "/*\n             * Input-parallel prefill shared-expert down rows");
+    const std::string compact_canonical_rank_bank =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(canonical_rank_bank_section));
+    EXPECT_NE(compact_canonical_rank_bank.find(
+                  "createMoESharedExpertRankBankPublish(publish_params)"),
+              std::string::npos)
+        << "Canonical LocalTP MoE publication must materialize one explicit "
+           "shared rank-bank producer stage.";
+    EXPECT_NE(compact_canonical_rank_bank.find(
+                  "graph.addDependency("
+                  "canonical_publication_lowering.rooted_reduce_node,"
+                  "publish_name);"),
+              std::string::npos)
+        << "The rooted collective must wait for the shared rank-bank publisher; "
+           "otherwise routed and shared branches race in one payload.";
+    EXPECT_NE(compact_canonical_rank_bank.find(
+                  "createMoECanonicalPublicationFinalize(finalize_params)"),
+              std::string::npos)
+        << "The collective root must finalize route and rank banks through the "
+           "typed canonical publication stage.";
+    EXPECT_NE(compact_canonical_rank_bank.find(
+                  "broadcast_params.operation="
+                  "TPLocalRootedCollectiveOperation::Broadcast;"),
+              std::string::npos)
+        << "Canonical publication must broadcast only the final complete MoE row.";
+    EXPECT_EQ(compact_canonical_rank_bank.find("createTPAllreduceStage("),
+              std::string::npos)
+        << "The canonical rank-bank transaction must not recreate either legacy "
+           "branch allreduce inside its lowering.";
+
+    const auto independent_shared_collective_section = sliceBetween(
+        graph_source,
+        "if (shared_expert_requires_tp_allreduce &&",
+        "// Stage 5: Combine expert output");
+    const std::string compact_independent_shared_collective =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(
+            independent_shared_collective_section));
+    EXPECT_NE(compact_independent_shared_collective.find(
+                  "shared_expert_requires_tp_allreduce&&"
+                  "!canonical_publication_lowering.usesRankBanks()"),
+              std::string::npos)
+        << "The standalone shared allreduce must be structurally unreachable "
+           "when canonical rank-bank publication owns the transaction.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesCarryRequestShape)

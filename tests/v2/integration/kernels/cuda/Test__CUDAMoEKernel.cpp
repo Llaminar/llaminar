@@ -33,6 +33,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 #include "../moe/ActiveExpertCompactionTestOracle.h"
+#include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 
@@ -16377,6 +16378,374 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAl
             static_cast<size_t>(d_model));
     }
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Prove canonical rank-bank publication is M- and width-total on CUDA.
+ *
+ * Every quantized and floating expert format publishes the same FP32 expert
+ * output contract, so this post-FFN transaction is intentionally
+ * format-independent. The test sweeps every supported grouped verifier row
+ * count at Qwen's production width, crosses scalar/float4 width boundaries at
+ * representative M values, and compares all three outputs byte-for-byte with
+ * repeated production M=1 finalizer launches. A captured replay also changes
+ * the device-owned effective row count and requires every padded publication
+ * and output byte to be overwritten with zero.
+ */
+TEST_F(
+    Test__CUDAMoEKernel,
+    CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int kTopK = 8;
+    constexpr int kParticipantCount = 2;
+    const auto device = llaminar2::DeviceId::cuda(0);
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    llaminar2::PerfStatsCollector::reset();
+
+    size_t expected_publish_calls = 0;
+    size_t expected_finalize_calls = 0;
+
+    auto copy_device_tensor = [&](const std::shared_ptr<llaminar2::FP32Tensor> &tensor)
+    {
+        std::vector<float> values(tensor->numel());
+        EXPECT_NE(tensor->gpu_data_ptr(), nullptr);
+        EXPECT_EQ(
+            cudaMemcpyAsync(
+                values.data(),
+                tensor->gpu_data_ptr(),
+                values.size() * sizeof(float),
+                cudaMemcpyDeviceToHost,
+                stream_),
+            cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        return values;
+    };
+
+    auto run_case = [&](
+                        int seq_len,
+                        int d_model,
+                        int effective_seq_len,
+                        bool capture)
+    {
+        SCOPED_TRACE(
+            "M=" + std::to_string(seq_len) +
+            " d_model=" + std::to_string(d_model) +
+            " effective_M=" + std::to_string(effective_seq_len) +
+            (capture ? " captured" : " eager"));
+
+        const int participant_index = (seq_len + d_model) & 1;
+        const auto fixture =
+            llaminar2::test::makeCanonicalMoEPublicationFixture(
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                participant_index,
+                effective_seq_len);
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * d_model;
+
+        auto publisher_shared = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            fixture.publisher_shared);
+        auto publisher_payload = makeTensor(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)},
+            fixture.publisher_initial);
+        ASSERT_TRUE(publisher_shared->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(publisher_payload->ensureOnDevice(device, stream_));
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                device_position_,
+                &effective_seq_len,
+                sizeof(effective_seq_len),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+
+        if (capture)
+        {
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            ScopedCudaTestGraph graph(
+                stream_,
+                "canonical shared rank-bank publication");
+            ASSERT_TRUE(cuda_kernel_->publishSharedExpertRankBank(
+                publisher_shared.get(),
+                publisher_payload.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                participant_index,
+                kParticipantCount,
+                device_position_));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            ASSERT_TRUE(graph.launch());
+        }
+        else
+        {
+            ASSERT_TRUE(cuda_kernel_->publishSharedExpertRankBank(
+                publisher_shared.get(),
+                publisher_payload.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                participant_index,
+                kParticipantCount,
+                device_position_));
+        }
+        ++expected_publish_calls;
+
+        const auto published = copy_device_tensor(publisher_payload);
+        expectBitwiseFP32RowsEqual(
+            "CUDA canonical publisher must preserve routes and overwrite every rank bank",
+            published.data(),
+            fixture.publisher_expected.data(),
+            published.size(),
+            static_cast<size_t>(d_model));
+
+        auto grouped_input = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            fixture.input);
+        auto gate = makeTensor(
+            {static_cast<size_t>(d_model)}, fixture.gate);
+        auto grouped_publication = makeTensor(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)},
+            fixture.canonical_reduced);
+        const std::vector<float> output_sentinel(row_elements, 91.25f);
+        auto grouped_routed = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+        auto grouped_shared = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+        auto grouped_combined = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+
+        ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_publication->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_routed->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_shared->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_combined->ensureOnDevice(device, stream_));
+
+        if (capture)
+        {
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            ScopedCudaTestGraph graph(
+                stream_,
+                "canonical MoE publication finalizer");
+            ASSERT_TRUE(cuda_kernel_->finalizeCanonicalMoEPublication(
+                grouped_input.get(),
+                gate.get(),
+                grouped_publication.get(),
+                grouped_routed.get(),
+                grouped_shared.get(),
+                grouped_combined.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                device_position_));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            ASSERT_TRUE(graph.launch());
+        }
+        else
+        {
+            ASSERT_TRUE(cuda_kernel_->finalizeCanonicalMoEPublication(
+                grouped_input.get(),
+                gate.get(),
+                grouped_publication.get(),
+                grouped_routed.get(),
+                grouped_shared.get(),
+                grouped_combined.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                device_position_));
+        }
+        ++expected_finalize_calls;
+
+        const auto grouped_routed_host = copy_device_tensor(grouped_routed);
+        const auto grouped_shared_host = copy_device_tensor(grouped_shared);
+        const auto grouped_combined_host = copy_device_tensor(grouped_combined);
+
+        std::vector<float> serial_routed(row_elements, 0.0f);
+        std::vector<float> serial_shared(row_elements, 0.0f);
+        std::vector<float> serial_combined(row_elements, 0.0f);
+        auto row_input = makeZeros({1u, static_cast<size_t>(d_model)});
+        auto row_publication = makeZeros(
+            {1u,
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)});
+        auto row_routed = makeZeros({1u, static_cast<size_t>(d_model)});
+        auto row_shared = makeZeros({1u, static_cast<size_t>(d_model)});
+        auto row_combined = makeZeros({1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(row_input->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_publication->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_routed->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_shared->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_combined->ensureOnDevice(device, stream_));
+
+        for (int row = 0; row < effective_seq_len; ++row)
+        {
+            const auto serial_fixture =
+                llaminar2::test::extractCanonicalMoEPublicationRow(
+                    fixture, row);
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    row_input->gpu_data_ptr(),
+                    serial_fixture.input.data(),
+                    serial_fixture.input.size() * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream_),
+                cudaSuccess);
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    row_publication->gpu_data_ptr(),
+                    serial_fixture.publication.data(),
+                    serial_fixture.publication.size() * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream_),
+                cudaSuccess);
+            ASSERT_TRUE(cuda_kernel_->finalizeCanonicalMoEPublication(
+                row_input.get(),
+                gate.get(),
+                row_publication.get(),
+                row_routed.get(),
+                row_shared.get(),
+                row_combined.get(),
+                /*seq_len=*/1,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                /*device_effective_seq_len=*/nullptr));
+            ++expected_finalize_calls;
+
+            const size_t destination =
+                static_cast<size_t>(row) * d_model;
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    serial_routed.data() + destination,
+                    row_routed->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream_),
+                cudaSuccess);
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    serial_shared.data() + destination,
+                    row_shared->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream_),
+                cudaSuccess);
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    serial_combined.data() + destination,
+                    row_combined->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream_),
+                cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+        expectBitwiseFP32RowsEqual(
+            "CUDA canonical routed rows vs serial M=1",
+            grouped_routed_host.data(),
+            serial_routed.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+        expectBitwiseFP32RowsEqual(
+            "CUDA canonical gated shared rows vs serial M=1",
+            grouped_shared_host.data(),
+            serial_shared.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+        expectBitwiseFP32RowsEqual(
+            "CUDA canonical combined rows vs serial M=1",
+            grouped_combined_host.data(),
+            serial_combined.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+    };
+
+    for (const int seq_len :
+         llaminar2::test::kCanonicalMoEPublicationRows)
+    {
+        run_case(
+            seq_len,
+            /*d_model=*/2048,
+            /*effective_seq_len=*/seq_len,
+            /*capture=*/false);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    }
+
+    for (const int d_model :
+         llaminar2::test::kCanonicalMoEPublicationWidths)
+    {
+        if (d_model == 2048)
+            continue;
+        for (const int seq_len :
+             llaminar2::test::kCanonicalMoEPublicationGeometryRows)
+        {
+            run_case(
+                seq_len,
+                d_model,
+                /*effective_seq_len=*/seq_len,
+                /*capture=*/false);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        }
+    }
+
+    /*
+     * One captured bucket replay uses a shorter device-owned live prefix. This
+     * proves graph reuse does not preserve stale rows in either the publication
+     * suffix or any terminal output.
+     */
+    run_case(
+        /*seq_len=*/16,
+        /*d_model=*/2048,
+        /*effective_seq_len=*/11,
+        /*capture=*/true);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+    auto sum_counter = [](const std::vector<llaminar2::PerfStatRecord> &records)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+            total += record.value;
+        return total;
+    };
+    const auto publish_records =
+        llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_shared_rank_bank_publish_calls"});
+    const auto finalize_records =
+        llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_canonical_publication_finalize_calls"});
+    EXPECT_EQ(
+        sum_counter(publish_records),
+        static_cast<double>(expected_publish_calls));
+    EXPECT_EQ(
+        sum_counter(finalize_records),
+        static_cast<double>(expected_finalize_calls));
+    EXPECT_FALSE(publish_records.empty())
+        << "publisher PerfStats missing; production kernel was not exercised";
+    EXPECT_FALSE(finalize_records.empty())
+        << "finalizer PerfStats missing; production kernel was not exercised";
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }
 

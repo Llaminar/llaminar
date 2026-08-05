@@ -2030,6 +2030,22 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         "setup",
         "cuda:0",
         {{"fragment", "all-position verifier forward"}});
+    PerfStatsCollector::addCounter(
+        "tp_allreduce_bom",
+        "stages",
+        1.0,
+        "graph_setup",
+        "cuda:0",
+        {{"stage", "layer_0_gdn_wo_allreduce"},
+         {"elements", "2048"}});
+    PerfStatsCollector::addCounter(
+        "tp_rooted_collective_bom",
+        "calls",
+        1.0,
+        "graph_setup",
+        "cuda:0",
+        {{"stage", "layer_0_moe_canonical_routes_reduce_to_root"},
+         {"operation", "reduce_sum"}});
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
     auto runner = std::make_shared<MockCPUInferenceRunner>();
@@ -2058,6 +2074,10 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         << "Benchmark JSON diagnostics need the allocation BOM after warmup reset";
     EXPECT_TRUE(has_record("gpu_graph_inventory", "fragment_kernel_nodes"))
         << "Captured graph metadata is emitted during warmup and must survive into the benchmark artifact";
+    EXPECT_TRUE(has_record("tp_allreduce_bom", "stages"))
+        << "Captured allreduce stage/payload evidence must survive the measured reset";
+    EXPECT_TRUE(has_record("tp_rooted_collective_bom", "calls"))
+        << "Captured rooted-collective stage/payload evidence must survive the measured reset";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))
         << "Non-preserved warmup counters should still be cleared before measurement";
     PerfStatsCollector::reset();

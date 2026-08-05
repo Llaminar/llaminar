@@ -1089,6 +1089,76 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish one participant's shared-expert partial into a rank bank.
+         *
+         * The canonical publication tensor has the contiguous layout
+         * `[route slots][participant shared banks]`, where route slots occupy
+         * `seq_len * top_k * d_model` FP32 elements and every shared bank occupies
+         * `seq_len * d_model` elements. The implementation overwrites every
+         * shared-bank element on every invocation: the calling participant's bank
+         * receives its shared partial and every other bank receives exact zero.
+         * Consequently a later rooted sum transports the evidence without
+         * allowing the collective library to choose the shared branch's FP32
+         * addition order.
+         *
+         * @param shared_output Participant-local input-parallel shared FFN row.
+         * @param canonical_publication Route slots followed by shared rank banks.
+         * @param seq_len Physical graph row capacity.
+         * @param top_k Number of canonical routed slots per row.
+         * @param d_model Hidden width.
+         * @param participant_index Communicator-local bank written by this graph.
+         * @param participant_count Number of rank banks in the publication.
+         * @param device_effective_seq_len Optional device-owned live row count.
+         * @return true when the complete bank region was published.
+         */
+        virtual bool publishSharedExpertRankBank(
+            ITensor *shared_output,
+            ITensor *canonical_publication,
+            int seq_len,
+            int top_k,
+            int d_model,
+            int participant_index,
+            int participant_count,
+            const int *device_effective_seq_len = nullptr);
+
+        /**
+         * @brief Finalize one rooted canonical MoE publication in fixed order.
+         *
+         * Only the collective root calls this operation. For every output element
+         * it folds route slots in original router order, folds shared banks in
+         * ascending participant order, computes the existing shared sigmoid gate,
+         * and publishes the routed, gated-shared, and final combined tensors. The
+         * arithmetic order is independent of collective algorithm, M, and expert
+         * placement; GPU implementations must use explicit FP32 rounding boundaries
+         * and may not use atomics.
+         *
+         * @param input Normalized hidden rows used by the shared gate dot product.
+         * @param gate_inp FP32 shared-expert gate vector.
+         * @param canonical_publication Root-owned route slots and shared rank banks.
+         * @param routed_output Router-order reduced branch output.
+         * @param shared_output Rank-order reduced and sigmoid-gated shared output.
+         * @param combined_output Final routed plus gated-shared output.
+         * @param seq_len Physical graph row capacity.
+         * @param top_k Number of routed slots per row.
+         * @param d_model Hidden width.
+         * @param participant_count Number of shared rank banks.
+         * @param device_effective_seq_len Optional device-owned live row count.
+         * @return true when every output was published.
+         */
+        virtual bool finalizeCanonicalMoEPublication(
+            ITensor *input,
+            ITensor *gate_inp,
+            ITensor *canonical_publication,
+            ITensor *routed_output,
+            ITensor *shared_output,
+            ITensor *combined_output,
+            int seq_len,
+            int top_k,
+            int d_model,
+            int participant_count,
+            const int *device_effective_seq_len = nullptr);
+
+        /**
          * @brief Graph-capturable device-side MoE rebalance publish/apply.
          *
          * Backends consume a device-resident gathered histogram buffer with

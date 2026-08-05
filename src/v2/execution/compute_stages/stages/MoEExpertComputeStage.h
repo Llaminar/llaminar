@@ -1762,4 +1762,185 @@ namespace llaminar2
         mutable IMoEKernel *moe_kernel_ = nullptr;
     };
 
+    /**
+     * @brief Publish a participant-local shared FFN row into a canonical bank.
+     *
+     * This stage is the device-resident join between independently runnable
+     * routed and shared branches. The routed expert owns the route-slot prefix
+     * of the canonical publication tensor; this stage preserves that prefix and
+     * overwrites every participant-bank element in the suffix. Exactly one bank
+     * contains the local shared partial and all peer banks contain zero, so the
+     * following rooted sum transports values without selecting their arithmetic
+     * reduction order.
+     *
+     * The operation is intentionally a first-class graph node. Its dependencies
+     * make both branch producers visible, its inout buffer contract prevents
+     * stale route-prefix coherence, and its immutable participant identity is
+     * captured with the graph. No host publication, allocation, or dynamic
+     * launch decision is permitted.
+     */
+    class MoESharedExpertRankBankPublishStage final : public IComputeStage
+    {
+    public:
+        /** @brief Immutable graph-bound rank-bank publication parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            TensorBase *shared_output = nullptr;
+            TensorBase *canonical_publication = nullptr;
+            int seq_len = 0;
+            int top_k = 0;
+            int d_model = 0;
+            int participant_device_index = -1;
+            int participant_count = 0;
+            /** Device-owned live row count for padded captured graphs. */
+            const int32_t *active_row_count_device = nullptr;
+            BufferId shared_output_buffer_id =
+                BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            BufferId canonical_publication_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+        };
+
+        explicit MoESharedExpertRankBankPublishStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_SHARED_RANK_BANK_PUBLISH;
+        }
+        std::string name() const override
+        {
+            return "moe_shared_rank_bank_publish";
+        }
+        size_t estimatedFlops() const override { return 0; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /** @brief Expose immutable graph policy for structural tests. */
+        [[nodiscard]] const Params &params() const noexcept { return params_; }
+
+        /** @brief Inject a non-owning kernel oracle in device-free stage tests. */
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
+
+    private:
+        Params params_;
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
+        mutable IMoEKernel *moe_kernel_ = nullptr;
+    };
+
+    /**
+     * @brief Finalize a rooted canonical MoE transaction in fixed FP32 order.
+     *
+     * Every participant owns this graph node to keep LocalTP graphs symmetric,
+     * but only the fixed collective root accesses tensors or launches a kernel.
+     * The root folds route slots in router order, folds shared banks in ascending
+     * participant order, evaluates the established shared gate reduction, and
+     * writes routed, gated-shared, and final combined rows in one launch. The
+     * following rooted broadcast publishes only the final combined row.
+     *
+     * Root ownership is part of immutable graph policy. A non-root node has an
+     * empty coherence contract and cannot accidentally validate or publish stale
+     * local output; a root node requires all inputs and outputs explicitly.
+     */
+    class MoECanonicalPublicationFinalizeStage final : public IComputeStage
+    {
+    public:
+        /** @brief Immutable graph-bound finalization parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            TensorBase *input = nullptr;
+            TensorBase *gate_inp = nullptr;
+            TensorBase *canonical_publication = nullptr;
+            TensorBase *routed_output = nullptr;
+            TensorBase *shared_output = nullptr;
+            TensorBase *combined_output = nullptr;
+            int seq_len = 0;
+            int top_k = 0;
+            int d_model = 0;
+            int participant_device_index = -1;
+            int root_device_index = -1;
+            int participant_count = 0;
+            /** Device-owned live row count for padded captured graphs. */
+            const int32_t *active_row_count_device = nullptr;
+            BufferId input_buffer_id = BufferId::NORMALIZED;
+            BufferId canonical_publication_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+            BufferId routed_output_buffer_id =
+                BufferId::MOE_COMBINED_OUTPUT;
+            BufferId shared_output_buffer_id =
+                BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            BufferId combined_output_buffer_id = BufferId::ATTN_PROJ;
+        };
+
+        explicit MoECanonicalPublicationFinalizeStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_CANONICAL_PUBLICATION_FINALIZE;
+        }
+        std::string name() const override
+        {
+            return "moe_canonical_publication_finalize";
+        }
+        size_t estimatedFlops() const override;
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override;
+        bool supportsGraphCaptureAfterLaunchPreparation() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return supportsGraphCaptureAfterLaunchPreparation()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        CoherencePolicy coherencePolicy() const override
+        {
+            return params_.participant_device_index ==
+                           params_.root_device_index
+                       ? CoherencePolicy::FULL
+                       : CoherencePolicy::NONE;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /** @brief Expose immutable graph policy for structural tests. */
+        [[nodiscard]] const Params &params() const noexcept { return params_; }
+
+        /** @brief Inject a non-owning kernel oracle in device-free stage tests. */
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
+
+    private:
+        Params params_;
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
+        mutable IMoEKernel *moe_kernel_ = nullptr;
+    };
+
 } // namespace llaminar2

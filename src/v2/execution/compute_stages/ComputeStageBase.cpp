@@ -124,6 +124,10 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_GATE";
         case ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE:
             return "MOE_CANONICAL_ROUTE_REDUCE";
+        case ComputeStageType::MOE_SHARED_RANK_BANK_PUBLISH:
+            return "MOE_SHARED_RANK_BANK_PUBLISH";
+        case ComputeStageType::MOE_CANONICAL_PUBLICATION_FINALIZE:
+            return "MOE_CANONICAL_PUBLICATION_FINALIZE";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
         case ComputeStageType::MOE_SPARSE_DISPATCH:

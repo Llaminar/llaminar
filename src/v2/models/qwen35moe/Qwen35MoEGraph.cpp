@@ -2665,6 +2665,12 @@ namespace llaminar2
             std::max(std::max(1, seq_len), mtp_target_query_rows));
 
         config.custom_formulas["moe_top_k"] = static_cast<size_t>(top_k);
+        const int local_tp_degree =
+            config_.tp_ctx && config_.tp_ctx->isLocal()
+                ? std::max(1, config_.tp_ctx->degree())
+                : 0;
+        config.custom_formulas["moe_canonical_publication_slots"] =
+            static_cast<size_t>(top_k + local_tp_degree);
         config.custom_formulas["moe_expert_intermediate"] = static_cast<size_t>(expert_intermediate);
         config.custom_formulas["moe_ffn_intermediate_max"] =
             static_cast<size_t>(max_ffn_intermediate);
@@ -2690,6 +2696,8 @@ namespace llaminar2
 
         LOG_DEBUG("[Qwen35MoEGraph::getResolverConfig] MoE formulas: "
                   << "moe_top_k=" << top_k
+                  << ", moe_canonical_publication_slots="
+                  << (top_k + local_tp_degree)
                   << ", moe_expert_intermediate=" << expert_intermediate
                   << ", moe_ffn_intermediate_max=" << max_ffn_intermediate
                   << ", moe_activation_rows=" << moe_activation_rows);
@@ -4697,7 +4705,7 @@ namespace llaminar2
                 buffers.idFor(
                     BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
         TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
-        bool shared_gate_writes_combined_output = false;
+        bool moe_combined_output_ready = false;
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
 
         auto plannedSharedExpertDevice = [&]() -> DeviceId
@@ -4736,16 +4744,39 @@ namespace llaminar2
                    routed_row_execution_policy ==
                        RoutedExpertRowExecutionPolicy::ParticipantAssigned;
         };
+        const bool shared_expert_requires_tp_allreduce =
+            has_shared_expert_branch && needsTPAllreduce() &&
+            denseTPAllreduceEnabledForCurrentGraph();
+
         /*
          * LocalTP expert ownership must never shape the FP32 route addition
          * tree. GPU apportioned paths therefore publish every original route
-         * into an independent slot, reduce those slots in FP32 to one fixed
-         * participant, fold them in router order on that device, and broadcast
-         * only the compact routed row. The shared expert retains its normal
-         * allreduce-then-gate arithmetic and is combined only after the routed
-         * result has been published to every participant.
+         * into an independent slot. When the shared branch is input-parallel,
+         * graph policy additionally publishes each participant's shared partial
+         * into a rank-addressed bank. One rooted reduction then transports both
+         * branches, the root folds their banks in fixed order, and one broadcast
+         * publishes the final combined row. Topologies that do not satisfy that
+         * exact homogeneous LocalTP contract retain explicit independent branch
+         * collectives as a distinct lowering policy.
          */
         bool canonical_local_tp_route_publication = false;
+        struct CanonicalMoEPublicationLowering
+        {
+            MoEParticipantPublicationPolicy policy =
+                MoEParticipantPublicationPolicy::
+                    IndependentBranchCollectives;
+            int root_participant = -1;
+            int participant_count = 0;
+            std::string routed_producer;
+            std::string rooted_reduce_node;
+            std::string post_collective_terminal;
+
+            [[nodiscard]] bool usesRankBanks() const noexcept
+            {
+                return policy == MoEParticipantPublicationPolicy::
+                                     CanonicalRootedRankBanks;
+            }
+        } canonical_publication_lowering;
 
         {
             auto makeExpertParams = [&](TensorBase *output,
@@ -5209,6 +5240,16 @@ namespace llaminar2
                     needsMoEParticipantAllreduce() &&
                     needsTPAllreduce() &&
                     device.is_gpu();
+                canonical_publication_lowering.policy =
+                    canonical_local_tp_route_publication &&
+                            shared_expert_requires_tp_allreduce &&
+                            has_shared_expert_branch &&
+                            layer.shared_expert_gate_inp &&
+                            planned_shared_device == device
+                        ? MoEParticipantPublicationPolicy::
+                              CanonicalRootedRankBanks
+                        : MoEParticipantPublicationPolicy::
+                              IndependentBranchCollectives;
                 if (routed_row_execution_policy ==
                         RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
                     canonical_local_tp_route_publication)
@@ -5260,11 +5301,18 @@ namespace llaminar2
                         static_cast<size_t>(total_tokens) *
                         static_cast<size_t>(config_.d_model) *
                         (canonical_local_tp_route_publication
-                             ? static_cast<size_t>(config_.moe.top_k)
+                             ? static_cast<size_t>(config_.moe.top_k) +
+                                   (canonical_publication_lowering.usesRankBanks()
+                                        ? static_cast<size_t>(
+                                              expert_params.participant_count)
+                                        : size_t{0})
                              : size_t{1});
                     const std::string ar_name =
                         canonical_local_tp_route_publication
-                            ? prefix + "moe_canonical_routes_reduce_to_root"
+                            ? prefix +
+                                  (canonical_publication_lowering.usesRankBanks()
+                                       ? "moe_canonical_publication_reduce_to_root"
+                                       : "moe_canonical_routes_reduce_to_root")
                             : prefix + "moe_expert_overlay_fast_allreduce";
                     auto rebalance_sidebands =
                         takeGraphRebalanceSidebandsForAllreduce();
@@ -5329,14 +5377,13 @@ namespace llaminar2
                     }
                     graph.addNode(ar_name, std::move(collective_stage), device);
                     /*
-                     * The canonical route collective consumes the expert
-                     * kernel's per-route publication directly.  Keep that
-                     * producer edge explicit even when rebalance state is
-                     * piggybacked on the same collective; the collect-state
-                     * node is an additional producer, not a substitute for
-                     * the tensor producer.  This makes it structurally
-                     * impossible for later rebalance graph changes to let the
-                     * collective race ahead of the route contribution write.
+                     * The rooted transaction always consumes routed slots.
+                     * Keep that producer edge explicit even when the rank-bank
+                     * policy later adds a shared publisher and when rebalance
+                     * state is piggybacked on the same collective. Those nodes
+                     * are additional producers, never substitutes for routed
+                     * evidence. The collective therefore cannot race either
+                     * branch as the graph evolves.
                      */
                     graph.addDependency(
                         ar_name,
@@ -5371,7 +5418,30 @@ namespace llaminar2
                         ar_name,
                         ffn_terminal);
 
-                    if (canonical_local_tp_route_publication)
+                    if (canonical_local_tp_route_publication &&
+                        canonical_publication_lowering.usesRankBanks())
+                    {
+                        /*
+                         * Shared publication is created after its FFN branch.
+                         * Retain the complete rooted-transaction identity now
+                         * so later lowering can add the missing producer edge,
+                         * root finalizer, and final-row broadcast without
+                         * rediscovering topology or collective policy.
+                         */
+                        canonical_publication_lowering = {
+                            .policy = MoEParticipantPublicationPolicy::
+                                CanonicalRootedRankBanks,
+                            .root_participant =
+                                canonical_route_root_participant,
+                            .participant_count =
+                                expert_params.participant_count,
+                            .routed_producer =
+                                prefix + "moe_expert_ffn_overlay_fast",
+                            .rooted_reduce_node = ar_name,
+                            .post_collective_terminal = ffn_terminal,
+                        };
+                    }
+                    else if (canonical_local_tp_route_publication)
                     {
                         MoECanonicalRouteReduceStage::Params reduce_params;
                         reduce_params.device_id = device;
@@ -5443,6 +5513,9 @@ namespace llaminar2
                                                     << " row_execution="
                                                     << routedExpertRowExecutionPolicyToString(
                                                            routed_row_execution_policy)
+                                                    << " publication="
+                                                    << moeParticipantPublicationPolicyToString(
+                                                           canonical_publication_lowering.policy)
                                                     << " phase="
                                                     << (local_tp_fast_tier
                                                             ? routedExpertPhasePolicyToString(
@@ -5998,7 +6071,7 @@ namespace llaminar2
         // Stage 4: Shared Expert FFN (always-active dense SwiGLU)
         // =====================================================================
 
-        if (!shared_gate_writes_combined_output &&
+        if (!moe_combined_output_ready &&
             layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
         {
             DeviceId shared_device = planned_shared_device;
@@ -6012,8 +6085,6 @@ namespace llaminar2
              * prevents the gate/combine lowering and the collective lowering
              * from disagreeing about whether the branch is already complete.
              */
-            const bool shared_expert_requires_tp_allreduce =
-                needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph();
             if (overlay_runtime_plan)
             {
                 const auto &continuation_domain = overlay_runtime_plan->continuationDomain();
@@ -6128,22 +6199,169 @@ namespace llaminar2
             const bool shared_verifier_owns_branch_local_math =
                 main_verifier_rows &&
                 (shared_gpu_table_verifier_prefill ||
-                 shared_params.force_decode_equivalent_verifier_prefill);
+                 shared_params.force_decode_equivalent_verifier_prefill ||
+                 canonical_publication_lowering.usesRankBanks());
             if (main_verifier_rows &&
                 !shared_verifier_owns_branch_local_math &&
                 !ffn_terminal.empty())
             {
                 /*
-                 * Phase 9.8 correctness guard: only the standalone grouped
-                 * shared-verifier route has strict branch-local ownership.  If
-                 * this graph ever falls back to the row-serial verifier helper,
-                 * the shared branch temporarily re-enters normal decode and can
-                 * touch backend MoE bridge state.  Keep that path serialized
-                 * until a dedicated branch-scoped workspace proof exists.
+                 * A branch whose implementation shares mutable backend bridge
+                 * state with routed execution is serialized by policy. The
+                 * grouped GPU and canonical rank-bank implementations own
+                 * distinct persistent workspaces and therefore remain parallel.
                  */
                 graph.addDependency(prefix + "shared_expert_ffn", ffn_terminal);
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
+
+            if (canonical_publication_lowering.usesRankBanks())
+            {
+                if (!canonical_route_contributions || !buffers.normalized ||
+                    !buffers.attn_proj || !moe_output ||
+                    !layer.shared_expert_gate_inp || !local_tp_ctx ||
+                    canonical_publication_lowering.root_participant < 0 ||
+                    canonical_publication_lowering.participant_count <= 0 ||
+                    canonical_publication_lowering.routed_producer.empty() ||
+                    canonical_publication_lowering.rooted_reduce_node.empty() ||
+                    canonical_publication_lowering.post_collective_terminal.empty())
+                {
+                    throw std::logic_error(
+                        "Qwen35 MoE canonical rank-bank publication has an "
+                        "incomplete graph contract for layer " +
+                        std::to_string(layer_idx) + " on " +
+                        device.to_string());
+                }
+
+                MoESharedExpertRankBankPublishStage::Params publish_params;
+                publish_params.device_id = device;
+                publish_params.shared_output = shared_output;
+                publish_params.canonical_publication =
+                    canonical_route_contributions;
+                publish_params.seq_len = total_tokens;
+                publish_params.top_k = config_.moe.top_k;
+                publish_params.d_model = config_.d_model;
+                publish_params.participant_device_index =
+                    config_.tp_device_idx;
+                publish_params.participant_count =
+                    canonical_publication_lowering.participant_count;
+                publish_params.active_row_count_device =
+                    device.is_gpu() && batch_size == 1
+                        ? sequence_lengths_device
+                        : nullptr;
+                publish_params.shared_output_buffer_id =
+                    buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                publish_params.canonical_publication_buffer_id =
+                    buffers.idFor(
+                        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+
+                const std::string publish_name =
+                    prefix + "moe_shared_rank_bank_publish";
+                graph.addNode(
+                    publish_name,
+                    ComputeStageFactory::
+                        createMoESharedExpertRankBankPublish(
+                            publish_params),
+                    device);
+                graph.addDependency(
+                    publish_name,
+                    prefix + "shared_expert_ffn");
+                graph.addDependency(
+                    publish_name,
+                    canonical_publication_lowering.routed_producer);
+                graph.addDependency(
+                    canonical_publication_lowering.rooted_reduce_node,
+                    publish_name);
+
+                MoECanonicalPublicationFinalizeStage::Params finalize_params;
+                finalize_params.device_id = device;
+                finalize_params.input = buffers.normalized;
+                finalize_params.gate_inp = layer.shared_expert_gate_inp;
+                finalize_params.canonical_publication =
+                    canonical_route_contributions;
+                finalize_params.routed_output = moe_output;
+                finalize_params.shared_output = shared_output;
+                finalize_params.combined_output = buffers.attn_proj;
+                finalize_params.seq_len = total_tokens;
+                finalize_params.top_k = config_.moe.top_k;
+                finalize_params.d_model = config_.d_model;
+                finalize_params.participant_device_index =
+                    config_.tp_device_idx;
+                finalize_params.root_device_index =
+                    canonical_publication_lowering.root_participant;
+                finalize_params.participant_count =
+                    canonical_publication_lowering.participant_count;
+                finalize_params.active_row_count_device =
+                    device.is_gpu() && batch_size == 1
+                        ? sequence_lengths_device
+                        : nullptr;
+                finalize_params.input_buffer_id =
+                    buffers.idFor(BufferId::NORMALIZED);
+                finalize_params.canonical_publication_buffer_id =
+                    buffers.idFor(
+                        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                finalize_params.routed_output_buffer_id =
+                    buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                finalize_params.shared_output_buffer_id =
+                    buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                finalize_params.combined_output_buffer_id =
+                    buffers.idFor(BufferId::ATTN_PROJ);
+
+                const std::string finalize_name =
+                    prefix + "moe_canonical_publication_finalize";
+                graph.addNode(
+                    finalize_name,
+                    ComputeStageFactory::
+                        createMoECanonicalPublicationFinalize(
+                            finalize_params),
+                    device);
+                graph.addDependency(
+                    finalize_name,
+                    canonical_publication_lowering.post_collective_terminal);
+
+                TPLocalRootedCollectiveStage::Params broadcast_params;
+                broadcast_params.device_id = device;
+                broadcast_params.tp_ctx = local_tp_ctx;
+                broadcast_params.tensor = buffers.attn_proj;
+                broadcast_params.count =
+                    static_cast<size_t>(total_tokens) *
+                    static_cast<size_t>(config_.d_model);
+                broadcast_params.dtype = CollectiveDataType::FLOAT32;
+                broadcast_params.operation =
+                    TPLocalRootedCollectiveOperation::Broadcast;
+                broadcast_params.root_device_index =
+                    canonical_publication_lowering.root_participant;
+                broadcast_params.participant_device_index =
+                    config_.tp_device_idx;
+                broadcast_params.stage_name =
+                    prefix + "moe_canonical_publication_broadcast";
+                broadcast_params.tensor_buffer_id =
+                    buffers.idFor(BufferId::ATTN_PROJ);
+
+                const std::string broadcast_name =
+                    broadcast_params.stage_name;
+                graph.addNode(
+                    broadcast_name,
+                    ComputeStageFactory::createTPLocalRootedCollective(
+                        broadcast_params),
+                    device);
+                graph.addDependency(broadcast_name, finalize_name);
+
+                moe_combined_output_ready = true;
+                shared_ffn_last = broadcast_name;
+                ffn_terminal = broadcast_name;
+
+                LOG_TRACE(
+                    "[Qwen35MoEGraph] Layer "
+                    << layer_idx << " lowered "
+                    << moeParticipantPublicationPolicyToString(
+                           canonical_publication_lowering.policy)
+                    << " participants="
+                    << canonical_publication_lowering.participant_count
+                    << " root="
+                    << canonical_publication_lowering.root_participant
+                    << " device=" << device.to_string());
+            }
 
             /*
              * Input-parallel prefill shared-expert down rows are reduced before
@@ -6151,7 +6369,8 @@ namespace llaminar2
              * arithmetic independently of routed-expert placement. Replicated
              * decode rows are already complete and must never be summed again.
              */
-            if (shared_expert_requires_tp_allreduce)
+            if (shared_expert_requires_tp_allreduce &&
+                !canonical_publication_lowering.usesRankBanks())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                 std::string ar_name = prefix + "shared_expert_allreduce";
@@ -6177,7 +6396,8 @@ namespace llaminar2
             }
 
             // Stage 4b: Sigmoid gate on shared expert output
-            if (layer.shared_expert_gate_inp)
+            if (layer.shared_expert_gate_inp &&
+                !canonical_publication_lowering.usesRankBanks())
             {
                 const bool can_fuse_gate_and_combine =
                     !shared_expert_requires_tp_allreduce &&
@@ -6216,10 +6436,10 @@ namespace llaminar2
                     // The fused epilogue consumes both the shared-expert output
                     // and the routed-expert output.
                     graph.addDependency(prefix + "shared_expert_gate", ffn_terminal);
-                    shared_gate_writes_combined_output = true;
+                    moe_combined_output_ready = true;
                 }
                 shared_ffn_last = prefix + "shared_expert_gate";
-                if (shared_gate_writes_combined_output)
+                if (moe_combined_output_ready)
                 {
                     ffn_terminal = prefix + "shared_expert_gate";
                 }
@@ -6232,10 +6452,10 @@ namespace llaminar2
         // The combined MoE output goes to attn_proj so that the next layer's
         // FusedResidualNormStage handles the residual add automatically.
         {
-            if (shared_gate_writes_combined_output)
+            if (moe_combined_output_ready)
             {
-                // SharedExpertGateStage already wrote the combined MoE output to
-                // ATTN_PROJ, so no standalone residual-add combine node is needed.
+                // A fused shared gate or canonical rooted finalizer already
+                // wrote ATTN_PROJ; no standalone residual add is permitted.
             }
             else if (!shared_ffn_last.empty() && shared_output)
             {

@@ -990,5 +990,143 @@ namespace
         }
     }
 
+    /**
+     * @brief Compare the current routed/shared transaction with one rooted payload.
+     *
+     * The production LocalTP MoE graph currently publishes two independent
+     * branch results. Routed expert slots take the byte-exact root-reduce plus
+     * compact-broadcast path, while the input-parallel shared-expert down row
+     * takes a separate allreduce. Both custom epilogues are intentionally
+     * omitted here: the current route-order fold and the candidate fused
+     * route-fold/shared-gate epilogue do comparable device-local work. This A/B
+     * therefore measures only the communication architecture we are deciding
+     * whether to lower into the production graph.
+     *
+     * The candidate appends one M*d_model shared-partial bank per participant
+     * after the M*top_k*d_model route slots. Each participant writes only its
+     * own bank and zeroes its peers' banks, so NCCL transports the shared
+     * evidence without choosing its floating-point reduction order. The fixed
+     * root can then fold participant banks in ascending rank order, preserving
+     * serial-row arithmetic independently of NCCL algorithm selection. One
+     * compact M*d_model broadcast publishes the final FFN delta. Every address
+     * is persistent and both variants execute inside one participant-local
+     * CUDA graph with the same explicit stream contract as production.
+     */
+    TEST_F(Perf__NCCLCollectiveLatency, GraphCapturedCombinedMoETransaction)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        std::cout << "\nCUDA peer access: "
+                  << (bidirectionalPeerAccessAvailable()
+                          ? "bidirectional P2P"
+                          : "unavailable; NCCL will use a non-P2P transport")
+                  << "\n";
+        std::cout << std::left << std::setw(16) << "operation"
+                  << std::setw(24) << "shape"
+                  << std::right << std::setw(10) << "bytes"
+                  << std::setw(12) << "median_us"
+                  << std::setw(12) << "p95_us"
+                  << std::setw(12) << "min_us"
+                  << std::setw(12) << "max_us" << '\n';
+
+        constexpr int root = 0;
+        for (const MessageShape &shape : kMessageShapes)
+        {
+            if (shape.canonical_output_bytes == 0)
+                continue;
+
+            const size_t route_count = shape.send_bytes / sizeof(float);
+            const size_t output_count =
+                shape.canonical_output_bytes / sizeof(float);
+
+            captureCollective(
+                [&](int participant, ParticipantResources &resources)
+                {
+                    if (!coordinator_.reduceSingleDeviceOnStream(
+                            resources.buffer,
+                            resources.buffer,
+                            route_count,
+                            CollectiveDataType::FLOAT32,
+                            CollectiveOp::ALLREDUCE_SUM,
+                            root,
+                            participant,
+                            resources.stream))
+                    {
+                        return false;
+                    }
+                    if (!coordinator_.broadcastSingleDeviceOnStream(
+                            resources.buffer,
+                            resources.send_buffer,
+                            output_count,
+                            CollectiveDataType::FLOAT32,
+                            root,
+                            participant,
+                            resources.stream))
+                    {
+                        return false;
+                    }
+
+                    float *shared_partial =
+                        static_cast<float *>(resources.buffer) + route_count;
+                    return coordinator_.allreduceSingleDeviceOnStream(
+                        shared_partial,
+                        output_count,
+                        CollectiveDataType::FLOAT32,
+                        CollectiveOp::ALLREDUCE_SUM,
+                        participant,
+                        resources.stream);
+                });
+            const LatencySummary split = benchmarkCaptured();
+
+            const size_t deterministic_publication_count =
+                route_count +
+                static_cast<size_t>(kDeviceCount) * output_count;
+            captureCollective(
+                [&](int participant, ParticipantResources &resources)
+                {
+                    if (!coordinator_.reduceSingleDeviceOnStream(
+                            resources.buffer,
+                            resources.buffer,
+                            deterministic_publication_count,
+                            CollectiveDataType::FLOAT32,
+                            CollectiveOp::ALLREDUCE_SUM,
+                            root,
+                            participant,
+                            resources.stream))
+                    {
+                        return false;
+                    }
+                    return coordinator_.broadcastSingleDeviceOnStream(
+                        resources.buffer,
+                        resources.send_buffer,
+                        output_count,
+                        CollectiveDataType::FLOAT32,
+                        root,
+                        participant,
+                        resources.stream);
+                });
+            const LatencySummary combined = benchmarkCaptured();
+
+            const MessageShape split_shape{
+                shape.label,
+                shape.send_bytes + shape.canonical_output_bytes,
+                shape.canonical_output_bytes};
+            const MessageShape deterministic_shape{
+                shape.label,
+                shape.send_bytes +
+                    static_cast<size_t>(kDeviceCount) *
+                        shape.canonical_output_bytes,
+                shape.canonical_output_bytes};
+            printResult("split_moe", split_shape, split);
+            printResult("combined_rank_banks", deterministic_shape, combined);
+            std::cout << "  speedup=" << std::fixed << std::setprecision(3)
+                      << (combined.median_us > 0.0
+                              ? split.median_us / combined.median_us
+                              : 0.0)
+                      << "x\n";
+        }
+    }
+
 } // namespace
 } // namespace llaminar2

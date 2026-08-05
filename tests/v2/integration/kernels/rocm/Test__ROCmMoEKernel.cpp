@@ -57,6 +57,7 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../moe/ActiveExpertCompactionTestOracle.h"
+#include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 
@@ -15195,6 +15196,391 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllr
             static_cast<size_t>(d_model));
     }
     EXPECT_EQ(hipSetDevice(0), hipSuccess);
+}
+
+/**
+ * @brief Prove canonical rank-bank publication is M- and width-total on ROCm.
+ *
+ * Routed and shared FFNs publish FP32 rows regardless of their source tensor
+ * codebook, so this transaction has no remaining format branch to sweep. The
+ * regression instead certifies every grouped verifier M at Qwen width, scalar
+ * and float4 width boundaries, exact participant-bank overwrite semantics,
+ * and byte equality with repeated production M=1 HIP finalizer launches. One
+ * captured replay narrows the device-owned live-row prefix to expose stale
+ * padded rows without introducing a host execution oracle.
+ */
+TEST(
+    Test__ROCmMoEKernel,
+    CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int kTopK = 8;
+    constexpr int kParticipantCount = 2;
+    const DeviceId device = DeviceId::rocm(0);
+    ScopedHipDeviceStream stream_owner(0);
+    ASSERT_EQ(stream_owner.status(), hipSuccess);
+    ASSERT_NE(stream_owner.get(), nullptr);
+    const hipStream_t stream = stream_owner.get();
+
+    ROCmMoEKernel gpu_kernel(0);
+    static_cast<ITensorKernel &>(gpu_kernel).setGPUStream(stream);
+    auto gpu_workspace = bindDefaultMoEWorkspace(
+        gpu_kernel,
+        /*max_seq_len=*/64,
+        /*d_model=*/2048,
+        /*intermediate=*/512,
+        /*num_experts=*/256,
+        /*top_k=*/16);
+    HipAllocation effective_rows_storage(sizeof(int));
+    auto *device_effective_rows =
+        static_cast<int *>(effective_rows_storage.get());
+
+    ScopedEnvOverride perf_stats_env(
+        "LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
+    size_t expected_publish_calls = 0;
+    size_t expected_finalize_calls = 0;
+
+    auto make_tensor = [](
+                           const std::vector<size_t> &shape,
+                           const std::vector<float> &values)
+    {
+        auto tensor = TestTensorFactory::createFP32(shape);
+        EXPECT_EQ(tensor->numel(), values.size());
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+    auto make_zero_tensor = [](
+                                const std::vector<size_t> &shape)
+    {
+        auto tensor = TestTensorFactory::createFP32(shape);
+        std::fill(
+            tensor->mutable_data(),
+            tensor->mutable_data() + tensor->numel(),
+            0.0f);
+        return tensor;
+    };
+
+    auto run_case = [&](
+                        int seq_len,
+                        int d_model,
+                        int effective_seq_len,
+                        bool capture)
+    {
+        SCOPED_TRACE(
+            "M=" + std::to_string(seq_len) +
+            " d_model=" + std::to_string(d_model) +
+            " effective_M=" + std::to_string(effective_seq_len) +
+            (capture ? " captured" : " eager"));
+
+        const int participant_index = (seq_len + d_model) & 1;
+        const auto fixture =
+            makeCanonicalMoEPublicationFixture(
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                participant_index,
+                effective_seq_len);
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * d_model;
+
+        auto publisher_shared = make_tensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            fixture.publisher_shared);
+        auto publisher_payload = make_tensor(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)},
+            fixture.publisher_initial);
+        ASSERT_TRUE(publisher_shared->ensureOnDevice(device, stream));
+        ASSERT_TRUE(publisher_payload->ensureOnDevice(device, stream));
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_effective_rows,
+                &effective_seq_len,
+                sizeof(effective_seq_len),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+
+        if (capture)
+        {
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ScopedHipTestGraph graph(
+                /*device_ordinal=*/0,
+                stream,
+                "canonical shared rank-bank publication");
+            ASSERT_TRUE(gpu_kernel.publishSharedExpertRankBank(
+                publisher_shared.get(),
+                publisher_payload.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                participant_index,
+                kParticipantCount,
+                device_effective_rows));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            ASSERT_TRUE(graph.launch());
+        }
+        else
+        {
+            ASSERT_TRUE(gpu_kernel.publishSharedExpertRankBank(
+                publisher_shared.get(),
+                publisher_payload.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                participant_index,
+                kParticipantCount,
+                device_effective_rows));
+        }
+        ++expected_publish_calls;
+
+        const auto published =
+            copyROCmFP32TensorToHost(publisher_payload.get(), stream);
+        expectBitwiseVerifierRowsEqual(
+            "ROCm canonical publisher must preserve routes and overwrite every rank bank",
+            published.data(),
+            fixture.publisher_expected.data(),
+            published.size(),
+            static_cast<size_t>(d_model));
+
+        auto grouped_input = make_tensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            fixture.input);
+        auto gate = make_tensor(
+            {static_cast<size_t>(d_model)}, fixture.gate);
+        auto grouped_publication = make_tensor(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)},
+            fixture.canonical_reduced);
+        const std::vector<float> output_sentinel(row_elements, 91.25f);
+        auto grouped_routed = make_tensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+        auto grouped_shared = make_tensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+        auto grouped_combined = make_tensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            output_sentinel);
+
+        ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(gate->ensureOnDevice(device, stream));
+        ASSERT_TRUE(grouped_publication->ensureOnDevice(device, stream));
+        ASSERT_TRUE(grouped_routed->ensureOnDevice(device, stream));
+        ASSERT_TRUE(grouped_shared->ensureOnDevice(device, stream));
+        ASSERT_TRUE(grouped_combined->ensureOnDevice(device, stream));
+
+        if (capture)
+        {
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ScopedHipTestGraph graph(
+                /*device_ordinal=*/0,
+                stream,
+                "canonical MoE publication finalizer");
+            ASSERT_TRUE(gpu_kernel.finalizeCanonicalMoEPublication(
+                grouped_input.get(),
+                gate.get(),
+                grouped_publication.get(),
+                grouped_routed.get(),
+                grouped_shared.get(),
+                grouped_combined.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                device_effective_rows));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            ASSERT_TRUE(graph.launch());
+        }
+        else
+        {
+            ASSERT_TRUE(gpu_kernel.finalizeCanonicalMoEPublication(
+                grouped_input.get(),
+                gate.get(),
+                grouped_publication.get(),
+                grouped_routed.get(),
+                grouped_shared.get(),
+                grouped_combined.get(),
+                seq_len,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                device_effective_rows));
+        }
+        ++expected_finalize_calls;
+
+        const auto grouped_routed_host =
+            copyROCmFP32TensorToHost(grouped_routed.get(), stream);
+        const auto grouped_shared_host =
+            copyROCmFP32TensorToHost(grouped_shared.get(), stream);
+        const auto grouped_combined_host =
+            copyROCmFP32TensorToHost(grouped_combined.get(), stream);
+
+        std::vector<float> serial_routed(row_elements, 0.0f);
+        std::vector<float> serial_shared(row_elements, 0.0f);
+        std::vector<float> serial_combined(row_elements, 0.0f);
+        auto row_input = make_zero_tensor(
+            {1u, static_cast<size_t>(d_model)});
+        auto row_publication = make_zero_tensor(
+            {1u,
+             static_cast<size_t>(kTopK + kParticipantCount),
+             static_cast<size_t>(d_model)});
+        auto row_routed = make_zero_tensor(
+            {1u, static_cast<size_t>(d_model)});
+        auto row_shared = make_zero_tensor(
+            {1u, static_cast<size_t>(d_model)});
+        auto row_combined = make_zero_tensor(
+            {1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(row_input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(row_publication->ensureOnDevice(device, stream));
+        ASSERT_TRUE(row_routed->ensureOnDevice(device, stream));
+        ASSERT_TRUE(row_shared->ensureOnDevice(device, stream));
+        ASSERT_TRUE(row_combined->ensureOnDevice(device, stream));
+
+        for (int row = 0; row < effective_seq_len; ++row)
+        {
+            const auto serial_fixture =
+                extractCanonicalMoEPublicationRow(fixture, row);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    row_input->gpu_data_ptr(),
+                    serial_fixture.input.data(),
+                    serial_fixture.input.size() * sizeof(float),
+                    hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    row_publication->gpu_data_ptr(),
+                    serial_fixture.publication.data(),
+                    serial_fixture.publication.size() * sizeof(float),
+                    hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+            ASSERT_TRUE(gpu_kernel.finalizeCanonicalMoEPublication(
+                row_input.get(),
+                gate.get(),
+                row_publication.get(),
+                row_routed.get(),
+                row_shared.get(),
+                row_combined.get(),
+                /*seq_len=*/1,
+                kTopK,
+                d_model,
+                kParticipantCount,
+                /*device_effective_seq_len=*/nullptr));
+            ++expected_finalize_calls;
+
+            const size_t destination =
+                static_cast<size_t>(row) * d_model;
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    serial_routed.data() + destination,
+                    row_routed->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    serial_shared.data() + destination,
+                    row_shared->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    serial_combined.data() + destination,
+                    row_combined->gpu_data_ptr(),
+                    static_cast<size_t>(d_model) * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+
+        expectBitwiseVerifierRowsEqual(
+            "ROCm canonical routed rows vs serial M=1",
+            grouped_routed_host.data(),
+            serial_routed.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+        expectBitwiseVerifierRowsEqual(
+            "ROCm canonical gated shared rows vs serial M=1",
+            grouped_shared_host.data(),
+            serial_shared.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+        expectBitwiseVerifierRowsEqual(
+            "ROCm canonical combined rows vs serial M=1",
+            grouped_combined_host.data(),
+            serial_combined.data(),
+            row_elements,
+            static_cast<size_t>(d_model));
+    };
+
+    for (const int seq_len : kCanonicalMoEPublicationRows)
+    {
+        run_case(
+            seq_len,
+            /*d_model=*/2048,
+            /*effective_seq_len=*/seq_len,
+            /*capture=*/false);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    }
+
+    for (const int d_model : kCanonicalMoEPublicationWidths)
+    {
+        if (d_model == 2048)
+            continue;
+        for (const int seq_len : kCanonicalMoEPublicationGeometryRows)
+        {
+            run_case(
+                seq_len,
+                d_model,
+                /*effective_seq_len=*/seq_len,
+                /*capture=*/false);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        }
+    }
+
+    run_case(
+        /*seq_len=*/16,
+        /*d_model=*/2048,
+        /*effective_seq_len=*/11,
+        /*capture=*/true);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+    auto sum_counter = [](const std::vector<PerfStatRecord> &records)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+            total += record.value;
+        return total;
+    };
+    const auto publish_records = PerfStatsCollector::snapshot(
+        {"kernel.rocm_moe_shared_rank_bank_publish_calls"});
+    const auto finalize_records = PerfStatsCollector::snapshot(
+        {"kernel.rocm_moe_canonical_publication_finalize_calls"});
+    EXPECT_EQ(
+        sum_counter(publish_records),
+        static_cast<double>(expected_publish_calls));
+    EXPECT_EQ(
+        sum_counter(finalize_records),
+        static_cast<double>(expected_finalize_calls));
+    EXPECT_FALSE(publish_records.empty())
+        << "publisher PerfStats missing; production kernel was not exercised";
+    EXPECT_FALSE(finalize_records.empty())
+        << "finalizer PerfStats missing; production kernel was not exercised";
+
+    gpu_kernel.unbindWorkspace();
+    PerfStatsCollector::reset();
 }
 
 /**

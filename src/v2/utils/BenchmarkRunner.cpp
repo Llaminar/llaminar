@@ -1830,12 +1830,21 @@ namespace llaminar2
         }
         /*
          * Warmup and post-warmup setup are deliberately outside the measured
-         * benchmark loop.  Keep immutable setup evidence (the memory lifecycle
-         * and captured-graph kernel inventory), but reset MoE rebalance stats
-         * here so maintenance perfstats describe steady-state measured decode
-         * rather than graph capture, setup, or host post-warmup placement work.
+         * benchmark loop. Keep immutable setup evidence: the memory lifecycle,
+         * captured-graph kernel inventory, and collective graph-template bills
+         * of materials. TP stage constructors execute while graph families are
+         * materialized, so discarding their BOM records here would leave an
+         * optimized captured replay with no stage/payload attribution at all.
+         *
+         * Runtime collective and MoE rebalance domains are intentionally not
+         * preserved. They must describe only steady-state measured work rather
+         * than graph capture, setup, or post-warmup placement activity.
          */
-        PerfStatsCollector::resetPreservingDomains({"memory", "gpu_graph_inventory"});
+        PerfStatsCollector::resetPreservingDomains(
+            {"memory",
+             "gpu_graph_inventory",
+             "tp_allreduce_bom",
+             "tp_rooted_collective_bom"});
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 

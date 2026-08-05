@@ -524,7 +524,7 @@ namespace llaminar2::test
             buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = arena.fp32({rows, kTopK});
             buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = arena.fp32({rows, kDModel});
             buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
-                arena.fp32({rows, kTopK, kDModel});
+                arena.fp32({rows, kTopK + 2u, kDModel});
             buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({rows, kDModel});
             buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({rows, kIntermediate});
             buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({rows, kIntermediate});
@@ -1343,13 +1343,14 @@ namespace llaminar2::test
     }
 
     /**
-     * @brief Prove rooted LocalTP route publication has total verifier-M lowering.
+     * @brief Prove rooted LocalTP MoE publication has total verifier-M lowering.
      *
-     * Every participant must lower the same reduce/fold/broadcast sequence for
-     * every grouped verifier row count.  More importantly, the collective
-     * payload sizes and the root-only fold must scale from the graph's actual M;
-     * retaining an M=1 count in a reused verifier graph would silently publish
-     * stale rows even though the collective ordering itself remained valid.
+     * Every participant must lower the same publish/reduce/finalize/broadcast
+     * sequence for every grouped verifier row count. The rooted payload contains
+     * both router-ordered route slots and rank-addressed shared banks, while the
+     * root-only finalizer and compact output broadcast scale from the graph's
+     * actual M. Retaining an M=1 count in a reused verifier graph would silently
+     * publish stale rows even though collective ordering remained valid.
      *
      * M=1..16 covers serial decode and every currently supported speculative
      * depth.  M=31 is the same deeper sentinel used by the grouped-verifier
@@ -1365,16 +1366,28 @@ namespace llaminar2::test
 
         GraphConfig config0 = makeConfig(plan);
         config0.default_device = DeviceId::rocm(0);
+        config0.moe.has_shared_expert = true;
+        config0.moe.shared_intermediate_size = kIntermediate;
         config0.tp_ctx = &tp_ctx;
         config0.tp_device_idx = 0;
 
         GraphConfig config1 = makeConfig(plan);
         config1.default_device = DeviceId::rocm(1);
+        config1.moe.has_shared_expert = true;
+        config1.moe.shared_intermediate_size = kIntermediate;
         config1.tp_ctx = &tp_ctx;
         config1.tp_device_idx = 1;
 
         TensorArena weight_arena;
         auto layer = makeLayerWeights(weight_arena);
+        layer.shared_expert_gate =
+            weight_arena.fp32({kIntermediate, kDModel});
+        layer.shared_expert_up =
+            weight_arena.fp32({kIntermediate, kDModel});
+        layer.shared_expert_down =
+            weight_arena.fp32({kDModel, kIntermediate});
+        layer.shared_expert_gate_inp =
+            weight_arena.fp32({1, kDModel});
         auto model_ctx = makeTestingModelContextWithHotDomainExperts();
         ScopedDevicePublicationStream publication_stream0(DeviceId::rocm(0));
         ScopedDevicePublicationStream publication_stream1(DeviceId::rocm(1));
@@ -1413,75 +1426,147 @@ namespace llaminar2::test
                 << "Every participant must enter identical rooted collectives";
             EXPECT_EQ(
                 rooted_collectives0.front(),
-                "layer0_moe_canonical_routes_reduce_to_root");
+                "layer0_moe_canonical_publication_reduce_to_root");
             EXPECT_EQ(
                 rooted_collectives0.back(),
-                "layer0_moe_canonical_routes_broadcast");
+                "layer0_moe_canonical_publication_broadcast");
             EXPECT_TRUE(stageNamesOfType(graph0, ComputeStageType::ALLREDUCE).empty());
             EXPECT_TRUE(stageNamesOfType(graph1, ComputeStageType::ALLREDUCE).empty());
+            EXPECT_EQ(graph0.getNode("layer0_shared_expert_allreduce"), nullptr);
+            EXPECT_EQ(graph1.getNode("layer0_shared_expert_allreduce"), nullptr);
+            EXPECT_EQ(graph0.getNode("layer0_shared_expert_gate"), nullptr);
+            EXPECT_EQ(graph1.getNode("layer0_shared_expert_gate"), nullptr);
+            EXPECT_EQ(graph0.getNode("layer0_moe_combine"), nullptr);
+            EXPECT_EQ(graph1.getNode("layer0_moe_combine"), nullptr);
 
             const auto *rooted_reduce0 =
                 dynamic_cast<const TPLocalRootedCollectiveStage *>(
                     graph0.getNode(
-                              "layer0_moe_canonical_routes_reduce_to_root")
+                              "layer0_moe_canonical_publication_reduce_to_root")
                         ->stage.get());
             const auto *rooted_reduce1 =
                 dynamic_cast<const TPLocalRootedCollectiveStage *>(
                     graph1.getNode(
-                              "layer0_moe_canonical_routes_reduce_to_root")
+                              "layer0_moe_canonical_publication_reduce_to_root")
                         ->stage.get());
             const auto *broadcast0 =
                 dynamic_cast<const TPLocalRootedCollectiveStage *>(
                     graph0.getNode(
-                              "layer0_moe_canonical_routes_broadcast")
+                              "layer0_moe_canonical_publication_broadcast")
                         ->stage.get());
             const auto *broadcast1 =
                 dynamic_cast<const TPLocalRootedCollectiveStage *>(
                     graph1.getNode(
-                              "layer0_moe_canonical_routes_broadcast")
+                              "layer0_moe_canonical_publication_broadcast")
                         ->stage.get());
             ASSERT_NE(rooted_reduce0, nullptr);
             ASSERT_NE(rooted_reduce1, nullptr);
             ASSERT_NE(broadcast0, nullptr);
             ASSERT_NE(broadcast1, nullptr);
 
-            const size_t expected_route_elements =
-                static_cast<size_t>(m) * kTopK * kDModel;
+            const size_t expected_publication_elements =
+                static_cast<size_t>(m) * (kTopK + 2u) * kDModel;
             const size_t expected_output_elements =
                 static_cast<size_t>(m) * kDModel;
-            EXPECT_EQ(rooted_reduce0->params().count, expected_route_elements);
-            EXPECT_EQ(rooted_reduce1->params().count, expected_route_elements);
+            EXPECT_EQ(
+                rooted_reduce0->params().count,
+                expected_publication_elements);
+            EXPECT_EQ(
+                rooted_reduce1->params().count,
+                expected_publication_elements);
             EXPECT_EQ(broadcast0->params().count, expected_output_elements);
             EXPECT_EQ(broadcast1->params().count, expected_output_elements);
+            EXPECT_EQ(
+                broadcast0->params().tensor,
+                buffers0.attn_proj);
+            EXPECT_EQ(
+                broadcast1->params().tensor,
+                buffers1.attn_proj);
             EXPECT_EQ(rooted_reduce0->params().root_device_index, 0);
             EXPECT_EQ(rooted_reduce1->params().root_device_index, 0);
             EXPECT_EQ(broadcast0->params().root_device_index, 0);
             EXPECT_EQ(broadcast1->params().root_device_index, 0);
 
-            const auto *reducer0 =
-                dynamic_cast<const MoECanonicalRouteReduceStage *>(
-                    graph0.getNode("layer0_moe_canonical_routes_reduce")
+            const auto *publisher0 =
+                dynamic_cast<const MoESharedExpertRankBankPublishStage *>(
+                    graph0.getNode("layer0_moe_shared_rank_bank_publish")
                         ->stage.get());
-            const auto *reducer1 =
-                dynamic_cast<const MoECanonicalRouteReduceStage *>(
-                    graph1.getNode("layer0_moe_canonical_routes_reduce")
+            const auto *publisher1 =
+                dynamic_cast<const MoESharedExpertRankBankPublishStage *>(
+                    graph1.getNode("layer0_moe_shared_rank_bank_publish")
                         ->stage.get());
-            ASSERT_NE(reducer0, nullptr);
-            ASSERT_NE(reducer1, nullptr);
-            EXPECT_EQ(reducer0->params().seq_len, m);
-            EXPECT_EQ(reducer1->params().seq_len, m);
-            EXPECT_EQ(reducer0->params().participant_device_index, 0);
-            EXPECT_EQ(reducer1->params().participant_device_index, 1);
-            EXPECT_EQ(reducer0->params().root_device_index, 0);
-            EXPECT_EQ(reducer1->params().root_device_index, 0);
-            EXPECT_FALSE(reducer0->bufferContract().empty())
-                << "The root graph owns the router-order arithmetic buffers";
-            EXPECT_TRUE(reducer1->bufferContract().empty())
-                << "The non-root graph must not claim root-only arithmetic buffers";
-            EXPECT_EQ(reducer0->coherencePolicy(), CoherencePolicy::FULL);
-            EXPECT_EQ(reducer1->coherencePolicy(), CoherencePolicy::NONE);
-            EXPECT_GT(reducer0->estimatedFlops(), 0u);
-            EXPECT_EQ(reducer1->estimatedFlops(), 0u);
+            ASSERT_NE(publisher0, nullptr);
+            ASSERT_NE(publisher1, nullptr);
+            EXPECT_EQ(publisher0->params().seq_len, m);
+            EXPECT_EQ(publisher1->params().seq_len, m);
+            EXPECT_EQ(publisher0->params().participant_device_index, 0);
+            EXPECT_EQ(publisher1->params().participant_device_index, 1);
+            EXPECT_EQ(publisher0->params().participant_count, 2);
+            EXPECT_EQ(publisher1->params().participant_count, 2);
+            EXPECT_TRUE(hasDependency(
+                graph0,
+                "layer0_moe_shared_rank_bank_publish",
+                "layer0_shared_expert_ffn"));
+            EXPECT_TRUE(hasDependency(
+                graph0,
+                "layer0_moe_shared_rank_bank_publish",
+                "layer0_moe_expert_ffn_overlay_fast"));
+            EXPECT_TRUE(hasDependency(
+                graph0,
+                "layer0_moe_canonical_publication_reduce_to_root",
+                "layer0_moe_shared_rank_bank_publish"));
+
+            const auto *finalizer0 =
+                dynamic_cast<const MoECanonicalPublicationFinalizeStage *>(
+                    graph0.getNode(
+                              "layer0_moe_canonical_publication_finalize")
+                        ->stage.get());
+            const auto *finalizer1 =
+                dynamic_cast<const MoECanonicalPublicationFinalizeStage *>(
+                    graph1.getNode(
+                              "layer0_moe_canonical_publication_finalize")
+                        ->stage.get());
+            ASSERT_NE(finalizer0, nullptr);
+            ASSERT_NE(finalizer1, nullptr);
+            EXPECT_EQ(finalizer0->params().seq_len, m);
+            EXPECT_EQ(finalizer1->params().seq_len, m);
+            EXPECT_EQ(finalizer0->params().participant_device_index, 0);
+            EXPECT_EQ(finalizer1->params().participant_device_index, 1);
+            EXPECT_EQ(finalizer0->params().root_device_index, 0);
+            EXPECT_EQ(finalizer1->params().root_device_index, 0);
+            EXPECT_EQ(finalizer0->params().participant_count, 2);
+            EXPECT_EQ(finalizer1->params().participant_count, 2);
+            EXPECT_FALSE(finalizer0->bufferContract().empty())
+                << "The root graph owns the complete fixed-order epilogue";
+            EXPECT_TRUE(finalizer1->bufferContract().empty())
+                << "The non-root graph must not claim root-only output bytes";
+            EXPECT_EQ(finalizer0->coherencePolicy(), CoherencePolicy::FULL);
+            EXPECT_EQ(finalizer1->coherencePolicy(), CoherencePolicy::NONE);
+            EXPECT_GT(finalizer0->estimatedFlops(), 0u);
+            EXPECT_EQ(finalizer1->estimatedFlops(), 0u);
+            EXPECT_TRUE(hasDependency(
+                graph0,
+                "layer0_moe_canonical_publication_finalize",
+                "layer0_moe_canonical_publication_reduce_to_root"));
+            EXPECT_TRUE(hasDependency(
+                graph0,
+                "layer0_moe_canonical_publication_broadcast",
+                "layer0_moe_canonical_publication_finalize"));
+            EXPECT_EQ(
+                countStagesOfType(
+                    graph0,
+                    ComputeStageType::MOE_SHARED_RANK_BANK_PUBLISH),
+                1u);
+            EXPECT_EQ(
+                countStagesOfType(
+                    graph0,
+                    ComputeStageType::MOE_CANONICAL_PUBLICATION_FINALIZE),
+                1u);
+            EXPECT_EQ(
+                countStagesOfType(
+                    graph0,
+                    ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE),
+                0u);
 
             const auto *expert_stage0 =
                 expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");

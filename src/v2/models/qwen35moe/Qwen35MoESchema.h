@@ -112,11 +112,14 @@ namespace llaminar2
 
             /*
              * LocalTP must retain every router slot until after the participant
-             * collective. This buffer deliberately has a separate lifetime
-             * group because it coexists with the reduced routed output.
+             * collective. Canonical GPU publication extends that slot bank with
+             * one shared-expert row bank per participant; the resolver leaves the
+             * extra count at zero for topologies that publish branches
+             * independently. This buffer deliberately has a separate lifetime
+             * group because it coexists with the compact final outputs.
              */
             schema.layer_buffers.push_back(
-                {"moe_canonical_route_contributions", {"moe_activation_rows", "moe_top_k", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_canonical_route_scratch", 10, "Ownership-invariant routed expert contributions in original top-k order"});
+                {"moe_canonical_route_contributions", {"moe_activation_rows", "moe_canonical_publication_slots", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_canonical_route_scratch", 10, "Original top-k route slots followed by rank-addressed shared-expert publication banks"});
 
             // Shared expert output
             schema.layer_buffers.push_back(

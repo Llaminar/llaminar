@@ -295,6 +295,8 @@ namespace llaminar2
         MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
         MOE_CANONICAL_ROUTE_REDUCE, ///< Router-ordered LocalTP contribution reduction
+        MOE_SHARED_RANK_BANK_PUBLISH, ///< Publish one shared partial into its canonical participant bank
+        MOE_CANONICAL_PUBLICATION_FINALIZE, ///< Root-only fixed-order routed/shared finalizer
         MOE_EXPERT_DISPATCH,        ///< Routed-row dispatch descriptor builder
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
@@ -526,9 +528,17 @@ namespace llaminar2
         /**
          * @brief Publish a tensor written by work enqueued through this token.
          *
-         * TransferEngine records the completion event on nativeStream(). No
-         * device or stream argument is accepted here, so a stage cannot publish
-         * the write against a different execution context by accident.
+         * During eager execution, TransferEngine records the completion event
+         * on nativeStream() and makes the producer device authoritative. During
+         * graph capture, recording is not execution: publication validates and
+         * records the internal producer edge in the capture dependency ledger,
+         * while the graph-launch boundary publishes live tensor authority after
+         * replay. Callers must therefore treat successful return as the complete
+         * publication contract and must never inspect or mutate raw tensor
+         * coherence afterward.
+         *
+         * No device or stream argument is accepted here, so a stage cannot
+         * publish the write against a different execution context by accident.
          *
          * @throws std::invalid_argument for a null tensor.
          * @throws std::runtime_error if completion-event publication fails.

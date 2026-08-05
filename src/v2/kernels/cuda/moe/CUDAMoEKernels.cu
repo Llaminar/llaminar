@@ -36,6 +36,15 @@ namespace
         llaminar2::DeviceMoELLEPLayerPlanScratch;
 
     constexpr int kThreads = 256;
+    /**
+     * Number of scalar output columns owned by one canonical finalizer block.
+     *
+     * MTP verifier groups are deliberately short, so one block per token leaves
+     * most GPU SMs idle at production hidden widths. A 256-column tile turns
+     * Qwen3.6's 2,048-column row into eight independent output blocks while
+     * retaining the same 256-thread gate-dot reduction in every block.
+     */
+    constexpr int kCanonicalMoEOutputTileColumns = 256;
     constexpr int kMaxExperts = 1024;
     constexpr int kDeviceMoEMaxExperts = 256;
     constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
@@ -11875,33 +11884,43 @@ namespace
         const size_t row_offset = static_cast<size_t>(token) * d_model;
         if (token >= effective_seq_len)
         {
-            float4 *out4 = reinterpret_cast<float4 *>(shared_output + row_offset);
-            const int n4 = d_model >> 2;
-            for (int i = threadIdx.x; i < n4; i += blockDim.x)
-                out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
-                shared_output[row_offset + i] = 0.0f;
+            if ((d_model & 3) == 0)
+            {
+                float4 *out4 =
+                    reinterpret_cast<float4 *>(shared_output + row_offset);
+                const int n4 = d_model >> 2;
+                for (int i = threadIdx.x; i < n4; i += blockDim.x)
+                    out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            else
+            {
+                for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                    shared_output[row_offset + i] = 0.0f;
+            }
             return;
         }
 
         __shared__ float partial[kThreads];
         const float *x = input + row_offset;
 
-        // d_model is always a multiple of 32 (enforced upstream), so it is also a
-        // multiple of 4 → we can process the row as float4 to cut the load/store
-        // instruction count 4× (the original scalar stride loop was MIO-bound at 65%
-        // memory throughput). Both rows start at token*d_model*4 bytes, which is
-        // 16-byte aligned for d_model multiple of 4.
-        const int n4 = d_model >> 2;
-        const float4 *x4 = reinterpret_cast<const float4 *>(x);
-        const float4 *g4 = reinterpret_cast<const float4 *>(gate_inp);
-
         float dot = 0.0f;
-        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        if ((d_model & 3) == 0)
         {
-            const float4 a = x4[i];
-            const float4 b = g4[i];
-            dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const int n4 = d_model >> 2;
+            const float4 *x4 = reinterpret_cast<const float4 *>(x);
+            const float4 *g4 =
+                reinterpret_cast<const float4 *>(gate_inp);
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                const float4 a = x4[i];
+                const float4 b = g4[i];
+                dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+        else
+        {
+            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                dot += x[i] * gate_inp[i];
         }
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -11913,18 +11932,26 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        float4 *out4 = reinterpret_cast<float4 *>(shared_output + row_offset);
-        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        if ((d_model & 3) == 0)
         {
-            float4 v = out4[i];
-            v.x *= gate;
-            v.y *= gate;
-            v.z *= gate;
-            v.w *= gate;
-            out4[i] = v;
+            const int n4 = d_model >> 2;
+            float4 *out4 =
+                reinterpret_cast<float4 *>(shared_output + row_offset);
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                float4 v = out4[i];
+                v.x *= gate;
+                v.y *= gate;
+                v.z *= gate;
+                v.w *= gate;
+                out4[i] = v;
+            }
         }
-        for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
-            shared_output[row_offset + i] *= gate;
+        else
+        {
+            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                shared_output[row_offset + i] *= gate;
+        }
     }
 
     __global__ void shared_expert_gate_add_kernel(
@@ -11945,36 +11972,50 @@ namespace
         const int effective_seq_len = clamp_effective_seq_len(seq_len, device_effective_seq_len);
         if (token >= effective_seq_len)
         {
-            float4 *shared4 = reinterpret_cast<float4 *>(shared_output + row_offset);
-            float4 *out4 = reinterpret_cast<float4 *>(combined_output + row_offset);
-            const int n4 = d_model >> 2;
-            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            if ((d_model & 3) == 0)
             {
-                shared4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                float4 *shared4 =
+                    reinterpret_cast<float4 *>(shared_output + row_offset);
+                float4 *out4 =
+                    reinterpret_cast<float4 *>(combined_output + row_offset);
+                const int n4 = d_model >> 2;
+                for (int i = threadIdx.x; i < n4; i += blockDim.x)
+                {
+                    shared4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
             }
-            for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
+            else
             {
-                shared_output[row_offset + i] = 0.0f;
-                combined_output[row_offset + i] = 0.0f;
+                for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                {
+                    shared_output[row_offset + i] = 0.0f;
+                    combined_output[row_offset + i] = 0.0f;
+                }
             }
             return;
         }
         const float *x = input + row_offset;
 
-        const int n4 = d_model >> 2;
-        const float4 *x4 = reinterpret_cast<const float4 *>(x);
-        const float4 *g4 = reinterpret_cast<const float4 *>(gate_inp);
-
         float dot = 0.0f;
-        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        if ((d_model & 3) == 0)
         {
-            const float4 a = x4[i];
-            const float4 b = g4[i];
-            dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const int n4 = d_model >> 2;
+            const float4 *x4 = reinterpret_cast<const float4 *>(x);
+            const float4 *g4 =
+                reinterpret_cast<const float4 *>(gate_inp);
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                const float4 a = x4[i];
+                const float4 b = g4[i];
+                dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
         }
-        for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
-            dot += x[i] * gate_inp[i];
+        else
+        {
+            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                dot += x[i] * gate_inp[i];
+        }
 
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -11986,26 +12027,39 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        float4 *shared4 = reinterpret_cast<float4 *>(shared_output + row_offset);
-        const float4 *residual4 = reinterpret_cast<const float4 *>(routed_residual + row_offset);
-        float4 *out4 = reinterpret_cast<float4 *>(combined_output + row_offset);
-        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        if ((d_model & 3) == 0)
         {
-            const float4 s = shared4[i];
-            const float4 r = residual4[i];
-            const float4 gated = make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
-            shared4[i] = gated;
-            out4[i] = make_float4(
-                r.x + gated.x,
-                r.y + gated.y,
-                r.z + gated.z,
-                r.w + gated.w);
+            const int n4 = d_model >> 2;
+            float4 *shared4 =
+                reinterpret_cast<float4 *>(shared_output + row_offset);
+            const float4 *residual4 =
+                reinterpret_cast<const float4 *>(
+                    routed_residual + row_offset);
+            float4 *out4 =
+                reinterpret_cast<float4 *>(combined_output + row_offset);
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                const float4 s = shared4[i];
+                const float4 r = residual4[i];
+                const float4 gated = make_float4(
+                    gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+                shared4[i] = gated;
+                out4[i] = make_float4(
+                    r.x + gated.x,
+                    r.y + gated.y,
+                    r.z + gated.z,
+                    r.w + gated.w);
+            }
         }
-        for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
+        else
         {
-            const float gated = gate * shared_output[row_offset + i];
-            shared_output[row_offset + i] = gated;
-            combined_output[row_offset + i] = routed_residual[row_offset + i] + gated;
+            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            {
+                const float gated = gate * shared_output[row_offset + i];
+                shared_output[row_offset + i] = gated;
+                combined_output[row_offset + i] =
+                    routed_residual[row_offset + i] + gated;
+            }
         }
     }
 
@@ -16460,6 +16514,310 @@ namespace
             static_cast<size_t>(n)] = sum;
     }
 
+    /**
+     * @brief Publish one shared partial into a rank-addressed canonical bank.
+     *
+     * Every launch overwrites the complete participant-bank suffix. A bank row
+     * owned by this participant copies the local shared FFN output; all peer
+     * banks and padded rows receive exact zero. Route slots precede the suffix
+     * and are intentionally untouched because the routed expert kernel owns them.
+     */
+    __global__ void publish_shared_expert_rank_bank_kernel(
+        const float *__restrict__ shared_output,
+        float *__restrict__ canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *__restrict__ device_effective_seq_len)
+    {
+        const int bank_row = blockIdx.y;
+        const int participant = bank_row / seq_len;
+        const int token = bank_row - participant * seq_len;
+        if (participant >= participant_count || token >= seq_len)
+            return;
+
+        const int effective_seq_len =
+            clamp_effective_seq_len(seq_len, device_effective_seq_len);
+        const bool copy_local =
+            participant == participant_index && token < effective_seq_len;
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t route_elements =
+            row_elements * static_cast<size_t>(top_k);
+        const size_t source_offset =
+            static_cast<size_t>(token) * static_cast<size_t>(d_model);
+        const size_t destination_offset =
+            route_elements +
+            static_cast<size_t>(participant) * row_elements + source_offset;
+
+        if ((d_model & 3) == 0)
+        {
+            const int n4 = d_model >> 2;
+            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 *source4 =
+                reinterpret_cast<const float4 *>(shared_output + source_offset);
+            float4 *destination4 =
+                reinterpret_cast<float4 *>(
+                    canonical_publication + destination_offset);
+            for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+                 index < n4;
+                 index += gridDim.x * blockDim.x)
+            {
+                destination4[index] = copy_local ? source4[index] : zero;
+            }
+            return;
+        }
+
+        /*
+         * A ragged row gives every token after row zero a potentially
+         * non-16-byte-aligned base. Reinterpreting that base as float4 is not
+         * a legal vector access, so width totality requires a scalar row path.
+         */
+        for (int column = blockIdx.x * blockDim.x + threadIdx.x;
+             column < d_model;
+             column += gridDim.x * blockDim.x)
+        {
+            canonical_publication[destination_offset + column] =
+                copy_local ? shared_output[source_offset + column] : 0.0f;
+        }
+    }
+
+    /**
+     * @brief Fold routed slots and shared rank banks into one final MoE row.
+     *
+     * The thread geometry and gate-dot reduction are deliberately identical to
+     * shared_expert_gate_add_kernel. The two-dimensional launch assigns one
+     * block to each token/output-column tile. Every tile recomputes the same
+     * fixed-order gate value, so no inter-block publication or second kernel is
+     * required and every tile observes a bit-identical gate. Each output column
+     * then walks router slots and participant banks in canonical increasing
+     * order. Explicit FP32 round-to-nearest intrinsics preserve the global-memory
+     * rounding boundaries of the former multi-kernel pipeline while avoiding
+     * its extra launches.
+     */
+    __global__ void finalize_canonical_moe_publication_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ gate_inp,
+        const float *__restrict__ canonical_publication,
+        float *__restrict__ routed_output,
+        float *__restrict__ shared_output,
+        float *__restrict__ combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *__restrict__ device_effective_seq_len)
+    {
+        const int output_tile = static_cast<int>(blockIdx.x);
+        const int token = static_cast<int>(blockIdx.y);
+        const int first_column =
+            output_tile * kCanonicalMoEOutputTileColumns;
+        const int unbounded_last_column =
+            first_column + kCanonicalMoEOutputTileColumns;
+        const int last_column =
+            unbounded_last_column < d_model
+                ? unbounded_last_column
+                : d_model;
+        if (token >= seq_len || first_column >= d_model)
+            return;
+
+        __shared__ float partial[kThreads];
+        const size_t row_offset =
+            static_cast<size_t>(token) * static_cast<size_t>(d_model);
+        const int effective_seq_len =
+            clamp_effective_seq_len(seq_len, device_effective_seq_len);
+        if (token >= effective_seq_len)
+        {
+            if ((d_model & 3) == 0)
+            {
+                const int first4 = first_column >> 2;
+                const int last4 = last_column >> 2;
+                const float4 zero =
+                    make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                float4 *routed4 =
+                    reinterpret_cast<float4 *>(routed_output + row_offset);
+                float4 *shared4 =
+                    reinterpret_cast<float4 *>(shared_output + row_offset);
+                float4 *combined4 =
+                    reinterpret_cast<float4 *>(combined_output + row_offset);
+                for (int index = first4 + threadIdx.x;
+                     index < last4;
+                     index += blockDim.x)
+                {
+                    routed4[index] = zero;
+                    shared4[index] = zero;
+                    combined4[index] = zero;
+                }
+            }
+            else
+            {
+                for (int column = first_column + threadIdx.x;
+                     column < last_column;
+                     column += blockDim.x)
+                {
+                    routed_output[row_offset + column] = 0.0f;
+                    shared_output[row_offset + column] = 0.0f;
+                    combined_output[row_offset + column] = 0.0f;
+                }
+            }
+            return;
+        }
+
+        float dot = 0.0f;
+        if ((d_model & 3) == 0)
+        {
+            const int n4 = d_model >> 2;
+            const float4 *input4 =
+                reinterpret_cast<const float4 *>(input + row_offset);
+            const float4 *gate4 =
+                reinterpret_cast<const float4 *>(gate_inp);
+            for (int index = threadIdx.x;
+                 index < n4;
+                 index += blockDim.x)
+            {
+                const float4 x = input4[index];
+                const float4 g = gate4[index];
+                dot += x.x * g.x + x.y * g.y + x.z * g.z + x.w * g.w;
+            }
+        }
+        else
+        {
+            for (int column = threadIdx.x;
+                 column < d_model;
+                 column += blockDim.x)
+            {
+                dot += input[row_offset + column] * gate_inp[column];
+            }
+        }
+        partial[threadIdx.x] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float gate = 1.0f / (1.0f + expf(-partial[0]));
+
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t route_elements =
+            row_elements * static_cast<size_t>(top_k);
+        const float *rank_banks = canonical_publication + route_elements;
+        if ((d_model & 3) == 0)
+        {
+            const int first4 = first_column >> 2;
+            const int last4 = last_column >> 2;
+            float4 *routed4 =
+                reinterpret_cast<float4 *>(routed_output + row_offset);
+            float4 *shared4 =
+                reinterpret_cast<float4 *>(shared_output + row_offset);
+            float4 *combined4 =
+                reinterpret_cast<float4 *>(combined_output + row_offset);
+
+            for (int index = first4 + threadIdx.x;
+                 index < last4;
+                 index += blockDim.x)
+            {
+                float4 routed = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 1
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const size_t route_row =
+                        (static_cast<size_t>(token) *
+                             static_cast<size_t>(top_k) +
+                         static_cast<size_t>(route)) *
+                        static_cast<size_t>(d_model);
+                    const float4 contribution =
+                        reinterpret_cast<const float4 *>(
+                            canonical_publication + route_row)[index];
+                    routed.x =
+                        moe_accumulate_rn(routed.x, contribution.x);
+                    routed.y =
+                        moe_accumulate_rn(routed.y, contribution.y);
+                    routed.z =
+                        moe_accumulate_rn(routed.z, contribution.z);
+                    routed.w =
+                        moe_accumulate_rn(routed.w, contribution.w);
+                }
+
+                float4 shared = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 1
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    const size_t bank_row =
+                        static_cast<size_t>(participant) * row_elements +
+                        row_offset;
+                    const float4 contribution =
+                        reinterpret_cast<const float4 *>(
+                            rank_banks + bank_row)[index];
+                    shared.x =
+                        moe_accumulate_rn(shared.x, contribution.x);
+                    shared.y =
+                        moe_accumulate_rn(shared.y, contribution.y);
+                    shared.z =
+                        moe_accumulate_rn(shared.z, contribution.z);
+                    shared.w =
+                        moe_accumulate_rn(shared.w, contribution.w);
+                }
+
+                const float4 gated = make_float4(
+                    __fmul_rn(gate, shared.x),
+                    __fmul_rn(gate, shared.y),
+                    __fmul_rn(gate, shared.z),
+                    __fmul_rn(gate, shared.w));
+                routed4[index] = routed;
+                shared4[index] = gated;
+                combined4[index] = make_float4(
+                    __fadd_rn(routed.x, gated.x),
+                    __fadd_rn(routed.y, gated.y),
+                    __fadd_rn(routed.z, gated.z),
+                    __fadd_rn(routed.w, gated.w));
+            }
+            return;
+        }
+
+        for (int column = first_column + threadIdx.x;
+             column < last_column;
+             column += blockDim.x)
+        {
+            float routed = 0.0f;
+#pragma unroll 1
+            for (int route = 0; route < top_k; ++route)
+            {
+                const size_t route_index =
+                    (static_cast<size_t>(token) *
+                         static_cast<size_t>(top_k) +
+                     static_cast<size_t>(route)) *
+                        static_cast<size_t>(d_model) +
+                    static_cast<size_t>(column);
+                routed = moe_accumulate_rn(
+                    routed, canonical_publication[route_index]);
+            }
+            float shared = 0.0f;
+#pragma unroll 1
+            for (int participant = 0;
+                 participant < participant_count;
+                 ++participant)
+            {
+                const size_t shared_index =
+                    static_cast<size_t>(participant) * row_elements +
+                    row_offset + static_cast<size_t>(column);
+                shared = moe_accumulate_rn(shared, rank_banks[shared_index]);
+            }
+            const size_t output_index =
+                row_offset + static_cast<size_t>(column);
+            const float gated = __fmul_rn(gate, shared);
+            routed_output[output_index] = routed;
+            shared_output[output_index] = gated;
+            combined_output[output_index] = __fadd_rn(routed, gated);
+        }
+    }
+
     template <uint8_t CodebookId>
     __global__ void grouped_native_vnni_gate_up_kpart_decode_runtime_kernel(
         const int8_t *__restrict__ A_int8,
@@ -19537,5 +19895,95 @@ extern "C"
             grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             d_route_contributions, d_output, seq_len, top_k, d_model);
         return finishLaunch("cudaMoE_reduce_canonical_route_contributions");
+    }
+
+    bool cudaMoE_publish_shared_expert_rank_bank(
+        const float *d_shared_output,
+        float *d_canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_shared_output || !d_canonical_publication || !stream ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0 || participant_index < 0 ||
+            participant_index >= participant_count)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int kThreadsPerBlock = 256;
+        const int vector_columns = (d_model + 3) / 4;
+        dim3 grid(
+            std::max(1, (vector_columns + kThreadsPerBlock - 1) /
+                            kThreadsPerBlock),
+            seq_len * participant_count);
+        publish_shared_expert_rank_bank_kernel<<<
+            grid,
+            kThreadsPerBlock,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            d_shared_output,
+            d_canonical_publication,
+            seq_len,
+            top_k,
+            d_model,
+            participant_index,
+            participant_count,
+            d_effective_seq_len);
+        return finishLaunch("cudaMoE_publish_shared_expert_rank_bank");
+    }
+
+    bool cudaMoE_finalize_canonical_publication(
+        const float *d_input,
+        const float *d_gate_inp,
+        const float *d_canonical_publication,
+        float *d_routed_output,
+        float *d_shared_output,
+        float *d_combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_input || !d_gate_inp || !d_canonical_publication ||
+            !d_routed_output || !d_shared_output || !d_combined_output ||
+            !stream || seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        const dim3 grid(
+            (d_model + kCanonicalMoEOutputTileColumns - 1) /
+                kCanonicalMoEOutputTileColumns,
+            seq_len);
+        finalize_canonical_moe_publication_kernel<<<
+            grid,
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            d_input,
+            d_gate_inp,
+            d_canonical_publication,
+            d_routed_output,
+            d_shared_output,
+            d_combined_output,
+            seq_len,
+            top_k,
+            d_model,
+            participant_count,
+            d_effective_seq_len);
+        return finishLaunch("cudaMoE_finalize_canonical_publication");
     }
 }

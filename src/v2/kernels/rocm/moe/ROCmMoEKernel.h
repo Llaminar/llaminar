@@ -350,6 +350,29 @@ namespace llaminar2
             int top_k,
             int d_model) override;
 
+        bool publishSharedExpertRankBank(
+            ITensor *shared_output,
+            ITensor *canonical_publication,
+            int seq_len,
+            int top_k,
+            int d_model,
+            int participant_index,
+            int participant_count,
+            const int *device_effective_seq_len = nullptr) override;
+
+        bool finalizeCanonicalMoEPublication(
+            ITensor *input,
+            ITensor *gate_inp,
+            ITensor *canonical_publication,
+            ITensor *routed_output,
+            ITensor *shared_output,
+            ITensor *combined_output,
+            int seq_len,
+            int top_k,
+            int d_model,
+            int participant_count,
+            const int *device_effective_seq_len = nullptr) override;
+
         bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
             ITensor *const *up_tensors,
