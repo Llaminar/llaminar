@@ -26,10 +26,11 @@ namespace llaminar2
     /**
      * @brief Device-owned execution policy for one transaction fragment.
      *
-     * Conditional fragments are still part of the one native parent graph.
-     * The policy controls whether their body executes on a particular loop
-     * iteration; it never authorizes host inspection, segmented replay, or a
-     * second launch path.
+     * CUDA lowers conditional fragments into one native parent graph. HIP
+     * retains the same typed branch description and submits a conditional tail
+     * only when its authenticated device-published ticket says it is due. The
+     * policy never authorizes host inspection of the predicate word itself,
+     * mutable inference state, or an eager kernel path.
      */
     enum class DeviceControlledLoopFragmentExecution
     {
@@ -281,6 +282,30 @@ namespace llaminar2
         /// Launch (replay) the instantiated graph executable on the associated stream.
         /// @return true on success
         virtual bool launch() = 0;
+
+        /**
+         * @brief Launch this executable on an explicit scheduler-owned stream.
+         *
+         * A captured graph does not retain the stream on which it was captured
+         * as an execution dependency. Host-scheduled HIP transaction graphs
+         * therefore replay retained child executables on one persistent stream,
+         * making producer-to-consumer order a visible stream property without
+         * host synchronization or per-fragment events. Implementations must
+         * reject null/default streams and preserve the graph owner's device.
+         *
+         * The operation is logically const: replay changes device execution
+         * state but never graph topology, executable identity, or ownership.
+         * The default hard failure keeps test doubles and non-GPU backends
+         * source-compatible while making support explicit in real backends.
+         *
+         * @param stream Exact non-null stream that will own this replay.
+         * @return true only when the executable was submitted successfully.
+         */
+        [[nodiscard]] virtual bool launchOnStream(void *stream) const
+        {
+            (void)stream;
+            return false;
+        }
 
         /**
          * @brief Report whether this graph owner supports a device-controlled WHILE node.

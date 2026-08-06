@@ -2288,10 +2288,40 @@ namespace llaminar2
 
     void CUDAMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_rows_ = 0;
-        router_q8_hidden_valid_ = false;
-        router_q8_hidden_capture_recorded_ = false;
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::ProducerAndConsumer &&
+            router_q8_hidden_publication_)
+        {
+            router_q8_hidden_publication_->clearPayload();
+        }
+    }
+
+    bool CUDAMoEKernel::bindRouterQ8HiddenPublication(
+        std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+        MoERouterQ8PublicationAccess access)
+    {
+        if (!publication)
+        {
+            LOG_ERROR("[CUDAMoEKernel::bindRouterQ8HiddenPublication] null publication");
+            return false;
+        }
+        if (publication->device_ordinal >= 0 &&
+            (publication->backend != DeviceType::CUDA ||
+             publication->device_ordinal != device_ordinal_))
+        {
+            LOG_ERROR("[CUDAMoEKernel::bindRouterQ8HiddenPublication] device mismatch"
+                      << " publication_backend="
+                      << static_cast<int>(publication->backend)
+                      << " publication_ordinal=" << publication->device_ordinal
+                      << " kernel_ordinal=" << device_ordinal_);
+            return false;
+        }
+
+        publication->backend = DeviceType::CUDA;
+        publication->device_ordinal = device_ordinal_;
+        router_q8_hidden_publication_ = std::move(publication);
+        router_q8_publication_access_ = access;
+        return true;
     }
 
     void CUDAMoEKernel::publishRouterQ8Hidden(
@@ -2299,6 +2329,13 @@ namespace llaminar2
         int rows,
         bool recorded_during_capture) noexcept
     {
+        if (router_q8_publication_access_ !=
+                MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishRouterQ8Hidden] consumer-only kernel attempted publication");
+            return;
+        }
         if (!source || rows <= 0 || rows > decode_hidden_rows_cap_ ||
             !d_decode_hidden_int8_ || !d_decode_hidden_scales_)
         {
@@ -2306,10 +2343,17 @@ namespace llaminar2
             return;
         }
 
-        router_q8_hidden_source_ = source;
-        router_q8_hidden_rows_ = rows;
-        router_q8_hidden_valid_ = true;
-        router_q8_hidden_capture_recorded_ = recorded_during_capture;
+        auto &publication = *router_q8_hidden_publication_;
+        publication.backend = DeviceType::CUDA;
+        publication.device_ordinal = device_ordinal_;
+        publication.source_rows = source;
+        publication.quantized_rows = d_decode_hidden_int8_;
+        publication.row_scales = d_decode_hidden_scales_;
+        publication.published_rows = rows;
+        publication.d_model_capacity = decode_gateup_d_model_cap_;
+        publication.blocks_per_row_capacity =
+            (decode_gateup_d_model_cap_ + 31) / 32;
+        publication.capture_recorded = recorded_during_capture;
     }
 
     bool CUDAMoEKernel::canReuseRouterQ8Hidden(
@@ -2327,17 +2371,22 @@ namespace llaminar2
     {
         if (!debugEnv().gemm.cuda_moe_reuse_router_q8_hidden)
             return "disabled";
-        if (!router_q8_hidden_valid_)
+        if (!router_q8_hidden_publication_)
             return "not_published";
-        if (router_q8_hidden_source_ != source)
+        const auto &publication = *router_q8_hidden_publication_;
+        if (!publication.quantized_rows || !publication.row_scales)
+            return "not_published";
+        if (publication.backend != DeviceType::CUDA ||
+            publication.device_ordinal != device_ordinal_)
+            return "device_mismatch";
+        if (publication.source_rows != source)
             return "source_changed";
-        if (rows <= 0 || router_q8_hidden_rows_ < rows)
+        if (rows <= 0 || publication.published_rows < rows)
             return "insufficient_rows";
-        if (d_model <= 0 || decode_gateup_d_model_cap_ < d_model)
+        if (d_model <= 0 || publication.d_model_capacity < d_model ||
+            publication.blocks_per_row_capacity < ((d_model + 31) / 32))
             return "insufficient_d_model_capacity";
-        if (!d_decode_hidden_int8_ || !d_decode_hidden_scales_)
-            return "scratch_unbound";
-        if (router_q8_hidden_capture_recorded_ &&
+        if (publication.capture_recorded &&
             !isCudaMoEDecodeCaptureActive(getStream()))
         {
             return "capture_provenance";
@@ -6473,6 +6522,17 @@ namespace llaminar2
         const bool reuse_router_q8_hidden =
             active_expert_slots > 0 &&
             router_q8_reuse_block_reason == nullptr;
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::RequiredConsumer &&
+            !reuse_router_q8_hidden)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] required "
+                      "router Q8 publication is unavailable: "
+                      << (router_q8_reuse_block_reason
+                              ? router_q8_reuse_block_reason
+                              : "no_active_experts"));
+            return false;
+        }
         if (!reuse_router_q8_hidden)
         {
             PerfStatsCollector::addCounter(
@@ -6533,8 +6593,12 @@ namespace llaminar2
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
-            reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
-            reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->quantized_rows
+                : nullptr,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->row_scales
+                : nullptr,
             gateup_table.device_gate_descs,
             gateup_table.device_up_descs,
             down_table.device_descs,

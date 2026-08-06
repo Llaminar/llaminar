@@ -53,14 +53,13 @@ namespace llaminar2
         Unspecified,
 
         /**
-         * Derive the next contiguous source range from the canonical main and
-         * shifted-MTP KV counts plus the resident request-batch geometry.  The
-         * row count and request index are graph topology; prompt width and
-         * current progress remain device data.  This produces one reusable
-         * captured graph per (request index, grouped row count), with no H2D
-         * row cursor and no runtime graph materialization.
+         * Derive every request's shifted rows from canonical main/shifted KV
+         * counts and resident request geometry, then execute one bucket-wide
+         * depth-zero KV append inside the same captured main-prefill graph.
+         * Prompt width and current progress remain device data. No sidecar
+         * capture, host row cursor, or post-forward transaction exists.
          */
-        GraphCapturedDeviceKVProgress,
+        GraphIntegratedKVTransaction,
     };
 
     /**

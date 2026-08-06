@@ -32,7 +32,7 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         int device_idx, void *stream);
@@ -41,7 +41,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -53,7 +53,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -66,7 +66,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int request_count, int request_seq_len,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
@@ -360,8 +360,10 @@ namespace llaminar2
                 return false;
 
             cudaGDN_gpu_set_device(device_ordinal_);
-            cudaGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
-            if (secondary_gpu_state_ && secondary_state_size_ > 0)
+            if (gpu_state_ != request_state_bank_)
+                cudaGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+            if (secondary_gpu_state_ && secondary_state_size_ > 0 &&
+                secondary_gpu_state_ != request_state_bank_)
                 cudaGDN_gpu_memset_zero_async(
                     secondary_gpu_state_, secondary_state_size_, stream);
             if (request_state_bank_ && request_state_bank_floats_ > 0)
@@ -391,8 +393,7 @@ namespace llaminar2
             if (!live_state)
                 return false;
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -403,7 +404,7 @@ namespace llaminar2
             // The stage handles coherence (ensureOnDevice/allocateOnDevice).
             const bool ok = cudaGDN_chunk_forward(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
@@ -430,8 +431,7 @@ namespace llaminar2
             if (!live_state)
                 return false;
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -439,7 +439,7 @@ namespace llaminar2
 
             const bool ok = cudaGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 device_effective_seq_len,
                 verifier_state_capture_,
@@ -506,20 +506,15 @@ namespace llaminar2
                     request_state_bank_ +
                     static_cast<size_t>(request) *
                         static_cast<size_t>(required_state_size);
+                float *updated_request_state = request_state;
                 float *snapshots = nullptr;
                 int snapshot_rows = 0;
                 if (capture_active)
                 {
-                    float *work_state =
+                    updated_request_state =
                         speculative_state_work_ +
                         static_cast<size_t>(request) *
                             static_cast<size_t>(required_state_size);
-                    cudaGDN_gpu_memcpy_async(
-                        work_state,
-                        request_state,
-                        static_cast<size_t>(required_state_size),
-                        stream_);
-                    request_state = work_state;
 
                     const int snapshot_base = request * request_seq_len;
                     snapshots =
@@ -544,6 +539,7 @@ namespace llaminar2
                         dt_bias,
                         output + v_offset,
                         request_state,
+                        updated_request_state,
                         request_seq_len, n_heads, head_dim_k, head_dim_v,
                         use_qk_l2norm,
                         snapshots,
@@ -605,17 +601,12 @@ namespace llaminar2
                     LOG_ERROR("[CUDAGatedDeltaNet] Grouped verifier requires one speculative state slot per request");
                     return false;
                 }
-                cudaGDN_gpu_memcpy_async(
-                    speculative_state_work_,
-                    request_state_bank_,
-                    static_cast<size_t>(work_floats),
-                    stream_);
                 effective_states = speculative_state_work_;
             }
 
             return cudaGDN_chunk_forward_batched_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_states,
+                output, request_state_bank_, effective_states,
                 seq_len, request_count, request_seq_len,
                 n_heads, head_dim_k, head_dim_v,
                 use_qk_l2norm,
@@ -642,8 +633,7 @@ namespace llaminar2
             if (!live_state)
                 return false;
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -656,7 +646,7 @@ namespace llaminar2
             // remains aligned with PyTorch.
             const bool ok = cudaGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
@@ -964,8 +954,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        float *prepareEffectiveStateForVerifierForward(
-            float *live_state,
+        float *resolveVerifierStateDestination(
             int required_state_size,
             void *stream)
         {
@@ -974,7 +963,7 @@ namespace llaminar2
                 verifier_state_capture_rows_ > 0 &&
                 verifier_state_capture_size_ == required_state_size;
             if (!verifier_capture_active)
-                return live_state;
+                return stateForSize(required_state_size);
             if (!stream)
             {
                 LOG_ERROR("[CUDAGatedDeltaNet] Speculative verifier state requires an explicit stream");
@@ -989,28 +978,22 @@ namespace llaminar2
                 return nullptr;
             }
 
-            cudaGDN_gpu_memcpy_async(
-                speculative_state_work_,
-                live_state,
-                static_cast<size_t>(required_state_size),
-                stream);
             return speculative_state_work_;
         }
 
         /**
          * @brief Publish scalar live state into request zero on its producer stream.
          *
-         * This copy is executable device work, so it is recorded into CUDA
-         * graphs and repeated on every replay. No host-side validity flag is
-         * permitted to stand in for publication because replay does not
-         * re-enter the C++ wrapper that changed such a flag during capture.
+         * Single-geometry bindings alias scalar state to request zero, making
+         * publication structurally complete with no operation. Distinct
+         * LocalTP geometries enqueue one explicit stream-ordered device copy.
          */
         bool publishLiveStateToRequestZero(
             const float *live_state,
             int live_state_size,
             void *stream) const
         {
-            if (!live_state ||
+            if (!stream || !live_state ||
                 live_state_size <= 0 ||
                 !request_state_bank_ ||
                 request_state_bank_capacity_ <= 0 ||
@@ -1024,22 +1007,15 @@ namespace llaminar2
                 return false;
             }
 
+            if (live_state == request_state_bank_)
+                return true;
+
             cudaGDN_gpu_set_device(device_ordinal_);
-            if (stream)
-            {
-                cudaGDN_gpu_memcpy_async(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size),
-                    stream);
-            }
-            else
-            {
-                cudaGDN_gpu_memcpy(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size));
-            }
+            cudaGDN_gpu_memcpy_async(
+                request_state_bank_,
+                live_state,
+                static_cast<size_t>(live_state_size),
+                stream);
             return true;
         }
 
@@ -1070,6 +1046,9 @@ namespace llaminar2
                           << " request_floats=" << request_state_bank_floats_);
                 return false;
             }
+
+            if (live_state == request_state_bank_)
+                return true;
 
             cudaGDN_gpu_set_device(device_ordinal_);
             cudaGDN_gpu_memcpy_async(

@@ -748,6 +748,27 @@ namespace llaminar2
     }
 
     /**
+     * @brief Resolve the persistent terminal-hidden archive row capacity.
+     *
+     * Main prefill archives one terminal row for every admitted request, while
+     * grouped verification and accepted-state publication may temporarily
+     * archive every flattened target row. The one graph-stable GPU owner must
+     * therefore cover both independently configurable dimensions.
+     *
+     * @param configured_batch_size General runner request capacity.
+     * @param config MTP depth and request-batch policy.
+     * @return Number of FP32 hidden rows required by the shared archive.
+     */
+    inline int resolveMTPTerminalHiddenRowCapacity(
+        int configured_batch_size,
+        const MTPRuntimeConfig &config)
+    {
+        return std::max(
+            resolveRuntimeBatchSizeForMTP(configured_batch_size, config),
+            resolveMTPMaxTargetQueryRows(config));
+    }
+
+    /**
      * @brief Get bytes per element for ActivationPrecision
      *
      * Returns the storage size per logical element:

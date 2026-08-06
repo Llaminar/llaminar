@@ -4,8 +4,12 @@
 GPU inference owns intermediate execution state on the device.  The host may
 observe only a compact serial-visible token result or the terminal response
 ledger produced after a complete device-owned generation request. Prefix-cache
-movement is the sole data-plane exception because
-RAM and disk are intentional cache tiers rather than execution-state mirrors.
+movement is the sole data-plane exception because RAM and disk are intentional
+cache tiers rather than execution-state mirrors. ROCm additionally permits one
+strictly authenticated 48-byte scheduler ticket per transaction: HIP graphs do
+not provide conditional nodes, so the host submits the already-captured branch
+named by this immutable control-plane snapshot without receiving mutable model
+state, verifier data, KV data, or draft tokens.
 
 PerfStats includes both semantic operation records and legacy aggregate
 ``transfer/d2h`` byte counters.  The aggregates do not identify the caller, so
@@ -44,6 +48,10 @@ _FINAL_RESPONSE_OPERATIONS = frozenset(
     }
 )
 
+_ROCM_HOST_DISPATCH_OPERATION = (
+    "device_generation_dispatch_ticket_d2h_submissions"
+)
+
 
 @dataclass(frozen=True)
 class GPUHostTransferValidation:
@@ -51,6 +59,7 @@ class GPUHostTransferValidation:
 
     error: str | None
     final_response_operations: tuple[str, ...]
+    scheduler_dispatch_operations: tuple[str, ...]
     prefix_cache_operations: tuple[str, ...]
     forbidden_operations: tuple[str, ...]
 
@@ -110,6 +119,35 @@ def _is_explicit_prefix_cache_tier_transfer(
     )
 
 
+def _is_authenticated_rocm_scheduler_ticket(
+    record: Mapping[str, Any],
+) -> bool:
+    """Accept only the reviewed HIP conditional-graph control snapshot.
+
+    The exact byte count deliberately belongs to the gate. A future ABI change
+    must be reviewed here instead of silently expanding this narrow scheduler
+    boundary into a model-state readback. CUDA has native conditional graph
+    nodes and therefore may never emit this operation.
+    """
+
+    if record.get("name") != _ROCM_HOST_DISPATCH_OPERATION:
+        return False
+    if str(record.get("domain", "")).lower() != "mtp":
+        return False
+    if not str(record.get("device", "")).lower().startswith("rocm:"):
+        return False
+
+    tags = {
+        str(key): str(value)
+        for key, value in (record.get("tags") or {}).items()
+    }
+    return (
+        tags.get("bytes") == "48"
+        and tags.get("authority") == "immutable_scheduler_snapshot"
+        and tags.get("state_payload") == "false"
+    )
+
+
 def validate_gpu_host_transfer_policy(
     records: Iterable[Mapping[str, Any]],
 ) -> GPUHostTransferValidation:
@@ -122,6 +160,7 @@ def validate_gpu_host_transfer_policy(
     """
 
     final_response: set[str] = set()
+    scheduler_dispatch: set[str] = set()
     prefix_cache: set[str] = set()
     forbidden: set[str] = set()
 
@@ -136,6 +175,9 @@ def validate_gpu_host_transfer_policy(
         if name in _FINAL_RESPONSE_OPERATIONS:
             final_response.add(name)
             continue
+        if _is_authenticated_rocm_scheduler_ticket(record):
+            scheduler_dispatch.add(name)
+            continue
         if _is_explicit_prefix_cache_tier_transfer(record):
             prefix_cache.add(name)
             continue
@@ -147,13 +189,15 @@ def validate_gpu_host_transfer_policy(
         error = (
             "GPU inference performed intermediate device-to-host transfers; "
             "only compact final-response materialization and explicit "
-            "RAM/disk prefix-cache tier movement are permitted: "
+            "RAM/disk prefix-cache tier movement are permitted, plus ROCm's "
+            "exact authenticated immutable graph-dispatch ticket: "
             + ", ".join(forbidden_operations)
         )
 
     return GPUHostTransferValidation(
         error=error,
         final_response_operations=tuple(sorted(final_response)),
+        scheduler_dispatch_operations=tuple(sorted(scheduler_dispatch)),
         prefix_cache_operations=tuple(sorted(prefix_cache)),
         forbidden_operations=forbidden_operations,
     )

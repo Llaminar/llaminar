@@ -223,10 +223,18 @@ __device__ inline uint32_t pf_iq3_grid_lookup(int idx)
 }
 
 // IQ2 grid lookup (compile-time format dispatch)
-template <NativeVNNIFormatPrefill FMT>
-__device__ inline uint64_t pf_iq2_grid_lookup(int idx)
+template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+__device__ inline uint64_t pf_iq2_grid_lookup(
+    int idx,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
-    if constexpr (FMT == NVNNI_PF_IQ2_S)       return d_pf_iq2s_grid[idx];
+    if constexpr (FMT == NVNNI_PF_IQ2_S)
+    {
+        if constexpr (USE_STAGED_IQ2_S)
+            return staged_iq2s_grid[idx];
+        else
+            return d_pf_iq2s_grid[idx];
+    }
     else if constexpr (FMT == NVNNI_PF_IQ2_XS) return d_pf_iq2xs_grid[idx];
     else                                        return d_pf_iq2xxs_grid[idx];
 }
@@ -317,10 +325,11 @@ void moe_prefill_hidden_quantize_rows_kernel(
 // Each thread computes one output element: output[slot, n] = dot(A_row, B_col_n)
 // ============================================================================
 
-template <NativeVNNIFormatPrefill FMT>
+template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ void moe_prefill_decode_groups(
     const uint8_t* __restrict__ payload,
-    int32_t* packed_groups)
+    int32_t* packed_groups,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
     using Traits = PrefillNVNNITraits<FMT>;
 
@@ -404,7 +413,9 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
             #pragma unroll
             for (int l = 0; l < 4; ++l) {
                 const int idx = (w_qs >> (l * 8)) & 0xFF;
-                const uint64_t grid8 = pf_iq2_grid_lookup<FMT>(idx);
+                const uint64_t grid8 =
+                    pf_iq2_grid_lookup<FMT, USE_STAGED_IQ2_S>(
+                        idx, staged_iq2s_grid);
                 const uint32_t g_lo = static_cast<uint32_t>(grid8);
                 const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
                 const uint8_t signs = static_cast<uint8_t>(w_signs >> (l * 8));
@@ -426,7 +437,9 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
                     idx |= (static_cast<int>((w_qh_signs >> l) & 1) << 8);
                 else if constexpr (Traits::qh_bits_per_lookup == 2)
                     idx |= (static_cast<int>((w_qh_signs >> (2 * l)) & 3) << 8);
-                const uint64_t grid8 = pf_iq2_grid_lookup<FMT>(idx);
+                const uint64_t grid8 =
+                    pf_iq2_grid_lookup<FMT, USE_STAGED_IQ2_S>(
+                        idx, staged_iq2s_grid);
                 const uint32_t g_lo = static_cast<uint32_t>(grid8);
                 const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
                 const uint8_t signs_byte = (l < 3)
@@ -696,7 +709,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
  * rows but deliberately call the same per-block accumulator so optimization
  * cannot relax byte equality.
  */
-template <NativeVNNIFormatPrefill FMT>
+template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ float moe_prefill_dot_desc_range(
     const DeviceNativeVNNIMatrixDesc& desc,
     int n,
@@ -704,7 +717,8 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     const float* __restrict__ slot_scales,
     int N,
     int b_start,
-    int b_end)
+    int b_end,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
     using Traits = PrefillNVNNITraits<FMT>;
     if (!slot_A ||
@@ -731,7 +745,8 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
         int32_t packed_groups[8];
         constexpr int PB = Traits::payload_bytes;
         const uint8_t* payload = payload_base + linear * PB;
-        moe_prefill_decode_groups<FMT>(payload, packed_groups);
+        moe_prefill_decode_groups<FMT, USE_STAGED_IQ2_S>(
+            payload, packed_groups, staged_iq2s_grid);
 
         const int32_t* a4 = reinterpret_cast<const int32_t*>(slot_A + b * 32);
         acc = moe_prefill_accumulate_decoded_block<FMT>(
@@ -739,6 +754,195 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     }
 
     return acc;
+}
+
+/**
+ * @brief Integer and scale terms for one exact dual-scale K-block contribution.
+ *
+ * These are the operands consumed by
+ * @ref rocm_native_vnni_commit_dual_scale_block. Keeping the FP32 accumulator
+ * out of this structure lets several lanes prepare independent K blocks while
+ * one owner lane still commits them in serial-decode order.
+ */
+struct MoEPrefillDualScaleBlockTerms
+{
+    int32_t low_dot = 0;       ///< INT32 dot for K elements 0..15.
+    int32_t high_dot = 0;      ///< INT32 dot for K elements 16..31.
+    float low_scale = 0.0f;    ///< FP16-derived low-half weight scale.
+    float high_scale = 0.0f;   ///< FP16-derived high-half weight scale.
+    float activation_scale = 0.0f; ///< Blockwise activation scale.
+};
+
+/**
+ * @brief Prepare one correction-free dual-scale block without changing FP32 state.
+ *
+ * The payload decode and both `sdot4` chains are identical to
+ * @ref moe_prefill_accumulate_decoded_block. Only the independent integer work
+ * is separated from the serial FP32 commit so neighboring lanes can expose
+ * enough wavefronts to occupy gfx906 for M=1..4 verifier buckets.
+ *
+ * @tparam FMT Correction-free dual-scale NativeVNNI format.
+ * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use the LDS copy.
+ * @param desc Prepared matrix descriptor.
+ * @param n Output column owned by the cooperating lane subgroup.
+ * @param slot_A Quantized activation row, optionally staged in LDS.
+ * @param slot_scales Activation block scales, optionally staged in LDS.
+ * @param N Matrix output width.
+ * @param block_index Increasing-K block index to prepare.
+ * @return Exact integer dots and scale operands for the block.
+ */
+template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+__device__ __forceinline__ MoEPrefillDualScaleBlockTerms
+moe_prefill_prepare_dual_scale_block_terms(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ slot_A,
+    const float* __restrict__ slot_scales,
+    int N,
+    int block_index,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
+{
+    using Traits = PrefillNVNNITraits<FMT>;
+    static_assert(
+        Traits::is_dual_scale &&
+            !Traits::is_dual_scale_asym &&
+            FMT != NVNNI_PF_IQ1_M,
+        "subgroup preparation requires a correction-free dual-scale format");
+    static_assert(!USE_STAGED_IQ2_S || FMT == NVNNI_PF_IQ2_S,
+                  "only IQ2_S may consume the staged IQ2_S codebook");
+
+    const size_t linear =
+        static_cast<size_t>(block_index) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const uint8_t* payload =
+        desc.payload + linear * static_cast<size_t>(Traits::payload_bytes);
+    int32_t packed_groups[8];
+    moe_prefill_decode_groups<FMT, USE_STAGED_IQ2_S>(
+        payload, packed_groups, staged_iq2s_grid);
+
+    const int32_t* a4 = reinterpret_cast<const int32_t*>(
+        slot_A + static_cast<size_t>(block_index) * 32u);
+    MoEPrefillDualScaleBlockTerms terms{};
+#pragma unroll
+    for (int group = 0; group < 4; ++group)
+    {
+        terms.low_dot = __builtin_amdgcn_sdot4(
+            a4[group], packed_groups[group], terms.low_dot, false);
+    }
+#pragma unroll
+    for (int group = 4; group < 8; ++group)
+    {
+        terms.high_dot = __builtin_amdgcn_sdot4(
+            a4[group], packed_groups[group], terms.high_dot, false);
+    }
+
+    const uint16_t* low_scales =
+        static_cast<const uint16_t*>(desc.scales);
+    const uint16_t* high_scales =
+        static_cast<const uint16_t*>(desc.mins);
+    const uint16_t low_bits = low_scales[linear];
+    const uint16_t high_bits = high_scales[linear];
+    terms.low_scale =
+        __half2float(*reinterpret_cast<const __half*>(&low_bits));
+    terms.high_scale =
+        __half2float(*reinterpret_cast<const __half*>(&high_bits));
+    terms.activation_scale = slot_scales[block_index];
+    return terms;
+}
+
+/**
+ * @brief Compute one dual-scale output with parallel preparation and serial commits.
+ *
+ * `K_LANES` adjacent lanes own one output column. During each iteration they
+ * prepare consecutive K blocks independently. Every lane then participates in
+ * bit-preserving shuffles, while subgroup lane zero calls the canonical RN
+ * commit helper for source lanes 0..K_LANES-1. Consequently the observable
+ * FP32 expression remains block 0, block 1, ... exactly as in serial decode;
+ * this is parallel work preparation, not a floating-point reduction.
+ *
+ * @tparam FMT Correction-free dual-scale NativeVNNI format.
+ * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use the LDS copy.
+ * @tparam K_LANES Number of adjacent lanes cooperating on one output.
+ * @param desc Prepared matrix descriptor.
+ * @param n Output column shared by this subgroup.
+ * @param slot_A Quantized activation row, normally staged in LDS.
+ * @param slot_scales Activation block scales, normally staged in LDS.
+ * @param N Matrix output width.
+ * @param blocks_per_row Number of 32-element K blocks.
+ * @return Exact output on subgroup lane zero; other lanes return an unused zero.
+ */
+template <
+    NativeVNNIFormatPrefill FMT,
+    bool USE_STAGED_IQ2_S,
+    int K_LANES>
+__device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ slot_A,
+    const float* __restrict__ slot_scales,
+    int N,
+    int blocks_per_row,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
+{
+    static_assert(K_LANES == 2 || K_LANES == 4,
+                  "dual-scale verifier subgroup width must be two or four lanes");
+    using Traits = PrefillNVNNITraits<FMT>;
+    static_assert(
+        Traits::is_dual_scale &&
+            !Traits::is_dual_scale_asym &&
+            FMT != NVNNI_PF_IQ1_M,
+        "subgroup dot requires a correction-free dual-scale format");
+    const int subgroup_lane = static_cast<int>(threadIdx.x) & (K_LANES - 1);
+    float accumulator = 0.0f;
+
+    for (int first_block = 0;
+         first_block < blocks_per_row;
+         first_block += K_LANES)
+    {
+        const int block_index = first_block + subgroup_lane;
+        MoEPrefillDualScaleBlockTerms local{};
+        if (block_index < blocks_per_row)
+        {
+            local = moe_prefill_prepare_dual_scale_block_terms<
+                FMT, USE_STAGED_IQ2_S>(
+                desc,
+                n,
+                slot_A,
+                slot_scales,
+                N,
+                block_index,
+                staged_iq2s_grid);
+        }
+
+#pragma unroll
+        for (int source_lane = 0; source_lane < K_LANES; ++source_lane)
+        {
+            const int32_t low_dot =
+                __shfl(local.low_dot, source_lane, K_LANES);
+            const int32_t high_dot =
+                __shfl(local.high_dot, source_lane, K_LANES);
+            const float low_scale =
+                __shfl(local.low_scale, source_lane, K_LANES);
+            const float high_scale =
+                __shfl(local.high_scale, source_lane, K_LANES);
+            const float activation_scale =
+                __shfl(local.activation_scale, source_lane, K_LANES);
+
+            if (subgroup_lane == 0 &&
+                first_block + source_lane < blocks_per_row)
+            {
+                accumulator = rocm_native_vnni_commit_dual_scale_block(
+                    accumulator,
+                    low_dot,
+                    high_dot,
+                    low_scale,
+                    high_scale,
+                    activation_scale);
+            }
+        }
+    }
+
+    return subgroup_lane == 0 ? accumulator : 0.0f;
 }
 
 namespace
@@ -1041,15 +1245,24 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
  *
  * Grouped publication must match rowwise serial decode byte-for-byte for every
  * prefill bucket, not only MTP verifier rows. One block owns one original route
- * slot and a 64-column
- * output tile. The route-to-grouped inverse map skips non-local routes and
- * directs valid results to compact expert scratch, so the launch has exactly
- * `seq_len * top_k` row work rather than a sparse expert-by-max-M rectangle.
- * FP32 gate/up scratch is written exactly like the M=1 decode-table path before
- * one grouped SwiGLU quantization pass consumes it.
+ * slot, one trained output-column tile, and one projection role.
+ * `blockIdx.z == 0` computes gate while `blockIdx.z == 1` computes up. The two
+ * projections have no arithmetic dependency, so exposing them as independent
+ * workgroups improves occupancy without changing either projection's
+ * increasing-K dot order or adding another graph launch. The route-to-grouped
+ * inverse map skips
+ * non-local routes and directs valid results to compact expert scratch, so the
+ * launch has exactly `2 * seq_len * top_k` projection-row work rather than a
+ * sparse expert-by-max-M rectangle. FP32 gate/up scratch is written exactly
+ * like the M=1 decode-table path before one grouped SwiGLU quantization pass
+ * consumes it.
  */
-template <NativeVNNIFormatPrefill FMT>
-__global__ __launch_bounds__(64)
+template <
+    NativeVNNIFormatPrefill FMT,
+    int TILE_N = 64,
+    bool STAGE_IQ2_S_GRID = false,
+    int K_LANES = 1>
+__global__ __launch_bounds__(TILE_N * K_LANES)
 void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, K]
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
@@ -1067,10 +1280,52 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     int K,
     int num_experts)
 {
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
+                  "route-owned grouped gate/up supports measured gfx906 column tiles");
+    static_assert(!STAGE_IQ2_S_GRID || FMT == NVNNI_PF_IQ2_S,
+                  "only IQ2_S may consume the staged IQ2_S codebook");
+    static_assert(K_LANES == 1 || K_LANES == 2 || K_LANES == 4,
+                  "route-owned grouped gate/up supports one, two, or four K lanes");
+    static_assert(
+        K_LANES == 1 ||
+            FMT == NVNNI_PF_Q6_K ||
+            FMT == NVNNI_PF_IQ2_S,
+        "only tuned correction-free dual-scale formats may use subgroup preparation");
+    static_assert(TILE_N * K_LANES <= 256,
+                  "route-owned grouped gate/up exceeds the tuned gfx906 block size");
+
+    /*
+     * IQ2_S performs four data-dependent 64-bit codebook lookups for every
+     * 32-element K block. With one-wave workgroups those vector-memory reads
+     * were repeated by every route/projection wave even though the complete
+     * codebook is only 8 KiB. The IQ2_S specialization uses four waves per
+     * workgroup and cooperatively copies the immutable table into LDS once.
+     * Every output lane then reads the identical uint64_t entries from LDS;
+     * its dot products, dual-scale commits, corrections, and increasing-K
+     * accumulation order are unchanged.
+     *
+     * Dynamic shared storage is zero bytes for every other codebook, so this
+     * specialization cannot silently tax their occupancy or alter their
+     * established launch geometry.
+     */
+    constexpr size_t kIQ2SGridBytes = 1024u * sizeof(uint64_t);
+    constexpr size_t kStagedCodebookBytes =
+        STAGE_IQ2_S_GRID ? kIQ2SGridBytes : 0u;
+    extern __shared__ uint8_t staged_bytes[];
+    uint64_t* staged_iq2s_grid =
+        reinterpret_cast<uint64_t*>(staged_bytes);
+    if constexpr (STAGE_IQ2_S_GRID)
+    {
+        constexpr int kIQ2SGridEntries = 1024;
+        for (int i = threadIdx.x; i < kIQ2SGridEntries; i += blockDim.x)
+            staged_iq2s_grid[i] = d_pf_iq2s_grid[i];
+    }
+
+    const int output_lane = static_cast<int>(threadIdx.x) / K_LANES;
+    const int n = blockIdx.x * TILE_N + output_lane;
     const int original_slot = blockIdx.y;
-    if (original_slot >= total_slots || n >= N)
+    const int projection_role = static_cast<int>(blockIdx.z);
+    if (original_slot >= total_slots || projection_role > 1)
         return;
 
     const int grouped_slot = original_to_grouped[original_slot];
@@ -1083,13 +1338,10 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     if (expert_id < 0 || expert_id >= num_experts)
         return;
 
-    const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-    const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
-        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
-    {
+    const DeviceNativeVNNIMatrixDesc desc =
+        projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
-    }
 
     const int blocks_per_row = K / 32;
     int input_row = grouped_slot;
@@ -1102,12 +1354,227 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int8_t* slot_A = A_int8 + static_cast<size_t>(input_row) * K;
     const float* slot_scales =
         scales_A_blockwise + static_cast<size_t>(input_row) * blocks_per_row;
-    const size_t out_index = static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-                             static_cast<size_t>(n);
-    gate_out[out_index] = moe_prefill_dot_desc_range<FMT>(
-        gate_desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
-    up_out[out_index] = moe_prefill_dot_desc_range<FMT>(
-        up_desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+
+    /*
+     * The subgroup geometry makes activation addresses lane-varying, so relying
+     * on scalar-cache broadcast would turn four unique block reads into
+     * redundant vector traffic. One 256-thread workgroup instead copies the
+     * activation row and its scale row into launch LDS before any lane exits for
+     * a partial N tile. IQ2_S places these rows immediately after its immutable
+     * codebook. Both publications share one barrier, avoiding an extra
+     * workgroup-wide rendezvous while retaining an explicit producer/consumer
+     * edge for every staged byte.
+     */
+    if constexpr (K_LANES > 1)
+    {
+        int8_t* staged_A = reinterpret_cast<int8_t*>(
+            staged_bytes + kStagedCodebookBytes);
+        float* staged_scales = reinterpret_cast<float*>(
+            staged_bytes + kStagedCodebookBytes + static_cast<size_t>(K));
+        for (int index = static_cast<int>(threadIdx.x);
+             index < K;
+             index += static_cast<int>(blockDim.x))
+        {
+            staged_A[index] = slot_A[index];
+        }
+        for (int index = static_cast<int>(threadIdx.x);
+             index < blocks_per_row;
+             index += static_cast<int>(blockDim.x))
+        {
+            staged_scales[index] = slot_scales[index];
+        }
+        slot_A = staged_A;
+        slot_scales = staged_scales;
+    }
+
+    if constexpr (STAGE_IQ2_S_GRID || K_LANES > 1)
+        __syncthreads();
+
+    if (n >= N)
+        return;
+
+    const size_t out_index =
+        static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+
+    float* projection_out = projection_role == 0 ? gate_out : up_out;
+    if constexpr (K_LANES > 1)
+    {
+        const float value = moe_prefill_dual_scale_subgroup_dot<
+            FMT, STAGE_IQ2_S_GRID, K_LANES>(
+            desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            blocks_per_row,
+            staged_iq2s_grid);
+        if ((static_cast<int>(threadIdx.x) & (K_LANES - 1)) == 0)
+            projection_out[out_index] = value;
+    }
+    else
+    {
+        projection_out[out_index] =
+            moe_prefill_dot_desc_range<FMT, STAGE_IQ2_S_GRID>(
+                desc,
+                n,
+                slot_A,
+                slot_scales,
+                N,
+                0,
+                blocks_per_row,
+                staged_iq2s_grid);
+    }
+}
+
+/**
+ * @brief Launch one compile-time route-owned gate/up geometry.
+ *
+ * This helper is the single host boundary for verifier gate/up geometry.  It
+ * computes persistent LDS capacity before graph capture and launches on the
+ * caller's exact stream; graph replay performs no host policy lookup.  Every
+ * specialization invokes the same byte-exact kernel body above.
+ *
+ * @tparam FMT NativeVNNI execution codebook.
+ * @tparam TILE_N Output columns owned by one workgroup before K subdivision.
+ * @tparam K_LANES Adjacent lanes preparing independent increasing-K blocks.
+ * @param stream Non-null graph-capture stream that owns this launch.
+ * @param A_int8 Quantized input rows.
+ * @param scales_A_blockwise Per-row activation scales.
+ * @param original_to_grouped Original-route to compact-route mapping.
+ * @param original_expert_ids Expert id for every original route.
+ * @param gate_descs Prepared gate descriptors.
+ * @param up_descs Prepared up descriptors.
+ * @param gate_out Compact gate output rows.
+ * @param up_out Compact up output rows.
+ * @param total_slots Number of original route slots.
+ * @param seq_len Number of original token rows.
+ * @param top_k Routed experts per original token.
+ * @param input_is_original_rows Whether activation rows are token-owned.
+ * @param N Projection output width.
+ * @param K Projection reduction width.
+ * @param num_experts Number of descriptors in each table.
+ */
+template <
+    NativeVNNIFormatPrefill FMT,
+    int TILE_N,
+    int K_LANES>
+void launch_moe_grouped_gate_up_route_owned_geometry(
+    hipStream_t stream,
+    const int8_t* A_int8,
+    const float* scales_A_blockwise,
+    const int* original_to_grouped,
+    const int* original_expert_ids,
+    const DeviceNativeVNNIMatrixDesc* gate_descs,
+    const DeviceNativeVNNIMatrixDesc* up_descs,
+    float* gate_out,
+    float* up_out,
+    int total_slots,
+    int seq_len,
+    int top_k,
+    int input_is_original_rows,
+    int N,
+    int K,
+    int num_experts)
+{
+    constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
+    constexpr bool kStageActivation = K_LANES > 1;
+    const size_t lds_bytes =
+        (kStageIQ2SGrid ? 1024u * sizeof(uint64_t) : 0u) +
+        (kStageActivation
+             ? static_cast<size_t>(K) +
+                   static_cast<size_t>(K / 32) * sizeof(float)
+             : 0u);
+    const dim3 grid((N + TILE_N - 1) / TILE_N, total_slots, 2);
+    const dim3 block(TILE_N * K_LANES);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<
+            FMT, TILE_N, kStageIQ2SGrid, K_LANES>),
+        grid,
+        block,
+        lds_bytes,
+        stream,
+        A_int8,
+        scales_A_blockwise,
+        original_to_grouped,
+        original_expert_ids,
+        gate_descs,
+        up_descs,
+        gate_out,
+        up_out,
+        total_slots,
+        seq_len,
+        top_k,
+        input_is_original_rows,
+        N,
+        K,
+        num_experts);
+}
+
+/**
+ * @brief Select the measured route-owned geometry once, during graph capture.
+ *
+ * IQ2_S is codebook-stage limited at tiny route counts and K-loop limited once
+ * the route grid broadens.  Measurements on gfx906 select four K lanes for at
+ * most sixteen route slots and two K lanes above that boundary. Q6_K has no
+ * 8-KiB codebook publication and retains its four-lane winner. Other formats
+ * preserve one-lane serial-K execution until an exact profiled specialization
+ * proves a different geometry.
+ */
+template <NativeVNNIFormatPrefill FMT>
+void launch_moe_grouped_gate_up_route_owned(
+    hipStream_t stream,
+    const int8_t* A_int8,
+    const float* scales_A_blockwise,
+    const int* original_to_grouped,
+    const int* original_expert_ids,
+    const DeviceNativeVNNIMatrixDesc* gate_descs,
+    const DeviceNativeVNNIMatrixDesc* up_descs,
+    float* gate_out,
+    float* up_out,
+    int total_slots,
+    int seq_len,
+    int top_k,
+    int input_is_original_rows,
+    int N,
+    int K,
+    int num_experts)
+{
+    if constexpr (FMT == NVNNI_PF_IQ2_S)
+    {
+        if (total_slots <= 16)
+        {
+            launch_moe_grouped_gate_up_route_owned_geometry<FMT, 64, 4>(
+                stream, A_int8, scales_A_blockwise, original_to_grouped,
+                original_expert_ids, gate_descs, up_descs, gate_out, up_out,
+                total_slots, seq_len, top_k, input_is_original_rows,
+                N, K, num_experts);
+        }
+        else
+        {
+            launch_moe_grouped_gate_up_route_owned_geometry<FMT, 128, 2>(
+                stream, A_int8, scales_A_blockwise, original_to_grouped,
+                original_expert_ids, gate_descs, up_descs, gate_out, up_out,
+                total_slots, seq_len, top_k, input_is_original_rows,
+                N, K, num_experts);
+        }
+    }
+    else if constexpr (FMT == NVNNI_PF_Q6_K)
+    {
+        launch_moe_grouped_gate_up_route_owned_geometry<FMT, 64, 4>(
+            stream, A_int8, scales_A_blockwise, original_to_grouped,
+            original_expert_ids, gate_descs, up_descs, gate_out, up_out,
+            total_slots, seq_len, top_k, input_is_original_rows,
+            N, K, num_experts);
+    }
+    else
+    {
+        launch_moe_grouped_gate_up_route_owned_geometry<FMT, 64, 1>(
+            stream, A_int8, scales_A_blockwise, original_to_grouped,
+            original_expert_ids, gate_descs, up_descs, gate_out, up_out,
+            total_slots, seq_len, top_k, input_is_original_rows,
+            N, K, num_experts);
+    }
 }
 
 
@@ -1419,22 +1886,72 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range_dispatch(
     }
 }
 
+/** Sentinel selecting the first-class heterogeneous descriptor-table kernel. */
+constexpr int kMoEPrefillMixedCodebookTag = -1;
+
+/**
+ * @brief Resolve one down-projection dot under a capture-time codebook policy.
+ *
+ * Homogeneous prepared tables instantiate the exact NativeVNNI format, letting
+ * HIP inline only that decoder and discard the per-output format switch. A
+ * genuinely heterogeneous table instantiates @ref kMoEPrefillMixedCodebookTag
+ * and performs the descriptor-owned dispatch intentionally.
+ *
+ * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
+ */
+template <int FORMAT_TAG>
+__device__ __forceinline__ float moe_prefill_down_dot(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ slot_A,
+    const float* __restrict__ slot_scales,
+    int N,
+    int blocks_per_row)
+{
+    if constexpr (FORMAT_TAG == kMoEPrefillMixedCodebookTag)
+    {
+        return moe_prefill_dot_desc_range_dispatch(
+            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+    }
+    else
+    {
+        constexpr auto kFormat =
+            static_cast<NativeVNNIFormatPrefill>(FORMAT_TAG);
+        if (!prefill_native_vnni_desc_shape_ok<kFormat>(
+                desc, N, blocks_per_row * 32))
+        {
+            /*
+             * A homogeneous mask and a mismatched descriptor cannot describe a
+             * valid captured graph. Trap on device instead of publishing a
+             * plausible zero row and allowing inference to limp onward.
+             */
+            moe_prefill_fail_fast_invalid_grouped_index();
+            return 0.0f;
+        }
+        return moe_prefill_dot_desc_range<kFormat>(
+            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+    }
+}
+
 /**
  * @brief Batch-invariant ordered down projection and publication.
  *
  * This is the canonical ROCm grouped-prefill down contract for every M bucket.
  * For each token/output column, one thread walks the original route slots in
  * top-k order, computes the down dot for that route's expert, applies the route
- * weight, and accumulates into a single FP32 total.  No per-route down rows are
+ * weight, and accumulates into a single FP32 total. No per-route down rows are
  * materialized and no atomic add participates in the result, so full prefill,
  * split prefill, and row-by-row decode all retain identical arithmetic order.
  *
  * The kernel is still a true grouped implementation: all request tokens, all
  * route slots, and all active experts are published by one graph-capturable
- * device dispatch.  The only serial loop is the tiny top-k route loop inside
+ * device dispatch. The only serial loop is the tiny top-k route loop inside
  * each token/column lane, exactly where serial decode defines the mathematical
  * accumulation order.
+ *
+ * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
  */
+template <int FORMAT_TAG>
 __global__ __launch_bounds__(64)
 void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
     const int8_t* __restrict__ swiglu_int8,          // [total_slots, intermediate]
@@ -1476,8 +1993,8 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
         const int8_t* slot_A = swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
         const float* slot_scales =
             swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
-        const float expert_acc = moe_prefill_dot_desc_range_dispatch(
-            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+        const float expert_acc = moe_prefill_down_dot<FORMAT_TAG>(
+            desc, n, slot_A, slot_scales, N, blocks_per_row);
         const float weighted_route = rocm_native_vnni_weight_route_rn(
             grouped_weights[grouped_slot], expert_acc);
         total = rocm_native_vnni_accumulate_rn(total, weighted_route);
@@ -1492,7 +2009,10 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
  * Invalid or participant-remote slots explicitly write zero. The route axis is
  * preserved through the LocalTP collective and is reduced only afterward by
  * the canonical router-order epilogue.
+ *
+ * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
  */
+template <int FORMAT_TAG>
 __global__ __launch_bounds__(64)
 void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     const int8_t* __restrict__ swiglu_int8,
@@ -1532,8 +2052,8 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
         swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
     const float* slot_scales =
         swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
-    const float expert_acc = moe_prefill_dot_desc_range_dispatch(
-        desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+    const float expert_acc = moe_prefill_down_dot<FORMAT_TAG>(
+        desc, n, slot_A, slot_scales, N, blocks_per_row);
     route_output[output_index] = rocm_native_vnni_weight_route_rn(
         grouped_weights[grouped_slot], expert_acc);
 }
@@ -1915,20 +2435,13 @@ bool rocmMoE_grouped_prefill_pipeline(
     // Trained expert-row tiles preserve every row's serial increasing-K order.
     // =========================================================================
     {
-        constexpr int route_tile_n = 64;
-        dim3 route_block(route_tile_n);
-        const int route_n_tiles =
-            (intermediate + route_tile_n - 1) / route_tile_n;
-
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
         const auto* up_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_up_desc_table);
 
         #define LAUNCH_GATEUP_ROUTE_OWNED(FMT) \
             do { \
-                dim3 grid(route_n_tiles, total_slots); \
-                hipLaunchKernelGGL( \
-                    HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT>), \
-                    grid, route_block, 0, hip_stream, \
+                launch_moe_grouped_gate_up_route_owned<FMT>( \
+                    hip_stream, \
                     reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
                     reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
                     d_original_to_grouped, d_original_expert_ids, gate_descs, up_descs, \
@@ -2047,34 +2560,73 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         if (!use_expert_row_tiles)
         {
-            if (canonical_publication)
+            /*
+             * The codebook mask is immutable graph identity. A one-bit mask
+             * therefore selects one fully inlined down decoder during capture;
+             * only a table that deliberately contains multiple formats enters
+             * the mixed-table specialization. Both routes execute the same
+             * ordered publication kernels and differ solely in decoder dispatch.
+             */
+            #define LAUNCH_ROUTE_OWNED_DOWN(FORMAT_TAG) \
+                do { \
+                    if (canonical_publication) { \
+                        dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots); \
+                        hipLaunchKernelGGL( \
+                            HIP_KERNEL_NAME(moe_grouped_down_publish_canonical_routes_prefill_kernel<FORMAT_TAG>), \
+                            grid, block, 0, hip_stream, \
+                            d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                            d_original_to_grouped, d_original_expert_ids, d_group_weights, \
+                            d_canonical_route_contributions, total_slots, d_model, \
+                            intermediate, num_experts); \
+                    } else { \
+                        dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len); \
+                        hipLaunchKernelGGL( \
+                            HIP_KERNEL_NAME(moe_grouped_down_publish_original_token_ordered_prefill_kernel<FORMAT_TAG>), \
+                            grid, block, 0, hip_stream, \
+                            d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                            d_original_to_grouped, d_original_expert_ids, d_group_weights, \
+                            d_output, seq_len, top_k, d_model, intermediate, num_experts); \
+                    } \
+                } while (0)
+
+            #define LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(FMT) \
+                case (uint32_t{1} << static_cast<uint32_t>(FMT)): \
+                    LAUNCH_ROUTE_OWNED_DOWN(static_cast<int>(FMT)); \
+                    break
+
+            switch (down_codebook_mask)
             {
-                dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);
-                hipLaunchKernelGGL(
-                    moe_grouped_down_publish_canonical_routes_prefill_kernel,
-                    grid, block, 0, hip_stream,
-                    d_scratch_swiglu_int8,
-                    d_scratch_swiglu_scales,
-                    down_descs,
-                    d_original_to_grouped,
-                    d_original_expert_ids,
-                    d_group_weights,
-                    d_canonical_route_contributions,
-                    total_slots,
-                    d_model,
-                    intermediate,
-                    num_experts);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_NL);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_1);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_1);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q6_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q3_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q2_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ3_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ3_XXS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_XS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_XXS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_M);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q8_0);
+            default:
+                if (down_codebook_mask == 0 ||
+                    (down_codebook_mask & (down_codebook_mask - 1u)) == 0)
+                {
+                    fprintf(stderr,
+                            "[rocmMoE_grouped_prefill_pipeline] invalid route-owned down codebook mask=0x%x\n",
+                            down_codebook_mask);
+                    return false;
+                }
+                LAUNCH_ROUTE_OWNED_DOWN(kMoEPrefillMixedCodebookTag);
+                break;
             }
-            else
-            {
-                dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
-                hipLaunchKernelGGL(
-                    moe_grouped_down_publish_original_token_ordered_prefill_kernel,
-                    grid, block, 0, hip_stream,
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
-                    d_original_to_grouped, d_original_expert_ids, d_group_weights,
-                    d_output, seq_len, top_k, d_model, intermediate, num_experts);
-            }
+
+            #undef LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT
+            #undef LAUNCH_ROUTE_OWNED_DOWN
         }
         else
         {

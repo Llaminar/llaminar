@@ -337,6 +337,11 @@ namespace llaminar2
         /// @brief Prepare grouped prefill metadata for the always-active shared expert.
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
+        /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
+        bool bindRouterQ8HiddenPublication(
+            std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+            MoERouterQ8PublicationAccess access) override;
+
         /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
@@ -1128,10 +1133,13 @@ namespace llaminar2
 
         int8_t *d_decode_hidden_int8_ = nullptr;
         float *d_decode_hidden_scales_ = nullptr;
-        const float *router_q8_hidden_source_ = nullptr; ///< FP32 row base that produced the Q8 publication
-        int router_q8_hidden_rows_ = 0; ///< Contiguous valid rows in decode hidden scratch
-        bool router_q8_hidden_valid_ = false; ///< Set only by a successful Q8 router producer
-        bool router_q8_hidden_capture_recorded_ = false; ///< Producer exists only in the current capture
+        /** Capture-time publication metadata; payload remains entirely on device. */
+        std::shared_ptr<MoERouterQ8HiddenPublication>
+            router_q8_hidden_publication_ =
+                std::make_shared<MoERouterQ8HiddenPublication>();
+        /** Typed authority prevents a sibling consumer from clearing producer state. */
+        MoERouterQ8PublicationAccess router_q8_publication_access_ =
+            MoERouterQ8PublicationAccess::ProducerAndConsumer;
         int decode_gateup_topk_cap_ = 0;
         int decode_gateup_d_model_cap_ = 0;
         int decode_hidden_rows_cap_ = 0;

@@ -630,15 +630,6 @@ namespace llaminar2
             int request_count,
             int32_t *out_tokens) override;
 
-        /**
-         * @brief Rebind every child mailbox after a rank-wide diagnostic restore.
-         *
-         * LocalTP owns one compact publication per mirrored verifier child. The
-         * rank must refresh all child events first and then atomically rebuild its
-         * aggregate identity token; a partial aggregate is never exposed.
-         */
-        bool rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-            int request_count) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -795,27 +786,25 @@ namespace llaminar2
             const MTPRequestPenaltyPolicy &penalty_policy) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
         /**
-         * @brief Sample compact request-batched prefill rows on every LocalTP child.
+         * @brief Publish compact prefill samples on every LocalTP participant.
          *
          * Mirrored LocalTP MTP heads produce one full-vocabulary terminal row
          * per logical request on every GPU participant. Each child samples its
          * own row batch and initializes its child-local resident logical-state
-         * mailbox. Child zero alone surfaces the explicit host response token;
-         * verifier planning and accepted-state publication continue to consume
-         * the child-resident mailboxes without host comparison or adoption.
+         * mailbox. The rank adopts only the immutable mailbox identities after
+         * every child succeeds; no token shadow or comparison crosses the host.
+         * Participant agreement is authenticated by the complete generation
+         * parent and its terminal ledgers.
          *
          * @param request_count Number of compact terminal rows per child.
          * @param params Shared sampling policy for the request batch.
-         * @param out_tokens Host response-token shadow written from child zero.
          * @param stochastic_position_seeds Immutable per-request seeds. Draws
          *        remain device-generated from each child's resident positions.
-         * @return true when every child sampled and published its resident
-         *         logical-state mailbox and child zero surfaced the response row.
+         * @return true when every child published a matching-lifecycle mailbox.
          */
-        bool sampleMainLogitsBatchRowsOnDevice(
+        bool publishMainLogitsBatchSamplesToDeviceResidentState(
             int request_count,
             const SamplingParams &params,
-            int32_t *out_tokens,
             const uint64_t *stochastic_position_seeds = nullptr) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
@@ -864,7 +853,7 @@ namespace llaminar2
          * the same compact summary before this bridge is needed for response
          * tokens.
          */
-        bool copyDeviceSpeculativeOutcomesToHost(
+        bool copyDeviceSpeculativeOutcomesToHostForDiagnostics(
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
         bool supportsDeviceStochasticMTPVerification() const override;
@@ -1005,11 +994,33 @@ namespace llaminar2
         bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens) override;
+        /**
+         * @brief Reduce participant MTP loop policies into one rank policy.
+         *
+         * A rank uses native conditional execution only when every participant
+         * can execute the requested topology natively. If any valid ROCm or
+         * heterogeneous participant requires hosted transaction scheduling,
+         * the complete rank uses that policy so collective-bearing transaction
+         * graphs remain launched in lockstep. Any unsupported participant makes
+         * the rank policy unsupported.
+         *
+         * @param topology Fixed-depth or dynamic device-selected loop shape.
+         * @return One policy shared by every rank-local participant.
+         */
+        DeviceGenerationExecutionPolicy deviceGenerationExecutionPolicy(
+            DeviceGenerationLoopTopology topology) const noexcept override;
         bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth,
+            DeviceGenerationLoopTopology topology,
             DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
+        bool observeDeviceGenerationDispatchTicket(
+            sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+            override;
+        bool submitHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+            override;
         bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
@@ -1053,6 +1064,9 @@ namespace llaminar2
          * D2H gather eliminates massive PCIe traffic for multi-token forwards.
          */
         void setSkipLogitsGatherPrefill(bool skip) override;
+
+        /** Wait for every submitted participant's exact terminal event. */
+        bool waitForLastForwardCompletionForBenchmark() override;
 
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
@@ -1627,6 +1641,16 @@ namespace llaminar2
         /// PP stage runners (when stages are TP domains, these are RankOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
         std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners_;
+
+        /** Explicit policy/topology installed by the latest graph materialization. */
+        std::optional<DeviceGenerationExecutionPolicy>
+            materialized_device_generation_execution_policy_;
+        std::optional<DeviceGenerationLoopTopology>
+            materialized_device_generation_loop_topology_;
+        /** Per-participant authenticated tickets retained between observe/submit. */
+        std::vector<sampling_math::DeviceGenerationDispatchTicket>
+            rank_hosted_device_generation_tickets_;
+        int admitted_device_generation_max_new_tokens_ = 0;
 
         /// Per-child prefix hits captured during the last rank-level lookup.
         std::vector<PrefixLookupResult> last_device_prefix_hits_;

@@ -128,7 +128,8 @@ namespace llaminar2
              * serial decode's M=1 route, and even tiny output-projection drift can
              * flip later MoE routes. When enabled, this stage preserves the same
              * graph-level output tensor but requires the kernel layer to prove and
-             * use a grouped M=2..4 path with the serial-decode numerical contract.
+             * use an economical grouped path at every positive M with the
+             * serial-decode numerical contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
 

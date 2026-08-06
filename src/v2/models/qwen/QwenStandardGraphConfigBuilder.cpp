@@ -135,7 +135,7 @@ namespace llaminar2
                 GraphCapturedDeviceGeometry;
         config.mtp_shifted_prefill_hidden_publication =
             MTPShiftedPrefillHiddenPublicationPolicy::
-                GraphCapturedDeviceKVProgress;
+                GraphIntegratedKVTransaction;
 
         // Precision settings: use defaults from GraphConfig
         // (ModelConfig doesn't carry rms_norm_eps/rope_theta)
@@ -393,7 +393,7 @@ namespace llaminar2
                 GraphCapturedDeviceGeometry;
         config.mtp_shifted_prefill_hidden_publication =
             MTPShiftedPrefillHiddenPublicationPolicy::
-                GraphCapturedDeviceKVProgress;
+                GraphIntegratedKVTransaction;
 
         // head_dim: prefer explicit key_length, fall back to d_model / n_heads
         config.head_dim = ctx.keyLength() > 0

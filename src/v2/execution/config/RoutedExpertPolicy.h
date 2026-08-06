@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include "backends/DeviceType.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -197,6 +199,85 @@ namespace llaminar2
     };
 
     /**
+     * @enum MoERouteAccumulationPolicy
+     * @brief Arithmetic layout used to accumulate router-selected expert rows.
+     *
+     * This policy is orthogonal to expert placement and participant
+     * publication. It says whether one kernel owns the complete ordered route
+     * fold or whether route dots are exposed as independent device work before
+     * a dedicated reducer reproduces the same increasing-route addition tree.
+     * Keeping the choice typed makes the extra reducer an explicit graph edge
+     * instead of an implicit backend convention.
+     */
+    enum class MoERouteAccumulationPolicy : uint8_t
+    {
+        /** One output lane visits router slots in increasing order. */
+        DirectOrderedFold = 0,
+
+        /**
+         * Each router slot publishes one FP32 row, then a following device
+         * kernel folds those rows in increasing router-slot order.
+         */
+        IndependentRouteSlotsThenOrderedFold,
+    };
+
+    /**
+     * @enum MoERouteAccumulationWorkload
+     * @brief Graph workload class relevant to route-accumulation lowering.
+     *
+     * Ordinary prefill and one-row decode retain their backend's direct ordered
+     * publication. A grouped verifier is allowed to expose independent route
+     * rows only when the complete graph topology can preserve serial route
+     * order in a following device reducer.
+     */
+    enum class MoERouteAccumulationWorkload : uint8_t
+    {
+        Ordinary = 0,
+        GroupedVerifier,
+    };
+
+    /**
+     * @struct MoERouteAccumulationSelection
+     * @brief Immutable inputs for selecting one graph accumulation topology.
+     *
+     * The graph builder supplies this value once while constructing a captured
+     * executable. Runtime kernels do not inspect host state or mode-shift
+     * between accumulation trees after capture.
+     */
+    struct MoERouteAccumulationSelection
+    {
+        DeviceType backend = DeviceType::CPU; ///< Backend that owns the graph.
+        int participant_count = 0; ///< Number of graph participants in the domain.
+        MoERouteAccumulationWorkload workload =
+            MoERouteAccumulationWorkload::Ordinary; ///< Fixed captured workload.
+    };
+
+    /**
+     * @brief Select the route-accumulation topology for a captured MoE graph.
+     * @param selection Typed backend, participant, and workload context.
+     * @return One immutable production accumulation policy.
+     *
+     * gfx906 benefits materially from publishing independent route dots for a
+     * small grouped verifier: doing so exposes route-level parallelism while a
+     * compact reducer restores increasing-router-slot FP32 addition order. The
+     * current CUDA kernel already owns an economical deterministic ordered
+     * publication, and multi-participant graphs have a separate canonical
+     * rank-bank lowering, so neither enters this single-device ROCm topology.
+     */
+    [[nodiscard]] constexpr MoERouteAccumulationPolicy
+    selectMoERouteAccumulationPolicy(
+        const MoERouteAccumulationSelection &selection) noexcept
+    {
+        return selection.backend == DeviceType::ROCm &&
+                       selection.participant_count == 1 &&
+                       selection.workload ==
+                           MoERouteAccumulationWorkload::GroupedVerifier
+                   ? MoERouteAccumulationPolicy::
+                         IndependentRouteSlotsThenOrderedFold
+                   : MoERouteAccumulationPolicy::DirectOrderedFold;
+    }
+
+    /**
      * @brief Return the canonical configuration spelling for a compute policy.
      * @param policy Typed compute-distribution value to render.
      * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
@@ -290,6 +371,24 @@ namespace llaminar2
             return "independent-branch-collectives";
         case MoEParticipantPublicationPolicy::CanonicalRootedRankBanks:
             return "canonical-rooted-rank-banks";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the stable diagnostic spelling for route accumulation.
+     * @param policy Typed local route-accumulation contract.
+     * @return Lowercase spelling used by graph diagnostics and PerfStats.
+     */
+    inline const char *moeRouteAccumulationPolicyToString(
+        MoERouteAccumulationPolicy policy)
+    {
+        switch (policy)
+        {
+        case MoERouteAccumulationPolicy::DirectOrderedFold:
+            return "direct-ordered-fold";
+        case MoERouteAccumulationPolicy::IndependentRouteSlotsThenOrderedFold:
+            return "independent-route-slots-then-ordered-fold";
         }
         return "unknown";
     }

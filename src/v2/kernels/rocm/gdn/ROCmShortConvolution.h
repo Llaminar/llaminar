@@ -22,7 +22,9 @@ extern "C"
 {
     bool rocmGDN_short_conv1d(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         float *state_snapshots,
@@ -32,7 +34,9 @@ extern "C"
 
     bool rocmGDN_short_conv1d_effective(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
@@ -43,7 +47,9 @@ extern "C"
 
     bool rocmGDN_short_conv1d_batched(
         const float *input, const float *weight, const float *bias,
-        float *output, float *request_states,
+        float *output,
+        const float *initial_request_states,
+        float *updated_request_states,
         int request_count, int request_seq_len,
         int channels, int kernel_size,
         bool apply_silu,
@@ -61,16 +67,18 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count);
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
-    bool rocmGDN_gpu_copy_capture_row_from_device_index(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_row_from_device_index(
+        float *live_state,
+        float *request_zero_state,
         const float *capture,
         const int *device_row_index,
         int rows,
         int state_size,
         int device_idx,
         void *stream);
-    bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_rows_from_device_indices(
+        float *request_states,
+        float *request_zero_live_state,
         const float *capture,
         const int *device_row_indices,
         int request_count,
@@ -79,8 +87,9 @@ extern "C"
         int state_size,
         int device_idx,
         void *stream);
-    bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
+        float *request_states,
+        float *request_zero_live_state,
         const float *capture,
         const int *device_request_seq_lens,
         int request_count,
@@ -194,8 +203,9 @@ namespace llaminar2
                 return false;
             }
 
-            const bool ok = rocmGDN_gpu_copy_capture_row_from_device_index(
+            const bool ok = rocmGDN_gpu_publish_capture_row_from_device_index(
                 live_state,
+                request_state_bank_,
                 verifier_state_capture_,
                 device_row_index,
                 verifier_state_capture_rows_,
@@ -204,10 +214,7 @@ namespace llaminar2
                 stream);
             if (!ok)
                 return false;
-            return publishLiveStateToRequestZero(
-                live_state,
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
@@ -236,8 +243,9 @@ namespace llaminar2
                 return false;
             }
 
-            if (!rocmGDN_gpu_copy_capture_rows_from_device_indices(
+            if (!rocmGDN_gpu_publish_capture_rows_from_device_indices(
                     request_state_bank_,
+                    stateForSize(verifier_state_capture_size_),
                     verifier_state_capture_,
                     device_row_indices,
                     request_count,
@@ -249,9 +257,7 @@ namespace llaminar2
             {
                 return false;
             }
-            return publishRequestZeroToLiveState(
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool restoreVerifierStateCaptureRequestTerminalRows(
@@ -275,8 +281,9 @@ namespace llaminar2
             {
                 return false;
             }
-            if (!rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+            if (!rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
                     request_state_bank_,
+                    stateForSize(verifier_state_capture_size_),
                     verifier_state_capture_,
                     device_request_seq_lens,
                     request_count,
@@ -288,9 +295,7 @@ namespace llaminar2
             {
                 return false;
             }
-            return publishRequestZeroToLiveState(
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool supportsPaddedPrefillRealLength() const override { return true; }
@@ -322,8 +327,10 @@ namespace llaminar2
                 return false;
 
             rocmGDN_gpu_set_device(device_ordinal_);
-            rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
-            if (secondary_gpu_state_ && secondary_state_size_ > 0)
+            if (gpu_state_ != request_state_bank_)
+                rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+            if (secondary_gpu_state_ && secondary_state_size_ > 0 &&
+                secondary_gpu_state_ != request_state_bank_)
                 rocmGDN_gpu_memset_zero_async(
                     secondary_gpu_state_, secondary_state_size_, stream);
             if (request_state_bank_ && request_state_bank_floats_ > 0)
@@ -349,12 +356,11 @@ namespace llaminar2
                 "ROCmShortConvolution::forward");
             if (!live_state)
                 return false;
-            float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+            float *updated_state =
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
-            if (!effective_state)
+            if (!updated_state)
                 return false;
             float *effective_output = output;
 
@@ -377,7 +383,8 @@ namespace llaminar2
 
             // All pointers are device pointers — pass directly to HIP kernel.
             const bool ok = rocmGDN_short_conv1d(
-                input, weight, bias, effective_output, effective_state,
+                input, weight, bias, effective_output,
+                live_state, updated_state,
                 seq_len, channels, kernel_size, apply_silu,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
@@ -410,12 +417,11 @@ namespace llaminar2
             if (!live_state)
                 return false;
 
-            float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+            float *updated_state =
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
-            if (!effective_state)
+            if (!updated_state)
                 return false;
             float *effective_output = output;
             const bool needs_scratch = (input == output);
@@ -432,7 +438,8 @@ namespace llaminar2
             }
 
             const bool ok = rocmGDN_short_conv1d_effective(
-                input, weight, bias, effective_output, effective_state,
+                input, weight, bias, effective_output,
+                live_state, updated_state,
                 seq_len, channels, kernel_size, apply_silu,
                 device_effective_seq_len,
                 verifier_state_capture_,
@@ -510,25 +517,19 @@ namespace llaminar2
                     static_cast<size_t>(request) *
                     static_cast<size_t>(request_seq_len) *
                     static_cast<size_t>(channels);
-                float *state =
+                float *initial_state =
                     request_state_bank_ +
                     static_cast<size_t>(request) *
                         static_cast<size_t>(required_state_size);
+                float *updated_state = initial_state;
                 float *snapshots = nullptr;
                 int snapshot_rows = 0;
                 if (capture_active)
                 {
-                    float *work_state =
+                    updated_state =
                         speculative_state_work_ +
                         static_cast<size_t>(request) *
                             static_cast<size_t>(required_state_size);
-                    rocmGDN_gpu_memcpy_async(
-                        work_state,
-                        state,
-                        static_cast<size_t>(required_state_size),
-                        stream_);
-                    state = work_state;
-
                     const int snapshot_base = request * request_seq_len;
                     snapshots =
                         verifier_state_capture_ +
@@ -543,7 +544,8 @@ namespace llaminar2
                         weight,
                         bias,
                         effective_output + row_offset,
-                        state,
+                        initial_state,
+                        updated_state,
                         request_seq_len, channels, kernel_size, apply_silu,
                         snapshots,
                         required_state_size,
@@ -598,7 +600,7 @@ namespace llaminar2
                 verifier_state_capture_ != nullptr &&
                 verifier_state_capture_rows_ >= request_count * request_seq_len &&
                 verifier_state_capture_size_ == required_state_size;
-            float *effective_states = request_state_bank_;
+            float *updated_states = request_state_bank_;
             if (capture_active)
             {
                 const int work_floats = request_count * required_state_size;
@@ -608,12 +610,7 @@ namespace llaminar2
                     LOG_ERROR("[ROCmShortConvolution] Grouped verifier requires one speculative state slot per request");
                     return false;
                 }
-                rocmGDN_gpu_memcpy_async(
-                    speculative_state_work_,
-                    request_state_bank_,
-                    static_cast<size_t>(work_floats),
-                    stream_);
-                effective_states = speculative_state_work_;
+                updated_states = speculative_state_work_;
             }
 
             float *effective_output = output;
@@ -632,7 +629,8 @@ namespace llaminar2
 
             if (!rocmGDN_short_conv1d_batched(
                     input, weight, bias,
-                    effective_output, effective_states,
+                    effective_output,
+                    request_state_bank_, updated_states,
                     request_count, request_seq_len,
                     channels, kernel_size, apply_silu,
                     device_request_seq_lens,
@@ -886,8 +884,16 @@ namespace llaminar2
             return bound_scratch_size_;
         }
 
-        float *prepareEffectiveStateForVerifierForward(
-            float *live_state,
+        /**
+         * @brief Resolve the state bank written by the next convolution launch.
+         *
+         * Ordinary execution updates the canonical state in place. Verifier
+         * execution instead writes a transactional bank while reading the
+         * canonical state directly. Keeping source and destination explicit in
+         * the kernel ABI removes the former device-to-device seed copy without
+         * changing convolution arithmetic or accepted-row publication.
+         */
+        float *resolveVerifierStateDestination(
             int required_state_size,
             void *stream)
         {
@@ -896,7 +902,7 @@ namespace llaminar2
                 verifier_state_capture_rows_ > 0 &&
                 verifier_state_capture_size_ == required_state_size;
             if (!verifier_capture_active)
-                return live_state;
+                return stateForSize(required_state_size);
             if (!stream)
             {
                 LOG_ERROR("[ROCmShortConvolution] Speculative verifier state requires an explicit stream");
@@ -911,26 +917,22 @@ namespace llaminar2
                 return nullptr;
             }
 
-            rocmGDN_gpu_memcpy_async(
-                speculative_state_work_,
-                live_state,
-                static_cast<size_t>(required_state_size),
-                stream);
             return speculative_state_work_;
         }
 
         /**
          * @brief Publish scalar live state into request zero on its producer stream.
          *
-         * The stream-ordered copy is captured and replayed as device work;
-         * host-only validity metadata cannot become stale relative to it.
+         * Single-geometry bindings alias scalar state to request zero, making
+         * publication structurally complete with no operation. Distinct
+         * LocalTP geometries enqueue one explicit stream-ordered device copy.
          */
         bool publishLiveStateToRequestZero(
             const float *live_state,
             int live_state_size,
             void *stream) const
         {
-            if (!live_state ||
+            if (!stream || !live_state ||
                 live_state_size <= 0 ||
                 !request_state_bank_ ||
                 request_state_bank_capacity_ <= 0 ||
@@ -944,55 +946,13 @@ namespace llaminar2
                 return false;
             }
 
-            rocmGDN_gpu_set_device(device_ordinal_);
-            if (stream)
-            {
-                rocmGDN_gpu_memcpy_async(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size),
-                    stream);
-            }
-            else
-            {
-                rocmGDN_gpu_memcpy(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size));
-            }
-            return true;
-        }
-
-        /**
-         * @brief Publish accepted request zero back to the scalar live owner.
-         *
-         * The packed bank is authoritative during grouped publication, while
-         * scalar decode and one-request grouped execution consume the stable
-         * scalar allocation. Request zero represents the same sequence in both
-         * layouts, so publish it device-to-device on the exact producer stream.
-         */
-        bool publishRequestZeroToLiveState(
-            int live_state_size,
-            void *stream) const
-        {
-            float *live_state = stateForSize(live_state_size);
-            if (!stream ||
-                !live_state ||
-                !request_state_bank_ ||
-                live_state_size <= 0 ||
-                request_state_bank_floats_ <
-                    static_cast<size_t>(live_state_size))
-            {
-                LOG_ERROR("[ROCmShortConvolution] Cannot publish accepted request-zero conv state"
-                          << " state_size=" << live_state_size
-                          << " request_floats=" << request_state_bank_floats_);
-                return false;
-            }
+            if (live_state == request_state_bank_)
+                return true;
 
             rocmGDN_gpu_set_device(device_ordinal_);
             rocmGDN_gpu_memcpy_async(
-                live_state,
                 request_state_bank_,
+                live_state,
                 static_cast<size_t>(live_state_size),
                 stream);
             return true;

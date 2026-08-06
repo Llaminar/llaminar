@@ -941,15 +941,22 @@ namespace llaminar2
 
     bool CUDAGraphCapture::launch()
     {
-        if (!activateOwner("launch"))
+        return launchOnStream(static_cast<void *>(stream_));
+    }
+
+    bool CUDAGraphCapture::launchOnStream(void *stream) const
+    {
+        if (!activateOwner("launchOnStream"))
             return false;
 
-        if (!exec_)
+        if (!exec_ || !stream)
         {
-            LOG_ERROR("[CUDAGraphCapture] Cannot launch: no instantiated executable");
+            LOG_ERROR("[CUDAGraphCapture] Cannot launch: executable or explicit stream is missing");
             return false;
         }
-        cudaError_t err = cudaGraphLaunch(exec_, stream_);
+        cudaError_t err = cudaGraphLaunch(
+            exec_,
+            static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] cudaGraphLaunch failed: " << cudaGetErrorString(err));

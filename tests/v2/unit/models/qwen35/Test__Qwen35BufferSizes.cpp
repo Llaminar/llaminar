@@ -13,6 +13,7 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 
+#include <algorithm>
 #include <array>
 #include <string_view>
 
@@ -43,6 +44,12 @@ static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
 {
     if (!config.custom_formulas.contains("mtp_target_query_rows"))
         config.custom_formulas["mtp_target_query_rows"] = 4;
+    if (!config.custom_formulas.contains("mtp_kv_prefill_rows"))
+    {
+        config.custom_formulas["mtp_kv_prefill_rows"] = std::max(
+            static_cast<size_t>(std::max(1, config.seq_len)),
+            config.custom_formulas["mtp_target_query_rows"]);
+    }
     config.custom_formulas["mtp_global_gather_rows"] = 1;
     config.custom_formulas["mtp_global_gather_vocab"] = 1;
 }
@@ -254,22 +261,22 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto *mtp_embedding = findBuf(reqs, "mtp_embedding");
     ASSERT_NE(mtp_embedding, nullptr);
-    EXPECT_EQ(mtp_embedding->shape[0], 4u);
+    EXPECT_EQ(mtp_embedding->shape[0], 4096u);
     EXPECT_EQ(mtp_embedding->shape[1], 2560u);
 
     auto *mtp_concat = findBuf(reqs, "mtp_concat");
     ASSERT_NE(mtp_concat, nullptr);
-    EXPECT_EQ(mtp_concat->shape[0], 4u);
+    EXPECT_EQ(mtp_concat->shape[0], 4096u);
     EXPECT_EQ(mtp_concat->shape[1], 5120u);
 
     auto *mtp_q = findBuf(reqs, "mtp_q");
     ASSERT_NE(mtp_q, nullptr);
-    EXPECT_EQ(mtp_q->shape[0], 4u);
+    EXPECT_EQ(mtp_q->shape[0], 4096u);
     EXPECT_EQ(mtp_q->shape[1], 4096u);
 
     auto *mtp_k = findBuf(reqs, "mtp_k");
     ASSERT_NE(mtp_k, nullptr);
-    EXPECT_EQ(mtp_k->shape[0], 4u);
+    EXPECT_EQ(mtp_k->shape[0], 4096u);
     EXPECT_EQ(mtp_k->shape[1], 1024u);
 
     auto *mtp_gate = findBuf(reqs, "mtp_gate");
@@ -289,7 +296,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
         << "Single-device MTP must not reserve a redundant gathered vocabulary.";
 }
 
-TEST(Test__Qwen35BufferSizes, LayerBuffers_AllMTPSidecarRowsScalePastLegacyLimits)
+TEST(Test__Qwen35BufferSizes, LayerBuffers_SeparateVerifierAndIntegratedKVPrefillRows)
 {
     Qwen35SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -347,9 +354,22 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_AllMTPSidecarRowsScalePastLegacyLimit
         const size_t expected_rows =
             std::string_view(name) == "mtp_logits_gathered"
                 ? 1u
-                : target_query_rows;
+                : (std::string_view(name) == "mtp_embedding" ||
+                   std::string_view(name) == "mtp_norm_hidden" ||
+                   std::string_view(name) == "mtp_norm_embedding" ||
+                   std::string_view(name) == "mtp_concat" ||
+                   std::string_view(name) == "mtp_projected" ||
+                   std::string_view(name) == "mtp_q_raw" ||
+                   std::string_view(name) == "mtp_q_gate" ||
+                   std::string_view(name) == "mtp_q" ||
+                   std::string_view(name) == "mtp_k" ||
+                   std::string_view(name) == "mtp_v" ||
+                   std::string_view(name) == "mtp_k_full_prefill" ||
+                   std::string_view(name) == "mtp_v_full_prefill")
+                      ? static_cast<size_t>(config.seq_len)
+                      : target_query_rows;
         EXPECT_EQ(buffer->shape[0], expected_rows)
-            << name << " retained a fixed small-M row capacity";
+            << name << " used the wrong verifier or integrated-prefill row domain";
     }
 }
 
@@ -501,6 +521,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
     config.custom_formulas["mtp_target_query_rows"] = 4;
+    config.custom_formulas["mtp_kv_prefill_rows"] = 4096;
     config.custom_formulas["mtp_global_gather_rows"] = 4;
     config.custom_formulas["mtp_global_gather_vocab"] = 248320;
 

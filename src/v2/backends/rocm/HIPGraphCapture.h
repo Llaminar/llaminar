@@ -25,8 +25,9 @@ namespace llaminar2
     {
     public:
         /// @param stream The HIP stream to capture on. Must remain valid for the
-        ///               lifetime of this object. Typically from AMDDeviceContext::defaultStream().
-        explicit HIPGraphCapture(hipStream_t stream);
+        ///               lifetime of this object.
+        /// @param device_ordinal Immutable ROCm device owning the stream/graph.
+        HIPGraphCapture(hipStream_t stream, int device_ordinal);
         ~HIPGraphCapture() override;
 
         // Move-only (graph handles are not copyable)
@@ -37,6 +38,7 @@ namespace llaminar2
         bool endCapture() override;
         bool instantiate() override;
         bool launch() override;
+        [[nodiscard]] bool launchOnStream(void *stream) const override;
         [[nodiscard]] void *executionStream() const noexcept override
         {
             return static_cast<void *>(stream_);
@@ -57,7 +59,11 @@ namespace llaminar2
         hipGraphExec_t executable() const { return exec_; }
 
     private:
+        /** @brief Select the immutable HIP owner before a runtime operation. */
+        bool activateOwner(const char *operation) const noexcept;
+
         hipStream_t stream_ = nullptr;        ///< Non-owned stream
+        int device_ordinal_ = -1;             ///< Immutable HIP resource owner.
         hipGraph_t graph_ = nullptr;          ///< Captured graph (owned)
         hipGraphExec_t exec_ = nullptr;       ///< Instantiated executable (owned)
         size_t node_count_ = 0;               ///< Cached node count from last capture

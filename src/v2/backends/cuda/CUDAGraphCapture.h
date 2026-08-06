@@ -42,6 +42,7 @@ namespace llaminar2
         bool endCapture() override;
         bool instantiate() override;
         bool launch() override;
+        [[nodiscard]] bool launchOnStream(void *stream) const override;
         [[nodiscard]] bool supportsDeviceControlledWhileLoop() const noexcept override
         {
 #if CUDART_VERSION >= 12030

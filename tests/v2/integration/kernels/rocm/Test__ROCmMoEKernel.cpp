@@ -724,10 +724,11 @@ namespace
         ScopedHipTestGraph(
             int device_ordinal,
             hipStream_t stream,
-            std::string operation)
+            std::string operation,
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr)
             : device_ordinal_(device_ordinal),
-              graph_(stream),
-              transaction_(graph_, std::move(operation))
+              graph_(stream, device_ordinal),
+              transaction_(graph_, std::move(operation), dependency_ledger)
         {
             if (!stream || hipSetDevice(device_ordinal_) != hipSuccess ||
                 !transaction_.begin())
@@ -14963,6 +14964,229 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
               << cosine << " l2_err=" << l2_err << std::endl;
 }
 
+/**
+ * @brief Prove the padded shared-gate epilogue obeys its production capture contract.
+ *
+ * The fused epilogue reads the normalized row, gate vector, shared-expert
+ * contribution, and routed residual. It overwrites the combined tensor without
+ * reading its prior bytes. Production graph dependency planning therefore
+ * declares `shared_output` as an in/out and `combined_output` as a pure output.
+ * This regression installs that exact strict ledger while HIP records the real
+ * effective-length kernel. Reclassifying the combined tensor as an input makes
+ * capture fail before launch, which is the failure that previously stopped the
+ * Qwen3.6 ROCm prefill graph at `layer0_shared_expert_gate`.
+ */
+TEST(Test__ROCmMoEKernel,
+     SharedExpertGateAddEffectiveSeqLenHonorsProductionCaptureLedger)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int bucket_seq_len = 4;
+    constexpr int replay_real_seq_len = 2;
+    constexpr int d_model = 8;
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = rocmMoETestStream();
+
+    std::vector<float> input_values(bucket_seq_len * d_model);
+    std::vector<float> gate_values(d_model);
+    std::vector<float> shared_values(bucket_seq_len * d_model);
+    std::vector<float> residual_values(bucket_seq_len * d_model);
+    for (int i = 0; i < bucket_seq_len * d_model; ++i)
+    {
+        input_values[static_cast<size_t>(i)] =
+            0.03f * static_cast<float>((i % 11) - 5);
+        shared_values[static_cast<size_t>(i)] =
+            -0.7f + 0.04f * static_cast<float>(i);
+        residual_values[static_cast<size_t>(i)] =
+            0.9f - 0.02f * static_cast<float>(i);
+    }
+    for (int i = 0; i < d_model; ++i)
+        gate_values[static_cast<size_t>(i)] =
+            0.025f * static_cast<float>(i - 3);
+
+    auto make_fp32 = [](const std::vector<size_t> &shape,
+                        const std::vector<float> &values)
+    {
+        auto tensor = TestTensorFactory::createFP32(shape);
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+
+    auto input_gpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        input_values);
+    auto gate_gpu = make_fp32({static_cast<size_t>(d_model)}, gate_values);
+    auto shared_gpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        shared_values);
+    auto residual_gpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        residual_values);
+    auto combined_gpu = TestTensorFactory::createFP32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)});
+    std::fill(
+        combined_gpu->mutable_data(),
+        combined_gpu->mutable_data() + combined_gpu->numel(),
+        123.0f);
+
+    auto input_cpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        input_values);
+    auto gate_cpu = make_fp32({static_cast<size_t>(d_model)}, gate_values);
+    auto shared_cpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        shared_values);
+    auto residual_cpu = make_fp32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)},
+        residual_values);
+    auto combined_cpu = TestTensorFactory::createFP32(
+        {static_cast<size_t>(bucket_seq_len), static_cast<size_t>(d_model)});
+    std::fill(
+        combined_cpu->mutable_data(),
+        combined_cpu->mutable_data() + combined_cpu->numel(),
+        0.0f);
+    CPUMoEKernel cpu_kernel;
+    cpu_kernel.sharedExpertGateAddFromTensors(
+        input_cpu.get(), gate_cpu.get(), shared_cpu.get(), residual_cpu.get(),
+        combined_cpu.get(), replay_real_seq_len, d_model);
+
+    ASSERT_TRUE(input_gpu->ensureOnDevice(device, stream));
+    ASSERT_TRUE(gate_gpu->ensureOnDevice(device, stream));
+    ASSERT_TRUE(shared_gpu->ensureOnDevice(device, stream));
+    ASSERT_TRUE(residual_gpu->ensureOnDevice(device, stream));
+    ASSERT_TRUE(combined_gpu->ensureOnDevice(device, stream));
+
+    auto effective_rows = TestTensorFactory::createINT32({1u});
+    effective_rows->mutable_int32_data()[0] = bucket_seq_len;
+    ASSERT_TRUE(effective_rows->ensureOnDevice(device, stream));
+
+    ROCmMoEKernel gpu_kernel(0);
+    bindROCmMoETestStream(gpu_kernel);
+    auto workspace = bindDefaultMoEWorkspace(
+        gpu_kernel,
+        bucket_seq_len,
+        d_model,
+        /*intermediate=*/16,
+        /*num_experts=*/1,
+        /*top_k=*/1);
+
+    // Warmup binds the persistent shared-gate scratch before native capture.
+    ASSERT_TRUE(gpu_kernel.sharedExpertGateAddFromTensorsEffectiveSeqLen(
+        input_gpu.get(), gate_gpu.get(), shared_gpu.get(), residual_gpu.get(),
+        combined_gpu.get(), bucket_seq_len, d_model,
+        static_cast<const int *>(effective_rows->gpu_data_ptr())));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    /*
+     * DeviceGraphExecutor joins every external producer event before native
+     * capture begins. The eager warmup above publishes a fresh generation of
+     * the in/out shared tensor, so this focused harness must perform the same
+     * prejoin explicitly. Capture itself remains free of event insertion and
+     * validates only graph-internal publication edges.
+     */
+    ASSERT_NO_THROW(
+        TransferEngine::requireDeviceInput(shared_gpu.get(), device, stream));
+
+    int gate_stage_identity = 0;
+    std::vector<GraphCaptureDependencyLedger::StagePlan> capture_stages = {{
+        .stage_identity = &gate_stage_identity,
+        .stage_name = "shared_expert_gate_add",
+        .external_inputs = {
+            shared_gpu->transferStorageOwner(),
+        },
+        .outputs = {
+            shared_gpu->transferStorageOwner(),
+            combined_gpu->transferStorageOwner(),
+        },
+    }};
+    GraphCaptureDependencyLedger capture_ledger(
+        device,
+        stream,
+        std::move(capture_stages),
+        "rocm_shared_expert_gate_add_effective_seq_len");
+    ScopedHipTestGraph graph(
+        /*device_ordinal=*/0,
+        stream,
+        "shared-expert gate effective-sequence capture",
+        &capture_ledger);
+    bool captured_gate = false;
+    {
+        ScopedGraphCaptureStage stage_scope(&gate_stage_identity);
+        captured_gate = gpu_kernel.sharedExpertGateAddFromTensorsEffectiveSeqLen(
+            input_gpu.get(), gate_gpu.get(), shared_gpu.get(), residual_gpu.get(),
+            combined_gpu.get(), bucket_seq_len, d_model,
+            static_cast<const int *>(effective_rows->gpu_data_ptr()));
+        stage_scope.complete();
+    }
+    ASSERT_TRUE(captured_gate);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    const int replay_rows = replay_real_seq_len;
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            effective_rows->gpu_data_ptr(),
+            &replay_rows,
+            sizeof(replay_rows),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            shared_gpu->gpu_data_ptr(),
+            shared_values.data(),
+            shared_values.size() * sizeof(float),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    std::vector<float> combined_replay(
+        static_cast<size_t>(bucket_seq_len) * d_model,
+        77.0f);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            combined_gpu->gpu_data_ptr(),
+            combined_replay.data(),
+            combined_replay.size() * sizeof(float),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_TRUE(graph.launch());
+
+    TransferEngine::publishDeviceWrite(shared_gpu, device, stream);
+    TransferEngine::publishDeviceWrite(combined_gpu, device, stream);
+    ASSERT_TRUE(shared_gpu->ensureOnHost(stream));
+    ASSERT_TRUE(combined_gpu->ensureOnHost(stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    for (int row = 0; row < bucket_seq_len; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            const size_t index =
+                static_cast<size_t>(row) * d_model + column;
+            if (row < replay_real_seq_len)
+            {
+                EXPECT_NEAR(
+                    shared_gpu->data()[index],
+                    shared_cpu->data()[index],
+                    1.0e-5f)
+                    << "shared row=" << row << " column=" << column;
+                EXPECT_NEAR(
+                    combined_gpu->data()[index],
+                    combined_cpu->data()[index],
+                    1.0e-5f)
+                    << "combined row=" << row << " column=" << column;
+            }
+            else
+            {
+                EXPECT_EQ(shared_gpu->data()[index], 0.0f)
+                    << "shared padded row=" << row << " column=" << column;
+                EXPECT_EQ(combined_gpu->data()[index], 0.0f)
+                    << "combined padded row=" << row << " column=" << column;
+            }
+        }
+    }
+}
+
 TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows)
 {
     SKIP_IF_NO_ROCM();
@@ -21365,6 +21589,23 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
 
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
+    ROCmMoEKernel shared_moe_kernel(0);
+    static_cast<ITensorKernel &>(shared_moe_kernel).setGPUStream(stream);
+
+    /*
+     * Production gives the routed and shared expert stages independent kernel
+     * instances.  The only state shared between them is this graph-owned Q8
+     * activation publication, so the sweep cannot accidentally pass by reading
+     * private router state from a single reused kernel object.
+     */
+    auto router_q8_publication =
+        std::make_shared<MoERouterQ8HiddenPublication>();
+    ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+        router_q8_publication,
+        MoERouterQ8PublicationAccess::ProducerAndConsumer));
+    ASSERT_TRUE(shared_moe_kernel.bindRouterQ8HiddenPublication(
+        router_q8_publication,
+        MoERouterQ8PublicationAccess::RequiredConsumer));
 
     /*
      * Mirror the graph resolver's arena-owned scratch contract.  The same
@@ -21406,6 +21647,9 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
          * but not byte-identical to the serial decode path.
          */
         params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+        if (grouped_verifier)
+            params.required_router_q8_publication =
+                router_q8_publication;
         params.force_decode_equivalent_verifier_prefill = false;
         params.disable_grouped_decode_shortcut = false;
         params.prepared_ref_gate = prepared.gate_ref;
@@ -21419,7 +21663,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
     {
         auto stage = std::make_unique<SharedExpertFFNStage>(params);
         stage->setGPUStream(stream);
-        stage->setMoEKernelForTesting(&moe_kernel);
+        stage->setMoEKernelForTesting(&shared_moe_kernel);
         return stage;
     };
 
@@ -21456,6 +21700,10 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
     auto *moe_workspace = dynamic_cast<IWorkspaceConsumer *>(&moe_kernel);
     ASSERT_NE(moe_workspace, nullptr);
     moe_workspace->bindWorkspace(stage_workspace.get());
+    auto *shared_moe_workspace =
+        dynamic_cast<IWorkspaceConsumer *>(&shared_moe_kernel);
+    ASSERT_NE(shared_moe_workspace, nullptr);
+    shared_moe_workspace->bindWorkspace(stage_workspace.get());
 
     /*
      * Qwen3.6 routes against 256 experts with top-k 8.  The shared expert does
@@ -22927,8 +23175,8 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         reduce_params.seq_len = 1;
         reduce_params.top_k = top_k;
         reduce_params.d_model = d_model;
-        reduce_params.participant_device_index = 0;
-        reduce_params.root_device_index = 0;
+        reduce_params.reduction_role =
+            MoECanonicalRouteReductionRole::RootOwner;
         MoECanonicalRouteReduceStage reduce_stage(std::move(reduce_params));
         reduce_stage.setGPUStream(stream);
         ASSERT_TRUE(reduce_stage.execute(&context))
@@ -24997,7 +25245,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
     auto captured_runtime_output = TestTensorFactory::createFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(captured_runtime_output->ensureOnDevice(device, stream));
-    HIPGraphCapture capture(stream);
+    HIPGraphCapture capture(stream, /*device_ordinal=*/0);
     ScopedBackendGraphCapture capture_transaction(
         capture,
         "ROCm real-weight routed verifier complete-plan capture");

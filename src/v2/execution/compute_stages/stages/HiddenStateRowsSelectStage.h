@@ -62,6 +62,10 @@ namespace llaminar2
          * next contiguous shifted-prefill range from canonical device KV counts
          * and the same resident request geometry. Both policies preserve full
          * device ownership and remain stable across captured graph replay.
+         * `ShiftedPrefillTransaction` is the production prefill policy: it packs
+         * the complete bucket-wide depth-zero payload and archives each request
+         * terminal in one stage so the following MTP graph can remain part of
+         * the same native capture.
          */
         enum class DeviceRowIndexSource
         {
@@ -71,6 +75,7 @@ namespace llaminar2
             ExternalDeviceIndices,
             RequestTerminalLengths,
             ShiftedPrefillKVProgress,
+            ShiftedPrefillTransaction,
         };
 
         /**
@@ -115,6 +120,20 @@ namespace llaminar2
             const int32_t *main_cached_tokens_device = nullptr; ///< Canonical main-KV count for ShiftedPrefillKVProgress.
             const int32_t *shifted_cached_tokens_device = nullptr; ///< Canonical shifted-MTP KV count for ShiftedPrefillKVProgress.
             int request_index = -1; ///< Immutable request row selected by ShiftedPrefillKVProgress.
+
+            /** @name Graph-integrated shifted-prefill transaction bindings */
+            ///@{
+            const int32_t *input_token_ids_device = nullptr; ///< Admitted request tokens read after main forward.
+            const int32_t *input_position_ids_device = nullptr; ///< Admitted absolute request positions.
+            int32_t *shifted_token_ids_output_device = nullptr; ///< Packed depth-zero condition tokens.
+            int32_t *shifted_position_ids_output_device = nullptr; ///< Packed positions paired with condition tokens.
+            int32_t *shifted_append_lengths_output_device = nullptr; ///< One real shifted append width per request.
+            TensorBase *terminal_hidden_archive = nullptr; ///< Persistent prior/next terminal row per request.
+            std::vector<const int32_t *> main_cached_tokens_by_request; ///< Canonical main-KV count addresses.
+            std::vector<const int32_t *> shifted_cached_tokens_by_request; ///< Canonical shifted-KV count addresses.
+            int request_count = 0; ///< Fixed request count represented by this graph.
+            std::optional<BufferId> terminal_hidden_archive_buffer_id; ///< Arena identity of terminal_hidden_archive.
+            ///@}
         };
 
         explicit HiddenStateRowsSelectStage(Params params);

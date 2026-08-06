@@ -2252,10 +2252,40 @@ namespace llaminar2
 
     void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_rows_ = 0;
-        router_q8_hidden_valid_ = false;
-        router_q8_hidden_capture_recorded_ = false;
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::ProducerAndConsumer &&
+            router_q8_hidden_publication_)
+        {
+            router_q8_hidden_publication_->clearPayload();
+        }
+    }
+
+    bool ROCmMoEKernel::bindRouterQ8HiddenPublication(
+        std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+        MoERouterQ8PublicationAccess access)
+    {
+        if (!publication)
+        {
+            LOG_ERROR("[ROCmMoEKernel::bindRouterQ8HiddenPublication] null publication");
+            return false;
+        }
+        if (publication->device_ordinal >= 0 &&
+            (publication->backend != DeviceType::ROCm ||
+             publication->device_ordinal != device_ordinal_))
+        {
+            LOG_ERROR("[ROCmMoEKernel::bindRouterQ8HiddenPublication] device mismatch"
+                      << " publication_backend="
+                      << static_cast<int>(publication->backend)
+                      << " publication_ordinal=" << publication->device_ordinal
+                      << " kernel_ordinal=" << device_ordinal_);
+            return false;
+        }
+
+        publication->backend = DeviceType::ROCm;
+        publication->device_ordinal = device_ordinal_;
+        router_q8_hidden_publication_ = std::move(publication);
+        router_q8_publication_access_ = access;
+        return true;
     }
 
     void ROCmMoEKernel::publishRouterQ8Hidden(
@@ -2263,6 +2293,13 @@ namespace llaminar2
         int rows,
         bool recorded_during_capture) noexcept
     {
+        if (router_q8_publication_access_ !=
+                MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_)
+        {
+            LOG_ERROR("[ROCmMoEKernel::publishRouterQ8Hidden] consumer-only kernel attempted publication");
+            return;
+        }
         if (!source || rows <= 0 ||
             rows > router_q8_hidden_rows_cap_ ||
             !d_router_q8_hidden_ || !d_router_q8_hidden_scales_)
@@ -2271,10 +2308,17 @@ namespace llaminar2
             return;
         }
 
-        router_q8_hidden_source_ = source;
-        router_q8_hidden_rows_ = rows;
-        router_q8_hidden_valid_ = true;
-        router_q8_hidden_capture_recorded_ = recorded_during_capture;
+        auto &publication = *router_q8_hidden_publication_;
+        publication.backend = DeviceType::ROCm;
+        publication.device_ordinal = device_ordinal_;
+        publication.source_rows = source;
+        publication.quantized_rows = d_router_q8_hidden_;
+        publication.row_scales = d_router_q8_hidden_scales_;
+        publication.published_rows = rows;
+        publication.d_model_capacity = router_q8_hidden_d_model_cap_;
+        publication.blocks_per_row_capacity =
+            router_q8_hidden_blocks_cap_;
+        publication.capture_recorded = recorded_during_capture;
     }
 
     bool ROCmMoEKernel::canReuseRouterQ8Hidden(
@@ -2283,15 +2327,18 @@ namespace llaminar2
         int d_model) const noexcept
     {
         if (!debugEnv().rocm.moe_reuse_router_q8_hidden ||
-            !router_q8_hidden_valid_ ||
-            router_q8_hidden_source_ != source ||
-            router_q8_hidden_rows_ < rows ||
-            router_q8_hidden_rows_cap_ < rows ||
+            !router_q8_hidden_publication_ ||
             rows <= 0 ||
             d_model <= 0 ||
-            router_q8_hidden_d_model_cap_ < d_model ||
-            router_q8_hidden_blocks_cap_ < ((d_model + 31) / 32) ||
-            !d_router_q8_hidden_ || !d_router_q8_hidden_scales_)
+            router_q8_hidden_publication_->backend != DeviceType::ROCm ||
+            router_q8_hidden_publication_->device_ordinal != device_ordinal_ ||
+            router_q8_hidden_publication_->source_rows != source ||
+            router_q8_hidden_publication_->published_rows < rows ||
+            router_q8_hidden_publication_->d_model_capacity < d_model ||
+            router_q8_hidden_publication_->blocks_per_row_capacity <
+                ((d_model + 31) / 32) ||
+            !router_q8_hidden_publication_->quantized_rows ||
+            !router_q8_hidden_publication_->row_scales)
         {
             return false;
         }
@@ -2302,7 +2349,8 @@ namespace llaminar2
          * recorded kernels have not materialized bytes, so only an eager
          * publication may be reused by eager expert decode.
          */
-        return !router_q8_hidden_capture_recorded_ || isDecodeGraphCaptureActive();
+        return !router_q8_hidden_publication_->capture_recorded ||
+               isDecodeGraphCaptureActive();
     }
 
     const ROCmMoEKernel::RouterQ8GateCacheEntry *ROCmMoEKernel::getOrCreateQ8RouterGateCache(
@@ -5766,7 +5814,7 @@ namespace llaminar2
             !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensors") ||
             !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensors") ||
             !requireTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensors") ||
-            !requireTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensors"))
+            !requireOutputOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensors"))
             return;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -5813,7 +5861,7 @@ namespace llaminar2
             !requireTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
             !requireTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
             !requireTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
-            !requireTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
+            !requireOutputOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
             return false;
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -9680,6 +9728,16 @@ namespace llaminar2
         }
         const bool reuse_router_q8_hidden =
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::RequiredConsumer &&
+            !reuse_router_q8_hidden)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] required "
+                      "router Q8 publication is unavailable"
+                      << " rows=" << seq_len
+                      << " d_model=" << d_model);
+            return false;
+        }
         /*
          * Ordered publication is the sole grouped-prefill contract. One lane
          * owns each token/column and accumulates routes in top-k order. Small
@@ -9704,8 +9762,12 @@ namespace llaminar2
         // Launch the fixed, fully grouped pipeline without a host synchronization.
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
-            reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
-            reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->quantized_rows
+                : nullptr,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->row_scales
+                : nullptr,
             gateup_table.device_gate_descs,
             gateup_table.device_up_descs,
             down_table.device_descs,

@@ -466,7 +466,7 @@ public:
         return true;
     }
 
-    bool copyDeviceSpeculativeOutcomesToHost(
+    bool copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes) override
     {
@@ -6246,7 +6246,7 @@ TEST_F(Test__RankOrchestrator,
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 0u);
 
     DeviceSpeculativeVerifyBatchOutcome materialized;
-    ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
+    ASSERT_TRUE(orchestrator->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         handle,
         &materialized));
     EXPECT_TRUE(materialized.ok);
@@ -6497,7 +6497,7 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferr
     ASSERT_TRUE(handle.valid());
 
     DeviceSpeculativeVerifyBatchOutcome materialized;
-    ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
+    ASSERT_TRUE(orchestrator->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         handle,
         &materialized));
     EXPECT_TRUE(materialized.ok);
@@ -6687,7 +6687,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesEveryPar
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 2u);
 
     DeviceSpeculativeVerifyBatchOutcome materialized;
-    ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
+    ASSERT_TRUE(orchestrator->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         handle,
         &materialized));
     EXPECT_TRUE(materialized.ok);

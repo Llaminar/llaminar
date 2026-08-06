@@ -138,6 +138,23 @@ namespace llaminar2
                 moe_kernel_ = owned_moe_kernel_.get();
             }
         }
+
+        if (params_.device_id.is_gpu() &&
+            params_.routed_pipeline_kernel_owner)
+        {
+            const auto &publication =
+                params_.routed_pipeline_kernel_owner->router_q8_publication;
+            if (!moe_kernel_ ||
+                !moe_kernel_->bindRouterQ8HiddenPublication(
+                    publication,
+                    MoERouterQ8PublicationAccess::ProducerAndConsumer))
+            {
+                LOG_ERROR("[MoERoutingStage] Failed to bind the graph-local "
+                          "router Q8 publication on "
+                          << params_.device_id.to_string());
+                return nullptr;
+            }
+        }
         auto *kernel = bindStageStream(moe_kernel_);
         if (bound_workspace_)
         {
@@ -1085,18 +1102,32 @@ namespace llaminar2
         return info;
     }
 
-    WorkspaceRequirements MoERoutingStage::getWorkspaceRequirements(int, int, int) const
+    WorkspaceRequirements MoERoutingStage::getWorkspaceRequirements(
+        int m,
+        int,
+        int) const
     {
         if (!params_.device_id.is_cuda() && !params_.device_id.is_rocm())
             return WorkspaceRequirements{};
+
+        /*
+         * A stage's tensors describe one concrete graph bucket, whereas `m`
+         * describes the stable-address envelope shared by the complete serial
+         * graph family.  Neither may weaken the other.  In particular, the
+         * server can first capture a 39-row chat request and then admit a
+         * 68-row multi-turn request; using only `params_.seq_len` would publish
+         * 39 rows of router storage and make the second request impossible.
+         */
+        const int workspace_rows =
+            std::max({1, m, params_.seq_len});
         WorkspaceRequirements reqs =
             params_.device_id.is_rocm()
                 ? MoEWorkspaceBuffers::rocmRouting(
-                      params_.seq_len,
+                      workspace_rows,
                       params_.d_model,
                       params_.num_experts)
                 : MoEWorkspaceBuffers::cudaRouting(
-                      params_.seq_len,
+                      workspace_rows,
                       params_.d_model,
                       params_.num_experts);
 

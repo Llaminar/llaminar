@@ -24,6 +24,8 @@
 #include <hip/hip_runtime.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -1167,6 +1169,266 @@ TEST(Test__ROCmHiddenStateRowSelectStage,
     EXPECT_EQ(hipFree(stride_device), hipSuccess);
     EXPECT_EQ(hipFree(main_count_device), hipSuccess);
     EXPECT_EQ(hipFree(shifted_count_device), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Prove the graph-integrated shifted-prefill transaction on HIP.
+ *
+ * The first replay covers a fresh request, where the shifted cache consumes
+ * every main-prefill row except the terminal row. The second replay covers a
+ * continuation segment, where the archived terminal row bridges the prior and
+ * current segments. Keeping both transitions in one captured graph verifies
+ * that live cache counters and admitted request geometry remain device-owned.
+ */
+TEST(Test__ROCmHiddenStateRowSelectStage,
+     CapturedShiftedPrefillTransactionIsExactAcrossInitialAndBridgeSegments)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int captured_rows = 8;
+    constexpr int d_model = 32;
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(captured_rows, d_model, device, stream);
+    auto packed = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{captured_rows, d_model},
+        DeviceId::cpu());
+    auto archive = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, d_model},
+        DeviceId::cpu());
+    std::fill(
+        packed->mutable_data(),
+        packed->mutable_data() + packed->numel(),
+        0.0f);
+    std::fill(
+        archive->mutable_data(),
+        archive->mutable_data() + archive->numel(),
+        -1.0f);
+    ASSERT_TRUE(packed->allocateOnDevice(device, stream));
+    ASSERT_TRUE(archive->ensureOnDevice(device, stream));
+
+    int32_t *input_tokens = nullptr;
+    int32_t *input_positions = nullptr;
+    int32_t *shifted_tokens = nullptr;
+    int32_t *shifted_positions = nullptr;
+    int32_t *append_lengths = nullptr;
+    int32_t *request_lengths = nullptr;
+    int32_t *request_stride = nullptr;
+    int32_t *main_count = nullptr;
+    int32_t *shifted_count = nullptr;
+    const size_t row_bytes = captured_rows * sizeof(int32_t);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&input_tokens), row_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&input_positions), row_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&shifted_tokens), row_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&shifted_positions), row_bytes), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&append_lengths), sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&request_lengths), sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&request_stride), sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&main_count), sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&shifted_count), sizeof(int32_t)), hipSuccess);
+
+    const auto upload_rows = [&](const std::array<int32_t, captured_rows> &tokens,
+                                 const std::array<int32_t, captured_rows> &positions,
+                                 int32_t length,
+                                 int32_t stride,
+                                 int32_t main_tokens,
+                                 int32_t shifted_tokens_count)
+    {
+        ASSERT_EQ(hipMemcpyAsync(input_tokens, tokens.data(), row_bytes,
+                                 hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(input_positions, positions.data(), row_bytes,
+                                 hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(request_lengths, &length, sizeof(int32_t),
+                                 hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(request_stride, &stride, sizeof(int32_t),
+                                 hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(main_count, &main_tokens, sizeof(int32_t),
+                                 hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(shifted_count, &shifted_tokens_count,
+                                 sizeof(int32_t), hipMemcpyHostToDevice,
+                                 stream), hipSuccess);
+    };
+
+    const std::array<int32_t, captured_rows> initial_tokens{1, 2, 3, 4, 5, 0, 0, 0};
+    const std::array<int32_t, captured_rows> initial_positions{10, 11, 12, 13, 14, 0, 0, 0};
+    upload_rows(initial_tokens, initial_positions,
+                /*length=*/5, /*stride=*/5,
+                /*main_tokens=*/5, /*shifted_tokens_count=*/0);
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = packed.get();
+    params.seq_len = captured_rows;
+    params.d_model = d_model;
+    params.selected_row_count = captured_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            ShiftedPrefillTransaction;
+    params.request_sequence_lengths_device = request_lengths;
+    params.request_row_stride_source =
+        HiddenStateRowsSelectStage::RequestRowStrideSource::
+            ExternalDeviceScalar;
+    params.request_row_stride_device = request_stride;
+    params.input_token_ids_device = input_tokens;
+    params.input_position_ids_device = input_positions;
+    params.shifted_token_ids_output_device = shifted_tokens;
+    params.shifted_position_ids_output_device = shifted_positions;
+    params.shifted_append_lengths_output_device = append_lengths;
+    params.terminal_hidden_archive = archive.get();
+    params.main_cached_tokens_by_request = {main_count};
+    params.shifted_cached_tokens_by_request = {shifted_count};
+    params.request_count = 1;
+    params.terminal_hidden_archive_buffer_id =
+        BufferId::PREFIX_TERMINAL_HIDDEN;
+    HiddenStateRowsSelectStage stage(std::move(params));
+    stage.setGPUStream(stream);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+                  hipSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    size_t graph_node_count = 0;
+    ASSERT_EQ(
+        hipGraphGetNodes(graph, nullptr, &graph_node_count),
+        hipSuccess);
+    EXPECT_EQ(graph_node_count, 1U)
+        << "The shifted-prefill payload and terminal archive must remain one fused transaction";
+    ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+              hipSuccess);
+
+    const auto download_transaction = [&]()
+    {
+        struct Result
+        {
+            std::vector<float> hidden;
+            std::array<int32_t, captured_rows> tokens{};
+            std::array<int32_t, captured_rows> positions{};
+            std::array<float, d_model> archive{};
+            int32_t append_length = -1;
+        } result;
+        result.hidden.resize(
+            static_cast<size_t>(captured_rows) * d_model);
+        EXPECT_EQ(hipMemcpyAsync(result.hidden.data(), packed->gpu_data_ptr(),
+                                 result.hidden.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream), hipSuccess);
+        EXPECT_EQ(hipMemcpyAsync(result.tokens.data(), shifted_tokens, row_bytes,
+                                 hipMemcpyDeviceToHost, stream), hipSuccess);
+        EXPECT_EQ(hipMemcpyAsync(result.positions.data(), shifted_positions, row_bytes,
+                                 hipMemcpyDeviceToHost, stream), hipSuccess);
+        EXPECT_EQ(hipMemcpyAsync(&result.append_length, append_lengths,
+                                 sizeof(int32_t), hipMemcpyDeviceToHost,
+                                 stream), hipSuccess);
+        EXPECT_EQ(hipMemcpyAsync(result.archive.data(), archive->gpu_data_ptr(),
+                                 d_model * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream), hipSuccess);
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        return result;
+    };
+
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    const auto initial = download_transaction();
+    EXPECT_EQ(initial.append_length, 4);
+    EXPECT_EQ(initial.tokens,
+              (std::array<int32_t, captured_rows>{2, 3, 4, 5, 0, 0, 0, 0}));
+    EXPECT_EQ(initial.positions,
+              (std::array<int32_t, captured_rows>{11, 12, 13, 14, 0, 0, 0, 0}));
+    for (int row = 0; row < captured_rows; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            const float expected = row < 4
+                                       ? hidden->data()[static_cast<size_t>(row) * d_model + column]
+                                       : 0.0f;
+            EXPECT_FLOAT_EQ(initial.hidden[static_cast<size_t>(row) * d_model + column], expected);
+        }
+    }
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(initial.archive[static_cast<size_t>(column)],
+                        hidden->data()[static_cast<size_t>(4) * d_model + column]);
+    }
+
+    std::vector<float> continuation_hidden(
+        static_cast<size_t>(captured_rows) * d_model,
+        0.0f);
+    for (int row = 0; row < 3; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            continuation_hidden[static_cast<size_t>(row) * d_model + column] =
+                1000.0f + 10.0f * row + 0.125f * column;
+        }
+    }
+    ASSERT_EQ(hipMemcpyAsync(hidden->gpu_data_ptr(), continuation_hidden.data(),
+                             continuation_hidden.size() * sizeof(float),
+                             hipMemcpyHostToDevice, stream), hipSuccess);
+    const std::array<int32_t, captured_rows> bridge_tokens{6, 7, 8, 0, 0, 0, 0, 0};
+    const std::array<int32_t, captured_rows> bridge_positions{15, 16, 17, 0, 0, 0, 0, 0};
+    upload_rows(bridge_tokens, bridge_positions,
+                /*length=*/3, /*stride=*/3,
+                /*main_tokens=*/8, /*shifted_tokens_count=*/4);
+
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    const auto bridge = download_transaction();
+    EXPECT_EQ(bridge.append_length, 3);
+    EXPECT_EQ(bridge.tokens,
+              (std::array<int32_t, captured_rows>{6, 7, 8, 0, 0, 0, 0, 0}));
+    EXPECT_EQ(bridge.positions,
+              (std::array<int32_t, captured_rows>{15, 16, 17, 0, 0, 0, 0, 0}));
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(column)],
+            initial.archive[static_cast<size_t>(column)]);
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(d_model) + column],
+            continuation_hidden[static_cast<size_t>(column)]);
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(2 * d_model) + column],
+            continuation_hidden[static_cast<size_t>(d_model) + column]);
+        EXPECT_FLOAT_EQ(
+            bridge.archive[static_cast<size_t>(column)],
+            continuation_hidden[static_cast<size_t>(2 * d_model) + column]);
+    }
+    for (int row = 3; row < captured_rows; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            EXPECT_FLOAT_EQ(
+                bridge.hidden[static_cast<size_t>(row) * d_model + column],
+                0.0f);
+        }
+    }
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipFree(input_tokens), hipSuccess);
+    EXPECT_EQ(hipFree(input_positions), hipSuccess);
+    EXPECT_EQ(hipFree(shifted_tokens), hipSuccess);
+    EXPECT_EQ(hipFree(shifted_positions), hipSuccess);
+    EXPECT_EQ(hipFree(append_lengths), hipSuccess);
+    EXPECT_EQ(hipFree(request_lengths), hipSuccess);
+    EXPECT_EQ(hipFree(request_stride), hipSuccess);
+    EXPECT_EQ(hipFree(main_count), hipSuccess);
+    EXPECT_EQ(hipFree(shifted_count), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }

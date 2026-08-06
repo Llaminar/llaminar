@@ -617,9 +617,10 @@ namespace
         ScopedCudaTestGraph(
             cudaStream_t stream,
             std::string operation,
-            int device_ordinal = 0)
+            int device_ordinal = 0,
+            llaminar2::GraphCaptureDependencyLedger *dependency_ledger = nullptr)
             : graph_(stream, device_ordinal),
-              transaction_(graph_, std::move(operation))
+              transaction_(graph_, std::move(operation), dependency_ledger)
         {
             if (!transaction_.begin())
             {
@@ -17138,6 +17139,17 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
              */
             llaminar2::CUDAMoEKernel moe_kernel(0);
             static_cast<llaminar2::ITensorKernel &>(moe_kernel).setGPUStream(stream_);
+            llaminar2::CUDAMoEKernel shared_moe_kernel(0);
+            static_cast<llaminar2::ITensorKernel &>(shared_moe_kernel)
+                .setGPUStream(stream_);
+            auto router_q8_publication =
+                std::make_shared<llaminar2::MoERouterQ8HiddenPublication>();
+            ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                router_q8_publication,
+                llaminar2::MoERouterQ8PublicationAccess::ProducerAndConsumer));
+            ASSERT_TRUE(shared_moe_kernel.bindRouterQ8HiddenPublication(
+                router_q8_publication,
+                llaminar2::MoERouterQ8PublicationAccess::RequiredConsumer));
 
             /*
              * Mirror the graph resolver's arena-owned scratch contract.  These
@@ -17174,6 +17186,9 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                 params.d_model = d_model;
                 params.intermediate = intermediate;
                 params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+                if (grouped_verifier)
+                    params.required_router_q8_publication =
+                        router_q8_publication;
                 params.force_decode_equivalent_verifier_prefill = false;
                 params.disable_grouped_decode_shortcut = false;
                 params.prepared_ref_gate = prepared.gate_ref;
@@ -17187,7 +17202,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
             {
                 auto stage = std::make_unique<llaminar2::SharedExpertFFNStage>(params);
                 stage->setGPUStream(stream_);
-                stage->setMoEKernelForTesting(&moe_kernel);
+                stage->setMoEKernelForTesting(&shared_moe_kernel);
                 return stage;
             };
 
@@ -17231,6 +17246,11 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                 dynamic_cast<llaminar2::IWorkspaceConsumer *>(&moe_kernel);
             ASSERT_NE(moe_workspace_consumer, nullptr);
             moe_workspace_consumer->bindWorkspace(stage_workspace.get());
+            auto *shared_workspace_consumer =
+                dynamic_cast<llaminar2::IWorkspaceConsumer *>(
+                    &shared_moe_kernel);
+            ASSERT_NE(shared_workspace_consumer, nullptr);
+            shared_workspace_consumer->bindWorkspace(stage_workspace.get());
 
             llaminar2::DeviceNativeVNNIMatrixDesc serial_gate_desc{};
             llaminar2::DeviceNativeVNNIMatrixDesc serial_up_desc{};
@@ -17797,13 +17817,38 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAc
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
+    int gate_stage_identity = 0;
+    std::vector<llaminar2::GraphCaptureDependencyLedger::StagePlan>
+        capture_stages = {{
+        .stage_identity = &gate_stage_identity,
+        .stage_name = "shared_expert_gate_add",
+        .external_inputs = {
+            shared_cuda->transferStorageOwner(),
+        },
+        .outputs = {
+            shared_cuda->transferStorageOwner(),
+            combined_cuda->transferStorageOwner(),
+        },
+    }};
+    llaminar2::GraphCaptureDependencyLedger capture_ledger(
+        device,
+        stream_,
+        std::move(capture_stages),
+        "cuda_shared_expert_gate_add_effective_seq_len");
     ScopedCudaTestGraph graph(
         stream_,
-        "shared-expert gate effective-sequence capture");
-    const bool captured_gate = cuda_kernel_->sharedExpertGateAddFromTensorsEffectiveSeqLen(
-        input_cuda.get(), gate_cuda.get(), shared_cuda.get(),
-        residual_cuda.get(), combined_cuda.get(),
-        bucket_seq_len, d_model, device_effective_seq_len);
+        "shared-expert gate effective-sequence capture",
+        /*device_ordinal=*/0,
+        &capture_ledger);
+    bool captured_gate = false;
+    {
+        llaminar2::ScopedGraphCaptureStage stage_scope(&gate_stage_identity);
+        captured_gate = cuda_kernel_->sharedExpertGateAddFromTensorsEffectiveSeqLen(
+            input_cuda.get(), gate_cuda.get(), shared_cuda.get(),
+            residual_cuda.get(), combined_cuda.get(),
+            bucket_seq_len, d_model, device_effective_seq_len);
+        stage_scope.complete();
+    }
     EXPECT_TRUE(captured_gate);
     ASSERT_TRUE(graph.finishAndInstantiate());
 
@@ -17835,6 +17880,10 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAc
                               stream_),
               cudaSuccess);
     ASSERT_TRUE(graph.launch());
+    llaminar2::TransferEngine::publishDeviceWrite(shared_cuda, device, stream_);
+    llaminar2::TransferEngine::publishDeviceWrite(combined_cuda, device, stream_);
+    ASSERT_TRUE(shared_cuda->ensureOnHost(stream_));
+    ASSERT_TRUE(combined_cuda->ensureOnHost(stream_));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const float *shared_actual = shared_cuda->data();
@@ -22510,8 +22559,8 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             reduce_params.seq_len = 1;
             reduce_params.top_k = top_k;
             reduce_params.d_model = d_model;
-            reduce_params.participant_device_index = 0;
-            reduce_params.root_device_index = 0;
+            reduce_params.reduction_role =
+                llaminar2::MoECanonicalRouteReductionRole::RootOwner;
             llaminar2::MoECanonicalRouteReduceStage reduce_stage(
                 std::move(reduce_params));
             reduce_stage.setGPUStream(stream_);

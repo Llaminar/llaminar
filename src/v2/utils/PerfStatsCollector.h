@@ -40,11 +40,41 @@ namespace llaminar2
         using Tags = std::map<std::string, std::string>;
         using Clock = std::chrono::steady_clock;
 
+        /**
+         * @brief Exact record family retained across a measurement reset.
+         *
+         * Domain-only retention is appropriate for wholly setup-owned domains
+         * such as graph kernel inventory. Mixed domains need a narrower key:
+         * graph capture evidence and measured replay counters both live in
+         * `forward_graph`, and retaining that complete domain would contaminate
+         * the benchmark window with warmup runtime activity.
+         */
+        struct RecordFamily
+        {
+            std::string domain; ///< Exact PerfStats domain.
+            std::string name;   ///< Exact counter/timer name within the domain.
+        };
+
         static bool isEnabled();
         static bool gpuStageEventTimingEnabled();
         static void reset();
         static void resetPreservingDomains(
             const std::vector<std::string> &domains_to_preserve);
+
+        /**
+         * @brief Reset measured evidence while retaining named setup records.
+         *
+         * A record survives when either its complete domain appears in
+         * `domains_to_preserve` or its exact `(domain, name)` pair appears in
+         * `record_families_to_preserve`. Tags, phase, device, count, and timing
+         * aggregates remain intact for surviving records.
+         *
+         * @param domains_to_preserve Complete domains owned by immutable setup.
+         * @param record_families_to_preserve Exact families from mixed domains.
+         */
+        static void resetPreserving(
+            const std::vector<std::string> &domains_to_preserve,
+            const std::vector<RecordFamily> &record_families_to_preserve);
 
         static void addCounter(
             std::string domain,

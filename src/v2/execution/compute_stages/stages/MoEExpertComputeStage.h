@@ -829,7 +829,24 @@ namespace llaminar2
         // =====================================================================
         // IWorkspaceConsumer Implementation
         // =====================================================================
-        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        /**
+         * @brief Declare routed-expert scratch for the complete row envelope.
+         *
+         * The planner-supplied @p m may cover more rows than this concrete
+         * stage instance because one stable workspace backs every serial
+         * prefill bucket, decode graph, and grouped verifier graph.  The stage
+         * sizes both its MoE-owned buffers and every nested GEMM workspace for
+         * the maximum of that family envelope and its concrete `seq_len`.
+         *
+         * @param m Maximum rows declared by the graph-family planner.
+         * @param n Optional output-width hint forwarded to prepared GEMMs.
+         * @param k Optional input-width hint forwarded to prepared GEMMs.
+         * @return Complete routed-expert and projection workspace requirements.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
         bool hasWorkspace() const override;
@@ -1304,6 +1321,16 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
             /**
+             * @brief Required router-owned Q8 rows for GPU grouped verification.
+             *
+             * This object exposes only immutable capture-time row addresses;
+             * the shared expert retains a private MoE kernel and private
+             * grouping scratch. A grouped GPU verifier must provide it and
+             * execution fails hard if its exact source/geometry is absent.
+             */
+            std::shared_ptr<MoERouterQ8HiddenPublication>
+                required_router_q8_publication;
+            /**
              * @brief Bypass normal grouped decode shortcuts for verifier replay.
              *
              * Decode-equivalent verifier publication needs a stable one-row
@@ -1407,11 +1434,32 @@ namespace llaminar2
         bool usesDecodeEquivalentVerifierPrefillForTesting() const;
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const;
         bool usesGroupedDecodeForTesting() const;
+        /** @brief Test whether grouped execution requires a router Q8 publication. */
+        bool requiresRouterQ8PublicationForTesting() const
+        {
+            return params_.required_router_q8_publication != nullptr;
+        }
 
         // =====================================================================
         // IWorkspaceConsumer Implementation
         // =====================================================================
-        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        /**
+         * @brief Declare shared-expert scratch for the complete row envelope.
+         *
+         * Grouped shared-expert execution owns MoE metadata in addition to its
+         * three GEMM workspaces.  All of those buffers use the maximum of the
+         * concrete stage rows and the planner's serial-family rows so captured
+         * graph addresses remain valid across request-shape changes.
+         *
+         * @param m Maximum rows declared by the graph-family planner.
+         * @param n Optional model-width hint for prepared GEMMs.
+         * @param k Optional intermediate-width hint for prepared GEMMs.
+         * @return Complete shared-expert workspace requirements.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
         bool hasWorkspace() const override;
@@ -1649,6 +1697,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Graph-local ownership role for canonical route reduction.
+     *
+     * The reducer needs to know whether this participant owns arithmetic; it
+     * does not need communicator indices. Keeping that decision typed avoids
+     * reconstructing ownership from two raw integers and lets a single-device
+     * graph declare local ownership without inventing a collective root.
+     */
+    enum class MoECanonicalRouteReductionRole
+    {
+        Unspecified,
+        RootOwner,
+        NonRootParticipant
+    };
+
+    /**
      * @brief Device-only canonical LocalTP routed-expert reduction.
      *
      * Expert placement is intentionally absent from this stage. Each input
@@ -1673,10 +1736,9 @@ namespace llaminar2
             int seq_len = 0;
             int top_k = 0;
             int d_model = 0;
-            /** Communicator-local participant represented by this graph. */
-            int participant_device_index = -1;
-            /** Fixed participant that owns the ordered reduction kernel. */
-            int root_device_index = -1;
+            /** Explicit graph-local arithmetic ownership; never inferred. */
+            MoECanonicalRouteReductionRole reduction_role =
+                MoECanonicalRouteReductionRole::Unspecified;
             BufferId canonical_route_contributions_buffer_id =
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
@@ -1743,8 +1805,8 @@ namespace llaminar2
          */
         CoherencePolicy coherencePolicy() const override
         {
-            return params_.participant_device_index ==
-                           params_.root_device_index
+            return params_.reduction_role ==
+                           MoECanonicalRouteReductionRole::RootOwner
                        ? CoherencePolicy::FULL
                        : CoherencePolicy::NONE;
         }

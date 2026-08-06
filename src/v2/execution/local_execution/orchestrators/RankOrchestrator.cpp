@@ -3522,30 +3522,27 @@ namespace llaminar2
         return -1;
     }
 
-    bool RankOrchestrator::sampleMainLogitsBatchRowsOnDevice(
+    bool RankOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(
         int request_count,
         const SamplingParams &params,
-        int32_t *out_tokens,
         const uint64_t *stochastic_position_seeds)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return pp_sidecar->sampleMainLogitsBatchRowsOnDevice(
+            return pp_sidecar->publishMainLogitsBatchSamplesToDeviceResidentState(
                 request_count,
                 params,
-                out_tokens,
                 stochastic_position_seeds);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
-            return device_runners_[0]->sampleMainLogitsBatchRowsOnDevice(
+            return device_runners_[0]
+                ->publishMainLogitsBatchSamplesToDeviceResidentState(
                 request_count,
                 params,
-                out_tokens,
                 stochastic_position_seeds);
         }
         if (request_count <= 0 ||
-            !out_tokens ||
             device_runners_.size() < 2 ||
             !usesMirroredLocalTPMTPHeadForVerifier() ||
             !supportsDeviceResidentMTPSpecStatePublication())
@@ -3561,14 +3558,11 @@ namespace llaminar2
          * the token would leave the remaining publication transactions without
          * authoritative device-owned logical state.
          *
-         * This is a prefill-only boundary, so the compact host vectors below
-         * are response shadows rather than planning state. No full logits or
-         * threshold rows cross the host, and decode consumes only the resident
-         * child mailboxes initialized by these calls.
+         * No token vector is materialized for host comparison. Mirrored
+         * participants execute the same immutable sampling policy and seeds;
+         * rank-level generation later authenticates their dispatch tickets and
+         * terminal ledgers before surfacing the final response.
          */
-        std::vector<std::vector<int32_t>> child_token_shadows(
-            device_runners_.size(),
-            std::vector<int32_t>(static_cast<size_t>(request_count), -1));
         std::vector<std::future<bool>> futures;
         futures.reserve(device_runners_.size());
         for (size_t child_index = 0;
@@ -3589,14 +3583,12 @@ namespace llaminar2
                 [child,
                  request_count,
                  &params,
-                 stochastic_position_seeds,
-                 &child_token_shadows,
-                 child_index]()
+                 stochastic_position_seeds]()
                 {
-                    return child->sampleMainLogitsBatchRowsOnDevice(
+                    return child
+                        ->publishMainLogitsBatchSamplesToDeviceResidentState(
                         request_count,
                         params,
-                        child_token_shadows[child_index].data(),
                         stochastic_position_seeds);
                 }));
         }
@@ -3622,18 +3614,6 @@ namespace llaminar2
             }
         }
 
-        const std::vector<int32_t> &primary_tokens = child_token_shadows.front();
-        for (size_t child_index = 1;
-             child_index < child_token_shadows.size();
-             ++child_index)
-        {
-            if (child_token_shadows[child_index] != primary_tokens)
-            {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP request-batch "
-                          "prefill children produced different sampled tokens");
-                return false;
-            }
-        }
         std::string mailbox_error;
         if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
                 request_count,
@@ -3645,19 +3625,17 @@ namespace llaminar2
                       << mailbox_error);
             return false;
         }
-        std::copy(primary_tokens.begin(), primary_tokens.end(), out_tokens);
-
         PerfStatsCollector::addCounter(
             "mtp",
-            "rank_mirrored_localtp_request_batch_prefill_samples",
+            "rank_mirrored_localtp_request_batch_prefill_publications",
             static_cast<double>(request_count),
             /*phase=*/"decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
              {"sampling", params.is_greedy() ? "greedy" : "stochastic"},
              {"logical_state_owner", "child_device_mailboxes"},
-             {"host_payload", "response_token_shadows_only"},
-             {"boundary", "first_decode_step_after_request_prefill"}});
+             {"host_token_materializations", "0"},
+             {"boundary", "first_grouped_verifier_transaction"}});
         return true;
     }
 
@@ -5523,76 +5501,6 @@ namespace llaminar2
             {{"requests", std::to_string(request_count)},
              {"owner", "primary_child"},
              {"boundary", "host_result"}});
-        return true;
-    }
-
-    bool RankOrchestrator::
-        rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-            int request_count)
-    {
-        if (request_count <= 0)
-            return false;
-
-        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
-        {
-            return pp_sidecar
-                ->rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-                    request_count);
-        }
-        if (device_runners_.empty())
-            return false;
-        if (device_runners_.size() == 1)
-        {
-            return device_runners_[0] &&
-                   device_runners_[0]
-                       ->rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-                           request_count);
-        }
-
-        /*
-         * Every LocalTP child restored its own KV/GDN timeline and therefore owns
-         * a distinct fresh readiness event. Rebind all children before adopting
-         * any aggregate handle; this keeps a failed participant from exposing a
-         * mixture of old and new mailbox epochs.
-         */
-        for (size_t participant = 0;
-             participant < device_runners_.size();
-             ++participant)
-        {
-            IInferenceRunner *child = device_runners_[participant].get();
-            if (!child ||
-                !child
-                     ->rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-                         request_count))
-            {
-                invalidateRankResidentLogicalStateAggregate(
-                    "commit_replay_diagnostic_restore",
-                    "child_rebind_failed",
-                    static_cast<int>(participant));
-                return false;
-            }
-        }
-
-        std::string adoption_error;
-        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
-                request_count,
-                "commit_replay_diagnostic_restore",
-                &adoption_error))
-        {
-            LOG_ERROR(
-                "[RankOrchestrator] Diagnostic resident-state aggregate rebind failed: "
-                << adoption_error);
-            return false;
-        }
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "rank_commit_replay_check_resident_rebinds",
-            1.0,
-            "decode",
-            "rank",
-            {{"participants", std::to_string(device_runners_.size())},
-             {"requests", std::to_string(request_count)}});
         return true;
     }
 
@@ -10656,7 +10564,7 @@ namespace llaminar2
         {
             return false;
         }
-        return copyDeviceSpeculativeOutcomesToHost(handle, out);
+        return copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, out);
     }
 
     bool RankOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
@@ -10720,7 +10628,41 @@ namespace llaminar2
         {
             return false;
         }
-        return copyDeviceSpeculativeOutcomesToHost(handle, out);
+        return copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, out);
+    }
+
+    DeviceGenerationExecutionPolicy
+    RankOrchestrator::deviceGenerationExecutionPolicy(
+        DeviceGenerationLoopTopology topology) const noexcept
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+            return DeviceGenerationExecutionPolicy::Unsupported;
+
+        DeviceGenerationExecutionPolicy rank_policy =
+            DeviceGenerationExecutionPolicy::NativeConditionalGraph;
+        for (const auto &participant : participants)
+        {
+            if (!participant)
+                return DeviceGenerationExecutionPolicy::Unsupported;
+
+            const DeviceGenerationExecutionPolicy participant_policy =
+                participant->deviceGenerationExecutionPolicy(topology);
+            if (participant_policy ==
+                DeviceGenerationExecutionPolicy::Unsupported)
+            {
+                return DeviceGenerationExecutionPolicy::Unsupported;
+            }
+            if (participant_policy ==
+                DeviceGenerationExecutionPolicy::
+                    HostScheduledCapturedTransactions)
+            {
+                rank_policy = DeviceGenerationExecutionPolicy::
+                    HostScheduledCapturedTransactions;
+            }
+        }
+        return rank_policy;
     }
 
     bool RankOrchestrator::beginDeviceResidentGeneration(
@@ -10733,6 +10675,10 @@ namespace llaminar2
                       << request_count << " max_new_tokens=" << max_new_tokens);
             return false;
         }
+        materialized_device_generation_execution_policy_.reset();
+        materialized_device_generation_loop_topology_.reset();
+        rank_hosted_device_generation_tickets_.clear();
+        admitted_device_generation_max_new_tokens_ = 0;
 
         const auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
@@ -10762,12 +10708,14 @@ namespace llaminar2
                 return false;
             }
         }
+        admitted_device_generation_max_new_tokens_ = max_new_tokens;
         return true;
     }
 
     bool RankOrchestrator::materializeDeviceResidentGeneration(
         int request_count,
         int draft_depth,
+        DeviceGenerationLoopTopology topology,
         DeviceGenerationSamplingMode sampling_mode)
     {
         if (request_count <= 0 || draft_depth <= 0 ||
@@ -10789,14 +10737,36 @@ namespace llaminar2
             LOG_ERROR("[RankOrchestrator] Device-generation parent preparation has no participants");
             return false;
         }
+        const DeviceGenerationExecutionPolicy execution_policy =
+            deviceGenerationExecutionPolicy(topology);
+        if (execution_policy ==
+            DeviceGenerationExecutionPolicy::Unsupported)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation materialization has no complete rank execution policy");
+            return false;
+        }
         if (participants.size() == 1)
         {
-            return participants.front() &&
-                   participants.front()
-                       ->materializeDeviceResidentGeneration(
-                           request_count,
-                           draft_depth,
-                           sampling_mode);
+            const bool materialized =
+                participants.front() &&
+                participants.front()->materializeDeviceResidentGeneration(
+                    request_count,
+                    draft_depth,
+                    topology,
+                    sampling_mode);
+            if (materialized)
+            {
+                materialized_device_generation_execution_policy_ =
+                    execution_policy;
+                materialized_device_generation_loop_topology_ = topology;
+                if (execution_policy ==
+                    DeviceGenerationExecutionPolicy::
+                        HostScheduledCapturedTransactions)
+                {
+                    rank_hosted_device_generation_tickets_.resize(1);
+                }
+            }
+            return materialized;
         }
 
         /*
@@ -10832,7 +10802,7 @@ namespace llaminar2
         const auto kv_phase = KVCacheProfiler::getCurrentPhase();
         const auto executor_phase = GraphExecutorStats::currentPhase();
         tp_worker_pool_->dispatch(
-            [this, use_pp_participants, request_count, draft_depth,
+            [this, use_pp_participants, request_count, draft_depth, topology,
              sampling_mode,
              kernel_phase, rocm_phase, cuda_phase, kv_phase,
              executor_phase](size_t i) -> bool
@@ -10861,6 +10831,7 @@ namespace llaminar2
                     ->materializeDeviceResidentGeneration(
                         request_count,
                         draft_depth,
+                        topology,
                         sampling_mode);
             });
 
@@ -10900,7 +10871,138 @@ namespace llaminar2
                       << first_exception_device);
             std::rethrow_exception(first_exception);
         }
+        if (all_success)
+        {
+            materialized_device_generation_execution_policy_ =
+                execution_policy;
+            materialized_device_generation_loop_topology_ = topology;
+            if (execution_policy ==
+                DeviceGenerationExecutionPolicy::
+                    HostScheduledCapturedTransactions)
+            {
+                rank_hosted_device_generation_tickets_.resize(
+                    participants.size());
+            }
+        }
         return all_success;
+    }
+
+    bool RankOrchestrator::observeDeviceGenerationDispatchTicket(
+        sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+    {
+        if (out_ticket)
+            *out_ticket = sampling_math::DeviceGenerationDispatchTicket{};
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (!out_ticket ||
+            !materialized_device_generation_execution_policy_ ||
+            *materialized_device_generation_execution_policy_ !=
+                DeviceGenerationExecutionPolicy::
+                    HostScheduledCapturedTransactions ||
+            participants.empty() ||
+            rank_hosted_device_generation_tickets_.size() !=
+                participants.size())
+        {
+            LOG_ERROR("[RankOrchestrator] Hosted device-generation ticket observation has no exact materialized rank policy");
+            return false;
+        }
+
+        for (size_t participant_index = 0;
+             participant_index < participants.size();
+             ++participant_index)
+        {
+            if (!participants[participant_index] ||
+                !participants[participant_index]
+                     ->observeDeviceGenerationDispatchTicket(
+                         &rank_hosted_device_generation_tickets_[
+                             participant_index]))
+            {
+                LOG_ERROR("[RankOrchestrator] Hosted device-generation ticket observation failed on participant "
+                          << participant_index);
+                return false;
+            }
+        }
+
+        const auto &authoritative =
+            rank_hosted_device_generation_tickets_.front();
+        for (size_t participant_index = 1;
+             participant_index <
+                 rank_hosted_device_generation_tickets_.size();
+             ++participant_index)
+        {
+            if (!authoritative.hasSameDispatchDecision(
+                    rank_hosted_device_generation_tickets_[
+                        participant_index]))
+            {
+                const auto &divergent =
+                    rank_hosted_device_generation_tickets_[
+                        participant_index];
+                LOG_ERROR("[RankOrchestrator] Device-generation controllers selected divergent hosted graph branches"
+                          << " participant=" << participant_index
+                          << " authoritative_transaction="
+                          << authoritative.transaction_count
+                          << " divergent_transaction="
+                          << divergent.transaction_count
+                          << " authoritative_depth="
+                          << authoritative.next_draft_depth
+                          << " divergent_depth="
+                          << divergent.next_draft_depth
+                          << " authoritative_complete="
+                          << authoritative.complete
+                          << " divergent_complete=" << divergent.complete
+                          << " authoritative_maintenance="
+                          << authoritative.maintenance_due
+                          << " divergent_maintenance="
+                          << divergent.maintenance_due);
+                std::terminate();
+            }
+        }
+
+        *out_ticket = authoritative;
+        return true;
+    }
+
+    bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(
+        const sampling_math::DeviceGenerationDispatchTicket &ticket)
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (!materialized_device_generation_execution_policy_ ||
+            *materialized_device_generation_execution_policy_ !=
+                DeviceGenerationExecutionPolicy::
+                    HostScheduledCapturedTransactions ||
+            participants.empty() ||
+            rank_hosted_device_generation_tickets_.size() !=
+                participants.size() ||
+            !ticket.hasSameDispatchDecision(
+                rank_hosted_device_generation_tickets_.front()))
+        {
+            LOG_ERROR("[RankOrchestrator] Hosted device-generation submission rejected a stale rank decision");
+            return false;
+        }
+
+        /*
+         * Graph-launch APIs are asynchronous. Submit every participant's exact
+         * branch before observing the next ticket so NCCL/RCCL nodes can
+         * rendezvous without participant-zero ever blocking the host first.
+         */
+        for (size_t participant_index = 0;
+             participant_index < participants.size();
+             ++participant_index)
+        {
+            if (!participants[participant_index] ||
+                !participants[participant_index]
+                     ->submitHostScheduledDeviceGenerationAdvance(
+                         rank_hosted_device_generation_tickets_[
+                             participant_index]))
+            {
+                LOG_ERROR("[RankOrchestrator] Hosted device-generation branch submission failed on participant "
+                          << participant_index
+                          << " after distributed submission began");
+                std::terminate();
+            }
+        }
+        return true;
     }
 
     bool RankOrchestrator::launchDeviceResidentGeneration()
@@ -10910,6 +11012,59 @@ namespace llaminar2
         if (participants.empty())
         {
             LOG_ERROR("[RankOrchestrator] Device-generation parent launch has no participants");
+            return false;
+        }
+        if (!materialized_device_generation_execution_policy_ ||
+            !materialized_device_generation_loop_topology_)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation launch has no exact materialized policy/topology");
+            return false;
+        }
+
+        if (*materialized_device_generation_execution_policy_ ==
+            DeviceGenerationExecutionPolicy::
+                HostScheduledCapturedTransactions)
+        {
+            if (admitted_device_generation_max_new_tokens_ <= 0)
+            {
+                LOG_ERROR("[RankOrchestrator] Hosted device-generation loop has no admitted transaction bound");
+                return false;
+            }
+            for (int observation = 0;
+                 observation < admitted_device_generation_max_new_tokens_;
+                 ++observation)
+            {
+                sampling_math::DeviceGenerationDispatchTicket ticket;
+                if (!observeDeviceGenerationDispatchTicket(&ticket) ||
+                    !submitHostScheduledDeviceGenerationAdvance(ticket))
+                {
+                    LOG_ERROR("[RankOrchestrator] Hosted device-generation transaction loop failed");
+                    return false;
+                }
+                if (ticket.complete != 0)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "rank_device_generation_parent_launches",
+                        1.0,
+                        "decode",
+                        "rank",
+                        {{"participants",
+                          std::to_string(participants.size())},
+                         {"launch_order",
+                          "all_participants_before_ticket_wait"},
+                         {"execution",
+                          "hosted_ticket_selected_captured_transactions"}});
+                    return true;
+                }
+            }
+            LOG_ERROR("[RankOrchestrator] Hosted device-generation loop exceeded its admitted response bound without completing");
+            return false;
+        }
+        if (*materialized_device_generation_execution_policy_ !=
+            DeviceGenerationExecutionPolicy::NativeConditionalGraph)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-generation launch encountered an invalid materialized policy");
             return false;
         }
 
@@ -11029,6 +11184,10 @@ namespace llaminar2
         }
 
         *out_result = std::move(participant_results.front());
+        materialized_device_generation_execution_policy_.reset();
+        materialized_device_generation_loop_topology_.reset();
+        rank_hosted_device_generation_tickets_.clear();
+        admitted_device_generation_max_new_tokens_ = 0;
         PerfStatsCollector::addCounter(
             "mtp",
             "rank_device_generation_terminal_response_bridges",
@@ -11587,7 +11746,7 @@ namespace llaminar2
         return false;
     }
 
-    bool RankOrchestrator::copyDeviceSpeculativeOutcomesToHost(
+    bool RankOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {
@@ -11612,7 +11771,7 @@ namespace llaminar2
             }
 
             if (!device_runners_.front() ||
-                !device_runners_.front()->materializeDeviceSpeculativeOutcomesForHostResponse(
+                !device_runners_.front()->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
                     rank_mirrored_child_outcomes_.front(),
                     outcomes))
             {
@@ -13133,6 +13292,36 @@ namespace llaminar2
     {
         skip_logits_gather_prefill_ = skip;
         applyLogitsGatherSkipFlags();
+    }
+
+    bool RankOrchestrator::waitForLastForwardCompletionForBenchmark()
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Benchmark completion boundary has no participants");
+            return false;
+        }
+
+        /*
+         * forwardTP() submits every participant before returning. Waiting here
+         * is therefore safe for captured NCCL/RCCL graphs: no rank can be held
+         * before its peer graph is launched. Each child waits on its own exact
+         * terminal event, so this does not widen into a device synchronization.
+         */
+        for (size_t participant = 0; participant < participants.size(); ++participant)
+        {
+            if (!participants[participant] ||
+                !participants[participant]
+                     ->waitForLastForwardCompletionForBenchmark())
+            {
+                LOG_ERROR("[RankOrchestrator] Benchmark terminal-event wait failed for participant "
+                          << participant);
+                return false;
+            }
+        }
+        return true;
     }
 
     void RankOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)

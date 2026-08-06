@@ -114,9 +114,12 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
             return reqs;
 
-        const size_t bytes = static_cast<size_t>(max_seq_len) *
-                             static_cast<size_t>(params_.channels) * sizeof(float);
-        reqs.buffers.push_back({inplacePrefillScratchBufferName(), bytes, 256, true});
+        if (params_.input == params_.output)
+        {
+            const size_t bytes = static_cast<size_t>(max_seq_len) *
+                                 static_cast<size_t>(params_.channels) * sizeof(float);
+            reqs.buffers.push_back({inplacePrefillScratchBufferName(), bytes, 256, true});
+        }
         return reqs;
     }
 

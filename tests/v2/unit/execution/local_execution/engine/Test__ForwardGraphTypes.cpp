@@ -675,6 +675,101 @@ TEST(Test__ForwardGraphSignature, DifferentDeviceSequenceLengthSourceNotEqual)
         ForwardGraphSignatureHash{}(resident_request_lengths));
 }
 
+TEST(Test__ForwardGraphSignature,
+     ShiftedMTPPrefillBindingIdentityPreventsStaleGraphReuse)
+{
+    ForwardGraphSignature first{
+        .seq_len = 512,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MainInference,
+        .decode = false,
+        .uses_device_token_ids = true,
+        .uses_device_sequence_lengths = true,
+        .shifted_mtp_prefill_capture_identity = UINT64_C(0x1234)};
+    ForwardGraphSignature rebound = first;
+    rebound.shifted_mtp_prefill_capture_identity = UINT64_C(0x5678);
+
+    EXPECT_NE(first, rebound);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(first),
+        ForwardGraphSignatureHash{}(rebound));
+}
+
+/**
+ * @brief Completion provenance distinguishes integrated shifted prefill by type.
+ *
+ * This regression prevents completion consumers from rediscovering transaction
+ * scope through global MTP configuration or from waiting on the retired
+ * post-forward sidecar event after shifted KV population joins the main graph.
+ */
+TEST(Test__ForwardGraphTypes,
+     ShiftedMTPPrefillBindingDeclaresTransitiveCompletionScope)
+{
+    ForwardInput ordinary;
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(ordinary),
+        ForwardCompletionScope::ModelForwardOnly);
+
+    ForwardInput integrated;
+    integrated.shifted_mtp_prefill.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(integrated),
+        ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill);
+}
+
+/**
+ * @brief A scalar MTP condition remains logical main output in row storage.
+ *
+ * This is the production shape used when a bounded response leaves no room for
+ * speculative drafts. The next token must sample the condition graph's freshly
+ * written all-position allocation, not the stale canonical prefill row.
+ */
+TEST(Test__ForwardLogitsPublication,
+     ScalarMTPConditionOwnsAllPositionStorageAsCurrentMainLogits)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::MTPCondition,
+        .logical_all_position_logits = false,
+        .storage_surface =
+            ForwardLogitsStorageSurface::AllPositionFull,
+    };
+
+    EXPECT_TRUE(publication.isMainModelOutput());
+    EXPECT_TRUE(publication.supportsScalarMainConsumer());
+    EXPECT_TRUE(publication.supportsMainRequestBatchConsumer())
+        << "The same stable row allocation is valid for a one-request grouped condition.";
+    EXPECT_FALSE(publication.isColumnParallelStorage());
+}
+
+TEST(Test__ForwardLogitsPublication,
+     GroupedVerifierCannotMasqueradeAsCurrentMainLogits)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::GroupedMTPVerifier,
+        .logical_all_position_logits = true,
+        .storage_surface =
+            ForwardLogitsStorageSurface::AllPositionFull,
+    };
+
+    EXPECT_FALSE(publication.isMainModelOutput());
+    EXPECT_FALSE(publication.supportsScalarMainConsumer());
+    EXPECT_FALSE(publication.supportsMainRequestBatchConsumer());
+}
+
+TEST(Test__ForwardLogitsPublication,
+     UnknownStorageCannotReachAnyMainConsumer)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::MainInference,
+        .logical_all_position_logits = false,
+        .storage_surface = ForwardLogitsStorageSurface::Unknown,
+    };
+
+    EXPECT_FALSE(publication.supportsScalarMainConsumer());
+    EXPECT_FALSE(publication.supportsMainRequestBatchConsumer());
+}
+
 TEST(Test__ForwardGraphSignature, DifferentPPFieldsNotEqual)
 {
     ForwardGraphSignature a{.pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 13};

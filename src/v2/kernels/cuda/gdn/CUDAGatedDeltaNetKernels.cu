@@ -72,7 +72,7 @@ namespace
      * @tparam D_K Compile-time key width. Supported graph geometries select a
      *              specialization before capture; no runtime fallback exists.
      */
-    template <int D_K>
+    template <int D_K, bool OutOfPlaceState>
     __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
     void cuda_gdn_recurrent_step_kernel(
         const float *__restrict__ q,        // [n_heads * d_k]
@@ -83,7 +83,8 @@ namespace
         const float *__restrict__ A_log,    // [n_heads]
         const float *__restrict__ dt_bias,  // [n_heads]
         float *__restrict__ output,         // [n_heads * d_v]
-        float *__restrict__ state,          // [n_heads, d_k, d_v]
+        const float *initial_state,
+        float *updated_state,
         int request_count, int request_seq_len,
         int n_heads, int d_v,
         bool use_qk_l2norm,
@@ -116,23 +117,27 @@ namespace
         const size_t request_state_stride =
             static_cast<size_t>(n_heads) * static_cast<size_t>(D_K) *
             static_cast<size_t>(d_v);
-        float *S =
-            state + static_cast<size_t>(request) * request_state_stride +
+        const float *state_source =
+            OutOfPlaceState ? initial_state : updated_state;
+        const float *S_initial =
+            state_source + static_cast<size_t>(request) * request_state_stride +
+            static_cast<size_t>(h) * D_K * d_v;
+        float *S_updated =
+            updated_state + static_cast<size_t>(request) * request_state_stride +
             static_cast<size_t>(h) * D_K * d_v;
 
         // Shared memory for preprocessed Q and K
         extern __shared__ float smem[];
-        float *q_local = smem;                    // [D_K]
-        float *k_local = smem + D_K;              // [D_K]
-        float *reduce_kv = smem + 2 * D_K;        // [blockDim.x]
-        float *reduce_out = reduce_kv + blockDim.x; // [blockDim.x]
+        float *q_local = smem;                       // [D_K]
+        float *k_local = smem + D_K;                 // [D_K]
+        float *reduce_kv = smem + 2 * D_K;           // [blockDim.x]
+        float *reduce_out = reduce_kv + blockDim.x;  // [blockDim.x]
 
         const float scale = rsqrtf(static_cast<float>(D_K));
         __shared__ float warp_sums[1];
         __shared__ float decay_shared;
         __shared__ float beta_shared;
         const int lane_id = tid % 32;
-
         /*
          * Each lane owns one contiguous state partition. The compile-time
          * extent is essential: nvcc scalarizes this array into registers, so
@@ -146,7 +151,7 @@ namespace
             for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
             {
                 const int state_row = row_begin + local_row;
-                state_rows[local_row] = S[state_row * d_v + vi];
+                state_rows[local_row] = S_initial[state_row * d_v + vi];
             }
         }
         else
@@ -334,13 +339,16 @@ namespace
             __syncthreads();
         }
 
-        if (vi < d_v)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (vi < d_v && !terminal_state_is_snapshotted)
         {
 #pragma unroll
             for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
             {
                 const int state_row = row_begin + local_row;
-                S[state_row * d_v + vi] = state_rows[local_row];
+                S_updated[state_row * d_v + vi] = state_rows[local_row];
             }
         }
     }
@@ -363,7 +371,8 @@ namespace
         const float *A_log,
         const float *dt_bias,
         float *output,
-        float *state,
+        const float *initial_state,
+        float *updated_state,
         int request_count,
         int request_seq_len,
         int n_heads,
@@ -385,10 +394,11 @@ namespace
             static_cast<size_t>(2 * d_k + 2 * kGdnRecurrentThreads) *
             sizeof(float);
 
-#define LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(D_K)                                \
-    cuda_gdn_recurrent_step_kernel<D_K>                                        \
+#define LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(D_K, OUT_OF_PLACE)                  \
+    cuda_gdn_recurrent_step_kernel<D_K, OUT_OF_PLACE>                          \
         <<<grid, kGdnRecurrentThreads, shared_bytes, stream>>>(                 \
-            q, k, v, alpha, beta_raw, A_log, dt_bias, output, state,            \
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,                  \
+            initial_state, updated_state,                                      \
             request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,       \
             effective_seq_len_ptr, effective_row_idx, state_snapshots,          \
             snapshot_stride_floats, max_snapshot_rows)
@@ -396,10 +406,16 @@ namespace
         switch (d_k)
         {
         case 64:
-            LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64);
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64, true);
             break;
         case 128:
-            LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128);
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128, true);
             break;
         default:
             fprintf(
@@ -445,7 +461,8 @@ namespace
         const float *__restrict__ A_log,    // [n_heads]
         const float *__restrict__ dt_bias,  // [n_heads]
         float *__restrict__ output,         // [seq_len, n_heads * d_v]
-        float *__restrict__ state,          // [n_heads, d_k, d_v]
+        const float *initial_state,
+        float *updated_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -480,9 +497,12 @@ namespace
         const int request_row_base = request * request_seq_len;
         const size_t request_state_stride =
             static_cast<size_t>(n_heads) * d_k * d_v;
-        float *S = state +
-                   static_cast<size_t>(request) * request_state_stride +
-                   static_cast<size_t>(h) * d_k * d_v;
+        const float *S_initial = initial_state +
+                                 static_cast<size_t>(request) * request_state_stride +
+                                 static_cast<size_t>(h) * d_k * d_v;
+        float *S_updated = updated_state +
+                           static_cast<size_t>(request) * request_state_stride +
+                           static_cast<size_t>(h) * d_k * d_v;
 
         extern __shared__ float smem[];
         float *q_local = smem;       // [d_k]
@@ -530,7 +550,7 @@ namespace
         {
 #pragma unroll
             for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                sc[j] = S[(j_start + j) * d_v + vi];
+                sc[j] = S_initial[(j_start + j) * d_v + vi];
         }
         else
         {
@@ -709,7 +729,7 @@ namespace
         {
 #pragma unroll
             for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                S[(j_start + j) * d_v + vi] = sc[j];
+                S_updated[(j_start + j) * d_v + vi] = sc[j];
         }
     }
 
@@ -837,7 +857,8 @@ namespace
         const float *__restrict__ weight, // [channels, kernel_size]
         const float *__restrict__ bias,   // [channels] or nullptr
         float *__restrict__ output,       // [channels]
-        float *__restrict__ conv_state,   // [channels, kernel_size-1]
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int channels, int kernel_size,
         bool apply_silu)
     {
@@ -851,7 +872,7 @@ namespace
         // (must compute before shift to avoid overwriting state values)
         float sum = 0.0f;
         for (int k = 0; k < ks_minus1; k++)
-            sum += conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
+            sum += initial_conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
         sum += input[ch] * weight[ch * kernel_size + ks_minus1];
 
         if (bias)
@@ -865,8 +886,9 @@ namespace
 
         // Now shift conv_state left by 1, insert new input at the end
         for (int k = 0; k < ks_minus1 - 1; k++)
-            conv_state[ch * ks_minus1 + k] = conv_state[ch * ks_minus1 + k + 1];
-        conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
+            updated_conv_state[ch * ks_minus1 + k] =
+                initial_conv_state[ch * ks_minus1 + k + 1];
+        updated_conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
     }
 
     // =========================================================================
@@ -881,7 +903,7 @@ namespace
         const float *__restrict__ weight, // [channels, kernel_size]
         const float *__restrict__ bias,   // [channels] or nullptr
         float *__restrict__ output,       // [seq_len, channels]
-        float *__restrict__ conv_state,   // [channels, kernel_size-1] (updated at end)
+        const float *__restrict__ initial_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -914,8 +936,8 @@ namespace
                 float val = 0.0f;
                 if (src_t >= 0)
                     val = input[src_t * channels + ch];
-                else if (conv_state)
-                    val = conv_state[ch * ks_minus1 + ks_minus1 + src_t];
+                else if (initial_conv_state)
+                    val = initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t];
                 sum += val * weight[ch * kernel_size + k];
             }
 
@@ -937,7 +959,7 @@ namespace
                 const int src_t = t - ks_minus1 + 1 + state_idx;
                 snapshot[state_idx] =
                     (src_t >= 0) ? input[src_t * channels + ch]
-                                 : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+                                 : (initial_conv_state ? initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
             }
         }
     }
@@ -957,7 +979,8 @@ namespace
         const float *__restrict__ weight,
         const float *__restrict__ bias,
         float *__restrict__ output,
-        float *__restrict__ conv_state,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -983,9 +1006,9 @@ namespace
 
         const float *channel_weight =
             weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
-        const float *initial_state =
-            conv_state
-                ? conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1)
+        const float *channel_initial_state =
+            initial_conv_state
+                ? initial_conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1)
                 : nullptr;
 
         for (int t = 0; t < seq_len; ++t)
@@ -999,8 +1022,8 @@ namespace
                     const float val =
                         (src_t >= 0)
                             ? input[static_cast<size_t>(src_t) * channels + ch]
-                            : (initial_state
-                                   ? initial_state[ks_minus1 + src_t]
+                            : (channel_initial_state
+                                   ? channel_initial_state[ks_minus1 + src_t]
                                    : 0.0f);
                     sum += val * channel_weight[k];
                 }
@@ -1024,36 +1047,39 @@ namespace
                     snapshot[state_idx] =
                         (src_t >= 0)
                             ? input[static_cast<size_t>(src_t) * channels + ch]
-                            : (initial_state
-                                   ? initial_state[ks_minus1 + src_t]
+                            : (channel_initial_state
+                                   ? channel_initial_state[ks_minus1 + src_t]
                                    : 0.0f);
                 }
             }
         }
 
-        if (conv_state)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr && max_snapshot_rows >= seq_len;
+        if (updated_conv_state && !terminal_state_is_snapshotted)
         {
             float *state =
-                conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+                updated_conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
             for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
             {
                 const int src_t = effective_seq_len - ks_minus1 + state_idx;
                 state[state_idx] =
                     (src_t >= 0 && src_t < effective_seq_len)
                         ? input[static_cast<size_t>(src_t) * channels + ch]
-                        : initial_state[ks_minus1 + src_t];
+                    : channel_initial_state[ks_minus1 + src_t];
             }
         }
     }
 
     __global__ void cuda_short_conv1d_state_update_kernel(
         const float *__restrict__ input,
-        float *__restrict__ conv_state,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         int seq_len, int channels, int kernel_size)
     {
         int ch = blockIdx.x * blockDim.x + threadIdx.x;
-        if (ch >= channels || !conv_state)
+        if (ch >= channels || !initial_conv_state || !updated_conv_state)
             return;
 
         const int ks_minus1 = kernel_size - 1;
@@ -1067,13 +1093,14 @@ namespace
             effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
         }
 
-        float *state = conv_state + ch * ks_minus1;
+        const float *initial_state = initial_conv_state + ch * ks_minus1;
+        float *updated_state = updated_conv_state + ch * ks_minus1;
         for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
         {
             const int src_t = effective_seq_len - ks_minus1 + state_idx;
-            state[state_idx] =
+            updated_state[state_idx] =
                 (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
-                                                           : state[ks_minus1 + src_t];
+                                                           : initial_state[ks_minus1 + src_t];
         }
     }
 
@@ -1090,7 +1117,8 @@ namespace
         const float *__restrict__ weight,
         const float *__restrict__ bias,
         float *__restrict__ output,
-        float *__restrict__ request_states,
+        const float *initial_request_states,
+        float *updated_request_states,
         const int *__restrict__ request_seq_lens,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -1122,8 +1150,11 @@ namespace
             static_cast<size_t>(request) *
             static_cast<size_t>(channels) *
             static_cast<size_t>(ks_minus1);
-        float *channel_state =
-            request_states + state_base +
+        const float *channel_initial_state =
+            initial_request_states + state_base +
+            static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+        float *channel_updated_state =
+            updated_request_states + state_base +
             static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
         const float *channel_weight =
             weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
@@ -1140,7 +1171,7 @@ namespace
                         src_t >= 0
                             ? input[element_base +
                                     static_cast<size_t>(src_t) * channels + ch]
-                            : channel_state[ks_minus1 + src_t];
+                            : channel_initial_state[ks_minus1 + src_t];
                     sum += value * channel_weight[k];
                 }
                 if (bias)
@@ -1168,19 +1199,25 @@ namespace
                         src_t >= 0
                             ? input[element_base +
                                     static_cast<size_t>(src_t) * channels + ch]
-                            : channel_state[ks_minus1 + src_t];
+                            : channel_initial_state[ks_minus1 + src_t];
                 }
             }
         }
 
-        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (!terminal_state_is_snapshotted)
         {
-            const int src_t = real_len - ks_minus1 + state_idx;
-            channel_state[state_idx] =
-                src_t >= 0 && src_t < real_len
-                    ? input[element_base +
-                            static_cast<size_t>(src_t) * channels + ch]
-                    : channel_state[ks_minus1 + src_t];
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = real_len - ks_minus1 + state_idx;
+                channel_updated_state[state_idx] =
+                    src_t >= 0 && src_t < real_len
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_initial_state[ks_minus1 + src_t];
+            }
         }
     }
 
@@ -1277,7 +1314,8 @@ namespace
     /** @brief Commit each request's terminal real-row convolution state. */
     __global__ void cuda_short_conv1d_batched_state_update_kernel(
         const float *__restrict__ input,
-        float *__restrict__ request_states,
+        const float *initial_request_states,
+        float *updated_request_states,
         const int *__restrict__ request_seq_lens,
         int request_count,
         int request_seq_len,
@@ -1302,19 +1340,23 @@ namespace
             static_cast<size_t>(request) *
             static_cast<size_t>(request_seq_len) *
             static_cast<size_t>(channels);
-        float *channel_state =
-            request_states +
+        const float *channel_initial_state =
+            initial_request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+        float *channel_updated_state =
+            updated_request_states +
             static_cast<size_t>(request) * channels * ks_minus1 +
             static_cast<size_t>(ch) * ks_minus1;
 
         for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
         {
             const int src_t = real_len - ks_minus1 + state_idx;
-            channel_state[state_idx] =
+            channel_updated_state[state_idx] =
                 src_t >= 0 && src_t < real_len
                     ? input[element_base +
                             static_cast<size_t>(src_t) * channels + ch]
-                    : channel_state[ks_minus1 + src_t];
+                    : channel_initial_state[ks_minus1 + src_t];
         }
     }
 
@@ -2125,7 +2167,7 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         int device_idx, void *stream)
@@ -2135,7 +2177,7 @@ extern "C"
         return launch_cuda_gdn_recurrent_step(
             "cudaGDN_recurrent_step",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             /*request_count=*/1, /*request_seq_len=*/1,
             n_heads, d_k, d_v,
             use_qk_l2norm,
@@ -2151,7 +2193,7 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -2163,7 +2205,7 @@ extern "C"
         return launch_cuda_gdn_recurrent_step(
             "cudaGDN_recurrent_step_effective_row",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             /*request_count=*/1, /*request_seq_len=*/1,
             n_heads, d_k, d_v,
             use_qk_l2norm,
@@ -2179,7 +2221,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int request_count, int request_seq_len,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
@@ -2191,7 +2233,7 @@ extern "C"
     {
         cudaSetDevice(device_idx);
         if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
-            !output || !state || !stream ||
+            !output || !initial_state || !updated_state || !stream ||
             seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
             seq_len != request_count * request_seq_len ||
             n_heads <= 0 || d_k <= 0 || d_v <= 0)
@@ -2225,14 +2267,14 @@ extern "C"
                     n_heads,
                     d_k,
                     d_v,
-                    static_cast<void *>(state),
+                    static_cast<const void *>(initial_state),
                     static_cast<void *>(output),
                     static_cast<const void *>(device_effective_seq_len));
             }
             return launch_cuda_gdn_recurrent_step(
                 "cudaGDN_recurrent_step_batched",
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, state,
+                output, initial_state, updated_state,
                 request_count, request_seq_len,
                 n_heads, d_k, d_v,
                 use_qk_l2norm,
@@ -2275,7 +2317,7 @@ extern "C"
         dim3 grid(n_heads, num_col_blocks, request_count);
         cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             device_effective_seq_len,
             state_snapshots,
             snapshot_stride_floats,
@@ -2297,7 +2339,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -2308,7 +2350,7 @@ extern "C"
     {
         return cudaGDN_chunk_forward_batched_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
             n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
@@ -2322,7 +2364,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -2340,7 +2382,7 @@ extern "C"
          */
         return cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+        output, initial_state, updated_state,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
@@ -2353,7 +2395,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -2366,7 +2408,7 @@ extern "C"
 
         const bool ok = cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
@@ -2388,7 +2430,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int request_count, int request_seq_len,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
@@ -2402,7 +2444,7 @@ extern "C"
             return false;
         return cudaGDN_chunk_forward_batched_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             seq_len, request_count, request_seq_len,
             n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
@@ -2414,7 +2456,9 @@ extern "C"
 
     bool cudaGDN_short_conv1d(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         float *state_snapshots,
@@ -2441,7 +2485,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 nullptr,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2453,7 +2498,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 channels, kernel_size, apply_silu);
         }
         else if (seq_len <= 4)
@@ -2461,7 +2507,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 nullptr,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2474,7 +2521,7 @@ extern "C"
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output, initial_conv_state,
                 nullptr,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2482,7 +2529,7 @@ extern "C"
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, conv_state, nullptr,
+                input, initial_conv_state, updated_conv_state, nullptr,
                 seq_len, channels, kernel_size);
         }
 
@@ -2497,7 +2544,9 @@ extern "C"
 
     bool cudaGDN_short_conv1d_effective(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
@@ -2519,7 +2568,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 device_effective_seq_len,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2531,7 +2581,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 channels, kernel_size, apply_silu);
         }
         else if (seq_len <= 4)
@@ -2539,7 +2590,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 device_effective_seq_len,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2552,7 +2604,7 @@ extern "C"
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output, initial_conv_state,
                 device_effective_seq_len,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -2560,7 +2612,8 @@ extern "C"
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, conv_state, device_effective_seq_len,
+                input, initial_conv_state, updated_conv_state,
+                device_effective_seq_len,
                 seq_len, channels, kernel_size);
         }
 
@@ -2583,7 +2636,9 @@ extern "C"
      */
     bool cudaGDN_short_conv1d_batched(
         const float *input, const float *weight, const float *bias,
-        float *output, float *request_states,
+        float *output,
+        const float *initial_request_states,
+        float *updated_request_states,
         int request_count, int request_seq_len,
         int channels, int kernel_size,
         bool apply_silu,
@@ -2594,7 +2649,8 @@ extern "C"
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        if (!input || !weight || !output || !request_states ||
+        if (!input || !weight || !output ||
+            !initial_request_states || !updated_request_states ||
             !device_request_seq_lens || !stream ||
             request_count <= 0 || request_seq_len <= 0 ||
             channels <= 0 || kernel_size <= 1)
@@ -2616,7 +2672,8 @@ extern "C"
                 threads,
                 0,
                 static_cast<cudaStream_t>(stream)>>>(
-                input, weight, bias, output, request_states,
+                input, weight, bias, output,
+                initial_request_states, updated_request_states,
                 device_request_seq_lens,
                 state_snapshots, snapshot_stride_floats, max_snapshot_rows,
                 request_count, request_seq_len,
@@ -2633,7 +2690,7 @@ extern "C"
                 threads,
                 0,
                 static_cast<cudaStream_t>(stream)>>>(
-                input, weight, bias, output, request_states,
+                input, weight, bias, output, initial_request_states,
                 device_request_seq_lens,
                 state_snapshots, snapshot_stride_floats, max_snapshot_rows,
                 request_count, request_seq_len,
@@ -2647,7 +2704,8 @@ extern "C"
                 threads,
                 0,
                 static_cast<cudaStream_t>(stream)>>>(
-                input, request_states, device_request_seq_lens,
+                input, initial_request_states, updated_request_states,
+                device_request_seq_lens,
                 request_count, request_seq_len, channels, kernel_size);
         }
 

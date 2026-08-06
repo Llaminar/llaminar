@@ -144,6 +144,8 @@ namespace llaminar2
         int seq_len = 0;
         int batch_size = 0;
         DeviceId device = DeviceId::cpu();
+        ForwardExecutionRole execution_role =
+            ForwardExecutionRole::MainInference; ///< Mathematical owner embedded by this graph.
         bool decode = false;
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
@@ -155,6 +157,7 @@ namespace llaminar2
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
+        uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -171,6 +174,7 @@ namespace llaminar2
             return seq_len == other.seq_len &&
                    batch_size == other.batch_size &&
                    device == other.device &&
+                   execution_role == other.execution_role &&
                    decode == other.decode &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
@@ -183,6 +187,8 @@ namespace llaminar2
                    uses_device_position_ids == other.uses_device_position_ids &&
                    position_policy == other.position_policy &&
                    uses_device_sequence_lengths == other.uses_device_sequence_lengths &&
+                   shifted_mtp_prefill_capture_identity ==
+                       other.shifted_mtp_prefill_capture_identity &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -204,6 +210,9 @@ namespace llaminar2
             size_t h = std::hash<int>{}(sig.seq_len);
             h ^= (std::hash<int>{}(sig.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(sig.execution_role)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -218,6 +227,9 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.shifted_mtp_prefill_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));

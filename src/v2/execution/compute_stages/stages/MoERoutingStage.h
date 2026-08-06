@@ -167,7 +167,30 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
-        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        /**
+         * @brief Declare routing storage for the complete graph-family row envelope.
+         *
+         * The concrete stage records the row count of the graph that owns it,
+         * while the workspace allocator may pass a larger row count covering
+         * every prefill bucket that can reuse the same stable workspace
+         * addresses.  The implementation must honor both values.  Sizing only
+         * from `params_.seq_len` makes the first captured request determine the
+         * lifetime capacity of `moe_route_logits` and the quantized router
+         * inputs, so a later larger request cannot safely reuse the graph
+         * family.
+         *
+         * @param m Maximum logical rows requested by the graph-family planner.
+         * @param n Reserved for the generic workspace-consumer interface; the
+         *          router owns its expert count in `Params`.
+         * @param k Reserved for the generic workspace-consumer interface; the
+         *          router owns its hidden width in `Params`.
+         * @return Complete CUDA or ROCm routing workspace requirements sized
+         *         for at least both `m` and the stage's concrete row count.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
         bool hasWorkspace() const override;

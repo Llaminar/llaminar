@@ -858,6 +858,8 @@ namespace
             buffers.attn_proj = makeBuffer({rows, d});
             buffers.extensions[BufferId::GDN_QKV] =
                 makeBuffer({rows, qkv_dim});
+            buffers.extensions[BufferId::GDN_RECURRENCE_IN] =
+                makeBuffer({rows, qkv_dim});
             buffers.extensions[BufferId::GDN_Z] =
                 makeBuffer({rows, value_dim});
             buffers.extensions[BufferId::GDN_ALPHA] =
@@ -2060,6 +2062,51 @@ TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShifte
     EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
 }
 
+TEST(Test__MTPGraphConstruction,
+     BuildsRequestBatchedPaddedKVOnlyQwen35GraphForIntegratedPrefill)
+{
+    DenseMTPGraphFixture fixture(/*rows=*/6);
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const std::array<int, 6> draft_tokens = {17, 23, 41, 19, 29, 43};
+    const std::array<int, 6> positions = {5, 6, 0, 11, 12, 13};
+    const std::array<int32_t, 2> append_lengths = {2, 3};
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = positions.data();
+    input.sequence_lengths_device = append_lengths.data();
+    input.batch_size = 2;
+    input.seq_len = 3;
+    input.kv_cache_only = true;
+    input.terminal_hidden_buffer_id = BufferId::NORMALIZED;
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0,
+        weights,
+        input,
+        output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "MTP0_kv_append");
+    ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
+    EXPECT_EQ(
+        graph.getNode("MTP0_kv_append")->stage->type(),
+        ComputeStageType::KV_CACHE_APPEND);
+    EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
+    EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
+}
+
 TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequest)
 {
     DeviceManager::instance().initialize(-1, false);
@@ -2905,11 +2952,12 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
  * @brief Prove independently replayable GDN graph roles cannot alias mutable scratch.
  *
  * Long prefill and grouped verifier graphs may be queued on different streams.
- * Both deinterleave merged QKV and preserve in-place short-convolution input,
- * so a device-wide literal scratch key lets one graph overwrite rows while the
- * other graph is still consuming them. The graph builder owns the role policy:
- * main inference keeps the legacy key, grouped verification receives a distinct
- * role key, and layers within either role continue to share one allocation.
+ * Both deinterleave merged QKV, so a device-wide literal scratch key lets one
+ * graph overwrite rows while the other graph is still consuming them. Short
+ * convolution publishes into a distinct graph-owned recurrence-input tensor;
+ * it must never recreate the older in-place repair workspace. The graph builder
+ * owns the role policy for the remaining deinterleave and transaction storage,
+ * while layers within either role continue to share one allocation.
  */
 TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
 {
@@ -3004,16 +3052,24 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
         main_conv->getWorkspaceRequirements(/*m=*/4);
     const WorkspaceRequirements verifier_conv_reqs =
         verifier_conv->getWorkspaceRequirements(/*m=*/4);
-    EXPECT_NE(
+    EXPECT_EQ(
         main_conv_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH),
-        nullptr);
+        nullptr)
+        << "Declarative GDN wiring must not allocate an in-place repair buffer.";
     EXPECT_EQ(
         verifier_conv_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH),
         nullptr);
-    EXPECT_NE(
+    EXPECT_EQ(
         verifier_conv_reqs.find(
             "gdn_shortconv_inplace_scratch_grouped_mtp_verifier"),
-        nullptr);
+        nullptr)
+        << "Grouped verification must publish directly to GDN_RECURRENCE_IN.";
+    EXPECT_NE(main_conv->getParams().input, main_conv->getParams().output);
+    EXPECT_NE(verifier_conv->getParams().input, verifier_conv->getParams().output);
+    EXPECT_EQ(main_conv->getParams().output_buffer_id, BufferId::GDN_RECURRENCE_IN);
+    EXPECT_EQ(verifier_conv->getParams().output_buffer_id, BufferId::GDN_RECURRENCE_IN);
+    EXPECT_EQ(main_recurrence->getParams().qkv_buffer_id, BufferId::GDN_RECURRENCE_IN);
+    EXPECT_EQ(verifier_recurrence->getParams().qkv_buffer_id, BufferId::GDN_RECURRENCE_IN);
 
     const WorkspaceRequirements main_recurrence_reqs =
         main_recurrence->getWorkspaceRequirements(/*m=*/4);
@@ -3033,11 +3089,11 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
     ShortConv1dStage::Params second_conv_params = verifier_conv->getParams();
     second_conv_params.layer_idx = 1;
     ShortConv1dStage second_conv(std::move(second_conv_params));
-    EXPECT_NE(
+    EXPECT_EQ(
         second_conv.getWorkspaceRequirements(/*m=*/4).find(
             "gdn_shortconv_inplace_scratch_grouped_mtp_verifier"),
         nullptr)
-        << "Serialized layers in one graph role must reuse one economical scratch allocation.";
+        << "A second layer must not resurrect obsolete in-place repair storage.";
     EXPECT_NE(
         second_conv.getWorkspaceRequirements(/*m=*/4).find(
             "gdn_shortconv_speculative_state_work_grouped_mtp_verifier"),
@@ -3134,12 +3190,10 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     const WorkspaceDescriptor *short_conv_dynamic_scratch =
         short_conv_dynamic_reqs.find(
             "gdn_shortconv_inplace_scratch_grouped_mtp_verifier");
-    ASSERT_NE(short_conv_dynamic_scratch, nullptr);
-    EXPECT_GE(short_conv_dynamic_scratch->size_bytes,
-              static_cast<size_t>(total_tokens) *
-                  static_cast<size_t>(short_conv->getParams().channels) *
-                  sizeof(float))
-        << "Per-request dynamic m must still reserve flattened in-place scratch.";
+    EXPECT_EQ(short_conv_dynamic_scratch, nullptr)
+        << "Request batching must retain the distinct recurrence-input contract.";
+    EXPECT_NE(short_conv->getParams().input, short_conv->getParams().output);
+    EXPECT_EQ(short_conv->getParams().output_buffer_id, BufferId::GDN_RECURRENCE_IN);
 
     const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
     ASSERT_NE(recurrence_node, nullptr);

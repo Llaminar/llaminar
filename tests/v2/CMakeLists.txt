@@ -11977,6 +11977,44 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm padded GDN real-length integration tests")
 
+    # Performance: ROCm GDN scalar decode, grouped verification, and accepted
+    # state publication. The timed region invokes production C ABI launches
+    # with persistent buffers; correctness is owned by the integration gates.
+    add_executable(v2_perf_rocm_gdn_verifier_rows
+        performance/kernels/rocm/gdn/Perf__ROCmGatedDeltaNetVerifierRows.cpp
+    )
+    target_link_libraries(v2_perf_rocm_gdn_verifier_rows
+        hip::host
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmGatedDeltaNetVerifierRows
+        COMMAND $<TARGET_FILE:v2_perf_rocm_gdn_verifier_rows>
+        LABELS "V2;Performance;ROCm;GatedDeltaNet;MTP;GroupedVerifierRows;StatePublication;Decode;Latency;Economy;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm GDN verifier performance benchmarks")
+
+    # Performance: exact production stochastic-verifier Top-K/Top-P graph.
+    # The speedometer owns persistent buffers, captures the complete two-kernel
+    # distribution builder, and reports M=1/2/4/8/16 at Qwen 3.6 vocabulary.
+    add_executable(v2_perf_rocm_sampling_verifier_rows
+        performance/kernels/rocm/sampling/Perf__ROCmTopKTopPVerifierRows.cpp
+    )
+    target_link_libraries(v2_perf_rocm_sampling_verifier_rows
+        hip::host
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmSamplingVerifierRows
+        COMMAND $<TARGET_FILE:v2_perf_rocm_sampling_verifier_rows>
+        LABELS "V2;Performance;ROCm;Sampling;TopK;TopP;MTP;GroupedVerifierRows;Decode;Latency;Economy;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm stochastic-verifier sampling benchmark")
+
     # Integration Test: ROCm TurboQuant KV Cache
     # Tests ROCmRingKVCacheTQ: TQ8 K / TQ4 V quantized storage, RoPE-on-read, eviction, shadows
     add_executable(v2_integration_rocm_ring_kv_cache_tq 

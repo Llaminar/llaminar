@@ -339,6 +339,7 @@ namespace llaminar2
 
         // Add GDN buffer name → BufferId mappings
         config.buffer_name_to_id["gdn_qkv"] = BufferId::GDN_QKV;
+        config.buffer_name_to_id["gdn_recurrence_in"] = BufferId::GDN_RECURRENCE_IN;
         config.buffer_name_to_id["gdn_z"] = BufferId::GDN_Z;
         config.buffer_name_to_id["gdn_alpha"] = BufferId::GDN_ALPHA;
         config.buffer_name_to_id["gdn_beta"] = BufferId::GDN_BETA;
@@ -395,11 +396,10 @@ namespace llaminar2
         if (input.batch_size <= 0 ||
             input.seq_len <= 0 ||
             input.batch_size > std::numeric_limits<int>::max() / input.seq_len ||
-            (!input.kv_cache_only && input.seq_len != 1) ||
-            (input.kv_cache_only && input.batch_size != 1 && input.seq_len != 1))
+            (!input.kv_cache_only && input.seq_len != 1))
         {
             LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require a positive, representable shape, "
-                      "normal execution with seq_len=1, and multi-token catchup only for a single request");
+                      "and normal execution with seq_len=1; KV-only prefill accepts request-batched padded geometry");
             return graph;
         }
         const int total_tokens = input.batch_size * input.seq_len;
@@ -601,6 +601,9 @@ namespace llaminar2
                           .gemm_context = GemmContext::NONE,
                           .a_buffer_id = BufferId::MTP_CONCAT,
                           .c_buffer_id = BufferId::MTP_PROJECTED,
+                          .force_decode_equivalent_verifier_prefill =
+                              total_tokens > 1 &&
+                              config_.usesMTPGroupedDecodeEquivalentRows(),
                           .prepared_ref = preparedRefForGraphWeight(weights.fc_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
@@ -663,6 +666,7 @@ namespace llaminar2
                 input.kv_cache,
                 input.position_ids,
                 input.position_ids_device,
+                input.sequence_lengths_device,
                 device,
                 sidecar_stage_prefix,
                 /*layer_idx_is_cache_local=*/true,
@@ -1204,7 +1208,7 @@ namespace llaminar2
         ShortConv1dStage::Params conv_params;
         conv_params.device_id = device;
         conv_params.input = buffers.get(BufferId::GDN_QKV);
-        conv_params.output = buffers.get(BufferId::GDN_QKV); // In-place (conv modifies QKV)
+        conv_params.output = buffers.get(BufferId::GDN_RECURRENCE_IN);
         conv_params.weight = gdn_layer->ssm_conv1d;
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
         // CPU kernels own live state in the cache vector. GPU kernels own stable
@@ -1228,7 +1232,7 @@ namespace llaminar2
         conv_params.kernel = gdn_state->conv_kernel.get();
 
         conv_params.input_buffer_id = BufferId::GDN_QKV;
-        conv_params.output_buffer_id = BufferId::GDN_QKV;
+        conv_params.output_buffer_id = BufferId::GDN_RECURRENCE_IN;
 
         graph.addNode(prefix + "short_conv",
                       ComputeStageFactory::createShortConv1d(conv_params),
@@ -1240,7 +1244,7 @@ namespace llaminar2
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "short_conv",
-                buffers.get(BufferId::GDN_QKV),
+                buffers.get(BufferId::GDN_RECURRENCE_IN),
                 prefix + "short_conv",
                 layer_idx,
                 total_tokens,
@@ -1251,7 +1255,7 @@ namespace llaminar2
         // =====================================================================
         // Stage 4: GDN Recurrence (delta rule linear attention)
         // =====================================================================
-        // Q, K, V are interleaved in gdn_qkv after conv:
+        // Q, K, V are interleaved in gdn_recurrence_in after conv:
         // [seq_len, 2*n_k_heads*d_k + n_v_heads*d_v]
         // The recurrence stage splits Q, K, V internally and repeat_interleaves
         // Q/K from n_k_heads to n_v_heads when they differ.
@@ -1259,9 +1263,9 @@ namespace llaminar2
         rec_params.device_id = device;
         rec_params.layer_idx = layer_idx;
         rec_params.workspace_namespace = workspace_namespace;
-        rec_params.Q = buffers.get(BufferId::GDN_QKV); // Will be split by kernel
-        rec_params.K = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
-        rec_params.V = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
+        rec_params.Q = buffers.get(BufferId::GDN_RECURRENCE_IN); // Split by kernel.
+        rec_params.K = buffers.get(BufferId::GDN_RECURRENCE_IN); // Same tensor, kernel offset.
+        rec_params.V = buffers.get(BufferId::GDN_RECURRENCE_IN); // Same tensor, kernel offset.
         rec_params.alpha = buffers.get(BufferId::GDN_ALPHA);
         rec_params.beta = buffers.get(BufferId::GDN_BETA);
         rec_params.A_log = gdn_layer->ssm_a; // Learnable log-space gate
@@ -1311,7 +1315,7 @@ namespace llaminar2
         }
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-        rec_params.qkv_buffer_id = BufferId::GDN_QKV;
+        rec_params.qkv_buffer_id = BufferId::GDN_RECURRENCE_IN;
         rec_params.alpha_buffer_id = BufferId::GDN_ALPHA;
         rec_params.beta_buffer_id = BufferId::GDN_BETA;
 
@@ -1383,7 +1387,7 @@ namespace llaminar2
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "gdn_preprocessed_qkv",
-                buffers.get(BufferId::GDN_QKV),
+                buffers.get(BufferId::GDN_RECURRENCE_IN),
                 gdn_state_ready_node,
                 layer_idx,
                 total_tokens,
@@ -1521,6 +1525,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         const void *position_ids_device,
+        const int32_t *sequence_lengths_device,
         DeviceId device,
         const std::string &stage_prefix_override,
         bool layer_idx_is_cache_local,
@@ -1651,7 +1656,7 @@ namespace llaminar2
             seq_len,
             batch_size,
             kv_cache,
-            /*request_sequence_lengths_device=*/nullptr,
+            sequence_lengths_device,
             device,
             rope_node,
             cache_source_dependencies,

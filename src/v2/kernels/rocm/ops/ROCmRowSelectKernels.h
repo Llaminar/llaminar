@@ -202,6 +202,35 @@ namespace llaminar2::rocm
         int selected_row_count,
         void *stream);
 
+    /**
+     * @brief Prepare one request's graph-resident shifted-MTP prefill payload.
+     *
+     * This is the HIP counterpart of the CUDA transaction preparer. Canonical
+     * device KV counts select initial-segment or continuation-bridge arithmetic;
+     * malformed progress traps on device instead of producing a partial append.
+     * All outputs are persistent arena allocations consumed later in the same
+     * captured graph.
+     */
+    bool launchShiftedMTPPrefillPrepareFP32(
+        const float *input_hidden,
+        float *terminal_hidden_archive,
+        float *packed_hidden_out,
+        const int32_t *input_token_ids,
+        const int32_t *input_position_ids,
+        int32_t *shifted_token_ids_out,
+        int32_t *shifted_position_ids_out,
+        int32_t *append_lengths_out,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride_device,
+        int request_index,
+        int request_count,
+        int captured_row_stride,
+        int seq_capacity,
+        int d_model,
+        void *stream);
+
     /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */
     bool launchMTPConcatFP32(
         const float *hidden,

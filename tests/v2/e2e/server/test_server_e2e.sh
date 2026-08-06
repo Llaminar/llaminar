@@ -2105,6 +2105,7 @@ from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
 from mtp_device_generation_perf_policy import (
     validate_cuda_dynamic_mtp_device_generation_policy,
+    validate_rocm_host_scheduled_mtp_device_generation_policy,
 )
 from request_input_lifetime_perf_policy import (
     validate_request_input_lifetime_policy,
@@ -2419,27 +2420,32 @@ if require_stochastic_mtp:
         and (record.get("tags") or {}).get("sampling_mode") == "stochastic"
         for record in records
     )
+    hosted_generation_parent = any(
+        record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_loop_graph_materializations"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("execution")
+        == "hosted_captured_transactions_with_ticket_only_dispatch"
+        and (record.get("tags") or {}).get("sampling_mode") == "stochastic"
+        for record in records
+    )
     request_batch_outcome_bridges = record_value_sum(
         ("stochastic_verify_request_batch_outcomes",),
         "mtp",
     )
-    if native_generation_parent and request_batch_outcome_bridges > 0.0:
+    if request_batch_outcome_bridges > 0.0:
         print(
-            "FAIL: native stochastic MTP entered the retired request-batched "
+            "FAIL: stochastic GPU MTP entered the retired request-batched "
             "host outcome bridge"
         )
         sys.exit(0)
-    if not native_generation_parent and request_batch_outcome_bridges <= 0.0:
-        print("FAIL: stochastic MTP emitted no request-batched device outcome")
+    if not native_generation_parent and not hosted_generation_parent:
+        print(
+            "FAIL: stochastic GPU MTP emitted neither a native conditional "
+            "parent nor an authenticated ticket-selected captured parent"
+        )
         sys.exit(0)
-    gpu_reducer_records = [
-        record
-        for record in records
-        if record.get("domain") == "mtp"
-        and record.get("name")
-        == "stochastic_request_batch_summary_gpu_reducer"
-        and numeric(record.get("total_ns")) > 0.0
-    ]
     native_reducer_records = [
         record
         for record in records
@@ -2455,9 +2461,6 @@ if require_stochastic_mtp:
     if native_generation_parent and not native_reducer_records:
         print("FAIL: native stochastic MTP emitted no terminal compact-outcome reducer ledger")
         sys.exit(0)
-    if not native_generation_parent and not gpu_reducer_records:
-        print("FAIL: stochastic MTP emitted no GPU compact-outcome reducer evidence")
-        sys.exit(0)
     if record_value_sum(
         ("stochastic_serial_equivalent_host_verifier_rows",),
         "mtp",
@@ -2467,19 +2470,30 @@ if require_stochastic_mtp:
     if record_value_sum(("depth_policy_windows",), "mtp") <= 0.0:
         print("FAIL: stochastic dynamic-depth MTP emitted no controller window")
         sys.exit(0)
-    if "cuda:" in extra_flags:
-        try:
-            expected_minimum_depth = int(
-                flag_value("--mtp-min-draft-tokens") or "0"
-            )
-            expected_maximum_depth = int(
-                flag_value("--mtp-max-draft-tokens") or "0"
-            )
-        except ValueError:
-            print("FAIL: stochastic CUDA MTP has malformed dynamic depth bounds")
-            sys.exit(0)
+    try:
+        expected_minimum_depth = int(
+            flag_value("--mtp-min-draft-tokens") or "0"
+        )
+        expected_maximum_depth = int(
+            flag_value("--mtp-max-draft-tokens") or "0"
+        )
+    except ValueError:
+        print("FAIL: stochastic GPU MTP has malformed dynamic depth bounds")
+        sys.exit(0)
+    if native_generation_parent:
         device_generation_validation = (
             validate_cuda_dynamic_mtp_device_generation_policy(
+                records,
+                expected_minimum_depth=expected_minimum_depth,
+                expected_maximum_depth=expected_maximum_depth,
+            )
+        )
+        if device_generation_validation.error:
+            print(f"FAIL: {device_generation_validation.error}")
+            sys.exit(0)
+    if hosted_generation_parent:
+        device_generation_validation = (
+            validate_rocm_host_scheduled_mtp_device_generation_policy(
                 records,
                 expected_minimum_depth=expected_minimum_depth,
                 expected_maximum_depth=expected_maximum_depth,

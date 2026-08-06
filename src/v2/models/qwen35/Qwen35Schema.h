@@ -193,11 +193,36 @@ namespace llaminar2
                 // GDN Projection: in_proj_qkv + in_proj_z (4 GEMMs)
                 StageSpec{.name = "gdn_proj", .type = StageType::GDNProjection, .inputs = {{"normalized", BufferSemantic::Input}, {"weights.attn_qkv", BufferSemantic::Input}, {"weights.attn_gate", BufferSemantic::Input}, {"weights.ssm_alpha", BufferSemantic::Input}, {"weights.ssm_beta", BufferSemantic::Input}}, .outputs = {{"gdn_qkv", BufferSemantic::Output}, {"gdn_z", BufferSemantic::Output}, {"gdn_alpha", BufferSemantic::Output}, {"gdn_beta", BufferSemantic::Output}}, .dependencies = {"attn_norm"}, .tp_mode = TPMode::ColumnParallel, .is_optional = true, .exec_policy_key = "exec_gemm"},
 
-                // Short conv1d + SiLU on QKV
-                StageSpec{.name = "short_conv", .type = StageType::ShortConv1d, .inputs = {{"gdn_qkv", BufferSemantic::InOut}, {"weights.ssm_conv1d", BufferSemantic::Input}}, .outputs = {{"gdn_qkv", BufferSemantic::InOut}}, .dependencies = {"gdn_proj"}, .is_optional = true, .exec_policy_key = "exec_conv1d"},
+                // Short conv1d + SiLU publishes a distinct recurrence input.
+                // The projection row remains immutable while the convolution
+                // reads its causal neighborhood, so GPU execution never needs
+                // an in-place repair copy after the kernel.
+                StageSpec{
+                    .name = "short_conv",
+                    .type = StageType::ShortConv1d,
+                    .inputs = {
+                        {"gdn_qkv", BufferSemantic::Input},
+                        {"weights.ssm_conv1d", BufferSemantic::Input}},
+                    .outputs = {{"gdn_recurrence_in", BufferSemantic::Output}},
+                    .dependencies = {"gdn_proj"},
+                    .is_optional = true,
+                    .exec_policy_key = "exec_conv1d"},
 
                 // GDN Recurrence (delta rule)
-                StageSpec{.name = "gdn_recurrence", .type = StageType::GDNRecurrence, .inputs = {{"gdn_qkv", BufferSemantic::Input}, {"gdn_alpha", BufferSemantic::Input}, {"gdn_beta", BufferSemantic::Input}, {"weights.ssm_dt_bias", BufferSemantic::Input}, {"weights.ssm_a", BufferSemantic::Input}, {"weights.ssm_norm", BufferSemantic::Input}}, .outputs = {{"attn_output", BufferSemantic::Output}}, .dependencies = {"short_conv"}, .is_optional = true, .exec_policy_key = "exec_gdn_recurrence"},
+                StageSpec{
+                    .name = "gdn_recurrence",
+                    .type = StageType::GDNRecurrence,
+                    .inputs = {
+                        {"gdn_recurrence_in", BufferSemantic::Input},
+                        {"gdn_alpha", BufferSemantic::Input},
+                        {"gdn_beta", BufferSemantic::Input},
+                        {"weights.ssm_dt_bias", BufferSemantic::Input},
+                        {"weights.ssm_a", BufferSemantic::Input},
+                        {"weights.ssm_norm", BufferSemantic::Input}},
+                    .outputs = {{"attn_output", BufferSemantic::Output}},
+                    .dependencies = {"short_conv"},
+                    .is_optional = true,
+                    .exec_policy_key = "exec_gdn_recurrence"},
 
                 // Gated RMSNorm: RMSNorm(out) ⊙ SiLU(z)
                 StageSpec{.name = "gated_norm", .type = StageType::GatedRMSNorm, .inputs = {{"attn_output", BufferSemantic::InOut}, {"gdn_z", BufferSemantic::Input}, {"weights.ssm_norm", BufferSemantic::Input}}, .outputs = {{"attn_output", BufferSemantic::InOut}}, .dependencies = {"gdn_recurrence"}, .is_optional = true, .exec_policy_key = "exec_gated_rmsnorm"},
@@ -311,6 +336,12 @@ namespace llaminar2
 
                 // GDN-specific buffers
                 {"gdn_qkv", {"seq_len", "gdn_qkv_dim"}, "fp32", BufferSemantic::Scratch, "gdn_scratch", 10, "GDN fused QKV"},
+                // This buffer overlaps gdn_qkv for the complete short-convolution
+                // launch: the kernel reads causal source rows from gdn_qkv while
+                // publishing transformed rows here. It therefore has no alias
+                // group, even though both tensors belong to the logical GDN
+                // working set.
+                {"gdn_recurrence_in", {"seq_len", "gdn_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "GDN short-convolution output and recurrence input"},
                 {"gdn_z", {"seq_len", "gdn_inner_size"}, "fp32", BufferSemantic::Scratch, "gdn_scratch", 5, "GDN gate Z"},
                 {"gdn_alpha", {"seq_len", "gdn_time_step_rank"}, "fp32", BufferSemantic::Scratch, "gdn_scratch", 1, "GDN alpha"},
                 {"gdn_beta", {"seq_len", "gdn_time_step_rank"}, "fp32", BufferSemantic::Scratch, "gdn_scratch", 1, "GDN beta"},
@@ -331,19 +362,19 @@ namespace llaminar2
                 // verifier capacity. Runtime execution still supplies the
                 // semantic row count, so fixed and dynamic policies can use any
                 // M that fits their graph plan without a hidden M<=4 ABI.
-                {"mtp_embedding", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
-                {"mtp_norm_hidden", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
-                {"mtp_norm_embedding", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
-                {"mtp_concat", {"mtp_target_query_rows", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
-                {"mtp_projected", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
+                {"mtp_embedding", {"mtp_kv_prefill_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding and bucket-wide shifted-prefill scratch"},
+                {"mtp_norm_hidden", {"mtp_kv_prefill_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden and bucket-wide shifted-prefill scratch"},
+                {"mtp_norm_embedding", {"mtp_kv_prefill_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding and bucket-wide shifted-prefill scratch"},
+                {"mtp_concat", {"mtp_kv_prefill_rows", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat and bucket-wide shifted-prefill scratch"},
+                {"mtp_projected", {"mtp_kv_prefill_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden and bucket-wide shifted-prefill scratch"},
                 {"mtp_hidden", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
-                {"mtp_q_raw", {"mtp_target_query_rows", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
-                {"mtp_q_gate", {"mtp_target_query_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
-                {"mtp_q", {"mtp_target_query_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
-                {"mtp_k", {"mtp_target_query_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
-                {"mtp_v", {"mtp_target_query_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
-                {"mtp_k_full_prefill", {"mtp_target_query_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split prefill KV handoff"},
-                {"mtp_v_full_prefill", {"mtp_target_query_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split prefill KV handoff"},
+                {"mtp_q_raw", {"mtp_kv_prefill_rows", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output including bucket-wide shifted prefill"},
+                {"mtp_q_gate", {"mtp_kv_prefill_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate including bucket-wide shifted prefill"},
+                {"mtp_q", {"mtp_kv_prefill_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection including bucket-wide shifted prefill"},
+                {"mtp_k", {"mtp_kv_prefill_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection including bucket-wide shifted prefill"},
+                {"mtp_v", {"mtp_kv_prefill_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection including bucket-wide shifted prefill"},
+                {"mtp_k_full_prefill", {"mtp_kv_prefill_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split and shifted-prefill KV handoff"},
+                {"mtp_v_full_prefill", {"mtp_kv_prefill_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split and shifted-prefill KV handoff"},
                 {"mtp_attn_output", {"mtp_target_query_rows", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
                 {"mtp_attn_proj", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
                 {"mtp_gate", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},

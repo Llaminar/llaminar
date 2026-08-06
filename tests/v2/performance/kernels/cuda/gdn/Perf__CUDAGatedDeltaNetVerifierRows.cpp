@@ -60,14 +60,19 @@ namespace
     class DeviceFloatBuffer
     {
     public:
-        explicit DeviceFloatBuffer(size_t count) : count_(count)
+        DeviceFloatBuffer(size_t count, cudaStream_t producer_stream)
+            : count_(count)
         {
+            if (!producer_stream)
+                throw std::invalid_argument(
+                    "DeviceFloatBuffer requires an explicit producer stream");
             checkCuda(
                 cudaMalloc(reinterpret_cast<void **>(&data_), count_ * sizeof(float)),
                 "cudaMalloc(DeviceFloatBuffer)");
             checkCuda(
-                cudaMemset(data_, 0, count_ * sizeof(float)),
-                "cudaMemset(DeviceFloatBuffer)");
+                cudaMemsetAsync(
+                    data_, 0, count_ * sizeof(float), producer_stream),
+                "cudaMemsetAsync(DeviceFloatBuffer)");
         }
 
         ~DeviceFloatBuffer()
@@ -133,17 +138,17 @@ namespace
         static constexpr int kValueRowFloats = kHeads * kValueWidth;
 
         GdnBenchmarkFixture()
-            : q(static_cast<size_t>(kMaxRows) * kQkRowFloats),
-              k(static_cast<size_t>(kMaxRows) * kQkRowFloats),
-              v(static_cast<size_t>(kMaxRows) * kValueRowFloats),
-              alpha(static_cast<size_t>(kMaxRows) * kHeads),
-              beta(static_cast<size_t>(kMaxRows) * kHeads),
-              a_log(kHeads),
-              dt_bias(kHeads),
-              output(static_cast<size_t>(kMaxRows) * kValueRowFloats),
-              scalar_state(kStateFloats),
-              grouped_state(kStateFloats),
-              snapshots(static_cast<size_t>(kMaxRows) * kStateFloats)
+            : q(static_cast<size_t>(kMaxRows) * kQkRowFloats, timing.stream),
+              k(static_cast<size_t>(kMaxRows) * kQkRowFloats, timing.stream),
+              v(static_cast<size_t>(kMaxRows) * kValueRowFloats, timing.stream),
+              alpha(static_cast<size_t>(kMaxRows) * kHeads, timing.stream),
+              beta(static_cast<size_t>(kMaxRows) * kHeads, timing.stream),
+              a_log(kHeads, timing.stream),
+              dt_bias(kHeads, timing.stream),
+              output(static_cast<size_t>(kMaxRows) * kValueRowFloats, timing.stream),
+              scalar_state(kStateFloats, timing.stream),
+              grouped_state(kStateFloats, timing.stream),
+              snapshots(static_cast<size_t>(kMaxRows) * kStateFloats, timing.stream)
         {}
 
         /** @brief Launch one scalar row on the benchmark stream. */
@@ -158,6 +163,7 @@ namespace
                 a_log.get(),
                 dt_bias.get(),
                 output.get() + static_cast<size_t>(row) * kValueRowFloats,
+                state,
                 state,
                 kHeads,
                 kKeyWidth,
@@ -181,6 +187,7 @@ namespace
                 a_log.get(),
                 dt_bias.get(),
                 output.get(),
+                scalar_state.get(),
                 grouped_state.get(),
                 rows,
                 kHeads,

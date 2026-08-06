@@ -200,6 +200,77 @@ namespace llaminar2
             });
     }
 
+    /**
+     * @brief Prove that one measured prefill used only already-captured graphs.
+     *
+     * The setup gate above proves that a graph exists. A throughput sample has
+     * a stronger contract: every participant/chunk observed before the sample
+     * must advance its replay counter, no capture counter may change, and the
+     * final phase must remain ready/replay. Comparing stable probe identity in
+     * order also rejects cache replacement disguised as a successful replay.
+     */
+    static bool prefillGraphProbeShowsReplayAdvance(
+        const PrefixRuntimeStateSnapshot &before,
+        const PrefixRuntimeStateSnapshot &after,
+        std::string *reason)
+    {
+        const auto fail = [&](std::string message) -> bool
+        {
+            if (reason)
+                *reason = std::move(message);
+            return false;
+        };
+
+        if (before.prefill_graphs.empty() || after.prefill_graphs.empty())
+            return fail("prefill graph probe is empty");
+        if (before.prefill_graphs.size() != after.prefill_graphs.size())
+        {
+            return fail(
+                "prefill graph entry count changed from " +
+                std::to_string(before.prefill_graphs.size()) + " to " +
+                std::to_string(after.prefill_graphs.size()));
+        }
+
+        for (size_t index = 0; index < before.prefill_graphs.size(); ++index)
+        {
+            const auto &prior = before.prefill_graphs[index];
+            const auto &current = after.prefill_graphs[index];
+            const bool same_identity =
+                prior.domain_id == current.domain_id &&
+                prior.participant_id == current.participant_id &&
+                prior.chunk_index == current.chunk_index &&
+                prior.bucket_seq_len == current.bucket_seq_len &&
+                prior.placement_epoch == current.placement_epoch &&
+                prior.topology_signature == current.topology_signature;
+            if (!same_identity)
+            {
+                return fail(
+                    "prefill graph identity changed at probe " +
+                    std::to_string(index));
+            }
+            if (current.capture_count != prior.capture_count)
+            {
+                return fail(
+                    "prefill graph captured during measurement at probe " +
+                    std::to_string(index));
+            }
+            if (current.replay_count <= prior.replay_count)
+            {
+                return fail(
+                    "prefill graph replay counter did not advance at probe " +
+                    std::to_string(index));
+            }
+            if (current.phase != "ready" ||
+                current.capture_phase != "replay")
+            {
+                return fail(
+                    "prefill graph did not finish in ready/replay phase at probe " +
+                    std::to_string(index));
+            }
+        }
+        return true;
+    }
+
     static std::string summarizePrefillGraphProbe(
         const PrefixRuntimeStateSnapshot &snapshot)
     {
@@ -857,6 +928,8 @@ namespace llaminar2
         auto start = std::chrono::high_resolution_clock::now();
 
         bool success = false;
+        const char *const synchronization_phase =
+            decode_request_batch_ > 1 ? "request-batched prefill" : "prefill";
         if (decode_request_batch_ > 1)
         {
             const int request_batch = decode_request_batch_;
@@ -882,15 +955,29 @@ namespace llaminar2
                     last_failure_reason_ = "request-batched benchmark prefill failed";
             }
 
-            success = synchronizeSuccess(success, "request-batched prefill");
         }
         else
         {
             success = runner_->forward(tokens.data(), tokens.size());
-
-            // Synchronize after forward and propagate failures to every rank.
-            success = synchronizeSuccess(success, "prefill");
         }
+
+        /*
+         * GPU forward() publishes an exact terminal event and returns
+         * asynchronously. The benchmark clock must include completed GPU
+         * work, while production inference remains free to chain consumers
+         * directly from that event. This wait performs no D2H and does not
+         * synchronize unrelated streams or the whole device.
+         */
+        if (success &&
+            !runner_->waitForLastForwardCompletionForBenchmark())
+        {
+            last_failure_reason_ =
+                "prefill benchmark could not observe the durable forward completion event";
+            success = false;
+        }
+
+        // Propagate local execution/event failures to every MPI rank.
+        success = synchronizeSuccess(success, synchronization_phase);
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -1815,6 +1902,21 @@ namespace llaminar2
             return capture_and_return();
         }
 
+        PrefixRuntimeStateSnapshot measured_prefill_graph_baseline;
+        if (debugEnv().execution.prefill_graph_required)
+        {
+            measured_prefill_graph_baseline = runner_->prefixStateProbe();
+            if (!prefillGraphProbeShowsCaptureOrReplay(
+                    measured_prefill_graph_baseline))
+            {
+                last_failure_reason_ =
+                    "required prefill graph was absent immediately before the measured replay";
+                if (mpi_ctx_->rank() == 0)
+                    LOG_ERROR(last_failure_reason_);
+                return capture_and_return();
+            }
+        }
+
         if (mpi_ctx_->rank() == 0)
         {
             LOG_INFO("Running " << benchmark_iterations << " benchmark iterations...");
@@ -1840,11 +1942,19 @@ namespace llaminar2
          * preserved. They must describe only steady-state measured work rather
          * than graph capture, setup, or post-warmup placement activity.
          */
-        PerfStatsCollector::resetPreservingDomains(
+        PerfStatsCollector::resetPreserving(
             {"memory",
              "gpu_graph_inventory",
              "tp_allreduce_bom",
-             "tp_rooted_collective_bom"});
+             "tp_rooted_collective_bom"},
+            {
+                {"forward_graph", "full_graph_plan_graphs"},
+                {"forward_graph", "graph_replay_plan_graphs"},
+                {"forward_graph", "full_graph_capture_executable_nodes"},
+                {"forward_graph", "prefill_graph_lifecycle"},
+                {"forward_graph", "prefill_graph_phase"},
+                {"forward_graph", "decode_graph_phase"},
+            });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
@@ -1896,10 +2006,32 @@ namespace llaminar2
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
                 return capture_and_return();
             }
-            if (!requirePrefillGraphCapture(("measured prefill iteration " + std::to_string(iter + 1)).c_str()))
+            if (debugEnv().execution.prefill_graph_required)
             {
-                logGPUMemorySnapshot(("prefill-graph-required-fail iter=" + std::to_string(iter + 1)).c_str());
-                return capture_and_return();
+                PrefixRuntimeStateSnapshot measured_prefill_graph_after =
+                    runner_->prefixStateProbe();
+                std::string replay_failure;
+                if (!prefillGraphProbeShowsReplayAdvance(
+                        measured_prefill_graph_baseline,
+                        measured_prefill_graph_after,
+                        &replay_failure))
+                {
+                    last_failure_reason_ =
+                        "required warmed prefill graph replay was not observed on measured iteration " +
+                        std::to_string(iter + 1) + ": " + replay_failure +
+                        " (before: " +
+                        summarizePrefillGraphProbe(
+                            measured_prefill_graph_baseline) +
+                        "; after: " +
+                        summarizePrefillGraphProbe(
+                            measured_prefill_graph_after) + ")";
+                    if (mpi_ctx_->rank() == 0)
+                        LOG_ERROR(last_failure_reason_);
+                    logGPUMemorySnapshot(("prefill-graph-replay-required-fail iter=" + std::to_string(iter + 1)).c_str());
+                    return capture_and_return();
+                }
+                measured_prefill_graph_baseline =
+                    std::move(measured_prefill_graph_after);
             }
             prefill_times.push_back(prefill_time);
             logGPUMemorySnapshot(("after-prefill iter=" + std::to_string(iter + 1)).c_str());

@@ -201,6 +201,47 @@ namespace
         std::string old_;
     };
 
+    /**
+     * @brief Select the production ROCm router-Q8 publication policy.
+     *
+     * Shared-expert verifier performance is meaningful only when its input is
+     * the exact Q8 row publication produced by the routed router stage.  This
+     * scope keeps that production contract independent of test order while
+     * restoring every mutable debug-policy field when a case finishes.
+     */
+    class ScopedROCmBatchInvariantRouterPolicy
+    {
+    public:
+        ScopedROCmBatchInvariantRouterPolicy()
+            : old_q8_(llaminar2::mutableDebugEnv().rocm.moe_router_q8),
+              old_fp16_(llaminar2::mutableDebugEnv().rocm.moe_router_fp16),
+              old_reuse_(llaminar2::mutableDebugEnv().rocm.moe_reuse_router_q8_hidden)
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_router_q8 = true;
+            config.moe_router_fp16 = false;
+            config.moe_reuse_router_q8_hidden = true;
+        }
+
+        ~ScopedROCmBatchInvariantRouterPolicy()
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_router_q8 = old_q8_;
+            config.moe_router_fp16 = old_fp16_;
+            config.moe_reuse_router_q8_hidden = old_reuse_;
+        }
+
+        ScopedROCmBatchInvariantRouterPolicy(
+            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
+        ScopedROCmBatchInvariantRouterPolicy &operator=(
+            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
+
+    private:
+        bool old_q8_ = true;
+        bool old_fp16_ = false;
+        bool old_reuse_ = true;
+    };
+
     int envInt(const char *name, int fallback)
     {
         const char *value = std::getenv(name);
@@ -894,8 +935,11 @@ namespace
     class ScopedHipPerfGraph
     {
     public:
-        ScopedHipPerfGraph(hipStream_t stream, std::string operation)
-            : graph_(stream),
+        ScopedHipPerfGraph(
+            hipStream_t stream,
+            int device_ordinal,
+            std::string operation)
+            : graph_(stream, device_ordinal),
               transaction_(graph_, std::move(operation))
         {
             if (!stream || !transaction_.begin())
@@ -1054,7 +1098,8 @@ namespace
         int d_model = 2048,
         int intermediate = 512,
         const llaminar2::test::QuantizedVerifierFormatCase *gateup_format = nullptr,
-        const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr)
+        const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr,
+        bool canonical_route_split = false)
     {
         /*
          * Keep this harness aligned with the Qwen3.6 MoE model shape.  The
@@ -1126,10 +1171,22 @@ namespace
         auto route_indices_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_indices);
         auto route_weights_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_weights);
         auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        std::shared_ptr<llaminar2::FP32Tensor> canonical_route_contributions;
+        if (canonical_route_split)
+        {
+            canonical_route_contributions = makeZeros(
+                {static_cast<size_t>(rows * top_k),
+                 static_cast<size_t>(d_model)});
+        }
         EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
         EXPECT_TRUE(route_indices_tensor->ensureOnDevice(device, stream));
         EXPECT_TRUE(route_weights_tensor->ensureOnDevice(device, stream));
         EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        if (canonical_route_contributions)
+        {
+            EXPECT_TRUE(canonical_route_contributions->ensureOnDevice(
+                device, stream));
+        }
 
         /**
          * @brief Run only the device-resident grouping half of the verifier path.
@@ -1151,10 +1208,30 @@ namespace
 
         auto run_pipeline = [&]()
         {
-            return moe->executeGroupedPrefillPipeline(
-                hidden.get(), grouped_output.get(),
-                tables.gateup_table_id, tables.down_table_id,
-                rows, d_model, intermediate, num_experts, top_k);
+            if (!moe->executeGroupedPrefillPipeline(
+                    hidden.get(), grouped_output.get(),
+                    tables.gateup_table_id, tables.down_table_id,
+                    rows, d_model, intermediate, num_experts, top_k,
+                    canonical_route_contributions.get()))
+            {
+                return false;
+            }
+            if (!canonical_route_contributions)
+                return true;
+
+            /*
+             * This is the same graph-capturable producer/reducer contract used
+             * by LocalTP after its rooted collective. For one device there is
+             * no collective between the two launches: the experiment isolates
+             * whether exposing route-parallel down dots outweighs one compact,
+             * deterministic router-order reduction.
+             */
+            return moe->reduceCanonicalRouteContributions(
+                canonical_route_contributions.get(),
+                grouped_output.get(),
+                rows,
+                top_k,
+                d_model);
         };
 
         auto run_grouped = [&]()
@@ -1177,6 +1254,7 @@ namespace
 
         ScopedHipPerfGraph graph(
             stream,
+            /*device_ordinal=*/0,
             "ROCm MoE routed verifier perf capture");
         requireHipBenchBody(run_grouped(), "graph capture");
         if (!graph.finishAndInstantiate())
@@ -1206,7 +1284,7 @@ namespace
             moe.get(), stream, hidden_values, routing_indices, routing_weights,
             rows, top_k, d_model, intermediate,
             tables.gateup_table_id, tables.down_table_id, &rowwise_ms);
-        CloseMetrics metrics = compareVectors(grouped, rowwise, static_cast<size_t>(d_model));
+        CloseMetrics metrics = compareVectors(grouped, rowwise, grouped.size());
 
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 
@@ -1240,9 +1318,12 @@ namespace
     {
         constexpr int d_model = 2048;
         constexpr int intermediate = 512;
+        constexpr int routed_experts = 256;
+        constexpr int routed_top_k = 8;
         const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 120);
         const int warmups = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", 5);
         const auto device = llaminar2::DeviceId::rocm(0);
+        ScopedROCmBatchInvariantRouterPolicy router_policy;
 
         EXPECT_EQ(hipSetDevice(0), hipSuccess);
         hipStream_t stream = nullptr;
@@ -1257,8 +1338,29 @@ namespace
         auto moe = KernelFactory::createMoEKernel(device);
         EXPECT_NE(moe, nullptr);
         moe->setGPUStream(stream);
+        auto router_moe = KernelFactory::createMoEKernel(device);
+        EXPECT_NE(router_moe, nullptr);
+        router_moe->setGPUStream(stream);
         auto *moe_workspace = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe.get());
         EXPECT_NE(moe_workspace, nullptr);
+        auto *router_workspace =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(router_moe.get());
+        EXPECT_NE(router_workspace, nullptr);
+
+        /*
+         * Production gives routed and shared experts independent backend
+         * objects. Their only shared execution state is this graph-local Q8
+         * publication, whose stable device addresses are populated by the
+         * routed producer before the shared consumer is captured.
+         */
+        auto router_q8_publication =
+            std::make_shared<llaminar2::MoERouterQ8HiddenPublication>();
+        EXPECT_TRUE(router_moe->bindRouterQ8HiddenPublication(
+            router_q8_publication,
+            llaminar2::MoERouterQ8PublicationAccess::ProducerAndConsumer));
+        EXPECT_TRUE(moe->bindRouterQ8HiddenPublication(
+            router_q8_publication,
+            llaminar2::MoERouterQ8PublicationAccess::RequiredConsumer));
         auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
             gate_w.get(),
             up_w.get(),
@@ -1270,8 +1372,14 @@ namespace
         const auto hidden_values = makeHiddenValues(rows, d_model);
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        auto gate_scratch = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(intermediate)});
+        auto up_scratch = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(intermediate)});
         EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
         EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(gate_scratch->ensureOnDevice(device, stream));
+        EXPECT_TRUE(up_scratch->ensureOnDevice(device, stream));
 
         auto make_params = [&](llaminar2::TensorBase *output,
                                bool grouped_verifier)
@@ -1283,6 +1391,8 @@ namespace
             params.up_w = up_w.get();
             params.down_w = down_w.get();
             params.output = output;
+            params.gate_scratch = gate_scratch.get();
+            params.up_scratch = up_scratch.get();
             params.seq_len = rows;
             params.d_model = d_model;
             params.intermediate = intermediate;
@@ -1292,6 +1402,8 @@ namespace
             params.prepared_store = prepared.store.get();
             params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
             params.force_decode_equivalent_verifier_prefill = false;
+            if (grouped_verifier)
+                params.required_router_q8_publication = router_q8_publication;
             return params;
         };
 
@@ -1315,6 +1427,45 @@ namespace
         grouped_stage.bindWorkspace(workspace.get());
         if (moe_workspace)
             moe_workspace->bindWorkspace(workspace.get());
+        if (router_workspace)
+            router_workspace->bindWorkspace(workspace.get());
+
+        /*
+         * Materialize the exact producer payload once, outside the isolated
+         * shared-stage timing window. Inputs are immutable in this kernel
+         * speedometer, so every graph replay consumes the same bytes and
+         * addresses that a routed producer node would publish immediately
+         * before it in the complete inference graph.
+         */
+        std::vector<float> router_gate_values(
+            static_cast<size_t>(routed_experts) * d_model);
+        for (size_t i = 0; i < router_gate_values.size(); ++i)
+        {
+            router_gate_values[i] =
+                0.017f * std::sin(0.0017f * static_cast<float>(i + 29)) +
+                0.011f * std::cos(0.0023f * static_cast<float>(i + 47));
+        }
+        auto router_gate = makeTensor(
+            {static_cast<size_t>(routed_experts), static_cast<size_t>(d_model)},
+            router_gate_values);
+        auto router_indices = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(routed_top_k)});
+        auto router_weights = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(routed_top_k)});
+        EXPECT_TRUE(router_gate->ensureOnDevice(device, stream));
+        EXPECT_TRUE(router_indices->ensureOnDevice(device, stream));
+        EXPECT_TRUE(router_weights->ensureOnDevice(device, stream));
+        EXPECT_TRUE(router_moe->routeVerifierRowsDecodeEquivalent(
+            hidden.get(),
+            router_gate.get(),
+            rows,
+            d_model,
+            routed_experts,
+            routed_top_k,
+            /*normalize_weights=*/true,
+            router_indices.get(),
+            router_weights.get()));
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         llaminar2::DeviceNativeVNNIMatrixDesc gate_desc{};
         llaminar2::DeviceNativeVNNIMatrixDesc up_desc{};
@@ -1408,6 +1559,7 @@ namespace
 
         ScopedHipPerfGraph graph(
             stream,
+            /*device_ordinal=*/0,
             "ROCm MoE shared-expert verifier perf capture");
         requireHipBenchBody(run_grouped(), "shared graph capture");
         requireHipBenchBody(
@@ -1437,6 +1589,8 @@ namespace
         grouped_stage.unbindWorkspace();
         if (moe_workspace)
             moe_workspace->unbindWorkspace();
+        if (router_workspace)
+            router_workspace->unbindWorkspace();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 
         return BenchResult{
@@ -1737,46 +1891,6 @@ namespace
     }
 
     /**
-     * @brief Force the production Q8 router policy for one benchmark case.
-     *
-     * The combined CUDA/ROCm perf binary may initialize DebugEnv before the ROCm
-     * tests run. Mutating the parsed policy directly avoids test-order-dependent
-     * environment reloads while restoring every field on scope exit.
-     */
-    class ScopedROCmBatchInvariantRouterPolicy
-    {
-    public:
-        ScopedROCmBatchInvariantRouterPolicy()
-            : old_q8_(llaminar2::mutableDebugEnv().rocm.moe_router_q8),
-              old_fp16_(llaminar2::mutableDebugEnv().rocm.moe_router_fp16),
-              old_reuse_(llaminar2::mutableDebugEnv().rocm.moe_reuse_router_q8_hidden)
-        {
-            auto &config = llaminar2::mutableDebugEnv().rocm;
-            config.moe_router_q8 = true;
-            config.moe_router_fp16 = false;
-            config.moe_reuse_router_q8_hidden = true;
-        }
-
-        ~ScopedROCmBatchInvariantRouterPolicy()
-        {
-            auto &config = llaminar2::mutableDebugEnv().rocm;
-            config.moe_router_q8 = old_q8_;
-            config.moe_router_fp16 = old_fp16_;
-            config.moe_reuse_router_q8_hidden = old_reuse_;
-        }
-
-        ScopedROCmBatchInvariantRouterPolicy(
-            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
-        ScopedROCmBatchInvariantRouterPolicy &operator=(
-            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
-
-    private:
-        bool old_q8_ = true;
-        bool old_fp16_ = false;
-        bool old_reuse_ = true;
-    };
-
-    /**
      * @brief Benchmark captured batch-invariant Q8 routing against serial M=1.
      *
      * The grouped kernel owns one expert and one fixed four-row tile. Increasing
@@ -1852,6 +1966,7 @@ namespace
 
         ScopedHipPerfGraph graph(
             stream,
+            /*device_ordinal=*/0,
             "ROCm MoE router verifier perf capture");
         requireHipBenchBody(run_grouped(), "router graph capture");
         requireHipBenchBody(
@@ -1979,142 +2094,6 @@ namespace
             rowwise_ms,
             index_metrics.bit_mismatch_count,
             weight_metrics.bit_mismatch_count};
-    }
-
-    /**
-     * @brief Exercise production's M=1 grouped-verifier shared-FFN route.
-     *
-     * The Qwen3.6 MoE MTP sidecar sets both verifier-facing knobs on
-     * `SharedExpertFFNStage`: it disables the ordinary grouped decode shortcut
-     * and asks for grouped verifier prefill when the backend advertises that
-     * capability.  The older stage tests covered M=2..4, but the prefix-cache
-     * restore path starts with a single sidecar row.  This regression keeps
-     * that exact row count and verifies that the stage refuses to route M=1
-     * into the grouped verifier kernel, whose contract starts at M=2.
-     */
-    BenchResult runROCmSharedExpertStageM1GroupedVerifierCase(
-        const QuantFormatCase &format)
-    {
-        constexpr int rows = 1;
-        constexpr int d_model = 2048;
-        constexpr int intermediate = 512;
-        const auto device = llaminar2::DeviceId::rocm(0);
-
-        EXPECT_EQ(hipSetDevice(0), hipSuccess);
-        hipStream_t stream = nullptr;
-        EXPECT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
-
-        auto gate_w = format.create(
-            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8201);
-        auto up_w = format.create(
-            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8202);
-        auto down_w = format.create(
-            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 8203);
-        auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
-            gate_w.get(),
-            up_w.get(),
-            down_w.get(),
-            device,
-            std::string("perf.moe_verifier.rocm.shared_stage.m1_grouped_verifier.") + format.name,
-            llaminar2::ModelContextId{393000});
-
-        const auto hidden_values = makeHiddenValues(rows, d_model);
-        auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
-        auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        auto reference_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
-        EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
-        EXPECT_TRUE(reference_output->ensureOnDevice(device, stream));
-
-        auto make_params = [&](llaminar2::TensorBase *output,
-                               bool grouped_verifier)
-        {
-            llaminar2::SharedExpertFFNStage::Params params;
-            params.device_id = device;
-            params.input = hidden.get();
-            params.gate_w = gate_w.get();
-            params.up_w = up_w.get();
-            params.down_w = down_w.get();
-            params.output = output;
-            params.seq_len = rows;
-            params.d_model = d_model;
-            params.intermediate = intermediate;
-            params.prepared_ref_gate = prepared.gate_ref;
-            params.prepared_ref_up = prepared.up_ref;
-            params.prepared_ref_down = prepared.down_ref;
-            params.prepared_store = prepared.store.get();
-            params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
-            params.disable_grouped_decode_shortcut = true;
-            return params;
-        };
-
-        llaminar2::SharedExpertFFNStage grouped_stage(
-            make_params(grouped_output.get(), true));
-        llaminar2::SharedExpertFFNStage reference_stage(
-            make_params(reference_output.get(), false));
-        grouped_stage.setGPUStream(stream);
-        reference_stage.setGPUStream(stream);
-        /*
-         * M=1 is still a verifier bucket in the MTP transaction.  Keep it on
-         * the same grouped table-prefill route as M=2..4 so the publication
-         * path has one production implementation and this perf regression
-         * proves that even the smallest bucket remains decode-equivalent.
-         */
-        EXPECT_TRUE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
-        EXPECT_FALSE(grouped_stage.usesGroupedDecodeForTesting());
-        EXPECT_FALSE(reference_stage.usesGroupedVerifierPrefillRouteForTesting());
-        EXPECT_FALSE(reference_stage.usesGroupedDecodeForTesting());
-
-        auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
-        reqs.merge(reference_stage.getWorkspaceRequirements(rows, d_model, intermediate));
-        reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
-            rows,
-            d_model,
-            intermediate,
-            /*num_experts=*/256,
-            /*top_k=*/8));
-        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
-            device,
-            reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
-        EXPECT_TRUE(workspace->allocate(reqs));
-        grouped_stage.bindWorkspace(workspace.get());
-        reference_stage.bindWorkspace(workspace.get());
-
-        llaminar2::testing::MockDeviceContext ctx(
-            device, llaminar2::ComputeBackendType::GPU_ROCM);
-        EXPECT_TRUE(grouped_stage.execute(&ctx));
-        EXPECT_TRUE(reference_stage.execute(&ctx));
-        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-        TransferEngine::publishDeviceWrite(grouped_output, device, stream);
-        TransferEngine::publishDeviceWrite(reference_output, device, stream);
-        std::vector<float> grouped(
-            grouped_output->data(),
-            grouped_output->data() + grouped_output->numel());
-        std::vector<float> reference(
-            reference_output->data(),
-            reference_output->data() + reference_output->numel());
-        CloseMetrics metrics =
-            compareVectors(grouped, reference, static_cast<size_t>(d_model));
-
-        grouped_stage.unbindWorkspace();
-        reference_stage.unbindWorkspace();
-        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
-
-        return BenchResult{
-            "rocm",
-            std::string("shared_stage_ffn_m1_grouped_verifier_") + format.name,
-            rows,
-            1,
-            1,
-            d_model,
-            intermediate,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            metrics};
     }
 
     /** One reciprocal MoE projection shape in the dispatch trainer. */
@@ -2416,6 +2395,7 @@ namespace
                     llaminar2::PerfStatsCollector::reset();
                     ScopedHipPerfGraph graph(
                         stream,
+                        /*device_ordinal=*/0,
                         "ROCm MoE grouped-prefill candidate capture");
                     ASSERT_TRUE(run_pipeline())
                         << format.label << ' ' << shape.name << " M=" << rows
@@ -2959,7 +2939,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M1_SharedExpertFFNStageGroupedVerifierDecode
 
     ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     const QuantFormatCase &format = sharedExpertPreparedFormatCase("IQ3_S");
-    auto shared = runROCmSharedExpertStageM1GroupedVerifierCase(format);
+    auto shared = runROCmSharedExpertStageCase(/*rows=*/1, format);
     expectClose(shared.metrics);
     printResult(shared);
 #endif
@@ -2988,6 +2968,41 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4_CombinedRoutedSharedUpperBound)
         /*case_name_override=*/"combined_top9_upper_bound",
         /*unique_routes=*/true,
         /*include_terminal_expert=*/true);
+    expectClose(combined.metrics);
+    expectGraphReplayFasterThanReference(combined);
+    printResult(combined);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M4_CanonicalRouteSplitUpperBound)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * Compare the route-parallel down producer plus strict router-order
+     * reducer using the same top-9 verifier geometry as the direct publication
+     * speedometer. The candidate uses only public production APIs and
+     * persistent device storage, so a winner can be selected by graph policy
+     * without introducing a benchmark-only implementation.
+     */
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    auto combined = runROCmCase(
+        /*shared=*/false,
+        /*rows=*/4,
+        /*routed_top_k=*/9,
+        /*routed_num_experts=*/257,
+        /*case_name_override=*/"canonical_route_split_top9",
+        /*unique_routes=*/true,
+        /*include_terminal_expert=*/true,
+        /*d_model=*/2048,
+        /*intermediate=*/512,
+        /*gateup_format=*/nullptr,
+        /*down_format=*/nullptr,
+        /*canonical_route_split=*/true);
     expectClose(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
@@ -3025,13 +3040,14 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4M9M31_CombinedTop9AllFormatsDecodeEquivale
                 rows,
                 /*routed_top_k=*/9,
                 /*routed_num_experts=*/257,
-                /*case_name_override=*/"combined_top9_all_formats",
+                /*case_name_override=*/"canonical_route_split_top9_all_formats",
                 /*unique_routes=*/false,
                 /*include_terminal_expert=*/true,
                 /*d_model=*/2048,
                 /*intermediate=*/512,
                 &format,
-                &format);
+                &format,
+                /*canonical_route_split=*/true);
             expectClose(combined.metrics);
             expectGraphReplayFasterThanReference(combined);
         }

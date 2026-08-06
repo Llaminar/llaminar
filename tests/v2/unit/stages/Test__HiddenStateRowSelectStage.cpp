@@ -665,6 +665,57 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataUsesOnlyTheExactProduce
     EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
 }
 
+TEST(Test__HiddenStateRowSelectStage,
+     ShiftedPrefillTransactionDeclaresCompletePersistentArenaContract)
+{
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 16;
+    params.d_model = 32;
+    params.selected_row_count = 16;
+    params.input_buffer_id = BufferId::HIDDEN_STATE;
+    params.output_buffer_id = BufferId::NORMALIZED;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            ShiftedPrefillTransaction;
+    params.terminal_hidden_archive_buffer_id =
+        BufferId::PREFIX_TERMINAL_HIDDEN;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(16, 32, 0).buffers.empty())
+        << "Integrated shifted prefill derives all metadata from persistent device owners.";
+    const StageBufferContract contract = stage.bufferContract();
+    const auto has_binding = [](const auto &bindings, BufferId id)
+    {
+        return std::any_of(
+            bindings.begin(),
+            bindings.end(),
+            [id](const BufferBinding &binding)
+            {
+                return binding.id == id;
+            });
+    };
+
+    const auto reads = contract.allArenaReads();
+    const auto writes = contract.allWrites();
+    EXPECT_TRUE(has_binding(reads, BufferId::HIDDEN_STATE));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_TOKEN_IDS));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_POSITION_IDS));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_BATCH_GEOMETRY));
+    EXPECT_TRUE(has_binding(reads, BufferId::PREFIX_TERMINAL_HIDDEN));
+    EXPECT_TRUE(has_binding(writes, BufferId::PREFIX_TERMINAL_HIDDEN));
+    EXPECT_TRUE(has_binding(writes, BufferId::NORMALIZED));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS));
+}
+
 TEST(Test__HiddenStateRowSelectStage, FixedContiguousGpuRowsHaveNoHostMetadataLifecycle)
 {
     HiddenStateRowsSelectStage::Params params;

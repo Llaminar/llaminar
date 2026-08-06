@@ -32,6 +32,9 @@ namespace llaminar2
         REQUEST_TOKEN_IDS,         ///< Device-owned request token rows admitted once at the API boundary
         REQUEST_POSITION_IDS,      ///< Device-owned absolute request positions paired with REQUEST_TOKEN_IDS
         REQUEST_BATCH_GEOMETRY,    ///< Device-owned real lengths followed by the padded physical row stride
+        MTP_SHIFTED_PREFILL_TOKEN_IDS, ///< Device-owned shifted condition tokens produced inside the captured prefill graph
+        MTP_SHIFTED_PREFILL_POSITION_IDS, ///< Device-owned shifted positions paired with MTP_SHIFTED_PREFILL_TOKEN_IDS
+        MTP_SHIFTED_PREFILL_APPEND_LENGTHS, ///< Device-owned real shifted-KV append width for each request
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -117,6 +120,7 @@ namespace llaminar2
         MTP_FIRST_TRANSACTION_DIAGNOSTIC, ///< Retained device-only stochastic transaction-zero evidence
         MTP_GENERATION_RESPONSE_TOKENS, ///< Persistent device-owned response ledger [request, max_seq_len]
         MTP_GENERATION_CONTROL,         ///< Persistent device-owned generation controller [request, control_words]
+        MTP_GENERATION_DISPATCH_TICKETS, ///< Narrow immutable HIP scheduler snapshots [request, ticket_words]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,
@@ -301,6 +305,14 @@ namespace llaminar2
             return "MTP_GENERATION_RESPONSE_TOKENS";
         case BufferId::MTP_GENERATION_CONTROL:
             return "MTP_GENERATION_CONTROL";
+        case BufferId::MTP_GENERATION_DISPATCH_TICKETS:
+            return "MTP_GENERATION_DISPATCH_TICKETS";
+        case BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS:
+            return "MTP_SHIFTED_PREFILL_TOKEN_IDS";
+        case BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS:
+            return "MTP_SHIFTED_PREFILL_POSITION_IDS";
+        case BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS:
+            return "MTP_SHIFTED_PREFILL_APPEND_LENGTHS";
         case BufferId::PREFIX_K_STAGING:
             return "PREFIX_K_STAGING";
         case BufferId::PREFIX_V_STAGING:

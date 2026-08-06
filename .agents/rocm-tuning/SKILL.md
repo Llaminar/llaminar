@@ -1,6 +1,6 @@
 ---
 name: rocm-tuning
-description: Profile and tune Llaminar V2 ROCm/HIP INT8 VNNI GEMM and GEMV kernels on AMD Instinct GPUs (gfx906 MI50/MI60) using rocprof per-dispatch timing and LLVM ISA analysis (llvm-objcopy/readelf/objdump), benchmarked against AMD Composable Kernel (CK). Use when asked to find a slow HIP kernel, diagnose occupancy / VGPR pressure / register spills / waitcnt stalls, A/B kernel variants (V1-V7), close a GEMM gap vs CK, or distinguish a real GPU-kernel gap from PCIe/wallclock noise while keeping parity.
+description: Profile and tune Llaminar V2 ROCm/HIP kernels on AMD Instinct GPUs (gfx906 MI50/MI60), including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
 ---
 
 # ROCm / HIP Kernel Profiling & Tuning (Llaminar V2, gfx906)
@@ -160,6 +160,23 @@ Force a specific variant with env vars when isolating:
 | `LLAMINAR_ROCM_WIDE_TILE_V7=1` | Force V7 |
 | `LLAMINAR_ROCM_WIDE_TILE_V6=1` … `_V2=1` | Force V6 … V2 |
 
+### Isolate one production-shaped launch
+
+Whole-graph PerfStats identifies the expensive captured fragment. Attribute
+individual kernels with a standalone performance harness that invokes the same
+backend entrypoint, geometry, persistent scratch contract, and tensor format as
+production. Never disable graph capture or select eager inference merely to
+make a profiler attach: that measures a different engine. Some rocprofiler
+versions cannot trace retained HIP graphs reliably; retain the outer graph
+event measurement and profile the isolated real kernel instead.
+
+Keep canonical timing unprofiled, then gather timing, counters, and ISA in a
+separate deterministic profiler invocation for that exact candidate. Read
+[`references/rocprof-isolated-kernel.md`](references/rocprof-isolated-kernel.md)
+for the tested rocprof v1 dispatch-range/counter commands, metric
+interpretation, wave64 vectorization checks, and ROCm 7 `.hip_fatbin`
+extraction workflow.
+
 ---
 
 ## Step 3: ISA deep-dive (occupancy + scheduling)
@@ -187,6 +204,10 @@ llvm-objdump -d --mcpu=gfx906 /tmp/co.elf > /tmp/disasm.txt
 # 4. Locate kernels (CK symbols are >1000 chars due to C++ templates)
 grep -n '<_Z' /tmp/disasm.txt | head -40
 ```
+
+For ROCm 7 objects that use `.hip_fatbin`, use the extraction workflow in the
+linked isolated-kernel reference. The unprofiled benchmark, rocprof evidence,
+and static ISA must always describe the same compiled candidate.
 
 ### Read the metadata FIRST
 

@@ -1593,6 +1593,133 @@ namespace llaminar2
         return params.stage_name;
     }
 
+    std::string QwenGraphBase::maybeAddShiftedMTPPrefillTransaction(
+        ComputeGraph &graph,
+        const ForwardInput &input,
+        const std::string &dependency_node,
+        DeviceId device)
+    {
+        if (!input.shifted_mtp_prefill.has_value())
+            return dependency_node;
+
+        const auto &binding = *input.shifted_mtp_prefill;
+        const int total_tokens = input.batch_size * input.seq_len;
+        if (!device.is_gpu() ||
+            input.execution_role != ForwardExecutionRole::MainInference ||
+            input.execution_phase != ForwardExecutionPhase::Prefill ||
+            total_tokens <= 0 ||
+            !binding.validForRequestCount(input.batch_size) ||
+            !input.sequence_lengths_device ||
+            config_.mtp_shifted_prefill_hidden_publication !=
+                MTPShiftedPrefillHiddenPublicationPolicy::
+                    GraphIntegratedKVTransaction)
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill requires a complete graph-integrated main-prefill binding");
+        }
+        if (weight_bindings_.mtp.empty() ||
+            weight_bindings_.mtp.depths.empty())
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill requires depth-zero MTP weight bindings");
+        }
+        if (!buffers_.current_hidden || !buffers_.layer_buffers.normalized ||
+            buffers_.current_hidden->rows() <
+                static_cast<size_t>(total_tokens) ||
+            buffers_.layer_buffers.normalized->rows() <
+                static_cast<size_t>(total_tokens))
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill exceeds its persistent hidden-state arena capacity");
+        }
+
+        const std::string prepare_node =
+            "mtp_shifted_prefill_prepare_and_archive";
+        HiddenStateRowsSelectStage::Params prepare_params{
+            .device_id = device,
+            .input = buffers_.current_hidden,
+            .output = buffers_.layer_buffers.normalized,
+            .seq_len = total_tokens,
+            .d_model = config_.d_model,
+            .selected_row_count = total_tokens,
+            .input_buffer_id = BufferId::HIDDEN_STATE,
+            .output_buffer_id = BufferId::NORMALIZED,
+            .device_row_index_source =
+                HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                    ShiftedPrefillTransaction,
+            .request_sequence_lengths_device =
+                input.sequence_lengths_device,
+            .request_row_stride_source =
+                HiddenStateRowsSelectStage::RequestRowStrideSource::
+                    ExternalDeviceScalar,
+            .request_row_stride_device =
+                binding.request_row_stride_device,
+            .input_token_ids_device =
+                binding.request_token_ids_device,
+            .input_position_ids_device =
+                binding.request_position_ids_device,
+            .shifted_token_ids_output_device =
+                binding.shifted_token_ids_device,
+            .shifted_position_ids_output_device =
+                binding.shifted_position_ids_device,
+            .shifted_append_lengths_output_device =
+                binding.append_lengths_device,
+            .terminal_hidden_archive =
+                binding.terminal_hidden_archive,
+            .main_cached_tokens_by_request =
+                binding.main_cached_tokens_device,
+            .shifted_cached_tokens_by_request =
+                binding.shifted_cached_tokens_device,
+            .request_count = input.batch_size,
+            .terminal_hidden_archive_buffer_id =
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+        };
+        graph.addNode(
+            prepare_node,
+            ComputeStageFactory::createHiddenStateRowsSelect(
+                std::move(prepare_params)),
+            device);
+        graph.addDependency(prepare_node, dependency_node);
+
+        MTPForwardInput mtp_input{
+            .draft_token_ids = nullptr,
+            .draft_token_ids_device =
+                binding.shifted_token_ids_device,
+            .terminal_hidden = buffers_.layer_buffers.normalized,
+            .kv_cache = binding.kv_cache,
+            .position_ids = nullptr,
+            .position_ids_device =
+                binding.shifted_position_ids_device,
+            .sequence_lengths = nullptr,
+            .sequence_lengths_device = binding.append_lengths_device,
+            .batch_size = input.batch_size,
+            .seq_len = input.seq_len,
+            .first_sequence_index = 0,
+            .device_state_publication_stream =
+                input.device_state_publication_stream,
+            .device = device,
+            .terminal_hidden_buffer_id = BufferId::NORMALIZED,
+            .kv_cache_only = true,
+        };
+        MTPForwardOutput mtp_output = binding.output;
+        ComputeGraph mtp_kv_graph = buildMTPGraph(
+            /*depth_idx=*/0,
+            weight_bindings_.mtp.depths.front(),
+            mtp_input,
+            mtp_output);
+        if (mtp_kv_graph.size() == 0 ||
+            mtp_kv_graph.terminalNode().empty())
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill produced an empty depth-zero KV graph");
+        }
+        const std::string transaction_terminal =
+            mtp_kv_graph.terminalNode();
+        graph.merge(std::move(mtp_kv_graph), prepare_node);
+        graph.setTerminalNode(transaction_terminal);
+        return transaction_terminal;
+    }
+
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
         const ForwardInput &input,
         ForwardOutput &output)
@@ -1869,6 +1996,13 @@ namespace llaminar2
             graphLMHeadOutput(use_column_parallel),
             lm_layout.seq_len,
             device);
+
+        prev_node = maybeAddShiftedMTPPrefillTransaction(
+            graph,
+            input,
+            prev_node,
+            device);
+        graph.setTerminalNode(prev_node);
 
         // Set output
         output.logits = graphLMHeadOutput(use_column_parallel);
@@ -3486,6 +3620,16 @@ namespace llaminar2
 
         config.custom_formulas["mtp_target_query_rows"] =
             static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+        /*
+         * Grouped verification remains bounded by configured speculative depth,
+         * while graph-integrated shifted prefill performs one KV-only MTP pass
+         * across the complete captured prompt bucket. The shared MTP projection
+         * scratch must cover the larger of those two graph families.
+         */
+        config.custom_formulas["mtp_kv_prefill_rows"] =
+            static_cast<size_t>(std::max(
+                std::max(1, seq_len),
+                resolveMTPMaxTargetQueryRows(config_.mtp)));
         config.custom_formulas["mtp_vocab"] =
             static_cast<size_t>(reserve_full_mtp_head_buffers
                                     ? config_.vocab_size

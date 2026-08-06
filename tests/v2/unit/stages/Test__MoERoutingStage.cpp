@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
@@ -224,6 +225,74 @@ TEST_F(MoERoutingStageTest, SingleToken)
     for (int k = 0; k < TOP_K; ++k)
         sum += wt[k];
     EXPECT_NEAR(sum, 1.0f, 0.01f);
+}
+
+/**
+ * @brief Prove that routing workspace follows the graph-family row envelope.
+ *
+ * The live server regression first built a 39-row Qwen3.6 MoE graph and then
+ * admitted a 68-row multi-turn prompt.  The old router ignored the allocator's
+ * family-wide `m` argument, leaving `moe_route_logits` permanently sized for
+ * the first request.  Exercise both GPU backends without launching device work
+ * and verify that a larger planner envelope, as well as a larger concrete
+ * stage, can never be weakened by the other value.
+ */
+TEST_F(MoERoutingStageTest, GPUWorkspaceRowsCoverConcreteAndFamilyEnvelope)
+{
+    constexpr int kConcreteRows = 39;
+    constexpr int kLaterRequestRows = 68;
+    constexpr int kFamilyRows = 4096;
+    constexpr int kModelWidth = 2048;
+    constexpr int kExperts = 256;
+
+    const auto expectedRouteLogitsBytes = [](int rows)
+    {
+        return static_cast<size_t>(rows) *
+               static_cast<size_t>(kExperts) * sizeof(float);
+    };
+
+    const auto verifyBackend = [&](DeviceId device)
+    {
+        MoERoutingStage::Params params;
+        params.device_id = device;
+        params.seq_len = kConcreteRows;
+        params.d_model = kModelWidth;
+        params.num_experts = kExperts;
+        params.top_k = 8;
+
+        MoERoutingStage stage(params);
+
+        const WorkspaceRequirements concrete =
+            stage.getWorkspaceRequirements(/*m=*/1);
+        const WorkspaceDescriptor *concrete_logits =
+            concrete.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(concrete_logits, nullptr);
+        EXPECT_EQ(
+            concrete_logits->size_bytes,
+            expectedRouteLogitsBytes(kConcreteRows));
+
+        const WorkspaceRequirements later_request =
+            stage.getWorkspaceRequirements(kLaterRequestRows);
+        const WorkspaceDescriptor *later_logits =
+            later_request.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(later_logits, nullptr);
+        EXPECT_EQ(
+            later_logits->size_bytes,
+            expectedRouteLogitsBytes(kLaterRequestRows));
+
+        const WorkspaceRequirements family =
+            stage.getWorkspaceRequirements(kFamilyRows);
+        const WorkspaceDescriptor *family_logits =
+            family.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(family_logits, nullptr);
+        EXPECT_EQ(
+            family_logits->size_bytes,
+            expectedRouteLogitsBytes(kFamilyRows));
+        EXPECT_GT(family_logits->size_bytes, later_logits->size_bytes);
+    };
+
+    verifyBackend(DeviceId::cuda(0));
+    verifyBackend(DeviceId::rocm(0));
 }
 
 TEST_F(MoERoutingStageTest, CPUVerifierTwoRowsMatchSplitDecodeRoutes)

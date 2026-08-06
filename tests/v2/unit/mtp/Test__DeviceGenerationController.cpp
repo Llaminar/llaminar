@@ -149,6 +149,143 @@ TEST(Test__DeviceGenerationController, InitializationAndBudgetAreTotalForPositiv
 }
 
 TEST(Test__DeviceGenerationController,
+     DispatchTicketExposesOnlyAuthenticatedSchedulingState)
+{
+    constexpr uint64_t session_epoch = 0x0123456789ABCDEFull;
+    constexpr uint64_t workspace_generation = 0xFEDCBA9876543210ull;
+
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/32,
+        /*response_capacity=*/64,
+        fixedDepthPolicy(/*depth=*/4),
+        control.data()));
+
+    DeviceGenerationDispatchTicket ticket{};
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(
+        session_epoch,
+        workspace_generation,
+        &ticket));
+    EXPECT_TRUE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation));
+    EXPECT_EQ(ticket.transaction_count, 0);
+    EXPECT_EQ(ticket.healthy, 0)
+        << "Admission identity alone must not advertise a schedulable row.";
+
+    control[kDeviceGenerationControlTransactionCount] = 7;
+    control[kDeviceGenerationControlCurrentDraftDepth] = 4;
+    control[kDeviceGenerationControlRequestComplete] = 0;
+    control[kDeviceGenerationControlErrorCode] =
+        static_cast<int>(DeviceGenerationError::None);
+    const uint32_t maintenance_due = 1;
+    ASSERT_TRUE(publish_device_generation_dispatch_ticket(
+        control.data(),
+        &maintenance_due,
+        &ticket));
+
+    EXPECT_TRUE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation));
+    EXPECT_EQ(ticket.healthy, 1);
+    EXPECT_EQ(ticket.complete, 0);
+    EXPECT_EQ(ticket.transaction_count, 7);
+    EXPECT_EQ(ticket.next_draft_depth, 4);
+    EXPECT_EQ(ticket.error_code, static_cast<int>(DeviceGenerationError::None));
+    EXPECT_EQ(ticket.maintenance_due, 1);
+
+    DeviceGenerationDispatchTicket mirrored_ticket = ticket;
+    mirrored_ticket.session_epoch_low ^= 0x1u;
+    EXPECT_FALSE(mirrored_ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation));
+    EXPECT_TRUE(ticket.hasSameDispatchDecision(mirrored_ticket))
+        << "Participant-local lifecycle identity is not a dispatch decision.";
+    mirrored_ticket.next_draft_depth = 3;
+    EXPECT_FALSE(ticket.hasSameDispatchDecision(mirrored_ticket));
+}
+
+TEST(Test__DeviceGenerationController,
+     DispatchTicketPoisonsMalformedMaintenanceState)
+{
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/8,
+        /*response_capacity=*/8,
+        fixedDepthPolicy(/*depth=*/2),
+        control.data()));
+    control[kDeviceGenerationControlTransactionCount] = 1;
+
+    DeviceGenerationDispatchTicket ticket{};
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(
+        /*session_epoch=*/11,
+        /*workspace_generation=*/29,
+        &ticket));
+    const uint32_t poisoned_maintenance_due = 2;
+    ASSERT_TRUE(publish_device_generation_dispatch_ticket(
+        control.data(),
+        &poisoned_maintenance_due,
+        &ticket));
+
+    expectFatal(control, DeviceGenerationError::InvalidMaintenanceState);
+    EXPECT_EQ(ticket.healthy, 0);
+    EXPECT_EQ(ticket.complete, 1);
+    EXPECT_EQ(
+        ticket.error_code,
+        static_cast<int>(DeviceGenerationError::InvalidMaintenanceState));
+    EXPECT_EQ(ticket.maintenance_due, 0)
+        << "A poisoned maintenance value must never select a graph branch.";
+}
+
+TEST(Test__DeviceGenerationController,
+     DynamicDispatchTicketPublishesEverySupportedDepthWithoutHostPolicy)
+{
+    DeviceGenerationDepthPolicy policy;
+    policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+    policy.initial_depth = 1;
+    policy.minimum_depth = 1;
+    policy.maximum_depth =
+        DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth;
+    ASSERT_TRUE(policy.valid());
+
+    ControlRow control{};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/256,
+        /*response_capacity=*/256,
+        policy,
+        control.data()));
+
+    DeviceGenerationDispatchTicket ticket{};
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(
+        /*session_epoch=*/77,
+        /*workspace_generation=*/91,
+        &ticket));
+
+    for (int depth = policy.minimum_depth;
+         depth <= policy.maximum_depth;
+         ++depth)
+    {
+        control[kDeviceGenerationControlTransactionCount] = depth;
+        control[kDeviceGenerationControlCurrentDraftDepth] = depth;
+        control[kDeviceGenerationControlActiveVerifierRowCount] = depth + 1;
+        const uint32_t maintenance_due =
+            static_cast<uint32_t>(depth & 1);
+        ASSERT_TRUE(publish_device_generation_dispatch_ticket(
+            control.data(),
+            &maintenance_due,
+            &ticket));
+        EXPECT_TRUE(ticket.matchesLifecycle(77, 91));
+        EXPECT_EQ(ticket.transaction_count, depth);
+        EXPECT_EQ(ticket.next_draft_depth, depth);
+        EXPECT_EQ(
+            ticket.maintenance_due,
+            static_cast<int32_t>(maintenance_due));
+        EXPECT_EQ(ticket.healthy, 1);
+        EXPECT_EQ(ticket.complete, 0);
+    }
+}
+
+TEST(Test__DeviceGenerationController,
      CurrentBatchLLEPEvidenceFieldsAreContiguousTerminalControlWords)
 {
     using namespace llaminar2::sampling_math;

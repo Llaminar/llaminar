@@ -634,6 +634,8 @@ namespace
         buffers.attn_output = arena.fp32({rows, value_dim});
         buffers.attn_proj = arena.fp32({rows, d});
         buffers.extensions[BufferId::GDN_QKV] = arena.fp32({rows, qkv_dim});
+        buffers.extensions[BufferId::GDN_RECURRENCE_IN] =
+            arena.fp32({rows, qkv_dim});
         buffers.extensions[BufferId::GDN_Z] = arena.fp32({rows, value_dim});
         buffers.extensions[BufferId::GDN_ALPHA] = arena.fp32({rows, v_heads});
         buffers.extensions[BufferId::GDN_BETA] = arena.fp32({rows, v_heads});
@@ -661,6 +663,8 @@ namespace
         buffers.attn_output = arena.fp32({rows, value_dim});
         buffers.attn_proj = arena.fp32({rows, d});
         buffers.extensions[BufferId::GDN_QKV] = arena.fp32({rows, qkv_dim});
+        buffers.extensions[BufferId::GDN_RECURRENCE_IN] =
+            arena.fp32({rows, qkv_dim});
         buffers.extensions[BufferId::GDN_Z] = arena.fp32({rows, value_dim});
         buffers.extensions[BufferId::GDN_ALPHA] = arena.fp32({rows, v_heads});
         buffers.extensions[BufferId::GDN_BETA] = arena.fp32({rows, v_heads});
@@ -2439,6 +2443,7 @@ TEST(Test__Qwen35MoEGraph, LocalTPColumnParallelForwardPublishesLocalLogits)
 TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPath)
 {
     GraphConfig config = makeMoEConfig();
+    config.grouped_mtp_verifier = true;
     config.compute_all_position_logits = true;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
@@ -3498,6 +3503,44 @@ TEST(Test__Qwen35MoEGraph, GroupedMainVerifierCreatesDecodeMaintenanceBinding)
     EXPECT_EQ(source.find("local_decode_layer &&\n                (first_local_decode_layer"),
               std::string::npos)
         << "Route-boundary binding/apply must not retain the obsolete M=1-only gate.";
+}
+
+/**
+ * @brief Lock in the standard single-GPU grouped-verifier runtime-table path.
+ *
+ * The standard routed branch used to initialize its full-local runtime bank for
+ * M=1 decode only.  M>1 grouped verifier stages nevertheless requested deferred
+ * accepted-route publication, so execution reached the publication boundary
+ * without either runtime grouping or a route ledger.  This source-level graph
+ * policy regression is device-free while ensuring both CUDA and ROCm retain the
+ * same explicit verifier-owned binding.
+ */
+TEST(Test__Qwen35MoEGraph, GroupedMainVerifierBindsStandardGpuRuntimeGrouping)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    EXPECT_NE(
+        source.find(
+            "serial_decode_runtime_table_requested ||\n"
+            "                     grouped_main_verifier_layer"),
+        std::string::npos)
+        << "M>1 main verifiers must initialize the standard GPU runtime bank";
+    EXPECT_NE(
+        source.find(
+            "if (grouped_main_verifier_layer)\n"
+            "                        expert_params.use_runtime_row_grouping = true;"),
+        std::string::npos)
+        << "The verifier route ledger and runtime grouper must share one table";
+    EXPECT_NE(
+        source.find(
+            "local_decode_layer ||\n"
+            "             grouped_main_verifier_layer ||"),
+        std::string::npos)
+        << "Apportioned LocalTP verifier rows need the same device runtime binding";
 }
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)

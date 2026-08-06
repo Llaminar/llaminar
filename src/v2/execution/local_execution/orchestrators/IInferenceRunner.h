@@ -193,9 +193,9 @@ namespace llaminar2
      * verifier summary remains on GPU.  The pointed-to buffers are owned by the
      * runner and are valid until the runner stages another stochastic outcome
      * request.  Device-resident publication consumes these buffers directly and
-     * avoids the per-step D2H state-publication boundary; response code may pass
-     * the handle to materializeDeviceSpeculativeOutcomesForHostResponse() only
-     * after live state has been published.
+     * avoids every per-transaction D2H boundary. Production generation consumes
+     * the handle only through device-resident publication. Focused diagnostics
+     * may inspect it through copyDeviceSpeculativeOutcomesToHostForDiagnostics().
      */
     struct DeviceSpeculativeOutcomeHandle
     {
@@ -390,6 +390,62 @@ namespace llaminar2
     {
         return mode == DeviceGenerationSamplingMode::Greedy ||
                mode == DeviceGenerationSamplingMode::Stochastic;
+    }
+
+    /**
+     * @brief Control topology required by one complete MTP generation loop.
+     *
+     * Fixed-depth generation needs one device-controlled WHILE body. Dynamic
+     * generation additionally needs a device-selected branch for every legal
+     * draft depth. Keeping this distinction typed prevents callers from
+     * assuming that support for a fixed conditional body also proves support
+     * for a SWITCH-in-WHILE graph.
+     */
+    enum class DeviceGenerationLoopTopology : uint8_t
+    {
+        FixedDepth = 0, ///< One immutable transaction body repeated to completion.
+        DynamicDepth,   ///< Device-selected transaction body repeated to completion.
+    };
+
+    /**
+     * @brief Backend execution policy for the complete MTP generation loop.
+     *
+     * `NativeConditionalGraph` is the target architecture: one asynchronous
+     * parent graph owns every transaction. HIP currently exposes neither graph
+     * conditional nodes nor device-side graph launch, so ROCm deliberately uses
+     * `HostScheduledCapturedTransactions`: each expensive transaction remains a
+     * captured GPU graph, while the host advances only the outer transaction
+     * loop from a narrow generation-tagged dispatch ticket. Compact outcomes,
+     * response ledgers, caches, samplers, and dynamic-depth state remain device
+     * authoritative. This is an explicit backend policy, not a retry after
+     * native graph construction fails.
+     *
+     * `Unsupported` is fatal. It distinguishes a known backend limitation from
+     * a missing capture owner or an unexpectedly incomplete native capability.
+     */
+    enum class DeviceGenerationExecutionPolicy : uint8_t
+    {
+        NativeConditionalGraph = 0,
+        HostScheduledCapturedTransactions,
+        Unsupported,
+    };
+
+    /**
+     * @brief Return the stable diagnostic name for an MTP loop policy.
+     */
+    constexpr const char *deviceGenerationExecutionPolicyName(
+        DeviceGenerationExecutionPolicy policy) noexcept
+    {
+        switch (policy)
+        {
+        case DeviceGenerationExecutionPolicy::NativeConditionalGraph:
+            return "native_conditional_graph";
+        case DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions:
+            return "host_scheduled_captured_transactions";
+        case DeviceGenerationExecutionPolicy::Unsupported:
+            return "unsupported";
+        }
+        return "invalid";
     }
 
     /**
@@ -1017,6 +1073,26 @@ namespace llaminar2
          * @return true if forward succeeded
          */
         virtual bool forward(const int *tokens, int seq_len) = 0;
+
+        /**
+         * @brief Wait for the most recently submitted forward pass at a benchmark boundary.
+         *
+         * Production GPU inference deliberately returns after publishing its exact
+         * terminal event so downstream device work can remain asynchronous. A host
+         * wall-clock benchmark, however, must not stop its timer at graph submission.
+         * GPU runners override this method and wait only for the durable event
+         * that terminates the complete forward transaction. For MTP prefill,
+         * that boundary includes shifted sidecar KV population rather than only
+         * the earlier main-graph output. Implementations must not synchronize the
+         * whole device or copy logits to host. CPU execution is already complete
+         * when forward() returns.
+         *
+         * @return true when the last forward pass is complete and may be timed.
+         */
+        virtual bool waitForLastForwardCompletionForBenchmark()
+        {
+            return !primaryDeviceId().is_gpu();
+        }
 
         /**
          * @brief Run a prompt/suffix prefill forward pass.
@@ -2520,8 +2596,8 @@ namespace llaminar2
          * enqueue verifier-row argmax plus compact accepted-token metadata on
          * an explicit producer stream and return a DeviceSpeculativeOutcomeHandle
          * that can be consumed by device-resident publication before any host
-         * response bridge.  The legacy host-visible verifier may delegate to
-         * this method and then call materializeDeviceSpeculativeOutcomesForHostResponse().
+         * response bridge. Focused parity diagnostics may explicitly copy the
+         * resulting compact row, but production generation must keep it resident.
          */
         virtual bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
             const int32_t *draft_tokens,
@@ -2759,32 +2835,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Rebind resident outcome metadata after an opt-in diagnostic restore.
-         *
-         * The commit/replay equivalence diagnostic deliberately restores several
-         * live-prefix checkpoints while comparing grouped publication with serial
-         * replay. A restore invalidates transient mailbox events and advances the
-         * live-state epoch, even though the arena-owned compact outcome rows still
-         * contain the publication being diagnosed. Before returning to the real
-         * decode transaction, the diagnostic calls this method exactly once to
-         * bind those durable rows to the restored epoch and a fresh stream event.
-         *
-         * This is not a production publication API. Normal MTP execution must
-         * publish logical state through the grouped verifier outcome path. The
-         * default hard failure keeps runners without a proved resident diagnostic
-         * lifecycle from silently substituting host state.
-         *
-         * @param request_count Number of durable compact outcome rows to rebind.
-         * @return true only when the runner restored a complete resident mailbox.
-         */
-        virtual bool rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-            int request_count)
-        {
-            (void)request_count;
-            return false;
-        }
-
-        /**
          * @brief Get vocabulary size
          */
         virtual int vocab_size() const = 0;
@@ -2924,32 +2974,32 @@ namespace llaminar2
         }
 
         /**
-         * @brief Sample request-batched main logits that already live on device.
+         * @brief Publish request-batched prefill samples into resident state.
          *
-         * request-batched prefill writes one terminal logits row per logical
-         * request. GPU runners must sample those rows through this hook instead
-         * of exposing a device pointer to the CPU Sampler. Implementations own
-         * stream ordering and any compact D2H copy of selected token ids.
+         * Request-batched prefill writes one terminal logits row per logical
+         * request. A GPU implementation samples every row, stores each token in
+         * its persistent target slot, and publishes the corresponding logical
+         * position, sequence length, and next-condition rows through one exact
+         * producer event. No sampled token is returned to the host: the first
+         * grouped verifier transaction consumes these rows directly and the
+         * complete generation parent is the sole owner of response materialization.
          *
-         * @param request_count Number of active request rows to sample.
-         * @param params Sampling parameters for all rows.
-         * @param out_tokens Host output buffer [request_count].
+         * @param request_count Number of active request rows to publish.
+         * @param params Sampling parameters shared by the request batch.
          * @param stochastic_position_seeds Optional immutable request seeds
          *        [request_count] for non-greedy sampling. The runner combines
          *        each seed with its device-resident logical position; callers
          *        must never compute or pass host threshold values. A non-greedy
          *        request requires one non-zero seed per row.
-         * @return true when every row was sampled on the runner device.
+         * @return true only after every row and its publication event are valid.
          */
-        virtual bool sampleMainLogitsBatchRowsOnDevice(
+        virtual bool publishMainLogitsBatchSamplesToDeviceResidentState(
             int request_count,
             const SamplingParams &params,
-            int32_t *out_tokens,
             const uint64_t *stochastic_position_seeds = nullptr)
         {
             (void)request_count;
             (void)params;
-            (void)out_tokens;
             (void)stochastic_position_seeds;
             return false;
         }
@@ -3698,9 +3748,8 @@ namespace llaminar2
          *
          * This scalar convenience wrapper preserves the legacy call shape while
          * routing through the same request-batch resident contract used by the
-         * scheduler-oriented path.  Future publication code can consume the
-         * returned handle directly; compatibility callers should immediately
-         * bridge it with materializeDeviceSpeculativeOutcomesForHostResponse().
+         * scheduler-oriented path. Production publication consumes the returned
+         * handle directly; only focused parity diagnostics may materialize it.
          */
         virtual bool verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
             int first_target_slot,
@@ -4035,9 +4084,9 @@ namespace llaminar2
          *
          * Implementations should enqueue all per-request verify/bonus/summary
          * kernels on one explicit stream and return a handle to compact device
-         * output rows.  This is the GPU-resident Phase 10 contract; callers that
-         * still need host-visible response metadata should call
-         * materializeDeviceSpeculativeOutcomesForHostResponse().
+         * output rows. This is the GPU-resident production contract. Intermediate
+         * response metadata must remain resident until the terminal ledger is
+         * surfaced; only focused diagnostics may inspect an individual outcome.
          */
         virtual bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
             const DeviceStochasticBatchOutcomeRequest *requests,
@@ -4074,7 +4123,27 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compose the exact policy-complete device generation parent.
+         * @brief Select the complete-loop execution policy before admission.
+         *
+         * Production device and rank orchestrators override this method using
+         * their live graph-capture capabilities and participant topology. The
+         * interface default is deliberately unsupported: a device identifier
+         * alone cannot prove that a complete graph family was materialized.
+         *
+         * @param topology Fixed or device-selected draft-depth topology.
+         * @return One explicit policy. `Unsupported` must fail before request
+         *         admission rather than selecting another path after failure.
+         */
+        virtual DeviceGenerationExecutionPolicy
+        deviceGenerationExecutionPolicy(
+            DeviceGenerationLoopTopology topology) const noexcept
+        {
+            (void)topology;
+            return DeviceGenerationExecutionPolicy::Unsupported;
+        }
+
+        /**
+         * @brief Compose the exact policy-complete device generation executable.
          *
          * The first externally orchestrated transaction must already have
          * committed its resident response/state rows, and every child graph in
@@ -4086,41 +4155,43 @@ namespace llaminar2
          *
          * Rank implementations must complete this preparation for every local
          * participant before any participant launches. The method performs
-         * graph composition only; it must not launch the parent, synchronize a
+         * graph composition only; it must not launch generation, synchronize a
          * stream/device, materialize live state on the host, or recover through
          * segmented/eager execution.
          *
          * @param request_count Number of admitted resident controller rows.
-         * Fixed policy produces one immutable WHILE body. Dynamic policy produces
-         * a native device-selected branch for every legal depth; all branches use
-         * one maximum-capacity verifier family and mask inactive rows from the
-         * resident selector. No host-selected replay path is part of the contract.
-         *
          * @param draft_depth Fixed depth, or maximum capture depth for a dynamic
          *        child family. The verifier child owns `draft_depth + 1` rows.
+         * @param topology Typed fixed/dynamic depth topology already selected
+         *        before admission. CUDA embeds it in a conditional parent;
+         *        HIP retains every legal branch and captures only its immutable
+         *        dispatch-ticket publisher.
          * @param sampling_mode Exact compact-outcome topology embedded in every
          *        transaction body. It is part of graph-cache identity.
-         * @return true when the complete parent executable is ready to launch.
+         * @return true when the complete policy executable is ready to launch.
          */
         virtual bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth,
+            DeviceGenerationLoopTopology topology,
             DeviceGenerationSamplingMode sampling_mode)
         {
             (void)request_count;
             (void)draft_depth;
+            (void)topology;
             (void)sampling_mode;
             return false;
         }
 
         /**
-         * @brief Launch the complete graph-owned device generation loop.
+         * @brief Execute the complete device-owned generation policy.
          *
          * The first transaction has already committed its compact outcome and
-         * materialized the exact fixed-depth child graph family. GPU runners
-         * consume that controller publication on the parent graph's own stream,
-         * enqueue one native device-controlled loop, and republish readiness
-         * after the terminal iteration. The method is asynchronous and may be
+         * materialized the exact child graph family. CUDA enqueues one native
+         * conditional parent asynchronously. HIP advances retained captured
+         * transactions from authenticated device-published tickets; only the
+         * outer launch decision is host-visible, while mutable state and the
+         * dynamic depth controller remain device-owned. This method may be
          * called exactly once for an admitted request.
          */
         virtual bool launchDeviceResidentGeneration()
@@ -4129,12 +4200,51 @@ namespace llaminar2
         }
 
         /**
+         * @brief Observe one authenticated device-owned graph-dispatch decision.
+         *
+         * This operation exists only for the explicit HIP hosted-transaction
+         * policy. Implementations publish a fixed ticket on device, enqueue one
+         * ticket-only D2H copy, and wait on that copy's exact event. They must
+         * never materialize a compact verifier outcome or any mutable inference
+         * state. Rank schedulers call this method for every participant and
+         * compare decisions before submitting another collective-bearing branch.
+         *
+         * @param out_ticket Destination for the immutable scheduling snapshot.
+         * @return true when one fresh, lifecycle-authenticated ticket was read.
+         */
+        virtual bool observeDeviceGenerationDispatchTicket(
+            sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+        {
+            (void)out_ticket;
+            return false;
+        }
+
+        /**
+         * @brief Submit the branch selected by the last observed HIP ticket.
+         *
+         * The ticket must byte-match the runner's last authenticated snapshot.
+         * A due maintenance graph is submitted first; a complete ticket then
+         * publishes terminal readiness, while a live ticket submits exactly one
+         * retained depth branch followed by the next ticket observation. The
+         * call is asynchronous and performs no host wait or state upload.
+         *
+         * @param ticket Last ticket returned by this runner.
+         * @return true when the next device work was submitted successfully.
+         */
+        virtual bool submitHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+        {
+            (void)ticket;
+            return false;
+        }
+
+        /**
          * @brief Surface and close one completed device-owned generation.
          *
          * GPU implementations consume the final controller-ready event on a
          * dedicated result stream, enqueue the response and controller copies,
-         * synchronize that stream exactly once, and validate the complete
-         * controller ABI before releasing the request lifecycle.  Calling this
+         * record one terminal event, wait for that exact event, and validate the
+         * complete controller ABI before releasing the request lifecycle. Calling this
          * method before every request is terminal is an error, not a polling API.
          */
         virtual bool finishDeviceResidentGeneration(
@@ -4145,35 +4255,21 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compatibility bridge from a device-resident outcome to host structs.
+         * @brief Copy one compact outcome to host for a focused diagnostic.
          *
-         * This method intentionally represents the legacy host-visible boundary.
-         * New state-publication code should consume DeviceSpeculativeOutcomeHandle
-         * directly instead of calling this bridge in the decode hot path.
+         * This operation is an oracle/probe boundary for parity and kernel tests.
+         * It may synchronize a dedicated diagnostic stream and is therefore
+         * forbidden in production generation. Production state publication and
+         * response construction consume DeviceSpeculativeOutcomeHandle directly
+         * and surface only the final terminal ledger.
          */
-        virtual bool copyDeviceSpeculativeOutcomesToHost(
+        virtual bool copyDeviceSpeculativeOutcomesToHostForDiagnostics(
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes)
         {
             (void)handle;
             (void)outcomes;
             return false;
-        }
-
-        /**
-         * @brief Materialize resident outcomes only for host-visible response data.
-         *
-         * Device-resident publication must already have consumed @p handle
-         * before the all-position fast path calls this method.  The method may
-         * copy compact output tokens and metadata so `decodeStep()` can return
-         * tokens and update host diagnostics, but it must not be required for GPU
-         * live-state mutation.
-         */
-        virtual bool materializeDeviceSpeculativeOutcomesForHostResponse(
-            const DeviceSpeculativeOutcomeHandle &handle,
-            DeviceSpeculativeVerifyBatchOutcome *outcomes)
-        {
-            return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
         }
 
         /**

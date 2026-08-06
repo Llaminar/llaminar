@@ -522,6 +522,47 @@ TEST(Test__Qwen35Schema, GDNTemplate_HasCorrectStageOrder)
     EXPECT_TRUE(hasStageNamed(stages, "gated_norm"));
 }
 
+/**
+ * @brief Prove the declarative GDN graph exposes an out-of-place convolution handoff.
+ *
+ * Short convolution reads neighboring projection rows while producing each
+ * transformed recurrence row. The source and destination must consequently be
+ * distinct live buffers. This schema regression prevents a future graph or
+ * arena refactor from restoring the former in-place repair copy or aliasing the
+ * two physical allocations.
+ */
+TEST(Test__Qwen35Schema, GDNTemplate_DeclaresDistinctRecurrenceInputLifetime)
+{
+    Qwen35SchemaFactory factory;
+    const GraphSchema schema = factory.createSchema();
+    const auto &stages = schema.named_templates.at("gdn").attention_stages;
+
+    const StageSpec *short_conv = findStage(stages, "short_conv");
+    const StageSpec *recurrence = findStage(stages, "gdn_recurrence");
+    ASSERT_NE(short_conv, nullptr);
+    ASSERT_NE(recurrence, nullptr);
+
+    ASSERT_EQ(short_conv->inputs.size(), 2u);
+    ASSERT_EQ(short_conv->outputs.size(), 1u);
+    EXPECT_EQ(short_conv->inputs.front().name, "gdn_qkv");
+    EXPECT_EQ(short_conv->inputs.front().semantic, BufferSemantic::Input);
+    EXPECT_EQ(short_conv->outputs.front().name, "gdn_recurrence_in");
+    EXPECT_EQ(short_conv->outputs.front().semantic, BufferSemantic::Output);
+
+    ASSERT_FALSE(recurrence->inputs.empty());
+    EXPECT_EQ(recurrence->inputs.front().name, "gdn_recurrence_in");
+    EXPECT_EQ(recurrence->inputs.front().semantic, BufferSemantic::Input);
+
+    const auto recurrence_buffer = std::find_if(
+        schema.layer_buffers.begin(),
+        schema.layer_buffers.end(),
+        [](const BufferSpec &spec)
+        { return spec.name == "gdn_recurrence_in"; });
+    ASSERT_NE(recurrence_buffer, schema.layer_buffers.end());
+    EXPECT_TRUE(recurrence_buffer->alias_group.empty())
+        << "Projection source and convolution destination overlap in lifetime.";
+}
+
 TEST(Test__Qwen35Schema, GDNTemplate_NoKVCache)
 {
     Qwen35SchemaFactory factory;
@@ -1017,6 +1058,7 @@ namespace
             hidden_ = TestTensorFactory::createFP32({2, d});
             normalized_ = TestTensorFactory::createFP32({2, d});
             gdn_qkv_ = TestTensorFactory::createFP32({2, qkv_total});
+            gdn_recurrence_in_ = TestTensorFactory::createFP32({2, qkv_total});
             gdn_z_ = TestTensorFactory::createFP32({2, value_total});
             gdn_alpha_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
             gdn_beta_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
@@ -1043,6 +1085,8 @@ namespace
             buffers_.current_hidden = hidden_.get();
             buffers_.normalized = normalized_.get();
             buffers_.extensions[BufferId::GDN_QKV] = gdn_qkv_.get();
+            buffers_.extensions[BufferId::GDN_RECURRENCE_IN] =
+                gdn_recurrence_in_.get();
             buffers_.extensions[BufferId::GDN_Z] = gdn_z_.get();
             buffers_.extensions[BufferId::GDN_ALPHA] = gdn_alpha_.get();
             buffers_.extensions[BufferId::GDN_BETA] = gdn_beta_.get();
@@ -1075,6 +1119,7 @@ namespace
         std::unique_ptr<FP32Tensor> hidden_;
         std::unique_ptr<FP32Tensor> normalized_;
         std::unique_ptr<FP32Tensor> gdn_qkv_;
+        std::unique_ptr<FP32Tensor> gdn_recurrence_in_;
         std::unique_ptr<FP32Tensor> gdn_z_;
         std::unique_ptr<FP32Tensor> gdn_alpha_;
         std::unique_ptr<FP32Tensor> gdn_beta_;

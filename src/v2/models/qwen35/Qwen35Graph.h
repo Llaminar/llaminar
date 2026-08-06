@@ -212,6 +212,7 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             const void *position_ids_device,
+            const int32_t *sequence_lengths_device,
             DeviceId device,
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false,

@@ -352,6 +352,84 @@ struct NVNNITraits {
     static constexpr int grid_lds_bytes = grid_entries * grid_entry_bytes;
 };
 
+/**
+ * @brief Dilate four packed Q6 two-bit fields into four byte-local high nibbles.
+ *
+ * A Q6 high-bit byte stores four consecutive two-bit fields in bits
+ * `[1:0]`, `[3:2]`, `[5:4]`, and `[7:6]`.  Native-VNNI dot operands need
+ * those fields in bits `[5:4]` of four independent bytes.  The first
+ * shuffle step separates the two nibbles by twelve bits; the second separates
+ * each nibble's two-bit fields by six more bits.  The final shift places each
+ * field in the byte-local high-nibble position:
+ *
+ * @code
+ * abcdefgh -> 00ab0000 00cd0000 00ef0000 00gh0000
+ * @endcode
+ *
+ * This identity is exhaustive over the 256 possible input bytes and replaces
+ * four independent mask/shift deposits.  It changes only the integer decode;
+ * block order, SDOT4 order, scale conversion, and FP32 accumulation remain
+ * identical to serial decode.
+ *
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+static constexpr uint32_t rocm_native_vnni_expand_q6_high_fields_reference(
+    uint32_t packed_fields)
+{
+    return ((packed_fields & 0x03u) << 4) |
+           ((packed_fields & 0x0Cu) << 10) |
+           ((packed_fields & 0x30u) << 16) |
+           ((packed_fields & 0xC0u) << 22);
+}
+
+/**
+ * @brief Evaluate the low-instruction-count Q6 high-field dilation identity.
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+static constexpr uint32_t rocm_native_vnni_expand_q6_high_fields_dilated(
+    uint32_t packed_fields)
+{
+    const uint32_t separated_nibbles =
+        (packed_fields | (packed_fields << 12)) & 0x000F000Fu;
+    const uint32_t separated_pairs =
+        (separated_nibbles | (separated_nibbles << 6)) & 0x03030303u;
+    return separated_pairs << 4;
+}
+
+/**
+ * @brief Prove the optimized Q6 expansion for every possible packed byte.
+ * @return `true` only when all 256 values equal the direct reference mapping.
+ */
+static constexpr bool rocm_native_vnni_q6_high_field_dilation_is_exhaustive()
+{
+    for (uint32_t packed = 0; packed <= 0xFFu; ++packed)
+    {
+        if (rocm_native_vnni_expand_q6_high_fields_dilated(packed) !=
+            rocm_native_vnni_expand_q6_high_fields_reference(packed))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(
+    rocm_native_vnni_q6_high_field_dilation_is_exhaustive(),
+    "ROCm Q6 high-field dilation must equal the direct mapping for every byte");
+
+/**
+ * @brief Device wrapper for the compile-time-proven Q6 dilation identity.
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+__device__ __forceinline__ uint32_t rocm_native_vnni_expand_q6_high_fields(
+    uint32_t packed_fields)
+{
+    return rocm_native_vnni_expand_q6_high_fields_dilated(packed_fields);
+}
+
 template <NativeVNNIFormat FMT>
 struct NVNNIGroupedMoESupported {
     static constexpr bool value =
@@ -936,7 +1014,6 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
     }
 }
 
-
 // ============================================================================
 // Native-VNNI GEMV kernel: lossless decode with per-block FP16 scales
 //
@@ -1303,8 +1380,8 @@ __global__ void gemv_native_vnni_kernel_t(
 
                             // Low nibbles + scattered 2-bit highs + subtract-32
                             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-                            const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
-                                                 | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
+                            const uint32_t hb_lo =
+                                rocm_native_vnni_expand_q6_high_fields(h_lo);
                             uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
                             val_lo -= 0x20202020u;
                             val_lo ^= 0x80808080u;
@@ -1312,8 +1389,8 @@ __global__ void gemv_native_vnni_kernel_t(
 
                             // High nibbles + scattered 2-bit highs + subtract-32
                             const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-                            const uint32_t hb_hi = ((h_hi & 0x03u) << 4)  | ((h_hi & 0x0Cu) << 10)
-                                                 | ((h_hi & 0x30u) << 16) | ((h_hi & 0xC0u) << 22);
+                            const uint32_t hb_hi =
+                                rocm_native_vnni_expand_q6_high_fields(h_hi);
                             uint32_t val_hi = (hi_nibs | hb_hi) ^ 0x80808080u;
                             val_hi -= 0x20202020u;
                             val_hi ^= 0x80808080u;
@@ -1944,6 +2021,10 @@ __device__ __forceinline__ void moe_decode_native_vnni_groups(
             const uint32_t h_hi = qh_p[g + 4];
 
             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            // The grouped verifier keeps the direct deposits: on gfx906 its
+            // larger live-row state schedules this form 2.7% faster than the
+            // serial kernel's bit-dilation identity.  Both forms are exhaustive
+            // integer identities over all 256 possible packed high-bit bytes.
             const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
                                  | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
             uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
@@ -3045,7 +3126,27 @@ __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
 
 constexpr int NVNNI_SMALL_M_MAX_BATCH = 8;
 constexpr int NVNNI_SMALL_M_GRAPH_SAFE_KB_CAP = 64;
-constexpr int NVNNI_VERIFIER_ROWS_PER_TILE = 2;
+constexpr int NVNNI_VERIFIER_SHORT_ROWS_PER_TILE = 2;
+constexpr int NVNNI_VERIFIER_WIDE_ROWS_PER_TILE = 4;
+
+/**
+ * @brief Select the measured verifier-row reuse geometry for a runtime batch.
+ *
+ * M=2 retains the two-row specialization because a four-row accumulator adds
+ * idle predicates without any extra weight reuse.  M>=3 uses four rows: this
+ * matches the common depth-three transaction and amortizes each packed-weight
+ * decode across every live row.  Larger batches add independent Z-grid tiles,
+ * so this capture-time policy is total for every positive runtime M.
+ *
+ * @param m Number of grouped verifier rows in the launch.
+ * @return Compile-time kernel geometry selected by the host launch wrapper.
+ */
+constexpr int native_vnni_verifier_rows_per_tile(int m)
+{
+    return m <= NVNNI_VERIFIER_SHORT_ROWS_PER_TILE
+        ? NVNNI_VERIFIER_SHORT_ROWS_PER_TILE
+        : NVNNI_VERIFIER_WIDE_ROWS_PER_TILE;
+}
 
 struct NativeVNNISmallMBatchedArgs
 {
@@ -3288,7 +3389,8 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_row(
  * row, which preserves the serial decode order but decodes the same packed
  * weight block once per row.  For MTP verifier economics that is the wrong
  * tradeoff on wide projections: dequantization is a material part of the
- * cost, and grouped verifier execution should amortize it.
+ * cost, and grouped verifier execution should amortize it across the complete
+ * four-row production transaction.
  *
  * This body keeps the same per-row FP32 accumulation order as serial decode:
  * each row sees blocks in increasing `b` order, and split-K partials are
@@ -3296,7 +3398,7 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_row(
  * lane decodes one weight block and then accumulates all verifier rows before
  * moving to the next block.
  */
-template <int TILE_N, int CPT, NativeVNNIFormat FMT>
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
 __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     const int8_t* __restrict__ d_A_int8,                // [M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
@@ -3307,6 +3409,10 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     int kblocks)
 {
     static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
+    static_assert(
+        ROWS_PER_TILE == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE ||
+            ROWS_PER_TILE == NVNNI_VERIFIER_WIDE_ROWS_PER_TILE,
+        "native-VNNI verifier row tile must be one of the measured geometries");
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
                   "small-M native-VNNI requires a supported native-VNNI format");
 
@@ -3316,7 +3422,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     const int N = args.N[proj];
     const int n_base = local_tile * TILE_N + threadIdx.x * CPT;
     const int kb = blockIdx.y;
-    const int row_base = static_cast<int>(blockIdx.z) * NVNNI_VERIFIER_ROWS_PER_TILE;
+    const int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
@@ -3331,9 +3437,9 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     float* out_base = args.output[proj];
     float* partial_base = args.partial[proj];
 
-    float acc[NVNNI_VERIFIER_ROWS_PER_TILE][CPT];
+    float acc[ROWS_PER_TILE][CPT];
     #pragma unroll
-    for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+    for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
@@ -3356,7 +3462,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
             moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
             #pragma unroll
-            for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
                 const int row = row_base + tile_row;
                 if (row >= M)
@@ -3377,7 +3483,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
             continue;
 
         #pragma unroll
-        for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
             const int row = row_base + tile_row;
             if (row >= M)
@@ -3398,7 +3504,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     }
 }
 
-template <int TILE_N, int CPT, NativeVNNIFormat FMT>
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_small_m_batched_shared_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
@@ -3408,11 +3514,11 @@ __global__ void gemv_native_vnni_small_m_batched_shared_kernel_t(
     int K,
     int kblocks)
 {
-    gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, FMT>(
+    gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, FMT>(
         d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
 }
 
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, int ROWS_PER_TILE>
 __global__ void gemv_native_vnni_small_m_batched_shared_mixed_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
@@ -3426,67 +3532,67 @@ __global__ void gemv_native_vnni_small_m_batched_shared_mixed_kernel_t(
     switch (static_cast<NativeVNNIFormat>(args.codebook[proj]))
     {
     case NVNNI_Q4_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q4_0>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_0>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ4_NL:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ4_NL>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_NL>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q4_1:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q4_1>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_1>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q5_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q5_0>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_0>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q5_1:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q5_1>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_1>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q6_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q6_K>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q6_K>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q3_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q3_K>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q3_K>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q2_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q2_K>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q2_K>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ3_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ3_S>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_S>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ3_XXS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ3_XXS>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_XXS>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ2_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ2_S>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_S>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ2_XS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ2_XS>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XS>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ2_XXS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ2_XXS>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XXS>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ1_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ1_S>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_S>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_IQ1_M:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_IQ1_M>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_M>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     case NVNNI_Q8_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, NVNNI_Q8_0>(
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q8_0>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, M, K, kblocks);
         return;
     default:
@@ -3541,15 +3647,15 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
 }
 
 /**
- * @brief Runtime-row NativeVNNI verifier GEMV with fixed two-row work tiles.
+ * @brief Runtime-row NativeVNNI verifier GEMV with fixed four-row work tiles.
  *
  * A workgroup decodes each packed weight block once and applies it to at most
- * two verifier rows.  Larger speculative batches add independent Z-grid tiles;
+ * four verifier rows.  Larger speculative batches add independent Z-grid tiles;
  * they never enlarge the accumulator array or alter an existing row's block
  * order.  Split-K output is always written to declared workspace so the
  * following reducer can publish partitions in serial-M1 order.
  */
-template <int TILE_N, int CPT, NativeVNNIFormat FMT>
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_small_m_kernel_t(
     const int8_t*    __restrict__ d_A_int8,       // [M x K] quantized activations
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row x N x payload_bytes]
@@ -3563,21 +3669,25 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
     int M, int N, int K, int kblocks)
 {
     static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
+    static_assert(
+        ROWS_PER_TILE == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE ||
+            ROWS_PER_TILE == NVNNI_VERIFIER_WIDE_ROWS_PER_TILE,
+        "native-VNNI verifier row tile must be one of the measured geometries");
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
                   "small-M native-VNNI requires a supported native-VNNI format");
 
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     const int kb = blockIdx.y;
-    const int row_base = static_cast<int>(blockIdx.z) * NVNNI_VERIFIER_ROWS_PER_TILE;
+    const int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
     const int b_start = kb * b_per;
     const int b_end = min(b_start + b_per, blocks_per_row);
 
-    float acc[NVNNI_VERIFIER_ROWS_PER_TILE][CPT];
+    float acc[ROWS_PER_TILE][CPT];
     #pragma unroll
-    for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+    for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
@@ -3599,7 +3709,7 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
             moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
             #pragma unroll
-            for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
                 const int row = row_base + tile_row;
                 if (row >= M)
@@ -3620,7 +3730,7 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
             continue;
 
         #pragma unroll
-        for (int tile_row = 0; tile_row < NVNNI_VERIFIER_ROWS_PER_TILE; ++tile_row)
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
             const int row = row_base + tile_row;
             if (row >= M)
@@ -5038,9 +5148,9 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
     const int logical_row_tiles =
-        (M + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-        NVNNI_VERIFIER_ROWS_PER_TILE;
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
     const int resident_tiles = max(1, grid_n * logical_row_tiles);
     int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
     int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
@@ -5093,9 +5203,9 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
         const int tile_row_groups =
-            (tile_m + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-            NVNNI_VERIFIER_ROWS_PER_TILE;
+            (tile_m + tile_rows_per_group - 1) / tile_rows_per_group;
         const int8_t* tile_a =
             d_A_int8 + static_cast<size_t>(row_base) * K;
         const float* tile_scales =
@@ -5109,13 +5219,28 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         float* tile_c =
             d_C_fp32 + static_cast<size_t>(row_base) * N;
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<TN, CPT, FMT>),
-            dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
-            static_cast<hipStream_t>(stream),
-            tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
-            tile_c, d_partial_fp32, tile_scales, tile_sums,
-            tile_m, N, K, kb);
+        if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT>),
+                dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_c, d_partial_fp32, tile_scales, tile_sums,
+                tile_m, N, K, kb);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT>),
+                dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_c, d_partial_fp32, tile_scales, tile_sums,
+                tile_m, N, K, kb);
+        }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
@@ -5255,9 +5380,9 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
     const int logical_row_tiles =
-        (M + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-        NVNNI_VERIFIER_ROWS_PER_TILE;
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
     const int resident_tiles =
         max(1, args.total_grid_n * logical_row_tiles);
     int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
@@ -5313,9 +5438,9 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
         const int tile_row_groups =
-            (tile_m + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-            NVNNI_VERIFIER_ROWS_PER_TILE;
+            (tile_m + tile_rows_per_group - 1) / tile_rows_per_group;
         NativeVNNISmallMBatchedArgs tile_args = args;
         for (int p = 0; p < num_projections; ++p)
         {
@@ -5334,12 +5459,26 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
                       static_cast<size_t>(row_base) * blocks_per_row
                 : nullptr;
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<TN, CPT, FMT>),
-            dim3(tile_args.total_grid_n, kb, tile_row_groups),
-            dim3(THREADS, 1, 1), 0,
-            static_cast<hipStream_t>(stream),
-            tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT>),
+                dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT>),
+                dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
@@ -5531,9 +5670,9 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
     const int logical_row_tiles =
-        (M + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-        NVNNI_VERIFIER_ROWS_PER_TILE;
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
     const int resident_tiles =
         max(1, args.total_grid_n * logical_row_tiles);
     int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
@@ -5589,9 +5728,9 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
         const int tile_row_groups =
-            (tile_m + NVNNI_VERIFIER_ROWS_PER_TILE - 1) /
-            NVNNI_VERIFIER_ROWS_PER_TILE;
+            (tile_m + tile_rows_per_group - 1) / tile_rows_per_group;
         NativeVNNISmallMBatchedArgs tile_args = args;
         for (int p = 0; p < num_projections; ++p)
         {
@@ -5610,12 +5749,26 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
                       static_cast<size_t>(row_base) * blocks_per_row
                 : nullptr;
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<TN, CPT>),
-            dim3(tile_args.total_grid_n, kb, tile_row_groups),
-            dim3(THREADS, 1, 1), 0,
-            static_cast<hipStream_t>(stream),
-            tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE>),
+                dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE>),
+                dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, tile_scales, tile_sums, tile_args, tile_m, K, kb);
+        }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
@@ -6407,11 +6560,11 @@ bool rocmGemv_native_vnni_fp32(
     else
     {
         // =====================================================================
-        // Non-IQ formats + IQ small-N fallback: TN=64, 1 wavefront/WG
+        // Non-IQ formats + IQ small-N fallback: TN=128, 2 wavefronts/WG
         // =====================================================================
-        constexpr int TN = 64;
+        constexpr int TN = 128;
         constexpr int CPT = 1;
-        constexpr int THREADS = TN / CPT;  // 64 threads = 1 wavefront
+        constexpr int THREADS = TN / CPT;  // 128 threads = 2 wavefronts
 
         const int grid_n = (N + TN - 1) / TN;
 

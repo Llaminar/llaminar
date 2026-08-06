@@ -16,6 +16,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <stdexcept>
@@ -55,38 +56,42 @@ void print_pointer_attrs(const char *label, const void *ptr)
 
 namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 
-// =========================================================================
-// Decode Recurrence Kernel (seq_len=1, multi-block per head)
-//
-// V3 Optimizations:
-//   1. ROW_SPLIT=4: 256 threads/block (4 wavefronts) — each column
-//      processed by 4 threads splitting d_k rows. Increases occupancy
-//      from 0.53 to 2.1 waves/CU on gfx906 (32→128 total wavefronts).
-//   2. Fused decay into per-column loops — eliminates separate decay pass
-//   3. Two-pass column processing: Pass 1 reads state (decay+kv), Pass 2
-//      reads+writes (decay+update+output). 50% traffic savings.
-//   4. 2D grid: (n_heads, col_blocks) with col_blocks = d_v / 64
-//   5. Shared-memory reduction for cross-wavefront kv/output sums
-//
-// Memory: d_k × d_v × 4 bytes per head = 64KB state
-// Occupancy: 128 wavefronts / 60 CUs = 2.1 waves/CU (was 0.53)
-// =========================================================================
+constexpr int kGdnRecurrentThreads = 256;
+constexpr int kGdnRecurrentRowSplit = 4;
+constexpr int kGdnRecurrentColumnsPerBlock =
+    kGdnRecurrentThreads / kGdnRecurrentRowSplit;
 
 /**
- * @brief Advance a tiny grouped recurrence with the exact scalar HIP arithmetic.
+ * @brief Advance grouped recurrence rows while retaining state in VGPRs.
  *
  * Scalar decode and grouped MTP verification both enter this kernel. M=1 uses
- * one loop iteration; a runtime-sized verifier matrix keeps the same block
- * resident and advances rows in causal order. In particular, the four-way
- * `d_k` split, wavefront reduction, gate math, and state-update expressions are
- * shared rather than reimplemented by a prefill kernel with a subtly different
- * floating-point schedule.
+ * one loop iteration; a runtime-sized verifier matrix keeps one block resident
+ * and advances every row in causal order. Each lane owns one fixed partition
+ * of a value column and loads that partition from global state exactly once.
+ * The first twenty-two rows remain in VGPRs; any remaining rows occupy an explicit
+ * coalesced LDS tile. This split prevents clang from silently spilling the
+ * Qwen-width register array into private memory while preserving the same
+ * ascending key-row arithmetic. Post-row snapshots remain complete, but the
+ * speculative work bank is written only once after the final row rather than
+ * being read twice and written once for every row.
  *
- * Grid X flattens request and head identity. Grid Y owns independent value
- * columns. Post-row snapshots use the flattened request-row namespace, so one
- * launch publishes every verifier state row without host replay.
+ * The four-way key-row split, wave64 normalization reduction, gate expressions,
+ * K-part reduction order, and state update expressions are deliberately the
+ * same as scalar HIP decode. Register retention changes storage traffic, not
+ * arithmetic order. The all-M captured publication sweep proves every grouped
+ * output, selected snapshot, and continuation byte against serial M=1 decode.
+ *
+ * Grid X flattens request/head identity and grid Y owns independent value
+ * columns. Snapshot rows use the flattened request-row namespace, so the launch
+ * publishes every possible accepted state without host replay.
+ *
+ * @tparam D_K Compile-time key width. Supported graph geometries select a
+ *             specialization before capture so register extent and occupancy
+ *             are fixed properties of the captured launch.
  */
-__global__ void rocm_gdn_recurrent_step_kernel(
+template <int D_K>
+__global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+void rocm_gdn_recurrent_step_kernel(
     const float *__restrict__ q,
     const float *__restrict__ k,
     const float *__restrict__ v,
@@ -95,9 +100,10 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const float *__restrict__ A_log,
     const float *__restrict__ dt_bias,
     float *__restrict__ output,
-    float *__restrict__ state,
+    const float *initial_state,
+    float *updated_state,
     int request_count, int request_seq_len,
-    int n_heads, int d_k, int d_v,
+    int n_heads, int d_v,
     bool use_qk_l2norm,
     const int *__restrict__ effective_seq_len_ptr,
     int effective_row_idx,
@@ -110,48 +116,97 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int h = request_head - request * n_heads;
     if (request >= request_count || h >= n_heads) return;
 
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
+    static_assert(D_K % kGdnRecurrentRowSplit == 0);
+    constexpr int kRowsPerSplit = D_K / kGdnRecurrentRowSplit;
+    constexpr int kRegisterRowsPerSplit =
+        kRowsPerSplit < 22 ? kRowsPerSplit : 22;
+    constexpr int kLdsRowsPerSplit =
+        kRowsPerSplit - kRegisterRowsPerSplit;
 
-    // ROW_SPLIT=4: 4 threads collaborate on each column, splitting d_k rows
-    constexpr int ROW_SPLIT = 4;
-    const int cols_per_block = block_size / ROW_SPLIT; // 64
-    const int split_id = tid / cols_per_block;         // 0..3
-    const int col_in_block = tid % cols_per_block;     // 0..63
-    const int vi = blockIdx.y * cols_per_block + col_in_block;
+    const int tid = threadIdx.x;
+    const int split_id = tid / kGdnRecurrentColumnsPerBlock;
+    const int col_in_block = tid % kGdnRecurrentColumnsPerBlock;
+    const int vi =
+        blockIdx.y * kGdnRecurrentColumnsPerBlock + col_in_block;
 
     const size_t row_qk_stride =
-        static_cast<size_t>(n_heads) * static_cast<size_t>(d_k);
+        static_cast<size_t>(n_heads) * static_cast<size_t>(D_K);
     const size_t row_v_stride =
         static_cast<size_t>(n_heads) * static_cast<size_t>(d_v);
     const size_t request_state_stride =
-        static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) *
+        static_cast<size_t>(n_heads) * static_cast<size_t>(D_K) *
         static_cast<size_t>(d_v);
-    float *S =
-        state + static_cast<size_t>(request) * request_state_stride +
-        static_cast<size_t>(h) * d_k * d_v;
+    const float *S_initial =
+        initial_state + static_cast<size_t>(request) * request_state_stride +
+        static_cast<size_t>(h) * D_K * d_v;
+    float *S_updated =
+        updated_state + static_cast<size_t>(request) * request_state_stride +
+        static_cast<size_t>(h) * D_K * d_v;
 
     extern __shared__ float smem[];
-    float *q_local = smem;                              // [d_k]
-    float *k_local = smem + d_k;                        // [d_k]
-    float *warp_sums = smem + 2 * d_k;                  // [4] for norm reduction
-    float *reduce_kv = smem + 2 * d_k + 4;             // [block_size]
-    float *reduce_out = smem + 2 * d_k + 4 + block_size; // [block_size]
+    float *q_local = smem;
+    float *k_local = smem + D_K;
+    float *wave_sums = smem + 2 * D_K;
+    float *reduce_kv = wave_sums + 4;
+    float *reduce_out = reduce_kv + kGdnRecurrentThreads;
+    float *state_tail = reduce_out + kGdnRecurrentThreads;
 
-    const float scale = rsqrtf((float)d_k);
+    const float scale = rsqrtf(static_cast<float>(D_K));
     const int warp_id = tid / 64;
     const int lane_id = tid % 64;
-    const int num_warps = block_size / 64; // 4
+    constexpr int kWaveCount = kGdnRecurrentThreads / 64;
+
+    /*
+     * The bounded compile-time array is scalarized into VGPRs by clang. The
+     * explicit LDS tail replaces what would otherwise become compiler-owned
+     * private scratch at D_K=128. M=16 still performs one global state load and
+     * one final global state store; LDS is reused wholly inside the launch.
+     */
+    float state_rows[kRegisterRowsPerSplit];
+    const int row_begin = split_id * kRowsPerSplit;
+    if (vi < d_v)
+    {
+#pragma unroll
+        for (int local_row = 0;
+             local_row < kRegisterRowsPerSplit;
+             ++local_row)
+        {
+            const int state_row = row_begin + local_row;
+            state_rows[local_row] = S_initial[state_row * d_v + vi];
+        }
+#pragma clang loop unroll(disable)
+        for (int tail_row = 0; tail_row < kLdsRowsPerSplit; ++tail_row)
+        {
+            const int state_row =
+                row_begin + kRegisterRowsPerSplit + tail_row;
+            state_tail[tail_row * kGdnRecurrentThreads + tid] =
+                S_initial[state_row * d_v + vi];
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int local_row = 0;
+             local_row < kRegisterRowsPerSplit;
+             ++local_row)
+            state_rows[local_row] = 0.0f;
+#pragma clang loop unroll(disable)
+        for (int tail_row = 0; tail_row < kLdsRowsPerSplit; ++tail_row)
+        {
+            state_tail[tail_row * kGdnRecurrentThreads + tid] = 0.0f;
+        }
+    }
+    __syncthreads();
 
     for (int request_row = 0; request_row < request_seq_len; ++request_row)
     {
         const int flat_row = request * request_seq_len + request_row;
         const float *q_head =
             q + static_cast<size_t>(flat_row) * row_qk_stride +
-            static_cast<size_t>(h) * d_k;
+            static_cast<size_t>(h) * D_K;
         const float *k_head =
             k + static_cast<size_t>(flat_row) * row_qk_stride +
-            static_cast<size_t>(h) * d_k;
+            static_cast<size_t>(h) * D_K;
         const float *v_head =
             v + static_cast<size_t>(flat_row) * row_v_stride +
             static_cast<size_t>(h) * d_v;
@@ -170,7 +225,7 @@ __global__ void rocm_gdn_recurrent_step_kernel(
         }
 
         // Preserve scalar decode's 256-thread Q/K normalization tree.
-        for (int i = tid; i < d_k; i += block_size)
+        for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
         {
             q_local[i] = q_head[i];
             k_local[i] = k_head[i];
@@ -180,52 +235,52 @@ __global__ void rocm_gdn_recurrent_step_kernel(
         if (use_qk_l2norm)
         {
             float q_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
+            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 q_sum += q_local[i] * q_local[i];
             for (int offset = 32; offset > 0; offset >>= 1)
                 q_sum += __shfl_xor(q_sum, offset);
             if (lane_id == 0)
-                warp_sums[warp_id] = q_sum;
+                wave_sums[warp_id] = q_sum;
             __syncthreads();
             if (tid == 0)
             {
                 float total = 0.0f;
-                for (int w = 0; w < num_warps; ++w)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
+                for (int wave = 0; wave < kWaveCount; ++wave)
+                    total += wave_sums[wave];
+                wave_sums[0] = total;
             }
             __syncthreads();
             const float q_inv =
-                scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-            for (int i = tid; i < d_k; i += block_size)
+                scale / fmaxf(sqrtf(wave_sums[0]), 1e-6f);
+            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 q_local[i] *= q_inv;
             __syncthreads();
 
             float k_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
+            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 k_sum += k_local[i] * k_local[i];
             for (int offset = 32; offset > 0; offset >>= 1)
                 k_sum += __shfl_xor(k_sum, offset);
             if (lane_id == 0)
-                warp_sums[warp_id] = k_sum;
+                wave_sums[warp_id] = k_sum;
             __syncthreads();
             if (tid == 0)
             {
                 float total = 0.0f;
-                for (int w = 0; w < num_warps; ++w)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
+                for (int wave = 0; wave < kWaveCount; ++wave)
+                    total += wave_sums[wave];
+                wave_sums[0] = total;
             }
             __syncthreads();
             const float k_inv =
-                1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-            for (int i = tid; i < d_k; i += block_size)
+                1.0f / fmaxf(sqrtf(wave_sums[0]), 1e-6f);
+            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 k_local[i] *= k_inv;
             __syncthreads();
         }
         else
         {
-            for (int i = tid; i < d_k; i += block_size)
+            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 q_local[i] *= scale;
             __syncthreads();
         }
@@ -238,70 +293,228 @@ __global__ void rocm_gdn_recurrent_step_kernel(
                 h;
             const float x = alpha[gate_index] + dt_bias[h];
             const float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            warp_sums[0] = expf(A_log[h] * sp);
-            warp_sums[1] =
+            wave_sums[0] = expf(A_log[h] * sp);
+            wave_sums[1] =
                 1.0f / (1.0f + expf(-beta_raw[gate_index]));
         }
         __syncthreads();
-        const float decay = warp_sums[0];
-        const float beta_h = warp_sums[1];
+        const float decay = wave_sums[0];
+        const float beta_h = wave_sums[1];
 
-        const int rows_per_split = d_k / ROW_SPLIT;
-        const int j_start = split_id * rows_per_split;
-        const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
-
-        // Pass 1: Fused decay + partial kv dot product (read-only)
+        // Pass 1 retains scalar decode's ascending key-row accumulation.
         float partial_kv = 0.0f;
-        if (vi < d_v) {
-            for (int j = j_start; j < j_end; j++) {
-                float s_decayed = S[j * d_v + vi] * decay;
-                partial_kv += s_decayed * k_local[j];
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int local_row = 0;
+                 local_row < kRegisterRowsPerSplit;
+                 ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                const float s_decayed = state_rows[local_row] * decay;
+                partial_kv += s_decayed * k_local[state_row];
+            }
+#pragma clang loop unroll(disable)
+            for (int tail_row = 0;
+                 tail_row < kLdsRowsPerSplit;
+                 ++tail_row)
+            {
+                const int state_row =
+                    row_begin + kRegisterRowsPerSplit + tail_row;
+                const float s_decayed =
+                    state_tail[tail_row * kGdnRecurrentThreads + tid] *
+                    decay;
+                partial_kv += s_decayed * k_local[state_row];
             }
         }
         reduce_kv[tid] = partial_kv;
         __syncthreads();
 
-        // Reduce kv across splits and compute delta
+        // The split reduction order is fixed and shared with M=1 decode.
         float delta = 0.0f;
-        if (vi < d_v) {
+        if (vi < d_v)
+        {
             float kv = 0.0f;
-            for (int s = 0; s < ROW_SPLIT; s++)
-                kv += reduce_kv[col_in_block + s * cols_per_block];
+            for (int split = 0; split < kGdnRecurrentRowSplit; ++split)
+            {
+                kv += reduce_kv[
+                    col_in_block +
+                    split * kGdnRecurrentColumnsPerBlock];
+            }
             delta = (v_head[vi] - kv) * beta_h;
         }
 
-        // Pass 2: Fused decay + update + partial output (read-modify-write)
+        // Pass 2 updates VGPR state and writes the optional accepted-row image.
         float partial_out = 0.0f;
-        if (vi < d_v) {
-            float *snapshot =
-                state_snapshots && flat_row < max_snapshot_rows
-                    ? state_snapshots +
-                          static_cast<size_t>(flat_row) *
-                              static_cast<size_t>(snapshot_stride_floats) +
-                          static_cast<size_t>(h) * d_k * d_v
-                    : nullptr;
-            for (int j = j_start; j < j_end; j++) {
-                float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-                S[j * d_v + vi] = s_new;
+        float *snapshot =
+            state_snapshots && flat_row < max_snapshot_rows
+                ? state_snapshots +
+                      static_cast<size_t>(flat_row) *
+                          static_cast<size_t>(snapshot_stride_floats) +
+                      static_cast<size_t>(h) * D_K * d_v
+                : nullptr;
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int local_row = 0;
+                 local_row < kRegisterRowsPerSplit;
+                 ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                const float s_new =
+                    state_rows[local_row] * decay +
+                    k_local[state_row] * delta;
+                state_rows[local_row] = s_new;
                 if (snapshot)
-                    snapshot[j * d_v + vi] = s_new;
-                partial_out += s_new * q_local[j];
+                    snapshot[state_row * d_v + vi] = s_new;
+                partial_out += s_new * q_local[state_row];
+            }
+#pragma clang loop unroll(disable)
+            for (int tail_row = 0;
+                 tail_row < kLdsRowsPerSplit;
+                 ++tail_row)
+            {
+                const int state_row =
+                    row_begin + kRegisterRowsPerSplit + tail_row;
+                const int lds_index =
+                    tail_row * kGdnRecurrentThreads + tid;
+                const float s_new =
+                    state_tail[lds_index] * decay +
+                    k_local[state_row] * delta;
+                state_tail[lds_index] = s_new;
+                if (snapshot)
+                    snapshot[state_row * d_v + vi] = s_new;
+                partial_out += s_new * q_local[state_row];
             }
         }
         reduce_out[tid] = partial_out;
         __syncthreads();
 
-        // Reduce output across splits — only split_id=0 writes final output
-        if (vi < d_v && split_id == 0) {
+        if (vi < d_v && split_id == 0)
+        {
             float out_vi = 0.0f;
-            for (int s = 0; s < ROW_SPLIT; s++)
-                out_vi += reduce_out[col_in_block + s * cols_per_block];
+            for (int split = 0; split < kGdnRecurrentRowSplit; ++split)
+            {
+                out_vi += reduce_out[
+                    col_in_block +
+                    split * kGdnRecurrentColumnsPerBlock];
+            }
             o_head[vi] = out_vi;
         }
 
-        // Shared Q/K and reduction slots are reused by the next causal row.
+        // Shared rows and reduction slots belong to exactly one causal row.
         __syncthreads();
     }
+
+    const bool terminal_state_is_snapshotted =
+        state_snapshots != nullptr &&
+        max_snapshot_rows >= request_count * request_seq_len;
+    if (vi < d_v && !terminal_state_is_snapshotted)
+    {
+#pragma unroll
+        for (int local_row = 0;
+             local_row < kRegisterRowsPerSplit;
+             ++local_row)
+        {
+            const int state_row = row_begin + local_row;
+            S_updated[state_row * d_v + vi] = state_rows[local_row];
+        }
+#pragma clang loop unroll(disable)
+        for (int tail_row = 0; tail_row < kLdsRowsPerSplit; ++tail_row)
+        {
+            const int state_row =
+                row_begin + kRegisterRowsPerSplit + tail_row;
+            S_updated[state_row * d_v + vi] =
+                state_tail[tail_row * kGdnRecurrentThreads + tid];
+        }
+    }
+}
+
+/**
+ * @brief Launch one fixed HIP recurrence specialization for graph capture.
+ *
+ * GDN key width is immutable model topology. Dispatching here makes register
+ * ownership, resource usage, and launch geometry part of graph construction.
+ * Unknown widths fail immediately; there is no eager or global-state alternate
+ * route hidden behind the optimized grouped implementation.
+ */
+bool launch_rocm_gdn_recurrent_step(
+    const char *caller,
+    const float *q,
+    const float *k,
+    const float *v,
+    const float *alpha,
+    const float *beta_raw,
+    const float *A_log,
+    const float *dt_bias,
+    float *output,
+    const float *initial_state,
+    float *updated_state,
+    int request_count,
+    int request_seq_len,
+    int n_heads,
+    int d_k,
+    int d_v,
+    bool use_qk_l2norm,
+    const int *effective_seq_len_ptr,
+    int effective_row_idx,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    hipStream_t stream)
+{
+    const dim3 grid(
+        request_count * n_heads,
+        (d_v + kGdnRecurrentColumnsPerBlock - 1) /
+            kGdnRecurrentColumnsPerBlock);
+    const int rows_per_split = d_k / kGdnRecurrentRowSplit;
+    const int lds_rows_per_split = std::max(0, rows_per_split - 22);
+    const size_t shared_bytes =
+        static_cast<size_t>(
+            2 * d_k + 4 + 2 * kGdnRecurrentThreads +
+            lds_rows_per_split * kGdnRecurrentThreads) *
+        sizeof(float);
+
+#define LLAMINAR_LAUNCH_ROCM_GDN_RECURRENT(D_K)                               \
+    hipLaunchKernelGGL(                                                       \
+        HIP_KERNEL_NAME(rocm_gdn_recurrent_step_kernel<D_K>),                 \
+        grid,                                                                 \
+        dim3(kGdnRecurrentThreads),                                           \
+        shared_bytes,                                                         \
+        stream,                                                               \
+        q, k, v, alpha, beta_raw, A_log, dt_bias, output,                    \
+        initial_state, updated_state,                                        \
+        request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,          \
+        effective_seq_len_ptr, effective_row_idx, state_snapshots,             \
+        snapshot_stride_floats, max_snapshot_rows)
+
+    switch (d_k)
+    {
+    case 64:
+        LLAMINAR_LAUNCH_ROCM_GDN_RECURRENT(64);
+        break;
+    case 128:
+        LLAMINAR_LAUNCH_ROCM_GDN_RECURRENT(128);
+        break;
+    default:
+        fprintf(
+            stderr,
+            "[%s] unsupported ROCm GDN d_k=%d; capture supports d_k in "
+            "{64,128}\n",
+            caller,
+            d_k);
+        return false;
+    }
+
+#undef LLAMINAR_LAUNCH_ROCM_GDN_RECURRENT
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[%s] %s\n", caller, hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 // =========================================================================
@@ -331,7 +544,8 @@ void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ A_log,
     const float *__restrict__ dt_bias,
     float *__restrict__ output,
-    float *__restrict__ state,
+    const float *initial_state,
+    float *updated_state,
     const int *__restrict__ effective_seq_len_ptr,
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
@@ -360,9 +574,14 @@ void rocm_gdn_chunk_forward_kernel(
     const int request_row_base = request * request_seq_len;
     const size_t request_state_stride =
         static_cast<size_t>(n_heads) * d_k * d_v;
-    float *S = state +
-               static_cast<size_t>(request) * request_state_stride +
-               static_cast<size_t>(h) * d_k * d_v;
+    const float *S_initial =
+        initial_state +
+        static_cast<size_t>(request) * request_state_stride +
+        static_cast<size_t>(h) * d_k * d_v;
+    float *S_updated =
+        updated_state +
+        static_cast<size_t>(request) * request_state_stride +
+        static_cast<size_t>(h) * d_k * d_v;
 
     extern __shared__ float smem[];
     float *q_local = smem;
@@ -413,38 +632,38 @@ void rocm_gdn_chunk_forward_kernel(
     float sc24, sc25, sc26, sc27, sc28, sc29, sc30, sc31;
 
     if (vi < d_v) {
-        sc0  = S[(j_start +  0) * d_v + vi];
-        sc1  = S[(j_start +  1) * d_v + vi];
-        sc2  = S[(j_start +  2) * d_v + vi];
-        sc3  = S[(j_start +  3) * d_v + vi];
-        sc4  = S[(j_start +  4) * d_v + vi];
-        sc5  = S[(j_start +  5) * d_v + vi];
-        sc6  = S[(j_start +  6) * d_v + vi];
-        sc7  = S[(j_start +  7) * d_v + vi];
-        sc8  = S[(j_start +  8) * d_v + vi];
-        sc9  = S[(j_start +  9) * d_v + vi];
-        sc10 = S[(j_start + 10) * d_v + vi];
-        sc11 = S[(j_start + 11) * d_v + vi];
-        sc12 = S[(j_start + 12) * d_v + vi];
-        sc13 = S[(j_start + 13) * d_v + vi];
-        sc14 = S[(j_start + 14) * d_v + vi];
-        sc15 = S[(j_start + 15) * d_v + vi];
-        sc16 = S[(j_start + 16) * d_v + vi];
-        sc17 = S[(j_start + 17) * d_v + vi];
-        sc18 = S[(j_start + 18) * d_v + vi];
-        sc19 = S[(j_start + 19) * d_v + vi];
-        sc20 = S[(j_start + 20) * d_v + vi];
-        sc21 = S[(j_start + 21) * d_v + vi];
-        sc22 = S[(j_start + 22) * d_v + vi];
-        sc23 = S[(j_start + 23) * d_v + vi];
-        sc24 = S[(j_start + 24) * d_v + vi];
-        sc25 = S[(j_start + 25) * d_v + vi];
-        sc26 = S[(j_start + 26) * d_v + vi];
-        sc27 = S[(j_start + 27) * d_v + vi];
-        sc28 = S[(j_start + 28) * d_v + vi];
-        sc29 = S[(j_start + 29) * d_v + vi];
-        sc30 = S[(j_start + 30) * d_v + vi];
-        sc31 = S[(j_start + 31) * d_v + vi];
+        sc0  = S_initial[(j_start +  0) * d_v + vi];
+        sc1  = S_initial[(j_start +  1) * d_v + vi];
+        sc2  = S_initial[(j_start +  2) * d_v + vi];
+        sc3  = S_initial[(j_start +  3) * d_v + vi];
+        sc4  = S_initial[(j_start +  4) * d_v + vi];
+        sc5  = S_initial[(j_start +  5) * d_v + vi];
+        sc6  = S_initial[(j_start +  6) * d_v + vi];
+        sc7  = S_initial[(j_start +  7) * d_v + vi];
+        sc8  = S_initial[(j_start +  8) * d_v + vi];
+        sc9  = S_initial[(j_start +  9) * d_v + vi];
+        sc10 = S_initial[(j_start + 10) * d_v + vi];
+        sc11 = S_initial[(j_start + 11) * d_v + vi];
+        sc12 = S_initial[(j_start + 12) * d_v + vi];
+        sc13 = S_initial[(j_start + 13) * d_v + vi];
+        sc14 = S_initial[(j_start + 14) * d_v + vi];
+        sc15 = S_initial[(j_start + 15) * d_v + vi];
+        sc16 = S_initial[(j_start + 16) * d_v + vi];
+        sc17 = S_initial[(j_start + 17) * d_v + vi];
+        sc18 = S_initial[(j_start + 18) * d_v + vi];
+        sc19 = S_initial[(j_start + 19) * d_v + vi];
+        sc20 = S_initial[(j_start + 20) * d_v + vi];
+        sc21 = S_initial[(j_start + 21) * d_v + vi];
+        sc22 = S_initial[(j_start + 22) * d_v + vi];
+        sc23 = S_initial[(j_start + 23) * d_v + vi];
+        sc24 = S_initial[(j_start + 24) * d_v + vi];
+        sc25 = S_initial[(j_start + 25) * d_v + vi];
+        sc26 = S_initial[(j_start + 26) * d_v + vi];
+        sc27 = S_initial[(j_start + 27) * d_v + vi];
+        sc28 = S_initial[(j_start + 28) * d_v + vi];
+        sc29 = S_initial[(j_start + 29) * d_v + vi];
+        sc30 = S_initial[(j_start + 30) * d_v + vi];
+        sc31 = S_initial[(j_start + 31) * d_v + vi];
     } else {
         sc0=sc1=sc2=sc3=sc4=sc5=sc6=sc7=0.0f;
         sc8=sc9=sc10=sc11=sc12=sc13=sc14=sc15=0.0f;
@@ -673,38 +892,38 @@ void rocm_gdn_chunk_forward_kernel(
     // Write state back to global memory ONCE at the end
     // =====================================================================
     if (vi < d_v) {
-        S[(j_start +  0) * d_v + vi] = sc0;
-        S[(j_start +  1) * d_v + vi] = sc1;
-        S[(j_start +  2) * d_v + vi] = sc2;
-        S[(j_start +  3) * d_v + vi] = sc3;
-        S[(j_start +  4) * d_v + vi] = sc4;
-        S[(j_start +  5) * d_v + vi] = sc5;
-        S[(j_start +  6) * d_v + vi] = sc6;
-        S[(j_start +  7) * d_v + vi] = sc7;
-        S[(j_start +  8) * d_v + vi] = sc8;
-        S[(j_start +  9) * d_v + vi] = sc9;
-        S[(j_start + 10) * d_v + vi] = sc10;
-        S[(j_start + 11) * d_v + vi] = sc11;
-        S[(j_start + 12) * d_v + vi] = sc12;
-        S[(j_start + 13) * d_v + vi] = sc13;
-        S[(j_start + 14) * d_v + vi] = sc14;
-        S[(j_start + 15) * d_v + vi] = sc15;
-        S[(j_start + 16) * d_v + vi] = sc16;
-        S[(j_start + 17) * d_v + vi] = sc17;
-        S[(j_start + 18) * d_v + vi] = sc18;
-        S[(j_start + 19) * d_v + vi] = sc19;
-        S[(j_start + 20) * d_v + vi] = sc20;
-        S[(j_start + 21) * d_v + vi] = sc21;
-        S[(j_start + 22) * d_v + vi] = sc22;
-        S[(j_start + 23) * d_v + vi] = sc23;
-        S[(j_start + 24) * d_v + vi] = sc24;
-        S[(j_start + 25) * d_v + vi] = sc25;
-        S[(j_start + 26) * d_v + vi] = sc26;
-        S[(j_start + 27) * d_v + vi] = sc27;
-        S[(j_start + 28) * d_v + vi] = sc28;
-        S[(j_start + 29) * d_v + vi] = sc29;
-        S[(j_start + 30) * d_v + vi] = sc30;
-        S[(j_start + 31) * d_v + vi] = sc31;
+        S_updated[(j_start +  0) * d_v + vi] = sc0;
+        S_updated[(j_start +  1) * d_v + vi] = sc1;
+        S_updated[(j_start +  2) * d_v + vi] = sc2;
+        S_updated[(j_start +  3) * d_v + vi] = sc3;
+        S_updated[(j_start +  4) * d_v + vi] = sc4;
+        S_updated[(j_start +  5) * d_v + vi] = sc5;
+        S_updated[(j_start +  6) * d_v + vi] = sc6;
+        S_updated[(j_start +  7) * d_v + vi] = sc7;
+        S_updated[(j_start +  8) * d_v + vi] = sc8;
+        S_updated[(j_start +  9) * d_v + vi] = sc9;
+        S_updated[(j_start + 10) * d_v + vi] = sc10;
+        S_updated[(j_start + 11) * d_v + vi] = sc11;
+        S_updated[(j_start + 12) * d_v + vi] = sc12;
+        S_updated[(j_start + 13) * d_v + vi] = sc13;
+        S_updated[(j_start + 14) * d_v + vi] = sc14;
+        S_updated[(j_start + 15) * d_v + vi] = sc15;
+        S_updated[(j_start + 16) * d_v + vi] = sc16;
+        S_updated[(j_start + 17) * d_v + vi] = sc17;
+        S_updated[(j_start + 18) * d_v + vi] = sc18;
+        S_updated[(j_start + 19) * d_v + vi] = sc19;
+        S_updated[(j_start + 20) * d_v + vi] = sc20;
+        S_updated[(j_start + 21) * d_v + vi] = sc21;
+        S_updated[(j_start + 22) * d_v + vi] = sc22;
+        S_updated[(j_start + 23) * d_v + vi] = sc23;
+        S_updated[(j_start + 24) * d_v + vi] = sc24;
+        S_updated[(j_start + 25) * d_v + vi] = sc25;
+        S_updated[(j_start + 26) * d_v + vi] = sc26;
+        S_updated[(j_start + 27) * d_v + vi] = sc27;
+        S_updated[(j_start + 28) * d_v + vi] = sc28;
+        S_updated[(j_start + 29) * d_v + vi] = sc29;
+        S_updated[(j_start + 30) * d_v + vi] = sc30;
+        S_updated[(j_start + 31) * d_v + vi] = sc31;
     }
 }
 
@@ -717,7 +936,8 @@ __global__ void rocm_short_conv1d_decode_kernel(
     const float *__restrict__ weight,
     const float *__restrict__ bias,
     float *__restrict__ output,
-    float *__restrict__ conv_state,
+    const float *initial_conv_state,
+    float *updated_conv_state,
     int channels, int kernel_size,
     bool apply_silu)
 {
@@ -730,7 +950,7 @@ __global__ void rocm_short_conv1d_decode_kernel(
     // (must compute before shift to avoid overwriting state values)
     float sum = 0.0f;
     for (int k = 0; k < ks_minus1; k++)
-        sum += conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
+        sum += initial_conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
     sum += input[ch] * weight[ch * kernel_size + ks_minus1];
 
     if (bias) sum += bias[ch];
@@ -740,8 +960,9 @@ __global__ void rocm_short_conv1d_decode_kernel(
 
     // Now shift conv_state left by 1, insert new input at the end
     for (int k = 0; k < ks_minus1 - 1; k++)
-        conv_state[ch * ks_minus1 + k] = conv_state[ch * ks_minus1 + k + 1];
-    conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
+        updated_conv_state[ch * ks_minus1 + k] =
+            initial_conv_state[ch * ks_minus1 + k + 1];
+    updated_conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
 }
 
 __global__ void rocm_short_conv1d_prefill_kernel(
@@ -749,7 +970,7 @@ __global__ void rocm_short_conv1d_prefill_kernel(
     const float *__restrict__ weight,
     const float *__restrict__ bias,
     float *__restrict__ output,
-    float *__restrict__ conv_state,
+    const float *__restrict__ initial_conv_state,
     const int *__restrict__ effective_seq_len_ptr,
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
@@ -779,8 +1000,8 @@ __global__ void rocm_short_conv1d_prefill_kernel(
             float val = 0.0f;
             if (src_t >= 0)
                 val = input[src_t * channels + ch];
-            else if (conv_state)
-                val = conv_state[ch * ks_minus1 + ks_minus1 + src_t];
+            else if (initial_conv_state)
+                val = initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t];
             sum += val * weight[ch * kernel_size + k];
         }
 
@@ -799,7 +1020,7 @@ __global__ void rocm_short_conv1d_prefill_kernel(
             int src_t = t - ks_minus1 + 1 + state_idx;
             snapshot[state_idx] =
                 (src_t >= 0) ? input[src_t * channels + ch]
-                             : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+                             : (initial_conv_state ? initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
         }
     }
 }
@@ -819,7 +1040,8 @@ __global__ void rocm_short_conv1d_small_m_kernel(
     const float *__restrict__ weight,
     const float *__restrict__ bias,
     float *__restrict__ output,
-    float *__restrict__ conv_state,
+    const float *initial_conv_state,
+    float *updated_conv_state,
     const int *__restrict__ effective_seq_len_ptr,
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
@@ -844,8 +1066,10 @@ __global__ void rocm_short_conv1d_small_m_kernel(
     }
 
     const float *channel_weight = weight + static_cast<size_t>(ch) * kernel_size;
-    const float *initial_state =
-        conv_state ? conv_state + static_cast<size_t>(ch) * ks_minus1 : nullptr;
+    const float *channel_initial_state =
+        initial_conv_state
+            ? initial_conv_state + static_cast<size_t>(ch) * ks_minus1
+            : nullptr;
 
     for (int t = 0; t < seq_len; ++t)
     {
@@ -858,8 +1082,8 @@ __global__ void rocm_short_conv1d_small_m_kernel(
                 const float val =
                     (src_t >= 0)
                         ? input[static_cast<size_t>(src_t) * channels + ch]
-                        : (initial_state
-                               ? initial_state[ks_minus1 + src_t]
+                        : (channel_initial_state
+                               ? channel_initial_state[ks_minus1 + src_t]
                                : 0.0f);
                 sum += val * channel_weight[k];
             }
@@ -883,35 +1107,39 @@ __global__ void rocm_short_conv1d_small_m_kernel(
                 snapshot[state_idx] =
                     (src_t >= 0)
                         ? input[static_cast<size_t>(src_t) * channels + ch]
-                        : (initial_state
-                               ? initial_state[ks_minus1 + src_t]
+                        : (channel_initial_state
+                               ? channel_initial_state[ks_minus1 + src_t]
                                : 0.0f);
             }
         }
     }
 
-    if (conv_state)
+    const bool terminal_state_is_snapshotted =
+        state_snapshots != nullptr && max_snapshot_rows >= seq_len;
+    if (updated_conv_state && !terminal_state_is_snapshotted)
     {
-        float *state = conv_state + static_cast<size_t>(ch) * ks_minus1;
+        float *state =
+            updated_conv_state + static_cast<size_t>(ch) * ks_minus1;
         for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
         {
             const int src_t = effective_seq_len - ks_minus1 + state_idx;
             state[state_idx] =
                 (src_t >= 0 && src_t < effective_seq_len)
                     ? input[static_cast<size_t>(src_t) * channels + ch]
-                    : initial_state[ks_minus1 + src_t];
+                    : channel_initial_state[ks_minus1 + src_t];
         }
     }
 }
 
 __global__ void rocm_short_conv1d_state_update_kernel(
     const float *__restrict__ input,
-    float *__restrict__ conv_state,
+    const float *initial_conv_state,
+    float *updated_conv_state,
     const int *__restrict__ effective_seq_len_ptr,
     int seq_len, int channels, int kernel_size)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels || !conv_state) return;
+    if (ch >= channels || !initial_conv_state || !updated_conv_state) return;
 
     int ks_minus1 = kernel_size - 1;
     if (ks_minus1 <= 0) return;
@@ -923,12 +1151,13 @@ __global__ void rocm_short_conv1d_state_update_kernel(
         effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
     }
 
-    float *state = conv_state + ch * ks_minus1;
+    const float *initial_state = initial_conv_state + ch * ks_minus1;
+    float *updated_state = updated_conv_state + ch * ks_minus1;
     for (int state_idx = 0; state_idx < ks_minus1; ++state_idx) {
         int src_t = effective_seq_len - ks_minus1 + state_idx;
-        state[state_idx] =
+        updated_state[state_idx] =
             (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
-                                                       : state[ks_minus1 + src_t];
+                                                       : initial_state[ks_minus1 + src_t];
     }
 }
 
@@ -945,7 +1174,8 @@ __global__ void rocm_short_conv1d_batched_small_m_kernel(
     const float *__restrict__ weight,
     const float *__restrict__ bias,
     float *__restrict__ output,
-    float *__restrict__ request_states,
+    const float *initial_request_states,
+    float *updated_request_states,
     const int *__restrict__ request_seq_lens,
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
@@ -977,8 +1207,11 @@ __global__ void rocm_short_conv1d_batched_small_m_kernel(
         static_cast<size_t>(request) *
         static_cast<size_t>(channels) *
         static_cast<size_t>(ks_minus1);
-    float *channel_state =
-        request_states + state_base +
+    const float *channel_initial_state =
+        initial_request_states + state_base +
+        static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+    float *channel_updated_state =
+        updated_request_states + state_base +
         static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
     const float *channel_weight =
         weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
@@ -995,7 +1228,7 @@ __global__ void rocm_short_conv1d_batched_small_m_kernel(
                     src_t >= 0
                         ? input[element_base +
                                 static_cast<size_t>(src_t) * channels + ch]
-                        : channel_state[ks_minus1 + src_t];
+                        : channel_initial_state[ks_minus1 + src_t];
                 sum += value * channel_weight[k];
             }
             if (bias)
@@ -1022,19 +1255,25 @@ __global__ void rocm_short_conv1d_batched_small_m_kernel(
                     src_t >= 0
                         ? input[element_base +
                                 static_cast<size_t>(src_t) * channels + ch]
-                        : channel_state[ks_minus1 + src_t];
+                        : channel_initial_state[ks_minus1 + src_t];
             }
         }
     }
 
-    for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+    const bool terminal_state_is_snapshotted =
+        state_snapshots != nullptr &&
+        max_snapshot_rows >= request_count * request_seq_len;
+    if (!terminal_state_is_snapshotted)
     {
-        const int src_t = real_len - ks_minus1 + state_idx;
-        channel_state[state_idx] =
-            src_t >= 0 && src_t < real_len
-                ? input[element_base +
-                        static_cast<size_t>(src_t) * channels + ch]
-                : channel_state[ks_minus1 + src_t];
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = real_len - ks_minus1 + state_idx;
+            channel_updated_state[state_idx] =
+                src_t >= 0 && src_t < real_len
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_initial_state[ks_minus1 + src_t];
+        }
     }
 }
 
@@ -1130,7 +1369,8 @@ __global__ void rocm_short_conv1d_batched_prefill_kernel(
 /** @brief Commit each request's terminal real-row convolution state. */
 __global__ void rocm_short_conv1d_batched_state_update_kernel(
     const float *__restrict__ input,
-    float *__restrict__ request_states,
+    const float *initial_request_states,
+    float *updated_request_states,
     const int *__restrict__ request_seq_lens,
     int request_count,
     int request_seq_len,
@@ -1155,19 +1395,23 @@ __global__ void rocm_short_conv1d_batched_state_update_kernel(
         static_cast<size_t>(request) *
         static_cast<size_t>(request_seq_len) *
         static_cast<size_t>(channels);
-    float *channel_state =
-        request_states +
+    const float *channel_initial_state =
+        initial_request_states +
+        static_cast<size_t>(request) * channels * ks_minus1 +
+        static_cast<size_t>(ch) * ks_minus1;
+    float *channel_updated_state =
+        updated_request_states +
         static_cast<size_t>(request) * channels * ks_minus1 +
         static_cast<size_t>(ch) * ks_minus1;
 
     for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
     {
         const int src_t = real_len - ks_minus1 + state_idx;
-        channel_state[state_idx] =
+        channel_updated_state[state_idx] =
             src_t >= 0 && src_t < real_len
                 ? input[element_base +
                         static_cast<size_t>(src_t) * channels + ch]
-                : channel_state[ks_minus1 + src_t];
+                : channel_initial_state[ks_minus1 + src_t];
     }
 }
 
@@ -1343,20 +1587,39 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
 }
 
 /**
- * Copy one captured verifier state row selected by a device scalar.
+ * @brief Publish one captured verifier-state row selected by a device scalar.
  *
  * The accepted-row selector is produced by GPU stochastic verifier metadata.
- * Reading it here keeps GDN/short-conv state publication on the verifier stream
- * and avoids a host synchronization just to discover the row index.
+ * Reading it in this kernel keeps recurrent and short-convolution state
+ * publication on the verifier stream and avoids a host synchronization merely
+ * to discover the accepted row.  Arena-backed recurrent rows are 16-byte
+ * aligned, so the common path moves four FP32 values per memory instruction.
+ * A grid-stride loop keeps the launch at a bounded number of workgroups instead
+ * of scheduling one thousand mostly single-iteration blocks for a 2 MiB state.
+ *
+ * The alignment predicate is workgroup-uniform.  Non-vector tails and unusual
+ * externally supplied buffers retain exact scalar copy semantics, while every
+ * production arena row takes the vectorized path.  No value is converted or
+ * recomputed: publication remains byte-for-byte state selection.
+ *
+ * @param live_state Scalar live recurrent or short-convolution state.
+ * @param request_zero_state Request-bank slot representing the same sequence.
+ * @param capture Post-row verifier state matrix.
+ * @param row_index Device-owned accepted-row selector.
+ * @param rows Number of rows available in @p capture.
+ * @param state_size Number of FP32 values in one state row.
  */
-__global__ void rocm_gdn_copy_capture_row_from_device_index_kernel(
-    float *__restrict__ dst,
+__global__ __launch_bounds__(256)
+void rocm_gdn_publish_capture_row_from_device_index_kernel(
+    float *live_state,
+    float *request_zero_state,
     const float *__restrict__ capture,
     const int *__restrict__ row_index,
     int rows,
     int state_size)
 {
-    if (!dst || !capture || !row_index || rows <= 0 || state_size <= 0)
+    if (!live_state || !request_zero_state || !capture || !row_index ||
+        rows <= 0 || state_size <= 0)
         return;
     const int row = *row_index;
     if (row < 0 || row >= rows)
@@ -1364,23 +1627,66 @@ __global__ void rocm_gdn_copy_capture_row_from_device_index_kernel(
 
     const float *src =
         capture + static_cast<size_t>(row) * static_cast<size_t>(state_size);
-    const int stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < state_size;
-         i += stride)
+    const int thread =
+        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+        static_cast<int>(threadIdx.x);
+    const int stride =
+        static_cast<int>(blockDim.x) * static_cast<int>(gridDim.x);
+    const bool vector_aligned =
+        ((reinterpret_cast<uintptr_t>(live_state) |
+          reinterpret_cast<uintptr_t>(request_zero_state) |
+          reinterpret_cast<uintptr_t>(src)) & 0x0fu) == 0;
+    const bool shared_request_zero_owner =
+        live_state == request_zero_state;
+
+    if (vector_aligned)
     {
-        dst[i] = src[i];
+        float4 *live4 = reinterpret_cast<float4 *>(live_state);
+        float4 *request4 = reinterpret_cast<float4 *>(request_zero_state);
+        const float4 *src4 = reinterpret_cast<const float4 *>(src);
+        const int vector_count = state_size / 4;
+        for (int vector_index = thread;
+             vector_index < vector_count;
+             vector_index += stride)
+        {
+            const float4 value = src4[vector_index];
+            live4[vector_index] = value;
+            if (!shared_request_zero_owner)
+                request4[vector_index] = value;
+        }
+
+        const int tail_begin = vector_count * 4;
+        for (int i = tail_begin + thread; i < state_size; i += stride)
+        {
+            const float value = src[i];
+            live_state[i] = value;
+            if (!shared_request_zero_owner)
+                request_zero_state[i] = value;
+        }
+        return;
+    }
+
+    for (int i = thread; i < state_size; i += stride)
+    {
+        const float value = src[i];
+        live_state[i] = value;
+        if (!shared_request_zero_owner)
+            request_zero_state[i] = value;
     }
 }
 
 /**
- * Copy one captured verifier state row into each request's live-state slot.
+ * @brief Publish selected rows into request state and its scalar request-zero owner.
  *
  * A negative row index leaves that request untouched. This lets the compact
  * device-side MTP metadata publish only accepted requests without a host sync.
+ * Request zero is also written to the scalar live allocation by the same lane,
+ * making coherence a property of this publication transaction rather than a
+ * second memcpy that can be omitted, reordered, or captured independently.
  */
-__global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
-    float *__restrict__ dst,
+__global__ void rocm_gdn_publish_capture_rows_from_device_indices_kernel(
+    float *request_states,
+    float *request_zero_live_state,
     const float *__restrict__ capture,
     const int *__restrict__ row_indices,
     int request_count,
@@ -1389,7 +1695,7 @@ __global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
     int rows,
     int state_size)
 {
-    if (!dst || !capture || !row_indices ||
+    if (!request_states || !request_zero_live_state || !capture || !row_indices ||
         request_count <= 0 || row_index_stride <= 0 ||
         rows <= 0 || state_size <= 0)
     {
@@ -1411,9 +1717,12 @@ __global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
                 : metadata_value;
         if (row < 0 || row >= rows)
             continue;
-        dst[linear] =
+        const float value =
             capture[static_cast<size_t>(row) * static_cast<size_t>(state_size) +
                     static_cast<size_t>(state_offset)];
+        request_states[linear] = value;
+        if (request == 0 && request_zero_live_state != request_states)
+            request_zero_live_state[state_offset] = value;
     }
 }
 
@@ -1572,8 +1881,9 @@ void rocmGDN_stream_synchronize(void *stream)
     (void)hipStreamSynchronize((hipStream_t)stream);
 }
 
-bool rocmGDN_gpu_copy_capture_row_from_device_index(
-    float *dst,
+bool rocmGDN_gpu_publish_capture_row_from_device_index(
+    float *live_state,
+    float *request_zero_state,
     const float *capture,
     const int *device_row_index,
     int rows,
@@ -1581,7 +1891,7 @@ bool rocmGDN_gpu_copy_capture_row_from_device_index(
     int device_idx,
     void *stream)
 {
-    if (!dst || !capture || !device_row_index ||
+    if (!live_state || !request_zero_state || !capture || !device_row_index ||
         rows <= 0 || state_size <= 0 || !stream)
     {
         return false;
@@ -1589,18 +1899,21 @@ bool rocmGDN_gpu_copy_capture_row_from_device_index(
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     constexpr int threads = 256;
-    int blocks = (state_size + threads - 1) / threads;
+    constexpr int max_blocks = 256;
+    const int vector_work_items = (state_size + 3) / 4;
+    int blocks = (vector_work_items + threads - 1) / threads;
     if (blocks < 1)
         blocks = 1;
-    if (blocks > 1024)
-        blocks = 1024;
+    if (blocks > max_blocks)
+        blocks = max_blocks;
     hipLaunchKernelGGL(
-        rocm_gdn_copy_capture_row_from_device_index_kernel,
+        rocm_gdn_publish_capture_row_from_device_index_kernel,
         dim3(blocks),
         dim3(threads),
         0,
         (hipStream_t)stream,
-        dst,
+        live_state,
+        request_zero_state,
         capture,
         device_row_index,
         rows,
@@ -1609,15 +1922,16 @@ bool rocmGDN_gpu_copy_capture_row_from_device_index(
     if (err != hipSuccess)
     {
         fprintf(stderr,
-                "[rocmGDN_gpu_copy_capture_row_from_device_index] %s\n",
+                "[rocmGDN_gpu_publish_capture_row_from_device_index] %s\n",
                 hipGetErrorString(err));
         return false;
     }
     return true;
 }
 
-bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
-    float *dst,
+bool rocmGDN_gpu_publish_capture_rows_from_device_indices(
+    float *request_states,
+    float *request_zero_live_state,
     const float *capture,
     const int *device_row_indices,
     int request_count,
@@ -1627,7 +1941,7 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
     int device_idx,
     void *stream)
 {
-    if (!dst || !capture || !device_row_indices ||
+    if (!request_states || !request_zero_live_state || !capture || !device_row_indices ||
         request_count <= 0 || row_index_stride <= 0 ||
         rows <= 0 || state_size <= 0 || !stream)
     {
@@ -1642,12 +1956,13 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
     if (blocks > 1024)
         blocks = 1024;
     hipLaunchKernelGGL(
-        rocm_gdn_copy_capture_rows_from_device_indices_kernel,
+        rocm_gdn_publish_capture_rows_from_device_indices_kernel,
         dim3(blocks),
         dim3(threads),
         0,
         (hipStream_t)stream,
-        dst,
+        request_states,
+        request_zero_live_state,
         capture,
         device_row_indices,
         request_count,
@@ -1659,15 +1974,16 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
     if (err != hipSuccess)
     {
         fprintf(stderr,
-                "[rocmGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
+                "[rocmGDN_gpu_publish_capture_rows_from_device_indices] %s\n",
                 hipGetErrorString(err));
         return false;
     }
     return true;
 }
 
-bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
-    float *dst,
+bool rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
+    float *request_states,
+    float *request_zero_live_state,
     const float *capture,
     const int *device_request_seq_lens,
     int request_count,
@@ -1677,7 +1993,7 @@ bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
     int device_idx,
     void *stream)
 {
-    if (!dst || !capture || !device_request_seq_lens ||
+    if (!request_states || !request_zero_live_state || !capture || !device_request_seq_lens ||
         request_count <= 0 || request_row_width <= 0 ||
         rows < request_count * request_row_width ||
         state_size <= 0 || !stream)
@@ -1690,12 +2006,13 @@ bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
     int blocks = ((request_count * state_size) + threads - 1) / threads;
     blocks = std::max(1, std::min(blocks, 1024));
     hipLaunchKernelGGL(
-        rocm_gdn_copy_capture_rows_from_device_indices_kernel,
+        rocm_gdn_publish_capture_rows_from_device_indices_kernel,
         dim3(blocks),
         dim3(threads),
         0,
         static_cast<hipStream_t>(stream),
-        dst,
+        request_states,
+        request_zero_live_state,
         capture,
         device_request_seq_lens,
         request_count,
@@ -1707,7 +2024,7 @@ bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
     if (error != hipSuccess)
     {
         fprintf(stderr,
-                "[rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths] %s\n",
+                "[rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths] %s\n",
                 hipGetErrorString(error));
         return false;
     }
@@ -1927,7 +2244,7 @@ bool rocmGDN_recurrent_step(
     const float *q, const float *k, const float *v,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     int device_idx, void *stream)
@@ -1944,37 +2261,29 @@ bool rocmGDN_recurrent_step(
         print_pointer_attrs("A_log", A_log);
         print_pointer_attrs("dt_bias", dt_bias);
         print_pointer_attrs("output", output);
-        print_pointer_attrs("state", state);
+        print_pointer_attrs("initial_state", initial_state);
+        print_pointer_attrs("updated_state", updated_state);
     }
 
-    // ROW_SPLIT=4: 256 threads/block (4 wavefronts), 64 columns per block.
-    // Increases occupancy from 0.53 to 2.1 waves/CU on gfx906 (32→128 wavefronts).
-    // Shared memory: q[d_k] + k[d_k] + warp_sums[4] + reduce_kv[256] + reduce_out[256]
-    int col_threads = 256;
-    int cols_per_block = col_threads / 4; // 64 columns with ROW_SPLIT=4
-    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
-
-    hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
-        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
-        q, k, v, alpha, beta_raw, A_log, dt_bias,
-        output, state,
-        /*request_count=*/1, /*request_seq_len=*/1,
-        n_heads, d_k, d_v, use_qk_l2norm,
-        nullptr,
-        -1,
-        /*state_snapshots=*/nullptr,
-        /*snapshot_stride_floats=*/0,
-        /*max_snapshot_rows=*/0);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        fprintf(stderr, "[rocmGDN_recurrent_step] %s\n", hipGetErrorString(err));
+    if (!launch_rocm_gdn_recurrent_step(
+            "rocmGDN_recurrent_step",
+            q, k, v, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            /*request_count=*/1,
+            /*request_seq_len=*/1,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            /*effective_seq_len_ptr=*/nullptr,
+            /*effective_row_idx=*/-1,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0,
+            static_cast<hipStream_t>(stream)))
+    {
         return false;
     }
     if (llaminar2::debugEnv().rocm.gdn_sync)
     {
-        err = hipStreamSynchronize((hipStream_t)stream);
+        const hipError_t err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmGDN_recurrent_step_sync] %s\n", hipGetErrorString(err));
@@ -1988,7 +2297,7 @@ bool rocmGDN_recurrent_step_effective_row(
     const float *q, const float *k, const float *v,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     const int *device_effective_seq_len,
@@ -1997,31 +2306,25 @@ bool rocmGDN_recurrent_step_effective_row(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    int col_threads = 256;
-    const int cols_per_block = col_threads / 4;
-    const int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    const int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
-
-    hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
-        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
-        q, k, v, alpha, beta_raw, A_log, dt_bias,
-        output, state,
-        /*request_count=*/1, /*request_seq_len=*/1,
-        n_heads, d_k, d_v, use_qk_l2norm,
-        device_effective_seq_len,
-        row_idx,
-        /*state_snapshots=*/nullptr,
-        /*snapshot_stride_floats=*/0,
-        /*max_snapshot_rows=*/0);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        fprintf(stderr, "[rocmGDN_recurrent_step_effective_row] %s\n", hipGetErrorString(err));
+    if (!launch_rocm_gdn_recurrent_step(
+            "rocmGDN_recurrent_step_effective_row",
+            q, k, v, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            /*request_count=*/1,
+            /*request_seq_len=*/1,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            device_effective_seq_len,
+            row_idx,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0,
+            static_cast<hipStream_t>(stream)))
+    {
         return false;
     }
     if (llaminar2::debugEnv().rocm.gdn_sync)
     {
-        err = hipStreamSynchronize((hipStream_t)stream);
+        const hipError_t err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmGDN_recurrent_step_effective_row_sync] %s\n", hipGetErrorString(err));
@@ -2035,7 +2338,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int seq_len, int request_count, int request_seq_len,
     int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
@@ -2047,7 +2350,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
-        !output || !state || !stream ||
+        !output || !initial_state || !updated_state || !stream ||
         seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
         seq_len != request_count * request_seq_len ||
         n_heads <= 0 || d_k <= 0 || d_v <= 0)
@@ -2065,7 +2368,8 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         print_pointer_attrs("A_log", A_log);
         print_pointer_attrs("dt_bias", dt_bias);
         print_pointer_attrs("output", output);
-        print_pointer_attrs("state", state);
+        print_pointer_attrs("initial_state", initial_state);
+        print_pointer_attrs("updated_state", updated_state);
     }
 
     const int required_snapshot_stride = n_heads * d_k * d_v;
@@ -2087,50 +2391,35 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         {
             fprintf(
                 stderr,
-                "[rocmGDN_recurrent_step_batched] requests=%d heads=%d d_k=%d d_v=%d state=%p output=%p lengths=%p\n",
+                "[rocmGDN_recurrent_step_batched] requests=%d heads=%d d_k=%d d_v=%d initial_state=%p updated_state=%p output=%p lengths=%p\n",
                 request_count,
                 n_heads,
                 d_k,
                 d_v,
-                static_cast<void *>(state),
+                static_cast<const void *>(initial_state),
+                static_cast<void *>(updated_state),
                 static_cast<void *>(output),
                 static_cast<const void *>(device_effective_seq_len));
         }
-        constexpr int col_threads = 256;
-        constexpr int row_split = 4;
-        const int cols_per_block = col_threads / row_split;
-        const int num_col_blocks =
-            (d_v + cols_per_block - 1) / cols_per_block;
-        const int smem_size =
-            (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
-
-        hipLaunchKernelGGL(
-            rocm_gdn_recurrent_step_kernel,
-            dim3(request_count * n_heads, num_col_blocks),
-            dim3(col_threads),
-            smem_size,
-            static_cast<hipStream_t>(stream),
-            Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
-            request_count, request_seq_len,
-            n_heads, d_k, d_v, use_qk_l2norm,
-            device_effective_seq_len,
-            /*effective_row_idx=*/0,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows);
-
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
+        if (!launch_rocm_gdn_recurrent_step(
+                "rocmGDN_recurrent_step_batched",
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, initial_state, updated_state,
+                request_count, request_seq_len,
+                n_heads, d_k, d_v, use_qk_l2norm,
+                device_effective_seq_len,
+                /*effective_row_idx=*/0,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                static_cast<hipStream_t>(stream)))
         {
-            fprintf(stderr,
-                    "[rocmGDN_recurrent_step_batched] %s\n",
-                    hipGetErrorString(err));
             return false;
         }
         if (llaminar2::debugEnv().rocm.gdn_sync)
         {
-            err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
+            const hipError_t err =
+                hipStreamSynchronize(static_cast<hipStream_t>(stream));
             if (err != hipSuccess)
             {
                 fprintf(stderr,
@@ -2159,7 +2448,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
     hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
         dim3(n_heads, num_col_blocks, request_count), dim3(col_threads), smem_size, (hipStream_t)stream,
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, state,
+        output, initial_state, updated_state,
         device_effective_seq_len,
         state_snapshots,
         snapshot_stride_floats,
@@ -2188,7 +2477,7 @@ bool rocmGDN_chunk_forward_kernel_route(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     float *state_snapshots,
@@ -2199,7 +2488,7 @@ bool rocmGDN_chunk_forward_kernel_route(
 {
     return rocmGDN_chunk_forward_batched_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, state,
+        output, initial_state, updated_state,
         seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
         n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
@@ -2213,7 +2502,7 @@ bool rocmGDN_chunk_forward(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     float *state_snapshots,
@@ -2233,7 +2522,7 @@ bool rocmGDN_chunk_forward(
      */
     return rocmGDN_chunk_forward_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, state,
+        output, initial_state, updated_state,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
         snapshot_stride_floats,
@@ -2246,7 +2535,7 @@ bool rocmGDN_chunk_forward_effective(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     const int *device_effective_seq_len,
@@ -2267,13 +2556,14 @@ bool rocmGDN_chunk_forward_effective(
         print_pointer_attrs("A_log", A_log);
         print_pointer_attrs("dt_bias", dt_bias);
         print_pointer_attrs("output", output);
-        print_pointer_attrs("state", state);
+        print_pointer_attrs("initial_state", initial_state);
+        print_pointer_attrs("updated_state", updated_state);
         print_pointer_attrs("effective_seq_len", device_effective_seq_len);
     }
 
     const bool ok = rocmGDN_chunk_forward_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, state,
+        output, initial_state, updated_state,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
         snapshot_stride_floats,
@@ -2306,7 +2596,7 @@ bool rocmGDN_chunk_forward_batched_effective(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
-    float *output, float *state,
+    float *output, const float *initial_state, float *updated_state,
     int seq_len, int request_count, int request_seq_len,
     int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
@@ -2320,7 +2610,7 @@ bool rocmGDN_chunk_forward_batched_effective(
         return false;
     return rocmGDN_chunk_forward_batched_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, state,
+        output, initial_state, updated_state,
         seq_len, request_count, request_seq_len,
         n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
@@ -2332,7 +2622,9 @@ bool rocmGDN_chunk_forward_batched_effective(
 
 bool rocmGDN_short_conv1d(
     const float *input, const float *weight, const float *bias,
-    float *output, float *conv_state,
+    float *output,
+    const float *initial_conv_state,
+    float *updated_conv_state,
     int seq_len, int channels, int kernel_size,
     bool apply_silu,
     float *state_snapshots,
@@ -2358,7 +2650,8 @@ bool rocmGDN_short_conv1d(
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             nullptr,
             state_snapshots,
             snapshot_stride_floats,
@@ -2369,14 +2662,16 @@ bool rocmGDN_short_conv1d(
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             channels, kernel_size, apply_silu);
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             nullptr,
             state_snapshots,
             snapshot_stride_floats,
@@ -2388,7 +2683,7 @@ bool rocmGDN_short_conv1d(
         int blocks = (total + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output, initial_conv_state,
             nullptr,
             state_snapshots,
             snapshot_stride_floats,
@@ -2397,7 +2692,7 @@ bool rocmGDN_short_conv1d(
         int state_blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
             dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, conv_state, nullptr,
+            input, initial_conv_state, updated_conv_state, nullptr,
             seq_len, channels, kernel_size);
     }
 
@@ -2411,7 +2706,9 @@ bool rocmGDN_short_conv1d(
 
 bool rocmGDN_short_conv1d_effective(
     const float *input, const float *weight, const float *bias,
-    float *output, float *conv_state,
+    float *output,
+    const float *initial_conv_state,
+    float *updated_conv_state,
     int seq_len, int channels, int kernel_size,
     bool apply_silu,
     const int *device_effective_seq_len,
@@ -2433,7 +2730,8 @@ bool rocmGDN_short_conv1d_effective(
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             device_effective_seq_len,
             state_snapshots,
             snapshot_stride_floats,
@@ -2444,14 +2742,16 @@ bool rocmGDN_short_conv1d_effective(
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             channels, kernel_size, apply_silu);
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output,
+            initial_conv_state, updated_conv_state,
             device_effective_seq_len,
             state_snapshots,
             snapshot_stride_floats,
@@ -2463,7 +2763,7 @@ bool rocmGDN_short_conv1d_effective(
         int blocks = (total + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output, conv_state,
+            input, weight, bias, output, initial_conv_state,
             device_effective_seq_len,
             state_snapshots,
             snapshot_stride_floats,
@@ -2472,7 +2772,8 @@ bool rocmGDN_short_conv1d_effective(
         int state_blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
             dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, conv_state, device_effective_seq_len,
+            input, initial_conv_state, updated_conv_state,
+            device_effective_seq_len,
             seq_len, channels, kernel_size);
     }
 
@@ -2493,7 +2794,9 @@ bool rocmGDN_short_conv1d_effective(
  */
 bool rocmGDN_short_conv1d_batched(
     const float *input, const float *weight, const float *bias,
-    float *output, float *request_states,
+    float *output,
+    const float *initial_request_states,
+    float *updated_request_states,
     int request_count, int request_seq_len,
     int channels, int kernel_size,
     bool apply_silu,
@@ -2504,7 +2807,8 @@ bool rocmGDN_short_conv1d_batched(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    if (!input || !weight || !output || !request_states ||
+    if (!input || !weight || !output ||
+        !initial_request_states || !updated_request_states ||
         !device_request_seq_lens || !stream ||
         request_count <= 0 || request_seq_len <= 0 ||
         channels <= 0 || kernel_size <= 1)
@@ -2527,7 +2831,8 @@ bool rocmGDN_short_conv1d_batched(
             dim3(threads),
             0,
             static_cast<hipStream_t>(stream),
-            input, weight, bias, output, request_states,
+            input, weight, bias, output,
+            initial_request_states, updated_request_states,
             device_request_seq_lens,
             state_snapshots, snapshot_stride_floats, max_snapshot_rows,
             request_count, request_seq_len,
@@ -2543,7 +2848,7 @@ bool rocmGDN_short_conv1d_batched(
             dim3(threads),
             0,
             static_cast<hipStream_t>(stream),
-            input, weight, bias, output, request_states,
+            input, weight, bias, output, initial_request_states,
             device_request_seq_lens,
             state_snapshots, snapshot_stride_floats, max_snapshot_rows,
             request_count, request_seq_len,
@@ -2557,7 +2862,8 @@ bool rocmGDN_short_conv1d_batched(
             dim3(threads),
             0,
             static_cast<hipStream_t>(stream),
-            input, request_states, device_request_seq_lens,
+            input, initial_request_states, updated_request_states,
+            device_request_seq_lens,
             request_count, request_seq_len, channels, kernel_size);
     }
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -189,15 +190,27 @@ namespace llaminar2
         }                                                                         \
     } while (0)
 
-    HIPGraphCapture::HIPGraphCapture(hipStream_t stream) : stream_(stream) {}
+    HIPGraphCapture::HIPGraphCapture(
+        hipStream_t stream,
+        int device_ordinal)
+        : stream_(stream), device_ordinal_(device_ordinal)
+    {
+        if (!stream_ || device_ordinal_ < 0)
+        {
+            throw std::invalid_argument(
+                "HIPGraphCapture requires an explicit stream and ROCm ordinal");
+        }
+    }
 
     HIPGraphCapture::~HIPGraphCapture() { reset(); }
 
     HIPGraphCapture::HIPGraphCapture(HIPGraphCapture &&other) noexcept
-        : stream_(other.stream_), graph_(other.graph_), exec_(other.exec_),
+        : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
+          graph_(other.graph_), exec_(other.exec_),
           node_count_(other.node_count_)
     {
         other.stream_ = nullptr;
+        other.device_ordinal_ = -1;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
@@ -209,10 +222,12 @@ namespace llaminar2
         {
             reset();
             stream_ = other.stream_;
+            device_ordinal_ = other.device_ordinal_;
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
             other.stream_ = nullptr;
+            other.device_ordinal_ = -1;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -220,8 +235,33 @@ namespace llaminar2
         return *this;
     }
 
+    bool HIPGraphCapture::activateOwner(const char *operation) const noexcept
+    {
+        if (!stream_ || device_ordinal_ < 0)
+        {
+            LOG_ERROR("[HIPGraphCapture] "
+                      << (operation ? operation : "graph operation")
+                      << " has no valid ROCm owner"
+                      << " stream=" << static_cast<void *>(stream_)
+                      << " device=" << device_ordinal_);
+            return false;
+        }
+        const hipError_t error = hipSetDevice(device_ordinal_);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[HIPGraphCapture] hipSetDevice(" << device_ordinal_
+                      << ") failed before "
+                      << (operation ? operation : "graph operation") << ": "
+                      << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
     bool HIPGraphCapture::beginCapture()
     {
+        if (!activateOwner("beginCapture"))
+            return false;
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
@@ -248,6 +288,8 @@ namespace llaminar2
 
     bool HIPGraphCapture::endCapture()
     {
+        if (!activateOwner("endCapture"))
+            return false;
         hipError_t err = hipStreamEndCapture(stream_, &graph_);
         if (err != hipSuccess)
         {
@@ -274,6 +316,8 @@ namespace llaminar2
 
     bool HIPGraphCapture::instantiate()
     {
+        if (!activateOwner("instantiate"))
+            return false;
         if (!graph_)
         {
             LOG_ERROR("[HIPGraphCapture] Cannot instantiate: no captured graph");
@@ -306,12 +350,19 @@ namespace llaminar2
 
     bool HIPGraphCapture::launch()
     {
-        if (!exec_)
+        return launchOnStream(static_cast<void *>(stream_));
+    }
+
+    bool HIPGraphCapture::launchOnStream(void *stream) const
+    {
+        if (!activateOwner("launchOnStream") || !exec_ || !stream)
         {
-            LOG_ERROR("[HIPGraphCapture] Cannot launch: no instantiated executable");
+            LOG_ERROR("[HIPGraphCapture] Cannot launch: executable or explicit stream is missing");
             return false;
         }
-        hipError_t err = hipGraphLaunch(exec_, stream_);
+        hipError_t err = hipGraphLaunch(
+            exec_,
+            static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipGraphLaunch failed: " << hipGetErrorString(err));
@@ -341,6 +392,8 @@ namespace llaminar2
         std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
         std::string *error) const
     {
+        if (!activateOwner("inspectKernelNodes"))
+            return false;
         kernel_nodes.clear();
         if (error)
             error->clear();
@@ -370,6 +423,11 @@ namespace llaminar2
 
     void HIPGraphCapture::reset()
     {
+        if ((exec_ || graph_) && !activateOwner("reset"))
+        {
+            LOG_ERROR("[HIPGraphCapture] Cannot release graph resources without their immutable ROCm owner");
+            std::terminate();
+        }
         if (exec_)
         {
             HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));

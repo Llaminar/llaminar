@@ -530,7 +530,130 @@ namespace llaminar2::sampling_math
         InvalidPublicationMetadata = 9,
         InvalidDepthPolicy = 10,
         InvalidDepthSelector = 11,
+        InvalidMaintenanceState = 12,
     };
+
+    /**
+     * @brief Immutable host-scheduler view of one device-owned transaction.
+     *
+     * HIP graph replay currently has no native conditional-node equivalent.  A
+     * host scheduler consequently needs to know whether another captured graph
+     * transaction is required and which pre-captured depth branch to submit.
+     * It must not receive the generation controller, compact verifier outcome,
+     * response tokens, cache positions, or sampler state.  This fixed-size ABI
+     * is the only intermediate device-to-host payload permitted by that policy.
+     *
+     * The record is a value snapshot, never an authority.  Its lifecycle fields
+     * identify the admitted request and arena generation; its decision fields
+     * are copied from the authoritative controller by a graph-captured device
+     * kernel.  The host may validate and schedule from these words but may never
+     * upload a modified ticket or derive live inference state from it.
+     */
+    struct DeviceGenerationDispatchTicket
+    {
+        static constexpr uint32_t kMagic = 0x4D545044u; // "MTPD"
+        static constexpr uint32_t kABIVersion = 1u;
+
+        uint32_t magic = 0;
+        uint32_t abi_version = 0;
+        uint32_t session_epoch_low = 0;
+        uint32_t session_epoch_high = 0;
+        uint32_t workspace_generation_low = 0;
+        uint32_t workspace_generation_high = 0;
+        int32_t healthy = 0;
+        int32_t complete = 0;
+        int32_t transaction_count = 0;
+        int32_t next_draft_depth = 0;
+        int32_t error_code = 0;
+        int32_t maintenance_due = 0;
+
+        /** @brief Reconstruct the request epoch without relying on host layout. */
+        LLAMINAR_SAMPLING_HD uint64_t sessionEpoch() const
+        {
+            return static_cast<uint64_t>(session_epoch_low) |
+                   (static_cast<uint64_t>(session_epoch_high) << 32u);
+        }
+
+        /** @brief Reconstruct the arena generation carried by the ticket. */
+        LLAMINAR_SAMPLING_HD uint64_t workspaceGeneration() const
+        {
+            return static_cast<uint64_t>(workspace_generation_low) |
+                   (static_cast<uint64_t>(workspace_generation_high) << 32u);
+        }
+
+        /** @brief Check only the stable wire-format identity. */
+        LLAMINAR_SAMPLING_HD bool hasValidABI() const
+        {
+            return magic == kMagic && abi_version == kABIVersion;
+        }
+
+        /**
+         * @brief Authenticate this snapshot against the active request owner.
+         *
+         * A transaction count of zero is valid immediately after admission but
+         * is never sufficient to schedule a continuation.  Callers observing a
+         * completed first transaction additionally require a strictly positive
+         * count before choosing a graph branch.
+         */
+        LLAMINAR_SAMPLING_HD bool matchesLifecycle(
+            uint64_t expected_session_epoch,
+            uint64_t expected_workspace_generation) const
+        {
+            return hasValidABI() &&
+                   sessionEpoch() == expected_session_epoch &&
+                   workspaceGeneration() == expected_workspace_generation &&
+                   (healthy == 0 || healthy == 1) &&
+                   (complete == 0 || complete == 1) &&
+                   transaction_count >= 0 && next_draft_depth >= 0 &&
+                   maintenance_due >= 0 && maintenance_due <= 1;
+        }
+
+        /** @brief Compare only fields that must agree across mirrored ranks. */
+        LLAMINAR_SAMPLING_HD bool hasSameDispatchDecision(
+            const DeviceGenerationDispatchTicket &other) const
+        {
+            return healthy == other.healthy && complete == other.complete &&
+                   transaction_count == other.transaction_count &&
+                   next_draft_depth == other.next_draft_depth &&
+                   error_code == other.error_code &&
+                   maintenance_due == other.maintenance_due;
+        }
+    };
+
+    static_assert(sizeof(DeviceGenerationDispatchTicket) == 12u * sizeof(uint32_t));
+
+    /**
+     * @brief Initialize the stable identity of a host-scheduling ticket.
+     *
+     * This runs in the same admission kernel that initializes the authoritative
+     * generation controller.  No host-side ticket image is uploaded, so a stale
+     * pinned destination can never seed device execution state.
+     */
+    LLAMINAR_SAMPLING_HD bool initialize_device_generation_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        DeviceGenerationDispatchTicket *ticket)
+    {
+        if (!ticket || session_epoch == 0 || workspace_generation == 0)
+            return false;
+
+        ticket->magic = DeviceGenerationDispatchTicket::kMagic;
+        ticket->abi_version = DeviceGenerationDispatchTicket::kABIVersion;
+        ticket->session_epoch_low = static_cast<uint32_t>(session_epoch);
+        ticket->session_epoch_high = static_cast<uint32_t>(session_epoch >> 32u);
+        ticket->workspace_generation_low =
+            static_cast<uint32_t>(workspace_generation);
+        ticket->workspace_generation_high =
+            static_cast<uint32_t>(workspace_generation >> 32u);
+        ticket->healthy = 0;
+        ticket->complete = 0;
+        ticket->transaction_count = 0;
+        ticket->next_draft_depth = 0;
+        ticket->error_code =
+            static_cast<int32_t>(DeviceGenerationError::InvalidInitialization);
+        ticket->maintenance_due = 0;
+        return true;
+    }
 
     /**
      * @brief Invalidate a resident generation request after a fatal transition.
@@ -559,6 +682,49 @@ namespace llaminar2::sampling_math
                 static_cast<int>(error);
         }
         return false;
+    }
+
+    /**
+     * @brief Pack the only host-visible decision from authoritative device state.
+     *
+     * The helper deliberately accepts no response-token, compact-outcome, cache,
+     * or sampler pointers.  This makes the HIP scheduling boundary incapable of
+     * growing into a second inference-state owner.  A malformed maintenance
+     * controller poisons the authoritative generation row before the ticket is
+     * published, so all participants observe one fatal decision instead of
+     * selecting divergent collective graphs.
+     *
+     * @param control Authoritative generation controller row.
+     * @param maintenance_due Optional device-owned MoE maintenance predicate.
+     *        Null means the graph has no maintenance transaction.
+     * @param ticket Admission-initialized persistent ticket destination.
+     * @return true when a structurally valid ticket snapshot was published.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_device_generation_dispatch_ticket(
+        int *control,
+        const uint32_t *maintenance_due,
+        DeviceGenerationDispatchTicket *ticket)
+    {
+        if (!control || !ticket || !ticket->hasValidABI())
+            return false;
+
+        const uint32_t due = maintenance_due ? *maintenance_due : 0u;
+        if (due > 1u)
+        {
+            fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidMaintenanceState);
+        }
+
+        ticket->healthy = control[kDeviceGenerationControlOk];
+        ticket->complete = control[kDeviceGenerationControlRequestComplete];
+        ticket->transaction_count =
+            control[kDeviceGenerationControlTransactionCount];
+        ticket->next_draft_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        ticket->error_code = control[kDeviceGenerationControlErrorCode];
+        ticket->maintenance_due = due <= 1u ? static_cast<int32_t>(due) : 0;
+        return true;
     }
 
     /**

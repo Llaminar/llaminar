@@ -183,6 +183,12 @@ namespace llaminar2
             orch_runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
     }
 
+    bool InferenceRunnerAdapter::waitForLastForwardCompletionForBenchmark()
+    {
+        return orch_runner_ &&
+               orch_runner_->waitForLastForwardCompletionForBenchmark();
+    }
+
     void InferenceRunnerAdapter::setSkipLogitsGatherDecode(bool skip)
     {
         orch_runner_->setSkipLogitsGatherDecode(skip);

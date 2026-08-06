@@ -373,6 +373,28 @@ namespace llaminar2
         // =====================================================================
 
         TensorContext buildTensorContext() const;
+        /**
+         * @brief Append graph-integrated shifted MTP KV prefill when declared.
+         *
+         * The main graph owns this transaction after its terminal logits are
+         * complete. One device stage packs shifted hidden/token/position rows
+         * and archives request terminals; a bucket-wide depth-zero MTP KV-only
+         * subgraph then consumes that payload. The returned node is therefore
+         * the terminal of the complete prefill transaction.
+         *
+         * @param graph Main forward graph receiving the transaction.
+         * @param input Typed forward input and immutable shifted-MTP binding.
+         * @param dependency_node Existing main-forward terminal node.
+         * @param device Participant device for every appended stage.
+         * @return New graph terminal, or @p dependency_node when no transaction
+         *         was declared.
+         * @throws std::runtime_error when a declared GPU transaction is partial.
+         */
+        std::string maybeAddShiftedMTPPrefillTransaction(
+            ComputeGraph &graph,
+            const ForwardInput &input,
+            const std::string &dependency_node,
+            DeviceId device);
         bool needsTPAllreduce() const;
         bool denseTPAllreduceEnabledForCurrentGraph() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;

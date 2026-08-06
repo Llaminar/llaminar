@@ -373,7 +373,15 @@ namespace llaminar2
     void PerfStatsCollector::resetPreservingDomains(
         const std::vector<std::string> &domains_to_preserve)
     {
-        if (domains_to_preserve.empty())
+        resetPreserving(domains_to_preserve, {});
+    }
+
+    void PerfStatsCollector::resetPreserving(
+        const std::vector<std::string> &domains_to_preserve,
+        const std::vector<RecordFamily> &record_families_to_preserve)
+    {
+        if (domains_to_preserve.empty() &&
+            record_families_to_preserve.empty())
         {
             reset();
             return;
@@ -383,10 +391,20 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(s.mutex);
         for (auto it = s.records.begin(); it != s.records.end();)
         {
-            const bool preserve =
+            const bool preserve_domain =
                 std::find(domains_to_preserve.begin(),
                           domains_to_preserve.end(),
                           it->first.domain) != domains_to_preserve.end();
+            const bool preserve_record_family =
+                std::any_of(
+                    record_families_to_preserve.begin(),
+                    record_families_to_preserve.end(),
+                    [&](const RecordFamily &family)
+                    {
+                        return family.domain == it->first.domain &&
+                               family.name == it->first.name;
+                    });
+            const bool preserve = preserve_domain || preserve_record_family;
             if (preserve)
                 ++it;
             else

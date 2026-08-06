@@ -2523,6 +2523,8 @@ namespace llaminar2
             return forward(tokens, seq_len, 1) != nullptr;
         }
 
+        bool waitForLastForwardCompletionForBenchmark() override;
+
         bool forwardPrefill(const int *tokens, int seq_len) override;
 
         bool supportsPrefillChunkSchedule(int seq_len) const override;
@@ -2549,10 +2551,9 @@ namespace llaminar2
             const SamplingParams &params,
             int logical_position) override;
         bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
-        bool sampleMainLogitsBatchRowsOnDevice(
+        bool publishMainLogitsBatchSamplesToDeviceResidentState(
             int request_count,
             const SamplingParams &params,
-            int32_t *out_tokens,
             const uint64_t *stochastic_position_seeds = nullptr) override;
 
         /**
@@ -2727,11 +2728,34 @@ namespace llaminar2
         bool beginDeviceResidentGeneration(
             int request_count,
             int max_new_tokens) override;
+
+        /**
+         * @brief Select native-parent or hosted-transaction MTP execution.
+         *
+         * The decision is made from the preallocated graph owner's live
+         * conditional-node capabilities. CUDA must provide the requested
+         * native topology. ROCm may use host-scheduled captured transactions
+         * until HIP exposes equivalent conditional graph nodes; it is selected
+         * before admission and is never entered after a native launch failure.
+         *
+         * @param topology Fixed-depth WHILE or dynamic SWITCH-in-WHILE shape.
+         * @return Explicit execution policy, or `Unsupported` for a fatal
+         *         incomplete backend/capture configuration.
+         */
+        DeviceGenerationExecutionPolicy deviceGenerationExecutionPolicy(
+            DeviceGenerationLoopTopology topology) const noexcept override;
         bool materializeDeviceResidentGeneration(
             int request_count,
             int draft_depth,
+            DeviceGenerationLoopTopology topology,
             DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
+        bool observeDeviceGenerationDispatchTicket(
+            sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+            override;
+        bool submitHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+            override;
         bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override;
 
@@ -2894,9 +2918,9 @@ namespace llaminar2
          * owns the backend event and exact stream stored in the handle.
          */
         /**
-         * @brief Legacy host bridge for a device-resident stochastic outcome.
+         * @brief Diagnostic-only host probe for a device-resident outcome.
          */
-        bool copyDeviceSpeculativeOutcomesToHost(
+        bool copyDeviceSpeculativeOutcomesToHostForDiagnostics(
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
         /**
@@ -3451,6 +3475,7 @@ namespace llaminar2
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
             clearAllPendingLogitsStreams(reset_reason);
+            clearCurrentMainLogitsPublication(reset_reason);
             std::fill(stochastic_target_distribution_streams_.begin(),
                       stochastic_target_distribution_streams_.end(),
                       nullptr);
@@ -3710,21 +3735,6 @@ namespace llaminar2
         */
         DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override;
 
-        /**
-         * @brief Rebind durable compact outcome rows after replay diagnostics.
-         *
-         * Prefix restore correctly clears the transient mailbox because its event
-         * and epoch describe the discarded timeline. The opt-in commit/replay
-         * diagnostic, however, restores the exact publication it started from.
-         * This method records a fresh event over the existing arena-owned rows so
-         * normal decode can resume without adopting any host-visible state.
-         *
-         * @param request_count Number of compact outcome rows being restored.
-         * @return true when a current-epoch resident mailbox was recorded.
-         */
-        bool rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-            int request_count) override;
-
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
@@ -3918,6 +3928,15 @@ namespace llaminar2
          * or pageable-stage these buffers on every MTP step.
          */
         struct PinnedHostScratch;
+
+        /**
+         * @brief Fixed pinned destination for the narrow HIP dispatch ticket.
+         *
+         * This allocation is distinct from compact-outcome and terminal-result
+         * scratch so the hosted graph scheduler cannot accidentally observe a
+         * broader inference payload while deciding which captured graph follows.
+         */
+        struct PinnedDispatchTicketScratch;
 
         /**
          * @brief Shared implementation for host-token and device-token forwards.
@@ -4251,6 +4270,25 @@ namespace llaminar2
             const char *reason);
 
         /**
+         * @brief Initialize the graph-stable terminal-hidden archive on device.
+         *
+         * The shifted-prefill stage reads and overwrites the same arena tensor
+         * across graph replays. Static graph contracts therefore require valid
+         * input bytes before the first capture even though a fresh request's
+         * device cache counters select the branch that does not consume the
+         * prior terminal row. This setup operation establishes byte validity;
+         * it deliberately does not mark the archive semantically current for a
+         * request.
+         *
+         * @param producer_stream Explicit setup stream carrying the zero-fill.
+         * @param reason Stable lifecycle reason used by fatal diagnostics.
+         * @return true after initialized device authority has been published.
+         */
+        bool initializeAndPublishMTPTerminalHiddenArchiveOnStream(
+            void *producer_stream,
+            const char *reason);
+
+        /**
          * @brief Initialize persistent target/draft sample banks before decode.
          *
          * The banks are range-published by independent sampler operations, but
@@ -4307,6 +4345,16 @@ namespace llaminar2
         bool publishDeviceGenerationArenaState(
             void *producer_stream,
             const char *producer);
+
+        /**
+         * @brief Enqueue the next ticket-only HIP scheduling observation.
+         *
+         * The retained publication graph, one D2H copy into persistent pinned
+         * storage, and one exact completion event are submitted in stream order.
+         * This method never waits and cannot access compact outcomes or mutable
+         * inference payloads.
+         */
+        bool enqueueDeviceGenerationDispatchTicketObservation();
 
         /**
          * @brief Clear the device-side "sample token is ready" marker for one draft slot.
@@ -5594,8 +5642,26 @@ namespace llaminar2
                                                 int position_offset,
                                                 const ForwardExecutionProvenance &producer,
                                                 const std::vector<int> *request_lengths = nullptr,
-                                                const std::vector<int> *position_ids = nullptr,
-                                                const void *position_ids_device = nullptr);
+                                                 const std::vector<int> *position_ids = nullptr,
+                                                 const void *position_ids_device = nullptr);
+
+        /**
+         * @brief Bind shifted MTP prefill into a main GPU forward graph.
+         *
+         * The binding contains only model-lifetime device addresses. Live token
+         * values, request geometry, and main/shifted KV progress remain in those
+         * allocations and are consumed by the captured graph at replay time.
+         * Consequently this method performs no transfer and creates no host
+         * shadow of request state.
+         *
+         * @param input Main-prefill input receiving the typed graph binding.
+         * @param request_count Number of independent request rows in the graph.
+         * @return true when the binding is either unnecessary or complete;
+         *         false when enabled GPU MTP lacks a required owner.
+         */
+        bool bindShiftedMTPPrefillTransaction(
+            ForwardInput &input,
+            int request_count);
 
         /**
          * @brief Record the hidden-state ownership produced by main forward.
@@ -5996,8 +6062,63 @@ namespace llaminar2
          *        forward engine. Its raw stream is consumed only during this call.
          * @return true after the persistent event was recorded successfully.
          */
-        bool publishForwardGraphOutputReady(
-            const ForwardExecutionProvenance &producer);
+        bool publishForwardGraphOutputReady(const ForwardOutput &output);
+
+        /**
+         * @brief Producer class for the authoritative current main-logits row(s).
+         *
+         * Forward graphs and prefix-terminal restores have different event
+         * timelines, but both can establish the bytes sampled by the next token
+         * transaction. The source remains typed so a consumer never treats a
+         * restored row as an unrecorded forward or vice versa.
+         */
+        enum class MainLogitsPublicationSource
+        {
+            None,
+            ForwardGraph,
+            PrefixTerminalRestore,
+        };
+
+        /**
+         * @brief Exact tensor authority for current main-model logits.
+         *
+         * This record contains no stream. Ordering remains owned by the durable
+         * forward event or live-prefix mutation event. Its sole responsibility
+         * is selecting the exact stable tensor written by that ordered producer.
+         */
+        struct MainLogitsPublicationState
+        {
+            TensorBase *tensor = nullptr;
+            ForwardLogitsPublicationDescriptor descriptor{};
+            MainLogitsPublicationSource source =
+                MainLogitsPublicationSource::None;
+            uint64_t session_epoch = 0;
+            bool valid = false;
+        };
+
+        /** Classify an owned tensor without inferring from graph role or M. */
+        [[nodiscard]] ForwardLogitsStorageSurface classifyForwardLogitsSurface(
+            const TensorBase *tensor) const noexcept;
+
+        /** Publish exact current-main tensor identity after its ordering edge. */
+        bool publishCurrentMainLogits(
+            TensorBase *tensor,
+            const ForwardLogitsPublicationDescriptor &descriptor,
+            MainLogitsPublicationSource source,
+            const char *producer_name);
+
+        /** Invalidate tensor identity at a request or restore boundary. */
+        void clearCurrentMainLogitsPublication(const char *reason) noexcept;
+
+        /** Resolve the exact published tensor for a semantic main consumer. */
+        [[nodiscard]] TensorBase *requireCurrentMainLogits(
+            DeviceLogitsSource source,
+            const char *consumer_name) const;
+
+        /** Resolve any sampling source while preserving main publication rules. */
+        [[nodiscard]] TensorBase *resolveDeviceLogitsTensor(
+            DeviceLogitsSource source,
+            const char *consumer_name) const;
 
         /** @brief Required semantic kind for a latest-forward consumer. */
         enum class ForwardGraphOutputKind
@@ -6428,13 +6549,12 @@ namespace llaminar2
         /**
          * @brief Persistent owner for one policy-complete device generation loop.
          *
-         * Fixed and observe policies own one immutable transaction body. Dynamic
-         * policy owns a native SWITCH-in-WHILE parent whose branch index is the
-         * resident controller's exact draft depth. Every branch is composed from
-         * strict child captures at one maximum-capacity verifier geometry, while
-         * the branch itself contains only the sidecar/publication prefix required
-         * by that depth. This gives the device controller sole depth authority
-         * without executing inactive draft rows.
+         * Fixed policy owns one immutable transaction body. Dynamic policy owns
+         * one complete retained branch per legal draft depth, selected from the
+         * resident controller's exact value. CUDA embeds those branches in a
+         * native SWITCH-in-WHILE parent. HIP captures an isolated ticket
+         * publisher and submits the selected retained branch on one explicit
+         * scheduler stream. Mutable generation state never leaves the device.
          *
          * The stream is allocated with runner workspace setup. The graph object
          * is retained across request boundaries and rebuilt from exact child
@@ -6444,10 +6564,31 @@ namespace llaminar2
          */
         struct MTPDeviceGenerationLoopGraphCache
         {
+            enum class ExecutionKind : uint8_t
+            {
+                Unmaterialized = 0,
+                NativeConditionalParent,
+                HostedDispatchTicketPublisher,
+            };
+
             std::shared_ptr<void> stream;
             std::unique_ptr<IGPUGraphCapture> capture;
             /** Exact child capture, policy, and predicate identities in the executable. */
             std::vector<DeviceControlledLoopFragment> source_fragments;
+            /** Flat source-fragment span owned by each legal draft depth. */
+            std::array<
+                size_t,
+                sampling_math::DeviceGenerationDepthPolicy::
+                        kMaximumSupportedDraftDepth +
+                    1>
+                branch_offsets{};
+            /** Number of source fragments in each legal draft-depth branch. */
+            std::array<
+                size_t,
+                sampling_math::DeviceGenerationDepthPolicy::
+                        kMaximumSupportedDraftDepth +
+                    1>
+                branch_fragment_counts{};
             uint64_t workspace_generation = 0;
             int request_count = 0;
             /** Maximum/capture draft width embedded in every verifier child. */
@@ -6463,6 +6604,7 @@ namespace llaminar2
             size_t fragment_count = 0;
             /** Number of fragments whose execution is selected by device state. */
             size_t conditional_fragment_count = 0;
+            ExecutionKind execution_kind = ExecutionKind::Unmaterialized;
             bool valid = false;
             bool launched = false;
 
@@ -6499,6 +6641,9 @@ namespace llaminar2
                 sampling_mode.reset();
                 fragment_count = 0;
                 conditional_fragment_count = 0;
+                branch_offsets.fill(0);
+                branch_fragment_counts.fill(0);
+                execution_kind = ExecutionKind::Unmaterialized;
                 valid = false;
                 launched = false;
                 source_fragments.clear();
@@ -6970,6 +7115,8 @@ namespace llaminar2
             int control_stride = 0;
             int32_t *response_tokens_device = nullptr;
             int *control_device = nullptr;
+            sampling_math::DeviceGenerationDispatchTicket
+                *dispatch_tickets_device = nullptr;
             int active_request_count = 0;
 
             bool bind(
@@ -6978,14 +7125,23 @@ namespace llaminar2
                 int response_stride,
                 void *control_base,
                 int control_rows,
-                int controller_stride)
+                int controller_stride,
+                void *dispatch_ticket_base,
+                int dispatch_ticket_rows,
+                int dispatch_ticket_words)
             {
                 clear();
-                if (!response_base || !control_base ||
+                constexpr int expected_dispatch_ticket_words =
+                    static_cast<int>(
+                        sizeof(sampling_math::DeviceGenerationDispatchTicket) /
+                        sizeof(int32_t));
+                if (!response_base || !control_base || !dispatch_ticket_base ||
                     response_rows <= 0 || response_rows != control_rows ||
+                    response_rows != dispatch_ticket_rows ||
                     response_stride <= 0 ||
                     controller_stride <
-                        sampling_math::kDeviceGenerationControlCount)
+                        sampling_math::kDeviceGenerationControlCount ||
+                    dispatch_ticket_words != expected_dispatch_ticket_words)
                 {
                     return false;
                 }
@@ -6995,6 +7151,10 @@ namespace llaminar2
                 response_tokens_device =
                     static_cast<int32_t *>(response_base);
                 control_device = static_cast<int *>(control_base);
+                dispatch_tickets_device =
+                    static_cast<
+                        sampling_math::DeviceGenerationDispatchTicket *>(
+                        dispatch_ticket_base);
                 return true;
             }
 
@@ -7006,7 +7166,8 @@ namespace llaminar2
                        response_token_stride > 0 &&
                        control_device != nullptr &&
                        control_stride >=
-                           sampling_math::kDeviceGenerationControlCount;
+                           sampling_math::kDeviceGenerationControlCount &&
+                       dispatch_tickets_device != nullptr;
             }
 
             int *controlForRequest(int request_index) const
@@ -7031,6 +7192,16 @@ namespace llaminar2
                            : nullptr;
             }
 
+            sampling_math::DeviceGenerationDispatchTicket *
+            dispatchTicketForRequest(int request_index) const
+            {
+                return request_index >= 0 &&
+                               request_index < request_capacity &&
+                               dispatch_tickets_device
+                           ? dispatch_tickets_device + request_index
+                           : nullptr;
+            }
+
             void clear()
             {
                 request_capacity = 0;
@@ -7038,6 +7209,7 @@ namespace llaminar2
                 control_stride = 0;
                 response_tokens_device = nullptr;
                 control_device = nullptr;
+                dispatch_tickets_device = nullptr;
                 active_request_count = 0;
             }
         };
@@ -7060,6 +7232,9 @@ namespace llaminar2
         void *mtp_verifier_request_lengths_dev_ = nullptr; ///< INT32 [stochastic_batch_output_request_capacity_], valid grouped-verifier width per request.
         void *request_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], immutable external request tokens after admission.
         void *request_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], absolute positions paired with request_token_ids_dev_.
+        void *mtp_shifted_prefill_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], graph-produced shifted condition tokens.
+        void *mtp_shifted_prefill_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], graph-produced shifted absolute positions.
+        void *mtp_shifted_prefill_append_lengths_dev_ = nullptr; ///< INT32 [request capacity], graph-produced shifted KV append widths.
         int request_input_row_capacity_ = 0; ///< Number of flattened token/position elements reserved in the arena.
         /**
          * @brief Immutable host source for graph-bucket padding admitted to the GPU.
@@ -7112,6 +7287,16 @@ namespace llaminar2
             mtp_first_transaction_diagnostic_dev_ = nullptr; ///< Optional transaction-zero evidence retained entirely on device until a fatal mirrored mismatch.
         std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
         std::unique_ptr<PinnedHostScratch> device_generation_terminal_host_scratch_;
+        std::unique_ptr<PinnedDispatchTicketScratch>
+            device_generation_dispatch_ticket_host_scratch_;
+        std::shared_ptr<void> device_generation_dispatch_ticket_ready_event_;
+        std::shared_ptr<void> device_generation_terminal_host_ready_event_;
+        std::optional<sampling_math::DeviceGenerationDispatchTicket>
+            last_device_generation_dispatch_ticket_;
+        bool device_generation_dispatch_ticket_copy_pending_ = false;
+        bool hosted_device_generation_scheduler_started_ = false;
+        bool hosted_device_generation_terminal_submitted_ = false;
+        int hosted_device_generation_last_transaction_count_ = 0;
 
         /**
          * @brief Device representation stored in a stochastic verifier row slot.
@@ -7390,6 +7575,10 @@ namespace llaminar2
                 ForwardExecutionRole::MainInference;
             bool is_decode = false;
             bool all_position_logits = false;
+            ForwardCompletionScope completion_scope =
+                ForwardCompletionScope::ModelForwardOnly;
+            int graph_seq_len = 0;
+            int graph_batch_size = 0;
         };
 
         /**
@@ -7443,6 +7632,7 @@ namespace llaminar2
         PendingRequestInputReuseReadyState
             request_input_reuse_ready_;
         ForwardGraphOutputReadyState forward_graph_output_ready_;
+        MainLogitsPublicationState current_main_logits_publication_;
         std::shared_ptr<void>
             device_resident_mtp_transaction_ready_event_;
         std::shared_ptr<void>
@@ -7753,7 +7943,6 @@ namespace llaminar2
         enum class DeviceResidentLogicalStatePublicationKind : uint8_t
         {
             RequestBatchConditionAdvance,
-            DiagnosticRestoreRebind,
             TargetSampleInitialization,
             AcceptedSpecState,
             MainBatchSampleInitialization,
@@ -8954,14 +9143,16 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
-         * @brief Assemble the configured stochastic policy into one native parent.
+         * @brief Assemble the configured sampling policy into its backend executable.
          *
          * Fixed/observe policy clones one producer-ordered transaction into a
-         * WHILE body. Dynamic policy clones one complete transaction per legal
-         * depth into a device-selected SWITCH-in-WHILE. Every fragment must
-         * already be replay-ready at @p draft_depth capture capacity and match
-         * the active request/workspace identity. This method composes and
-         * instantiates only; it never launches or reads controller state on host.
+         * branch. Dynamic policy clones one complete transaction per legal
+         * depth. CUDA composes native conditional nodes; HIP retains those
+         * branches and instantiates an isolated dispatch-ticket publisher.
+         * Every fragment must already be replay-ready at @p draft_depth capture
+         * capacity and match the active request/workspace identity. This method
+         * composes and instantiates only; it never launches generation or reads
+         * mutable controller state on the host.
          *
          * @param request_count Exact admitted controller row count.
          * @param draft_depth Fixed transaction depth, or maximum capture depth
@@ -8969,7 +9160,7 @@ namespace llaminar2
          * @param sampling_mode Exact compact-outcome topology retained by the
          *        verifier child and transaction tail.
          * @param error Optional first violated capture/composition invariant.
-         * @return true when one complete native parent is executable.
+         * @return true when the complete backend policy is executable.
          */
         bool materializeMTPDeviceGenerationLoopGraph(
             int request_count,

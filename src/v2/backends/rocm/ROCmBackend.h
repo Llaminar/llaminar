@@ -556,6 +556,23 @@ namespace llaminar2
             void *control_device,
             int device_id,
             void *stream) override;
+        bool enqueueInitializeDeviceGenerationDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            void *control_device,
+            int control_stride,
+            int request_count,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishDeviceGenerationDispatchTickets(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            const void *maintenance_due_device,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream) override;
         bool enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
             const void *runtime_layers_device,
             int layer_count,

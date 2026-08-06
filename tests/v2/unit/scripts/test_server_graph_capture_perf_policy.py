@@ -30,6 +30,7 @@ from llep_verifier_perf_policy import (  # noqa: E402
 )
 from mtp_device_generation_perf_policy import (  # noqa: E402
     validate_cuda_dynamic_mtp_device_generation_policy,
+    validate_rocm_host_scheduled_mtp_device_generation_policy,
 )
 from request_input_lifetime_perf_policy import (  # noqa: E402
     validate_request_input_lifetime_policy,
@@ -136,6 +137,75 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 "stochastic_request_batch_summary_d2h_sync",
             ),
         )
+
+    def test_gpu_host_transfer_policy_accepts_authenticated_rocm_dispatch_ticket(
+        self,
+    ) -> None:
+        """HIP may expose only its immutable graph-branch scheduler ticket."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                counter(
+                    "device_generation_dispatch_ticket_d2h_submissions",
+                    domain="mtp",
+                    device="ROCm:0",
+                    tags={
+                        "bytes": "48",
+                        "authority": "immutable_scheduler_snapshot",
+                        "state_payload": "false",
+                    },
+                )
+            ]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.scheduler_dispatch_operations,
+            ("device_generation_dispatch_ticket_d2h_submissions",),
+        )
+
+    def test_gpu_host_transfer_policy_rejects_noncanonical_dispatch_ticket(
+        self,
+    ) -> None:
+        """Backend, ABI size, and no-state authority tags are fail-closed."""
+
+        canonical_tags = {
+            "bytes": "48",
+            "authority": "immutable_scheduler_snapshot",
+            "state_payload": "false",
+        }
+        invalid_records = {
+            "cuda": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="CUDA:0",
+                tags=canonical_tags,
+            ),
+            "expanded_payload": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags | {"bytes": "64"},
+            ),
+            "state_payload": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags | {"state_payload": "true"},
+            ),
+            "mutable_authority": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags | {"authority": "mutable_host_shadow"},
+            ),
+        }
+        for case, record in invalid_records.items():
+            with self.subTest(case=case):
+                result = validate_gpu_host_transfer_policy([record])
+                self.assertIn(
+                    "device_generation_dispatch_ticket_d2h_submissions",
+                    result.error or "",
+                )
 
     def test_llep_verifier_policy_accepts_grouped_static_owner_execution(
         self,
@@ -253,7 +323,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     "authority": "device_generation_controller",
                     "accounting_role": "captured_graph_replay_multiplier",
                     "source": "captured_stochastic_compact_outcome",
-                    "execution": "native_device_generation_parent",
+                    "execution": "native_conditional_graph",
                 },
             ),
             counter(
@@ -307,6 +377,180 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             expected_maximum_depth=15,
         )
         self.assertIn("terminal depth ledger", result.error or "")
+
+    def test_rocm_dynamic_mtp_policy_accepts_authenticated_host_dispatch(
+        self,
+    ) -> None:
+        """HIP host scheduling exposes decisions while state stays on device."""
+
+        device = "ROCm:0"
+        records = [
+            counter(
+                "device_generation_loop_graph_materializations",
+                domain="mtp",
+                device=device,
+                tags={
+                    "backend": "HIP",
+                    "depth_policy": "dynamic",
+                    "execution":
+                        "hosted_captured_transactions_with_ticket_only_dispatch",
+                    "conditional_fragments": "0",
+                    "fragments": "12",
+                    "minimum_draft_depth": "3",
+                    "maximum_draft_depth": "3",
+                    "draft_depth": "3",
+                    "verifier_rows": "4",
+                    "physical_verifier_rows": "4",
+                    "sampling_mode": "stochastic",
+                },
+            ),
+            counter(
+                "device_generation_execution_policy_selections",
+                domain="mtp",
+                device=device,
+                tags={
+                    "policy": "host_scheduled_captured_transactions",
+                    "selection_boundary": "pre_first_draft",
+                    "topology": "dynamic_depth",
+                },
+            ),
+            counter(
+                "device_generation_loop_graph_launches",
+                domain="mtp",
+                device=device,
+                tags={
+                    "backend": "HIP",
+                    "execution": "hosted_ticket_selected_captured_transactions",
+                    "conditional_fragments": "0",
+                    "fragments": "12",
+                    "minimum_draft_depth": "3",
+                    "maximum_draft_depth": "3",
+                },
+            ),
+            counter(
+                "dynamic_device_generation_capacity_capture_transactions",
+                domain="mtp",
+                tags={
+                    "capture_depth": "3",
+                    "selected_depth": "3",
+                    "authority": "device_generation_controller",
+                },
+            ),
+            counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                value=3,
+                domain="mtp",
+                device=device,
+                tags={
+                    "bytes": "48",
+                    "authority": "immutable_scheduler_snapshot",
+                    "state_payload": "false",
+                },
+            ),
+            counter(
+                "device_generation_dispatch_tickets_observed",
+                value=3,
+                domain="mtp",
+                device=device,
+                tags={
+                    "transaction": "1",
+                    "next_depth": "3",
+                    "complete": "false",
+                    "maintenance_due": "false",
+                },
+            ),
+            counter(
+                "hosted_device_generation_transaction_submissions",
+                value=2,
+                domain="mtp",
+                device=device,
+                tags={
+                    "depth": "3",
+                    "dynamic_depth_source": "device_controller_ticket",
+                    "fragments": "12",
+                },
+            ),
+            counter(
+                "hosted_device_generation_terminal_submissions",
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_transactions",
+                value=3,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_attempted_draft_tokens",
+                value=9,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_verifier_tokens",
+                value=12,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_depth_evaluated_windows",
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_response_bridges",
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_compact_outcome_reductions",
+                value=3,
+                domain="mtp",
+                device=device,
+                tags={
+                    "authority": "device_generation_controller",
+                    "accounting_role": "captured_graph_replay_multiplier",
+                    "source": "captured_stochastic_compact_outcome",
+                    "execution": "host_scheduled_captured_transactions",
+                },
+            ),
+            counter(
+                "device_generation_terminal_consumed_verifier_rows",
+                value=7,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_accepted_speculative_tokens",
+                value=4,
+                domain="mtp",
+                device=device,
+            ),
+            counter(
+                "device_generation_terminal_rejected_transactions",
+                domain="mtp",
+                device=device,
+            ),
+        ]
+
+        result = validate_rocm_host_scheduled_mtp_device_generation_policy(
+            records,
+            expected_minimum_depth=3,
+            expected_maximum_depth=3,
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.devices, (device,))
+
+        records[4] = records[4] | {
+            "tags": (records[4].get("tags") or {}) | {"bytes": "64"}
+        }
+        result = validate_rocm_host_scheduled_mtp_device_generation_policy(
+            records,
+            expected_minimum_depth=3,
+            expected_maximum_depth=3,
+        )
+        self.assertIn("scheduler ticket boundary", result.error or "")
 
     def test_llep_verifier_policy_rejects_prefill_assignment_bleed(self) -> None:
         """Least-loaded current-batch assignment is never a verifier policy."""
@@ -790,12 +1034,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             'record.get("name") == "stochastic_accept_tests"',
             'get("device_resident") == "true"',
             '"stochastic_verify_request_batch_outcomes"',
-            '"FAIL: native stochastic MTP entered the retired request-batched "',
+            '"FAIL: stochastic GPU MTP entered the retired request-batched "',
             'get("sampling_mode") == "stochastic"',
-            '"stochastic_request_batch_summary_gpu_reducer"',
+            '"hosted_captured_transactions_with_ticket_only_dispatch"',
+            'validate_rocm_host_scheduled_mtp_device_generation_policy',
             '"device_generation_terminal_compact_outcome_reductions"',
             '"captured_stochastic_compact_outcome"',
-            'numeric(record.get("total_ns")) > 0.0',
             '"stochastic_serial_equivalent_host_verifier_rows"',
             '"depth_policy_windows"',
         ):
@@ -805,7 +1049,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             REPO_ROOT / "src/v2/execution/runner/OrchestrationRunner.cpp"
         ).read_text(encoding="utf-8")
         terminal_ledger_start = runner.index(
-            "GenerationResult OrchestrationRunner::completeNativeDeviceGenerationParent"
+            "GenerationResult OrchestrationRunner::completeDeviceResidentGeneration"
         )
         terminal_ledger_end = runner.index(
             "GenerationResult OrchestrationRunner::decodeStepMTP",
@@ -817,7 +1061,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             '"device_resident",',
             '"true"',
             '"grouped_decode_equivalent_stochastic"',
-            '"native_device_generation_parent_terminal_ledger"',
+            '"device_resident_generation_terminal_ledger"',
             '"stochastic_accept_tests"',
             "stochastic_tags",
         ):

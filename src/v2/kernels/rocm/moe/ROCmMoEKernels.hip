@@ -16681,8 +16681,28 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
                 runtime->banks[runtime->active_bank];
             const uint32_t local_bit =
                 runtime_participant_bit(local_participant);
-            const bool local_ready =
-                rocm_publish_runtime_expert_descriptors_lane(
+            const bool is_active = count > 0;
+
+            /*
+             * The compact plan's descriptor validity set is exactly its
+             * active-expert list. Route-owned kernels index descriptors only
+             * through validated active routes, while expert-row kernels walk
+             * active_expert_ids. Publishing locally resident but inactive
+             * experts therefore wrote three large descriptor records per lane
+             * that no consumer could observe. At verifier depth four this
+             * meant copying all 256 experts even though at most 32 routes can
+             * be active.
+             *
+             * Leave inactive slots outside the transaction instead of
+             * zero-filling or refreshing them. Every active slot is still
+             * published from the selected immutable bank and validated before
+             * the workgroup releases the plan, so a stale inactive descriptor
+             * cannot become reachable through a valid grouped transaction.
+             */
+            bool local_ready = true;
+            if (is_active)
+            {
+                local_ready = rocm_publish_runtime_expert_descriptors_lane(
                     bank,
                     local_bit,
                     tid,
@@ -16690,7 +16710,8 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
                     gate_descs,
                     up_descs,
                     down_descs);
-            if (count > 0)
+            }
+            if (is_active)
             {
                 if (active_rank < max_active_experts)
                     active_expert_ids[active_rank] = tid;

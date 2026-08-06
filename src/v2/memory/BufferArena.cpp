@@ -354,6 +354,8 @@ namespace llaminar2
         // GDN (Gated Delta Network) buffers
         if (name == "gdn_qkv")
             return BufferId::GDN_QKV;
+        if (name == "gdn_recurrence_in")
+            return BufferId::GDN_RECURRENCE_IN;
         if (name == "gdn_z")
             return BufferId::GDN_Z;
         if (name == "gdn_alpha")

@@ -272,6 +272,7 @@ namespace llaminar2
 
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
+        bool waitForLastForwardCompletionForBenchmark() override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
@@ -500,6 +501,21 @@ namespace llaminar2
          */
         bool admitScalarDeviceResidentGeneration(bool grouped_device_verify);
         /**
+         * @brief Admit one complete request-batched GPU generation ledger.
+         *
+         * The successful batched prefill boundary owns immutable prompt
+         * lengths and request seeds, but response progress is never mirrored on
+         * the host. This method resolves the common per-request response budget,
+         * initializes every persistent controller row on the participant
+         * stream, and closes the admission boundary before prefill logits are
+         * sampled into resident condition slots.
+         *
+         * @param request_count Exact number of live request rows.
+         * @return true only when every participant published its controller
+         *         initialization event for the complete request set.
+         */
+        bool admitRequestBatchDeviceResidentGeneration(int request_count);
+        /**
          * @brief Advance the scheduler position after one committed decode row.
          *
          * A normal decode forward consumes the previous response token and
@@ -552,13 +568,35 @@ namespace llaminar2
          * @param result Current decode result to complete with terminal tokens.
          * @return Completed result, or an error suitable for atomic rollback.
          */
-        GenerationResult completeNativeDeviceGenerationParent(
+        GenerationResult completeDeviceResidentGeneration(
             const DeviceSpeculativePublicationRequest &publication_request,
             DeviceGenerationSamplingMode sampling_mode,
             int transaction_base_cached_tokens,
             int requested_draft_depth,
             int capture_draft_depth,
             GenerationResult result);
+        /**
+         * @brief Complete a request batch from one native device-generation parent.
+         *
+         * Transaction zero has already committed its controller-owned compact
+         * outcome. This method materializes and launches the reusable parent,
+         * validates one terminal ledger row per admitted request, and performs
+         * the only response D2H boundary in the request lifetime. It never
+         * reconstructs a compact transaction or advances live state on the host.
+         *
+         * @param publication_request Controller-owned first transaction.
+         * @param sampling_mode Greedy or stochastic captured topology.
+         * @param requested_draft_depth First transaction's selected depth.
+         * @param capture_draft_depth Maximum child-family depth materialized.
+         * @param result Output object whose request rows receive terminal tokens.
+         * @return Complete terminal batch or a fatal lifecycle error.
+         */
+        GenerationBatchResult completeDeviceResidentBatchGeneration(
+            const DeviceSpeculativePublicationRequest &publication_request,
+            DeviceGenerationSamplingMode sampling_mode,
+            int requested_draft_depth,
+            int capture_draft_depth,
+            GenerationBatchResult result);
         /**
          * @brief Publish device MoE maintenance before launching a future MTP consumer.
          *
@@ -850,6 +888,18 @@ namespace llaminar2
          * has initialized and event-published its resident controller.
          */
         bool device_generation_admission_pending_{false};
+        /**
+         * @brief Exact response budget accepted by the resident GPU controller.
+         *
+         * `decode_step_token_budget_` is a caller-facing admission hint whose
+         * zero value means "use the remaining context capacity." Admission
+         * resolves that sentinel exactly once and records the resulting positive
+         * budget here. Terminal validation consumes this value so completion can
+         * never reinterpret a stale caller hint or guess the controller contract.
+         * The scalar is lifecycle metadata only; response progress and stop state
+         * remain exclusively device-owned between admission and terminal result.
+         */
+        std::optional<int> admitted_device_generation_token_budget_;
         /**
          * @brief Whether the terminal GPU ledger owns reported adaptive depth.
          *

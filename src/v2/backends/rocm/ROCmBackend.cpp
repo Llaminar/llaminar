@@ -1223,6 +1223,23 @@ namespace llaminar2
         int *control,
         int device_idx,
         void *stream);
+    extern "C" bool rocmOps_initialize_device_generation_dispatch_tickets(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        int *control,
+        int control_stride,
+        int request_count,
+        sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_publish_device_generation_dispatch_tickets(
+        int *control,
+        int control_stride,
+        int request_count,
+        const uint32_t *maintenance_due,
+        sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream);
     extern "C" bool
     hipMoE_publish_current_batch_llep_evidence_to_generation_control(
         const void *runtime_layers,
@@ -2767,6 +2784,66 @@ namespace llaminar2
             response_token_stride,
             control_stride,
             static_cast<int *>(control_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueInitializeDeviceGenerationDispatchTicket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        void *control_device,
+        int control_stride,
+        int request_count,
+        void *dispatch_tickets_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            session_epoch == 0 || workspace_generation == 0 ||
+            !control_device ||
+            control_stride < sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !dispatch_tickets_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_initialize_device_generation_dispatch_tickets(
+            session_epoch,
+            workspace_generation,
+            static_cast<int *>(control_device),
+            control_stride,
+            request_count,
+            static_cast<sampling_math::DeviceGenerationDispatchTicket *>(
+                dispatch_tickets_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueuePublishDeviceGenerationDispatchTickets(
+        void *control_device,
+        int control_stride,
+        int request_count,
+        const void *maintenance_due_device,
+        void *dispatch_tickets_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ || !control_device ||
+            control_stride < sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !dispatch_tickets_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_publish_device_generation_dispatch_tickets(
+            static_cast<int *>(control_device),
+            control_stride,
+            request_count,
+            static_cast<const uint32_t *>(maintenance_due_device),
+            static_cast<sampling_math::DeviceGenerationDispatchTicket *>(
+                dispatch_tickets_device),
             device_id,
             stream);
     }

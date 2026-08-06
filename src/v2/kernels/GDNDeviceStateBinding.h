@@ -30,11 +30,11 @@ namespace llaminar2
      */
     struct GDNDeviceStateBinding
     {
-        float *primary_state = nullptr;       ///< Cache-owned primary live state.
+        float *primary_state = nullptr;       ///< Cache-owned primary live state; may alias request zero.
         int primary_state_floats = 0;         ///< FP32 elements in primary_state.
         float *secondary_state = nullptr;     ///< Optional second LocalTP geometry.
         int secondary_state_floats = 0;       ///< FP32 elements in secondary_state.
-        float *request_state_bank = nullptr;  ///< Packed request-local live states.
+        float *request_state_bank = nullptr;  ///< Packed request-local live states and canonical request zero.
         size_t request_state_bank_floats = 0; ///< Complete request-bank capacity.
         int request_capacity = 0;             ///< Maximum independent requests.
 
@@ -67,6 +67,21 @@ namespace llaminar2
                 return false;
             if (has_secondary && secondary_state_floats == primary_state_floats)
                 return false;
+
+            /*
+             * A single state geometry has one owner: packed request slot zero.
+             * Distinct LocalTP geometries cannot alias the packed bank because
+             * request rows use the active geometry's stride; either alias would
+             * permit one geometry to overwrite bytes owned by the other.
+             */
+            if (!has_secondary && primary_state != request_state_bank)
+                return false;
+            if (has_secondary &&
+                (primary_state == request_state_bank ||
+                 secondary_state == request_state_bank))
+            {
+                return false;
+            }
 
             const size_t required_request_floats =
                 static_cast<size_t>(request_capacity) *

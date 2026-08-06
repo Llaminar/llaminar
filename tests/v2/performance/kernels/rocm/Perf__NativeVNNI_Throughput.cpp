@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <fstream>
 #include <iostream>
@@ -67,6 +68,7 @@
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -760,13 +762,14 @@ namespace
     };
 
     /**
-     * @brief Own one captured production launch and its executable graph.
+     * @brief Own one production-contract ROCm capture and output publication.
      *
-     * Capture invokes the same kernel object and stable device pointers used by
-     * eager execution.  No allocation, upload, or host callback is admitted to
-     * the graph.  Perfstats route telemetry is emitted by the production
-     * launcher while nodes are captured, then replay timing measures only
-     * ``hipGraphLaunch`` work on the explicit stream.
+     * A raw HIP stream capture is insufficient for a public tensor kernel:
+     * the kernel publishes each device write, but recording graph nodes has not
+     * executed those writes yet. Production capture therefore records tensor
+     * dependencies in a frozen ledger and publishes the output only after each
+     * replay. The trainer uses that same lifecycle so graph measurements prove
+     * an ordering contract that inference can execute unchanged.
      */
     class CapturedDecodeLaunch
     {
@@ -778,14 +781,73 @@ namespace
             reset();
         }
 
+        /**
+         * @brief Record one declared projection and freeze its executable graph.
+         *
+         * @param stream Exact non-default HIP stream used for capture/replay.
+         * @param device ROCm device that owns all declared tensors.
+         * @param inputs Stable graph-external inputs joined before capture.
+         * @param outputs Stable outputs published after every graph replay.
+         * @param launch Public production entrypoint that records device work.
+         * @return True only when capture and instantiation both succeed.
+         */
         template <typename Launch>
-        bool capture(hipStream_t stream, Launch &&launch)
+        bool capture(
+            hipStream_t stream,
+            DeviceId device,
+            const std::vector<const TensorBase *> &inputs,
+            const std::vector<TensorBase *> &outputs,
+            Launch &&launch)
         {
             reset();
+            if (!stream || !device.is_gpu() || outputs.empty())
+                return false;
+
+            std::vector<const TensorBase *> declared_outputs;
+            declared_outputs.reserve(outputs.size());
+            for (TensorBase *output : outputs)
+            {
+                if (!output)
+                    return false;
+                declared_outputs.push_back(output);
+            }
+
+            GraphCaptureDependencyLedger ledger(
+                device,
+                reinterpret_cast<void *>(stream),
+                {GraphCaptureDependencyLedger::StagePlan{
+                    .stage_identity = this,
+                    .stage_name = "ROCm NativeVNNI trainer projection",
+                    .external_inputs = inputs,
+                    .internal_inputs = {},
+                    .outputs = std::move(declared_outputs),
+                }},
+                "ROCm NativeVNNI trainer captured launch");
+
             if (hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal) != hipSuccess)
                 return false;
-            const bool launch_ok = launch();
+
+            bool launch_ok = false;
+            std::exception_ptr launch_error;
+            try
+            {
+                GraphCaptureGuard guard(&ledger);
+                ScopedGraphCaptureStage stage(this);
+                launch_ok = launch();
+                if (launch_ok)
+                    stage.complete();
+            }
+            catch (...)
+            {
+                launch_error = std::current_exception();
+            }
+
             const hipError_t end_status = hipStreamEndCapture(stream, &graph_);
+            if (launch_error)
+            {
+                reset();
+                std::rethrow_exception(launch_error);
+            }
             if (!launch_ok || end_status != hipSuccess || graph_ == nullptr)
             {
                 reset();
@@ -797,13 +859,32 @@ namespace
                 reset();
                 return false;
             }
+            device_ = device;
+            outputs_ = outputs;
             return true;
         }
 
+        /**
+         * @brief Replay and publish one completed graph generation in order.
+         *
+         * Publication records completion events after `hipGraphLaunch()` on
+         * this exact stream. It performs no synchronization or host transfer.
+         */
         bool launch(hipStream_t stream) const
         {
-            return executable_ != nullptr &&
-                   hipGraphLaunch(executable_, stream) == hipSuccess;
+            if (!stream || executable_ == nullptr || !device_.has_value() ||
+                hipGraphLaunch(executable_, stream) != hipSuccess)
+            {
+                return false;
+            }
+            for (TensorBase *output : outputs_)
+            {
+                TransferEngine::publishDeviceWrite(
+                    output,
+                    *device_,
+                    reinterpret_cast<void *>(stream));
+            }
+            return true;
         }
 
         void reset()
@@ -814,6 +895,8 @@ namespace
                 (void)hipGraphDestroy(graph_);
             executable_ = nullptr;
             graph_ = nullptr;
+            outputs_.clear();
+            device_.reset();
         }
 
         CapturedDecodeLaunch(const CapturedDecodeLaunch &) = delete;
@@ -822,6 +905,8 @@ namespace
     private:
         hipGraph_t graph_ = nullptr;
         hipGraphExec_t executable_ = nullptr;
+        std::vector<TensorBase *> outputs_;
+        std::optional<DeviceId> device_;
     };
 #endif
 
@@ -1960,14 +2045,21 @@ namespace
 
         auto output = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
-        if (!input->ensureOnDevice(DeviceId::rocm(device_id), stream) ||
-            !output->allocateOnDevice(DeviceId::rocm(device_id)))
+        const DeviceId device = DeviceId::rocm(device_id);
+        if (!input->ensureOnDevice(device, stream) ||
+            !output->allocateOnDevice(device))
         {
             kernel.unbindWorkspace();
             kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
             return fail("tensor_prepare");
         }
+        TransferEngine::requireDeviceInput(
+            input,
+            device,
+            reinterpret_cast<void *>(stream));
+        const std::vector<const TensorBase *> capture_inputs = {input};
+        const std::vector<TensorBase *> capture_outputs = {output.get()};
 
         const auto run_once = [&]() -> bool
         {
@@ -1981,13 +2073,33 @@ namespace
 
         PerfStatsCollector::reset();
         CapturedDecodeLaunch captured_launch;
-        if (execution_mode == DecodeExecutionMode::GraphCaptured &&
-            !captured_launch.capture(stream, run_once))
+        if (execution_mode == DecodeExecutionMode::GraphCaptured)
         {
-            kernel.unbindWorkspace();
-            kernel.clearGPUStreamBinding();
-            (void)hipStreamDestroy(stream);
-            return fail("graph_capture");
+            /*
+             * Resolve lazy preparation before capture, then clear its route
+             * evidence. The production graph itself contains only the stable
+             * projection and its frozen tensor-dependency contract.
+             */
+            if (!run_once() || hipStreamSynchronize(stream) != hipSuccess)
+            {
+                kernel.unbindWorkspace();
+                kernel.clearGPUStreamBinding();
+                (void)hipStreamDestroy(stream);
+                return fail("graph_primer");
+            }
+            PerfStatsCollector::reset();
+            if (!captured_launch.capture(
+                    stream,
+                    device,
+                    capture_inputs,
+                    capture_outputs,
+                    run_once))
+            {
+                kernel.unbindWorkspace();
+                kernel.clearGPUStreamBinding();
+                (void)hipStreamDestroy(stream);
+                return fail("graph_capture");
+            }
         }
         const auto execute_once = [&]() -> bool
         {

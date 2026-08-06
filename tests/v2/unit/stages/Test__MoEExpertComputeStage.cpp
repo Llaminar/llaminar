@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
@@ -2074,6 +2075,77 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
     EXPECT_GT(stage.estimatedFlops(), 0u);
+}
+
+/**
+ * @brief Prove routed-expert scratch follows later and family-wide row counts.
+ *
+ * A live server sequence first admitted 39 rows and then 68 rows.  After the
+ * router envelope was repaired, the expert stage exposed the same stale-first-
+ * request defect in `moe_staging_indices`.  This device-free regression checks
+ * both GPU backends and the full 4096-row family envelope so no individual MoE
+ * buffer can make request order part of the allocation contract again.
+ */
+TEST_F(
+    MoEExpertComputeStageTest,
+    GPUWorkspaceRowsCoverConcreteLaterRequestAndFamilyEnvelope)
+{
+    constexpr int kConcreteRows = 39;
+    constexpr int kLaterRequestRows = 68;
+    constexpr int kFamilyRows = 4096;
+    constexpr int kModelWidth = 2048;
+    constexpr int kIntermediate = 768;
+    constexpr int kExperts = 256;
+    constexpr int kTopK = 8;
+
+    const auto expectedStagingBytes = [](int rows)
+    {
+        return static_cast<size_t>(rows) * sizeof(int);
+    };
+
+    const auto verifyBackend = [&](DeviceId device)
+    {
+        MoEExpertComputeStage::Params params;
+        params.device_id = device;
+        params.seq_len = kConcreteRows;
+        params.d_model = kModelWidth;
+        params.expert_intermediate = kIntermediate;
+        params.num_experts = kExperts;
+        params.top_k = kTopK;
+
+        MoEExpertComputeStage stage(params);
+
+        const WorkspaceRequirements concrete =
+            stage.getWorkspaceRequirements(/*m=*/1);
+        const WorkspaceDescriptor *concrete_staging =
+            concrete.find(MoEWorkspaceBuffers::STAGING_INDICES);
+        ASSERT_NE(concrete_staging, nullptr);
+        EXPECT_EQ(
+            concrete_staging->size_bytes,
+            expectedStagingBytes(kConcreteRows));
+
+        const WorkspaceRequirements later =
+            stage.getWorkspaceRequirements(kLaterRequestRows);
+        const WorkspaceDescriptor *later_staging =
+            later.find(MoEWorkspaceBuffers::STAGING_INDICES);
+        ASSERT_NE(later_staging, nullptr);
+        EXPECT_EQ(
+            later_staging->size_bytes,
+            expectedStagingBytes(kLaterRequestRows));
+
+        const WorkspaceRequirements family =
+            stage.getWorkspaceRequirements(kFamilyRows);
+        const WorkspaceDescriptor *family_staging =
+            family.find(MoEWorkspaceBuffers::STAGING_INDICES);
+        ASSERT_NE(family_staging, nullptr);
+        EXPECT_EQ(
+            family_staging->size_bytes,
+            expectedStagingBytes(kFamilyRows));
+        EXPECT_GT(family_staging->size_bytes, later_staging->size_bytes);
+    };
+
+    verifyBackend(DeviceId::cuda(0));
+    verifyBackend(DeviceId::rocm(0));
 }
 
 TEST_F(MoEExpertComputeStageTest, DirectArrivalBindingUsesStageStream)

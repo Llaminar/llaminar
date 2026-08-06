@@ -283,7 +283,9 @@ namespace
                 static_cast<hipStream_t>(
                     opaque_stream);
             auto capture =
-                std::make_unique<HIPGraphCapture>(stream);
+                std::make_unique<HIPGraphCapture>(
+                    stream,
+                    /*device_ordinal=*/0);
             ScopedBackendGraphCapture capture_transaction(
                 *capture,
                 "ROCm grouped KV lifecycle graph");
@@ -358,7 +360,7 @@ namespace
             }
         }
 
-        HIPGraphCapture graph(stream);
+        HIPGraphCapture graph(stream, /*device_ordinal=*/0);
         ScopedBackendGraphCapture capture_transaction(
             graph,
             "ROCm grouped KV append");
@@ -441,7 +443,7 @@ namespace
         if (!stream)
             return false;
 
-        HIPGraphCapture graph(stream);
+        HIPGraphCapture graph(stream, /*device_ordinal=*/0);
         ScopedBackendGraphCapture capture_transaction(
             graph,
             "ROCm grouped KV converted read");

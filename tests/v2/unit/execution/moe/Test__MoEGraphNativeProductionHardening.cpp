@@ -4,6 +4,7 @@
  */
 
 #include "config/OrchestrationConfigParser.h"
+#include "execution/config/RoutedExpertPolicy.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 
@@ -17,6 +18,49 @@
 
 namespace llaminar2::test
 {
+    TEST(Test__MoEGraphNativeProductionHardening,
+         RouteAccumulationSelectsOnlySingleDeviceROCmGroupedVerifier)
+    {
+        using Workload = MoERouteAccumulationWorkload;
+        using Policy = MoERouteAccumulationPolicy;
+
+        EXPECT_EQ(
+            selectMoERouteAccumulationPolicy(
+                MoERouteAccumulationSelection{
+                    .backend = DeviceType::ROCm,
+                    .participant_count = 1,
+                    .workload = Workload::GroupedVerifier}),
+            Policy::IndependentRouteSlotsThenOrderedFold);
+
+        for (const DeviceType backend :
+             {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(static_cast<int>(backend));
+            EXPECT_EQ(
+                selectMoERouteAccumulationPolicy(
+                    MoERouteAccumulationSelection{
+                        .backend = backend,
+                        .participant_count = 1,
+                        .workload = Workload::Ordinary}),
+                Policy::DirectOrderedFold);
+            EXPECT_EQ(
+                selectMoERouteAccumulationPolicy(
+                    MoERouteAccumulationSelection{
+                        .backend = backend,
+                        .participant_count = 2,
+                        .workload = Workload::GroupedVerifier}),
+                Policy::DirectOrderedFold);
+        }
+
+        EXPECT_EQ(
+            selectMoERouteAccumulationPolicy(
+                MoERouteAccumulationSelection{
+                    .backend = DeviceType::CUDA,
+                    .participant_count = 1,
+                    .workload = Workload::GroupedVerifier}),
+            Policy::DirectOrderedFold);
+    }
+
     namespace
     {
 

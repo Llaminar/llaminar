@@ -723,6 +723,11 @@ namespace llaminar2
 
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
+        /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
+        bool bindRouterQ8HiddenPublication(
+            std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+            MoERouterQ8PublicationAccess access) override;
+
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
@@ -1161,10 +1166,13 @@ namespace llaminar2
         float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
         int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_rows_cap_, router_q8_hidden_d_model_cap_] device rows
         float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_rows_cap_, router_q8_hidden_blocks_cap_] device scales
-        const float *router_q8_hidden_source_ = nullptr; ///< FP32 row base that produced the published Q8 rows
-        int router_q8_hidden_rows_ = 0; ///< Number of contiguous valid rows in the publication
-        bool router_q8_hidden_valid_ = false; ///< True only after a Q8 router producer has been issued
-        bool router_q8_hidden_capture_recorded_ = false; ///< Producer exists only inside the current graph capture
+        /** Capture-time publication metadata; payload remains entirely on device. */
+        std::shared_ptr<MoERouterQ8HiddenPublication>
+            router_q8_hidden_publication_ =
+                std::make_shared<MoERouterQ8HiddenPublication>();
+        /** Typed authority prevents a sibling consumer from clearing producer state. */
+        MoERouterQ8PublicationAccess router_q8_publication_access_ =
+            MoERouterQ8PublicationAccess::ProducerAndConsumer;
         size_t route_logits_capacity_ = 0;
         size_t route_logits_partials_capacity_ = 0;
         int router_q8_hidden_rows_cap_ = 0;

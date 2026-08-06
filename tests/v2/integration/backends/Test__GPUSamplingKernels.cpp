@@ -17187,4 +17187,128 @@ namespace
         }
     }
 
+    /**
+     * @brief Prove the real captured dispatch-ticket publication on both GPUs.
+     *
+     * Admission initializes ticket identity on the fixture stream. Publication
+     * is then captured there but replayed on a second explicit scheduler stream
+     * after that stream changes controller/depth state. The observed ticket must
+     * reflect replay-time device bytes, proving that hosted HIP scheduling does
+     * not capture a host shadow or depend on the original capture stream.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered)
+    {
+        using namespace sampling_math;
+
+        constexpr uint64_t session_epoch = 0x123456789ABCDEF0ull;
+        constexpr uint64_t workspace_generation = 0x0FEDCBA987654321ull;
+        std::array<int, kDeviceGenerationControlCount> control{};
+        DeviceGenerationDepthPolicy policy;
+        policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+        policy.initial_depth = 2;
+        policy.minimum_depth = 1;
+        policy.maximum_depth =
+            DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth;
+        ASSERT_TRUE(policy.valid());
+        ASSERT_TRUE(initialize_device_generation_control(
+            /*max_new_tokens=*/64,
+            /*response_capacity=*/64,
+            policy,
+            control.data()));
+
+        void *const control_device = backend_->allocate(
+            sizeof(control),
+            device_id_);
+        void *const ticket_device = backend_->allocate(
+            sizeof(DeviceGenerationDispatchTicket),
+            device_id_);
+        void *const maintenance_due_device = backend_->allocate(
+            sizeof(uint32_t),
+            device_id_);
+        ASSERT_NE(control_device, nullptr);
+        ASSERT_NE(ticket_device, nullptr);
+        ASSERT_NE(maintenance_due_device, nullptr);
+
+        ASSERT_TRUE(copyHostToDevice(
+            control_device,
+            control.data(),
+            sizeof(control),
+            device_id_,
+            stream_));
+        ASSERT_TRUE(
+            backend_->enqueueInitializeDeviceGenerationDispatchTicket(
+                session_epoch,
+                workspace_generation,
+                control_device,
+                kDeviceGenerationControlCount,
+                /*request_count=*/1,
+                ticket_device,
+                device_id_,
+                stream_));
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+
+        const DeviceId device =
+            GetParam() == "CUDA" ? DeviceId::cuda(device_id_)
+                                 : DeviceId::rocm(device_id_);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        auto publication = context.createGraphCapture(stream_);
+        ASSERT_NE(publication, nullptr);
+        ASSERT_TRUE(publication->beginCapture());
+        ASSERT_TRUE(backend_->enqueuePublishDeviceGenerationDispatchTickets(
+            control_device,
+            kDeviceGenerationControlCount,
+            /*request_count=*/1,
+            maintenance_due_device,
+            ticket_device,
+            device_id_,
+            stream_));
+        ASSERT_TRUE(publication->endCapture());
+        ASSERT_TRUE(publication->instantiate());
+
+        control[kDeviceGenerationControlTransactionCount] = 9;
+        control[kDeviceGenerationControlCurrentDraftDepth] = 15;
+        control[kDeviceGenerationControlActiveVerifierRowCount] = 16;
+        const uint32_t maintenance_due = 1;
+        void *const scheduler_stream = backend_->createStream(device_id_);
+        ASSERT_NE(scheduler_stream, nullptr);
+        ASSERT_TRUE(copyHostToDevice(
+            control_device,
+            control.data(),
+            sizeof(control),
+            device_id_,
+            scheduler_stream));
+        ASSERT_TRUE(copyHostToDevice(
+            maintenance_due_device,
+            &maintenance_due,
+            sizeof(maintenance_due),
+            device_id_,
+            scheduler_stream));
+        ASSERT_TRUE(publication->launchOnStream(scheduler_stream));
+
+        DeviceGenerationDispatchTicket observed{};
+        ASSERT_TRUE(copyDeviceToHost(
+            &observed,
+            ticket_device,
+            sizeof(observed),
+            device_id_,
+            scheduler_stream));
+        EXPECT_TRUE(observed.matchesLifecycle(
+            session_epoch,
+            workspace_generation));
+        EXPECT_EQ(observed.transaction_count, 9);
+        EXPECT_EQ(observed.next_draft_depth, 15);
+        EXPECT_EQ(observed.maintenance_due, 1);
+        EXPECT_EQ(observed.healthy, 1);
+        EXPECT_EQ(
+            observed.error_code,
+            static_cast<int>(DeviceGenerationError::None));
+
+        backend_->destroyStream(scheduler_stream, device_id_);
+        backend_->free(maintenance_due_device, device_id_);
+        backend_->free(ticket_device, device_id_);
+        backend_->free(control_device, device_id_);
+    }
+
 } // anonymous namespace

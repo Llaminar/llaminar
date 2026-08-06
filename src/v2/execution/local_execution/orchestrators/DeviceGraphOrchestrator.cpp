@@ -3587,6 +3587,77 @@ namespace llaminar2
     };
 
     /**
+     * @brief Lifetime-owned pinned observer for HIP graph-dispatch tickets.
+     *
+     * The buffer is allocated once with graph workspace setup and is never used
+     * as a transfer source.  That one-way type and ownership boundary is
+     * intentional: host scheduling may observe a device decision, but it has no
+     * API with which to publish or reconstruct inference state.
+     */
+    struct DeviceGraphOrchestrator::PinnedDispatchTicketScratch
+    {
+        IBackend *backend = nullptr;
+        int device_id = -1;
+        int request_capacity = 0;
+        sampling_math::DeviceGenerationDispatchTicket *tickets = nullptr;
+
+        PinnedDispatchTicketScratch() = default;
+        PinnedDispatchTicketScratch(const PinnedDispatchTicketScratch &) =
+            delete;
+        PinnedDispatchTicketScratch &operator=(
+            const PinnedDispatchTicketScratch &) = delete;
+
+        ~PinnedDispatchTicketScratch()
+        {
+            release();
+        }
+
+        /** @brief Allocate one fixed ticket row per admitted request slot. */
+        bool allocate(
+            IBackend *owner_backend,
+            int owner_device_id,
+            int requests)
+        {
+            release();
+            if (!owner_backend || requests <= 0)
+                return false;
+
+            backend = owner_backend;
+            device_id = owner_device_id;
+            request_capacity = requests;
+            tickets = static_cast<
+                sampling_math::DeviceGenerationDispatchTicket *>(
+                backend->allocatePinned(
+                    sizeof(sampling_math::DeviceGenerationDispatchTicket) *
+                        static_cast<size_t>(requests),
+                    device_id));
+            if (!tickets)
+            {
+                release();
+                return false;
+            }
+            return true;
+        }
+
+        /** @brief Return whether this allocation can observe the request set. */
+        bool canServe(int requests) const noexcept
+        {
+            return tickets && requests > 0 && requests <= request_capacity;
+        }
+
+        /** @brief Release the pinned destination through its owning backend. */
+        void release()
+        {
+            if (backend && tickets)
+                backend->freePinned(tickets, device_id);
+            backend = nullptr;
+            device_id = -1;
+            request_capacity = 0;
+            tickets = nullptr;
+        }
+    };
+
+    /**
      * @brief Persistent pure-device buffers used to serialize prefix archives.
      *
      * The staging allocations deliberately bypass TensorBase storage because a
@@ -5100,8 +5171,16 @@ namespace llaminar2
         device_resident_logical_sequence_state_storage_.clear();
         device_generation_storage_.clear();
         device_generation_state_ready_ = {};
+        last_device_generation_dispatch_ticket_.reset();
+        device_generation_dispatch_ticket_copy_pending_ = false;
+        hosted_device_generation_scheduler_started_ = false;
+        hosted_device_generation_terminal_submitted_ = false;
+        hosted_device_generation_last_transaction_count_ = 0;
         request_token_ids_dev_ = nullptr;
         request_position_ids_dev_ = nullptr;
+        mtp_shifted_prefill_token_ids_dev_ = nullptr;
+        mtp_shifted_prefill_position_ids_dev_ = nullptr;
+        mtp_shifted_prefill_append_lengths_dev_ = nullptr;
         request_input_row_capacity_ = 0;
         request_padding_token_ids_host_.clear();
         request_batch_geometry_layout_ = {};
@@ -5330,12 +5409,28 @@ namespace llaminar2
                     {1,
                      state_.batch_size,
                      config.mtp.max_request_batch}));
+            const size_t terminal_hidden_row_capacity =
+                static_cast<size_t>(
+                    resolveMTPTerminalHiddenRowCapacity(
+                        state_.batch_size,
+                        config.mtp));
             request_batch_geometry_layout_ =
                 DeviceRequestBatchGeometryLayout(
                     static_cast<int>(request_length_capacity));
             if (!request_batch_geometry_layout_.valid())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to declare persistent request-batch geometry layout");
+                return false;
+            }
+            if (config.mtp.enabled &&
+                !arena_->registerBuffer(
+                    BufferId::PREFIX_TERMINAL_HIDDEN,
+                    terminal_hidden_row_capacity,
+                    static_cast<size_t>(config.d_model),
+                    "FP32",
+                    state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register the persistent GPU MTP terminal-hidden archive");
                 return false;
             }
             const size_t request_input_capacity =
@@ -5351,6 +5446,24 @@ namespace llaminar2
                                         request_input_capacity,
                                         "INT32",
                                         state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS,
+                    1,
+                    request_input_capacity,
+                    "INT32",
+                    state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS,
+                    1,
+                    request_input_capacity,
+                    "INT32",
+                    state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS,
+                    1,
+                    request_length_capacity,
+                    "INT32",
+                    state_.device_id) ||
                 !arena_->registerBuffer(BufferId::REQUEST_BATCH_GEOMETRY,
                                         1,
                                         request_batch_geometry_layout_.scalarCount(),
@@ -5372,6 +5485,13 @@ namespace llaminar2
                     BufferId::MTP_GENERATION_CONTROL,
                     request_length_capacity,
                     sampling_math::kDeviceGenerationControlCount,
+                    "INT32",
+                    state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_GENERATION_DISPATCH_TICKETS,
+                    request_length_capacity,
+                    sizeof(sampling_math::DeviceGenerationDispatchTicket) /
+                        sizeof(int32_t),
                     "INT32",
                     state_.device_id))
             {
@@ -5696,29 +5816,68 @@ namespace llaminar2
         logOrchestratorVramTrace(state_.device_id, "arena.after_allocate");
 
         /*
-         * Typed GPU MTP graphs bind their output addresses before graph
-         * construction starts. Reserve the maximum-row logits destination now,
-         * while allocation is still legal, so every grouped-verifier and live
-         * condition capture sees one stable address for the arena lifetime.
+         * Typed GPU MTP graphs bind every scratch address before graph
+         * construction starts. Materialize the complete schema-owned family
+         * while allocation is still legal so main prefill, grouped verifier,
+         * and live condition captures all retain stable arena addresses.
          *
-         * Allocation alone deliberately leaves the tensor UNINITIALIZED. The
-         * captured LM-head producer publishes device authority with its exact
-         * stream after writing; initialization must never pretend unwritten
-         * output bytes are coherent. MTP logits also remain device-local even
-         * when diagnostic snapshots request mapped memory elsewhere.
+         * Allocation alone deliberately leaves each tensor UNINITIALIZED. Its
+         * captured producer publishes device authority on the exact execution
+         * stream after writing; initialization must never claim that unwritten
+         * scratch bytes are coherent. Optional topology-specific members are
+         * absent from the schema and therefore intentionally skipped here.
          */
         if (state_.device_id.is_gpu() &&
             graph_builder_->config().mtp.enabled)
         {
+            constexpr std::array<BufferId, 22> kMTPGraphTensorFamily{
+                BufferId::MTP_EMBEDDING,
+                BufferId::MTP_NORM_HIDDEN,
+                BufferId::MTP_NORM_EMBEDDING,
+                BufferId::MTP_CONCAT,
+                BufferId::MTP_PROJECTED,
+                BufferId::MTP_HIDDEN,
+                BufferId::MTP_Q_PROJ,
+                BufferId::MTP_K_PROJ,
+                BufferId::MTP_V_PROJ,
+                BufferId::MTP_K_FULL_PREFILL,
+                BufferId::MTP_V_FULL_PREFILL,
+                BufferId::MTP_FA_Q_RAW,
+                BufferId::MTP_FA_GATE,
+                BufferId::MTP_Q_ROPE,
+                BufferId::MTP_K_ROPE,
+                BufferId::MTP_ATTN_OUTPUT,
+                BufferId::MTP_ATTN_PROJ,
+                BufferId::MTP_GATE_PROJ,
+                BufferId::MTP_UP_PROJ,
+                BufferId::MTP_FFN_OUTPUT,
+                BufferId::MTP_LOGITS,
+                BufferId::MTP_LOGITS_GATHERED,
+            };
+            for (const BufferId id : kMTPGraphTensorFamily)
+            {
+                if (!arena_->isRegistered(id))
+                    continue;
+                arena_->allocateDeviceStorage(id, state_.device_id);
+                const auto tensor = arena_->getSharedTensor(id);
+                const auto tensor_device =
+                    tensor ? tensor->current_device()
+                           : std::optional<DeviceId>{};
+                if (!tensor || tensor->isMapped() ||
+                    !tensor->gpu_data_ptr() ||
+                    !tensor_device.has_value() ||
+                    *tensor_device != state_.device_id)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to reserve device-local MTP graph tensor storage for "
+                              << bufferIdName(id));
+                    return false;
+                }
+            }
             if (!arena_->isRegistered(BufferId::MTP_LOGITS))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP requires a schema-owned MTP_LOGITS capacity");
                 return false;
             }
-
-            arena_->allocateDeviceStorage(
-                BufferId::MTP_LOGITS,
-                state_.device_id);
             const auto mtp_logits =
                 arena_->getSharedTensor(BufferId::MTP_LOGITS);
             const auto logits_device =
@@ -5733,6 +5892,45 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to reserve device-local MTP logits output storage");
                 return false;
             }
+
+            /*
+             * Terminal hidden rows participate in both the main-prefill graph
+             * and every later MTP transaction. Their address is therefore part
+             * of graph identity, not a sidecar scratch detail. Resolve the
+             * schema-sized arena owner before any graph can be constructed and
+             * retain that one owner for the complete orchestrator lifetime.
+             */
+            if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP requires an arena-owned terminal-hidden archive");
+                return false;
+            }
+            arena_->allocateDeviceStorage(
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                state_.device_id);
+            state_.prefix_terminal_hidden =
+                arena_->getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN);
+            const auto terminal_hidden_device =
+                state_.prefix_terminal_hidden
+                    ? state_.prefix_terminal_hidden->current_device()
+                    : std::optional<DeviceId>{};
+            if (!state_.prefix_terminal_hidden ||
+                state_.prefix_terminal_hidden->isMapped() ||
+                !state_.prefix_terminal_hidden->gpu_data_ptr() ||
+                !terminal_hidden_device.has_value() ||
+                *terminal_hidden_device != state_.device_id ||
+                state_.prefix_terminal_hidden->rows() <
+                    static_cast<size_t>(
+                        resolveMTPTerminalHiddenRowCapacity(
+                            state_.batch_size,
+                            graph_builder_->config().mtp)) ||
+                state_.prefix_terminal_hidden->cols() <
+                    static_cast<size_t>(state_.d_model))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve the persistent device-local MTP terminal-hidden archive");
+                return false;
+            }
+            state_.mtp_terminal_hidden_current = false;
         }
 
         /*
@@ -5752,6 +5950,15 @@ namespace llaminar2
                 BufferId::REQUEST_POSITION_IDS,
                 state_.device_id);
             arena_->allocateDeviceStorage(
+                BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
                 BufferId::REQUEST_BATCH_GEOMETRY,
                 state_.device_id);
             request_token_ids_dev_ = arena_->getDevicePtr(
@@ -5759,6 +5966,15 @@ namespace llaminar2
                 state_.device_id);
             request_position_ids_dev_ = arena_->getDevicePtr(
                 BufferId::REQUEST_POSITION_IDS,
+                state_.device_id);
+            mtp_shifted_prefill_token_ids_dev_ = arena_->getDevicePtr(
+                BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS,
+                state_.device_id);
+            mtp_shifted_prefill_position_ids_dev_ = arena_->getDevicePtr(
+                BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS,
+                state_.device_id);
+            mtp_shifted_prefill_append_lengths_dev_ = arena_->getDevicePtr(
+                BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS,
                 state_.device_id);
             request_input_row_capacity_ = static_cast<int>(
                 arena_->getCols(BufferId::REQUEST_TOKEN_IDS));
@@ -5782,11 +5998,20 @@ namespace llaminar2
                 0);
             if (!request_token_ids_dev_ ||
                 !request_position_ids_dev_ ||
+                !mtp_shifted_prefill_token_ids_dev_ ||
+                !mtp_shifted_prefill_position_ids_dev_ ||
+                !mtp_shifted_prefill_append_lengths_dev_ ||
                 request_input_row_capacity_ <= 0 ||
                 request_padding_token_ids_host_.size() !=
                     static_cast<size_t>(request_input_row_capacity_) ||
                 arena_->getCols(BufferId::REQUEST_POSITION_IDS) !=
                     static_cast<size_t>(request_input_row_capacity_) ||
+                arena_->getCols(BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS) !=
+                    static_cast<size_t>(request_input_row_capacity_) ||
+                arena_->getCols(BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS) !=
+                    static_cast<size_t>(request_input_row_capacity_) ||
+                arena_->getCols(BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS) !=
+                    static_cast<size_t>(request_sequence_lengths_capacity_) ||
                 !request_batch_geometry_dev_ ||
                 !request_sequence_lengths_dev_ ||
                 !request_row_stride_dev_ ||
@@ -5877,13 +6102,18 @@ namespace llaminar2
         }
         if (state_.device_id.is_gpu() &&
             arena_->isRegistered(BufferId::MTP_GENERATION_RESPONSE_TOKENS) &&
-            arena_->isRegistered(BufferId::MTP_GENERATION_CONTROL))
+            arena_->isRegistered(BufferId::MTP_GENERATION_CONTROL) &&
+            arena_->isRegistered(
+                BufferId::MTP_GENERATION_DISPATCH_TICKETS))
         {
             arena_->allocateDeviceStorage(
                 BufferId::MTP_GENERATION_RESPONSE_TOKENS,
                 state_.device_id);
             arena_->allocateDeviceStorage(
                 BufferId::MTP_GENERATION_CONTROL,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_GENERATION_DISPATCH_TICKETS,
                 state_.device_id);
             if (!device_generation_storage_.bind(
                     arena_->getDevicePtr(
@@ -5899,9 +6129,16 @@ namespace llaminar2
                     static_cast<int>(arena_->getRows(
                         BufferId::MTP_GENERATION_CONTROL)),
                     static_cast<int>(arena_->getCols(
-                        BufferId::MTP_GENERATION_CONTROL))))
+                        BufferId::MTP_GENERATION_CONTROL)),
+                    arena_->getDevicePtr(
+                        BufferId::MTP_GENERATION_DISPATCH_TICKETS,
+                        state_.device_id),
+                    static_cast<int>(arena_->getRows(
+                        BufferId::MTP_GENERATION_DISPATCH_TICKETS)),
+                    static_cast<int>(arena_->getCols(
+                        BufferId::MTP_GENERATION_DISPATCH_TICKETS))))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind persistent device generation response/controller rows");
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind persistent device generation response/controller/ticket rows");
                 return false;
             }
         }
@@ -6187,6 +6424,58 @@ namespace llaminar2
             device_generation_terminal_host_scratch_ =
                 std::move(terminal_scratch);
 
+            auto dispatch_ticket_scratch =
+                std::make_unique<PinnedDispatchTicketScratch>();
+            if (!dispatch_ticket_scratch->allocate(
+                    backend,
+                    state_.device_id.gpu_ordinal(),
+                    device_generation_storage_.request_capacity))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate the pinned device-generation dispatch-ticket observer on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            device_generation_dispatch_ticket_host_scratch_ =
+                std::move(dispatch_ticket_scratch);
+
+            void *const raw_dispatch_ticket_event =
+                backend->createEvent(state_.device_id.gpu_ordinal());
+            if (!raw_dispatch_ticket_event)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate the device-generation dispatch-ticket event on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            const int dispatch_ticket_device_ordinal =
+                state_.device_id.gpu_ordinal();
+            device_generation_dispatch_ticket_ready_event_.reset(
+                raw_dispatch_ticket_event,
+                [backend, dispatch_ticket_device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(
+                            event,
+                            dispatch_ticket_device_ordinal);
+                });
+
+            void *const raw_terminal_host_event =
+                backend->createEvent(state_.device_id.gpu_ordinal());
+            if (!raw_terminal_host_event)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate the terminal device-generation host event on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            device_generation_terminal_host_ready_event_.reset(
+                raw_terminal_host_event,
+                [backend, dispatch_ticket_device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(
+                            event,
+                            dispatch_ticket_device_ordinal);
+                });
+
             void *raw_response_stream =
                 backend->createStream(state_.device_id.gpu_ordinal());
             if (!raw_response_stream)
@@ -6266,6 +6555,9 @@ namespace llaminar2
         {
             stochastic_batch_output_host_scratch_.reset();
             device_generation_terminal_host_scratch_.reset();
+            device_generation_dispatch_ticket_host_scratch_.reset();
+            device_generation_dispatch_ticket_ready_event_.reset();
+            device_generation_terminal_host_ready_event_.reset();
             stochastic_outcome_response_bridge_stream_.reset();
             mtp_device_generation_loop_graph_.release();
         }
@@ -6445,7 +6737,8 @@ namespace llaminar2
          * inferring ownership from that dormant allocation.
          *
          * The compact-row count remains positive from successful prefill until
-         * `sampleMainLogitsBatchRowsOnDevice()` consumes the rows, so it is the
+         * `publishMainLogitsBatchSamplesToDeviceResidentState()` consumes the
+         * rows, so it is the
          * transaction-lifetime proof that the full-vocabulary result is active.
          */
         if (request_batched_prefill_logits_row_count_ > 0 &&
@@ -6730,7 +7023,7 @@ namespace llaminar2
             greedy_verifier_outcome_graph_transaction_.state =
                 GreedyVerifierOutcomeGraphState::Produced;
         }
-        if (!publishForwardGraphOutputReady(output.execution))
+        if (!publishForwardGraphOutputReady(output))
         {
             throw std::runtime_error(
                 "Successful GPU forward could not publish its durable "
@@ -10569,6 +10862,7 @@ namespace llaminar2
 
         // Reset input-dependent cached state on all kernels
         resetKernelDynamicState();
+        clearCurrentMainLogitsPublication("invalidate_execution_caches");
         ++session_epoch_;
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Execution caches invalidated");
@@ -10964,7 +11258,10 @@ namespace llaminar2
             void *const initialization_stream =
                 explicitGPUStreamForOperation(
                     "initialize_mtp_persistent_state");
-            if (!zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+            if (!initializeAndPublishMTPTerminalHiddenArchiveOnStream(
+                    initialization_stream,
+                    "initial_inference_state") ||
+                !zeroAndPublishMTPGeneratedTokenHistoryOnStream(
                     initialization_stream,
                     "initial_inference_state") ||
                 !initializeAndPublishDeviceGenerationStorageOnStream(
@@ -12748,6 +13045,12 @@ namespace llaminar2
             input.sequence_lengths_device = nullptr;
         }
 
+        if (!bindShiftedMTPPrefillTransaction(input, batch_size))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Main forward could not bind its graph-integrated shifted MTP prefill transaction");
+            return nullptr;
+        }
+
         // Build forward output
         ForwardOutput output;
         output.logits = logits_output;
@@ -12849,18 +13152,38 @@ namespace llaminar2
             }
         }
 
-        if (new_phase == InferencePhase::PREFILL &&
-            execution_role == ForwardExecutionRole::MainInference &&
-            !populateMTPShiftedCacheFromPrefill(
-                tokens,
-                effective_token_ids_device,
-                seq_len,
-                batch_size,
-                input.position_offset,
-                output.execution,
-                &last_forward_request_lengths,
-                &position_ids,
-                effective_position_ids_device))
+        const bool main_prefill =
+            new_phase == InferencePhase::PREFILL &&
+            execution_role == ForwardExecutionRole::MainInference;
+        if (main_prefill && state_.device_id.is_gpu() && graph_builder_ &&
+            graph_builder_->config().mtp.enabled)
+        {
+            if (!input.shifted_mtp_prefill.has_value())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Enabled GPU MTP prefill completed without its graph-integrated shifted-KV transaction");
+                return nullptr;
+            }
+            state_.mtp_terminal_hidden_current = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "shifted_prefill_integrated_graph_transactions",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"requests", std::to_string(batch_size)},
+                 {"bucket_rows", std::to_string(seq_len)}});
+        }
+        else if (main_prefill &&
+                 !populateMTPShiftedCacheFromPrefill(
+                     tokens,
+                     effective_token_ids_device,
+                     seq_len,
+                     batch_size,
+                     input.position_offset,
+                     output.execution,
+                     &last_forward_request_lengths,
+                     &position_ids,
+                     effective_position_ids_device))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to populate MTP shifted prefill cache");
             return nullptr;
@@ -12880,8 +13203,7 @@ namespace llaminar2
             seq_len,
             batch_size,
             std::move(last_forward_request_lengths),
-            batch_size == 1 &&
-                graph_builder_ &&
+            graph_builder_ &&
                 graph_builder_->config().mtp.enabled &&
                 state_.mtp_terminal_hidden_current);
 
@@ -13094,6 +13416,43 @@ namespace llaminar2
             return false;
         }
         const int required_rows = std::max(1, min_rows);
+
+        if (state_.device_id.is_gpu())
+        {
+            /*
+             * GPU graph construction may only observe the immutable arena
+             * owner installed during initializeBuffers(). Allocating, resizing,
+             * or rebinding here would change an embedded graph pointer and make
+             * the first request materially different from every replay.
+             */
+            const auto arena_owner =
+                arena_ && arena_->isRegistered(
+                              BufferId::PREFIX_TERMINAL_HIDDEN)
+                    ? arena_->getSharedTensor(
+                          BufferId::PREFIX_TERMINAL_HIDDEN)
+                    : std::shared_ptr<TensorBase>{};
+            const auto archive_device =
+                state_.prefix_terminal_hidden
+                    ? state_.prefix_terminal_hidden->current_device()
+                    : std::optional<DeviceId>{};
+            if (!arena_owner ||
+                state_.prefix_terminal_hidden != arena_owner ||
+                state_.prefix_terminal_hidden->rows() <
+                    static_cast<size_t>(required_rows) ||
+                state_.prefix_terminal_hidden->cols() <
+                    static_cast<size_t>(state_.d_model) ||
+                state_.prefix_terminal_hidden->isMapped() ||
+                !state_.prefix_terminal_hidden->gpu_data_ptr() ||
+                !archive_device.has_value() ||
+                *archive_device != state_.device_id)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP terminal-hidden archive was not installed as a capacity-complete arena owner before graph construction"
+                          << " required_rows=" << required_rows
+                          << " d_model=" << state_.d_model);
+                return false;
+            }
+            return true;
+        }
 
         auto register_with_arena = [&]() -> bool
         {
@@ -13400,7 +13759,7 @@ namespace llaminar2
             if (graph_builder_->config()
                     .mtp_shifted_prefill_hidden_publication !=
                 MTPShiftedPrefillHiddenPublicationPolicy::
-                    GraphCapturedDeviceKVProgress)
+                    GraphIntegratedKVTransaction)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] GPU shifted-prefill publication requires an explicit graph-declared device-KV-progress policy");
                 return false;
@@ -14612,7 +14971,7 @@ namespace llaminar2
             graph_builder_->config()
                     .mtp_shifted_prefill_hidden_publication !=
                 MTPShiftedPrefillHiddenPublicationPolicy::
-                    GraphCapturedDeviceKVProgress)
+                    GraphIntegratedKVTransaction)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Shifted-prefill progress selection reached execution without its graph-declared GPU policy");
             return false;
@@ -16241,6 +16600,23 @@ namespace llaminar2
                 : 0;
         const bool include_device_moe_maintenance =
             usesDeviceSideMoERebalanceController();
+        const DeviceGenerationLoopTopology loop_topology =
+            dynamic_depth ? DeviceGenerationLoopTopology::DynamicDepth
+                          : DeviceGenerationLoopTopology::FixedDepth;
+        const DeviceGenerationExecutionPolicy execution_policy =
+            deviceGenerationExecutionPolicy(loop_topology);
+        const auto desired_execution_kind =
+            execution_policy ==
+                    DeviceGenerationExecutionPolicy::NativeConditionalGraph
+                ? MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                      NativeConditionalParent
+                : execution_policy ==
+                          DeviceGenerationExecutionPolicy::
+                              HostScheduledCapturedTransactions
+                      ? MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                            HostedDispatchTicketPublisher
+                      : MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                            Unmaterialized;
         const auto fragment_count_for_depth =
             [include_device_moe_maintenance,
              sampling_mode](int depth) -> size_t
@@ -16282,9 +16658,20 @@ namespace llaminar2
             return fail(
                 "device-generation parent graph has no exact preallocated stream/capture owner");
         }
-        if (!loop.capture->supportsDeviceControlledWhileLoop() ||
-            (dynamic_depth &&
-             !loop.capture->supportsDeviceControlledSwitchWhileLoop()))
+        if (execution_policy ==
+                DeviceGenerationExecutionPolicy::Unsupported ||
+            desired_execution_kind ==
+                MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                    Unmaterialized)
+        {
+            return fail(
+                "device-generation graph has no complete execution policy for its backend and depth topology");
+        }
+        if (execution_policy ==
+                DeviceGenerationExecutionPolicy::NativeConditionalGraph &&
+            (!loop.capture->supportsDeviceControlledWhileLoop() ||
+             (dynamic_depth &&
+              !loop.capture->supportsDeviceControlledSwitchWhileLoop())))
         {
             return fail(
                 dynamic_depth
@@ -16320,6 +16707,7 @@ namespace llaminar2
                    DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth + 1>
             branch_fragment_counts{};
         int assembling_depth = 0;
+        const uint32_t *maintenance_due_device = nullptr;
         auto append = [&](const char *fragment_name,
                           const auto &view,
                           const std::string &fragment_error,
@@ -16513,7 +16901,7 @@ namespace llaminar2
                     return fail(
                         "device-generation parent graph has no current device MoE maintenance owner");
                 }
-                const auto *const maintenance_due_device =
+                maintenance_due_device =
                     reinterpret_cast<const uint32_t *>(
                         reinterpret_cast<const std::byte *>(controller) +
                         offsetof(
@@ -16625,6 +17013,7 @@ namespace llaminar2
             loop.sampling_mode == sampling_mode &&
             loop.fragment_count == expected_fragment_count &&
             loop.conditional_fragment_count == conditional_fragment_count &&
+            loop.execution_kind == desired_execution_kind &&
             source_identity_matches)
         {
             PerfStatsCollector::addCounter(
@@ -16644,6 +17033,8 @@ namespace llaminar2
                   dynamic_depth ? "dynamic" : "fixed_width"},
                  {"sampling_mode",
                   deviceGenerationSamplingModeName(sampling_mode)},
+                 {"execution_policy",
+                  deviceGenerationExecutionPolicyName(execution_policy)},
                  {"fragments", std::to_string(expected_fragment_count)},
                  {"conditional_fragments",
                   std::to_string(conditional_fragment_count)},
@@ -16682,45 +17073,90 @@ namespace llaminar2
                 }
             }
         }
-        const DeviceControlledLoopPredicate predicate{
-            .control_rows_device = device_generation_storage_.control_device,
-            .control_stride = device_generation_storage_.control_stride,
-            .request_count = request_count,
-            .healthy_index = kDeviceGenerationControlOk,
-            .complete_index = kDeviceGenerationControlRequestComplete,
-        };
-        const bool built =
-            dynamic_depth
-                ? loop.capture->buildDeviceControlledSwitchWhileLoop(
-                      mtp_device_generation_loop_branch_scratch_,
-                      predicate,
-                      DeviceControlledLoopSwitch{
-                          .control_rows_device =
-                              device_generation_storage_.control_device,
-                          .control_stride =
-                              device_generation_storage_.control_stride,
-                          .request_count = request_count,
-                          .healthy_index = kDeviceGenerationControlOk,
-                          .complete_index =
-                              kDeviceGenerationControlRequestComplete,
-                          .selector_index =
-                              kDeviceGenerationControlCurrentDraftDepth,
-                          .error_index =
-                              kDeviceGenerationControlErrorCode,
-                          .minimum_selector = minimum_draft_depth,
-                          .maximum_selector = maximum_draft_depth,
-                          .invalid_selector_error = static_cast<int>(
-                              DeviceGenerationError::InvalidDepthSelector),
-                      })
-                : loop.capture->buildDeviceControlledWhileLoop(
-                      mtp_device_generation_loop_fragment_scratch_,
-                      predicate);
-        if (!built ||
-            !loop.capture->instantiate() ||
+        bool built = false;
+        if (execution_policy ==
+            DeviceGenerationExecutionPolicy::NativeConditionalGraph)
+        {
+            const DeviceControlledLoopPredicate predicate{
+                .control_rows_device =
+                    device_generation_storage_.control_device,
+                .control_stride = device_generation_storage_.control_stride,
+                .request_count = request_count,
+                .healthy_index = kDeviceGenerationControlOk,
+                .complete_index =
+                    kDeviceGenerationControlRequestComplete,
+            };
+            built =
+                dynamic_depth
+                    ? loop.capture->buildDeviceControlledSwitchWhileLoop(
+                          mtp_device_generation_loop_branch_scratch_,
+                          predicate,
+                          DeviceControlledLoopSwitch{
+                              .control_rows_device =
+                                  device_generation_storage_.control_device,
+                              .control_stride =
+                                  device_generation_storage_.control_stride,
+                              .request_count = request_count,
+                              .healthy_index = kDeviceGenerationControlOk,
+                              .complete_index =
+                                  kDeviceGenerationControlRequestComplete,
+                              .selector_index =
+                                  kDeviceGenerationControlCurrentDraftDepth,
+                              .error_index =
+                                  kDeviceGenerationControlErrorCode,
+                              .minimum_selector = minimum_draft_depth,
+                              .maximum_selector = maximum_draft_depth,
+                              .invalid_selector_error = static_cast<int>(
+                                  DeviceGenerationError::
+                                      InvalidDepthSelector),
+                          })
+                    : loop.capture->buildDeviceControlledWhileLoop(
+                          mtp_device_generation_loop_fragment_scratch_,
+                          predicate);
+        }
+        else
+        {
+            /*
+             * HIP has no graph conditional nodes, so its graph owner captures
+             * only the immutable ticket publication. Every expensive branch
+             * remains in source_fragments and is replayed on the same scheduler
+             * stream after the host validates this narrow snapshot. The capture
+             * accepts no response, cache, sampler, or compact-outcome pointer.
+             */
+            IBackend *const backend = getBackendFor(state_.device_id);
+            if (!backend || !loop.capture->beginCapture())
+            {
+                return fail(
+                    "host-scheduled device generation could not begin its isolated dispatch-ticket capture");
+            }
+
+            /*
+             * Once capture begins, end it exactly once even when kernel
+             * submission reports an error. Leaving a stream in capture mode
+             * would poison every later graph operation on this device and turn
+             * a local construction failure into an ambiguous lifecycle defect.
+             */
+            const bool ticket_enqueued =
+                backend->enqueuePublishDeviceGenerationDispatchTickets(
+                    device_generation_storage_.control_device,
+                    device_generation_storage_.control_stride,
+                    request_count,
+                    maintenance_due_device,
+                    device_generation_storage_.dispatch_tickets_device,
+                    state_.device_id.gpu_ordinal(),
+                    loop.stream.get());
+            const bool capture_ended = loop.capture->endCapture();
+            built = ticket_enqueued && capture_ended;
+        }
+        if (!built || !loop.capture->instantiate() ||
             !loop.capture->hasExecutable())
         {
             return fail(
-                "device-generation parent graph could not build and instantiate its native conditional executable");
+                execution_policy ==
+                        DeviceGenerationExecutionPolicy::
+                            NativeConditionalGraph
+                    ? "device-generation parent graph could not build and instantiate its native conditional executable"
+                    : "host-scheduled device generation could not capture and instantiate its isolated dispatch-ticket publisher");
         }
 
         loop.source_fragments.clear();
@@ -16739,6 +17175,9 @@ namespace llaminar2
         loop.sampling_mode = sampling_mode;
         loop.fragment_count = expected_fragment_count;
         loop.conditional_fragment_count = conditional_fragment_count;
+        loop.branch_offsets = branch_offsets;
+        loop.branch_fragment_counts = branch_fragment_counts;
+        loop.execution_kind = desired_execution_kind;
         loop.valid = true;
         loop.launched = false;
 
@@ -16770,9 +17209,13 @@ namespace llaminar2
               include_device_moe_maintenance ? "true" : "false"},
              {"workspace_generation", std::to_string(generation)},
              {"execution",
-              dynamic_depth
-                  ? "native_device_controlled_switch_while"
-                  : "native_device_controlled_while"}});
+              execution_policy ==
+                      DeviceGenerationExecutionPolicy::
+                          NativeConditionalGraph
+                  ? (dynamic_depth
+                         ? "native_device_controlled_switch_while"
+                         : "native_device_controlled_while")
+                  : "hosted_captured_transactions_with_ticket_only_dispatch"}});
         return true;
     }
 
@@ -18476,6 +18919,229 @@ namespace llaminar2
             }
         }
         return ok;
+    }
+
+    bool DeviceGraphOrchestrator::bindShiftedMTPPrefillTransaction(
+        ForwardInput &input,
+        int request_count)
+    {
+        input.shifted_mtp_prefill.reset();
+
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (!state_.device_id.is_gpu() ||
+            input.execution_role != ForwardExecutionRole::MainInference ||
+            input.execution_phase != ForwardExecutionPhase::Prefill)
+        {
+            return true;
+        }
+
+        if (graph_builder_->config()
+                .mtp_shifted_prefill_hidden_publication !=
+            MTPShiftedPrefillHiddenPublicationPolicy::
+                GraphIntegratedKVTransaction)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill requires the graph-integrated shifted-KV transaction policy");
+            return false;
+        }
+        if (request_count <= 0 ||
+            request_count > request_sequence_lengths_capacity_ ||
+            !input.token_ids_device || !input.position_ids_device ||
+            !input.sequence_lengths_device || !request_row_stride_dev_ ||
+            !mtp_shifted_prefill_token_ids_dev_ ||
+            !mtp_shifted_prefill_position_ids_dev_ ||
+            !mtp_shifted_prefill_append_lengths_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill cannot bind incomplete persistent request geometry"
+                      << " requests=" << request_count
+                      << " length_capacity="
+                      << request_sequence_lengths_capacity_
+                      << " tokens=" << input.token_ids_device
+                      << " positions=" << input.position_ids_device
+                      << " lengths=" << input.sequence_lengths_device
+                      << " row_stride=" << request_row_stride_dev_);
+            return false;
+        }
+        if (!state_.kv_cache || state_.mtp_kv_caches.empty() ||
+            !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Enabled GPU MTP prefill requires both main and depth-zero shifted KV caches");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer(request_count) ||
+            !state_.prefix_terminal_hidden ||
+            !state_.prefix_terminal_hidden->gpu_data_ptr())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill requires a device-resident request terminal archive");
+            return false;
+        }
+
+        auto extension = [&](BufferId id) -> TensorBase *
+        {
+            const auto it = state_.extension_buffers.find(id);
+            return it == state_.extension_buffers.end()
+                       ? nullptr
+                       : it->second.get();
+        };
+        MTPForwardOutput output{
+            .logits = extension(BufferId::MTP_LOGITS),
+            .gathered_logits = extension(BufferId::MTP_LOGITS_GATHERED),
+            .hidden = extension(BufferId::MTP_HIDDEN),
+            .embedding = extension(BufferId::MTP_EMBEDDING),
+            .norm_hidden = extension(BufferId::MTP_NORM_HIDDEN),
+            .norm_embedding = extension(BufferId::MTP_NORM_EMBEDDING),
+            .concat = extension(BufferId::MTP_CONCAT),
+            .projected = extension(BufferId::MTP_PROJECTED),
+            .q = extension(BufferId::MTP_Q_PROJ),
+            .k = extension(BufferId::MTP_K_PROJ),
+            .v = extension(BufferId::MTP_V_PROJ),
+            .k_full_prefill = extension(BufferId::MTP_K_FULL_PREFILL),
+            .v_full_prefill = extension(BufferId::MTP_V_FULL_PREFILL),
+            .q_raw = extension(BufferId::MTP_FA_Q_RAW),
+            .q_gate = extension(BufferId::MTP_FA_GATE),
+            .attn_output = extension(BufferId::MTP_ATTN_OUTPUT),
+            .attn_proj = extension(BufferId::MTP_ATTN_PROJ),
+            .gate = extension(BufferId::MTP_GATE_PROJ),
+            .up = extension(BufferId::MTP_UP_PROJ),
+            .ffn_output = extension(BufferId::MTP_FFN_OUTPUT),
+            .moe_expert_indices = extension(BufferId::MOE_EXPERT_INDICES),
+            .moe_expert_weights = extension(BufferId::MOE_EXPERT_WEIGHTS),
+            .moe_combined_output =
+                extension(BufferId::MOE_COMBINED_OUTPUT),
+            .moe_canonical_route_contributions =
+                extension(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS),
+            .moe_shared_expert_output =
+                extension(BufferId::MOE_SHARED_EXPERT_OUTPUT),
+            .moe_gate_scratch = extension(BufferId::MOE_GATE_SCRATCH),
+            .moe_up_scratch = extension(BufferId::MOE_UP_SCRATCH),
+        };
+        const std::array<std::pair<const char *, TensorBase *>, 9>
+            required_kv_only_scratch{{
+                {"embedding", output.embedding},
+                {"norm_hidden", output.norm_hidden},
+                {"norm_embedding", output.norm_embedding},
+                {"concat", output.concat},
+                {"projected", output.projected},
+                {"q", output.q},
+                {"k", output.k},
+                {"v", output.v},
+                {"q_raw", output.q_raw},
+            }};
+        for (const auto &[name, tensor] : required_kv_only_scratch)
+        {
+            if (!tensor || !tensor->gpu_data_ptr())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill is missing device-resident KV-only scratch '"
+                          << name << "'");
+                return false;
+            }
+        }
+        if (!output.q_gate || !output.q_gate->gpu_data_ptr())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill is missing device-resident KV-only scratch 'q_gate'");
+            return false;
+        }
+
+        ShiftedMTPPrefillGraphBinding binding{
+            .kv_cache = state_.mtp_kv_caches[0].get(),
+            .terminal_hidden_archive =
+                state_.prefix_terminal_hidden.get(),
+            .request_token_ids_device = static_cast<const int32_t *>(
+                input.token_ids_device),
+            .request_position_ids_device = static_cast<const int32_t *>(
+                input.position_ids_device),
+            .shifted_token_ids_device = static_cast<int32_t *>(
+                mtp_shifted_prefill_token_ids_dev_),
+            .shifted_position_ids_device = static_cast<int32_t *>(
+                mtp_shifted_prefill_position_ids_dev_),
+            .append_lengths_device = static_cast<int32_t *>(
+                mtp_shifted_prefill_append_lengths_dev_),
+            .request_row_stride_device = request_row_stride_dev_,
+            .output = output,
+        };
+        binding.main_cached_tokens_device.reserve(
+            static_cast<size_t>(request_count));
+        binding.shifted_cached_tokens_device.reserve(
+            static_cast<size_t>(request_count));
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int32_t *main_count =
+                state_.kv_cache->deviceSequenceCachedTokenCountPtr(request);
+            const int32_t *shifted_count = state_.mtp_kv_caches[0]
+                                                ->deviceSequenceCachedTokenCountPtr(
+                                                    request);
+            if (!main_count || !shifted_count)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill cannot bind canonical KV progress for request "
+                          << request);
+                return false;
+            }
+            binding.main_cached_tokens_device.push_back(main_count);
+            binding.shifted_cached_tokens_device.push_back(shifted_count);
+        }
+
+        const uint64_t generation = workspaceGeneration(state_.device_id);
+        if (generation == 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill requires a finalized workspace generation");
+            return false;
+        }
+        uint64_t identity = UINT64_C(1469598103934665603);
+        auto mix_u64 = [&](uint64_t value)
+        {
+            identity ^= value;
+            identity *= UINT64_C(1099511628211);
+        };
+        auto mix_pointer = [&](const void *pointer)
+        {
+            mix_u64(static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(pointer)));
+        };
+        mix_u64(generation);
+        mix_u64(static_cast<uint64_t>(request_count));
+        mix_pointer(input.token_ids_device);
+        mix_pointer(input.position_ids_device);
+        mix_pointer(input.sequence_lengths_device);
+        mix_pointer(binding.kv_cache);
+        mix_pointer(state_.kv_cache.get());
+        mix_pointer(binding.terminal_hidden_archive);
+        mix_pointer(binding.terminal_hidden_archive->gpu_data_ptr());
+        mix_pointer(binding.request_token_ids_device);
+        mix_pointer(binding.request_position_ids_device);
+        mix_pointer(binding.shifted_token_ids_device);
+        mix_pointer(binding.shifted_position_ids_device);
+        mix_pointer(binding.append_lengths_device);
+        mix_pointer(binding.request_row_stride_device);
+        for (const int32_t *pointer : binding.main_cached_tokens_device)
+            mix_pointer(pointer);
+        for (const int32_t *pointer : binding.shifted_cached_tokens_device)
+            mix_pointer(pointer);
+        const std::array<TensorBase *, 10> captured_scratch{{
+            output.embedding,
+            output.norm_hidden,
+            output.norm_embedding,
+            output.concat,
+            output.projected,
+            output.q,
+            output.k,
+            output.v,
+            output.q_raw,
+            output.q_gate,
+        }};
+        for (TensorBase *tensor : captured_scratch)
+        {
+            mix_pointer(tensor);
+            mix_pointer(tensor ? tensor->gpu_data_ptr() : nullptr);
+        }
+        binding.capture_identity = identity == 0 ? UINT64_MAX : identity;
+        if (!binding.validForRequestCount(request_count))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill produced an incomplete graph binding");
+            return false;
+        }
+
+        input.shifted_mtp_prefill = std::move(binding);
+        return true;
     }
 
     bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(
@@ -20929,6 +21595,8 @@ namespace llaminar2
          * previous backend event may be retired before creating its replacement.
          */
         ready = {};
+        clearCurrentMainLogitsPublication(
+            "initialize_forward_graph_output_ready_event");
         ready.event = allocatePersistentDeviceEvent(state_.device_id);
         if (!ready.event)
         {
@@ -20940,9 +21608,181 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::publishForwardGraphOutputReady(
-        const ForwardExecutionProvenance &producer)
+    ForwardLogitsStorageSurface
+    DeviceGraphOrchestrator::classifyForwardLogitsSurface(
+        const TensorBase *tensor) const noexcept
     {
+        if (!tensor)
+            return ForwardLogitsStorageSurface::None;
+        if (tensor == state_.all_position_logits.get())
+            return ForwardLogitsStorageSurface::AllPositionFull;
+        if (tensor == state_.all_position_logits_local.get())
+            return ForwardLogitsStorageSurface::AllPositionLocal;
+        if (tensor == state_.logits.get())
+            return ForwardLogitsStorageSurface::CanonicalFull;
+        if (tensor == state_.logits_local.get())
+            return ForwardLogitsStorageSurface::CanonicalLocal;
+        return ForwardLogitsStorageSurface::Unknown;
+    }
+
+    bool DeviceGraphOrchestrator::publishCurrentMainLogits(
+        TensorBase *tensor,
+        const ForwardLogitsPublicationDescriptor &descriptor,
+        MainLogitsPublicationSource source,
+        const char *producer_name)
+    {
+        if (!descriptor.isMainModelOutput())
+            return true;
+        if (!tensor ||
+            descriptor.storage_surface ==
+                ForwardLogitsStorageSurface::None)
+        {
+            clearCurrentMainLogitsPublication(producer_name);
+            return true;
+        }
+        if (descriptor.storage_surface ==
+                ForwardLogitsStorageSurface::Unknown ||
+            source == MainLogitsPublicationSource::None)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Main-logits producer does not name an owned storage surface"
+                      << " producer="
+                      << (producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown")
+                      << " role="
+                      << static_cast<int>(descriptor.execution_role)
+                      << " tensor=" << tensor
+                      << " surface="
+                      << static_cast<int>(descriptor.storage_surface));
+            return false;
+        }
+
+        current_main_logits_publication_ = {
+            .tensor = tensor,
+            .descriptor = descriptor,
+            .source = source,
+            .session_epoch = session_epoch_,
+            .valid = true,
+        };
+        PerfStatsCollector::addCounter(
+            "sampling",
+            "current_main_logits_publications",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer",
+              producer_name && producer_name[0] != '\0'
+                  ? producer_name
+                  : "unknown"},
+             {"surface",
+              std::to_string(
+                  static_cast<int>(descriptor.storage_surface))},
+             {"execution_role",
+              std::to_string(
+                  static_cast<int>(descriptor.execution_role))}});
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearCurrentMainLogitsPublication(
+        const char *reason) noexcept
+    {
+        (void)reason;
+        current_main_logits_publication_ = {};
+    }
+
+    TensorBase *DeviceGraphOrchestrator::requireCurrentMainLogits(
+        DeviceLogitsSource source,
+        const char *consumer_name) const
+    {
+        if (source != DeviceLogitsSource::Main &&
+            source != DeviceLogitsSource::MainRequestBatch)
+        {
+            throw std::invalid_argument(
+                "Current-main logits resolver received a non-main source");
+        }
+
+        const auto &publication = current_main_logits_publication_;
+        const bool source_supported =
+            source == DeviceLogitsSource::Main
+                ? publication.descriptor.supportsScalarMainConsumer()
+                : publication.descriptor.supportsMainRequestBatchConsumer();
+        if (!publication.valid || !publication.tensor ||
+            publication.session_epoch != session_epoch_ ||
+            !source_supported)
+        {
+            std::ostringstream message;
+            message << "Main-logits consumer "
+                    << (consumer_name && consumer_name[0] != '\0'
+                            ? consumer_name
+                            : "unknown")
+                    << " has no compatible current publication"
+                    << " source=" << static_cast<int>(source)
+                    << " valid=" << publication.valid
+                    << " publication_epoch=" << publication.session_epoch
+                    << " session_epoch=" << session_epoch_
+                    << " execution_role="
+                    << static_cast<int>(
+                           publication.descriptor.execution_role)
+                    << " logical_all_position="
+                    << publication.descriptor.logical_all_position_logits
+                    << " storage_surface="
+                    << static_cast<int>(
+                           publication.descriptor.storage_surface);
+            throw std::logic_error(message.str());
+        }
+        return publication.tensor;
+    }
+
+    TensorBase *DeviceGraphOrchestrator::resolveDeviceLogitsTensor(
+        DeviceLogitsSource source,
+        const char *consumer_name) const
+    {
+        if (source == DeviceLogitsSource::Main ||
+            source == DeviceLogitsSource::MainRequestBatch)
+        {
+            return requireCurrentMainLogits(source, consumer_name);
+        }
+        if (source == DeviceLogitsSource::AllPosition)
+            return state_.all_position_logits.get();
+
+        const auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        return it == state_.extension_buffers.end()
+                   ? nullptr
+                   : it->second.get();
+    }
+
+    bool DeviceGraphOrchestrator::publishForwardGraphOutputReady(
+        const ForwardOutput &output)
+    {
+        const auto &producer = output.execution;
+        if (!producer.valid)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot publish invalid forward-output provenance");
+            return false;
+        }
+
+        if (producer.execution_role ==
+                ForwardExecutionRole::MainInference ||
+            producer.execution_role ==
+                ForwardExecutionRole::MTPCondition)
+        {
+            const ForwardLogitsPublicationDescriptor descriptor{
+                .execution_role = producer.execution_role,
+                .logical_all_position_logits =
+                    producer.all_position_logits,
+                .storage_surface =
+                    classifyForwardLogitsSurface(output.logits),
+            };
+            if (!publishCurrentMainLogits(
+                    output.logits,
+                    descriptor,
+                    MainLogitsPublicationSource::ForwardGraph,
+                    "forward_graph"))
+            {
+                return false;
+            }
+        }
+
         if (!state_.device_id.is_gpu())
             return true;
 
@@ -20986,6 +21826,9 @@ namespace llaminar2
         ready.execution_role = producer.execution_role;
         ready.is_decode = producer.is_decode;
         ready.all_position_logits = producer.all_position_logits;
+        ready.completion_scope = producer.completion_scope;
+        ready.graph_seq_len = producer.graph_seq_len;
+        ready.graph_batch_size = producer.graph_batch_size;
         PerfStatsCollector::addCounter(
             "forward_graph",
             "durable_output_publications",
@@ -20996,6 +21839,82 @@ namespace llaminar2
               std::to_string(static_cast<int>(producer.execution_role))},
              {"all_position_logits",
               boolTag(producer.all_position_logits)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForLastForwardCompletionForBenchmark()
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        const auto &ready = forward_graph_output_ready_;
+        if (!ready.valid || !ready.event || ready.device != state_.device_id)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Benchmark completion boundary has no valid durable forward-output event"
+                      << " device=" << state_.device_id.toString()
+                      << " valid=" << ready.valid
+                      << " event=" << ready.event.get()
+                      << " event_device=" << ready.device.toString());
+            return false;
+        }
+
+        const bool mtp_prefill_transaction =
+            !ready.is_decode &&
+            ready.execution_role == ForwardExecutionRole::MainInference &&
+            graph_builder_ &&
+            graph_builder_->config().mtp.enabled &&
+            !state_.mtp_kv_caches.empty();
+
+        const std::shared_ptr<void> *terminal_event = &ready.event;
+        const char *ordering = "durable_forward_output_event";
+        if (mtp_prefill_transaction)
+        {
+            /*
+             * Shifted MTP KV population and terminal archival are graph nodes,
+             * so ForwardGraphOutputReady is the transitive terminal event for
+             * the complete production prefill transaction. Require that exact
+             * scope rather than inferring completeness from MTP configuration
+             * or consulting the retired post-forward sidecar handoff. A GPU MTP
+             * prefill that does not publish this scope is incomplete and must
+             * fail instead of measuring only its main-model prefix.
+             */
+            if (ready.completion_scope !=
+                ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill completed without graph-integrated shifted-KV scope"
+                          << " device=" << state_.device_id.toString()
+                          << " graph_seq_len=" << ready.graph_seq_len
+                          << " graph_batch_size=" << ready.graph_batch_size
+                          << " completion_scope="
+                          << static_cast<int>(ready.completion_scope));
+                return false;
+            }
+            ordering = "graph_integrated_shifted_mtp_prefill_event";
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!terminal_event || !*terminal_event || !backend ||
+            !backend->waitForEvent(
+                terminal_event->get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Benchmark failed to wait for the exact complete-forward event on "
+                      << state_.device_id.toString()
+                      << " ordering=" << ordering);
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "benchmark_terminal_event_waits",
+            1.0,
+            ready.is_decode ? "decode" : "prefill",
+            state_.device_id.toString(),
+            {{"ordering", ordering},
+             {"scope", "benchmark_result_boundary"},
+             {"mtp_prefill_included", boolTag(mtp_prefill_transaction)},
+             {"device_sync", "false"},
+             {"host_transfer", "false"}});
         return true;
     }
 
@@ -21022,12 +21941,22 @@ namespace llaminar2
             return false;
         }
 
+        const bool main_forward =
+            !ready.all_position_logits &&
+            (ready.execution_role ==
+                 ForwardExecutionRole::MainInference ||
+             ready.execution_role ==
+                 ForwardExecutionRole::MTPCondition);
+        const bool grouped_verifier =
+            ready.all_position_logits &&
+            ready.execution_role ==
+                ForwardExecutionRole::GroupedMTPVerifier;
         const bool kind_matches =
             required_kind == ForwardGraphOutputKind::Any ||
             (required_kind == ForwardGraphOutputKind::MainForward &&
-             !ready.all_position_logits) ||
+             main_forward) ||
             (required_kind == ForwardGraphOutputKind::GroupedVerifier &&
-             ready.all_position_logits);
+             grouped_verifier);
         if (!kind_matches)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] ForwardGraphOutputReady kind mismatch for consumer="
@@ -21410,6 +22339,11 @@ namespace llaminar2
         forward_graph_output_ready_.valid = false;
         forward_graph_output_ready_.is_decode = false;
         forward_graph_output_ready_.all_position_logits = false;
+        forward_graph_output_ready_.completion_scope =
+            ForwardCompletionScope::ModelForwardOnly;
+        forward_graph_output_ready_.graph_seq_len = 0;
+        forward_graph_output_ready_.graph_batch_size = 0;
+        clearCurrentMainLogitsPublication(clear_reason);
 
         clearMTPVerifierTransactionStateForBoundary(clear_reason);
 
@@ -21479,11 +22413,14 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::consumeUnusedReplicatedMainLogitsPublication()
     {
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main,
+            "consumeUnusedReplicatedMainLogitsPublication");
         if (!state_.device_id.is_gpu() ||
-            activeMainLogitsAreColumnParallel() ||
-            !state_.logits ||
-            !state_.logits->deviceValid() ||
-            !state_.logits->gpu_data_ptr())
+            current_main_logits_publication_.descriptor
+                .isColumnParallelStorage() ||
+            !main_logits->deviceValid() ||
+            !main_logits->gpu_data_ptr())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Only a GPU runner with replicated "
                       "full main logits may retire an unused main-decode publication");
@@ -22332,84 +23269,6 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::
-        rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
-            int request_count)
-    {
-        auto fail = [&](const std::string &reason) -> bool
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Diagnostic logical-state rebind failed: "
-                << reason);
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "commit_replay_check_resident_rebind_failures",
-                1.0,
-                "decode",
-                state_.device_id.toString(),
-                {{"reason", reason}});
-            return false;
-        };
-
-        if (!state_.device_id.is_gpu())
-            return fail("runner is not GPU-backed");
-        if (request_count <= 0)
-            return fail("request count is not positive");
-        if (!device_resident_logical_sequence_state_storage_.validFor(
-                request_count))
-        {
-            return fail("arena-owned compact outcome storage is incomplete");
-        }
-        if (device_resident_logical_sequence_state_storage_
-                .published_request_count != request_count)
-        {
-            return fail(
-                "durable compact outcome row count does not match the restored transaction");
-        }
-
-        /*
-         * restoreLivePrefixState() has already ordered the imported KV/GDN state,
-         * recorded its mutation event, and rebuilt the shifted-MTP transaction.
-         * Recording this event on the same explicit stream therefore fences both
-         * the restored model state and the durable compact outcome rows. No copy,
-         * allocation, device synchronization, or host metadata adoption belongs
-         * in this diagnostic lifecycle repair.
-         */
-        void *stream = explicitGPUStreamForOperation(
-            "rebindDeviceResidentLogicalStateAfterDiagnosticRestore");
-        if (!stream)
-            return fail("restore stream is unavailable");
-        if (!waitForDeviceResidentLogicalSequenceStateRowReuse(
-                stream,
-                "diagnostic_restore_logical_state_rebind"))
-        {
-            return fail("restore could not order the logical-state access fence");
-        }
-
-        std::string mailbox_error;
-        if (!recordDeviceResidentLogicalSequenceStateMailbox(
-                request_count,
-                stream,
-                DeviceResidentLogicalStatePublicationKind::DiagnosticRestoreRebind,
-                &mailbox_error))
-        {
-            return fail(mailbox_error.empty()
-                            ? "mailbox recording failed"
-                            : mailbox_error);
-        }
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "commit_replay_check_resident_rebinds",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"requests", std::to_string(request_count)},
-             {"state_owner", "arena_persistent"},
-             {"purpose", "diagnostic_restore"}});
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::
         publishDeviceResidentLogicalSequenceStateFromTargetSample(
             int target_sample_slot,
             const int32_t *live_position_device)
@@ -22554,8 +23413,6 @@ namespace llaminar2
         {
         case DeviceResidentLogicalStatePublicationKind::RequestBatchConditionAdvance:
             return "request_batch_condition_advance";
-        case DeviceResidentLogicalStatePublicationKind::DiagnosticRestoreRebind:
-            return "diagnostic_restore_rebind";
         case DeviceResidentLogicalStatePublicationKind::TargetSampleInitialization:
             return "target_sample_initialization";
         case DeviceResidentLogicalStatePublicationKind::AcceptedSpecState:
@@ -27969,6 +28826,47 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::initializeAndPublishMTPTerminalHiddenArchiveOnStream(
+        void *producer_stream,
+        const char *reason)
+    {
+        IBackend *const backend = getBackendFor(state_.device_id);
+        TensorBase *const archive = state_.prefix_terminal_hidden.get();
+        const size_t archive_bytes = archive ? archive->size_bytes() : 0;
+        if (!state_.device_id.is_gpu() ||
+            !producer_stream ||
+            !backend ||
+            !archive ||
+            !archive->gpu_data_ptr() ||
+            archive_bytes == 0 ||
+            !backend->memset(
+                archive->gpu_data_ptr(),
+                0,
+                archive_bytes,
+                state_.device_id.gpu_ordinal(),
+                producer_stream) ||
+            !publishPreparedArenaGraphInput(
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                archive->gpu_data_ptr(),
+                producer_stream,
+                state_.device_id,
+                "initialize_mtp_terminal_hidden_archive"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Could not initialize the device-owned MTP terminal-hidden archive"
+                      << " reason=" << (reason ? reason : "unknown")
+                      << " stream=" << producer_stream
+                      << " bytes=" << archive_bytes);
+            return false;
+        }
+
+        /*
+         * Coherent zero bytes satisfy the captured read/write contract, but no
+         * main or verifier graph has produced a request terminal yet.
+         */
+        state_.mtp_terminal_hidden_current = false;
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::initializeAndPublishMTPSampleBanksOnStream(
         void *producer_stream,
         const char *reason)
@@ -28061,6 +28959,9 @@ namespace llaminar2
             static_cast<size_t>(device_generation_storage_.request_capacity) *
             static_cast<size_t>(device_generation_storage_.control_stride) *
             sizeof(int);
+        const size_t dispatch_ticket_bytes =
+            static_cast<size_t>(device_generation_storage_.request_capacity) *
+            sizeof(sampling_math::DeviceGenerationDispatchTicket);
 
         /*
          * The response ledger uses -1 as its empty-token sentinel while a zero
@@ -28085,6 +28986,12 @@ namespace llaminar2
                 device_generation_storage_.control_device,
                 0,
                 control_bytes,
+                state_.device_id.gpu_ordinal(),
+                producer_stream) ||
+            !backend->memset(
+                device_generation_storage_.dispatch_tickets_device,
+                0,
+                dispatch_ticket_bytes,
                 state_.device_id.gpu_ordinal(),
                 producer_stream) ||
             !publishDeviceGenerationArenaState(
@@ -28121,6 +29028,12 @@ namespace llaminar2
             !publishPreparedArenaGraphInput(
                 BufferId::MTP_GENERATION_CONTROL,
                 device_generation_storage_.control_device,
+                producer_stream,
+                state_.device_id,
+                producer) ||
+            !publishPreparedArenaGraphInput(
+                BufferId::MTP_GENERATION_DISPATCH_TICKETS,
+                device_generation_storage_.dispatch_tickets_device,
                 producer_stream,
                 state_.device_id,
                 producer))
@@ -29277,20 +30190,27 @@ namespace llaminar2
 
         /*
          * At most one measurement can be pending for each target/draft row
-         * producer before the compact response boundary drains perfstats.
-         * Extra pairs cover the verifier summary, publication, and diagnostics.
-         * The capacity derives from the configured graph shape rather than an
-         * arbitrary runtime growth policy.
+         * producer before the compact response boundary drains perfstats. HIP's
+         * ticket-scheduled parent can additionally time every retained fragment
+         * in the selected transaction while one enclosing transaction interval
+         * remains live. A stochastic depth-D branch owns at most 2*D+7 source
+         * fragments (including maintenance); five additional pairs cover the
+         * enclosing interval, compact reducers, publication, and one diagnostic
+         * observer. Deriving the pool from the configured maximum depth keeps
+         * profiling allocation-free and total through depth 15.
          */
         if (PerfStatsCollector::isEnabled() &&
             mtp_gpu_timing_event_pool_.empty())
         {
+            const size_t hosted_transaction_timing_capacity =
+                static_cast<size_t>(2 * mtp_max_draft_depth_ + 12);
             const size_t timing_pair_capacity =
-                std::max<size_t>(
-                    8,
-                    stochastic_target_sample_ready_.size() +
-                        stochastic_draft_sample_ready_.size() +
-                        4);
+                std::max(
+                    {size_t{8},
+                     stochastic_target_sample_ready_.size() +
+                         stochastic_draft_sample_ready_.size() +
+                         4,
+                     hosted_transaction_timing_capacity});
             mtp_gpu_timing_event_pool_.reserve(timing_pair_capacity);
             for (size_t slot = 0;
                  slot < timing_pair_capacity;
@@ -32863,9 +33783,6 @@ namespace llaminar2
     {
         if (!supportsDeviceStochasticMTPVerification() ||
             globalTPContextForMTPCoordination() ||
-            !state_.logits ||
-            !state_.logits->deviceValid() ||
-            !state_.logits->gpu_data_ptr() ||
             target_sample_slot < 0 ||
             target_sample_slot >= stochastic_target_row_capacity_ ||
             !stochastic_target_sample_tokens_dev_ ||
@@ -32873,6 +33790,15 @@ namespace llaminar2
             !argmax_partial_vals_dev_ ||
             !argmax_partial_idxs_dev_ ||
             argmax_partial_capacity_ <= 0)
+        {
+            return false;
+        }
+
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main,
+            "sampleGreedyFromMainLogitsToDeviceTargetSlot");
+        if (!main_logits->deviceValid() ||
+            !main_logits->gpu_data_ptr())
         {
             return false;
         }
@@ -32890,7 +33816,7 @@ namespace llaminar2
             target_sample_slot,
             StochasticSampleReadyClearMode::Force);
 
-        const auto &shape = state_.logits->shape();
+        const auto &shape = main_logits->shape();
         if (shape.empty())
             return false;
         const size_t rows = shape.size() >= 2 ? shape[0] : 1;
@@ -32912,7 +33838,8 @@ namespace llaminar2
         if (!backend)
             return false;
 
-        const float *row_ptr = static_cast<const float *>(state_.logits->gpu_data_ptr());
+        const float *row_ptr =
+            static_cast<const float *>(main_logits->gpu_data_ptr());
         auto *out_token_dev =
             static_cast<int *>(stochastic_target_sample_tokens_dev_) +
             target_sample_slot;
@@ -33936,7 +34863,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!copyDeviceSpeculativeOutcomesToHost(handle, out))
+        if (!copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, out))
             return false;
 
         PerfStatsCollector::addCounter(
@@ -36700,6 +37627,7 @@ namespace llaminar2
         void *terminal_restore_stream = nullptr;
         TensorBase *terminal_logits_tensor =
             activeMainLogitsAreColumnParallel() ? state_.logits_local.get() : state_.logits.get();
+        TensorBase *published_terminal_logits_tensor = terminal_logits_tensor;
         const BufferId terminal_logits_buffer_id =
             terminal_logits_tensor == state_.logits_local.get() ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
@@ -36899,6 +37827,7 @@ namespace llaminar2
                 return false;
             }
             TransferEngine::publishHostWrite(state_.logits.get());
+            published_terminal_logits_tensor = state_.logits.get();
             if (arena_ && arena_->isRegistered(BufferId::LOGITS))
             {
                 arena_->markWrittenFlagsOnly(
@@ -37018,6 +37947,22 @@ namespace llaminar2
                     "prefix restore source ownership");
                 return false;
             }
+        }
+
+        const ForwardLogitsPublicationDescriptor restored_logits{
+            .execution_role = ForwardExecutionRole::MainInference,
+            .logical_all_position_logits = false,
+            .storage_surface = classifyForwardLogitsSurface(
+                published_terminal_logits_tensor),
+        };
+        if (!publishCurrentMainLogits(
+                published_terminal_logits_tensor,
+                restored_logits,
+                MainLogitsPublicationSource::PrefixTerminalRestore,
+                "restore_prefix_terminal_state"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix terminal restore could not publish current main-logits ownership");
+            return false;
         }
 
         return true;
@@ -39901,15 +40846,31 @@ namespace llaminar2
 
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()
     {
+        TensorBase *main_logits =
+            state_.device_id.is_gpu()
+                ? requireCurrentMainLogits(
+                      DeviceLogitsSource::Main,
+                      "sampleGreedyOnDevice")
+                : (activeMainLogitsAreColumnParallel()
+                       ? state_.logits_local.get()
+                       : state_.logits.get());
+        if (!main_logits)
+            return -1;
+
         // LmHeadStage always writes the last-token logits to row 0 for both
         // prefill and decode.  In GlobalTP/NodeLocalTP, the terminal restore path
         // repopulates logits_local, so greedy sampling must use the shard-local
         // tensor and coordinate the winning candidate across ranks.
-        if (activeMainLogitsAreColumnParallel())
+        const bool column_parallel =
+            state_.device_id.is_gpu()
+                ? current_main_logits_publication_.descriptor
+                      .isColumnParallelStorage()
+                : activeMainLogitsAreColumnParallel();
+        if (column_parallel)
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
             void *stream = nullptr;
-            auto device_opt = state_.logits_local->current_device();
+            auto device_opt = main_logits->current_device();
             if (device_opt.has_value() && device_opt->is_gpu())
             {
                 stream = prepareMainLogitsDeviceConsumer(
@@ -39921,7 +40882,7 @@ namespace llaminar2
                 }
             }
             return coordinateGreedyCandidate(
-                sampleGreedyCandidateFromTensor(state_.logits_local.get(),
+                sampleGreedyCandidateFromTensor(main_logits,
                                                 0,
                                                 token_offset,
                                                 argmax_partial_vals_dev_,
@@ -39932,11 +40893,8 @@ namespace llaminar2
                 globalTPContextForMTPCoordination());
         }
 
-        if (!state_.logits)
-            return -1;
-
         void *stream = nullptr;
-        auto device_opt = state_.logits->current_device();
+        auto device_opt = main_logits->current_device();
         if (device_opt.has_value() && device_opt->is_gpu())
         {
             stream = prepareMainLogitsDeviceConsumer(
@@ -39948,7 +40906,7 @@ namespace llaminar2
             }
         }
         return coordinateGreedyCandidate(
-            sampleGreedyCandidateFromTensor(state_.logits.get(),
+            sampleGreedyCandidateFromTensor(main_logits,
                                             0,
                                             0,
                                             argmax_partial_vals_dev_,
@@ -39972,11 +40930,15 @@ namespace llaminar2
         {
             return sampleGreedyOnDevice();
         }
-        if (!state_.device_id.is_gpu() || !state_.logits)
+        if (!state_.device_id.is_gpu())
         {
             return -1;
         }
-        if (activeMainLogitsAreColumnParallel())
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main,
+            "sampleOnDeviceAtLogicalPosition");
+        if (current_main_logits_publication_.descriptor
+                .isColumnParallelStorage())
         {
             return -1;
         }
@@ -39986,18 +40948,18 @@ namespace llaminar2
                       << params.top_k);
             return -1;
         }
-        if (!state_.logits->deviceValid())
+        if (!main_logits->deviceValid())
         {
             return -1;
         }
 
-        void *gpu_ptr = state_.logits->gpu_data_ptr();
+        void *gpu_ptr = main_logits->gpu_data_ptr();
         if (!gpu_ptr)
         {
             return -1;
         }
 
-        const auto &shape = state_.logits->shape();
+        const auto &shape = main_logits->shape();
         if (shape.empty())
         {
             return -1;
@@ -40203,6 +41165,54 @@ namespace llaminar2
         return true;
     }
 
+    DeviceGenerationExecutionPolicy
+    DeviceGraphOrchestrator::deviceGenerationExecutionPolicy(
+        DeviceGenerationLoopTopology topology) const noexcept
+    {
+        if (!state_.device_id.is_gpu())
+            return DeviceGenerationExecutionPolicy::Unsupported;
+
+        const auto &capture = mtp_device_generation_loop_graph_.capture;
+        if (!capture)
+            return DeviceGenerationExecutionPolicy::Unsupported;
+
+        const bool native_while =
+            capture->supportsDeviceControlledWhileLoop();
+        const bool native_switch_while =
+            capture->supportsDeviceControlledSwitchWhileLoop();
+        const bool native_topology_complete =
+            native_while &&
+            (topology == DeviceGenerationLoopTopology::FixedDepth ||
+             native_switch_while);
+        if (native_topology_complete)
+        {
+            return DeviceGenerationExecutionPolicy::
+                NativeConditionalGraph;
+        }
+
+        /*
+         * HIP 7.1 has graph capture/replay but no conditional graph nodes and
+         * no device-side graph-launch primitive. Select the compatibility
+         * architecture before admission so a failed native composition can
+         * never silently redirect execution. Every transaction still uses its
+         * retained production graph; only the outer stochastic loop is hosted.
+         * A future HIP runtime that exposes the required native topology will
+         * take the branch above without changing request orchestration.
+         */
+        if (state_.device_id.is_rocm())
+        {
+            return DeviceGenerationExecutionPolicy::
+                HostScheduledCapturedTransactions;
+        }
+
+        /*
+         * CUDA is required to expose its native conditional implementation. A
+         * missing capture owner or capability is an initialization defect, not
+         * permission to enter the ROCm compatibility policy.
+         */
+        return DeviceGenerationExecutionPolicy::Unsupported;
+    }
+
     bool DeviceGraphOrchestrator::beginDeviceResidentGeneration(
         int request_count,
         int max_new_tokens)
@@ -40215,7 +41225,9 @@ namespace llaminar2
         }
         const auto depth_policy =
             makeDeviceGenerationDepthPolicy(graph_builder_->config().mtp);
+        const uint64_t generation = workspaceGeneration(state_.device_id);
         if (request_count <= 0 || max_new_tokens <= 0 ||
+            session_epoch_ == 0 || generation == 0 ||
             !depth_policy.valid() ||
             !device_generation_storage_.validFor(request_count) ||
             max_new_tokens >
@@ -40224,6 +41236,8 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid device-resident generation admission"
                       << " requests=" << request_count
                       << " max_new_tokens=" << max_new_tokens
+                      << " session_epoch=" << session_epoch_
+                      << " workspace_generation=" << generation
                       << " response_capacity="
                       << device_generation_storage_.response_token_stride);
             return false;
@@ -40247,7 +41261,7 @@ namespace llaminar2
         }
         if (mtp_device_generation_loop_graph_.launched)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired native parent launch");
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired loop launch");
             return false;
         }
         if (device_generation_state_ready_.valid)
@@ -40275,6 +41289,15 @@ namespace llaminar2
                 device_generation_storage_.control_device,
                 state_.device_id.gpu_ordinal(),
                 stream) ||
+            !backend->enqueueInitializeDeviceGenerationDispatchTicket(
+                session_epoch_,
+                generation,
+                device_generation_storage_.control_device,
+                device_generation_storage_.control_stride,
+                request_count,
+                device_generation_storage_.dispatch_tickets_device,
+                state_.device_id.gpu_ordinal(),
+                stream) ||
             !publishDeviceGenerationStateReady(
                 stream,
                 request_count,
@@ -40284,6 +41307,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize and publish the device-generation controller");
             return false;
         }
+
+        last_device_generation_dispatch_ticket_.reset();
+        device_generation_dispatch_ticket_copy_pending_ = false;
+        hosted_device_generation_scheduler_started_ = false;
+        hosted_device_generation_terminal_submitted_ = false;
+        hosted_device_generation_last_transaction_count_ = 0;
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -40300,6 +41329,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(
         int request_count,
         int draft_depth,
+        DeviceGenerationLoopTopology topology,
         DeviceGenerationSamplingMode sampling_mode)
     {
         if (!state_.device_id.is_gpu() || request_count <= 0 ||
@@ -40320,6 +41350,22 @@ namespace llaminar2
                       << deviceGenerationSamplingModeName(sampling_mode)
                       << " controller_ready="
                       << device_generation_state_ready_.valid);
+            return false;
+        }
+
+        const auto configured_depth_policy =
+            makeDeviceGenerationDepthPolicy(graph_builder_->config().mtp);
+        const DeviceGenerationLoopTopology configured_topology =
+            configured_depth_policy.mode ==
+                    sampling_math::DeviceGenerationDepthPolicyMode::Dynamic
+                ? DeviceGenerationLoopTopology::DynamicDepth
+                : DeviceGenerationLoopTopology::FixedDepth;
+        if (topology != configured_topology)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation materialization topology disagrees with the resident depth controller"
+                      << " requested=" << static_cast<int>(topology)
+                      << " configured="
+                      << static_cast<int>(configured_topology));
             return false;
         }
 
@@ -40356,6 +41402,410 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::
+        enqueueDeviceGenerationDispatchTicketObservation()
+    {
+        auto &loop = mtp_device_generation_loop_graph_;
+        const int request_count =
+            device_generation_storage_.active_request_count;
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (loop.execution_kind !=
+                MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                    HostedDispatchTicketPublisher ||
+            !loop.valid || !loop.capture || !loop.capture->hasExecutable() ||
+            !loop.stream || request_count != 1 ||
+            !device_generation_storage_.validFor(request_count) ||
+            !device_generation_dispatch_ticket_host_scratch_ ||
+            !device_generation_dispatch_ticket_host_scratch_->canServe(
+                request_count) ||
+            !device_generation_dispatch_ticket_ready_event_ ||
+            device_generation_dispatch_ticket_copy_pending_ || !backend)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket observation has incomplete or overlapping ownership"
+                      << " device=" << state_.device_id.toString()
+                      << " requests=" << request_count
+                      << " loop_valid=" << loop.valid
+                      << " copy_pending="
+                      << device_generation_dispatch_ticket_copy_pending_);
+            return false;
+        }
+
+        void *const scheduler_stream = loop.stream.get();
+        const size_t ticket_bytes =
+            sizeof(sampling_math::DeviceGenerationDispatchTicket) *
+            static_cast<size_t>(request_count);
+        if (!loop.capture->launchOnStream(scheduler_stream) ||
+            !backend->deviceToHostOnStream(
+                device_generation_dispatch_ticket_host_scratch_->tickets,
+                device_generation_storage_.dispatch_tickets_device,
+                ticket_bytes,
+                state_.device_id.gpu_ordinal(),
+                scheduler_stream) ||
+            !backend->recordEvent(
+                device_generation_dispatch_ticket_ready_event_.get(),
+                state_.device_id.gpu_ordinal(),
+                scheduler_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket observation submission failed on "
+                      << state_.device_id.toString());
+            return false;
+        }
+        device_generation_dispatch_ticket_copy_pending_ = true;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_dispatch_ticket_d2h_submissions",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"bytes", std::to_string(ticket_bytes)},
+             {"authority", "immutable_scheduler_snapshot"},
+             {"state_payload", "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket(
+        sampling_math::DeviceGenerationDispatchTicket *out_ticket)
+    {
+        using namespace sampling_math;
+        if (out_ticket)
+            *out_ticket = DeviceGenerationDispatchTicket{};
+
+        auto &loop = mtp_device_generation_loop_graph_;
+        const int request_count =
+            device_generation_storage_.active_request_count;
+        const uint64_t generation = workspaceGeneration(state_.device_id);
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (!out_ticket || !backend || request_count != 1 ||
+            loop.execution_kind !=
+                MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                    HostedDispatchTicketPublisher ||
+            !loop.valid || !loop.stream || loop.workspace_generation == 0 ||
+            loop.workspace_generation != generation ||
+            hosted_device_generation_terminal_submitted_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket observation has stale lifecycle identity");
+            return false;
+        }
+
+        if (!hosted_device_generation_scheduler_started_)
+        {
+            if (loop.launched ||
+                !consumeDeviceGenerationStateReady(
+                    loop.stream.get(),
+                    DeviceTimelineRole::DeviceGenerationController,
+                    request_count,
+                    "hosted_device_generation_ticket_scheduler") ||
+                (usesDeviceSideMoERebalanceController() &&
+                 !waitForPendingDeviceMoERebalanceMaintenance(
+                     loop.stream.get(),
+                     DeviceTimelineRole::MTPSidecarGraph,
+                     "hosted_device_generation_ticket_scheduler")))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation scheduler could not consume the first committed transaction");
+                return false;
+            }
+            hosted_device_generation_scheduler_started_ = true;
+            loop.launched = true;
+            if (!enqueueDeviceGenerationDispatchTicketObservation())
+                return false;
+        }
+
+        if (!device_generation_dispatch_ticket_copy_pending_ ||
+            !backend->waitForEvent(
+                device_generation_dispatch_ticket_ready_event_.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket event did not complete on "
+                      << state_.device_id.toString());
+            return false;
+        }
+        device_generation_dispatch_ticket_copy_pending_ = false;
+
+        const DeviceGenerationDispatchTicket ticket =
+            device_generation_dispatch_ticket_host_scratch_->tickets[0];
+        const int expected_transaction_count =
+            hosted_device_generation_last_transaction_count_ + 1;
+        const bool valid_ticket =
+            ticket.matchesLifecycle(session_epoch_, generation) &&
+            ticket.healthy == 1 &&
+            ticket.error_code ==
+                static_cast<int32_t>(DeviceGenerationError::None) &&
+            ticket.transaction_count == expected_transaction_count &&
+            ticket.next_draft_depth >= loop.minimum_draft_depth &&
+            ticket.next_draft_depth <= loop.maximum_draft_depth;
+        if (!valid_ticket)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation dispatch ticket failed authentication"
+                      << " device=" << state_.device_id.toString()
+                      << " abi=" << ticket.abi_version
+                      << " session=" << ticket.sessionEpoch()
+                      << " expected_session=" << session_epoch_
+                      << " workspace=" << ticket.workspaceGeneration()
+                      << " expected_workspace=" << generation
+                      << " healthy=" << ticket.healthy
+                      << " complete=" << ticket.complete
+                      << " transaction=" << ticket.transaction_count
+                      << " expected_transaction="
+                      << expected_transaction_count
+                      << " next_depth=" << ticket.next_draft_depth
+                      << " depth_range=[" << loop.minimum_draft_depth << ','
+                      << loop.maximum_draft_depth << ']'
+                      << " error=" << ticket.error_code
+                      << " maintenance_due=" << ticket.maintenance_due);
+            return false;
+        }
+
+        hosted_device_generation_last_transaction_count_ =
+            ticket.transaction_count;
+        last_device_generation_dispatch_ticket_ = ticket;
+        *out_ticket = ticket;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_generation_dispatch_tickets_observed",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"transaction", std::to_string(ticket.transaction_count)},
+             {"next_depth", std::to_string(ticket.next_draft_depth)},
+             {"complete", ticket.complete ? "true" : "false"},
+             {"maintenance_due",
+              ticket.maintenance_due ? "true" : "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::
+        submitHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+    {
+        auto &loop = mtp_device_generation_loop_graph_;
+        const int request_count =
+            device_generation_storage_.active_request_count;
+        if (!last_device_generation_dispatch_ticket_ ||
+            !ticket.matchesLifecycle(
+                last_device_generation_dispatch_ticket_->sessionEpoch(),
+                last_device_generation_dispatch_ticket_->workspaceGeneration()) ||
+            !ticket.hasSameDispatchDecision(
+                *last_device_generation_dispatch_ticket_) ||
+            request_count != 1 || !loop.valid || !loop.launched ||
+            !loop.stream ||
+            loop.execution_kind !=
+                MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                    HostedDispatchTicketPublisher ||
+            device_generation_dispatch_ticket_copy_pending_ ||
+            hosted_device_generation_terminal_submitted_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation advance rejected a stale, altered, or overlapping ticket");
+            return false;
+        }
+
+        const size_t branch_index =
+            static_cast<size_t>(ticket.next_draft_depth);
+        const size_t branch_offset = loop.branch_offsets[branch_index];
+        const size_t branch_count =
+            loop.branch_fragment_counts[branch_index];
+        if (branch_count == 0 || branch_offset > loop.source_fragments.size() ||
+            branch_count > loop.source_fragments.size() - branch_offset)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket selected an unmaterialized depth branch "
+                      << ticket.next_draft_depth);
+            return false;
+        }
+
+        void *const scheduler_stream = loop.stream.get();
+        const DeviceControlledLoopFragment *maintenance_fragment = nullptr;
+        size_t unconditional_fragment_count = 0;
+        for (size_t index = 0; index < branch_count; ++index)
+        {
+            const DeviceControlledLoopFragment &fragment =
+                loop.source_fragments[branch_offset + index];
+            if (fragment.execution ==
+                DeviceControlledLoopFragmentExecution::Always)
+            {
+                ++unconditional_fragment_count;
+                continue;
+            }
+            if (maintenance_fragment || index + 1 != branch_count ||
+                !fragment.condition_word_device)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation branch has an ambiguous conditional fragment topology");
+                return false;
+            }
+            maintenance_fragment = &fragment;
+        }
+
+        /*
+         * The ticket describes the transaction that just committed. Its due
+         * maintenance must run before another verifier transaction consumes
+         * that state. The source branch stores maintenance as a conditional
+         * tail for CUDA composition; HIP submits that same capture here only
+         * after the device-published predicate was observed as true.
+         */
+        if (ticket.maintenance_due != 0)
+        {
+            std::shared_ptr<void> maintenance_start_event;
+            std::shared_ptr<void> maintenance_stop_event;
+            const bool measure_gpu_fragments =
+                PerfStatsCollector::gpuStageEventTimingEnabled();
+            if (measure_gpu_fragments &&
+                !beginPendingGpuTimingMeasurement(
+                    "hosted_device_generation_maintenance_gpu",
+                    scheduler_stream,
+                    &maintenance_start_event,
+                    &maintenance_stop_event))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation maintenance could not acquire its preallocated GPU timing events");
+                return false;
+            }
+            if (!maintenance_fragment || !maintenance_fragment->capture ||
+                !maintenance_fragment->capture->launchOnStream(
+                    scheduler_stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation maintenance submission failed on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            if (measure_gpu_fragments)
+            {
+                finishPendingGpuTimingMeasurement(
+                    "hosted_device_generation_maintenance_gpu",
+                    scheduler_stream,
+                    {{"depth", std::to_string(ticket.next_draft_depth)},
+                     {"transaction",
+                      std::to_string(ticket.transaction_count)},
+                     {"fragment", "device MoE maintenance"},
+                     {"nodes",
+                      std::to_string(
+                          maintenance_fragment->capture->nodeCount())}},
+                    std::move(maintenance_start_event),
+                    std::move(maintenance_stop_event));
+            }
+        }
+
+        if (ticket.complete != 0)
+        {
+            if (!publishDeviceGenerationStateReady(
+                    scheduler_stream,
+                    request_count,
+                    "hosted_device_generation_terminal"))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation terminal event publication failed");
+                std::terminate();
+            }
+            hosted_device_generation_terminal_submitted_ = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "hosted_device_generation_terminal_submissions",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"transactions",
+                  std::to_string(ticket.transaction_count)}});
+            return true;
+        }
+
+        if (unconditional_fragment_count == 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation selected an empty transaction branch");
+            return false;
+        }
+
+        const bool measure_gpu_fragments =
+            PerfStatsCollector::gpuStageEventTimingEnabled();
+        std::shared_ptr<void> transaction_start_event;
+        std::shared_ptr<void> transaction_stop_event;
+        if (measure_gpu_fragments &&
+            !beginPendingGpuTimingMeasurement(
+                "hosted_device_generation_transaction_gpu",
+                scheduler_stream,
+                &transaction_start_event,
+                &transaction_stop_event))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation transaction could not acquire its preallocated GPU timing events");
+            return false;
+        }
+
+        for (size_t index = 0; index < branch_count; ++index)
+        {
+            const DeviceControlledLoopFragment &fragment =
+                loop.source_fragments[branch_offset + index];
+            if (fragment.execution !=
+                DeviceControlledLoopFragmentExecution::Always)
+            {
+                continue;
+            }
+
+            std::shared_ptr<void> fragment_start_event;
+            std::shared_ptr<void> fragment_stop_event;
+            if (measure_gpu_fragments &&
+                !beginPendingGpuTimingMeasurement(
+                    "hosted_device_generation_fragment_gpu",
+                    scheduler_stream,
+                    &fragment_start_event,
+                    &fragment_stop_event))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation fragment could not acquire its preallocated GPU timing events"
+                          << " fragment="
+                          << (fragment.name ? fragment.name : "unnamed")
+                          << " depth=" << ticket.next_draft_depth);
+                return false;
+            }
+            if (!fragment.capture ||
+                !fragment.capture->launchOnStream(scheduler_stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation fragment submission failed"
+                          << " device=" << state_.device_id.toString()
+                          << " fragment="
+                          << (fragment.name ? fragment.name : "unnamed")
+                          << " depth=" << ticket.next_draft_depth);
+                return false;
+            }
+            if (measure_gpu_fragments)
+            {
+                finishPendingGpuTimingMeasurement(
+                    "hosted_device_generation_fragment_gpu",
+                    scheduler_stream,
+                    {{"depth", std::to_string(ticket.next_draft_depth)},
+                     {"transaction",
+                      std::to_string(ticket.transaction_count)},
+                     {"fragment_index", std::to_string(index)},
+                     {"fragment",
+                      fragment.name ? fragment.name : "unnamed"},
+                     {"nodes",
+                      std::to_string(fragment.capture->nodeCount())}},
+                    std::move(fragment_start_event),
+                    std::move(fragment_stop_event));
+            }
+        }
+
+        if (measure_gpu_fragments)
+        {
+            finishPendingGpuTimingMeasurement(
+                "hosted_device_generation_transaction_gpu",
+                scheduler_stream,
+                {{"depth", std::to_string(ticket.next_draft_depth)},
+                 {"transaction", std::to_string(ticket.transaction_count)},
+                 {"fragments",
+                  std::to_string(unconditional_fragment_count)}},
+                std::move(transaction_start_event),
+                std::move(transaction_stop_event));
+        }
+
+        last_device_generation_dispatch_ticket_.reset();
+        if (!enqueueDeviceGenerationDispatchTicketObservation())
+            return false;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "hosted_device_generation_transaction_submissions",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"depth", std::to_string(ticket.next_draft_depth)},
+             {"fragments",
+              std::to_string(unconditional_fragment_count)},
+             {"dynamic_depth_source", "device_controller_ticket"}});
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::launchDeviceResidentGeneration()
     {
         auto &loop = mtp_device_generation_loop_graph_;
@@ -40380,6 +41830,62 @@ namespace llaminar2
                       << (loop.capture && loop.capture->hasExecutable())
                       << " loop_generation=" << loop.workspace_generation
                       << " workspace_generation=" << generation);
+            return false;
+        }
+
+        if (loop.execution_kind ==
+            MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                HostedDispatchTicketPublisher)
+        {
+            const int maximum_transaction_count =
+                device_generation_storage_.response_token_stride;
+            for (int observation = 0;
+                 observation < maximum_transaction_count;
+                 ++observation)
+            {
+                sampling_math::DeviceGenerationDispatchTicket ticket;
+                if (!observeDeviceGenerationDispatchTicket(&ticket) ||
+                    !submitHostScheduledDeviceGenerationAdvance(ticket))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation loop failed at observation "
+                              << observation << " on "
+                              << state_.device_id.toString());
+                    return false;
+                }
+                if (ticket.complete != 0)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "device_generation_loop_graph_launches",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"backend", loop.capture->backendName()},
+                         {"requests", std::to_string(request_count)},
+                         {"draft_depth",
+                          std::to_string(loop.draft_depth)},
+                         {"minimum_draft_depth",
+                          std::to_string(loop.minimum_draft_depth)},
+                         {"maximum_draft_depth",
+                          std::to_string(loop.maximum_draft_depth)},
+                         {"fragments",
+                          std::to_string(loop.fragment_count)},
+                         {"conditional_fragments",
+                          std::to_string(
+                              loop.conditional_fragment_count)},
+                         {"execution",
+                          "hosted_ticket_selected_captured_transactions"}});
+                    return true;
+                }
+            }
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation controller exceeded the response-capacity transaction bound without completing");
+            return false;
+        }
+        if (loop.execution_kind !=
+            MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                NativeConditionalParent)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation launch has no materialized execution kind");
             return false;
         }
 
@@ -40466,6 +41972,7 @@ namespace llaminar2
                 request_count,
                 device_generation_storage_.response_token_stride,
                 device_generation_storage_.control_stride) ||
+            !device_generation_terminal_host_ready_event_ ||
             !stochastic_outcome_response_bridge_stream_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation result has incomplete lifecycle storage"
@@ -40547,6 +42054,10 @@ namespace llaminar2
                     device_generation_storage_.control_device,
                     sizeof(int) * control_elements,
                     state_.device_id.gpu_ordinal(),
+                    result_stream) ||
+                !backend->recordEvent(
+                    device_generation_terminal_host_ready_event_.get(),
+                    state_.device_id.gpu_ordinal(),
                     result_stream))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Terminal response failed to enqueue its response/control copies on "
@@ -40561,11 +42072,11 @@ namespace llaminar2
                 "decode",
                 state_.device_id.toString(),
                 {{"requests", std::to_string(request_count)}});
-            if (!backend->synchronizeStream(
-                    result_stream,
+            if (!backend->waitForEvent(
+                    device_generation_terminal_host_ready_event_.get(),
                     state_.device_id.gpu_ordinal()))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Terminal response stream wait failed on "
+                LOG_ERROR("[DeviceGraphOrchestrator] Terminal response event wait failed on "
                           << state_.device_id.toString());
                 return false;
             }
@@ -40820,7 +42331,7 @@ namespace llaminar2
         }
 
         /*
-         * Validation above is the sole release gate. The native parent graph
+         * Validation above is the sole release gate. The device-generation loop
          * has already committed every accepted KV/recurrent/logical-state row
          * and published the final mailbox on its exact stream. The terminal
          * bridge is an observer only: it must neither advance the host epoch nor
@@ -40834,11 +42345,16 @@ namespace llaminar2
          */
         if (!mtp_device_generation_loop_graph_.retireCompletedLaunch())
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation response could not retire exactly one native parent launch on "
+            LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation response could not retire exactly one loop launch on "
                       << state_.device_id.toString());
             return false;
         }
         device_generation_storage_.active_request_count = 0;
+        last_device_generation_dispatch_ticket_.reset();
+        device_generation_dispatch_ticket_copy_pending_ = false;
+        hosted_device_generation_scheduler_started_ = false;
+        hosted_device_generation_terminal_submitted_ = false;
+        hosted_device_generation_last_transaction_count_ = 0;
         *out_result = std::move(parsed);
         PerfStatsCollector::addCounter(
             "mtp",
@@ -40848,7 +42364,8 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"requests", std::to_string(request_count)},
              {"d2h_operations", "2"},
-             {"stream_synchronizations", "1"}});
+             {"event_waits", "1"},
+             {"stream_synchronizations", "0"}});
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_terminal_response_tokens",
@@ -40868,21 +42385,28 @@ namespace llaminar2
             state_.device_id.toString(),
             terminal_multiplier_tags);
         /*
-         * A native parent transaction is committed only after
+         * A device-resident transaction is committed only after
          * append_speculative_outcome_to_device_generation() consumes one valid
-         * compact reducer row.  Publish that causal identity explicitly.  The
-         * ordinary per-launch GPU timing event is intentionally not observed by
-         * the host inside a captured WHILE replay, so the terminal device ledger
-         * is the authoritative execution proof for this path.
+         * compact reducer row. Publish that causal identity explicitly. Native
+         * conditional replay and HIP ticket-scheduled replay differ only in
+         * outer graph submission; the terminal device ledger is authoritative
+         * for both paths.
          */
         PerfStatsCollector::Tags compact_reducer_tags =
             terminal_multiplier_tags;
         compact_reducer_tags.emplace(
             "source",
-            "captured_stochastic_compact_outcome");
+            mtp_device_generation_loop_graph_.sampling_mode ==
+                    DeviceGenerationSamplingMode::Stochastic
+                ? "captured_stochastic_compact_outcome"
+                : "captured_greedy_compact_outcome");
         compact_reducer_tags.emplace(
             "execution",
-            "native_device_generation_parent");
+            mtp_device_generation_loop_graph_.execution_kind ==
+                    MTPDeviceGenerationLoopGraphCache::ExecutionKind::
+                        NativeConditionalParent
+                ? "native_conditional_graph"
+                : "host_scheduled_captured_transactions");
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_terminal_compact_outcome_reductions",
@@ -41065,6 +42589,11 @@ namespace llaminar2
                     consumer_name);
             }
             device_generation_storage_.active_request_count = 0;
+            last_device_generation_dispatch_ticket_.reset();
+            device_generation_dispatch_ticket_copy_pending_ = false;
+            hosted_device_generation_scheduler_started_ = false;
+            hosted_device_generation_terminal_submitted_ = false;
+            hosted_device_generation_last_transaction_count_ = 0;
         }
         PerfStatsCollector::addCounter(
             "request_reset",
@@ -41574,6 +43103,34 @@ namespace llaminar2
                 stream))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to enqueue the complete GPU request-input admission");
+            return false;
+        }
+        /*
+         * The raw transfer backend owns bytes, while BufferArena owns graph
+         * coherence. Publish all three members of the admission transaction on
+         * the exact transfer stream before exposing its readiness event. A
+         * consumer may never infer authority merely from a non-null GPU pointer.
+         */
+        if (!publishPreparedArenaGraphInput(
+                BufferId::REQUEST_TOKEN_IDS,
+                request_token_ids_dev_,
+                stream,
+                state_.device_id,
+                "request_input_admission") ||
+            !publishPreparedArenaGraphInput(
+                BufferId::REQUEST_POSITION_IDS,
+                request_position_ids_dev_,
+                stream,
+                state_.device_id,
+                "request_input_admission") ||
+            !publishPreparedArenaGraphInput(
+                BufferId::REQUEST_BATCH_GEOMETRY,
+                request_batch_geometry_dev_,
+                stream,
+                state_.device_id,
+                "request_input_admission"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU request-input admission could not publish its complete arena transaction");
             return false;
         }
         if (!publishMTPRequestStopTokensOnDevice(
@@ -42146,13 +43703,12 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(
+    bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(
         int request_count,
         const SamplingParams &params,
-        int32_t *out_tokens,
         const uint64_t *stochastic_position_seeds)
     {
-        if (request_count <= 0 || !out_tokens)
+        if (request_count <= 0)
         {
             return false;
         }
@@ -42160,22 +43716,15 @@ namespace llaminar2
         {
             return false;
         }
-        if (activeMainLogitsAreColumnParallel())
+        TensorBase *logits_tensor = requireCurrentMainLogits(
+            DeviceLogitsSource::MainRequestBatch,
+            "publishMainLogitsBatchSamplesToDeviceResidentState");
+        if (current_main_logits_publication_.descriptor
+                .isColumnParallelStorage())
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Request-batched main-logits "
                       "sampling is not enabled for column-parallel LM heads");
             return false;
-        }
-
-        TensorBase *logits_tensor = nullptr;
-        if (request_batched_prefill_logits_row_count_ >= request_count &&
-            state_.all_position_logits)
-        {
-            logits_tensor = state_.all_position_logits.get();
-        }
-        else
-        {
-            logits_tensor = state_.logits.get();
         }
 
         if (!logits_tensor || !logits_tensor->deviceValid())
@@ -42220,13 +43769,16 @@ namespace llaminar2
         }
 
         const PendingLogitsStreamRole stream_role =
-            logits_tensor == state_.all_position_logits.get()
+            current_main_logits_publication_.descriptor.storage_surface ==
+                    ForwardLogitsStorageSurface::AllPositionFull ||
+                current_main_logits_publication_.descriptor.storage_surface ==
+                    ForwardLogitsStorageSurface::AllPositionLocal
                 ? PendingLogitsStreamRole::AllPositionVerifier
                 : PendingLogitsStreamRole::MainDecode;
         void *stream = peekPendingLogitsStream(stream_role);
         if (!stream)
             stream = explicitGPUStreamForOperation(
-                "sampleMainLogitsBatchRowsOnDevice");
+                "publishMainLogitsBatchSamplesToDeviceResidentState");
         if (!stream)
         {
             return false;
@@ -42235,7 +43787,7 @@ namespace llaminar2
                 stream,
                 DeviceTimelineRole::TargetSampler,
                 ForwardGraphOutputKind::Any,
-                "sampleMainLogitsBatchRowsOnDevice"))
+                "publishMainLogitsBatchSamplesToDeviceResidentState"))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Request-batched main-logits "
                       "sampling could not join ForwardGraphOutputReady");
@@ -42293,7 +43845,7 @@ namespace llaminar2
                 if (!recordStochasticTargetSampleReady(
                         row,
                         stream,
-                        /*verifier_consumer_pending=*/false))
+                        /*verifier_consumer_pending=*/true))
                 {
                     return false;
                 }
@@ -42345,8 +43897,9 @@ namespace llaminar2
 
             /*
              * Build all request distributions in one launch, then leave every
-             * sampled token in its target slot. A single batched D2H below is the
-             * response observation; it is not part of MTP planning or publication.
+             * sampled token in its target slot. The first grouped verifier and
+             * the generation controller consume these slots directly; there is
+             * no host response boundary between prefill and transaction zero.
              */
             if (!buildStochasticDistributionsOnDevice(
                     DeviceLogitsSource::AllPosition,
@@ -42389,34 +43942,19 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * The serving API must return sampled token identities to the CPU, but
-         * this one contiguous response read occurs only after the device mailbox
-         * has become authoritative. No later grouped MTP operation consumes
-         * `out_tokens` or any host shadow derived from it.
-         */
-        if (!backend->deviceToHostFast(
-                out_tokens,
-                stochastic_target_sample_tokens_dev_,
-                sizeof(int32_t) * static_cast<size_t>(request_count),
-                state_.device_id.gpu_ordinal(),
-                stream))
-        {
-            return false;
-        }
-        for (int row = 0; row < request_count; ++row)
-        {
-            if (out_tokens[row] < 0)
-                return false;
-            clearStochasticTargetSampleReadySlot(
-                row,
-                StochasticSampleReadyClearMode::Force);
-        }
         drainPendingGpuTimingMeasurements(backend);
         (void)consumePendingLogitsStream(
             stream_role,
-            "sampleMainLogitsBatchRowsOnDeviceComplete");
+            "publishMainLogitsBatchSamplesToDeviceResidentStateComplete");
         request_batched_prefill_logits_row_count_ = 0;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "request_batch_prefill_samples_published_device_resident",
+            static_cast<double>(request_count),
+            "decode",
+            state_.device_id.toString(),
+            {{"host_token_materializations", "0"},
+             {"consumer", "first_grouped_verifier_transaction"}});
         return true;
     }
 
@@ -42463,12 +44001,18 @@ namespace llaminar2
         if (!stream)
             return false;
 
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main,
+            "applyPenaltiesOnDevice");
+        const bool column_parallel =
+            current_main_logits_publication_.descriptor
+                .isColumnParallelStorage();
         bool ok = false;
-        if (activeMainLogitsAreColumnParallel())
+        if (column_parallel)
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
             ok = applyPenaltiesToTensorRowOnDevice(
-                state_.logits_local.get(),
+                main_logits,
                 state_.device_id,
                 penalties,
                 vocab_size,
@@ -42480,7 +44024,7 @@ namespace llaminar2
         else
         {
             ok = applyPenaltiesToTensorRowOnDevice(
-                state_.logits.get(),
+                main_logits,
                 state_.device_id,
                 penalties,
                 vocab_size,
@@ -42702,7 +44246,9 @@ namespace llaminar2
         IBackend *backend = getBackendFor(state_.device_id);
         TensorBase *tensor = verifier_rows
                                  ? state_.all_position_logits.get()
-                                 : state_.logits.get();
+                                 : requireCurrentMainLogits(
+                                       DeviceLogitsSource::Main,
+                                       "applyDeviceOwnedMTPPenaltiesToLogitRows");
         if (!backend || !tensor || !tensor->deviceValid() ||
             !tensor->gpu_data_ptr())
         {
@@ -42993,25 +44539,10 @@ namespace llaminar2
             return false;
         }
 
-        TensorBase *tensor = nullptr;
-        switch (source)
-        {
-        case DeviceLogitsSource::Main:
-            tensor = state_.logits.get();
-            break;
-        case DeviceLogitsSource::MTP:
-        {
-            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
-            tensor = it == state_.extension_buffers.end() ? nullptr : it->second.get();
-            break;
-        }
-        case DeviceLogitsSource::AllPosition:
-            tensor = state_.all_position_logits.get();
-            break;
-        case DeviceLogitsSource::MainRequestBatch:
-            tensor = state_.all_position_logits.get();
-            break;
-        }
+        TensorBase *tensor = resolveDeviceLogitsTensor(
+            source,
+            operation_name ? operation_name
+                           : "buildStochasticProcessedLogitRowsOnDevice");
 
         if (!tensor || !tensor->deviceValid() || !tensor->gpu_data_ptr())
             return false;
@@ -43200,25 +44731,9 @@ namespace llaminar2
             return false;
         }
 
-        TensorBase *tensor = nullptr;
-        switch (source)
-        {
-        case DeviceLogitsSource::Main:
-            tensor = state_.logits.get();
-            break;
-        case DeviceLogitsSource::MTP:
-        {
-            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
-            tensor = it == state_.extension_buffers.end() ? nullptr : it->second.get();
-            break;
-        }
-        case DeviceLogitsSource::AllPosition:
-            tensor = state_.all_position_logits.get();
-            break;
-        case DeviceLogitsSource::MainRequestBatch:
-            tensor = state_.all_position_logits.get();
-            break;
-        }
+        TensorBase *tensor = resolveDeviceLogitsTensor(
+            source,
+            "buildStochasticDistributionOnDevice");
 
         if (!tensor || !tensor->deviceValid())
             return false;
@@ -43703,10 +45218,9 @@ namespace llaminar2
         if (!backend)
             return false;
 
-        TensorBase *tensor =
-            source == DeviceLogitsSource::Main
-                ? state_.logits.get()
-                : state_.all_position_logits.get();
+        TensorBase *tensor = resolveDeviceLogitsTensor(
+            source,
+            "buildStochasticDistributionsOnDevice");
         if (!tensor || !tensor->gpu_data_ptr())
             return false;
         const auto &shape = tensor->shape();
@@ -44912,7 +46426,7 @@ namespace llaminar2
         {
             return false;
         }
-        return copyDeviceSpeculativeOutcomesToHost(handle, out);
+        return copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, out);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
@@ -44952,7 +46466,7 @@ namespace llaminar2
         {
             return false;
         }
-        return copyDeviceSpeculativeOutcomesToHost(handle, out);
+        return copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, out);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
@@ -44968,7 +46482,7 @@ namespace llaminar2
         {
             return false;
         }
-        return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
+        return copyDeviceSpeculativeOutcomesToHostForDiagnostics(handle, outcomes);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
@@ -45451,7 +46965,7 @@ namespace llaminar2
         return out_handle->valid();
     }
 
-    bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(
+    bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {

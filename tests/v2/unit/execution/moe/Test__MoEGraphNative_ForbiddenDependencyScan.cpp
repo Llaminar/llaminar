@@ -6808,8 +6808,10 @@ namespace llaminar2::test
             << "Device evidence must be stream-ordered before the existing terminal copies";
         EXPECT_EQ(countOccurrences(terminal, "deviceToHostOnStream("), 2u)
             << "LLEP observability must not add a third production D2H";
-        EXPECT_EQ(countOccurrences(terminal, "synchronizeStream("), 1u)
-            << "LLEP observability must reuse the sole terminal result wait";
+        EXPECT_EQ(countOccurrences(terminal, "synchronizeStream("), 0u)
+            << "Terminal materialization must never block an entire stream";
+        EXPECT_EQ(countOccurrences(terminal, "waitForEvent("), 1u)
+            << "LLEP observability must reuse the exact terminal-result event";
 
         const size_t diagnostic_start = orchestrator.find(
             "publishSnapshotCurrentBatchLLEPEvidenceDiagnostics()");

@@ -150,6 +150,10 @@ CATEGORY_REASONS = {
         "Explicit KV/prefix-cache export, import, or immutable host observation "
         "boundary; this is not live GPU execution state."
     ),
+    "host_dispatch": (
+        "HIP conditional-graph substitute returning one authenticated immutable "
+        "dispatch ticket; mutable generation state remains device-owned."
+    ),
     "host_result": (
         "Public API whose contract is to return a completed value to the host."
     ),
@@ -265,6 +269,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "completeMTPDiagnosticObservation", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "logMTPGraphReuseBoundaryDiagnostics", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::waitForLastForwardCompletionForBenchmark", "backend_event", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_fused_tensor_impl", "raw_stream", 2),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_with_fused_swiglu", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CuBLASGemmKernel.cu", "CuBLASGemmKernel::execute_batched_same_a", "raw_stream", 1),
@@ -316,9 +321,13 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip", "ROCmRingKVCacheTQ::exportLogicalBlock", "raw_stream", 1),
     ),
     *reviewed(
+        "host_dispatch",
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket", "backend_event", 1),
+    ),
+    *reviewed(
         "host_result",
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),

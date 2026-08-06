@@ -125,6 +125,7 @@ namespace llaminar2
             ForwardExecutionRole execution_role,
             bool is_decode,
             bool all_position_logits,
+            ForwardCompletionScope completion_scope,
             int graph_seq_len,
             int graph_batch_size)
         {
@@ -135,6 +136,7 @@ namespace llaminar2
                 .execution_role = execution_role,
                 .is_decode = is_decode,
                 .all_position_logits = all_position_logits,
+                .completion_scope = completion_scope,
                 .graph_seq_len = graph_seq_len,
                 .graph_batch_size = graph_batch_size,
             };
@@ -1376,6 +1378,7 @@ namespace llaminar2
                                : effective_input.seq_len,
                 .batch_size = effective_input.batch_size,
                 .device = effective_input.device,
+                .execution_role = effective_input.execution_role,
                 .decode = is_decode,
                 .decode_has_history = decode_has_history,
                 .all_position_logits = all_position_logits,
@@ -1392,6 +1395,10 @@ namespace llaminar2
                 .position_policy = effective_input.position_policy,
                 .uses_device_sequence_lengths =
                     input.sequence_lengths_device != nullptr,
+                .shifted_mtp_prefill_capture_identity =
+                    effective_input.shifted_mtp_prefill
+                        ? effective_input.shifted_mtp_prefill->capture_identity
+                        : uint64_t{0},
                 .standard_path = is_standard_path,
                 .pp_stage_enabled = config_.pp_stage_config.has_value(),
                 .pp_first_layer = pp_first_layer,
@@ -2575,6 +2582,7 @@ namespace llaminar2
                 input.execution_role,
                 is_decode,
                 host.computeAllPositionLogitsEnabled(),
+                forwardCompletionScopeForInput(input),
                 input.seq_len,
                 input.batch_size);
             if (input.device.is_gpu() && !output.execution.valid)
@@ -3987,6 +3995,7 @@ namespace llaminar2
                 effective_input.execution_role,
                 is_decode,
                 host.computeAllPositionLogitsEnabled(),
+                forwardCompletionScopeForInput(effective_input),
                 effective_input.seq_len,
                 effective_input.batch_size);
 

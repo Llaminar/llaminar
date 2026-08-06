@@ -252,6 +252,190 @@ namespace llaminar2::cuda
             }
         }
 
+        /**
+         * @brief Build a complete request-local shifted-prefill transaction.
+         *
+         * Each block independently derives the tiny progress record so no
+         * inter-block synchronization or auxiliary metadata launch is needed.
+         * The copy is bandwidth-oriented: every output FP32 element has one
+         * writer, while the column-zero lane also publishes that row's token and
+         * position. Padding is initialized deterministically because embedding
+         * and projection kernels execute fixed bucket geometry even though KV
+         * append consumes only the real device-published row count.
+         */
+        template <bool RowsAreFloat4Aligned>
+        __global__ void shiftedMTPPrefillPrepareFP32Kernel(
+            const float *__restrict__ input_hidden,
+            float *__restrict__ terminal_hidden_archive,
+            float *__restrict__ packed_hidden_out,
+            const int32_t *__restrict__ input_token_ids,
+            const int32_t *__restrict__ input_position_ids,
+            int32_t *__restrict__ shifted_token_ids_out,
+            int32_t *__restrict__ shifted_position_ids_out,
+            int32_t *__restrict__ append_lengths_out,
+            const int32_t *__restrict__ main_cached_tokens,
+            const int32_t *__restrict__ shifted_cached_tokens,
+            const int32_t *__restrict__ request_sequence_lengths,
+            const int32_t *__restrict__ request_row_stride_device,
+            int request_index,
+            int request_count,
+            int captured_row_stride,
+            int seq_capacity,
+            int d_model)
+        {
+            const int request_length = request_sequence_lengths[request_index];
+            const int live_row_stride = *request_row_stride_device;
+            const int main_count = *main_cached_tokens;
+            const int shifted_count = *shifted_cached_tokens;
+            const int segment_base = main_count - request_length;
+            const bool initial_segment = shifted_count == segment_base;
+            const bool continuation_bridge =
+                shifted_count >= 0 && shifted_count + 1 == segment_base;
+            const bool valid =
+                request_count > 0 && request_index >= 0 &&
+                request_index < request_count && captured_row_stride > 0 &&
+                live_row_stride > 0 &&
+                (request_count == 1 ||
+                 live_row_stride == captured_row_stride) &&
+                request_length > 0 &&
+                request_length <= live_row_stride &&
+                request_length <= captured_row_stride && segment_base >= 0 &&
+                (initial_segment || continuation_bridge) &&
+                request_count <= seq_capacity / captured_row_stride;
+            if (!valid)
+                __trap();
+
+            const int append_length = continuation_bridge
+                                          ? request_length
+                                          : request_length - 1;
+            if (blockIdx.x == 0 && threadIdx.x == 0)
+                append_lengths_out[request_index] = append_length;
+
+            const int output_request_base =
+                request_index * captured_row_stride;
+            const int hidden_request_base = output_request_base;
+            const int input_request_base = request_index * live_row_stride;
+            /*
+             * One work item owns four adjacent hidden columns. Production
+             * Qwen widths are naturally float4-aligned, so each thread issues
+             * one 128-bit load and store instead of repeating row arithmetic
+             * for four scalar grid-stride iterations. The scalar-tail
+             * specialization below preserves totality for arbitrary widths.
+             */
+            const int vector_columns = (d_model + 3) / 4;
+            const int flattened_vectors =
+                captured_row_stride * vector_columns;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int grid_stride = blockDim.x * gridDim.x;
+            for (int vector_idx = thread_index;
+                 vector_idx < flattened_vectors;
+                 vector_idx += grid_stride)
+            {
+                const int output_row_in_request =
+                    vector_idx / vector_columns;
+                const int vector_column =
+                    vector_idx - output_row_in_request * vector_columns;
+                const int column = vector_column * 4;
+                const int output_row =
+                    output_request_base + output_row_in_request;
+                const bool real_row = output_row_in_request < append_length;
+
+                const float *source_hidden = nullptr;
+                int source_token_row = input_request_base;
+                if (real_row)
+                {
+                    if (continuation_bridge && output_row_in_request == 0)
+                    {
+                        source_hidden = terminal_hidden_archive +
+                            static_cast<size_t>(request_index) * d_model;
+                    }
+                    else
+                    {
+                        const int source_hidden_row =
+                            hidden_request_base + output_row_in_request -
+                            (continuation_bridge ? 1 : 0);
+                        source_hidden = input_hidden +
+                            static_cast<size_t>(source_hidden_row) * d_model;
+                    }
+                    source_token_row =
+                        input_request_base + output_row_in_request +
+                        (initial_segment ? 1 : 0);
+                }
+
+                float *destination_hidden = packed_hidden_out +
+                    static_cast<size_t>(output_row) * d_model;
+                if constexpr (RowsAreFloat4Aligned)
+                {
+                    const float4 hidden_value = real_row
+                        ? *reinterpret_cast<const float4 *>(
+                              source_hidden + column)
+                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    *reinterpret_cast<float4 *>(destination_hidden + column) =
+                        hidden_value;
+                }
+                else
+                {
+#pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        const int scalar_column = column + lane;
+                        if (scalar_column < d_model)
+                        {
+                            destination_hidden[scalar_column] = real_row
+                                ? source_hidden[scalar_column]
+                                : 0.0f;
+                        }
+                    }
+                }
+
+                /*
+                 * The row-zero work items also own terminal publication for
+                 * their four columns. In bridge mode the old archive load
+                 * above is sequenced before this store by the same thread, so
+                 * no other block can overwrite a value before its consumer
+                 * has copied it. This ownership rule replaces a second
+                 * row-selection launch without requiring grid synchronization.
+                 */
+                if (output_row_in_request == 0)
+                {
+                    const float *terminal_source = input_hidden +
+                        static_cast<size_t>(
+                            hidden_request_base + request_length - 1) *
+                            d_model;
+                    float *terminal_destination = terminal_hidden_archive +
+                        static_cast<size_t>(request_index) * d_model;
+                    if constexpr (RowsAreFloat4Aligned)
+                    {
+                        *reinterpret_cast<float4 *>(
+                            terminal_destination + column) =
+                            *reinterpret_cast<const float4 *>(
+                                terminal_source + column);
+                    }
+                    else
+                    {
+#pragma unroll
+                        for (int lane = 0; lane < 4; ++lane)
+                        {
+                            const int scalar_column = column + lane;
+                            if (scalar_column < d_model)
+                            {
+                                terminal_destination[scalar_column] =
+                                    terminal_source[scalar_column];
+                            }
+                        }
+                    }
+                }
+
+                if (vector_column == 0)
+                {
+                    shifted_token_ids_out[output_row] =
+                        real_row ? input_token_ids[source_token_row] : int32_t{0};
+                    shifted_position_ids_out[output_row] =
+                        real_row ? input_position_ids[source_token_row] : int32_t{0};
+                }
+            }
+        }
+
         /// @brief Concatenate two [rows, hidden_dim] matrices row-wise as [embedding, hidden].
         __global__ void mtpConcatFP32Kernel(
             const float *__restrict__ hidden,
@@ -669,6 +853,109 @@ namespace llaminar2::cuda
                       << cudaGetErrorString(launch_status)
                       << " request=" << request_index
                       << " rows=" << selected_row_count
+                      << " stream=" << stream);
+            return false;
+        }
+        return true;
+    }
+
+    bool launchShiftedMTPPrefillPrepareFP32(
+        const float *input_hidden,
+        float *terminal_hidden_archive,
+        float *packed_hidden_out,
+        const int32_t *input_token_ids,
+        const int32_t *input_position_ids,
+        int32_t *shifted_token_ids_out,
+        int32_t *shifted_position_ids_out,
+        int32_t *append_lengths_out,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride_device,
+        int request_index,
+        int request_count,
+        int captured_row_stride,
+        int seq_capacity,
+        int d_model,
+        void *stream)
+    {
+        if (!input_hidden || !terminal_hidden_archive || !packed_hidden_out ||
+            !input_token_ids || !input_position_ids || !shifted_token_ids_out ||
+            !shifted_position_ids_out || !append_lengths_out ||
+            !main_cached_tokens || !shifted_cached_tokens ||
+            !request_sequence_lengths || !request_row_stride_device || !stream ||
+            request_index < 0 || request_index >= request_count ||
+            request_count <= 0 || captured_row_stride <= 0 ||
+            seq_capacity < request_count * captured_row_stride || d_model <= 0)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Shifted-MTP prefill preparation rejected an incomplete launch contract"
+                      << " request=" << request_index << "/" << request_count
+                      << " row_stride=" << captured_row_stride
+                      << " seq_capacity=" << seq_capacity
+                      << " d_model=" << d_model
+                      << " stream=" << stream);
+            return false;
+        }
+
+        constexpr int threads_per_block = 256;
+        const int vector_columns = (d_model + 3) / 4;
+        const int vectors = captured_row_stride * vector_columns;
+        const int blocks = std::max(
+            1,
+            std::min(1024, (vectors + threads_per_block - 1) / threads_per_block));
+
+        const bool rows_are_float4_aligned = d_model % 4 == 0;
+        const auto is_float4_aligned = [](const void *pointer)
+        {
+            return (reinterpret_cast<std::uintptr_t>(pointer) & 0x0fU) == 0U;
+        };
+        if (rows_are_float4_aligned &&
+            (!is_float4_aligned(input_hidden) ||
+             !is_float4_aligned(terminal_hidden_archive) ||
+             !is_float4_aligned(packed_hidden_out)))
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Shifted-MTP vector preparation requires 16-byte-aligned hidden tensors"
+                      << " input=" << input_hidden
+                      << " archive=" << terminal_hidden_archive
+                      << " output=" << packed_hidden_out);
+            return false;
+        }
+
+        const auto launch = [&]<bool RowsAreFloat4Aligned>()
+        {
+            shiftedMTPPrefillPrepareFP32Kernel<RowsAreFloat4Aligned><<<
+                blocks,
+                threads_per_block,
+                0,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                input_hidden,
+                terminal_hidden_archive,
+                packed_hidden_out,
+                input_token_ids,
+                input_position_ids,
+                shifted_token_ids_out,
+                shifted_position_ids_out,
+                append_lengths_out,
+                main_cached_tokens,
+                shifted_cached_tokens,
+                request_sequence_lengths,
+                request_row_stride_device,
+                request_index,
+                request_count,
+                captured_row_stride,
+                seq_capacity,
+                d_model);
+        };
+        if (rows_are_float4_aligned)
+            launch.template operator()<true>();
+        else
+            launch.template operator()<false>();
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Shifted-MTP prefill preparation launch failed: "
+                      << cudaGetErrorString(launch_status)
+                      << " request=" << request_index
                       << " stream=" << stream);
             return false;
         }

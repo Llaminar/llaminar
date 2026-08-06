@@ -24,6 +24,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -1208,6 +1210,257 @@ TEST(Test__CUDAHiddenStateRowSelectStage,
     cudaFree(stride_device);
     cudaFree(main_count_device);
     cudaFree(shifted_count_device);
+    cudaStreamDestroy(stream);
+#endif
+}
+
+TEST(Test__CUDAHiddenStateRowSelectStage,
+     CapturedShiftedPrefillTransactionIsExactAcrossInitialAndBridgeSegments)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    constexpr int captured_rows = 8;
+    constexpr int d_model = 32;
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+    auto hidden = makeHiddenStates(captured_rows, d_model, device, stream);
+    auto packed = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{captured_rows, d_model},
+        DeviceId::cpu());
+    auto archive = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, d_model},
+        DeviceId::cpu());
+    std::fill(
+        packed->mutable_data(),
+        packed->mutable_data() + packed->numel(),
+        0.0f);
+    std::fill(
+        archive->mutable_data(),
+        archive->mutable_data() + archive->numel(),
+        -1.0f);
+    ASSERT_TRUE(packed->allocateOnDevice(device, stream));
+    ASSERT_TRUE(archive->ensureOnDevice(device, stream));
+
+    int32_t *input_tokens = nullptr;
+    int32_t *input_positions = nullptr;
+    int32_t *shifted_tokens = nullptr;
+    int32_t *shifted_positions = nullptr;
+    int32_t *append_lengths = nullptr;
+    int32_t *request_lengths = nullptr;
+    int32_t *request_stride = nullptr;
+    int32_t *main_count = nullptr;
+    int32_t *shifted_count = nullptr;
+    const size_t row_bytes = captured_rows * sizeof(int32_t);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&input_tokens), row_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&input_positions), row_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&shifted_tokens), row_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&shifted_positions), row_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&append_lengths), sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&request_lengths), sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&request_stride), sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&main_count), sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&shifted_count), sizeof(int32_t)), cudaSuccess);
+
+    const auto upload_rows = [&](const std::array<int32_t, captured_rows> &tokens,
+                                 const std::array<int32_t, captured_rows> &positions,
+                                 int32_t length,
+                                 int32_t stride,
+                                 int32_t main_tokens,
+                                 int32_t shifted_tokens_count)
+    {
+        ASSERT_EQ(cudaMemcpyAsync(input_tokens, tokens.data(), row_bytes,
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(input_positions, positions.data(), row_bytes,
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(request_lengths, &length, sizeof(int32_t),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(request_stride, &stride, sizeof(int32_t),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(main_count, &main_tokens, sizeof(int32_t),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(shifted_count, &shifted_tokens_count,
+                                  sizeof(int32_t), cudaMemcpyHostToDevice,
+                                  stream), cudaSuccess);
+    };
+
+    const std::array<int32_t, captured_rows> initial_tokens{1, 2, 3, 4, 5, 0, 0, 0};
+    const std::array<int32_t, captured_rows> initial_positions{10, 11, 12, 13, 14, 0, 0, 0};
+    upload_rows(initial_tokens, initial_positions,
+                /*length=*/5, /*stride=*/5,
+                /*main_tokens=*/5, /*shifted_tokens_count=*/0);
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = packed.get();
+    params.seq_len = captured_rows;
+    params.d_model = d_model;
+    params.selected_row_count = captured_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            ShiftedPrefillTransaction;
+    params.request_sequence_lengths_device = request_lengths;
+    params.request_row_stride_source =
+        HiddenStateRowsSelectStage::RequestRowStrideSource::
+            ExternalDeviceScalar;
+    params.request_row_stride_device = request_stride;
+    params.input_token_ids_device = input_tokens;
+    params.input_position_ids_device = input_positions;
+    params.shifted_token_ids_output_device = shifted_tokens;
+    params.shifted_position_ids_output_device = shifted_positions;
+    params.shifted_append_lengths_output_device = append_lengths;
+    params.terminal_hidden_archive = archive.get();
+    params.main_cached_tokens_by_request = {main_count};
+    params.shifted_cached_tokens_by_request = {shifted_count};
+    params.request_count = 1;
+    params.terminal_hidden_archive_buffer_id =
+        BufferId::PREFIX_TERMINAL_HIDDEN;
+    HiddenStateRowsSelectStage stage(std::move(params));
+    stage.setGPUStream(stream);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+                  cudaSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    size_t graph_node_count = 0;
+    ASSERT_EQ(
+        cudaGraphGetNodes(graph, nullptr, &graph_node_count),
+        cudaSuccess);
+    EXPECT_EQ(graph_node_count, 1U)
+        << "The shifted-prefill payload and terminal archive must remain one fused transaction";
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+              cudaSuccess);
+
+    const auto download_transaction = [&]()
+    {
+        struct Result
+        {
+            std::vector<float> hidden;
+            std::array<int32_t, captured_rows> tokens{};
+            std::array<int32_t, captured_rows> positions{};
+            std::array<float, d_model> archive{};
+            int32_t append_length = -1;
+        } result;
+        result.hidden.resize(
+            static_cast<size_t>(captured_rows) * d_model);
+        EXPECT_EQ(cudaMemcpyAsync(result.hidden.data(), packed->gpu_data_ptr(),
+                                  result.hidden.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        EXPECT_EQ(cudaMemcpyAsync(result.tokens.data(), shifted_tokens, row_bytes,
+                                  cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        EXPECT_EQ(cudaMemcpyAsync(result.positions.data(), shifted_positions, row_bytes,
+                                  cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        EXPECT_EQ(cudaMemcpyAsync(&result.append_length, append_lengths,
+                                  sizeof(int32_t), cudaMemcpyDeviceToHost,
+                                  stream), cudaSuccess);
+        EXPECT_EQ(cudaMemcpyAsync(result.archive.data(), archive->gpu_data_ptr(),
+                                  d_model * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        return result;
+    };
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    const auto initial = download_transaction();
+    EXPECT_EQ(initial.append_length, 4);
+    EXPECT_EQ(initial.tokens,
+              (std::array<int32_t, captured_rows>{2, 3, 4, 5, 0, 0, 0, 0}));
+    EXPECT_EQ(initial.positions,
+              (std::array<int32_t, captured_rows>{11, 12, 13, 14, 0, 0, 0, 0}));
+    for (int row = 0; row < captured_rows; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            const float expected = row < 4
+                                       ? hidden->data()[static_cast<size_t>(row) * d_model + column]
+                                       : 0.0f;
+            EXPECT_FLOAT_EQ(initial.hidden[static_cast<size_t>(row) * d_model + column], expected);
+        }
+    }
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(initial.archive[static_cast<size_t>(column)],
+                        hidden->data()[static_cast<size_t>(4) * d_model + column]);
+    }
+
+    std::vector<float> continuation_hidden(
+        static_cast<size_t>(captured_rows) * d_model,
+        0.0f);
+    for (int row = 0; row < 3; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            continuation_hidden[static_cast<size_t>(row) * d_model + column] =
+                1000.0f + 10.0f * row + 0.125f * column;
+        }
+    }
+    ASSERT_EQ(cudaMemcpyAsync(hidden->gpu_data_ptr(), continuation_hidden.data(),
+                              continuation_hidden.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream), cudaSuccess);
+    const std::array<int32_t, captured_rows> bridge_tokens{6, 7, 8, 0, 0, 0, 0, 0};
+    const std::array<int32_t, captured_rows> bridge_positions{15, 16, 17, 0, 0, 0, 0, 0};
+    upload_rows(bridge_tokens, bridge_positions,
+                /*length=*/3, /*stride=*/3,
+                /*main_tokens=*/8, /*shifted_tokens_count=*/4);
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    const auto bridge = download_transaction();
+    EXPECT_EQ(bridge.append_length, 3);
+    EXPECT_EQ(bridge.tokens,
+              (std::array<int32_t, captured_rows>{6, 7, 8, 0, 0, 0, 0, 0}));
+    EXPECT_EQ(bridge.positions,
+              (std::array<int32_t, captured_rows>{15, 16, 17, 0, 0, 0, 0, 0}));
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(column)],
+            initial.archive[static_cast<size_t>(column)]);
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(d_model) + column],
+            continuation_hidden[static_cast<size_t>(column)]);
+        EXPECT_FLOAT_EQ(
+            bridge.hidden[static_cast<size_t>(2 * d_model) + column],
+            continuation_hidden[static_cast<size_t>(d_model) + column]);
+        EXPECT_FLOAT_EQ(
+            bridge.archive[static_cast<size_t>(column)],
+            continuation_hidden[static_cast<size_t>(2 * d_model) + column]);
+    }
+    for (int row = 3; row < captured_rows; ++row)
+    {
+        for (int column = 0; column < d_model; ++column)
+        {
+            EXPECT_FLOAT_EQ(
+                bridge.hidden[static_cast<size_t>(row) * d_model + column],
+                0.0f);
+        }
+    }
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaFree(input_tokens);
+    cudaFree(input_positions);
+    cudaFree(shifted_tokens);
+    cudaFree(shifted_positions);
+    cudaFree(append_lengths);
+    cudaFree(request_lengths);
+    cudaFree(request_stride);
+    cudaFree(main_count);
+    cudaFree(shifted_count);
     cudaStreamDestroy(stream);
 #endif
 }

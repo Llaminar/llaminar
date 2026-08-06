@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/GDNDeviceStateBinding.h"
 
 #include <algorithm>
 #include <array>
@@ -777,6 +778,53 @@ TEST(
     EXPECT_EQ(handoff.find("allocateGPUState("), std::string::npos);
 }
 
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    SingleGeometryGDNBindingRequiresCanonicalRequestZeroAlias)
+{
+    std::array<float, 16> request_states{};
+    std::array<float, 8> duplicate_scalar_state{};
+
+    llaminar2::GDNDeviceStateBinding canonical{
+        .primary_state = request_states.data(),
+        .primary_state_floats = 8,
+        .request_state_bank = request_states.data(),
+        .request_state_bank_floats = request_states.size(),
+        .request_capacity = 2,
+    };
+    EXPECT_TRUE(canonical.valid());
+
+    auto duplicate_owner = canonical;
+    duplicate_owner.primary_state = duplicate_scalar_state.data();
+    EXPECT_FALSE(duplicate_owner.valid())
+        << "Single-geometry GPU GDN state must not create a second request-zero owner";
+}
+
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    DistinctGeometryGDNBindingKeepsScalarBanksOutsidePackedRequests)
+{
+    std::array<float, 8> local_state{};
+    std::array<float, 16> full_state{};
+    std::array<float, 32> request_states{};
+
+    llaminar2::GDNDeviceStateBinding distinct{
+        .primary_state = local_state.data(),
+        .primary_state_floats = static_cast<int>(local_state.size()),
+        .secondary_state = full_state.data(),
+        .secondary_state_floats = static_cast<int>(full_state.size()),
+        .request_state_bank = request_states.data(),
+        .request_state_bank_floats = request_states.size(),
+        .request_capacity = 2,
+    };
+    EXPECT_TRUE(distinct.valid());
+
+    auto overlapping = distinct;
+    overlapping.secondary_state = request_states.data();
+    EXPECT_FALSE(overlapping.valid())
+        << "Mixed-stride LocalTP geometry must not overlap a scalar owner with the packed bank";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
 {
     const int max_seq_len = 9;
@@ -1324,9 +1372,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
         << "The orchestrator must publish its typed role into execution provenance.";
     EXPECT_NE(
         compact_forward_impl.find(
+            "constboolmain_prefill="
             "new_phase==InferencePhase::PREFILL&&"
-            "execution_role==ForwardExecutionRole::MainInference&&"
-            "!populateMTPShiftedCacheFromPrefill("),
+            "execution_role==ForwardExecutionRole::MainInference"),
+        std::string::npos)
+        << "The named prefill policy must retain both the phase and typed-role "
+           "requirements.";
+    EXPECT_NE(
+        compact_forward_impl.find(
+            "elseif(main_prefill&&!populateMTPShiftedCacheFromPrefill("),
         std::string::npos)
         << "Only a real main-inference prefill may populate shifted MTP state; "
            "a grouped verifier can share its shape and all-position output policy.";
@@ -1774,7 +1828,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MainLogitsDeviceConsumersJoinDurableFor
         "int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(")));
     const auto batched = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(",
+        "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(",
         "bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(")));
 
     EXPECT_NE(
@@ -2710,7 +2764,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
         << "Long-lived producer ordering belongs to a durable event, not a retained raw stream.";
     EXPECT_NE(
         removeAsciiWhitespace(stripCommentsAndStringLiterals(source)).find(
-            "publishForwardGraphOutputReady(output.execution)"),
+            "publishForwardGraphOutputReady(output)"),
         std::string::npos)
         << "Every successful forward must publish its invocation-scoped stream before it can be invalidated.";
     EXPECT_NE(
@@ -3031,7 +3085,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenGpuPublicationHasTyped
               std::string::npos);
     EXPECT_NE(
         stage_execute.find(
-            "!request_terminal_rows&&!fixed_contiguous_rows&&!shifted_prefill_progress&&!uploadGpuSelectedRows()"),
+            "!request_terminal_rows&&!fixed_contiguous_rows&&!shifted_prefill_progress&&!shifted_prefill_transaction&&!uploadGpuSelectedRows()"),
         std::string::npos)
         << "Every device-owned row source must bypass pinned host metadata upload.";
     EXPECT_NE(stage_execute.find("launchDeviceKVProgressRowsSelectFP32("),
@@ -4125,7 +4179,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPResidentOutcomeHostBridgeQueuesD2HBe
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const auto body = sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(",
+        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
         "    bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(");
     const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
 
@@ -5294,8 +5348,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, TerminalDeviceGenerationBridgeIsSingleA
         << "Response tokens and controller words must be queued together.";
     EXPECT_EQ(
         countOccurrences(terminal_bridge, "synchronizeStream("),
+        0u)
+        << "Terminal materialization must not drain an execution stream.";
+    EXPECT_EQ(
+        countOccurrences(terminal_bridge, "recordEvent("),
         1u)
-        << "The complete generation has exactly one host-blocking boundary.";
+        << "The terminal copies must publish one exact completion event.";
+    EXPECT_EQ(
+        countOccurrences(terminal_bridge, "waitForEvent("),
+        1u)
+        << "The sole terminal host boundary waits only for its own result event.";
     EXPECT_EQ(
         terminal_bridge.find("deviceToHostFast("),
         std::string::npos);
@@ -5365,8 +5427,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "bool DeviceGraphOrchestrator::publishDeviceGenerationStateReady(",
         "bool DeviceGraphOrchestrator::consumeDeviceGenerationStateReady(");
 
-    EXPECT_EQ(countOccurrences(setup, "backend->memset("), 2u)
-        << "Setup must initialize the response ledger and controller directly on device.";
+    EXPECT_EQ(countOccurrences(setup, "backend->memset("), 3u)
+        << "Setup must initialize the response ledger, controller, and dispatch ticket directly on device.";
     EXPECT_NE(
         setup.find("publishDeviceGenerationArenaState("),
         std::string::npos);
@@ -5377,13 +5439,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         countOccurrences(
             arena_publication,
             "publishPreparedArenaGraphInput("),
-        2u)
-        << "The response ledger and controller are one arena publication transaction.";
+        3u)
+        << "The response ledger, controller, and dispatch ticket are one arena publication transaction.";
     EXPECT_NE(
         arena_publication.find("BufferId::MTP_GENERATION_RESPONSE_TOKENS"),
         std::string::npos);
     EXPECT_NE(
         arena_publication.find("BufferId::MTP_GENERATION_CONTROL"),
+        std::string::npos);
+    EXPECT_NE(
+        arena_publication.find(
+            "BufferId::MTP_GENERATION_DISPATCH_TICKETS"),
         std::string::npos);
 
     const size_t arena_edge = lifecycle_publication.find(
@@ -5396,126 +5462,159 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "The private readiness token cannot outrun arena authority.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticAllPositionPathKeepsResidentOutcomeHandleVisible)
+/**
+ * @brief Prove HIP scheduling observes decisions without importing state.
+ *
+ * HIP cannot encode the outer dynamic-depth loop as conditional graph nodes.
+ * Its host scheduler may therefore observe one immutable dispatch ticket, but
+ * the ticket copy must remain the only intermediate D2H operation. The device
+ * publishes the ticket, the host authenticates lifecycle and rank agreement,
+ * and every retained graph fragment is submitted on the exact scheduler stream
+ * before another ticket is observed. No compact outcome, cache state, response
+ * row, or controller row may cross this boundary.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     HostedGenerationSchedulerObservesOnlyAuthenticatedTickets)
+{
+    const auto root = repoRoot();
+    const auto device_source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto rank_source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+
+    const auto ticket_submission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            device_source,
+            "enqueueDeviceGenerationDispatchTicketObservation()",
+            "bool DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket(")));
+    const auto ticket_observation = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            device_source,
+            "bool DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket(",
+            "submitHostScheduledDeviceGenerationAdvance(")));
+    const auto branch_submission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            device_source,
+            "submitHostScheduledDeviceGenerationAdvance(",
+            "bool DeviceGraphOrchestrator::launchDeviceResidentGeneration(")));
+    const auto rank_observation = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            rank_source,
+            "bool RankOrchestrator::observeDeviceGenerationDispatchTicket(",
+            "bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(")));
+    const auto rank_submission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            rank_source,
+            "bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(",
+            "bool RankOrchestrator::launchDeviceResidentGeneration(")));
+
+    const size_t graph_launch = ticket_submission.find("launchOnStream(");
+    const size_t ticket_copy =
+        ticket_submission.find("deviceToHostOnStream(");
+    const size_t event_publish = ticket_submission.find("recordEvent(");
+    ASSERT_NE(graph_launch, std::string::npos);
+    ASSERT_NE(ticket_copy, std::string::npos);
+    ASSERT_NE(event_publish, std::string::npos);
+    EXPECT_LT(graph_launch, ticket_copy);
+    EXPECT_LT(ticket_copy, event_publish);
+    EXPECT_EQ(
+        countOccurrences(ticket_submission, "deviceToHostOnStream("),
+        1u)
+        << "One immutable dispatch ticket is the only hosted-loop D2H payload.";
+    EXPECT_NE(
+        ticket_submission.find(
+            "sizeof(sampling_math::DeviceGenerationDispatchTicket)"),
+        std::string::npos);
+
+    EXPECT_EQ(countOccurrences(ticket_observation, "waitForEvent("), 1u);
+    EXPECT_NE(ticket_observation.find("matchesLifecycle("), std::string::npos);
+    EXPECT_NE(
+        ticket_observation.find(
+            "ticket.transaction_count==expected_transaction_count"),
+        std::string::npos);
+    EXPECT_NE(
+        branch_submission.find("ticket.hasSameDispatchDecision("),
+        std::string::npos);
+    EXPECT_NE(
+        branch_submission.find(
+            "static_cast<size_t>(ticket.next_draft_depth)"),
+        std::string::npos)
+        << "The device-owned dynamic controller must select the retained branch.";
+    EXPECT_NE(branch_submission.find("launchOnStream("), std::string::npos);
+    EXPECT_EQ(branch_submission.find("waitForEvent("), std::string::npos)
+        << "Submitting a captured transaction is asynchronous.";
+
+    EXPECT_NE(
+        rank_observation.find("authoritative.hasSameDispatchDecision("),
+        std::string::npos)
+        << "Every participant must publish the same scheduling decision.";
+    EXPECT_NE(
+        rank_submission.find(
+            "submitHostScheduledDeviceGenerationAdvance(rank_hosted_device_generation_tickets_[participant_index])"),
+        std::string::npos)
+        << "All participant branches must be submitted before the next ticket wait.";
+
+    const std::array<const char *, 8> forbidden = {
+        "hostToDevice",
+        "materializeDeviceSpeculativeOutcomesForHostResponse(",
+        "copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
+        "synchronizeStream(",
+        "synchronizeDevice(",
+        "cudaStreamSynchronize(",
+        "hipStreamSynchronize(",
+        "GraphReplayPlanPolicy::AllowSegmented"};
+    for (const char *needle : forbidden)
+    {
+        EXPECT_EQ(ticket_submission.find(needle), std::string::npos);
+        EXPECT_EQ(ticket_observation.find(needle), std::string::npos);
+        EXPECT_EQ(branch_submission.find(needle), std::string::npos);
+    }
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ScalarStochasticMTPRemainsDeviceResidentUntilTerminalResult)
 {
     const auto source =
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
     const auto body = sliceBetween(
         source,
-        "if (batched_device_rejection)",
-        "if (!used_device_batch_outcome &&");
-    const auto publication_body = sliceBetween(
-        source,
-        "if (!state_published_from_device_outcome)\n"
-        "            {",
-        "int correction_forward_count = 0;");
-    const auto correction_body = sliceBetween(
-        source,
-        "int correction_forward_count = 0;",
-        "std::vector<int32_t> accepted_tokens =");
-    const auto initial_shifted_body = sliceBetween(
-        source,
-        "const bool first_shifted_row_available_from_sidecar",
-        "const MTPSpecDecodeVerifierInputPlan verifier_input_plan");
-    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
-    const auto compact_publication =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(publication_body));
-    const auto compact_correction =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(correction_body));
-    const auto compact_initial_shifted =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(initial_shifted_body));
+        "if (stochastic_verify && grouped_outcome_device_resident_publication)",
+        "if (!stochastic_verify && grouped_outcome_device_resident_publication)");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
 
-    /*
-     * Phase 10's direct-publication path needs the compact device verifier
-     * handle to remain visible in the runner.  Calling the legacy
-     * host-returning verifier here would hide the ownership boundary inside the
-     * runner implementation and make it much harder to move accepted-state
-     * publication onto device later.
-     */
-    EXPECT_NE(compact.find("DeviceSpeculativeOutcomeHandledevice_outcome_handle;"),
-              std::string::npos);
-    EXPECT_NE(compact.find(
-                  "verifyStochasticDistributionsBatchOutcomeOnDeviceResident("),
-              std::string::npos);
-    EXPECT_NE(compact.find(
-                  "verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident("),
-              std::string::npos);
-    EXPECT_NE(compact.find("supportsDeviceResidentMTPSpecStatePublication()"),
-              std::string::npos);
-    EXPECT_NE(compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome("),
-              std::string::npos);
-    EXPECT_NE(compact.find("materializeDeviceSpeculativeOutcomesForHostResponse("),
-              std::string::npos);
-    const size_t direct_publish =
-        compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
-    const size_t host_bridge = compact.find("copyDeviceSpeculativeOutcomesToHost(");
-    const size_t host_response_materialize =
-        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
+    const size_t resident_verify = compact.find(
+        "verifyStochasticDistributionsBatchOutcomeOnDeviceResident(");
+    const size_t direct_publish = compact.find(
+        "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(", resident_verify);
+    const size_t terminal_generation = compact.find(
+        "completeDeviceResidentGeneration(publication_request,"
+        "DeviceGenerationSamplingMode::Stochastic",
+        direct_publish);
+    ASSERT_NE(resident_verify, std::string::npos);
     ASSERT_NE(direct_publish, std::string::npos);
-    ASSERT_NE(host_response_materialize, std::string::npos);
-    EXPECT_EQ(host_bridge, std::string::npos)
-        << "The all-position path should call the named host-response materializer, "
-           "not the low-level D2H copy hook directly.";
-    EXPECT_LT(direct_publish, host_response_materialize)
-        << "Device-resident state publication must run before the "
-           "compatibility host-response materialization.";
-    EXPECT_EQ(compact.find(
-                  "verifyStochasticDistributionsBatchOutcomeOnDevice("),
-              std::string::npos)
-        << "The all-position stochastic path must enqueue a resident outcome "
-           "first; the host-returning verifier API is compatibility-only.";
-    EXPECT_EQ(compact.find(
-                  "verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken("),
-              std::string::npos)
-        << "Device-first stochastic outcome reduction must keep the resident "
-           "handle visible before bridging to host.";
+    ASSERT_NE(terminal_generation, std::string::npos);
+    EXPECT_LT(resident_verify, direct_publish);
+    EXPECT_LT(direct_publish, terminal_generation);
+    EXPECT_NE(
+        compact.find("device_generation_controller_owned", direct_publish),
+        std::string::npos)
+        << "The terminal graph may run only while the device controller owns the transaction.";
 
-    EXPECT_NE(compact_publication.find("publishAcceptedMTPSpecStateBatch("),
-              std::string::npos)
-        << "The non-resident branch still owns host-plan publication.";
-    EXPECT_NE(compact_publication.find("deviceResidentLogicalSequenceState()"),
-              std::string::npos)
-        << "The resident branch must validate the typed resident mailbox instead "
-           "of adopting backend host mirrors.";
-    EXPECT_NE(compact_publication.find("!resident_state.valid()"),
-              std::string::npos)
-        << "Resident publication must fail closed if publication produced no "
-           "typed logical-state mailbox.";
-    EXPECT_EQ(compact_publication.find("adoptDeviceResidentMTPSpecPublishedHostState("),
-              std::string::npos)
-        << "Scalar resident publication must not require backend host-state adoption.";
-
-    EXPECT_EQ(compact_correction.find(
-                  "commitMTPShiftedRowFromDeviceResidentLogicalState("),
-              std::string::npos)
-        << "A rejected correction token is only a pending verifier condition. "
-           "It must not append shifted MTP KV until the next step consumes it.";
-    EXPECT_EQ(compact_correction.find(
-                  "commitMTPShiftedRowFromCurrentTerminalHidden("),
-              std::string::npos)
-        << "The legacy host-token helper must not append shifted KV for a "
-           "deferred correction row either.";
-    EXPECT_NE(correction_body.find(
-                  "\"all_position_deferred_correction_condition_tokens\""),
-              std::string::npos)
-        << "The correction branch should remain visible as pending-condition "
-           "accounting, not as a shifted-cache mutation.";
-    EXPECT_EQ(compact_initial_shifted.find(
-                  "commitMTPShiftedRowFromCurrentTerminalHidden("),
-              std::string::npos)
-        << "All-position state publication must not synthesize the initial "
-           "shifted-MTP row from a host-visible token; only explicit sidecar "
-           "reuse or accepted verifier-row publication may own that state.";
-    EXPECT_EQ(compact_initial_shifted.find(
-                  "commitMTPShiftedRowFromDeviceTargetSample("),
-              std::string::npos)
-        << "The device-sampled first token is also only an output until a "
-           "published verifier row proves the matching state boundary.";
-    EXPECT_NE(initial_shifted_body.find(
-                  "\"all_position_initial_shifted_deferred_to_verifier_rows\""),
-              std::string::npos)
-        << "The non-reuse branch should be explicit in perf stats so future "
-           "profiling can distinguish sidecar reuse from verifier-row publication.";
+    const std::array<const char *, 6> forbidden = {
+        "materializeDeviceSpeculativeOutcomesForHostResponse(",
+        "copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
+        "deviceToHost",
+        "synchronizeStream(",
+        "synchronizeDevice(",
+        "GraphReplayPlanPolicy::AllowSegmented"};
+    for (const char *needle : forbidden)
+    {
+        EXPECT_EQ(compact.find(needle), std::string::npos)
+            << "Scalar stochastic MTP contains a forbidden intermediate host boundary: "
+            << needle;
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticAllPositionPathKeepsCompactBonusUntilProcessedBonusGate)
@@ -5524,8 +5623,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticAllPositionPathKeepsCompac
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
     const auto body = sliceBetween(
         source,
-        "if (batched_device_rejection)",
-        "if (!used_device_batch_outcome &&");
+        "if (stochastic_verify && grouped_outcome_device_resident_publication)",
+        "if (!stochastic_verify && grouped_outcome_device_resident_publication)");
     const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
 
     /*
@@ -5559,105 +5658,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticAllPositionPathKeepsCompac
            "target-preparation graph through the retired eager row builder.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, MTPResidentPublicationPrelaunchesBeforeHostBridge)
-{
-    const auto source =
-        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
-    const auto body = sliceBetween(
-        source,
-        "if (batched_device_rejection)",
-        "if (!used_device_batch_outcome &&");
-    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
-    const auto full_compact =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
-
-    /*
-     * vLLM overlaps host response materialization with already-resident GPU
-     * state work.  Llaminar's Phase 10 bridge follows the same shape for
-     * stochastic lanes: publish accepted state on device, enqueue the next
-     * first sidecar from the resident mailbox, then run the compatibility
-     * host-response materializer.  Stop handling is still host-visible at the
-     * response boundary, so completed requests must discard prelaunch work.
-     */
-    const size_t direct_publish =
-        compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
-    const size_t prelaunch_gate =
-        compact.find("constboolcan_prelaunch_next_first_sidecar=");
-    const size_t prelaunch_enqueue =
-        compact.find("forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(",
-                     prelaunch_gate);
-    const size_t host_response_materialize =
-        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
-
-    ASSERT_NE(direct_publish, std::string::npos);
-    ASSERT_NE(prelaunch_gate, std::string::npos);
-    ASSERT_NE(prelaunch_enqueue, std::string::npos);
-    ASSERT_NE(host_response_materialize, std::string::npos);
-    EXPECT_LT(direct_publish, prelaunch_gate);
-    EXPECT_LT(prelaunch_gate, prelaunch_enqueue);
-    EXPECT_LT(prelaunch_enqueue, host_response_materialize)
-        << "The first sidecar for the next step must be queued before the "
-           "host outcome bridge can synchronize for served tokens.";
-    EXPECT_NE(source.find(
-                  "\"stochastic_first_sidecar_prelaunch_reuses\""),
-              std::string::npos)
-        << "The following decode step must have an explicit reuse path for "
-           "the sidecar queued before host materialization.";
-    EXPECT_NE(source.find(
-                  "\"stochastic_first_sidecar_prelaunch_discarded_complete\""),
-              std::string::npos)
-        << "A stop-token completion must discard any sidecar prelaunched "
-           "before host-visible response materialization.";
-}
-
-TEST(Test__GpuWorkspaceAllocationPolicy, GroupedGreedyResidentPublicationPrelaunchesBeforeHostBridge)
-{
-    const auto source =
-        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
-    const auto body = sliceBetween(
-        source,
-        "if (!stochastic_verify && grouped_outcome_device_resident_publication)",
-        "if (!catchup.ok)\n                {");
-    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
-    const auto compact_raw = removeAsciiWhitespace(body);
-
-    const size_t direct_publish =
-        compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
-    const size_t prelaunch_gate =
-        compact.find("constboolcan_prelaunch_next_first_sidecar=");
-    const size_t mailbox =
-        compact.find("runner_->deviceResidentLogicalSequenceState()", prelaunch_gate);
-    const size_t prelaunch_enqueue =
-        compact.find("forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(",
-                     prelaunch_gate);
-    const size_t host_response_materialize =
-        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
-
-    ASSERT_NE(direct_publish, std::string::npos);
-    ASSERT_NE(prelaunch_gate, std::string::npos);
-    ASSERT_NE(mailbox, std::string::npos);
-    ASSERT_NE(prelaunch_enqueue, std::string::npos);
-    ASSERT_NE(host_response_materialize, std::string::npos);
-    EXPECT_LT(direct_publish, prelaunch_gate)
-        << "Grouped greedy prelaunch must wait until accepted state has been "
-           "published from compact device metadata.";
-    EXPECT_LT(prelaunch_gate, mailbox);
-    EXPECT_LT(mailbox, prelaunch_enqueue);
-    EXPECT_LT(prelaunch_enqueue, host_response_materialize)
-        << "Grouped greedy should queue the resident continuation before the "
-           "response-only D2H bridge.";
-    EXPECT_NE(compact_raw.find("\"prelaunch_timing\",\"pre_bridge\""),
-              std::string::npos);
-    EXPECT_EQ(compact_raw.find("\"prelaunch_timing\",\"post_bridge\""),
-              std::string::npos)
-        << "The grouped greedy resident continuation should not wait for "
-           "host-response materialization.";
-    EXPECT_NE(compact_raw.find("\"timing\",\"post_publication_response_bridge\""),
-              std::string::npos)
-        << "The bridge must remain explicitly response-only after publication.";
-}
-
-TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnResponseReadyEvent)
+TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchStochasticOutcomeDiagnosticProbeWaitsOnResponseReadyEvent)
 {
     const auto interface_source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h");
@@ -5670,10 +5671,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
     const auto resident_verify_body = sliceBetween(
         dgo_source,
         "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
-        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(");
+        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(");
     const auto host_bridge_body = sliceBetween(
         dgo_source,
-        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(",
+        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
         "bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(");
     const auto compact_handle =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(handle_body));
@@ -5701,10 +5702,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
            "the response-only bridge. A host-plan bridge invites state "
            "publication to depend on D2H metadata again.";
     EXPECT_NE(compact_interface.find(
-                  "returncopyDeviceSpeculativeOutcomesToHost(handle,outcomes);"),
+                  "copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
               std::string::npos)
-        << "The response-only materializer should delegate directly to the "
-           "low-level compact D2H hook, not through a host-plan adapter.";
+        << "Parity probes need one explicitly diagnostic compact D2H surface.";
+    EXPECT_EQ(compact_interface.find(
+                  "materializeDeviceSpeculativeOutcomesForHostResponse("),
+              std::string::npos)
+        << "The obsolete production-sounding response materializer must not remain as an alias.";
     EXPECT_NE(compact_verify.find(
                   "acquirePersistentMTPOutcomeReadyEvent("),
               std::string::npos)
@@ -5836,7 +5840,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
             },
             {
                 "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
-                "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(",
+                "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
                 "request-batch stochastic compact outcome",
             },
         }};
@@ -6074,8 +6078,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(");
     const auto greedy_runner_body = sliceBetween(
         runner_source,
-        "const bool use_greedy_device_batch_outcome =",
-        "else\n                {");
+        "if (!stochastic_verify && grouped_outcome_device_resident_publication)",
+        "return fail_after_checkpoint(\n"
+        "            std::string(\"MTP verifier policy selected unsupported path:");
     const auto cuda_greedy_summary_kernel = sliceBetween(
         cuda_sampling,
         "cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(",
@@ -6227,21 +6232,42 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         compact_greedy_runner.find(
             "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(",
             resident_verify);
-    const size_t host_materialize =
+    const size_t terminal_generation =
         compact_greedy_runner.find(
-            "materializeDeviceSpeculativeOutcomesForHostResponse(",
+            "completeDeviceResidentGeneration(publication_request,"
+            "DeviceGenerationSamplingMode::Greedy",
             direct_publish);
     ASSERT_NE(resident_verify, std::string::npos);
     ASSERT_NE(direct_publish, std::string::npos);
-    ASSERT_NE(host_materialize, std::string::npos);
+    ASSERT_NE(terminal_generation, std::string::npos);
     EXPECT_EQ(legacy_verify, std::string::npos)
         << "The greedy GPU all-position runner path must consume the resident "
            "compact outcome handle directly, not hide D2H inside the legacy "
            "host-returning verifier.";
     EXPECT_LT(resident_verify, direct_publish);
-    EXPECT_LT(direct_publish, host_materialize)
-        << "Device-resident greedy publication must happen before the "
-           "compatibility host response bridge.";
+    EXPECT_LT(direct_publish, terminal_generation)
+        << "Device-resident greedy publication must flow directly into the "
+           "terminal device-generation ledger.";
+    EXPECT_NE(
+        compact_greedy_runner.find(
+            "device_generation_controller_owned",
+            direct_publish),
+        std::string::npos)
+        << "The terminal graph may run only while the device controller owns the transaction.";
+
+    const std::array<const char *, 6> forbidden_greedy_boundaries = {
+        "materializeDeviceSpeculativeOutcomesForHostResponse(",
+        "copyDeviceSpeculativeOutcomesToHostForDiagnostics(",
+        "deviceToHost",
+        "synchronizeStream(",
+        "synchronizeDevice(",
+        "GraphReplayPlanPolicy::AllowSegmented"};
+    for (const char *needle : forbidden_greedy_boundaries)
+    {
+        EXPECT_EQ(compact_greedy_runner.find(needle), std::string::npos)
+            << "Scalar greedy MTP contains a forbidden intermediate host boundary: "
+            << needle;
+    }
 
     ASSERT_NE(sidecar_body.find(
                   "forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot("),
@@ -6448,11 +6474,14 @@ TEST(
         countOccurrences(
             compact_runner,
             "prepare_grouped_gpu_verifier_input_tokens"),
-        5u)
-        << "One definition plus all four verifier consumers must share the same ownership policy.";
+        4u)
+        << "One definition plus the sidecar probe, stochastic verifier, and greedy verifier must share the same ownership policy.";
+    EXPECT_NE(runner_source.find("\"sidecar_preservation_probe\""), std::string::npos);
+    EXPECT_NE(runner_source.find("\"grouped_stochastic_verifier\""), std::string::npos);
+    EXPECT_NE(runner_source.find("\"grouped_greedy_verifier\""), std::string::npos);
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBeforeHostBridge)
+TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesThenLaunchesCompleteDeviceGeneration)
 {
     const auto runner_source =
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
@@ -6497,18 +6526,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBef
               std::string::npos)
         << "Request-batched resident publication must not require backend "
            "host-state metadata adoption.";
-    EXPECT_NE(compact.find("materializeDeviceSpeculativeOutcomesForHostResponse("),
+    EXPECT_EQ(compact.find("materializeDeviceSpeculativeOutcomesForHostResponse("),
               std::string::npos)
-        << "The compact D2H bridge is allowed only for response tokens and "
-           "sampler bookkeeping after publication.";
+        << "GPU request batches must not materialize an intermediate response outcome.";
     EXPECT_EQ(compact.find("materializeDeviceSpeculativeOutcomesForHostPlan("),
               std::string::npos)
         << "Request-batched resident publication must not use the legacy "
            "host-plan bridge.";
-    EXPECT_EQ(compact.find("copyDeviceSpeculativeOutcomesToHost("),
+    EXPECT_EQ(compact.find("copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
               std::string::npos)
-        << "OrchestrationRunner should call the named response-only bridge, "
-           "not the low-level D2H hook directly.";
+        << "Production orchestration must not call the diagnostic D2H probe.";
 
     const size_t produce =
         compact.find("produce_stochastic_outcomes(");
@@ -6516,19 +6543,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBef
         compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
     const size_t resident_plan =
         compact.find("logical_state=runner_->deviceResidentLogicalSequenceState()");
-    const size_t response_bridge =
-        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
+    const size_t terminal_generation =
+        compact.find("completeDeviceResidentBatchGeneration(");
     ASSERT_NE(produce, std::string::npos);
     ASSERT_NE(publish, std::string::npos);
     ASSERT_NE(resident_plan, std::string::npos);
-    ASSERT_NE(response_bridge, std::string::npos);
+    ASSERT_NE(terminal_generation, std::string::npos);
     EXPECT_LT(produce, publish)
         << "The producer handle must exist before resident state publication.";
     EXPECT_LT(publish, resident_plan)
         << "Resident mailbox validation must run only after resident state publication.";
-    EXPECT_LT(resident_plan, response_bridge)
-        << "Response materialization is a post-publication bridge, not part "
-           "of live-state mutation.";
+    EXPECT_LT(resident_plan, terminal_generation)
+        << "The complete captured generation parent must consume the published resident state.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFallsBackToHostRow)
@@ -6618,7 +6644,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFal
         EXPECT_NE(compact.find("!stream||"), std::string::npos)
             << relative << " must reject default/null stream publication.";
         EXPECT_TRUE(compact.find("cudaGDN_gpu_copy_capture_row_from_device_index(") != std::string::npos ||
-                    compact.find("rocmGDN_gpu_copy_capture_row_from_device_index(") != std::string::npos)
+                    compact.find("rocmGDN_gpu_publish_capture_row_from_device_index(") != std::string::npos)
             << relative << " must use the graph-capturable row-index copy kernel.";
         EXPECT_EQ(compact.find("debugLogDeviceIndexedRestoreSamples"),
                   std::string::npos)
@@ -6651,7 +6677,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFal
         "} // extern \"C\"");
     const auto rocm_helper = sliceBetween(
         rocm_kernel,
-        "bool rocmGDN_gpu_copy_capture_row_from_device_index(",
+        "bool rocmGDN_gpu_publish_capture_row_from_device_index(",
         "} // extern \"C\"");
     for (const auto &helper : {cuda_helper, rocm_helper})
     {
@@ -7041,7 +7067,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataSta
               std::string::npos)
         << "The logical-state mailbox readiness event must be recorded by the "
            "publication endpoint after KV and shifted-MTP KV publication are enqueued.";
-    EXPECT_EQ(compact.find("copyDeviceSpeculativeOutcomesToHost("),
+    EXPECT_EQ(compact.find("copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
               std::string::npos)
         << "This preflight is the replacement for the host bridge dependency, not another caller of it.";
     EXPECT_EQ(compact.find("synchronizeStream("), std::string::npos)
@@ -7224,7 +7250,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
     EXPECT_NE(compact_publish.find("returntrue;"),
               std::string::npos)
         << "The endpoint must complete without a host adoption phase.";
-    EXPECT_EQ(compact_publish.find("copyDeviceSpeculativeOutcomesToHost("),
+    EXPECT_EQ(compact_publish.find("copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
               std::string::npos)
         << "Captured publication must not quietly fall back to a compatibility host bridge.";
     EXPECT_EQ(compact_publish.find("materializeDeviceSpeculativeOutcomesForHostPlan("),
@@ -7371,8 +7397,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.h");
     const auto runner_interface =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h");
-    const auto rank_source =
-        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
     const auto stage_interface =
         readFile(repoRoot() / "src/v2/execution/compute_stages/IComputeStage.h");
     const auto attention_header =
@@ -7552,61 +7576,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         "void OrchestrationRunner::setDecodeStepTokenBudget(");
     const auto compact_decode_step =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(decode_step_body));
-    const auto diagnostic_rebind_body = sliceBetween(
-        source,
-        "rebindDeviceResidentLogicalStateAfterDiagnosticRestore(",
-        "bool DeviceGraphOrchestrator::\n"
-        "        publishDeviceResidentLogicalSequenceStateFromTargetSample(");
-    const auto compact_diagnostic_rebind =
-        removeAsciiWhitespace(
-            stripCommentsAndStringLiterals(diagnostic_rebind_body));
-    const auto rank_diagnostic_rebind_body = sliceBetween(
-        rank_source,
-        "rebindDeviceResidentLogicalStateAfterDiagnosticRestore(",
-        "bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(");
-    const auto compact_rank_diagnostic_rebind =
-        removeAsciiWhitespace(
-            stripCommentsAndStringLiterals(rank_diagnostic_rebind_body));
-
     EXPECT_NE(compact_runner_interface.find("structDeviceResidentLogicalSequenceStateHandle"),
               std::string::npos);
     EXPECT_NE(compact_runner_interface.find("virtualDeviceResidentLogicalSequenceStateHandledeviceResidentLogicalSequenceState()const"),
               std::string::npos)
         << "The resident logical state handoff must be a typed runner contract.";
-    EXPECT_NE(
+    EXPECT_EQ(
         compact_runner_interface.find(
             "virtualboolrebindDeviceResidentLogicalStateAfterDiagnosticRestore(intrequest_count)"),
         std::string::npos)
-        << "Commit/replay diagnostics need an explicit fail-closed mailbox lifecycle API.";
-    EXPECT_NE(
-        compact_diagnostic_rebind.find(
-            "recordDeviceResidentLogicalSequenceStateMailbox(request_count,stream,DeviceResidentLogicalStatePublicationKind::DiagnosticRestoreRebind,&mailbox_error)"),
-        std::string::npos)
-        << "Diagnostic restore must rebind the durable arena rows through a fresh event.";
-    EXPECT_EQ(compact_diagnostic_rebind.find("synchronize"), std::string::npos)
-        << "Diagnostic mailbox rebind must remain stream ordered.";
-    EXPECT_EQ(compact_diagnostic_rebind.find("hostToDevice"), std::string::npos);
-    EXPECT_EQ(compact_diagnostic_rebind.find("deviceToHost"), std::string::npos);
-    EXPECT_NE(
-        compact_rank_diagnostic_rebind.find(
-            "child->rebindDeviceResidentLogicalStateAfterDiagnosticRestore(request_count)"),
-        std::string::npos)
-        << "LocalTP must refresh every child mailbox after a rank-wide restore.";
-    EXPECT_NE(
-        compact_rank_diagnostic_rebind.find(
-            "adoptMirroredLocalTPResidentLogicalStateMailboxes("),
-        std::string::npos)
-        << "LocalTP must rebuild its aggregate only after all child rebinds pass.";
-    EXPECT_NE(
+        << "CPU-only row-replay diagnostics must not leave a dead GPU mailbox rebind surface.";
+    EXPECT_EQ(
         compact_decode_mtp.find(
-            "rebindDeviceResidentLogicalStateAfterDiagnosticRestore("),
-        std::string::npos)
-        << "The opt-in commit/replay checker must repair mailbox lifecycle before returning.";
-    EXPECT_NE(
-        compact_decode_mtp.find(
-            "refresh_resident_condition_handles_after_replay_diagnostic("),
-        std::string::npos)
-        << "Condition handles captured before diagnostic replay must adopt the refreshed epoch.";
+            "refresh_resident_condition_handles_after_replay_diagnostic"),
+        std::string::npos);
     EXPECT_NE(
         decode_mtp_body.find(
             "commit_replay_check_serial_output_token_mismatches"),
@@ -8872,7 +8855,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(",
-            "bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(")));
+            "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(")));
     EXPECT_NE(initial_publication.find(
                   "backend->enqueueInitializeMTPDeviceLogicalState("),
               std::string::npos);
@@ -8973,7 +8956,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
-            "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(")));
+            "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(")));
     EXPECT_NE(request_batch_verifier.find(
                   "DeviceResidentLogicalStateReadScope"),
               std::string::npos);
@@ -9004,10 +8987,23 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto prefill_runner = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             decode_step_batch,
-            "if (has_ready_prefill_logits)",
-            "if (!state.prefill_logits_ready)")));
-    EXPECT_NE(prefill_runner.find("device_prefill_position_seeds"),
+            "if (has_ready_prefill_logits && gpu_request_batch)",
+            "if (has_ready_prefill_logits)")));
+    EXPECT_NE(prefill_runner.find("std::vector<uint64_t>position_seeds"),
               std::string::npos);
+    EXPECT_NE(
+        prefill_runner.find(
+            "publishMainLogitsBatchSamplesToDeviceResidentState("),
+        std::string::npos)
+        << "Transaction-zero sampling must publish directly into resident state.";
+    EXPECT_EQ(prefill_runner.find("device_prefill_tokens"),
+              std::string::npos)
+        << "GPU request-batch prefill must not create a host token response shadow.";
+    EXPECT_EQ(
+        prefill_runner.find(
+            "copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
+        std::string::npos)
+        << "The production request-batch path may not invoke the diagnostic D2H bridge.";
     EXPECT_EQ(prefill_runner.find("device_prefill_thresholds"),
               std::string::npos);
     EXPECT_EQ(prefill_runner.find("mtp_spec_threshold_from_seed("),
@@ -9198,7 +9194,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(",
-            "bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(")));
+            "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(")));
     EXPECT_NE(initial_publication.find(
                   "stochastic_target_sample_tokens_dev_,static_cast<constint32_t*>(request_sequence_lengths_dev_),request_count"),
               std::string::npos);
@@ -9211,7 +9207,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     const auto prefill_sampler_source = sliceBetween(
         orchestrator_source,
-        "bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(",
+        "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(",
         "bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(");
     const auto prefill_sampler = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(prefill_sampler_source));
@@ -9294,7 +9290,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
-            "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(")));
+            "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics(")));
     EXPECT_NE(request_batch_reducer.find(
                   "publication_metadata.base_cached_tokens+request.request_id"),
               std::string::npos)
@@ -10449,11 +10445,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, TypedMTPLogitsReuseOnlyPreplannedDevice
     EXPECT_EQ(compact_helper.find("candidate->deviceValid()"),
               std::string::npos)
         << "Unwritten output storage is not required to contain valid input bytes.";
-    EXPECT_NE(compact_initialization.find(
-                  "arena_->allocateDeviceStorage("
-                  "BufferId::MTP_LOGITS,state_.device_id)"),
+    EXPECT_NE(compact_initialization.find("BufferId::MTP_LOGITS,"),
               std::string::npos)
-        << "The stable MTP logits pointer must be allocated before graph construction.";
+        << "The stable MTP logits owner must belong to the complete preplanned "
+           "graph tensor family.";
+    EXPECT_NE(compact_initialization.find(
+                  "arena_->allocateDeviceStorage(id,state_.device_id)"),
+              std::string::npos)
+        << "Every registered member of the MTP graph tensor family must receive "
+           "device-local storage before graph construction.";
     EXPECT_NE(compact_forward.find("preplannedMTPLogitsBuffer("),
               std::string::npos);
     EXPECT_NE(compact_forward.find("BufferId::MTP_LOGITS_GATHERED"),
@@ -10675,7 +10675,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsO
            "mask-aware helper, not the full local decode helper.";
     EXPECT_NE(
         compact_graph.find(
-            "(local_decode_layer||(mtp_sidecar_context&&total_tokens==1))&&"
+            "(local_decode_layer||grouped_main_verifier_layer||"
+            "(mtp_sidecar_context&&total_tokens==1))&&"
             "device.is_gpu()&&!use_expert_overlay"),
         std::string::npos)
         << "Static apportioned MTP sidecars must receive the same mask-aware "
@@ -14489,19 +14490,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 }
 
 /**
- * @brief Lock both grouped sampling topologies into typed native device loops.
+ * @brief Lock both grouped sampling topologies into typed backend loop policies.
  *
- * The parent is valid only when every production fragment exports one strict
+ * The policy is valid only when every production fragment exports one strict
  * monolithic capture for the active request. Depth D has D draft rows and D+1
  * verifier/bonus rows. Greedy uses 2D+4 common fragments because its compact
  * reducer is inside the verifier forward; stochastic adds exactly two child
  * graphs for target-distribution preparation and serial rejection. Dynamic
  * placement may append one device-gated maintenance transaction. Sampling mode
- * and child replacement are cache identity, while unchanged parents remain
- * reusable across request-content reset.
+ * and child replacement are cache identity, while unchanged executables remain
+ * reusable across request-content reset. Backends without conditional graph
+ * nodes select host-scheduled captured transactions before admission and retain
+ * those exact fragments beside an isolated dispatch-ticket capture. This is a
+ * typed construction policy, never a redirect after native composition fails.
  */
 TEST(Test__GpuWorkspaceAllocationPolicy,
-     DeviceGenerationParentOwnsTheCompleteOrderedTransaction)
+     DeviceGenerationPolicyOwnsTheCompleteOrderedTransaction)
 {
     const auto root = repoRoot();
     const auto header = readFile(
@@ -14547,14 +14551,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             cuda_capture,
             "DeviceControlledFragmentAppendResult appendDeviceControlledFragment(",
             "#endif")));
-    const auto native_parent_runner_source = sliceBetween(
+    const auto resident_generation_runner_source = sliceBetween(
         runner_source,
-        "GenerationResult OrchestrationRunner::completeNativeDeviceGenerationParent(",
+        "GenerationResult OrchestrationRunner::completeDeviceResidentGeneration(",
         "GenerationResult OrchestrationRunner::decodeStepMTP()");
-    const auto native_parent_runner = removeAsciiWhitespace(
-        stripCommentsAndStringLiterals(native_parent_runner_source));
-    const auto native_parent_runner_text = removeAsciiWhitespace(
-        native_parent_runner_source);
+    const auto resident_generation_runner = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(resident_generation_runner_source));
+    const auto resident_generation_runner_text = removeAsciiWhitespace(
+        resident_generation_runner_source);
     const auto decode_step_source = sliceBetween(
         runner_source,
         "GenerationResult OrchestrationRunner::decodeStepMTP()",
@@ -14563,7 +14567,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto dynamic_parent_admission = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             decode_step_source,
-            "const bool materialize_cuda_dynamic_parent_this_step =",
+            "const bool materialize_dynamic_generation_loop_this_step =",
             "if (!admitScalarDeviceResidentGeneration(")));
 
     EXPECT_NE(
@@ -14700,7 +14704,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "hipStreamSynchronize",
         "addHostCallback",
         "enqueueHostCallback",
-        "copyDeviceSpeculativeOutcomesToHost",
+        "copyDeviceSpeculativeOutcomesToHostForDiagnostics",
         "GraphReplayPlanPolicy::AllowSegmented"};
     for (const char *needle : forbidden)
     {
@@ -14746,11 +14750,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "The terminal bridge must consume one event published after the complete parent launch.";
 
-    const size_t first_maintenance = native_parent_runner.find(
+    const size_t first_maintenance = resident_generation_runner.find(
         "publishDeviceMoEMaintenanceBeforeMTPConsumer(");
-    const size_t parent_prepare = native_parent_runner.find(
+    const size_t parent_prepare = resident_generation_runner.find(
         "runner_->materializeDeviceResidentGeneration(");
-    const size_t parent_launch = native_parent_runner.find(
+    const size_t parent_launch = resident_generation_runner.find(
         "runner_->launchDeviceResidentGeneration()");
     ASSERT_NE(first_maintenance, std::string::npos);
     ASSERT_NE(parent_prepare, std::string::npos);
@@ -14760,56 +14764,78 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(parent_prepare, parent_launch)
         << "Every participant must finish parent composition before any parent launch.";
     EXPECT_NE(
-        native_parent_runner.find(
+        resident_generation_runner.find(
             "runner_->finishDeviceResidentGeneration(&terminal)"),
         std::string::npos);
     EXPECT_NE(
-        native_parent_runner_text.find(
+        resident_generation_runner_text.find(
             "grouped_decode_equivalent_stochastic_verifier_runs"),
         std::string::npos);
     EXPECT_NE(
-        native_parent_runner_text.find(
+        resident_generation_runner_text.find(
             "grouped_decode_equivalent_greedy_verifier_runs"),
         std::string::npos)
-        << "A reused native parent must publish transaction-derived grouped "
+        << "A reused resident loop must publish transaction-derived grouped "
            "verifier evidence for both modes because captured iterations do not re-enter "
            "host instrumentation.";
     EXPECT_NE(
-        native_parent_runner.find(
+        resident_generation_runner.find(
             "static_cast<double>(transactions)"),
         std::string::npos)
         << "Grouped verifier evidence must use the terminal device ledger's "
            "exact transaction count.";
     EXPECT_EQ(
-        native_parent_runner.find(
+        resident_generation_runner.find(
             "materializeDeviceSpeculativeOutcomesForHostResponse("),
         std::string::npos)
-        << "Native production generation must not enter the per-transaction compatibility bridge.";
+        << "Production device-resident generation must not enter the per-transaction compatibility bridge.";
+    EXPECT_EQ(
+        resident_generation_runner.find(
+            "copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
+        std::string::npos)
+        << "Production device-resident generation must not enter the diagnostic compact-outcome probe.";
 
     EXPECT_NE(
         dynamic_parent_admission.find(
             "use_grouped_outcome_device_resident_publication_verifier"),
         std::string::npos);
-    EXPECT_NE(
-        dynamic_parent_admission.find("runner_->primaryDeviceId().is_cuda()"),
-        std::string::npos);
+    EXPECT_EQ(
+        dynamic_parent_admission.find(
+            "generation_execution_policy==DeviceGenerationExecutionPolicy::NativeConditionalGraph"),
+        std::string::npos)
+        << "Dynamic graph-family capture applies equally to native CUDA and "
+           "ticket-scheduled HIP execution.";
+    EXPECT_EQ(
+        dynamic_parent_admission.find("primaryDeviceId().is_cuda()"),
+        std::string::npos)
+        << "Loop selection must consume the typed backend policy rather than "
+           "repeat a device-kind guess in request orchestration.";
     EXPECT_NE(
         dynamic_parent_admission.find(
             "mtp.depth_policy.mode==MTPDepthPolicyMode::Dynamic"),
         std::string::npos);
     EXPECT_EQ(
-        dynamic_parent_admission.find("stochastic_device_verify"),
+        dynamic_parent_admission.find("recordMTPDepthObservation("),
         std::string::npos)
-        << "Sampling mode must not retain a second host-owned dynamic controller.";
+        << "Admission must not update a second host-owned dynamic controller.";
+    EXPECT_EQ(
+        dynamic_parent_admission.find("mtp_depth_controller_->recordStep("),
+        std::string::npos)
+        << "The device generation controller is the sole dynamic-depth writer.";
 
-    const size_t greedy_native_parent = decode_step_text.find(
-        "completeNativeDeviceGenerationParent(publication_request,DeviceGenerationSamplingMode::Greedy");
+    const size_t greedy_resident_generation = decode_step_text.find(
+        "completeDeviceResidentGeneration(publication_request,DeviceGenerationSamplingMode::Greedy");
     const size_t greedy_host_bridge = decode_step_text.find(
         "grouped_outcome_greedy_device_outcome_host_bridge");
-    ASSERT_NE(greedy_native_parent, std::string::npos);
-    ASSERT_NE(greedy_host_bridge, std::string::npos);
-    EXPECT_LT(greedy_native_parent, greedy_host_bridge)
-        << "Dynamic greedy generation must return through the terminal ledger before the compatibility D2H bridge.";
+    ASSERT_NE(greedy_resident_generation, std::string::npos);
+    EXPECT_EQ(greedy_host_bridge, std::string::npos)
+        << "Grouped greedy generation is terminally owned by the selected device "
+           "execution policy; no per-transaction compatibility D2H bridge may remain.";
+    EXPECT_EQ(
+        decode_step_text.find(
+            "grouped_outcome_stochastic_device_outcome_host_bridge"),
+        std::string::npos)
+        << "Grouped stochastic generation must obey the same terminal-ledger contract.";
 
     EXPECT_NE(
         conditional_builder.find(
@@ -14966,13 +14992,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "A missing verifier producer stream is fatal, not replaceable.";
 
-    EXPECT_GE(
+    EXPECT_EQ(
         countOccurrences(
             mtp_decode,
             "buildCapturedStochasticVerifierTargetDistributions("),
-        2U)
-        << "Both canonical single-request stochastic verifier lanes must use "
-           "the combined captured transaction.";
+        1U)
+        << "The scalar GPU stochastic verifier must use exactly one combined "
+           "captured target-and-bonus transaction.";
     EXPECT_EQ(
         mtp_decode.find(
             "applyDeviceOwnedMTPPenaltiesToLogitRows(DeviceLogitsSource::AllPosition"),

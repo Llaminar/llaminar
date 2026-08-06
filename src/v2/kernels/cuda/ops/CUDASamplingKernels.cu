@@ -4916,6 +4916,67 @@ __global__ void cuda_initialize_device_generation_kernel(
 }
 
 /**
+ * @brief Initialize one isolated HIP/CUDA host-scheduler ticket per request.
+ *
+ * Ticket identity is written directly from immutable admission scalars.  The
+ * host never uploads this record and therefore cannot become an alternate
+ * generation-state producer.
+ */
+__global__ void cuda_initialize_device_generation_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    auto *const ticket = tickets + request_index;
+    if (llaminar2::sampling_math::
+            initialize_device_generation_dispatch_ticket(
+                session_epoch,
+                workspace_generation,
+                ticket))
+    {
+        llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+            request_control,
+            /*maintenance_due=*/nullptr,
+            ticket);
+    }
+}
+
+/**
+ * @brief Pack the narrow host-scheduling decision from device authority.
+ */
+__global__ void cuda_publish_device_generation_dispatch_ticket_kernel(
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    const uint32_t *__restrict__ maintenance_due,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+        request_control,
+        maintenance_due,
+        tickets + request_index);
+}
+
+/**
  * @brief Acknowledge an ordinary prior boundary and publish the next budget.
  *
  * A speculative outcome leaves `decode_boundary_advanced` set so the due
@@ -8156,6 +8217,92 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA device-generation initialization launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_initialize_device_generation_dispatch_tickets(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        int *control,
+        int control_stride,
+        int request_count,
+        llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream)
+    {
+        if (session_epoch == 0 || workspace_generation == 0 || !control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !tickets || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_initialize_device_generation_dispatch_ticket_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            session_epoch,
+            workspace_generation,
+            control,
+            control_stride,
+            request_count,
+            tickets);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA device-generation ticket initialization launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_device_generation_dispatch_tickets(
+        int *control,
+        int control_stride,
+        int request_count,
+        const uint32_t *maintenance_due,
+        llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream)
+    {
+        if (!control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !tickets || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_publish_device_generation_dispatch_ticket_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            control,
+            control_stride,
+            request_count,
+            maintenance_due,
+            tickets);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA device-generation ticket publication launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

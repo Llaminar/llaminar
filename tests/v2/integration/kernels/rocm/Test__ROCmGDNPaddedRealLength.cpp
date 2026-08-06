@@ -129,8 +129,12 @@ namespace
             int primary_state_floats,
             int secondary_state_floats = 0,
             int request_capacity = 2)
-            : primary_(std::make_unique<HipFloatBuffer>(
-                  static_cast<size_t>(primary_state_floats), 0.0f)),
+            : primary_(
+                  secondary_state_floats > 0 &&
+                          secondary_state_floats != primary_state_floats
+                      ? std::make_unique<HipFloatBuffer>(
+                            static_cast<size_t>(primary_state_floats), 0.0f)
+                      : nullptr),
               secondary_(
                   secondary_state_floats > 0 &&
                           secondary_state_floats != primary_state_floats
@@ -149,7 +153,7 @@ namespace
                     "HipGDNStateOwner requires positive state and request capacity");
 
             const GDNDeviceStateBinding binding{
-                .primary_state = primary_->ptr,
+                .primary_state = primary_ ? primary_->ptr : requests_->ptr,
                 .primary_state_floats = primary_state_floats,
                 .secondary_state = secondary_ ? secondary_->ptr : nullptr,
                 .secondary_state_floats =

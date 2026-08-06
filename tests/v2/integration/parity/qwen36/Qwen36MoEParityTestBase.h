@@ -7758,7 +7758,7 @@ namespace llaminar2::test::parity::qwen36
                        "accepted verifier state from device metadata";
                 ASSERT_TRUE(handle.valid());
                 DeviceSpeculativeVerifyBatchOutcome materialized;
-                ASSERT_TRUE(runner->materializeDeviceSpeculativeOutcomesForHostResponse(
+                ASSERT_TRUE(runner->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
                     handle,
                     &materialized))
                     << "test-only host materialization should not affect the "
@@ -9826,7 +9826,7 @@ namespace llaminar2::test::parity::qwen36
                  */
                 DeviceSpeculativeVerifyBatchOutcome outcome_probe;
                 ASSERT_TRUE(
-                    runner->materializeDeviceSpeculativeOutcomesForHostResponse(
+                    runner->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
                         resident_outcome,
                         &outcome_probe))
                     << "accepted-prefix grouped verifier could not inspect its "
@@ -9975,7 +9975,7 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_TRUE(clear_grouped_verifier());
 
             DeviceSpeculativeVerifyBatchOutcome chained_outcome;
-            ASSERT_TRUE(runner->materializeDeviceSpeculativeOutcomesForHostResponse(
+            ASSERT_TRUE(runner->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
                 chained_outcome_handle,
                 &chained_outcome))
                 << "post-publication grouped verifier could not inspect its "
@@ -10278,7 +10278,7 @@ namespace llaminar2::test::parity::qwen36
                    "serial-equivalent compact summary";
             ASSERT_TRUE(outcome_handle.valid());
             DeviceSpeculativeVerifyBatchOutcome outcome;
-            ASSERT_TRUE(runner->materializeDeviceSpeculativeOutcomesForHostResponse(
+            ASSERT_TRUE(runner->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
                 outcome_handle,
                 &outcome))
                 << "focused grouped stochastic proof could not observe its "

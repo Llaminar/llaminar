@@ -907,12 +907,16 @@ namespace llaminar2
 
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture()
     {
-        return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(defaultStream()));
+        return std::make_unique<HIPGraphCapture>(
+            static_cast<hipStream_t>(defaultStream()),
+            device_ordinal_);
     }
 
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture(void *stream)
     {
-        return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream));
+        return std::make_unique<HIPGraphCapture>(
+            static_cast<hipStream_t>(stream),
+            device_ordinal_);
     }
 
     PointerValidationResult AMDDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)

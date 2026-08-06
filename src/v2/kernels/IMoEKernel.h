@@ -98,6 +98,61 @@ namespace llaminar2
     };
 
     /**
+     * @brief Access granted to one graph-local router Q8 publication binding.
+     *
+     * The routed router/expert pair owns both sides of the publication.  A
+     * sibling shared expert is deliberately a required consumer: it may read
+     * the published device rows, but it may neither invalidate them nor
+     * silently quantize a second copy when publication is unavailable.
+     */
+    enum class MoERouterQ8PublicationAccess : uint8_t
+    {
+        ProducerAndConsumer = 0,
+        RequiredConsumer = 1,
+    };
+
+    /**
+     * @brief Graph-construction metadata for reusable device-resident Q8 rows.
+     *
+     * This object contains no tensor values and is never consulted by graph
+     * replay.  During capture, the router records the stable device addresses
+     * that its quantization kernel writes; later capture-time consumers embed
+     * those same addresses in their own launches.  The source identity and
+     * geometry prevent a sibling stage from consuming another layer's rows.
+     *
+     * The object is shared independently of backend launch state.  In
+     * particular, routed and shared experts retain separate grouping scratch,
+     * descriptor tables, and work directories even though both consume the
+     * router's immutable Q8 row publication.
+     */
+    struct MoERouterQ8HiddenPublication
+    {
+        DeviceType backend = DeviceType::CPU; ///< Producing backend; ordinal < 0 means unbound.
+        int device_ordinal = -1;              ///< Exact producer device ordinal.
+        const float *source_rows = nullptr;   ///< FP32 source pointer used by the router.
+        const int8_t *quantized_rows = nullptr; ///< Device Q8 row payload.
+        const float *row_scales = nullptr;      ///< Device scale payload, one per 32 columns.
+        int published_rows = 0;               ///< Number of contiguous source rows published.
+        int d_model_capacity = 0;              ///< Hidden-width capacity of the payload.
+        int blocks_per_row_capacity = 0;       ///< Scale blocks available per row.
+        bool capture_recorded = false;         ///< Producer is recorded in the active capture.
+
+        /**
+         * @brief Clear payload provenance while preserving the device binding.
+         */
+        void clearPayload() noexcept
+        {
+            source_rows = nullptr;
+            quantized_rows = nullptr;
+            row_scales = nullptr;
+            published_rows = 0;
+            d_model_capacity = 0;
+            blocks_per_row_capacity = 0;
+            capture_recorded = false;
+        }
+    };
+
+    /**
      * @brief Immutable host launch metadata for one device-resident MoE call.
      *
      * GPU MoE execution may be captured concurrently by the main graph, an MTP
@@ -378,6 +433,29 @@ namespace llaminar2
         {
             (void)gate_weights;
             (void)plan;
+            return false;
+        }
+
+        /**
+         * @brief Bind the graph-local Q8 row publication used by this kernel.
+         *
+         * GPU graph builders call this before capture.  Producers publish
+         * stable device addresses into @p publication while required consumers
+         * only read them.  Implementations must reject backend/device mismatch
+         * and a required consumer must fail execution when the exact source
+         * rows are not present; duplicate quantization is not an allowed
+         * substitute.
+         *
+         * @param publication Graph-local publication shared with the router.
+         * @param access Typed producer/consumer authority for this kernel.
+         * @return True when the binding belongs to this exact backend device.
+         */
+        virtual bool bindRouterQ8HiddenPublication(
+            std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+            MoERouterQ8PublicationAccess access)
+        {
+            (void)publication;
+            (void)access;
             return false;
         }
 
@@ -2239,6 +2317,16 @@ namespace llaminar2
     struct MoERoutedPipelineKernelOwner
     {
         std::unique_ptr<IMoEKernel> kernel; ///< Backend object shared only by the paired routed stages.
+        /**
+         * @brief Immutable-row publication shared with sibling consumers.
+         *
+         * This is intentionally separate from @ref kernel.  A shared expert
+         * may consume the router's Q8 rows without gaining access to, or
+         * aliasing, the routed pipeline's mutable grouping and descriptor
+         * state.
+         */
+        std::shared_ptr<MoERouterQ8HiddenPublication> router_q8_publication =
+            std::make_shared<MoERouterQ8HiddenPublication>();
     };
 
 } // namespace llaminar2

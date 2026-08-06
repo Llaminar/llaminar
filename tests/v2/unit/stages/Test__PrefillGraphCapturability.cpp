@@ -1856,6 +1856,8 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPre
             params.down_w = down_w.get();
             params.output = output_.get();
             params.force_grouped_verifier_prefill_for_decode = true;
+            params.required_router_q8_publication =
+                std::make_shared<MoERouterQ8HiddenPublication>();
 
             SharedExpertFFNStage stage(params);
             EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), supported)
@@ -1925,6 +1927,8 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPref
         params.down_w = down_w.get();
         params.output = output_.get();
         params.force_grouped_verifier_prefill_for_decode = true;
+        params.required_router_q8_publication =
+            std::make_shared<MoERouterQ8HiddenPublication>();
 
         SharedExpertFFNStage stage(params);
         EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), supported)
@@ -1965,6 +1969,8 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupe
         params.down_w = down_w.get();
         params.output = output_.get();
         params.force_grouped_verifier_prefill_for_decode = true;
+        params.required_router_q8_publication =
+            std::make_shared<MoERouterQ8HiddenPublication>();
 
         SharedExpertFFNStage stage(params);
         EXPECT_EQ(stage.supportsPaddedPrefillGraphCapturePreflight(), supported)
@@ -2017,6 +2023,8 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPr
         params.down_w = down_w.get();
         params.output = output_.get();
         params.force_grouped_verifier_prefill_for_decode = true;
+        params.required_router_q8_publication =
+            std::make_shared<MoERouterQ8HiddenPublication>();
 
         SharedExpertFFNStage stage(params);
         EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), route_supported)
@@ -2182,6 +2190,8 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayUsesBackendGroup
         params.down_w = down_w.get();
         params.output = output_.get();
         params.force_grouped_verifier_prefill_for_decode = true;
+        params.required_router_q8_publication =
+            std::make_shared<MoERouterQ8HiddenPublication>();
 
         SharedExpertFFNStage stage(params);
         const bool backend_compiled =

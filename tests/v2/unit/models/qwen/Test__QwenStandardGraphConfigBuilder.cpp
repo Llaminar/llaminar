@@ -260,8 +260,8 @@ TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice,
     EXPECT_EQ(
         config.mtp_shifted_prefill_hidden_publication,
         MTPShiftedPrefillHiddenPublicationPolicy::
-            GraphCapturedDeviceKVProgress)
-        << "Qwen must declare that shifted-prefill hidden rows are selected from graph-captured, device-owned KV progress.";
+            GraphIntegratedKVTransaction)
+        << "Qwen must declare shifted-prefill preparation and KV append as one device-owned main-prefill graph transaction.";
 }
 
 // ============================================================================

@@ -257,6 +257,57 @@ namespace llaminar2::cuda
         void *stream);
 
     /**
+     * @brief Prepare one request's complete shifted-MTP prefill payload.
+     *
+     * The kernel derives whether the current segment starts a request or bridges
+     * an earlier segment from canonical main/shifted KV counts. It packs hidden
+     * rows, shifted condition tokens, positions, and the real append count into
+     * persistent graph-owned buffers. Invalid progress executes a device trap;
+     * malformed state can never be clamped into a plausible payload.
+     *
+     * @param input_hidden Main-forward hidden rows for the complete padded batch.
+     * @param terminal_hidden_archive Read/write terminal row archive. A bridge
+     *        consumes the prior row before the same thread publishes the
+     *        current segment's terminal row.
+     * @param packed_hidden_out Request-major hidden rows consumed by MTP depth zero.
+     * @param input_token_ids Admitted request tokens.
+     * @param input_position_ids Admitted absolute request positions.
+     * @param shifted_token_ids_out Prepared shifted condition-token rows.
+     * @param shifted_position_ids_out Prepared shifted position rows.
+     * @param append_lengths_out One real shifted append width per request.
+     * @param main_cached_tokens Canonical main-KV count for @p request_index.
+     * @param shifted_cached_tokens Canonical shifted-KV count for @p request_index.
+     * @param request_sequence_lengths Resident admitted request lengths.
+     * @param request_row_stride_device Resident padded request width.
+     * @param request_index Immutable request index owned by this launch.
+     * @param request_count Number of request rows in the captured graph.
+     * @param captured_row_stride Fixed row width represented by graph topology.
+     * @param seq_capacity Flattened main-hidden row capacity visible to the graph.
+     * @param d_model Hidden-state width.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the graph-capturable launch was submitted successfully.
+     */
+    bool launchShiftedMTPPrefillPrepareFP32(
+        const float *input_hidden,
+        float *terminal_hidden_archive,
+        float *packed_hidden_out,
+        const int32_t *input_token_ids,
+        const int32_t *input_position_ids,
+        int32_t *shifted_token_ids_out,
+        int32_t *shifted_position_ids_out,
+        int32_t *append_lengths_out,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride_device,
+        int request_index,
+        int request_count,
+        int captured_row_stride,
+        int seq_capacity,
+        int d_model,
+        void *stream);
+
+    /**
      * @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]].
      *
      * @param hidden Device pointer to [rows, hidden_dim].

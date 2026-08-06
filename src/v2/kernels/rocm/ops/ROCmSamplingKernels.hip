@@ -17,6 +17,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <cstddef>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -35,11 +36,17 @@ constexpr int TOPK_MEDIUM_K_CAP = 40;
 constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
 // Qwen-style top_k=40/64 distributions need enough partial blocks to occupy
-// MI50's 60 CUs. Scalar and shallow two-row batches prefer 64 blocks, while
-// deeper verifier batches spend less time in the second-stage merge with 32.
+// MI50's 60 CUs.  The cooperative selector below needs every block-owned span
+// and final partial set to fit its register-resident candidate inventory.
 constexpr int TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS = 64;
-constexpr int TOPK_SMALL_K_DEEP_BATCH_PARTIAL_BLOCKS = 32;
 constexpr int TOPK_SMALL_K_THREADS = 64;
+constexpr int TOPK_BATCHED_COOPERATIVE_THREADS = 256;
+constexpr int TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD = 16;
+constexpr int TOPK_BATCHED_COOPERATIVE_CAPACITY =
+    TOPK_BATCHED_COOPERATIVE_THREADS *
+    TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+constexpr int TOPK_BATCHED_COOPERATIVE_WAVES =
+    TOPK_BATCHED_COOPERATIVE_THREADS / 64;
 
 // Number of threads per block — one warp on NVIDIA, half wavefront on AMD
 // Using 32 threads keeps register pressure manageable for large k
@@ -68,8 +75,7 @@ constexpr int topkSmallKPartialBlockCap(int k)
 
 constexpr int topkSmallKPartialBlockCap(int k, int row_count)
 {
-    if (k > 32 && row_count > 2)
-        return TOPK_SMALL_K_DEEP_BATCH_PARTIAL_BLOCKS;
+    (void)row_count;
     return topkSmallKPartialBlockCap(k);
 }
 
@@ -83,6 +89,28 @@ int runtimeTopkSmallKPartialBlockCap(int k, int row_count)
 {
     const int override_cap = llaminar2::debugEnv().rocm.topk_smallk_partial_blocks;
     return override_cap > 0 ? override_cap : topkSmallKPartialBlockCap(k, row_count);
+}
+
+/**
+ * @brief Return the complete LDS footprint for the batched small-k pipeline.
+ *
+ * Every lane owns one sorted K-entry candidate list. Keeping those lists in
+ * explicit LDS is important on gfx906: an automatic `float[K]` plus `int[K]`
+ * pair spills hundreds of bytes per lane to device memory at top_k=40. The
+ * second-stage merge additionally owns three K-entry arrays for the merged
+ * values, token ids, and probability weights. Both
+ * kernels receive this same conservative allocation so their layout and launch
+ * contract cannot drift apart.
+ */
+constexpr size_t batchedTopkSmallKSharedBytes(int threads, int k)
+{
+    const size_t lane_candidate_bytes =
+        static_cast<size_t>(threads) * static_cast<size_t>(k) *
+        (sizeof(float) + sizeof(int));
+    const size_t merged_candidate_and_weight_bytes =
+        static_cast<size_t>(k) *
+        (2 * sizeof(float) + sizeof(int));
+    return lane_candidate_bytes + merged_candidate_and_weight_bytes;
 }
 
 /**
@@ -106,6 +134,222 @@ __device__ __forceinline__ bool topkCandidateBetter(
     return candidate_value > current_value ||
            (candidate_value == current_value &&
             candidate_index < current_index);
+}
+
+/**
+ * @brief One exact Top-K candidate carried through a wave64 reduction.
+ */
+struct ROCmTopKCandidate
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Small block-shared rendezvous for cooperative Top-K selection.
+ *
+ * Candidate payloads stay in lane registers.  LDS carries only one winner per
+ * wave, the selected block winner, and the final K entries, reducing the
+ * Qwen Top-K 40 footprint from 20.5 KiB to a few hundred bytes per workgroup.
+ */
+template <int K_CAP>
+struct ROCmBatchedTopKCooperativeStorage
+{
+    float wave_values[TOPK_BATCHED_COOPERATIVE_WAVES];
+    int wave_indices[TOPK_BATCHED_COOPERATIVE_WAVES];
+    int winner_index;
+    float selected_values[K_CAP];
+    int selected_indices[K_CAP];
+};
+
+/**
+ * @brief Reduce one deterministic candidate across a complete gfx906 wave.
+ *
+ * Every edge uses the canonical total comparator.  The reduction changes no
+ * floating-point arithmetic because Top-K performs only exact loads and
+ * comparisons; equal logits continue to select the lower token id.
+ */
+__device__ __forceinline__ ROCmTopKCandidate rocmTopKReduceWaveBest(
+    ROCmTopKCandidate candidate)
+{
+    const int lane = static_cast<int>(threadIdx.x) & 63;
+    for (int offset = 32; offset > 0; offset >>= 1)
+    {
+        const float peer_value = __shfl_down(candidate.value, offset, 64);
+        const int peer_index = __shfl_down(candidate.index, offset, 64);
+        if (lane + offset < 64 &&
+            topkCandidateBetter(
+                peer_value,
+                peer_index,
+                candidate.value,
+                candidate.index))
+        {
+            candidate.value = peer_value;
+            candidate.index = peer_index;
+        }
+    }
+    return candidate;
+}
+
+/**
+ * @brief Select a sorted block-wide Top-K from register-resident candidates.
+ *
+ * Each of 256 lanes owns sixteen candidate slots.  For each requested rank,
+ * lanes select their private maximum, four wave64 reductions publish wave
+ * maxima, and wave zero chooses the block winner.  Only the owning lane then
+ * invalidates that token id.  This fixed procedure replaces divergent
+ * insertion sorts and large lane-private LDS lists without atomics, scratch
+ * allocation, synchronization outside the workgroup, or order-dependent math.
+ */
+template <int K_CAP>
+__device__ __forceinline__ void rocmSelectBatchedTopKCooperative(
+    float (&local_values)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int (&local_indices)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int k,
+    ROCmBatchedTopKCooperativeStorage<K_CAP> &storage)
+{
+    const int lane = static_cast<int>(threadIdx.x) & 63;
+    const int wave = static_cast<int>(threadIdx.x) >> 6;
+
+    for (int rank = 0; rank < k; ++rank)
+    {
+        ROCmTopKCandidate local_best{-FLT_MAX, -1};
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (topkCandidateBetter(
+                    local_values[item],
+                    local_indices[item],
+                    local_best.value,
+                    local_best.index))
+            {
+                local_best.value = local_values[item];
+                local_best.index = local_indices[item];
+            }
+        }
+
+        const ROCmTopKCandidate wave_best =
+            rocmTopKReduceWaveBest(local_best);
+        if (lane == 0)
+        {
+            storage.wave_values[wave] = wave_best.value;
+            storage.wave_indices[wave] = wave_best.index;
+        }
+        __syncthreads();
+
+        if (wave == 0)
+        {
+            ROCmTopKCandidate block_best{-FLT_MAX, -1};
+            if (lane < TOPK_BATCHED_COOPERATIVE_WAVES)
+            {
+                block_best.value = storage.wave_values[lane];
+                block_best.index = storage.wave_indices[lane];
+            }
+            block_best = rocmTopKReduceWaveBest(block_best);
+            if (lane == 0)
+            {
+                storage.winner_index = block_best.index;
+                storage.selected_values[rank] = block_best.value;
+                storage.selected_indices[rank] = block_best.index;
+            }
+        }
+        __syncthreads();
+
+        const int winner_index = storage.winner_index;
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (local_indices[item] == winner_index)
+                local_indices[item] = -1;
+        }
+    }
+}
+
+/**
+ * @brief Merge one sorted candidate list per wave lane into a global Top-K.
+ *
+ * Each lane owns a descending list whose arithmetic-free insertion ordering is
+ * already canonical. For every output rank, a six-step wave64 shuffle tree
+ * selects the best current head with topkCandidateBetter(), then only the
+ * winning lane advances its private cursor. This replaces the historical
+ * lane-zero scan over all 64 heads. Although the reduction topology changes,
+ * the comparator is a total order over exact FP32 values and token ids, so the
+ * selected sequence retains the canonical lower-token tie break byte for byte.
+ * The caller must execute one full gfx906 wave and publish its LDS lane lists
+ * before entering this routine.
+ *
+ * @param lane_values Calling lane's sorted candidate values in LDS.
+ * @param lane_indices Calling lane's matching token ids in LDS.
+ * @param lane_count Number of valid candidates owned by the calling lane.
+ * @param k Number of global candidates to publish.
+ * @param out_values Common output array; lane zero is its sole writer.
+ * @param out_indices Common token-id array; lane zero is its sole writer.
+ */
+__device__ __forceinline__ void mergeTopkWave64LaneLists(
+    const float *lane_values,
+    const int *lane_indices,
+    int lane_count,
+    int k,
+    float *out_values,
+    int *out_indices)
+{
+    const int lane = static_cast<int>(threadIdx.x);
+    int cursor = 0;
+
+    for (int rank = 0; rank < k; ++rank)
+    {
+        float winner_value =
+            cursor < lane_count ? lane_values[cursor] : -FLT_MAX;
+        int winner_index =
+            cursor < lane_count ? lane_indices[cursor] : -1;
+        int winner_lane = lane;
+
+        for (int offset = TOPK_SMALL_K_THREADS / 2;
+             offset > 0;
+             offset >>= 1)
+        {
+            const float peer_value = __shfl_down(
+                winner_value,
+                offset,
+                TOPK_SMALL_K_THREADS);
+            const int peer_index = __shfl_down(
+                winner_index,
+                offset,
+                TOPK_SMALL_K_THREADS);
+            const int peer_lane = __shfl_down(
+                winner_lane,
+                offset,
+                TOPK_SMALL_K_THREADS);
+
+            if (lane + offset < TOPK_SMALL_K_THREADS &&
+                topkCandidateBetter(
+                    peer_value,
+                    peer_index,
+                    winner_value,
+                    winner_index))
+            {
+                winner_value = peer_value;
+                winner_index = peer_index;
+                winner_lane = peer_lane;
+            }
+        }
+
+        const int selected_lane = __shfl(
+            winner_lane,
+            0,
+            TOPK_SMALL_K_THREADS);
+        if (lane == 0)
+        {
+            out_values[rank] = winner_value;
+            out_indices[rank] = winner_index;
+        }
+        if (winner_index >= 0 && lane == selected_lane)
+            ++cursor;
+    }
 }
 
 // ============================================================================
@@ -738,6 +982,246 @@ __global__ void rocm_topk_topp_distribution_from_partials_f32_kernel(
     }
 }
 
+/**
+ * @brief Produce exact sorted Top-K partials with cooperative wave64 selection.
+ *
+ * Every workgroup owns one contiguous vocabulary span of at most
+ * TOPK_BATCHED_COOPERATIVE_CAPACITY entries.  The fixed sixteen entries per
+ * lane make vocabulary reads coalesced while keeping all candidates in VGPRs
+ * for the repeated deterministic maximum selections.
+ */
+template <int K_CAP>
+__global__ __launch_bounds__(TOPK_BATCHED_COOPERATIVE_THREADS, 2)
+void rocm_topk_cooperative_partials_batched_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int row_stride,
+    int k,
+    int partial_blocks,
+    float *__restrict__ partial_values,
+    int *__restrict__ partial_indices,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.y;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.y);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.y) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int partial = blockIdx.x;
+    const int block_start =
+        static_cast<int>((static_cast<long long>(partial) * n) / partial_blocks);
+    const int block_end = static_cast<int>(
+        (static_cast<long long>(partial + 1) * n) / partial_blocks);
+    const float *row_data = data + static_cast<size_t>(row) * row_stride;
+
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            static_cast<int>(threadIdx.x) +
+            item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const int index = block_start + offset;
+        const bool valid = index < block_end;
+        local_values[item] = valid ? row_data[index] : -FLT_MAX;
+        local_indices[item] = valid ? index : -1;
+    }
+
+    __shared__ ROCmBatchedTopKCooperativeStorage<K_CAP> storage;
+    rocmSelectBatchedTopKCooperative(
+        local_values,
+        local_indices,
+        k,
+        storage);
+
+    const int out_base = (row * partial_blocks + partial) * k;
+    for (int rank = static_cast<int>(threadIdx.x);
+         rank < k;
+         rank += static_cast<int>(blockDim.x))
+    {
+        partial_values[out_base + rank] = storage.selected_values[rank];
+        partial_indices[out_base + rank] = storage.selected_indices[rank];
+    }
+}
+
+/**
+ * @brief Merge cooperative partials and build one compact Top-K/Top-P row.
+ *
+ * The same block selector is used at both levels, so partial construction and
+ * final ranking share one exact comparator and one arithmetic-free ordering
+ * proof.  Top-P normalization remains the existing canonical serial routine in
+ * lane zero after the sorted Top-K is complete.
+ */
+template <int K_CAP>
+__global__ __launch_bounds__(TOPK_BATCHED_COOPERATIVE_THREADS, 2)
+void rocm_topk_topp_distribution_cooperative_batched_f32_kernel(
+    const float *__restrict__ partial_values,
+    const int *__restrict__ partial_indices,
+    int partial_blocks,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    int out_stride,
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.x) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int candidate_count = partial_blocks * k;
+    const int partial_base = row * candidate_count;
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            static_cast<int>(threadIdx.x) +
+            item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const bool valid = offset < candidate_count;
+        local_values[item] = valid
+                                 ? partial_values[partial_base + offset]
+                                 : -FLT_MAX;
+        local_indices[item] = valid
+                                  ? partial_indices[partial_base + offset]
+                                  : -1;
+    }
+
+    __shared__ ROCmBatchedTopKCooperativeStorage<K_CAP> storage;
+    __shared__ float distribution_weights[K_CAP];
+    rocmSelectBatchedTopKCooperative(
+        local_values,
+        local_indices,
+        k,
+        storage);
+
+    if (threadIdx.x == 0)
+    {
+        const int out_base = row * out_stride;
+        llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
+            storage.selected_values,
+            storage.selected_indices,
+            k,
+            top_p,
+            temperature,
+            out_token_ids + out_base,
+            out_probs + out_base,
+            distribution_weights);
+    }
+}
+
+/**
+ * @brief Merge at most 64 already-sorted partial lists with one wave64.
+ *
+ * Partial selection publishes one descending K-entry list per vocabulary
+ * partition.  Re-running a generic Top-K selector over all
+ * `partial_blocks * k` entries discards that useful ordering.  Here each lane
+ * owns one list cursor and keeps its current head in registers.  A canonical
+ * wave reduction chooses the next global rank; only the unique lane owning
+ * that token advances.  The complete merge therefore reads 64 initial heads
+ * plus at most K successors instead of repeatedly examining every partial
+ * candidate, while retaining exactly the same total-order result.
+ */
+template <int K_CAP>
+__global__ __launch_bounds__(64, 4)
+void rocm_topk_topp_distribution_sorted_partials_batched_f32_kernel(
+    const float *__restrict__ partial_values,
+    const int *__restrict__ partial_indices,
+    int partial_blocks,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    int out_stride,
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (k > K_CAP || partial_blocks > 64 || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.x) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int lane = static_cast<int>(threadIdx.x);
+    const int row_base = row * partial_blocks * k;
+    const int list_base = row_base + lane * k;
+    int cursor = 0;
+    ROCmTopKCandidate head{-FLT_MAX, -1};
+    if (lane < partial_blocks)
+    {
+        head.value = partial_values[list_base];
+        head.index = partial_indices[list_base];
+    }
+
+    __shared__ float selected_values[K_CAP];
+    __shared__ int selected_indices[K_CAP];
+    __shared__ float distribution_weights[K_CAP];
+    for (int rank = 0; rank < k; ++rank)
+    {
+        const ROCmTopKCandidate winner = rocmTopKReduceWaveBest(head);
+        const float winner_value = __shfl(winner.value, 0, 64);
+        const int winner_index = __shfl(winner.index, 0, 64);
+        if (lane == 0)
+        {
+            selected_values[rank] = winner_value;
+            selected_indices[rank] = winner_index;
+        }
+
+        /*
+         * Token ids are globally unique within a row, so exactly one partial
+         * list can own the selected head.  That lane alone reads its successor;
+         * all other lanes retain their register-resident head for the next rank.
+         */
+        if (head.index == winner_index && winner_index >= 0)
+        {
+            ++cursor;
+            if (cursor < k)
+            {
+                head.value = partial_values[list_base + cursor];
+                head.index = partial_indices[list_base + cursor];
+            }
+            else
+            {
+                head.value = -FLT_MAX;
+                head.index = -1;
+            }
+        }
+    }
+
+    if (lane == 0)
+    {
+        const int out_base = row * out_stride;
+        llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
+            selected_values,
+            selected_indices,
+            k,
+            top_p,
+            temperature,
+            out_token_ids + out_base,
+            out_probs + out_base,
+            distribution_weights);
+    }
+}
+
 template <int K_CAP>
 __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
     const float *__restrict__ data,
@@ -769,8 +1253,20 @@ __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
     const int block_end =
         static_cast<int>((static_cast<long long>(partial + 1) * n) / partial_blocks);
 
-    float local_vals[K_CAP];
-    int local_idxs[K_CAP];
+    /*
+     * The lane-private sorted list lives in LDS rather than an automatic array.
+     * HIP otherwise spills both K-entry arrays to scratch memory on gfx906. No
+     * synchronization is needed while scanning because each lane owns a
+     * disjoint contiguous slice; the barrier below publishes all slices to the
+     * deterministic single-lane merge.
+     */
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(
+        shared_mem + num_threads * k * sizeof(float));
+    const int base = tid * k;
+    float *local_vals = s_vals + base;
+    int *local_idxs = s_idxs + base;
     int local_count = 0;
 
     for (int i = 0; i < k; ++i)
@@ -806,59 +1302,16 @@ __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
             ++local_count;
     }
 
-    extern __shared__ char shared_mem[];
-    float *s_vals = reinterpret_cast<float *>(shared_mem);
-    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
-
-    const int base = tid * k;
-    for (int i = 0; i < k; ++i)
-    {
-        s_vals[base + i] = local_vals[i];
-        s_idxs[base + i] = local_idxs[i];
-    }
     __syncthreads();
 
-    if (tid == 0)
-    {
-        int ptrs[TOPK_SMALL_K_THREADS];
-        for (int t = 0; t < num_threads; ++t)
-            ptrs[t] = 0;
-
-        const int out_base = (row * partial_blocks + partial) * k;
-        for (int out_i = 0; out_i < k; ++out_i)
-        {
-            float best_val = -FLT_MAX;
-            int best_idx = -1;
-            int best_thread = -1;
-            for (int t = 0; t < num_threads; ++t)
-            {
-                if (ptrs[t] < k)
-                {
-                    const float v = s_vals[t * k + ptrs[t]];
-                    const int idx = s_idxs[t * k + ptrs[t]];
-                    if (topkCandidateBetter(v, idx, best_val, best_idx))
-                    {
-                        best_val = v;
-                        best_idx = idx;
-                        best_thread = t;
-                    }
-                }
-            }
-
-            if (best_thread >= 0)
-            {
-                partial_values[out_base + out_i] = best_val;
-                partial_indices[out_base + out_i] =
-                    s_idxs[best_thread * k + ptrs[best_thread]];
-                ++ptrs[best_thread];
-            }
-            else
-            {
-                partial_values[out_base + out_i] = -FLT_MAX;
-                partial_indices[out_base + out_i] = -1;
-            }
-        }
-    }
+    const int out_base = (row * partial_blocks + partial) * k;
+    mergeTopkWave64LaneLists(
+        local_vals,
+        local_idxs,
+        local_count,
+        k,
+        partial_values + out_base,
+        partial_indices + out_base);
 }
 
 template <int K_CAP>
@@ -890,8 +1343,19 @@ __global__ void rocm_topk_topp_distribution_batched_from_partials_f32_kernel(
     const int candidate_count = partial_blocks * k;
     const int partial_base = row * candidate_count;
 
-    float local_vals[K_CAP];
-    int local_idxs[K_CAP];
+    /*
+     * This is the same lane-list layout as the partial-selection kernel. The
+     * final merge also uses the trailing LDS region for cursors, merged
+     * candidates, and weights, leaving no top-k-sized automatic array for the
+     * compiler to spill into per-thread scratch.
+     */
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(
+        shared_mem + num_threads * k * sizeof(float));
+    const int base = tid * k;
+    float *local_vals = s_vals + base;
+    int *local_idxs = s_idxs + base;
     int local_count = 0;
 
     for (int i = 0; i < k; ++i)
@@ -930,60 +1394,24 @@ __global__ void rocm_topk_topp_distribution_batched_from_partials_f32_kernel(
             ++local_count;
     }
 
-    extern __shared__ char shared_mem[];
-    float *s_vals = reinterpret_cast<float *>(shared_mem);
-    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
-
-    const int base = tid * k;
-    for (int i = 0; i < k; ++i)
-    {
-        s_vals[base + i] = local_vals[i];
-        s_idxs[base + i] = local_idxs[i];
-    }
     __syncthreads();
+
+    std::byte *merge_storage =
+        reinterpret_cast<std::byte *>(shared_mem) +
+        num_threads * k * (sizeof(float) + sizeof(int));
+    float *merged_vals = reinterpret_cast<float *>(merge_storage);
+    int *merged_idxs = reinterpret_cast<int *>(merged_vals + k);
+    float *weights = reinterpret_cast<float *>(merged_idxs + k);
+    mergeTopkWave64LaneLists(
+        local_vals,
+        local_idxs,
+        local_count,
+        k,
+        merged_vals,
+        merged_idxs);
 
     if (tid == 0)
     {
-        float merged_vals[K_CAP];
-        int merged_idxs[K_CAP];
-        int ptrs[TOPK_SMALL_K_THREADS];
-        for (int t = 0; t < num_threads; ++t)
-            ptrs[t] = 0;
-
-        for (int out_i = 0; out_i < k; ++out_i)
-        {
-            float best_val = -FLT_MAX;
-            int best_idx = -1;
-            int best_thread = -1;
-            for (int t = 0; t < num_threads; ++t)
-            {
-                if (ptrs[t] < k)
-                {
-                    const float v = s_vals[t * k + ptrs[t]];
-                    const int idx = s_idxs[t * k + ptrs[t]];
-                    if (topkCandidateBetter(v, idx, best_val, best_idx))
-                    {
-                        best_val = v;
-                        best_idx = idx;
-                        best_thread = t;
-                    }
-                }
-            }
-
-            if (best_thread >= 0)
-            {
-                merged_vals[out_i] = best_val;
-                merged_idxs[out_i] = s_idxs[best_thread * k + ptrs[best_thread]];
-                ++ptrs[best_thread];
-            }
-            else
-            {
-                merged_vals[out_i] = -FLT_MAX;
-                merged_idxs[out_i] = -1;
-            }
-        }
-
-        float weights[K_CAP];
         const int out_base = row * out_stride;
         llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
             merged_vals,
@@ -3873,6 +4301,67 @@ __global__ void rocm_initialize_device_generation_kernel(
 }
 
 /**
+ * @brief Initialize one isolated host-scheduler ticket per request.
+ *
+ * The identity is written from immutable admission scalars and the initial
+ * decision is packed from the device controller.  No host ticket image is ever
+ * uploaded into GPU execution state.
+ */
+__global__ void rocm_initialize_device_generation_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    auto *const ticket = tickets + request_index;
+    if (llaminar2::sampling_math::
+            initialize_device_generation_dispatch_ticket(
+                session_epoch,
+                workspace_generation,
+                ticket))
+    {
+        llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+            request_control,
+            /*maintenance_due=*/nullptr,
+            ticket);
+    }
+}
+
+/**
+ * @brief Pack the narrow host-scheduling decision from device authority.
+ */
+__global__ void rocm_publish_device_generation_dispatch_ticket_kernel(
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    const uint32_t *__restrict__ maintenance_due,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+        request_control,
+        maintenance_due,
+        tickets + request_index);
+}
+
+/**
  * @brief Acknowledge an ordinary prior boundary and publish the next budget.
  *
  * A speculative outcome leaves `decode_boundary_advanced` set so the due
@@ -4548,7 +5037,8 @@ bool rocmOps_topk_topp_distribution_f32(
         const int required_scratch = partial_blocks * k;
         if (scratch_capacity >= required_scratch)
         {
-            const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+            const size_t smem_size =
+                batchedTopkSmallKSharedBytes(threads, k);
             if (k <= TOPK_MEDIUM_K_CAP)
             {
                 hipLaunchKernelGGL(
@@ -4679,9 +5169,39 @@ bool rocmOps_topk_topp_distributions_f32(
         const int required_scratch = row_count * partial_blocks * k;
         if (scratch_capacity >= required_scratch)
         {
-            const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+            const size_t smem_size =
+                batchedTopkSmallKSharedBytes(threads, k);
             const dim3 partial_grid(partial_blocks, row_count);
-            if (k <= TOPK_MEDIUM_K_CAP)
+            const int maximum_partial_span =
+                (n + partial_blocks - 1) / partial_blocks;
+            const bool use_cooperative_selector =
+                maximum_partial_span <=
+                    TOPK_BATCHED_COOPERATIVE_CAPACITY &&
+                partial_blocks * k <=
+                    TOPK_BATCHED_COOPERATIVE_CAPACITY;
+            if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
+                    partial_grid,
+                    dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    data, n, row_stride, k, partial_blocks,
+                    scratch_values, scratch_indices, active_rows);
+            }
+            else if (use_cooperative_selector)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
+                    partial_grid,
+                    dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    data, n, row_stride, k, partial_blocks,
+                    scratch_values, scratch_indices, active_rows);
+            }
+            else if (k <= TOPK_MEDIUM_K_CAP)
             {
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
@@ -4706,7 +5226,58 @@ bool rocmOps_topk_topp_distributions_f32(
                 return false;
             }
 
-            if (k <= TOPK_MEDIUM_K_CAP)
+            const bool use_sorted_partial_wave_merge =
+                partial_blocks <= 64;
+            if (use_sorted_partial_wave_merge &&
+                k <= TOPK_MEDIUM_K_CAP)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_topp_distribution_sorted_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
+                    dim3(row_count),
+                    dim3(64),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    scratch_values, scratch_indices, partial_blocks, k,
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
+            }
+            else if (use_sorted_partial_wave_merge)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_topp_distribution_sorted_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
+                    dim3(row_count),
+                    dim3(64),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    scratch_values, scratch_indices, partial_blocks, k,
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
+            }
+            else if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_topp_distribution_cooperative_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
+                    dim3(row_count),
+                    dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    scratch_values, scratch_indices, partial_blocks, k,
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
+            }
+            else if (use_cooperative_selector)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(rocm_topk_topp_distribution_cooperative_batched_f32_kernel<TOPK_SMALL_K_CAP>),
+                    dim3(row_count),
+                    dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    scratch_values, scratch_indices, partial_blocks, k,
+                    top_p, temperature, out_token_ids, out_stride, out_probs,
+                    active_rows);
+            }
+            else if (k <= TOPK_MEDIUM_K_CAP)
             {
                 hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(rocm_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>),
@@ -4781,7 +5352,15 @@ bool rocmOps_topk_topp_processed_logits_f32(
         const int required_scratch = row_count * partial_blocks * k;
         if (scratch_capacity >= required_scratch)
         {
-            const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+            /*
+             * The shared partial selector and every consumer must launch with
+             * the same complete LDS contract.  In particular, the selector's
+             * merge cursors occupy the trailing region after the lane lists;
+             * allocating only the historical lane-list footprint corrupts
+             * adjacent state before the processed-logit stage can consume it.
+             */
+            const size_t smem_size =
+                batchedTopkSmallKSharedBytes(threads, k);
             const dim3 partial_grid(partial_blocks, row_count);
             if (k <= TOPK_MEDIUM_K_CAP)
             {
@@ -6444,6 +7023,94 @@ bool rocmOps_initialize_device_generation(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm device-generation initialization launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_initialize_device_generation_dispatch_tickets(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    int *control,
+    int control_stride,
+    int request_count,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+    int device_idx,
+    void *stream)
+{
+    if (session_epoch == 0 || workspace_generation == 0 || !control ||
+        control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        request_count <= 0 || !tickets || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_initialize_device_generation_dispatch_ticket_kernel,
+        dim3(blocks),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        session_epoch,
+        workspace_generation,
+        control,
+        control_stride,
+        request_count,
+        tickets);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm device-generation ticket initialization launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_publish_device_generation_dispatch_tickets(
+    int *control,
+    int control_stride,
+    int request_count,
+    const uint32_t *maintenance_due,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+    int device_idx,
+    void *stream)
+{
+    if (!control ||
+        control_stride <
+            llaminar2::sampling_math::kDeviceGenerationControlCount ||
+        request_count <= 0 || !tickets || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_publish_device_generation_dispatch_ticket_kernel,
+        dim3(blocks),
+        dim3(threads_per_block),
+        0,
+        static_cast<hipStream_t>(stream),
+        control,
+        control_stride,
+        request_count,
+        maintenance_due,
+        tickets);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm device-generation ticket publication launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

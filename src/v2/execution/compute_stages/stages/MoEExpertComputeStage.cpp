@@ -1710,6 +1710,23 @@ namespace llaminar2
                 moe_kernel_ = owned_moe_kernel_.get();
             }
         }
+
+        if (params_.device_id.is_gpu() &&
+            params_.routed_pipeline_kernel_owner)
+        {
+            const auto &publication =
+                params_.routed_pipeline_kernel_owner->router_q8_publication;
+            if (!moe_kernel_ ||
+                !moe_kernel_->bindRouterQ8HiddenPublication(
+                    publication,
+                    MoERouterQ8PublicationAccess::ProducerAndConsumer))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to bind the graph-local "
+                          "router Q8 publication on "
+                          << params_.device_id.to_string());
+                return nullptr;
+            }
+        }
         auto *kernel = bindStageStream(moe_kernel_);
         if (bound_workspace_)
         {
@@ -7081,12 +7098,22 @@ namespace llaminar2
     WorkspaceRequirements MoEExpertComputeStage::getWorkspaceRequirements(int m, int n, int k) const
     {
         WorkspaceRequirements combined;
+        /*
+         * `params_.seq_len` is the concrete graph bucket and `m` is the
+         * allocator's complete serial-family envelope.  Every routed scratch
+         * buffer and nested GEMM must use the same maximum row contract.  If
+         * one component retains the first request's row count, a later larger
+         * request either aliases past its allocation or is rejected after a
+         * graph has already captured the published address.
+         */
+        const int workspace_rows =
+            std::max({1, m, params_.seq_len});
         const int workspace_experts = params_.num_experts;
         const int workspace_top_k = params_.top_k;
         if (params_.device_id.is_cuda())
         {
             combined.merge(MoEWorkspaceBuffers::cudaMoE(
-                params_.seq_len,
+                workspace_rows,
                 params_.d_model,
                 params_.expert_intermediate,
                 workspace_experts,
@@ -7095,7 +7122,7 @@ namespace llaminar2
         else if (params_.device_id.is_rocm())
         {
             combined.merge(MoEWorkspaceBuffers::rocmMoE(
-                params_.seq_len,
+                workspace_rows,
                 params_.d_model,
                 params_.expert_intermediate,
                 workspace_experts,
@@ -7114,11 +7141,14 @@ namespace llaminar2
             auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
             if (consumer)
             {
-                combined.merge(consumer->getWorkspaceRequirements(m, n, k));
+                combined.merge(consumer->getWorkspaceRequirements(
+                    workspace_rows,
+                    n,
+                    k));
                 addCudaConcurrentDecodeGemvSideStreamWorkspace(
                     combined,
                     params_.device_id,
-                    m,
+                    workspace_rows,
                     static_cast<size_t>(std::max(0, workspace_top_k)) * 2u);
                 break;
             }
@@ -7136,7 +7166,7 @@ namespace llaminar2
                 params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_up);
             ITensorGemm *shared_down =
                 params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_down);
-            const int rows = std::max(1, m > 0 ? m : params_.seq_len);
+            const int rows = workspace_rows;
             const int d_model = params_.d_model > 0 ? params_.d_model : n;
             const int intermediate =
                 params_.expert_intermediate > 0 ? params_.expert_intermediate : k;
@@ -8081,6 +8111,26 @@ namespace llaminar2
             owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
             moe_kernel_ = owned_moe_kernel_.get();
         }
+        if (params_.device_id.is_gpu() &&
+            shouldUseGroupedVerifierPrefillRoute())
+        {
+            if (!params_.required_router_q8_publication)
+            {
+                LOG_ERROR("[SharedExpertFFNStage] GPU grouped verifier is missing "
+                          "its required router Q8 publication binding");
+                return nullptr;
+            }
+            if (!moe_kernel_ ||
+                !moe_kernel_->bindRouterQ8HiddenPublication(
+                    params_.required_router_q8_publication,
+                    MoERouterQ8PublicationAccess::RequiredConsumer))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] Failed to bind the required "
+                          "router Q8 publication on "
+                          << params_.device_id.to_string());
+                return nullptr;
+            }
+        }
         auto *kernel = bindStageStream(moe_kernel_);
         if (bound_workspace_)
         {
@@ -8284,6 +8334,8 @@ namespace llaminar2
             << " prefill_graph_backend=" << perfBool(prefill_graph_backend)
             << " decode_graph_backend=" << perfBool(decode_graph_backend)
             << " verifier_route=" << perfBool(verifier_route)
+            << " router_q8_publication_bound="
+            << perfBool(params_.required_router_q8_publication != nullptr)
             << " decode_equivalent_route=" << perfBool(decode_equivalent_route)
             << " grouped_decode_route=" << perfBool(grouped_decode_route)
             << " scratch_seq_len=" << scratch_seq_len_
@@ -8327,6 +8379,7 @@ namespace llaminar2
                    params_.gate_w &&
                    params_.up_w &&
                    params_.down_w &&
+                   params_.required_router_q8_publication &&
                    params_.output;
         }
         return supportsLazyPrefillGraphCapturePreflight();
@@ -8411,7 +8464,7 @@ namespace llaminar2
         auto *self = const_cast<SharedExpertFFNStage *>(this);
         self->ensureGemmEnginesCached();
 
-        const int rows = std::max(1, m > 0 ? m : params_.seq_len);
+        const int rows = std::max({1, m, params_.seq_len});
         const int d_model =
             params_.d_model > 0 ? params_.d_model : (n > 0 ? n : 0);
         const int intermediate =
@@ -8463,7 +8516,7 @@ namespace llaminar2
             (shouldUseGroupedDecodeRoute() || shouldUseGroupedVerifierPrefillRoute());
         if (may_use_grouped_moe)
         {
-            const int workspace_seq_len = std::max(1, params_.seq_len);
+            const int workspace_seq_len = rows;
             if (params_.device_id.is_cuda())
             {
                 combined.merge(MoEWorkspaceBuffers::cudaMoE(
@@ -8938,6 +8991,23 @@ namespace llaminar2
     {
     }
 
+    namespace
+    {
+        /**
+         * @brief Return whether this graph participant owns ordered reduction.
+         *
+         * Callers must validate that the role is not `Unspecified` before
+         * consulting this helper. The helper deliberately contains no
+         * topology arithmetic: graph construction already made the ownership
+         * decision and the stage executes that immutable policy.
+         */
+        bool ownsCanonicalRouteReduction(
+            MoECanonicalRouteReductionRole role) noexcept
+        {
+            return role == MoECanonicalRouteReductionRole::RootOwner;
+        }
+    } // namespace
+
     bool MoECanonicalRouteReduceStage::execute(IDeviceContext *ctx)
     {
         if (!ctx ||
@@ -8946,8 +9016,8 @@ namespace llaminar2
             params_.seq_len <= 0 ||
             params_.top_k <= 0 ||
             params_.d_model <= 0 ||
-            params_.participant_device_index < 0 ||
-            params_.root_device_index < 0)
+            params_.reduction_role ==
+                MoECanonicalRouteReductionRole::Unspecified)
         {
             LOG_ERROR("[MoECanonicalRouteReduceStage] Invalid execution contract"
                       << " ctx=" << (ctx != nullptr)
@@ -8957,9 +9027,8 @@ namespace llaminar2
                       << " seq_len=" << params_.seq_len
                       << " top_k=" << params_.top_k
                       << " d_model=" << params_.d_model
-                      << " participant="
-                      << params_.participant_device_index
-                      << " root=" << params_.root_device_index);
+                      << " reduction_role="
+                      << static_cast<int>(params_.reduction_role));
             return false;
         }
 
@@ -8969,7 +9038,7 @@ namespace llaminar2
          * remains symmetric, but non-root participants must not read those
          * slots or launch redundant arithmetic before the compact broadcast.
          */
-        if (params_.participant_device_index != params_.root_device_index)
+        if (!ownsCanonicalRouteReduction(params_.reduction_role))
             return true;
 
         if (!moe_kernel_)
@@ -9001,7 +9070,7 @@ namespace llaminar2
 
     size_t MoECanonicalRouteReduceStage::estimatedFlops() const
     {
-        if (params_.participant_device_index != params_.root_device_index)
+        if (!ownsCanonicalRouteReduction(params_.reduction_role))
             return 0;
         return static_cast<size_t>(params_.seq_len) *
                static_cast<size_t>(params_.d_model) *
@@ -9030,7 +9099,7 @@ namespace llaminar2
     {
         if (!supportsGraphCaptureAfterLaunchPreparation())
             return false;
-        return params_.participant_device_index != params_.root_device_index ||
+        return !ownsCanonicalRouteReduction(params_.reduction_role) ||
                moe_kernel_ != nullptr;
     }
 
@@ -9046,7 +9115,7 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
-        if (params_.participant_device_index != params_.root_device_index)
+        if (!ownsCanonicalRouteReduction(params_.reduction_role))
             return true;
 
         if (!moe_kernel_)
@@ -9066,8 +9135,8 @@ namespace llaminar2
                params_.seq_len > 0 &&
                params_.top_k > 0 &&
                params_.d_model > 0 &&
-               params_.participant_device_index >= 0 &&
-               params_.root_device_index >= 0;
+               params_.reduction_role !=
+                   MoECanonicalRouteReductionRole::Unspecified;
     }
 
     bool MoECanonicalRouteReduceStage::supportsLazyPrefillGraphCapturePreflight() const
@@ -9096,7 +9165,7 @@ namespace llaminar2
     MoECanonicalRouteReduceStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
-        if (params_.participant_device_index != params_.root_device_index)
+        if (!ownsCanonicalRouteReduction(params_.reduction_role))
             return reqs;
         if (params_.canonical_route_contributions)
         {
@@ -9118,7 +9187,7 @@ namespace llaminar2
 
     StageBufferContract MoECanonicalRouteReduceStage::bufferContract() const
     {
-        if (params_.participant_device_index != params_.root_device_index)
+        if (!ownsCanonicalRouteReduction(params_.reduction_role))
             return {};
         return StageBufferContract::build()
             .addInput(params_.canonical_route_contributions_buffer_id)
@@ -9129,7 +9198,7 @@ namespace llaminar2
     {
         StageDumpInfo info;
         const bool owns_reduction =
-            params_.participant_device_index == params_.root_device_index;
+            ownsCanonicalRouteReduction(params_.reduction_role);
         if (owns_reduction && params_.canonical_route_contributions)
         {
             info.addInput(
@@ -9150,9 +9219,8 @@ namespace llaminar2
         info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt(
-            "participant_device_index",
-            params_.participant_device_index);
-        info.addScalarInt("root_device_index", params_.root_device_index);
+            "reduction_role",
+            static_cast<int>(params_.reduction_role));
         info.addScalarBool("owns_reduction", owns_reduction);
         return info;
     }

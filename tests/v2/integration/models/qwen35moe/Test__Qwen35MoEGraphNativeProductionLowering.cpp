@@ -789,8 +789,9 @@ namespace llaminar2::test
         EXPECT_EQ(reduce_stage->params().seq_len, kSeqLen);
         EXPECT_EQ(reduce_stage->params().top_k, kTopK);
         EXPECT_EQ(reduce_stage->params().d_model, kDModel);
-        EXPECT_EQ(reduce_stage->params().participant_device_index, 0);
-        EXPECT_EQ(reduce_stage->params().root_device_index, 0);
+        EXPECT_EQ(
+            reduce_stage->params().reduction_role,
+            MoECanonicalRouteReductionRole::RootOwner);
         EXPECT_TRUE(reduce_stage->supportsGraphCaptureAfterLaunchPreparation());
         EXPECT_TRUE(reduce_stage->supportsLazyPrefillGraphCapturePreflight())
             << "A cold LocalTP MoE graph must admit the allocation-free canonical "
@@ -871,6 +872,7 @@ namespace llaminar2::test
 
             GraphConfig config = makeConfig(nullptr);
             config.default_device = device;
+            config.grouped_mtp_verifier = true;
             config.compute_all_position_logits = true;
             config.moe.has_shared_expert = true;
             config.moe.shared_intermediate_size = kIntermediate;
@@ -920,6 +922,10 @@ namespace llaminar2::test
             ASSERT_NE(shared_stage, nullptr);
             EXPECT_TRUE(
                 shared_stage->usesGroupedVerifierPrefillRouteForTesting());
+            EXPECT_TRUE(
+                shared_stage->requiresRouterQ8PublicationForTesting())
+                << "The grouped shared verifier must fail closed without the "
+                   "router's exact Q8 row publication";
             EXPECT_TRUE(hasDependency(
                 graph,
                 "layer0_shared_expert_ffn",
@@ -1072,6 +1078,7 @@ namespace llaminar2::test
         config.default_device = DeviceId::rocm(0);
         config.moe.routed_prefill_config
             .least_loaded_min_routed_rows = 0;
+        config.grouped_mtp_verifier = true;
         config.compute_all_position_logits = true;
         config.moe.routed_decode_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;

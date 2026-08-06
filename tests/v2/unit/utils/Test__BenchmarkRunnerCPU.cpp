@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "utils/BenchmarkRunner.h"
@@ -167,6 +169,39 @@ namespace
         {
             (void)tokens;
             (void)seq_len;
+            ++prefill_forward_count_;
+            if (advance_prefill_graph_on_forward_ &&
+                !snapshot_.prefill_graphs.empty())
+            {
+                for (auto &graph : snapshot_.prefill_graphs)
+                {
+                    graph.phase = "ready";
+                    if (prefill_forward_count_ == capture_on_forward_)
+                    {
+                        ++graph.capture_count;
+                        graph.capture_phase = "capture";
+                    }
+                    else
+                    {
+                        ++graph.replay_count;
+                        graph.capture_phase = "replay";
+                    }
+                }
+            }
+            forward_pending_ = true;
+            return true;
+        }
+
+        bool waitForLastForwardCompletionForBenchmark() override
+        {
+            if (!forward_pending_)
+            {
+                completion_order_valid_ = false;
+                return false;
+            }
+            std::this_thread::sleep_for(completion_delay_);
+            forward_pending_ = false;
+            ++completion_wait_count_;
             return true;
         }
 
@@ -216,12 +251,28 @@ namespace
             snapshot_ = std::move(snapshot);
         }
 
+        void setAdvancePrefillGraphOnForward(bool enabled)
+        {
+            advance_prefill_graph_on_forward_ = enabled;
+        }
+
+        void setCaptureOnForward(int forward_count)
+        {
+            capture_on_forward_ = forward_count;
+        }
+
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
         bool skipLogitsGatherPrefillWasEnabled() const { return skip_logits_gather_prefill_; }
         int stopPolicyPublicationCount() const { return stop_policy_publication_count_; }
         const std::vector<int32_t> &configuredStopTokens() const
         {
             return configured_stop_tokens_;
+        }
+        int completionWaitCount() const { return completion_wait_count_; }
+        bool completionOrderValid() const { return completion_order_valid_; }
+        void setCompletionDelay(std::chrono::milliseconds delay)
+        {
+            completion_delay_ = delay;
         }
 
     private:
@@ -231,6 +282,13 @@ namespace
         bool skip_logits_gather_decode_ = false;
         bool skip_logits_gather_prefill_ = false;
         bool device_argmax_available_ = true;
+        bool forward_pending_ = false;
+        bool completion_order_valid_ = true;
+        int completion_wait_count_ = 0;
+        int prefill_forward_count_ = 0;
+        int capture_on_forward_ = -1;
+        bool advance_prefill_graph_on_forward_ = false;
+        std::chrono::milliseconds completion_delay_{0};
         int stop_policy_publication_count_ = 0;
     };
 
@@ -326,6 +384,12 @@ namespace
         {
             events_.push_back(seq_len > 1 ? "prefill" : "forward");
             return MockOrchestratedDecodeRunner::forward(tokens, seq_len);
+        }
+
+        bool waitForLastForwardCompletionForBenchmark() override
+        {
+            events_.push_back("prefill_completion");
+            return true;
         }
 
         void clear_cache() override
@@ -840,6 +904,38 @@ TEST(Test__BenchmarkRunnerCPU, EnablesSkipLogitsGatherOnGPU)
 }
 
 /**
+ * @brief GPU prefill timing must include the complete asynchronous transaction.
+ *
+ * The mock returns immediately from forward() and models the durable event wait
+ * with a short delay. MTP is enabled so this contract includes shifted sidecar
+ * KV population, not merely the earlier main graph output. A regression that
+ * stops the clock at graph submission either omits the wait entirely or reports
+ * less than the injected latency.
+ */
+TEST(Test__BenchmarkRunnerCPU, GPUPrefillTimingWaitsForDurableTerminalEvent)
+{
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    runner->setCompletionDelay(std::chrono::milliseconds(5));
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+    config.mtp.enabled = true;
+
+    const auto result = bench.run(config);
+
+    EXPECT_TRUE(result.success) << result.failure_reason;
+    EXPECT_TRUE(runner->completionOrderValid());
+    EXPECT_GT(runner->completionWaitCount(), 0);
+    EXPECT_GE(result.prefill_time_ms, 4.0)
+        << "GPU prefill timing stopped before the terminal event wait completed";
+}
+
+/**
  * @brief Verify CPU decode uses host-side argmax and succeeds.
  *
  * Regression test: BenchmarkRunner previously treated sampleGreedyOnDevice() == -1
@@ -928,6 +1024,7 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
     graph.domain_id = "mock_tp";
     snapshot.prefill_graphs.push_back(graph);
     runner->setPrefixRuntimeState(snapshot);
+    runner->setAdvancePrefillGraphOnForward(true);
 
     auto tokenizer = createMockTokenizer();
     auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
@@ -944,6 +1041,52 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
     ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 1u);
     EXPECT_EQ(result.prefix_state.prefill_graphs[0].capture_count, 1u);
     EXPECT_EQ(result.prefix_state.prefill_graphs[0].domain_id, "mock_tp");
+}
+
+/**
+ * @brief A measured prefill sample must never perform graph capture.
+ *
+ * With the default benchmark schedule, forwards 1-3 prepare the first graph,
+ * forward 4 is the ordinary warmup, forwards 5-7 re-arm steady-state capture,
+ * and forward 8 is the first measured sample. The mock deliberately reports a
+ * new capture on that sample; accepting it would mix setup work into the
+ * production replay speedometer.
+ */
+TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphReplayRejectsMeasuredCapture)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    PrefixRuntimeStateSnapshot snapshot;
+    PrefillGraphRuntimeProbe graph;
+    graph.phase = "ready";
+    graph.capture_phase = "capture";
+    graph.capture_count = 1;
+    graph.node_count = 42;
+    graph.domain_id = "mock_tp";
+    graph.participant_id = 0;
+    graph.bucket_seq_len = 2;
+    snapshot.prefill_graphs.push_back(graph);
+    runner->setPrefixRuntimeState(snapshot);
+    runner->setAdvancePrefillGraphOnForward(true);
+    runner->setCaptureOnForward(8);
+
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    const auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(
+        result.failure_reason.find("captured during measurement"),
+        std::string::npos)
+        << result.failure_reason;
 }
 
 TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)

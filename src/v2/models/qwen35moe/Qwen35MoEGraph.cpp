@@ -2925,6 +2925,7 @@ namespace llaminar2
         {
             return (candidate.is_cuda() || candidate.is_rocm()) &&
                    total_tokens > 1 &&
+                   config_.grouped_mtp_verifier &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -2946,6 +2947,7 @@ namespace llaminar2
                 (candidate.is_cuda() || candidate.is_rocm()) && total_tokens > 1;
             return (candidate.is_cpu() || gpu_grouped_verifier_rows) &&
                    total_tokens >= 1 &&
+                   config_.grouped_mtp_verifier &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -2953,6 +2955,7 @@ namespace llaminar2
         {
             return candidate.is_cpu() &&
                    total_tokens >= 1 &&
+                   config_.grouped_mtp_verifier &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -3003,6 +3006,7 @@ namespace llaminar2
         const bool grouped_main_verifier_layer =
             !mtp_sidecar_context &&
             total_tokens > 1 &&
+            config_.grouped_mtp_verifier &&
             config_.compute_all_position_logits &&
             layer_idx >= config_.pp_layer_offset &&
             layer_idx < config_.pp_layer_offset + config_.n_layers;
@@ -3204,6 +3208,7 @@ namespace llaminar2
             canUseLocalTPReplicatedFastPath(*overlay_plan, device);
         const bool masked_local_tp_apportioned_decode_runtime_table =
             (local_decode_layer ||
+             grouped_main_verifier_layer ||
              (mtp_sidecar_context && total_tokens == 1)) &&
             device.is_gpu() &&
             !use_expert_overlay &&
@@ -5039,6 +5044,27 @@ namespace llaminar2
             denseTPAllreduceEnabledForCurrentGraph();
 
         /*
+         * The grouped ROCm verifier has enough independent route work to make
+         * one serial top-k loop per output lane uneconomical. A single-device
+         * graph therefore publishes route dots independently and declares the
+         * exact ordered reducer as its next node. This is a graph policy, not a
+         * runtime branch: capture records one fixed producer/reducer topology,
+         * all storage is persistent, and the reducer preserves serial decode's
+         * increasing-route FP32 addition order byte-for-byte.
+         */
+        const int graph_participant_count =
+            config_.tp_ctx ? config_.tp_ctx->degree() : 1;
+        const MoERouteAccumulationPolicy route_accumulation_policy =
+            selectMoERouteAccumulationPolicy(
+                MoERouteAccumulationSelection{
+                    .backend = device.type,
+                    .participant_count = graph_participant_count,
+                    .workload = forceGroupedMoEVerifierPrefill(device)
+                                    ? MoERouteAccumulationWorkload::
+                                          GroupedVerifier
+                                    : MoERouteAccumulationWorkload::Ordinary});
+
+        /*
          * LocalTP expert ownership must never shape the FP32 route addition
          * tree. GPU apportioned paths therefore publish every original route
          * into an independent slot. When the shared branch is input-parallel,
@@ -5741,10 +5767,12 @@ namespace llaminar2
                         reduce_params.seq_len = total_tokens;
                         reduce_params.top_k = config_.moe.top_k;
                         reduce_params.d_model = config_.d_model;
-                        reduce_params.participant_device_index =
-                            config_.tp_device_idx;
-                        reduce_params.root_device_index =
-                            canonical_route_root_participant;
+                        reduce_params.reduction_role =
+                            config_.tp_device_idx ==
+                                    canonical_route_root_participant
+                                ? MoECanonicalRouteReductionRole::RootOwner
+                                : MoECanonicalRouteReductionRole::
+                                      NonRootParticipant;
                         reduce_params.canonical_route_contributions_buffer_id =
                             allreduce_buffer_id;
                         reduce_params.output_buffer_id =
@@ -6238,11 +6266,16 @@ namespace llaminar2
                         "standard routed expert LLEP grouped prefill");
                 }
 
-                if (device.is_gpu() &&
+                const bool serial_decode_runtime_table_requested =
                     total_tokens == 1 &&
-                    moe_runtime_table &&
                     debugEnv().rocm.moe_grouped_decode &&
-                    debugEnv().rocm.moe_device_routed_decode)
+                    debugEnv().rocm.moe_device_routed_decode;
+                const bool standard_gpu_runtime_table_requested =
+                    device.is_gpu() &&
+                    moe_runtime_table &&
+                    (serial_decode_runtime_table_requested ||
+                     grouped_main_verifier_layer);
+                if (standard_gpu_runtime_table_requested)
                 {
                     if (masked_local_tp_apportioned_decode_runtime_table)
                     {
@@ -6315,6 +6348,37 @@ namespace llaminar2
                                 std::to_string(layer_idx) + " on " + device.to_string());
                         }
                     }
+
+                    /*
+                     * A grouped main verifier must retain its final device route
+                     * assignment until accepted-state publication commits the
+                     * accepted prefix.  The same runtime table therefore owns
+                     * both grouping scratch and the deferred route ledger.  This
+                     * is not optional telemetry: omitting the binding lets the
+                     * verifier compute rows but makes their state transaction
+                     * impossible to commit.
+                     */
+                    if (grouped_main_verifier_layer)
+                        expert_params.use_runtime_row_grouping = true;
+                }
+
+                if (route_accumulation_policy ==
+                    MoERouteAccumulationPolicy::
+                        IndependentRouteSlotsThenOrderedFold)
+                {
+                    if (!canonical_route_contributions)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE independent route-slot accumulation "
+                            "requires canonical device storage for layer " +
+                            std::to_string(layer_idx) + " on " +
+                            device.to_string());
+                    }
+                    expert_params.canonical_route_contributions =
+                        canonical_route_contributions;
+                    expert_params.canonical_route_contributions_buffer_id =
+                        buffers.idFor(
+                            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
                 }
 
                 graph.addNode(prefix + "moe_expert_ffn",
@@ -6329,6 +6393,47 @@ namespace llaminar2
                                         ? prefix + "moe_routing"
                                         : rebalance_apply_dependency);
                 ffn_terminal = prefix + "moe_expert_ffn";
+
+                if (route_accumulation_policy ==
+                    MoERouteAccumulationPolicy::
+                        IndependentRouteSlotsThenOrderedFold)
+                {
+                    MoECanonicalRouteReduceStage::Params reduce_params;
+                    reduce_params.device_id = device;
+                    reduce_params.canonical_route_contributions =
+                        canonical_route_contributions;
+                    reduce_params.output = moe_output;
+                    reduce_params.seq_len = total_tokens;
+                    reduce_params.top_k = config_.moe.top_k;
+                    reduce_params.d_model = config_.d_model;
+                    reduce_params.reduction_role =
+                        MoECanonicalRouteReductionRole::RootOwner;
+                    reduce_params.canonical_route_contributions_buffer_id =
+                        buffers.idFor(
+                            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                    reduce_params.output_buffer_id =
+                        buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+
+                    const std::string reduce_name =
+                        prefix + "moe_local_canonical_routes_reduce";
+                    graph.addNode(
+                        reduce_name,
+                        ComputeStageFactory::createMoECanonicalRouteReduce(
+                            reduce_params),
+                        device);
+                    graph.addDependency(
+                        reduce_name,
+                        prefix + "moe_expert_ffn");
+                    ffn_terminal = reduce_name;
+                }
+
+                LOG_TRACE(
+                    "[Qwen35MoEGraph] Layer " << layer_idx
+                                              << " route_accumulation="
+                                              << moeRouteAccumulationPolicyToString(
+                                                     route_accumulation_policy)
+                                              << " device="
+                                              << device.to_string());
 
                 // Qwen35 MoE expert weights are normally replicated, so every rank
                 // computes the full routed-expert contribution. Only allreduce this
@@ -6429,6 +6534,11 @@ namespace llaminar2
                 (shared_device.is_cuda() || shared_device.is_rocm());
             shared_params.force_grouped_verifier_prefill_for_decode =
                 shared_gpu_table_verifier_prefill;
+            if (shared_gpu_table_verifier_prefill)
+            {
+                shared_params.required_router_q8_publication =
+                    routed_pipeline_kernel_owner->router_q8_publication;
+            }
             shared_params.force_decode_equivalent_verifier_prefill =
                 (!shared_gpu_table_verifier_prefill &&
                  (!shared_grouped_verifier_prefill &&

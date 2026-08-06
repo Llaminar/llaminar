@@ -216,6 +216,114 @@ Matched llama.cpp master comparison, tok/s:
 | ROCm dense 27B | `20.08/25.15` | `39.28/22.66` |
 | ROCm MoE 35B | `46.33/73.93` | `74.94/95.84` |
 
+### Reproducible ROCm1 SingleDevice Reference
+
+The active ROCm SingleDevice tuning control uses the Qwen3.6-35B-A3B MoE
+model, a fixed 425-token prompt, stochastic sampling, and MTP depth 3. Llaminar
+measures three steady-state graph replays after one warmup; model loading,
+arena construction, graph capture, and the warmup are outside the timing
+sample. MTP prefill is enabled, so each measured prefill includes population
+of both the main and MTP KV caches.
+
+```bash
+env \
+  LLAMINAR_BENCHMARK_ITERATIONS=3 \
+  LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+  LLAMINAR_PREFILL_GRAPH_REQUIRED=1 \
+  LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1 \
+  LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0 \
+  /workspaces/llaminar/build_v2_release/llaminar2 benchmark \
+  -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  -d rocm:0 --context-length 4096 -n 256 \
+  --benchmark-json-output /tmp/llaminar-rocm1-qwen36-35b-mtp-d3.json \
+  --prompt-file /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed.txt \
+  --seed 123 --temperature 0.8 --top-k 40 --top-p 0.9 \
+  --mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed \
+  --mtp-verify-mode speculative-sampling \
+  --moe-residency-maintenance off
+```
+
+The 2026-08-06 post-correctness baseline is `888.43 tok/s` prefill and
+`126.02 tok/s` decode, with `73.30%` stochastic draft acceptance, zero
+transaction-validation failures, and one warmed 512-row prefill graph (`1663`
+nodes). The prefill rate is `2.19x` the current llama.cpp reference and decode
+is `1.61x` faster than its `78.4 tok/s` median. Decode has crossed the current
+promotion target; the active ROCm1 work is now steady-state MTP prefill
+economy.
+
+The accuracy gate for this baseline publishes the exact physical logits
+surface produced by each forward graph rather than assuming that every
+logical main-model result occupies the canonical logits buffer. A focused
+Release ROCm MTP server suite passed `31/31`, including thinking and
+non-thinking requests that previously repeated their first token. The full
+4096-token long-context run then passed needle placement, strict multi-needle
+JSON, 1024-token structured generation, cache reset, graph replay, and clean
+shutdown checks while emitting `10,195` PerfStats records. Device-free policy
+tests passed `4/4` in `2.70 s`.
+
+```bash
+HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
+  /workspaces/llama.cpp-reference/build-rocm/bin/llama-cli \
+  -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 3 \
+  -f /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed.txt \
+  -n 256 -c 4096 -ngl all --split-mode none --main-gpu 0 --fit off \
+  --flash-attn on --seed 123 --temp 0.8 --top-k 40 --top-p 0.9 --min-p 0 \
+  --repeat-penalty 1 --dry-multiplier 0 --perf \
+  --conversation --single-turn --no-display-prompt
+```
+
+On current llama.cpp master `f9e832c10e94`, three runs measured prefill at
+`408.7`, `405.3`, and `403.0 tok/s`, and generation at `78.4`, `77.7`, and
+`78.4 tok/s`. The medians are therefore `405.3 tok/s` prefill and
+`78.4 tok/s` generation.
+
+### Reproducible Llaminar CUDA2 LLEP Reference
+
+This is the canonical clean-throughput command for the explicit apportioned
+LLEP policy tuple. It uses stochastic fixed depth 3 and the same prompt and
+sampling controls as the llama.cpp reference below. The 425-token prompt is
+below the production `M * top_k >= 8192` LLEP-prefill boundary, so this row
+isolates grouped decode and two-device communication economy; use a longer
+prompt to measure least-loaded current-batch expert movement itself.
+
+```bash
+env \
+  LLAMINAR_BENCHMARK_ITERATIONS=3 \
+  LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+  LLAMINAR_PREFILL_GRAPH_REQUIRED=1 \
+  LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1 \
+  LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0 \
+  /workspaces/llaminar/build_v2_release/llaminar2 benchmark \
+  -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --context-length 4096 -n 256 \
+  --benchmark-json-output /tmp/llaminar-cuda2-llep-d3-clean.json \
+  --prompt-file /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed.txt \
+  --seed 123 --temperature 0.8 --top-k 40 --top-p 0.9 \
+  --mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed \
+  --mtp-verify-mode speculative-sampling \
+  --mtp-terminal-head-policy mirrored-full-vocabulary \
+  --moe-release-raw-expert-weights \
+  --moe-residency-maintenance off --moe-hot-expert-cache off \
+  --moe-routed-expert-placement tiered-overlay \
+  --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot \
+  --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot \
+  --moe-routed-expert-shared-domain qwen36_moe_cuda_hot \
+  --moe-routed-expert-residency static-by-id \
+  --moe-continuation-dense-policy tensor-parallel \
+  --moe-routed-expert-domain \
+    'qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0' \
+  --moe-routed-expert-tier \
+    'hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192'
+```
+
+The 2026-08-05 post-correctness refresh measured `682.13 tok/s` prefill and
+`124.07 tok/s` decode, with `52.89%` stochastic draft acceptance and zero
+transaction-validation failures. Both devices captured and replayed one full
+prefill graph (`5947/5907` nodes). This is the active economy baseline; the
+older `180.43 tok/s` row had `79.25%` acceptance and must not be treated as
+current until the acceptance regression is explained.
+
 ### Reproducible llama.cpp CUDA Reference
 
 ```bash
@@ -250,3 +358,11 @@ On llama.cpp `5788b51`, three runs gave a `155.4 tok/s` decode median and
 4. Tune dynamic depth/hysteresis through depth 15 under deterministic prompt
    scenarios without regressing the fixed-d3 `180.43 tok/s` reference.
 5. Repeat the economy pass for ROCm and the remaining SingleDevice/EP lanes.
+6. After ROCm SingleDevice MTP is green, replace the current MTP KV-only
+   prefill lowering with a dedicated captured K/V-only stage. Preserve the
+   exact hidden/embedding norms, MTP projection, attention-input norm, K/V
+   projection, K norm/RoPE, and cache-format append, while eliminating Q
+   projection/gating, Q split/norm/RoPE, Q scratch, and unshiftable or padded
+   row work. Promotion requires byte-identical MTP KV payloads across cache
+   formats and prefix restore, plus CUDA/ROCm profiler evidence for occupancy,
+   registers/VGPRs, zero spills, and end-to-end prefill gain.

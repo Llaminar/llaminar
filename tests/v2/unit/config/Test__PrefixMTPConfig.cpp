@@ -292,6 +292,29 @@ TEST(Test__PrefixMTPConfig, MTPGraphCapacityUsesMaximumPolicyDepthAndRequestCoun
         << "Sixteen verifier rows are a certification default, not an architectural maximum.";
 }
 
+TEST(Test__PrefixMTPConfig, MTPTerminalHiddenArchiveCoversRequestAndVerifierRows)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.max_request_batch = 1;
+
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(1, mtp), 4)
+        << "A scalar fixed-d3 request must retain all four verifier target rows.";
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 8)
+        << "A larger general request batch must still have one terminal row per request.";
+
+    mtp.max_request_batch = 3;
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 12)
+        << "Flattened grouped-verifier rows win when they exceed request capacity.";
+
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 48)
+        << "The archive must reserve dynamic depth's promotion ceiling before capture.";
+}
+
 TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
 {
     {

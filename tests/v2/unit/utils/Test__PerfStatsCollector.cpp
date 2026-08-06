@@ -174,6 +174,64 @@ TEST(Test__PerfStatsCollector, ResetCanPreserveSelectedDomains)
     EXPECT_TRUE(has_transfer);
 }
 
+/**
+ * @brief Mixed domains retain only explicitly named setup record families.
+ *
+ * Benchmark graph evidence shares `forward_graph` with measured replay and
+ * host-wall timing records. This test prevents a future reset from either
+ * discarding capture certification or retaining the entire warmup runtime.
+ */
+TEST(Test__PerfStatsCollector, ResetCanPreserveExactFamiliesFromMixedDomains)
+{
+    ScopedEnv env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    PerfStatsCollector::addCounter(
+        "forward_graph", "full_graph_plan_graphs", 1.0, "setup");
+    PerfStatsCollector::addCounter(
+        "forward_graph", "decode_graph_phase", 1.0, "setup");
+    PerfStatsCollector::recordTimingNs(
+        "forward_graph", "full_graph_replay_graph", 9000, "warmup");
+    PerfStatsCollector::addCounter(
+        "mtp", "draft_steps", 3.0, "warmup");
+    PerfStatsCollector::addCounter(
+        "gpu_graph_inventory", "kernel_nodes", 7.0, "graph_setup");
+
+    PerfStatsCollector::resetPreserving(
+        {"gpu_graph_inventory"},
+        {{"forward_graph", "full_graph_plan_graphs"},
+         {"forward_graph", "decode_graph_phase"}});
+
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 3u);
+    EXPECT_TRUE(std::any_of(
+        records.begin(), records.end(), [](const PerfStatRecord &record)
+        {
+            return record.domain == "forward_graph" &&
+                   record.name == "full_graph_plan_graphs";
+        }));
+    EXPECT_TRUE(std::any_of(
+        records.begin(), records.end(), [](const PerfStatRecord &record)
+        {
+            return record.domain == "forward_graph" &&
+                   record.name == "decode_graph_phase";
+        }));
+    EXPECT_TRUE(std::any_of(
+        records.begin(), records.end(), [](const PerfStatRecord &record)
+        {
+            return record.domain == "gpu_graph_inventory" &&
+                   record.name == "kernel_nodes";
+        }));
+    EXPECT_FALSE(std::any_of(
+        records.begin(), records.end(), [](const PerfStatRecord &record)
+        {
+            return record.name == "full_graph_replay_graph" ||
+                   record.domain == "mtp";
+        }));
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTiming)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);

@@ -24,7 +24,7 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         int device_idx, void *stream);
@@ -33,7 +33,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -45,7 +45,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -58,7 +58,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int request_count, int request_seq_len,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
@@ -76,16 +76,18 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count);
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
-    bool rocmGDN_gpu_copy_capture_row_from_device_index(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_row_from_device_index(
+        float *live_state,
+        float *request_zero_state,
         const float *capture,
         const int *device_row_index,
         int rows,
         int state_size,
         int device_idx,
         void *stream);
-    bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_rows_from_device_indices(
+        float *request_states,
+        float *request_zero_live_state,
         const float *capture,
         const int *device_row_indices,
         int request_count,
@@ -94,8 +96,9 @@ extern "C"
         int state_size,
         int device_idx,
         void *stream);
-    bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
-        float *dst,
+    bool rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
+        float *request_states,
+        float *request_zero_live_state,
         const float *capture,
         const int *device_request_seq_lens,
         int request_count,
@@ -205,8 +208,9 @@ namespace llaminar2
                 return false;
             }
 
-            const bool ok = rocmGDN_gpu_copy_capture_row_from_device_index(
+            const bool ok = rocmGDN_gpu_publish_capture_row_from_device_index(
                 live_state,
+                request_state_bank_,
                 verifier_state_capture_,
                 device_row_index,
                 verifier_state_capture_rows_,
@@ -215,10 +219,7 @@ namespace llaminar2
                 stream);
             if (!ok)
                 return false;
-            return publishLiveStateToRequestZero(
-                live_state,
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
@@ -247,8 +248,9 @@ namespace llaminar2
                 return false;
             }
 
-            if (!rocmGDN_gpu_copy_capture_rows_from_device_indices(
+            if (!rocmGDN_gpu_publish_capture_rows_from_device_indices(
                     request_state_bank_,
+                    stateForSize(verifier_state_capture_size_),
                     verifier_state_capture_,
                     device_row_indices,
                     request_count,
@@ -260,9 +262,7 @@ namespace llaminar2
             {
                 return false;
             }
-            return publishRequestZeroToLiveState(
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool restoreVerifierStateCaptureRequestTerminalRows(
@@ -286,8 +286,9 @@ namespace llaminar2
             {
                 return false;
             }
-            if (!rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+            if (!rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
                     request_state_bank_,
+                    stateForSize(verifier_state_capture_size_),
                     verifier_state_capture_,
                     device_request_seq_lens,
                     request_count,
@@ -299,9 +300,7 @@ namespace llaminar2
             {
                 return false;
             }
-            return publishRequestZeroToLiveState(
-                verifier_state_capture_size_,
-                stream);
+            return true;
         }
 
         bool supportsPaddedPrefillRealLength() const override { return true; }
@@ -337,8 +336,10 @@ namespace llaminar2
                 return false;
 
             rocmGDN_gpu_set_device(device_ordinal_);
-            rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
-            if (secondary_gpu_state_ && secondary_state_size_ > 0)
+            if (gpu_state_ != request_state_bank_)
+                rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+            if (secondary_gpu_state_ && secondary_state_size_ > 0 &&
+                secondary_gpu_state_ != request_state_bank_)
                 rocmGDN_gpu_memset_zero_async(
                     secondary_gpu_state_, secondary_state_size_, stream);
             if (request_state_bank_ && request_state_bank_floats_ > 0)
@@ -368,8 +369,7 @@ namespace llaminar2
             if (!live_state)
                 return false;
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -378,7 +378,7 @@ namespace llaminar2
             // All pointers are device pointers — pass directly to HIP kernel.
             const bool ok = rocmGDN_chunk_forward(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
@@ -406,8 +406,7 @@ namespace llaminar2
                 return false;
 
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -415,7 +414,7 @@ namespace llaminar2
 
             const bool ok = rocmGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 device_effective_seq_len,
                 verifier_state_capture_,
@@ -482,21 +481,15 @@ namespace llaminar2
                     request_state_bank_ +
                     static_cast<size_t>(request) *
                         static_cast<size_t>(required_state_size);
+                float *updated_request_state = request_state;
                 float *snapshots = nullptr;
                 int snapshot_rows = 0;
                 if (capture_active)
                 {
-                    float *work_state =
+                    updated_request_state =
                         speculative_state_work_ +
                         static_cast<size_t>(request) *
                             static_cast<size_t>(required_state_size);
-                    rocmGDN_gpu_memcpy_async(
-                        work_state,
-                        request_state,
-                        static_cast<size_t>(required_state_size),
-                        stream_);
-                    request_state = work_state;
-
                     const int snapshot_base = request * request_seq_len;
                     snapshots =
                         verifier_state_capture_ +
@@ -520,6 +513,7 @@ namespace llaminar2
                         dt_bias,
                         output + v_offset,
                         request_state,
+                        updated_request_state,
                         request_seq_len, n_heads, head_dim_k, head_dim_v,
                         use_qk_l2norm,
                         snapshots,
@@ -537,9 +531,9 @@ namespace llaminar2
          * @brief Run variable-length request recurrence as one HIP launch.
          *
          * The grouped launch encodes request identity directly while each
-         * block preserves serial timestep order for its request-local state. A
-         * single contiguous device copy seeds speculative state when verifier
-         * capture is active.
+         * block preserves serial timestep order for its request-local state.
+         * The kernel reads the canonical request bank and writes its distinct
+         * transactional bank directly, so verifier entry needs no seed copy.
          */
         bool chunkForwardBatchedRequestsWithDeviceSeqLens(
             const float *Q, const float *K, const float *V,
@@ -581,17 +575,12 @@ namespace llaminar2
                     LOG_ERROR("[ROCmGatedDeltaNet] Grouped verifier requires one speculative state slot per request");
                     return false;
                 }
-                rocmGDN_gpu_memcpy_async(
-                    speculative_state_work_,
-                    request_state_bank_,
-                    static_cast<size_t>(work_floats),
-                    stream_);
                 effective_states = speculative_state_work_;
             }
 
             return rocmGDN_chunk_forward_batched_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_states,
+                output, request_state_bank_, effective_states,
                 seq_len, request_count, request_seq_len,
                 n_heads, head_dim_k, head_dim_v,
                 use_qk_l2norm,
@@ -618,8 +607,7 @@ namespace llaminar2
             if (!live_state)
                 return false;
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(
-                    live_state,
+                resolveVerifierStateDestination(
                     required_state_size,
                     stream_);
             if (!effective_state)
@@ -638,7 +626,7 @@ namespace llaminar2
              */
             const bool ok = rocmGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
@@ -923,8 +911,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        float *prepareEffectiveStateForVerifierForward(
-            float *live_state,
+        float *resolveVerifierStateDestination(
             int required_state_size,
             void *stream)
         {
@@ -933,7 +920,7 @@ namespace llaminar2
                 verifier_state_capture_rows_ > 0 &&
                 verifier_state_capture_size_ == required_state_size;
             if (!verifier_capture_active)
-                return live_state;
+                return stateForSize(required_state_size);
             if (!stream)
             {
                 LOG_ERROR("[ROCmGatedDeltaNet] Speculative verifier state requires an explicit stream");
@@ -948,27 +935,22 @@ namespace llaminar2
                 return nullptr;
             }
 
-            rocmGDN_gpu_memcpy_async(
-                speculative_state_work_,
-                live_state,
-                static_cast<size_t>(required_state_size),
-                stream);
             return speculative_state_work_;
         }
 
         /**
          * @brief Publish scalar live state into request zero on its producer stream.
          *
-         * This is real stream-ordered device work, so graph replay repeats the
-         * publication without relying on a host coherence flag changed only
-         * during capture.
+         * Single-geometry bindings alias scalar state to request zero, making
+         * publication structurally complete with no operation. Distinct
+         * LocalTP geometries enqueue one explicit stream-ordered device copy.
          */
         bool publishLiveStateToRequestZero(
             const float *live_state,
             int live_state_size,
             void *stream) const
         {
-            if (!live_state ||
+            if (!stream || !live_state ||
                 live_state_size <= 0 ||
                 !request_state_bank_ ||
                 request_state_bank_capacity_ <= 0 ||
@@ -982,55 +964,13 @@ namespace llaminar2
                 return false;
             }
 
-            rocmGDN_gpu_set_device(device_ordinal_);
-            if (stream)
-            {
-                rocmGDN_gpu_memcpy_async(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size),
-                    stream);
-            }
-            else
-            {
-                rocmGDN_gpu_memcpy(
-                    request_state_bank_,
-                    live_state,
-                    static_cast<size_t>(live_state_size));
-            }
-            return true;
-        }
-
-        /**
-         * @brief Publish accepted request zero back to the scalar live owner.
-         *
-         * Grouped accepted-state publication writes the packed bank directly.
-         * The first request is also the scalar decode sequence, so its accepted
-         * row must update the stable scalar allocation on the same HIP stream.
-         * This device-to-device handoff replaces host currentness bookkeeping.
-         */
-        bool publishRequestZeroToLiveState(
-            int live_state_size,
-            void *stream) const
-        {
-            float *live_state = stateForSize(live_state_size);
-            if (!stream ||
-                !live_state ||
-                !request_state_bank_ ||
-                live_state_size <= 0 ||
-                request_state_bank_floats_ <
-                    static_cast<size_t>(live_state_size))
-            {
-                LOG_ERROR("[ROCmGatedDeltaNet] Cannot publish accepted request-zero recurrence state"
-                          << " state_size=" << live_state_size
-                          << " request_floats=" << request_state_bank_floats_);
-                return false;
-            }
+            if (live_state == request_state_bank_)
+                return true;
 
             rocmGDN_gpu_set_device(device_ordinal_);
             rocmGDN_gpu_memcpy_async(
-                live_state,
                 request_state_bank_,
+                live_state,
                 static_cast<size_t>(live_state_size),
                 stream);
             return true;

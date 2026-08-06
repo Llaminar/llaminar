@@ -177,7 +177,9 @@ namespace llaminar2
             params_.device_row_index_source ==
                 DeviceRowIndexSource::FixedContiguousRange ||
             params_.device_row_index_source ==
-                DeviceRowIndexSource::ShiftedPrefillKVProgress)
+                DeviceRowIndexSource::ShiftedPrefillKVProgress ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillTransaction)
         {
             /*
              * Request-terminal mode reads current resident lengths. Fixed-range
@@ -286,6 +288,60 @@ namespace llaminar2
                 return false;
             }
         }
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::ShiftedPrefillTransaction)
+        {
+            const bool valid_transaction =
+                params_.device_id.is_gpu() && params_.request_count > 0 &&
+                params_.seq_len % params_.request_count == 0 &&
+                selected_row_count_ == params_.seq_len &&
+                params_.request_sequence_lengths_device &&
+                params_.request_row_stride_source ==
+                    RequestRowStrideSource::ExternalDeviceScalar &&
+                params_.request_row_stride == 0 &&
+                params_.request_row_stride_device &&
+                params_.input_token_ids_device &&
+                params_.input_position_ids_device &&
+                params_.shifted_token_ids_output_device &&
+                params_.shifted_position_ids_output_device &&
+                params_.shifted_append_lengths_output_device &&
+                params_.terminal_hidden_archive &&
+                params_.terminal_hidden_archive_buffer_id.has_value() &&
+                params_.main_cached_tokens_by_request.size() ==
+                    static_cast<size_t>(params_.request_count) &&
+                params_.shifted_cached_tokens_by_request.size() ==
+                    static_cast<size_t>(params_.request_count) &&
+                std::all_of(
+                    params_.main_cached_tokens_by_request.begin(),
+                    params_.main_cached_tokens_by_request.end(),
+                    [](const int32_t *ptr) { return ptr != nullptr; }) &&
+                std::all_of(
+                    params_.shifted_cached_tokens_by_request.begin(),
+                    params_.shifted_cached_tokens_by_request.end(),
+                    [](const int32_t *ptr) { return ptr != nullptr; });
+            if (!valid_transaction)
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill transaction requires complete immutable device ownership"
+                          << " requests=" << params_.request_count
+                          << " seq_capacity=" << params_.seq_len
+                          << " selected_rows=" << selected_row_count_
+                          << " token_input=" << params_.input_token_ids_device
+                          << " position_input=" << params_.input_position_ids_device
+                          << " append_output=" << params_.shifted_append_lengths_output_device
+                          << " archive=" << params_.terminal_hidden_archive);
+                return false;
+            }
+            if (params_.terminal_hidden_archive->native_type() !=
+                    TensorType::FP32 ||
+                params_.terminal_hidden_archive->rows() <
+                    static_cast<size_t>(params_.request_count) ||
+                params_.terminal_hidden_archive->cols() <
+                    static_cast<size_t>(params_.d_model))
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill terminal archive does not cover request geometry");
+                return false;
+            }
+        }
         if (params_.device_id.is_gpu() &&
             params_.device_row_index_source ==
                 DeviceRowIndexSource::WorkspaceBoundDeviceIndices &&
@@ -391,7 +447,9 @@ namespace llaminar2
         if (params_.device_row_index_source ==
                 DeviceRowIndexSource::RequestTerminalLengths ||
             params_.device_row_index_source ==
-                DeviceRowIndexSource::ShiftedPrefillKVProgress)
+                DeviceRowIndexSource::ShiftedPrefillKVProgress ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ShiftedPrefillTransaction)
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Request-terminal row selection must not bind a row-index workspace");
             return false;
@@ -578,8 +636,11 @@ namespace llaminar2
         const bool shifted_prefill_progress =
             params_.device_row_index_source ==
             DeviceRowIndexSource::ShiftedPrefillKVProgress;
+        const bool shifted_prefill_transaction =
+            params_.device_row_index_source ==
+            DeviceRowIndexSource::ShiftedPrefillTransaction;
         if (!request_terminal_rows && !fixed_contiguous_rows &&
-            !shifted_prefill_progress &&
+            !shifted_prefill_progress && !shifted_prefill_transaction &&
             !ensureGpuParamStateInitialized())
             return false;
 
@@ -620,7 +681,7 @@ namespace llaminar2
         }
 
         if (!request_terminal_rows && !fixed_contiguous_rows &&
-            !shifted_prefill_progress &&
+            !shifted_prefill_progress && !shifted_prefill_transaction &&
             !uploadGpuSelectedRows())
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Failed to update GPU selected-row array");
@@ -631,7 +692,41 @@ namespace llaminar2
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            if (shifted_prefill_progress)
+            if (shifted_prefill_transaction)
+            {
+                auto *archive_device = static_cast<float *>(
+                    params_.terminal_hidden_archive->gpu_data_ptr());
+                if (!archive_device)
+                {
+                    LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill transaction is missing its device terminal archive");
+                    return false;
+                }
+                const int row_stride = params_.seq_len / params_.request_count;
+                launched = true;
+                for (int request = 0; request < params_.request_count; ++request)
+                {
+                    launched = launched && cuda::launchShiftedMTPPrefillPrepareFP32(
+                        input_device,
+                        archive_device,
+                        output_device,
+                        params_.input_token_ids_device,
+                        params_.input_position_ids_device,
+                        params_.shifted_token_ids_output_device,
+                        params_.shifted_position_ids_output_device,
+                        params_.shifted_append_lengths_output_device,
+                        params_.main_cached_tokens_by_request[static_cast<size_t>(request)],
+                        params_.shifted_cached_tokens_by_request[static_cast<size_t>(request)],
+                        params_.request_sequence_lengths_device,
+                        params_.request_row_stride_device,
+                        request,
+                        params_.request_count,
+                        row_stride,
+                        params_.seq_len,
+                        params_.d_model,
+                        gpuStream());
+                }
+            }
+            else if (shifted_prefill_progress)
             {
                 launched = cuda::launchDeviceKVProgressRowsSelectFP32(
                     input_device,
@@ -695,7 +790,41 @@ namespace llaminar2
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            if (shifted_prefill_progress)
+            if (shifted_prefill_transaction)
+            {
+                auto *archive_device = static_cast<float *>(
+                    params_.terminal_hidden_archive->gpu_data_ptr());
+                if (!archive_device)
+                {
+                    LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill transaction is missing its device terminal archive");
+                    return false;
+                }
+                const int row_stride = params_.seq_len / params_.request_count;
+                launched = true;
+                for (int request = 0; request < params_.request_count; ++request)
+                {
+                    launched = launched && rocm::launchShiftedMTPPrefillPrepareFP32(
+                        input_device,
+                        archive_device,
+                        output_device,
+                        params_.input_token_ids_device,
+                        params_.input_position_ids_device,
+                        params_.shifted_token_ids_output_device,
+                        params_.shifted_position_ids_output_device,
+                        params_.shifted_append_lengths_output_device,
+                        params_.main_cached_tokens_by_request[static_cast<size_t>(request)],
+                        params_.shifted_cached_tokens_by_request[static_cast<size_t>(request)],
+                        params_.request_sequence_lengths_device,
+                        params_.request_row_stride_device,
+                        request,
+                        params_.request_count,
+                        row_stride,
+                        params_.seq_len,
+                        params_.d_model,
+                        gpuStream());
+                }
+            }
+            else if (shifted_prefill_progress)
             {
                 launched = rocm::launchDeviceKVProgressRowsSelectFP32(
                     input_device,
@@ -852,6 +981,24 @@ namespace llaminar2
     {
         if (!params_.input_buffer_id || !params_.output_buffer_id)
             return {};
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::ShiftedPrefillTransaction)
+        {
+            if (!params_.terminal_hidden_archive_buffer_id)
+                return {};
+            return StageBufferContract::build()
+                .addInput(*params_.input_buffer_id, "FP32")
+                .addInput(BufferId::REQUEST_TOKEN_IDS, "INT32")
+                .addInput(BufferId::REQUEST_POSITION_IDS, "INT32")
+                .addInput(BufferId::REQUEST_BATCH_GEOMETRY, "INT32")
+                .addPreallocatedInOut(
+                    *params_.terminal_hidden_archive_buffer_id,
+                    "FP32")
+                .addOutput(*params_.output_buffer_id, "FP32")
+                .addOutput(BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS, "INT32")
+                .addOutput(BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS, "INT32")
+                .addOutput(BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS, "INT32");
+        }
         return StageBufferContract::build()
             .addInput(*params_.input_buffer_id, "FP32")
             .addOutput(*params_.output_buffer_id, "FP32");

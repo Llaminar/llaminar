@@ -3,10 +3,12 @@
  * @brief Cache-owned, preplanned GPU storage for every GDN layer state bank.
  *
  * The arena translates model-level GDN geometry into one contiguous
- * DeviceWorkspaceManager allocation.  Each hybrid-cache layer receives
- * isolated local/full/request slices, and later kernel construction binds
- * those slices through GDNDeviceStateBinding.  No kernel allocation or
- * graph-time capacity repair is permitted.
+ * DeviceWorkspaceManager allocation. Each hybrid-cache layer receives stable
+ * local/full/request slices, and later kernel construction binds those slices
+ * through GDNDeviceStateBinding. When local and full geometry are identical,
+ * request slot zero is the scalar live state rather than a second allocation;
+ * this makes request-zero coherence structural and removes publication copies.
+ * No kernel allocation or graph-time capacity repair is permitted.
  */
 
 #pragma once
@@ -159,16 +161,15 @@ namespace llaminar2
             if (local_state_floats <= 0)
                 return;
 
-            requirements.buffers.push_back({
-                bufferName(layer, kernel, "primary"),
-                static_cast<size_t>(local_state_floats) * sizeof(float),
-                256,
-                true});
-
             const int distinct_full_state_floats =
                 full_state_floats > 0 ? full_state_floats : local_state_floats;
             if (distinct_full_state_floats != local_state_floats)
             {
+                requirements.buffers.push_back({
+                    bufferName(layer, kernel, "primary"),
+                    static_cast<size_t>(local_state_floats) * sizeof(float),
+                    256,
+                    true});
                 requirements.buffers.push_back({
                     bufferName(layer, kernel, "secondary"),
                     static_cast<size_t>(distinct_full_state_floats) * sizeof(float),
@@ -197,19 +198,10 @@ namespace llaminar2
                 return {};
 
             GDNDeviceStateBinding binding;
-            binding.primary_state = static_cast<float *>(
-                workspace_->getBuffer(bufferName(layer, kernel, "primary")));
             binding.primary_state_floats = local_state_floats;
 
             const int effective_full_state_floats =
                 full_state_floats > 0 ? full_state_floats : local_state_floats;
-            if (effective_full_state_floats != local_state_floats)
-            {
-                binding.secondary_state = static_cast<float *>(
-                    workspace_->getBuffer(bufferName(layer, kernel, "secondary")));
-                binding.secondary_state_floats = effective_full_state_floats;
-            }
-
             const std::string request_name =
                 bufferName(layer, kernel, "requests");
             binding.request_state_bank = static_cast<float *>(
@@ -217,6 +209,30 @@ namespace llaminar2
             binding.request_state_bank_floats =
                 workspace_->getBufferSize(request_name) / sizeof(float);
             binding.request_capacity = request_capacity;
+
+            if (effective_full_state_floats == local_state_floats)
+            {
+                /*
+                 * A single geometry has one canonical request-zero owner. Both
+                 * scalar decode and grouped request APIs address this exact
+                 * allocation, so no copy can be forgotten or reordered.
+                 */
+                binding.primary_state = binding.request_state_bank;
+            }
+            else
+            {
+                /*
+                 * Distinct LocalTP geometries retain isolated scalar banks.
+                 * The packed request bank uses the active geometry's stride,
+                 * so aliasing either scalar bank would let smaller request rows
+                 * overlap the larger scalar state.
+                 */
+                binding.primary_state = static_cast<float *>(
+                    workspace_->getBuffer(bufferName(layer, kernel, "primary")));
+                binding.secondary_state = static_cast<float *>(
+                    workspace_->getBuffer(bufferName(layer, kernel, "secondary")));
+                binding.secondary_state_floats = effective_full_state_floats;
+            }
 
             if (!binding.valid())
             {

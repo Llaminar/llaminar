@@ -23,6 +23,7 @@
 #include "../../../backends/DeviceId.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace llaminar2
@@ -61,6 +62,54 @@ namespace llaminar2
         constexpr bool valid() const noexcept
         {
             return runtime_layers_device != nullptr && layer_count > 0;
+        }
+    };
+
+    /**
+     * @brief Immutable-address contract for graph-integrated shifted MTP prefill.
+     *
+     * A normal prefill transaction produces both target logits and the hidden
+     * rows needed to seed the depth-zero MTP KV cache. GPU execution lowers
+     * those two results into one captured graph: a row-preparation stage derives
+     * shifted rows from canonical device KV counters, then one bucket-wide
+     * KV-only MTP subgraph consumes the prepared rows. Every pointer in this
+     * structure is model-lifetime storage. Request-varying values remain in
+     * those device allocations and are never reconstructed by the host.
+     */
+    struct ShiftedMTPPrefillGraphBinding
+    {
+        IKVCache *kv_cache = nullptr; ///< Depth-zero shifted MTP KV cache.
+        TensorBase *terminal_hidden_archive = nullptr; ///< One persistent terminal hidden row per request.
+        const int32_t *request_token_ids_device = nullptr; ///< Stable admitted request-token bank.
+        const int32_t *request_position_ids_device = nullptr; ///< Stable admitted absolute-position bank.
+        int32_t *shifted_token_ids_device = nullptr; ///< Packed shifted condition-token rows.
+        int32_t *shifted_position_ids_device = nullptr; ///< Packed positions paired with shifted tokens.
+        int32_t *append_lengths_device = nullptr; ///< Real append width for each padded request row.
+        const int32_t *request_row_stride_device = nullptr; ///< Resident padded request width.
+        std::vector<const int32_t *> main_cached_tokens_device; ///< Canonical main-KV count per request.
+        std::vector<const int32_t *> shifted_cached_tokens_device; ///< Canonical shifted-KV count per request.
+        MTPForwardOutput output; ///< Arena-owned depth-zero KV-only scratch tensors.
+        uint64_t capture_identity = 0; ///< Complete immutable pointer/generation identity used by graph caching.
+
+        /**
+         * @brief Validate the immutable portion of the graph binding.
+         *
+         * Request lengths, token values, positions, and cache counts are
+         * deliberately excluded: they are live device data consumed during
+         * replay. The vectors themselves must contain one exact counter address
+         * per request before graph construction begins.
+         */
+        [[nodiscard]] bool validForRequestCount(int request_count) const noexcept
+        {
+            return request_count > 0 && kv_cache && terminal_hidden_archive &&
+                   request_token_ids_device && request_position_ids_device &&
+                   shifted_token_ids_device && shifted_position_ids_device &&
+                   append_lengths_device && request_row_stride_device &&
+                   capture_identity != 0 &&
+                   main_cached_tokens_device.size() ==
+                       static_cast<size_t>(request_count) &&
+                   shifted_cached_tokens_device.size() ==
+                       static_cast<size_t>(request_count);
         }
     };
 
@@ -133,6 +182,79 @@ namespace llaminar2
     };
 
     /**
+     * @brief Physical tensor surface written by one terminal LM-head graph.
+     *
+     * Logical graph purpose and physical storage are deliberately independent.
+     * A scalar MTP condition is a main-model continuation, but it reuses the
+     * preplanned all-position allocation so its captured address remains stable
+     * across scalar and request-batched condition graphs. Consumers must use the
+     * publication descriptor rather than assuming that a logical main result is
+     * always stored in `LOGITS`.
+     */
+    enum class ForwardLogitsStorageSurface : uint8_t
+    {
+        Unknown,          ///< A non-null output did not match an owned surface.
+        None,             ///< This graph participant has no terminal LM head.
+        CanonicalFull,    ///< Full-vocabulary `LOGITS` storage.
+        CanonicalLocal,   ///< Column-parallel `LOGITS_LOCAL` storage.
+        AllPositionFull,  ///< Full-vocabulary all-position/preplanned storage.
+        AllPositionLocal, ///< Column-parallel all-position/preplanned storage.
+    };
+
+    /**
+     * @brief Typed identity of the logits bytes produced by one forward.
+     *
+     * `logical_all_position_logits` describes graph semantics: grouped verifier
+     * rows are logically all-position output, while a scalar MTP condition is
+     * not. `storage_surface` describes only the allocation that received those
+     * bytes. Keeping both dimensions prevents a sampler from selecting storage
+     * by role name and accidentally reading a stale row.
+     */
+    struct ForwardLogitsPublicationDescriptor
+    {
+        ForwardExecutionRole execution_role =
+            ForwardExecutionRole::MainInference;
+        bool logical_all_position_logits = false;
+        ForwardLogitsStorageSurface storage_surface =
+            ForwardLogitsStorageSurface::Unknown;
+
+        /** @return true when the producer is a main-model continuation. */
+        [[nodiscard]] constexpr bool isMainModelOutput() const noexcept
+        {
+            return execution_role == ForwardExecutionRole::MainInference ||
+                   execution_role == ForwardExecutionRole::MTPCondition;
+        }
+
+        /** @return true when a scalar semantic-main consumer may read it. */
+        [[nodiscard]] constexpr bool supportsScalarMainConsumer() const noexcept
+        {
+            return isMainModelOutput() &&
+                   !logical_all_position_logits &&
+                   storage_surface != ForwardLogitsStorageSurface::Unknown &&
+                   storage_surface != ForwardLogitsStorageSurface::None;
+        }
+
+        /** @return true when a grouped main-condition consumer may read it. */
+        [[nodiscard]] constexpr bool supportsMainRequestBatchConsumer() const noexcept
+        {
+            return isMainModelOutput() &&
+                   (storage_surface ==
+                        ForwardLogitsStorageSurface::AllPositionFull ||
+                    storage_surface ==
+                        ForwardLogitsStorageSurface::AllPositionLocal);
+        }
+
+        /** @return true when token columns are sharded across participants. */
+        [[nodiscard]] constexpr bool isColumnParallelStorage() const noexcept
+        {
+            return storage_surface ==
+                       ForwardLogitsStorageSurface::CanonicalLocal ||
+                   storage_surface ==
+                       ForwardLogitsStorageSurface::AllPositionLocal;
+        }
+    };
+
+    /**
      * @brief Mathematical phase selected for one concrete forward graph.
      *
      * Row count is not a phase discriminator. A short user prompt can have the
@@ -145,6 +267,22 @@ namespace llaminar2
     {
         Prefill, ///< Prompt ingestion using the configured prefill topology.
         Decode,  ///< Serial or grouped decode-equivalent execution.
+    };
+
+    /**
+     * @brief Complete asynchronous work represented by a forward completion event.
+     *
+     * A main-model prefill can either end after the ordinary model graph or own
+     * the shifted depth-zero MTP KV population inside that same captured graph.
+     * Consumers must not infer this distinction from global MTP configuration:
+     * doing so made the benchmark wait for a retired sidecar event after shifted
+     * prefill became graph-integrated. The scope travels with invocation
+     * provenance so one durable event has an exact, typed meaning.
+     */
+    enum class ForwardCompletionScope : uint8_t
+    {
+        ModelForwardOnly, ///< Ordinary model forward outputs and live-state writes.
+        GraphIntegratedShiftedMTPPrefill, ///< Model forward plus shifted MTP KV/archive writes.
     };
 
     /**
@@ -280,6 +418,17 @@ namespace llaminar2
          */
         const int32_t *sequence_lengths_device = nullptr;
 
+        /**
+         * @brief Optional graph-integrated shifted MTP prefill transaction.
+         *
+         * This binding is present only for a GPU main-prefill graph whose MTP
+         * depth-zero cache must advance alongside the main cache. Its presence
+         * changes graph topology and therefore participates in capture identity.
+         * CPU execution retains its host-owned implementation and leaves this
+         * field empty.
+         */
+        std::optional<ShiftedMTPPrefillGraphBinding> shifted_mtp_prefill;
+
         /// Batched input (alternative to token_ids)
         struct Batch
         {
@@ -308,6 +457,26 @@ namespace llaminar2
     };
 
     /**
+     * @brief Resolve the exact completion scope declared by one forward input.
+     *
+     * Presence of the immutable shifted-prefill binding changes graph topology;
+     * it therefore also changes what completion of that graph proves. Binding
+     * validity is checked by graph construction, while this helper deliberately
+     * performs only the total, side-effect-free policy classification needed by
+     * provenance publication and unit tests.
+     *
+     * @param input Concrete forward invocation whose graph policy is fixed.
+     * @return Typed work scope completed by the invocation's producer stream.
+     */
+    [[nodiscard]] inline constexpr ForwardCompletionScope
+    forwardCompletionScopeForInput(const ForwardInput &input) noexcept
+    {
+        return input.shifted_mtp_prefill.has_value()
+                   ? ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill
+                   : ForwardCompletionScope::ModelForwardOnly;
+    }
+
+    /**
      * @brief Device-ordering provenance for one concrete forward execution.
      *
      * A tensor pointer identifies storage, but it does not identify the GPU
@@ -331,6 +500,8 @@ namespace llaminar2
             ForwardExecutionRole::MainInference; ///< Typed purpose copied from ForwardInput.
         bool is_decode = false;                ///< Whether decode semantics selected this graph.
         bool all_position_logits = false;      ///< Whether this invocation produced all-position logits.
+        ForwardCompletionScope completion_scope =
+            ForwardCompletionScope::ModelForwardOnly; ///< Complete work transitively covered by this producer.
         int graph_seq_len = 0;                 ///< Captured graph rows per request, including prefill bucketing.
         int graph_batch_size = 0;              ///< Captured graph request count.
     };

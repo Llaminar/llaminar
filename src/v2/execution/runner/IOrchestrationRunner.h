@@ -164,6 +164,21 @@ namespace llaminar2
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
 
         /**
+         * @brief Observe completion of the latest forward pass for host timing.
+         *
+         * GPU implementations wait on the exact durable terminal event published
+         * by the complete graph transaction, including shifted MTP KV population
+         * during prefill. This is a benchmark result boundary, not permission to
+         * add a stream/device synchronization to production inference.
+         *
+         * @return true when the latest forward pass has completed.
+         */
+        virtual bool waitForLastForwardCompletionForBenchmark()
+        {
+            return !primaryDeviceId().is_gpu();
+        }
+
+        /**
          * @brief Whether prefillBatch() is implemented for this runner.
          *
          * A request-batched decode lane is valid only if every request slot has

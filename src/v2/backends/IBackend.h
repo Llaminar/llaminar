@@ -2304,6 +2304,68 @@ namespace llaminar2
         }
 
         /**
+         * @brief Initialize the isolated host-scheduler ticket identity.
+         *
+         * This admission-only operation writes a versioned ticket directly on
+         * device and snapshots the newly initialized controller into it.  The
+         * host never uploads a ticket image.  Keeping the ticket in separate
+         * storage from the controller prevents a HIP graph scheduler from
+         * observing or mutating response, sampler, KV, or depth-policy state.
+         *
+         * Implementations enqueue one allocation-free kernel on the exact
+         * non-null stream.  Session and workspace generations are immutable
+         * request identity; all scheduling decisions remain device-derived.
+         */
+        virtual bool enqueueInitializeDeviceGenerationDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            void *control_device,
+            int control_stride,
+            int request_count,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream)
+        {
+            (void)session_epoch;
+            (void)workspace_generation;
+            (void)control_device;
+            (void)control_stride;
+            (void)request_count;
+            (void)dispatch_tickets_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Publish one immutable scheduling snapshot per request row.
+         *
+         * The graph-captured kernel reads only the authoritative generation
+         * controller and the optional MoE maintenance predicate.  It writes the
+         * narrow @ref sampling_math::DeviceGenerationDispatchTicket ABI consumed
+         * by a HIP host scheduler.  No response token, compact verifier outcome,
+         * cache position, or sampler state crosses this interface.
+         */
+        virtual bool enqueuePublishDeviceGenerationDispatchTickets(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            const void *maintenance_due_device,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream)
+        {
+            (void)control_device;
+            (void)control_stride;
+            (void)request_count;
+            (void)maintenance_due_device;
+            (void)dispatch_tickets_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Reduce device-owned current-batch LLEP markers into terminal control.
          *
          * The complete MoE runtime table is scanned once after its final
