@@ -23,6 +23,7 @@
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "../native_vnni_dispatch/GPUTrainerVerification.h"
@@ -1011,6 +1012,44 @@ namespace
         {
             throw std::runtime_error(
                 "failed to inspect compiled CUDA MoE grouped-prefill kernel");
+        }
+        return resources;
+    }
+
+    /** Inspect one exact persistent grouped-IMMA specialization. */
+    CudaMoEPrefillKernelResources queryCudaMoEGroupedImmaKernelResources(
+        uint8_t execution_codebook)
+    {
+        CudaMoEPrefillKernelResources resources{};
+        if (!cudaMoEGroupedImma_queryKernelResources(
+                execution_codebook,
+                &resources.registers_per_thread,
+                &resources.local_memory_bytes_per_thread,
+                &resources.static_shared_memory_bytes,
+                &resources.max_threads_per_block,
+                &resources.max_active_blocks_per_sm))
+        {
+            throw std::runtime_error(
+                "failed to inspect compiled CUDA grouped-IMMA kernel");
+        }
+        return resources;
+    }
+
+    /** Inspect one fused grouped-IMMA gate/up/SwiGLU specialization. */
+    CudaMoEPrefillKernelResources queryCudaMoEGroupedImmaGateUpKernelResources(
+        uint8_t execution_codebook)
+    {
+        CudaMoEPrefillKernelResources resources{};
+        if (!cudaMoEGroupedImma_queryGateUpKernelResources(
+                execution_codebook,
+                &resources.registers_per_thread,
+                &resources.local_memory_bytes_per_thread,
+                &resources.static_shared_memory_bytes,
+                &resources.max_threads_per_block,
+                &resources.max_active_blocks_per_sm))
+        {
+            throw std::runtime_error(
+                "failed to inspect compiled CUDA grouped-IMMA gate/up kernel");
         }
         return resources;
     }
@@ -2757,6 +2796,51 @@ TEST(Perf__MoEVerifierPrefill, CUDA_AllFormatProductionPrefillCandidatesAreSpill
     for (const uint8_t codebook : execution_codebooks)
     {
         SCOPED_TRACE(static_cast<unsigned>(codebook));
+
+        const auto grouped_imma =
+            queryCudaMoEGroupedImmaKernelResources(codebook);
+        EXPECT_TRUE(grouped_imma.spillFree())
+            << "grouped IMMA registers="
+            << grouped_imma.registers_per_thread
+            << " local_bytes="
+            << grouped_imma.local_memory_bytes_per_thread
+            << " active_blocks="
+            << grouped_imma.max_active_blocks_per_sm;
+        EXPECT_GT(grouped_imma.registers_per_thread, 0);
+        EXPECT_GT(grouped_imma.max_active_blocks_per_sm, 0);
+
+        /*
+         * IQ4_NL and IQ2_S dominate the pinned Qwen 3.6 35B MoE expert
+         * mixture. Their production decoder distributes each output column's
+         * four independent payload groups across adjacent lanes. Besides
+         * removing idle decode lanes, that mapping keeps the compiled kernel
+         * at 48 registers/thread on sm_86 and admits ten 128-thread CTAs per
+         * SM. Guard the resulting occupancy directly: the former whole-column
+         * mapping used 56--62 registers/thread and only eight resident CTAs,
+         * which cost roughly 28--32% across the real grouped-IMMA launch
+         * family. Timing remains a benchmark concern, while this deterministic
+         * compiler-resource invariant catches the architectural regression.
+         */
+        if (codebook == 4 || codebook == 13)
+        {
+            EXPECT_LE(grouped_imma.registers_per_thread, 48)
+                << "dominant codebook lost its cooperative decode occupancy";
+            EXPECT_GE(grouped_imma.max_active_blocks_per_sm, 10)
+                << "dominant codebook admits too few resident CTAs";
+        }
+
+        const auto grouped_imma_gateup =
+            queryCudaMoEGroupedImmaGateUpKernelResources(codebook);
+        EXPECT_TRUE(grouped_imma_gateup.spillFree())
+            << "fused gate/up IMMA registers="
+            << grouped_imma_gateup.registers_per_thread
+            << " local_bytes="
+            << grouped_imma_gateup.local_memory_bytes_per_thread
+            << " active_blocks="
+            << grouped_imma_gateup.max_active_blocks_per_sm;
+        EXPECT_GT(grouped_imma_gateup.registers_per_thread, 0);
+        EXPECT_GT(grouped_imma_gateup.max_active_blocks_per_sm, 0);
+
         for (const int block_width : ordered_block_widths)
         {
             SCOPED_TRACE(block_width);

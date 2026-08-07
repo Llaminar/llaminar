@@ -3,15 +3,16 @@
 The C++ performance binary owns GPU execution, graph capture, correctness, and
 canonical HIP/CUDA event timing. This module owns the durable transaction
 around those launches: it expands the pinned GGUF inventory into immutable
-``(backend, routed source tuple, route profile, M)`` cells, assigns cells to distinct devices,
-authenticates every aggregate and raw timing row, and atomically promotes only
-complete cells. A rerun therefore preserves every validated cell and launches
-only missing or invalid work.
+``(backend, routed source tuple, route profile, M)`` cells, assigns distinct
+same-weight M batches to physical devices, authenticates every aggregate and
+raw timing row, and atomically promotes only complete cells. A rerun therefore
+preserves every validated cell and launches only missing or invalid work.
 
-One cell is intentionally the unit of process isolation. The C++ executable
-prepares all real experts once, screens the complete gate/up-by-down candidate
-pair space, and robustly retimes finalists. Distinct cells can run concurrently
-on distinct physical accelerators without duplicating a cell or sharing a GPU.
+The C++ executable prepares one real routed-expert set, then measures every M
+in that same source/geometry/routing batch. Python splits the native evidence
+back into independently committed cells. Content-addressed per-invocation plans
+make supplemental shapes or M values additive without weakening the immutable
+Release-trainer identity or the selected source identity in each plan.
 """
 
 from __future__ import annotations
@@ -25,11 +26,19 @@ import os
 import queue
 import subprocess
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from .adapters.evidence import verify_aggregate_timing
+from .corpus_provenance import (
+    TRAINER_PROVENANCE_SCHEMA,
+    mapping_digest,
+    require_release_trainer,
+    sha256_file,
+    trainer_provenance,
+)
 from .prefill_matrix import GPU_PREFILL_M_BUCKETS
 from .moe_routing_profiles import (
     MOE_ROUTING_PROFILES,
@@ -37,7 +46,6 @@ from .moe_routing_profiles import (
 )
 from .qwen_moe_gguf_patterns import (
     QwenMoERoutedPrefillCase,
-    load_qwen_moe_gguf_pattern_inventory,
     qwen_moe_routed_prefill_cases,
 )
 
@@ -87,6 +95,22 @@ CUDA_CANDIDATE_IDS = tuple(
 )
 
 _UINT64_MAX = (1 << 64) - 1
+CORPUS_MANIFEST_SCHEMA = "native-vnni-production-moe-prefill-corpus-v2"
+SWEEP_PLAN_SCHEMA = "native-vnni-production-moe-prefill-plan-v2"
+CELL_MANIFEST_SCHEMA = "native-vnni-production-moe-prefill-cell-v2"
+COMBINED_MANIFEST_SCHEMA = "native-vnni-production-moe-prefill-combined-v1"
+CORPUS_MANIFEST_FILENAME = "corpus.json"
+
+
+def _is_sha256_digest(value: object) -> bool:
+    """Return whether ``value`` is one canonical prefixed SHA-256 digest."""
+
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 @dataclass(frozen=True, order=True)
@@ -129,6 +153,9 @@ class ProductionMoEPrefillCell:
     def canonical_mapping(self) -> dict[str, object]:
         """Serialize this cell for a reviewable deterministic plan."""
 
+        gate_codebook, up_codebook, down_codebook = (
+            self.case.routed.runtime_codebooks(self.backend)
+        )
         return {
             "backend": self.backend,
             "cell_id": self.cell_id,
@@ -142,6 +169,9 @@ class ProductionMoEPrefillCell:
             "source_gate": self.case.routed.gate,
             "source_up": self.case.routed.up,
             "source_down": self.case.routed.down,
+            "gate_execution_codebook": gate_codebook,
+            "up_execution_codebook": up_codebook,
+            "down_execution_codebook": down_codebook,
             "mixture_overlay_keys": [
                 list(key) for key in self.case.mixture_overlay_keys
             ],
@@ -173,9 +203,20 @@ class CellPaths:
     aggregate: Path
     timing: Path
     log: Path
+    manifest: Path
     aggregate_staging: Path
     timing_staging: Path
     log_staging: Path
+    manifest_staging: Path
+
+
+@dataclass(frozen=True)
+class BatchPaths:
+    """Ephemeral native-process outputs for one same-weight M batch."""
+
+    aggregate: Path
+    timing: Path
+    log: Path
 
 
 def production_moe_prefill_cells(
@@ -212,9 +253,11 @@ def _cell_paths(root: Path, cell: ProductionMoEPrefillCell) -> CellPaths:
         aggregate=stem.with_suffix(".csv"),
         timing=stem.with_suffix(".timing.csv"),
         log=stem.with_suffix(".log"),
+        manifest=stem.with_suffix(".manifest.json"),
         aggregate_staging=stem.with_suffix(".csv.inprogress"),
         timing_staging=stem.with_suffix(".timing.csv.inprogress"),
         log_staging=stem.with_suffix(".log.inprogress"),
+        manifest_staging=stem.with_suffix(".manifest.json.inprogress"),
     )
 
 
@@ -225,6 +268,59 @@ def production_moe_prefill_cell_paths(
     """Return the stable on-disk locations owned by one planned cell."""
 
     return _cell_paths(Path(root), cell)
+
+
+def _batch_group_key(
+    cell: ProductionMoEPrefillCell,
+) -> tuple[object, ...]:
+    """Return every prepared-weight and routing field held fixed in a batch."""
+
+    return (
+        cell.backend,
+        cell.case.source_key,
+        cell.route_profile,
+    )
+
+
+def _validated_batch_cells(
+    cells: Sequence[ProductionMoEPrefillCell],
+) -> tuple[ProductionMoEPrefillCell, ...]:
+    """Validate one process batch in which only the runtime row count varies."""
+
+    ordered = tuple(sorted(cells, key=lambda cell: cell.m))
+    if not ordered:
+        raise ValueError("production MoE process batch cannot be empty")
+    group = _batch_group_key(ordered[0])
+    if any(_batch_group_key(cell) != group for cell in ordered):
+        raise ValueError(
+            "production MoE process batch changed format, geometry, or route"
+        )
+    if len({cell.m for cell in ordered}) != len(ordered):
+        raise ValueError("production MoE process batch contains duplicate M")
+    return ordered
+
+
+def _batch_paths(
+    root: Path,
+    cells: Sequence[ProductionMoEPrefillCell],
+) -> BatchPaths:
+    """Return collision-resistant staging paths for one native process."""
+
+    ordered = _validated_batch_cells(cells)
+    identity = [cell.identity for cell in ordered]
+    digest = hashlib.sha256(json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()[:20]
+    first = ordered[0]
+    stem = (
+        Path(root) / "batches" /
+        f"{first.backend}-{first.route_profile}-{digest}"
+    )
+    return BatchPaths(
+        aggregate=stem.with_suffix(".csv.inprogress"),
+        timing=stem.with_suffix(".timing.csv.inprogress"),
+        log=stem.with_suffix(".log.inprogress"),
+    )
 
 
 def _require_exact_header(
@@ -538,36 +634,365 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(staging, path)
 
 
+def _corpus_manifest_payload(
+    backend: str,
+    trainer: Mapping[str, object],
+) -> dict[str, object]:
+    """Construct the immutable producer and inventory contract for one root."""
+
+    normalized = backend.strip().lower()
+    if normalized not in {"cuda", "rocm"}:
+        raise ValueError(f"unsupported production GPU backend {backend!r}")
+    require_release_trainer(trainer)
+    if trainer.get("backend") != normalized:
+        raise ValueError("trainer provenance belongs to another backend")
+    body: dict[str, object] = {
+        "schema_version": CORPUS_MANIFEST_SCHEMA,
+        "backend": normalized,
+        "route_profiles": list(MOE_ROUTING_PROFILES),
+        "candidate_ids": list(production_moe_prefill_candidate_ids(normalized)),
+        "trainer_provenance": dict(trainer),
+        "trainer_provenance_digest": mapping_digest(trainer),
+    }
+    body["corpus_digest"] = mapping_digest(body)
+    return body
+
+
+def _read_corpus_manifest(path: Path) -> dict[str, object]:
+    """Read and authenticate one immutable corpus-root contract."""
+
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: corpus manifest must be a JSON object")
+    if payload.get("schema_version") != CORPUS_MANIFEST_SCHEMA:
+        raise ValueError(f"{path}: unsupported corpus-manifest schema")
+    recorded = payload.get("corpus_digest")
+    if not _is_sha256_digest(recorded):
+        raise ValueError(f"{path}: malformed corpus-manifest digest")
+    unsigned = dict(payload)
+    unsigned.pop("corpus_digest", None)
+    if recorded != mapping_digest(unsigned):
+        raise ValueError(f"{path}: corpus-manifest digest mismatch")
+    trainer = payload.get("trainer_provenance")
+    if not isinstance(trainer, dict) or (
+        payload.get("trainer_provenance_digest") != mapping_digest(trainer)
+    ):
+        raise ValueError(f"{path}: trainer provenance digest mismatch")
+    if payload.get("backend") not in {"cuda", "rocm"}:
+        raise ValueError(f"{path}: unsupported corpus backend")
+    if not _is_sha256_digest(payload.get("trainer_provenance_digest")):
+        raise ValueError(f"{path}: malformed trainer provenance digest")
+    for name in ("route_profiles", "candidate_ids"):
+        values = payload.get(name)
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"{path}: malformed {name}")
+    return payload
+
+
+def write_corpus_manifest(
+    root: Path,
+    backend: str,
+    trainer: Mapping[str, object],
+) -> dict[str, object]:
+    """Create one corpus root, or prove its producer contract is unchanged."""
+
+    root = Path(root)
+    path = root / CORPUS_MANIFEST_FILENAME
+    expected = _corpus_manifest_payload(backend, trainer)
+    if path.exists():
+        existing = _read_corpus_manifest(path)
+        if existing != expected:
+            raise ValueError(
+                f"{path}: immutable corpus manifest disagrees with this run; "
+                "use a new corpus directory"
+            )
+        return existing
+    _write_json_atomic(path, expected)
+    return expected
+
+
+def load_corpus_manifest(root: Path, backend: str) -> dict[str, object]:
+    """Authenticate the corpus root against today's immutable registries."""
+
+    path = Path(root) / CORPUS_MANIFEST_FILENAME
+    existing = _read_corpus_manifest(path)
+    trainer = existing["trainer_provenance"]
+    assert isinstance(trainer, dict)
+    expected = _corpus_manifest_payload(backend, trainer)
+    if existing != expected:
+        raise ValueError(
+            f"{path}: corpus inventory or candidate contract changed"
+        )
+    return existing
+
+
+def _sweep_plan_payload(
+    cells: Sequence[ProductionMoEPrefillCell],
+    corpus: Mapping[str, object],
+) -> dict[str, object]:
+    """Construct one exact additive invocation plan within a corpus root."""
+
+    ordered = tuple(sorted(cells))
+    if not ordered:
+        raise ValueError("production MoE sweep plan cannot be empty")
+    backend = str(corpus["backend"])
+    if any(cell.backend != backend for cell in ordered):
+        raise ValueError("sweep plan contains a cell for another backend")
+    if len({cell.cell_id for cell in ordered}) != len(ordered):
+        raise ValueError("sweep plan contains duplicate cells")
+    body: dict[str, object] = {
+        "schema_version": SWEEP_PLAN_SCHEMA,
+        "backend": backend,
+        "corpus_digest": corpus["corpus_digest"],
+        "cells": [cell.canonical_mapping() for cell in ordered],
+    }
+    body["plan_digest"] = mapping_digest(body)
+    return body
+
+
+def _plan_path(root: Path, plan_digest: str) -> Path:
+    """Map one authenticated digest onto its immutable plan filename."""
+
+    if not plan_digest.startswith("sha256:") or len(plan_digest) != 71:
+        raise ValueError("invalid production MoE sweep-plan digest")
+    return Path(root) / "plans" / f"{plan_digest.removeprefix('sha256:')}.json"
+
+
+def _read_sweep_plan(path: Path) -> dict[str, object]:
+    """Read and authenticate one content-addressed invocation plan."""
+
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: sweep plan must be a JSON object")
+    if payload.get("schema_version") != SWEEP_PLAN_SCHEMA:
+        raise ValueError(f"{path}: unsupported sweep-plan schema")
+    recorded = payload.get("plan_digest")
+    if not _is_sha256_digest(recorded):
+        raise ValueError(f"{path}: malformed sweep-plan digest")
+    unsigned = dict(payload)
+    unsigned.pop("plan_digest", None)
+    if recorded != mapping_digest(unsigned):
+        raise ValueError(f"{path}: sweep-plan digest mismatch")
+    if path.name != f"{recorded.removeprefix('sha256:')}.json":
+        raise ValueError(f"{path}: filename disagrees with sweep-plan digest")
+    if payload.get("backend") not in {"cuda", "rocm"}:
+        raise ValueError(f"{path}: unsupported sweep-plan backend")
+    if not _is_sha256_digest(payload.get("corpus_digest")):
+        raise ValueError(f"{path}: malformed sweep-plan corpus digest")
+    cells = payload.get("cells")
+    if not isinstance(cells, list) or not cells or any(
+        not isinstance(cell, dict)
+        or not isinstance(cell.get("cell_id"), str)
+        or not cell["cell_id"]
+        for cell in cells
+    ):
+        raise ValueError(f"{path}: malformed sweep-plan cell inventory")
+    cell_ids = [str(cell["cell_id"]) for cell in cells]
+    if len(cell_ids) != len(set(cell_ids)):
+        raise ValueError(f"{path}: duplicate sweep-plan cells")
+    return payload
+
+
 def write_sweep_plan(
-    path: Path,
+    root: Path,
     backend: str,
     cells: Sequence[ProductionMoEPrefillCell],
-) -> None:
-    """Write the complete GGUF/source/M plan and immutable manifest digest."""
+    trainer: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Create/reuse an additive plan under one immutable corpus contract."""
 
-    inventory = load_qwen_moe_gguf_pattern_inventory()
-    records = [cell.canonical_mapping() for cell in cells]
-    body = {
-        "schema_version": "native-vnni-production-moe-prefill-sweep-v3",
-        "backend": backend,
-        "gguf_manifest_digest": inventory.source_digest,
-        "gpu_m_buckets": list(GPU_PREFILL_M_BUCKETS),
-        "route_profiles": list(MOE_ROUTING_PROFILES),
-        "candidate_count": len(production_moe_prefill_candidate_ids(backend)),
-        "cells": records,
+    corpus = write_corpus_manifest(root, backend, trainer)
+    expected = _sweep_plan_payload(cells, corpus)
+    path = _plan_path(root, str(expected["plan_digest"]))
+    if path.exists():
+        existing = _read_sweep_plan(path)
+        if existing != expected:
+            raise ValueError(f"{path}: content-addressed sweep plan changed")
+        return corpus, existing
+    _write_json_atomic(path, expected)
+    return corpus, expected
+
+
+def load_sweep_plan(
+    root: Path,
+    backend: str,
+    cells: Sequence[ProductionMoEPrefillCell],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Authenticate one requested matrix without mutating corpus state."""
+
+    corpus = load_corpus_manifest(root, backend)
+    expected = _sweep_plan_payload(cells, corpus)
+    existing = _read_sweep_plan(
+        _plan_path(root, str(expected["plan_digest"]))
+    )
+    if existing != expected:
+        raise ValueError("requested production MoE sweep plan changed")
+    return corpus, existing
+
+
+def _cell_manifest_payload(
+    paths: CellPaths,
+    cell: ProductionMoEPrefillCell,
+    corpus: Mapping[str, object],
+    plan: Mapping[str, object],
+    native_process: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind one promoted cell to its plan, producer, and exact bytes."""
+
+    mapping = cell.canonical_mapping()
+    if (
+        corpus.get("backend") != cell.backend
+        or plan.get("backend") != cell.backend
+        or plan.get("corpus_digest") != corpus.get("corpus_digest")
+        or mapping not in plan.get("cells", [])
+    ):
+        raise ValueError("cell manifest producer closure does not own cell")
+    body: dict[str, object] = {
+        "schema_version": CELL_MANIFEST_SCHEMA,
+        "cell": mapping,
+        "corpus_digest": corpus["corpus_digest"],
+        "plan_digest": plan["plan_digest"],
+        "trainer_provenance_digest": corpus["trainer_provenance_digest"],
+        "native_process": dict(native_process),
+        "artifacts": {
+            "aggregate": {
+                "filename": paths.aggregate.name,
+                "sha256": sha256_file(paths.aggregate_staging),
+            },
+            "timing": {
+                "filename": paths.timing.name,
+                "sha256": sha256_file(paths.timing_staging),
+            },
+            "log": {
+                "filename": paths.log.name,
+                "sha256": sha256_file(paths.log_staging),
+            },
+        },
     }
-    body["plan_digest"] = "sha256:" + hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    _write_json_atomic(Path(path), body)
+    body["manifest_digest"] = mapping_digest(body)
+    return body
 
 
-def _cell_complete(root: Path, cell: ProductionMoEPrefillCell) -> bool:
+def _stage_cell_manifest(
+    paths: CellPaths,
+    cell: ProductionMoEPrefillCell,
+    corpus: Mapping[str, object],
+    plan: Mapping[str, object],
+    native_process: Mapping[str, object],
+) -> None:
+    """Durably stage a cell commit marker after evidence validates."""
+
+    payload = _cell_manifest_payload(
+        paths, cell, corpus, plan, native_process
+    )
+    paths.manifest_staging.parent.mkdir(parents=True, exist_ok=True)
+    with paths.manifest_staging.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _read_cell_manifest(path: Path) -> dict[str, object]:
+    """Read and authenticate one per-cell commit marker."""
+
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: cell manifest must be a JSON object")
+    if payload.get("schema_version") != CELL_MANIFEST_SCHEMA:
+        raise ValueError(f"{path}: unsupported cell-manifest schema")
+    recorded = payload.get("manifest_digest")
+    if not _is_sha256_digest(recorded):
+        raise ValueError(f"{path}: malformed cell-manifest digest")
+    unsigned = dict(payload)
+    unsigned.pop("manifest_digest", None)
+    if recorded != mapping_digest(unsigned):
+        raise ValueError(f"{path}: cell-manifest digest mismatch")
+    return payload
+
+
+def validate_promoted_production_moe_prefill_cell(
+    root: Path,
+    cell: ProductionMoEPrefillCell,
+    corpus: Mapping[str, object] | None = None,
+) -> CellValidation:
+    """Prove one committed cell belongs to the exact corpus closure."""
+
+    root = Path(root)
+    corpus = (
+        load_corpus_manifest(root, cell.backend)
+        if corpus is None else dict(corpus)
+    )
     paths = _cell_paths(root, cell)
+    manifest = _read_cell_manifest(paths.manifest)
+    if manifest.get("cell") != cell.canonical_mapping():
+        raise ValueError(f"{paths.manifest}: cell identity mismatch")
+    for field in ("corpus_digest", "trainer_provenance_digest"):
+        if manifest.get(field) != corpus.get(field):
+            raise ValueError(f"{paths.manifest}: {field} mismatch")
+
+    plan_digest = str(manifest.get("plan_digest"))
+    plan = _read_sweep_plan(_plan_path(root, plan_digest))
+    if plan.get("corpus_digest") != corpus.get("corpus_digest") or (
+        cell.canonical_mapping() not in plan.get("cells", [])
+    ):
+        raise ValueError(f"{paths.manifest}: producing plan does not own cell")
+
+    native_process = manifest.get("native_process")
+    if not isinstance(native_process, dict):
+        raise ValueError(f"{paths.manifest}: missing native-process identity")
+    cell_ids = native_process.get("cell_ids")
+    if (
+        native_process.get("backend") != cell.backend
+        or not isinstance(native_process.get("invocation_id"), str)
+        or not native_process["invocation_id"]
+        or not isinstance(native_process.get("device_ordinal"), int)
+        or native_process["device_ordinal"] < 0
+        or not isinstance(cell_ids, list)
+        or any(not isinstance(cell_id, str) for cell_id in cell_ids)
+        or len(cell_ids) != len(set(cell_ids))
+        or cell.cell_id not in cell_ids
+    ):
+        raise ValueError(f"{paths.manifest}: invalid native-process identity")
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "aggregate", "timing", "log"
+    }:
+        raise ValueError(f"{paths.manifest}: incomplete artifact inventory")
+    for role, artifact_path in (
+        ("aggregate", paths.aggregate),
+        ("timing", paths.timing),
+        ("log", paths.log),
+    ):
+        record = artifacts[role]
+        if not isinstance(record, dict) or (
+            set(record) != {"filename", "sha256"}
+            or not _is_sha256_digest(record.get("sha256"))
+            or record.get("filename") != artifact_path.name
+            or record.get("sha256") != sha256_file(artifact_path)
+        ):
+            raise ValueError(
+                f"{paths.manifest}: {role} artifact digest mismatch"
+            )
+    return validate_production_moe_prefill_cell(
+        paths.aggregate, paths.timing, cell
+    )
+
+
+def _cell_complete(
+    root: Path,
+    cell: ProductionMoEPrefillCell,
+    corpus: Mapping[str, object],
+) -> bool:
     try:
-        validate_production_moe_prefill_cell(
-            paths.aggregate, paths.timing, cell
-        )
+        validate_promoted_production_moe_prefill_cell(root, cell, corpus)
     except (OSError, ValueError):
         return False
     return True
@@ -579,44 +1004,152 @@ _BACKEND_TESTS = {
 }
 
 
-def _run_accelerator_cell(
-    binary: Path,
-    root: Path,
-    cell: ProductionMoEPrefillCell,
+def _batch_environment(
+    cells: Sequence[ProductionMoEPrefillCell],
+    paths: BatchPaths,
     device: int,
-) -> CellValidation:
-    """Launch, validate, and atomically promote one isolated GPU cell."""
+) -> dict[str, str]:
+    """Build the exact native environment for a same-weight multi-M batch."""
 
-    if cell.backend not in _BACKEND_TESTS:
-        raise ValueError(f"unsupported production GPU backend {cell.backend!r}")
-    paths = _cell_paths(root, cell)
-    paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
-    for staging in (
-        paths.aggregate_staging, paths.timing_staging, paths.log_staging
-    ):
-        staging.unlink(missing_ok=True)
-
+    ordered = _validated_batch_cells(cells)
+    first = ordered[0]
     environment = os.environ.copy()
-    prefix = f"LLAMINAR_{cell.backend.upper()}_MOE_PRODUCTION_SWEEP"
+    prefix = f"LLAMINAR_{first.backend.upper()}_MOE_PRODUCTION_SWEEP"
     environment.update({
         prefix: "1",
-        f"{prefix}_CASES": cell.case.evidence_id,
-        f"{prefix}_M": str(cell.m),
-        f"{prefix}_ROUTE_PROFILE": cell.route_profile,
-        f"{prefix}_MAX_CELLS": "1",
+        f"{prefix}_CASES": first.case.evidence_id,
+        f"{prefix}_M": ",".join(str(cell.m) for cell in ordered),
+        f"{prefix}_ROUTE_PROFILE": first.route_profile,
+        f"{prefix}_MAX_CELLS": str(len(ordered)),
         f"{prefix}_DEVICE": str(device),
-        f"{prefix}_CSV": str(
-            paths.aggregate_staging
-        ),
-        f"{prefix}_TIMING_CSV": str(
-            paths.timing_staging
-        ),
+        f"{prefix}_CSV": str(paths.aggregate),
+        f"{prefix}_TIMING_CSV": str(paths.timing),
     })
+    return environment
+
+
+def _write_csv_rows(
+    path: Path,
+    columns: Sequence[str],
+    rows: Sequence[Mapping[str, str]],
+) -> None:
+    """Durably publish one already-separated cell CSV into staging."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _split_batch_csv(
+    source: Path,
+    root: Path,
+    cells: Sequence[ProductionMoEPrefillCell],
+    *,
+    timing: bool,
+) -> None:
+    """Split multi-M native evidence into independently resumable cells."""
+
+    ordered = _validated_batch_cells(cells)
+    columns = TIMING_COLUMNS if timing else AGGREGATE_COLUMNS
+    cells_by_m = {cell.m: cell for cell in ordered}
+    rows_by_m: dict[int, list[dict[str, str]]] = {
+        cell.m: [] for cell in ordered
+    }
+    with source.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        _require_exact_header(source, reader.fieldnames, columns)
+        for line, row in enumerate(reader, start=2):
+            context = f"{source}:{line}"
+            try:
+                cell = cells_by_m[int(row["m"])]
+            except (KeyError, ValueError) as error:
+                raise ValueError(
+                    f"{context}: row does not belong to the native M batch"
+                ) from error
+            if (
+                row["backend"] != cell.backend
+                or row["phase"] != "moe_production_prefill"
+                or row["case_id"] != cell.case.evidence_id
+                or row["route_profile"] != cell.route_profile
+            ):
+                raise ValueError(
+                    f"{context}: row identity changed inside native M batch"
+                )
+            rows_by_m[cell.m].append(dict(row))
+
+    for cell in ordered:
+        if not rows_by_m[cell.m]:
+            raise ValueError(f"{source}: M={cell.m} produced no rows")
+        paths = _cell_paths(root, cell)
+        destination = paths.timing_staging if timing else paths.aggregate_staging
+        _write_csv_rows(destination, columns, rows_by_m[cell.m])
+
+
+def _write_batch_logs(
+    source: Path,
+    root: Path,
+    cells: Sequence[ProductionMoEPrefillCell],
+) -> None:
+    """Attach one native process log to every cell emitted by that process."""
+
+    payload = source.read_bytes()
+    for cell in _validated_batch_cells(cells):
+        destination = _cell_paths(root, cell).log_staging
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _run_accelerator_batch(
+    binary: Path,
+    root: Path,
+    cells: Sequence[ProductionMoEPrefillCell],
+    device: int,
+    corpus: Mapping[str, object],
+    plan: Mapping[str, object],
+) -> tuple[CellValidation, ...]:
+    """Measure all missing M buckets while retaining one prepared expert set.
+
+    The C++ trainer emits independent event samples for every M and candidate;
+    batching removes only process startup and immutable expert preparation. The
+    combined files are split, fully authenticated, and fsynced before any cell
+    reaches its final path, preserving per-M resume semantics.
+    """
+
+    ordered = _validated_batch_cells(cells)
+    paths = _batch_paths(root, ordered)
+    paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
+    for path in (paths.aggregate, paths.timing, paths.log):
+        path.unlink(missing_ok=True)
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        for staging in (
+            cell_paths.aggregate_staging,
+            cell_paths.timing_staging,
+            cell_paths.log_staging,
+            cell_paths.manifest_staging,
+        ):
+            staging.unlink(missing_ok=True)
+
+    native_process = {
+        "invocation_id": str(uuid.uuid4()),
+        "backend": ordered[0].backend,
+        "device_ordinal": device,
+        "cell_ids": [cell.cell_id for cell in ordered],
+    }
+
     command = (
         str(binary),
-        f"--gtest_filter={_BACKEND_TESTS[cell.backend]}",
+        f"--gtest_filter={_BACKEND_TESTS[ordered[0].backend]}",
     )
-    with paths.log_staging.open("wb") as log:
+    environment = _batch_environment(ordered, paths, device)
+    with paths.log.open("wb") as log:
         completed = subprocess.run(
             command,
             env=environment,
@@ -628,18 +1161,42 @@ def _run_accelerator_cell(
         os.fsync(log.fileno())
     if completed.returncode != 0:
         raise RuntimeError(
-            f"{cell.cell_id} failed on {cell.backend} device {device}; "
-            f"inspect {paths.log_staging}"
+            f"{ordered[0].backend} production MoE batch failed on device "
+            f"{device}; inspect {paths.log}"
         )
-    validation = validate_production_moe_prefill_cell(
-        paths.aggregate_staging,
-        paths.timing_staging,
-        cell,
-    )
-    os.replace(paths.aggregate_staging, paths.aggregate)
-    os.replace(paths.timing_staging, paths.timing)
-    os.replace(paths.log_staging, paths.log)
-    return validation
+
+    _split_batch_csv(paths.aggregate, root, ordered, timing=False)
+    _split_batch_csv(paths.timing, root, ordered, timing=True)
+    _write_batch_logs(paths.log, root, ordered)
+    validations = []
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        validations.append(validate_production_moe_prefill_cell(
+            cell_paths.aggregate_staging,
+            cell_paths.timing_staging,
+            cell,
+        ))
+        _stage_cell_manifest(
+            cell_paths,
+            cell,
+            corpus,
+            plan,
+            native_process,
+        )
+
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        os.replace(cell_paths.aggregate_staging, cell_paths.aggregate)
+        os.replace(cell_paths.timing_staging, cell_paths.timing)
+        os.replace(cell_paths.log_staging, cell_paths.log)
+        # The manifest is the transaction commit marker. Promoting it last
+        # prevents a crash during any preceding rename from creating a cell
+        # that a future resume can mistake for complete evidence.
+        os.replace(cell_paths.manifest_staging, cell_paths.manifest)
+        validate_promoted_production_moe_prefill_cell(root, cell, corpus)
+    for path in (paths.aggregate, paths.timing, paths.log):
+        path.unlink(missing_ok=True)
+    return tuple(validations)
 
 
 def run_missing_accelerator_cells(
@@ -649,6 +1206,7 @@ def run_missing_accelerator_cells(
     devices: Sequence[int],
     *,
     maximum_new_cells: int | None = None,
+    producer: Mapping[str, object] | None = None,
 ) -> tuple[ProductionMoEPrefillCell, ...]:
     """Run distinct missing cells concurrently, one worker per physical GPU."""
 
@@ -666,14 +1224,24 @@ def run_missing_accelerator_cells(
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"{backend} trainer binary is not executable: {binary}")
     root = Path(root)
-    missing = [cell for cell in cells if not _cell_complete(root, cell)]
+    producer = (
+        trainer_provenance(binary, backend)
+        if producer is None else dict(producer)
+    )
+    corpus, plan = write_sweep_plan(root, backend, cells, producer)
+    missing = [
+        cell for cell in cells if not _cell_complete(root, cell, corpus)
+    ]
     if maximum_new_cells is not None:
         if maximum_new_cells <= 0:
             raise ValueError("maximum_new_cells must be positive")
         missing = missing[:maximum_new_cells]
-    work: queue.Queue[ProductionMoEPrefillCell] = queue.Queue()
+    grouped: dict[tuple[object, ...], list[ProductionMoEPrefillCell]] = {}
     for cell in missing:
-        work.put(cell)
+        grouped.setdefault(_batch_group_key(cell), []).append(cell)
+    work: queue.Queue[tuple[ProductionMoEPrefillCell, ...]] = queue.Queue()
+    for _key, batch in sorted(grouped.items()):
+        work.put(_validated_batch_cells(batch))
 
     failures: list[BaseException] = []
     completed_cells: list[ProductionMoEPrefillCell] = []
@@ -683,13 +1251,27 @@ def run_missing_accelerator_cells(
     def worker(device: int) -> None:
         while not stop.is_set():
             try:
-                cell = work.get_nowait()
+                batch = work.get_nowait()
             except queue.Empty:
                 return
             try:
-                _run_accelerator_cell(binary, root, cell, device)
+                _run_accelerator_batch(
+                    binary,
+                    root,
+                    batch,
+                    device,
+                    corpus,
+                    plan,
+                )
                 with lock:
-                    completed_cells.append(cell)
+                    completed_cells.extend(batch)
+                    print(
+                        f"[{backend} device {device}] completed "
+                        f"{len(batch)} cells for "
+                        f"{batch[0].case.evidence_id}/"
+                        f"{batch[0].route_profile}",
+                        flush=True,
+                    )
             except BaseException as error:  # preserve worker traceback object
                 with lock:
                     failures.append(error)
@@ -719,6 +1301,7 @@ def run_missing_rocm_cells(
     devices: Sequence[int],
     *,
     maximum_new_cells: int | None = None,
+    producer: Mapping[str, object] | None = None,
 ) -> tuple[ProductionMoEPrefillCell, ...]:
     """Run missing ROCm cells through the backend-neutral transaction."""
 
@@ -730,6 +1313,7 @@ def run_missing_rocm_cells(
         cells,
         devices,
         maximum_new_cells=maximum_new_cells,
+        producer=producer,
     )
 
 
@@ -740,6 +1324,7 @@ def run_missing_cuda_cells(
     devices: Sequence[int],
     *,
     maximum_new_cells: int | None = None,
+    producer: Mapping[str, object] | None = None,
 ) -> tuple[ProductionMoEPrefillCell, ...]:
     """Run missing CUDA cells through the backend-neutral transaction."""
 
@@ -751,6 +1336,7 @@ def run_missing_cuda_cells(
         cells,
         devices,
         maximum_new_cells=maximum_new_cells,
+        producer=producer,
     )
 
 
@@ -782,16 +1368,27 @@ def combine_production_moe_prefill_cells(
 ) -> tuple[Path, Path]:
     """Require every planned cell and publish deterministic aggregate corpora."""
 
+    ordered = tuple(sorted(cells))
+    if not ordered:
+        raise ValueError("cannot combine an empty production MoE plan")
+    backend = ordered[0].backend
+    if any(cell.backend != backend for cell in ordered):
+        raise ValueError("cannot combine production MoE backends")
     root = Path(root)
+    corpus, plan = load_sweep_plan(root, backend, ordered)
     paths = []
-    for cell in cells:
+    for cell in ordered:
         cell_paths = _cell_paths(root, cell)
-        validate_production_moe_prefill_cell(
-            cell_paths.aggregate, cell_paths.timing, cell
+        validate_promoted_production_moe_prefill_cell(
+            root, cell, corpus
         )
         paths.append(cell_paths)
-    aggregate = root / "production_moe_prefill.csv"
-    timing = root / "production_moe_prefill.timing.csv"
+    plan_digest = str(plan["plan_digest"])
+    combined_root = (
+        root / "combined" / plan_digest.removeprefix("sha256:")
+    )
+    aggregate = combined_root / "production_moe_prefill.csv"
+    timing = combined_root / "production_moe_prefill.timing.csv"
     _combine_csvs_atomic(
         aggregate,
         (path.aggregate for path in paths),
@@ -802,6 +1399,31 @@ def combine_production_moe_prefill_cells(
         (path.timing for path in paths),
         TIMING_COLUMNS,
     )
+    combined_manifest: dict[str, object] = {
+        "schema_version": COMBINED_MANIFEST_SCHEMA,
+        "backend": backend,
+        "corpus_digest": corpus["corpus_digest"],
+        "plan_digest": plan_digest,
+        "cells": [
+            {
+                "cell_id": cell.cell_id,
+                "manifest_sha256": sha256_file(path.manifest),
+            }
+            for cell, path in zip(ordered, paths, strict=True)
+        ],
+        "artifacts": {
+            "aggregate": {
+                "filename": aggregate.name,
+                "sha256": sha256_file(aggregate),
+            },
+            "timing": {
+                "filename": timing.name,
+                "sha256": sha256_file(timing),
+            },
+        },
+    }
+    combined_manifest["manifest_digest"] = mapping_digest(combined_manifest)
+    _write_json_atomic(combined_root / "manifest.json", combined_manifest)
     return aggregate, timing
 
 
@@ -824,30 +1446,40 @@ def _parse_devices(raw: str) -> tuple[int, ...]:
 
 
 def _filtered_cells(args: argparse.Namespace) -> tuple[ProductionMoEPrefillCell, ...]:
-    cells = production_moe_prefill_cells(args.backend)
+    cases = qwen_moe_routed_prefill_cases()
     if args.case:
         selected = set(args.case)
-        cells = tuple(cell for cell in cells if cell.case.evidence_id in selected)
-    if args.m:
-        selected_m = set(args.m)
-        cells = tuple(cell for cell in cells if cell.m in selected_m)
-    if args.route_profile:
-        selected_profiles = set(args.route_profile)
-        cells = tuple(
-            cell for cell in cells
-            if cell.route_profile in selected_profiles
+        known = {case.evidence_id for case in cases}
+        if unknown := selected - known:
+            raise ValueError(f"unknown production MoE cases: {sorted(unknown)}")
+        cases = tuple(case for case in cases if case.evidence_id in selected)
+    m_values = tuple(args.m) if args.m else GPU_PREFILL_M_BUCKETS
+    route_profiles = (
+        tuple(dict.fromkeys(args.route_profile))
+        if args.route_profile else MOE_ROUTING_PROFILES
+    )
+    cells = tuple(
+        ProductionMoEPrefillCell(
+            args.backend,
+            case,
+            m,
+            route_profile,
         )
+        for case in cases
+        for route_profile in route_profiles
+        for m in m_values
+    )
     if not cells:
         raise ValueError("sweep filters selected no production MoE cells")
     return cells
 
 
 def main() -> int:
-    """CLI entry point for plan, resumable execution, and atomic combination."""
+    """CLI entry point for planning, execution, status, and combination."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("plan", "run", "combine"):
+    for name in ("plan", "run", "status", "combine"):
         command = subparsers.add_parser(name)
         command.add_argument("--backend", choices=("cuda", "rocm"), required=True)
         command.add_argument("--output-dir", type=Path, required=True)
@@ -859,6 +1491,8 @@ def main() -> int:
             choices=MOE_ROUTING_PROFILES,
             default=[],
         )
+    plan_command = subparsers.choices["plan"]
+    plan_command.add_argument("--binary", type=Path, required=True)
     run = subparsers.choices["run"]
     run.add_argument("--binary", type=Path, required=True)
     run.add_argument("--devices", type=_parse_devices, required=True)
@@ -867,20 +1501,42 @@ def main() -> int:
     args = parser.parse_args()
     cells = _filtered_cells(args)
     output_dir = Path(args.output_dir)
-    write_sweep_plan(output_dir / "plan.json", args.backend, cells)
     if args.command == "plan":
-        print(f"planned {len(cells)} cells in {output_dir / 'plan.json'}")
+        producer = trainer_provenance(args.binary, args.backend)
+        corpus, plan = write_sweep_plan(
+            output_dir, args.backend, cells, producer
+        )
+        plan_path = _plan_path(output_dir, str(plan["plan_digest"]))
+        print(
+            f"planned {len(cells)} cells in {plan_path}; "
+            f"corpus={corpus['corpus_digest']}"
+        )
         return 0
     if args.command == "run":
+        producer = trainer_provenance(args.binary, args.backend)
         completed = run_missing_accelerator_cells(
             args.binary,
             output_dir,
             cells,
             args.devices,
             maximum_new_cells=args.maximum_new_cells,
+            producer=producer,
         )
-        remaining = sum(not _cell_complete(output_dir, cell) for cell in cells)
+        corpus, _plan = load_sweep_plan(output_dir, args.backend, cells)
+        remaining = sum(
+            not _cell_complete(output_dir, cell, corpus) for cell in cells
+        )
         print(f"completed {len(completed)} new cells; {remaining} cells remain")
+        return 0
+    if args.command == "status":
+        corpus, plan = load_sweep_plan(output_dir, args.backend, cells)
+        complete = sum(
+            _cell_complete(output_dir, cell, corpus) for cell in cells
+        )
+        print(
+            f"{complete}/{len(cells)} cells complete; "
+            f"plan={plan['plan_digest']}"
+        )
         return 0
     aggregate, timing = combine_production_moe_prefill_cells(output_dir, cells)
     print(f"combined {len(cells)} cells into {aggregate} and {timing}")

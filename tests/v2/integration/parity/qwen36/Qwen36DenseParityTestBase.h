@@ -2764,9 +2764,21 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
+        constexpr int kPartialPrefixBlockSize = 4;
+        constexpr int kTerminalPartialPrefixTokens = 3;
         const int block_size = mode == PrefixRestoreParityMode::FullHit
                                    ? static_cast<int>(prompt_tokens.size())
-                                   : 4;
+                                   : kPartialPrefixBlockSize;
+        std::unique_ptr<ScopedEnvironmentValues> partial_prefix_graph_env;
+        if (mode == PrefixRestoreParityMode::PartialHit)
+        {
+            partial_prefix_graph_env =
+                std::make_unique<ScopedEnvironmentValues>(
+                    std::initializer_list<std::pair<const char *, const char *>>{
+                        {"LLAMINAR_GPU_GRAPHS", "1"},
+                        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                    });
+        }
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -2779,8 +2791,14 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> first_prompt = prompt_tokens;
         if (mode == PrefixRestoreParityMode::PartialHit)
         {
-            ASSERT_GT(prompt_tokens.size(), 4u);
-            first_prompt.assign(prompt_tokens.begin(), prompt_tokens.begin() + 4);
+            ASSERT_GT(
+                prompt_tokens.size(),
+                static_cast<size_t>(kTerminalPartialPrefixTokens));
+            first_prompt.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() + kTerminalPartialPrefixTokens);
+            ASSERT_NE(first_prompt.size() % static_cast<size_t>(block_size), 0u)
+                << "partial-prefix seed must terminate inside a cache block";
         }
 
         auto first = cached->generate(first_prompt, test_case.decode_steps, greedy);
@@ -2816,7 +2834,9 @@ namespace llaminar2::test::parity::qwen36
         {
             EXPECT_FALSE(after_second.prefix_request.hit);
             EXPECT_TRUE(after_second.prefix_request.partial_hit);
-            EXPECT_EQ(after_second.prefix_request.matched_tokens, 4);
+            EXPECT_EQ(
+                after_second.prefix_request.matched_tokens,
+                kTerminalPartialPrefixTokens);
             EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
         }
     }
@@ -2872,7 +2892,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         bool enable_prefix_cache,
         int mtp_draft_tokens = 1,
-        MTPDepthPolicyConfig depth_policy = {})
+        MTPDepthPolicyConfig depth_policy = {},
+        int terminal_partial_prefix_tokens = 0)
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
@@ -2894,15 +2915,38 @@ namespace llaminar2::test::parity::qwen36
         });
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
+        ASSERT_GE(terminal_partial_prefix_tokens, 0);
+        ASSERT_TRUE(
+            terminal_partial_prefix_tokens == 0 || enable_prefix_cache)
+            << "terminal-partial MTP restore requires prefix cache";
 
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
-        const int block_size = enable_prefix_cache
-                                   ? static_cast<int>(prompt_tokens.size())
-                                   : 2;
+        const bool terminal_partial_restore =
+            terminal_partial_prefix_tokens > 0;
+        if (terminal_partial_restore)
+        {
+            ASSERT_LT(
+                terminal_partial_prefix_tokens,
+                static_cast<int>(prompt_tokens.size()));
+        }
+        const int block_size = terminal_partial_restore
+                                   ? terminal_partial_prefix_tokens + 1
+                                   : (enable_prefix_cache
+                                          ? static_cast<int>(prompt_tokens.size())
+                                          : 2);
+        std::unique_ptr<ScopedEnvironmentValues> partial_prefix_graph_env;
+        if (terminal_partial_restore)
+        {
+            partial_prefix_graph_env =
+                std::make_unique<ScopedEnvironmentValues>(
+                    std::initializer_list<std::pair<const char *, const char *>>{
+                        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                    });
+        }
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -2919,15 +2963,31 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
+        const std::vector<int32_t> first_prompt = terminal_partial_restore
+                                                      ? std::vector<int32_t>(
+                                                            prompt_tokens.begin(),
+                                                            prompt_tokens.begin() +
+                                                                terminal_partial_prefix_tokens)
+                                                      : prompt_tokens;
+        if (terminal_partial_restore)
+        {
+            ASSERT_NE(first_prompt.size() % static_cast<size_t>(block_size), 0u)
+                << "MTP prefix seed must terminate inside its cache block";
+        }
+
         PerfStatsCollector::reset();
-        auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        auto first = mtp->generate(first_prompt, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
         const auto first_records =
             PerfStatsCollector::snapshot(
                 {"mtp", "tp_collective_runtime", "forward_graph"});
         ASSERT_TRUE(first.error.empty()) << first.error;
-        ASSERT_EQ(first.tokens.size(), expected_tokens.size());
-        EXPECT_EQ(first.tokens, expected_tokens);
+        ASSERT_FALSE(first.tokens.empty());
+        if (!terminal_partial_restore)
+        {
+            ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+            EXPECT_EQ(first.tokens, expected_tokens);
+        }
         EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
         const uint64_t expected_first_step_drafts = static_cast<uint64_t>(
             std::min(mtp_draft_tokens, std::max(0, test_case.decode_steps - 1)));
@@ -2966,7 +3026,7 @@ namespace llaminar2::test::parity::qwen36
         const auto after_second = mtp->prefixStateProbe();
         const auto second_records =
             PerfStatsCollector::snapshot(
-                {"mtp", "tp_collective_runtime", "forward_graph"});
+                {"mtp", "prefix_cache", "tp_collective_runtime", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
@@ -2974,11 +3034,29 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(second.tokens, expected_tokens);
         EXPECT_TRUE(after_second.prefix_cache_ready);
         EXPECT_GE(after_second.prefix_cache_hits, 1u);
-        EXPECT_TRUE(after_second.prefix_request.hit);
-        EXPECT_EQ(after_second.prefix_request.matched_tokens,
-                  static_cast<int>(prompt_tokens.size()));
-        EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
-        EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        if (terminal_partial_restore)
+        {
+            EXPECT_FALSE(after_second.prefix_request.hit);
+            EXPECT_TRUE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(
+                after_second.prefix_request.matched_tokens,
+                terminal_partial_prefix_tokens);
+            EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
+            EXPECT_FALSE(after_second.prefix_request.terminal_hidden_restored);
+            EXPECT_TRUE(denseHasPerfCounter(
+                second_records,
+                "prefix_cache",
+                "terminal_partial_block_prefix_hits"));
+        }
+        else
+        {
+            EXPECT_TRUE(after_second.prefix_request.hit);
+            EXPECT_FALSE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(after_second.prefix_request.matched_tokens,
+                      static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+            EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        }
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
         // MTP counters are request-local: prove the restored-prefix request
@@ -3002,6 +3080,25 @@ namespace llaminar2::test::parity::qwen36
             second_records,
             test_case.name + " restored request");
         PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Prove an in-block terminal prefix restores shifted MTP KV exactly.
+     *
+     * The seed request ends at token three of a four-token cache block. The
+     * second request extends that same block, forcing production lookup to use
+     * the shorter terminal key, import recurrent and shifted-MTP state, and
+     * prefill only the suffix before grouped verification resumes.
+     */
+    inline void runDenseMTPPartialTerminalPrefixRestoreParity(
+        DensePrefixRestoreParityCase test_case)
+    {
+        runDenseMTPParity(
+            std::move(test_case),
+            /*enable_prefix_cache=*/true,
+            /*mtp_draft_tokens=*/3,
+            /*depth_policy=*/{},
+            /*terminal_partial_prefix_tokens=*/3);
     }
 
     /**

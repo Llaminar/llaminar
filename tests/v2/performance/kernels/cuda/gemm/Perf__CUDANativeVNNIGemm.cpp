@@ -25,6 +25,7 @@
 #include "../../native_vnni_dispatch/GPUTrainerVerification.h"
 #include "CUDANativeVNNIGemmPerfCommon.h"
 #include "../../../../utils/ScopedGPUStream.h"
+#include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
 #include "fort.hpp"
 
 using namespace llaminar2::test::native_vnni_gemm_perf;
@@ -44,6 +45,8 @@ extern "C"
     int cudaNativeVNNIPrefill_getBK256Mode();
     void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
     bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+    void cudaNativeVNNIPrefill_setExactOverlayEnabled(bool enabled);
+    bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
     void cudaNativeVNNIPrefill_setForceTile(int tile_id);
     void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
@@ -75,6 +78,38 @@ extern "C"
 
 namespace
 {
+    /**
+     * @brief Temporarily expose the generic prefill policy to a tournament.
+     *
+     * Incremental collection often runs after older exact overlays have been
+     * installed. The AUTO evidence row must still mean the generic policy,
+     * otherwise an old winner can masquerade as AUTO and contaminate both
+     * candidate identity and workspace publication. The guard restores the
+     * process's production setting even when a GoogleTest assertion unwinds.
+     */
+    class ScopedDensePrefillOverlayBypass
+    {
+    public:
+        ScopedDensePrefillOverlayBypass()
+            : previous_(cudaNativeVNNIPrefill_getExactOverlayEnabled())
+        {
+            cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+        }
+
+        ~ScopedDensePrefillOverlayBypass()
+        {
+            cudaNativeVNNIPrefill_setExactOverlayEnabled(previous_);
+        }
+
+        ScopedDensePrefillOverlayBypass(
+            const ScopedDensePrefillOverlayBypass &) = delete;
+        ScopedDensePrefillOverlayBypass &operator=(
+            const ScopedDensePrefillOverlayBypass &) = delete;
+
+    private:
+        bool previous_ = true;
+    };
+
     const llaminar2::NativeVnniFormatInfo &requireNativeVnniInfo(
         const TensorBase *weights,
         const std::string &format_name)
@@ -255,6 +290,163 @@ namespace
         double peak_tc_tops_ = 0.0;
         int device_count_ = 0;
     };
+
+    TEST_F(CUDANativeVNNIGemmPerf, CompilerResources_AllCodebooksAndCandidates)
+    {
+        static constexpr uint8_t codebooks[] = {
+            0, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15, 16, 17, 19};
+        const std::string csv_path =
+            getEnvString("LLAMINAR_TILE_RESOURCE_CSV");
+        FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr) << "Failed to open " << csv_path;
+            std::fprintf(
+                csv,
+                "codebook,tile_id,canonical_kpart,ordered_bk256,"
+                "primary_registers_per_thread,"
+                "primary_local_memory_bytes_per_thread,"
+                "primary_static_shared_memory_bytes,"
+                "primary_dynamic_shared_memory_bytes,"
+                "primary_threads_per_block,"
+                "primary_max_threads_per_block,"
+                "primary_max_active_blocks_per_sm,"
+                "auxiliary_registers_per_thread,"
+                "auxiliary_local_memory_bytes_per_thread,"
+                "auxiliary_static_shared_memory_bytes,"
+                "auxiliary_dynamic_shared_memory_bytes,"
+                "auxiliary_threads_per_block,"
+                "auxiliary_max_threads_per_block,"
+                "auxiliary_max_active_blocks_per_sm,spill_free\n");
+        }
+
+        size_t queried = 0;
+        size_t spilling = 0;
+        std::set<std::tuple<int, int, int, int>> observed_spilling;
+        const auto inspect = [&](uint8_t codebook,
+                                 int tile_id,
+                                 int canonical_kpart,
+                                 int ordered_bk256)
+        {
+            CUDADensePrefillKernelResources primary{};
+            CUDADensePrefillKernelResources auxiliary{};
+            ASSERT_TRUE(cudaNativeVNNIPrefill_queryCandidateResources(
+                codebook,
+                tile_id,
+                canonical_kpart,
+                ordered_bk256,
+                /*cuda_device_id=*/0,
+                &primary,
+                &auxiliary));
+            EXPECT_GT(primary.registers_per_thread, 0);
+            EXPECT_GT(primary.threads_per_block, 0);
+            EXPECT_GE(
+                primary.max_threads_per_block,
+                primary.threads_per_block);
+            EXPECT_GT(primary.max_active_blocks_per_sm, 0);
+            if (canonical_kpart)
+            {
+                EXPECT_GT(auxiliary.registers_per_thread, 0);
+                EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                EXPECT_GT(auxiliary.threads_per_block, 0);
+                EXPECT_GE(
+                    auxiliary.max_threads_per_block,
+                    auxiliary.threads_per_block);
+                EXPECT_GT(auxiliary.max_active_blocks_per_sm, 0);
+            }
+            else
+            {
+                EXPECT_EQ(auxiliary.registers_per_thread, 0);
+                EXPECT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                EXPECT_EQ(auxiliary.threads_per_block, 0);
+                EXPECT_EQ(auxiliary.max_active_blocks_per_sm, 0);
+            }
+
+            const bool spill_free =
+                primary.local_memory_bytes_per_thread == 0 &&
+                auxiliary.local_memory_bytes_per_thread == 0;
+            ++queried;
+            spilling += spill_free ? 0 : 1;
+            if (!spill_free)
+            {
+                observed_spilling.emplace(
+                    static_cast<int>(codebook),
+                    tile_id,
+                    canonical_kpart,
+                    ordered_bk256);
+            }
+            if (csv)
+            {
+                std::fprintf(
+                    csv,
+                    "%u,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,"
+                    "%d,%zu,%zu,%zu,%d,%d,%d,%d\n",
+                    static_cast<unsigned>(codebook),
+                    tile_id,
+                    canonical_kpart,
+                    ordered_bk256,
+                    primary.registers_per_thread,
+                    primary.local_memory_bytes_per_thread,
+                    primary.static_shared_memory_bytes,
+                    primary.dynamic_shared_memory_bytes,
+                    primary.threads_per_block,
+                    primary.max_threads_per_block,
+                    primary.max_active_blocks_per_sm,
+                    auxiliary.registers_per_thread,
+                    auxiliary.local_memory_bytes_per_thread,
+                    auxiliary.static_shared_memory_bytes,
+                    auxiliary.dynamic_shared_memory_bytes,
+                    auxiliary.threads_per_block,
+                    auxiliary.max_threads_per_block,
+                    auxiliary.max_active_blocks_per_sm,
+                    spill_free ? 1 : 0);
+            }
+        };
+
+        for (uint8_t codebook : codebooks)
+        {
+            for (int tile_id = 0; tile_id < 6; ++tile_id)
+            {
+                inspect(codebook, tile_id, 0, 0);
+                inspect(codebook, tile_id, 1, 0);
+            }
+        }
+        for (int tile_id : {-3, -2})
+        {
+            inspect(/*Q4_0=*/0, tile_id, 0, 0);
+            inspect(/*Q4_0=*/0, tile_id, 0, 1);
+        }
+        if (csv)
+        {
+            std::fflush(csv);
+            std::fclose(csv);
+        }
+        std::fprintf(
+            stderr,
+            "[TileSweep][resources] queried=%zu spilling=%zu spill_free=%zu\n",
+            queried,
+            spilling,
+            queried - spilling);
+        EXPECT_EQ(queried, 196u);
+        std::set<std::tuple<int, int, int, int>> expected_spilling;
+        for (int codebook : {8, 9, 13, 14})
+        {
+            for (int tile_id : {1, 4})
+                expected_spilling.emplace(codebook, tile_id, 0, 0);
+        }
+        for (int codebook : {10, 17})
+        {
+            for (int tile_id : {1, 4, 5})
+            {
+                expected_spilling.emplace(codebook, tile_id, 0, 0);
+                expected_spilling.emplace(codebook, tile_id, 1, 0);
+            }
+        }
+        EXPECT_EQ(observed_spilling, expected_spilling)
+            << "Compiler resource drift changed the launchable candidate set";
+    }
 
     TEST_F(CUDANativeVNNIGemmPerf, Correctness_AllFormats_KeyShapes)
     {
@@ -714,6 +906,20 @@ namespace
         int observed_k_partitions;
         int observed_bk256;
         int observed_canonical_kpart;
+        int primary_registers_per_thread;
+        size_t primary_local_memory_bytes_per_thread;
+        size_t primary_static_shared_memory_bytes;
+        size_t primary_dynamic_shared_memory_bytes;
+        int primary_threads_per_block;
+        int primary_max_threads_per_block;
+        int primary_max_active_blocks_per_sm;
+        int auxiliary_registers_per_thread;
+        size_t auxiliary_local_memory_bytes_per_thread;
+        size_t auxiliary_static_shared_memory_bytes;
+        size_t auxiliary_dynamic_shared_memory_bytes;
+        int auxiliary_threads_per_block;
+        int auxiliary_max_threads_per_block;
+        int auxiliary_max_active_blocks_per_sm;
     };
 
     struct SweepTask
@@ -1051,6 +1257,20 @@ namespace
                 times_us_.data(), last_timing_sample_count_);
         }
 
+        /**
+         * @brief Resolve one candidate before querying compiler resources.
+         *
+         * AUTO is a shape-dependent policy rather than a kernel symbol. One
+         * untimed launch is therefore required to publish the exact physical
+         * specialization selected by production. The stream wait is setup
+         * work and occurs before any canonical timing event is recorded.
+         */
+        void probeLaunch()
+        {
+            launch(m_, input_.get(), output_.get());
+            checkStream("resource-identity probe");
+        }
+
         size_t byteMismatches()
         {
             auto *comparison_words = reinterpret_cast<uint64_t *>(
@@ -1158,6 +1378,7 @@ namespace
 
     TEST_F(CUDANativeVNNIGemmPerf, TileSweep_AllStrategies)
     {
+        ScopedDensePrefillOverlayBypass overlay_bypass;
         const SweepConfig cfg = loadSweepConfig();
         const double peak_tops = peak_tc_tops_;
         // Force-mode controls are process-wide. The turnkey collector obtains
@@ -1182,6 +1403,7 @@ namespace
         std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create_weights;
         std::string resolved_format_name;
         uint8_t resolved_codebook_id = 0;
+        uint8_t resolved_execution_codebook_id = 0;
         {
             std::string fmt_lower = toLower(cfg.format_name);
             bool found = false;
@@ -1192,6 +1414,7 @@ namespace
                     create_weights = f.create;
                     resolved_format_name = f.name;
                     resolved_codebook_id = f.codebook_id;
+                    resolved_execution_codebook_id = f.runtimeCodebook();
                     found = true;
                     break;
                 }
@@ -1201,15 +1424,17 @@ namespace
 
         // ── Build flat task list ──
         std::vector<SweepTask> tasks;
+        const uint8_t execution_codebook_id =
+            resolved_execution_codebook_id;
         const auto has_canonical_kpart =
-            [resolved_codebook_id](int n, int k)
+            [execution_codebook_id](int n, int k)
         {
             int shape_id = -1;
             int tile_n = 0;
             int cpt = 0;
             int exact_kb = 0;
             if (!cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
-                    resolved_codebook_id,
+                    execution_codebook_id,
                     /*graph_captured=*/1,
                     /*m=*/1,
                     n,
@@ -1224,6 +1449,29 @@ namespace
             }
             // NativeGemvShape::KPAR is the second scoped-enum value.
             return shape_id == 1;
+        };
+        const auto resource_eligible =
+            [execution_codebook_id](
+                int tile_id,
+                bool canonical_kpart,
+                bool ordered_bk256)
+        {
+            CUDADensePrefillKernelResources primary{};
+            CUDADensePrefillKernelResources auxiliary{};
+            if (!cudaNativeVNNIPrefill_queryCandidateResources(
+                    execution_codebook_id,
+                    tile_id,
+                    canonical_kpart ? 1 : 0,
+                    ordered_bk256 ? 1 : 0,
+                    /*cuda_device_id=*/0,
+                    &primary,
+                    &auxiliary))
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill candidate inventory query failed");
+            }
+            return primary.local_memory_bytes_per_thread == 0 &&
+                   auxiliary.local_memory_bytes_per_thread == 0;
         };
 
         for (const auto &shape : kQwenShapes)
@@ -1258,6 +1506,14 @@ namespace
                     {
                         continue;
                     }
+                    if (strat == Strategy::BK256 &&
+                        (!resource_eligible(-3, false, false) ||
+                         !resource_eligible(-3, false, true) ||
+                         !resource_eligible(-2, false, false) ||
+                         !resource_eligible(-2, false, true)))
+                    {
+                        continue;
+                    }
                     if (strat == Strategy::CanonicalKpart &&
                         !has_canonical_kpart(shape.n, shape.k))
                     {
@@ -1279,6 +1535,13 @@ namespace
                         // BK64 strategies: iterate tiles
                         for (int tile_id : cfg.tile_ids)
                         {
+                            if (!resource_eligible(
+                                    tile_id,
+                                    strat == Strategy::CanonicalKpart,
+                                    false))
+                            {
+                                continue;
+                            }
                             const int tile_count = cudaNativeVNNIPrefill_getTileCount(tile_id, m, shape.n);
                             const int candidate_k_partitions =
                                 strat == Strategy::CanonicalKpart ? 0 : 1;
@@ -1309,7 +1572,21 @@ namespace
                          "min_us,mean_us,tops,pct_peak,gpu,byte_mismatches,"
                          "first_byte_mismatch,correctness_pass,observed_tile_id,"
                          "observed_k_partitions,observed_bk256,"
-                         "observed_canonical_kpart,canonical_kpart_available\n");
+                         "observed_canonical_kpart,canonical_kpart_available,"
+                         "primary_registers_per_thread,"
+                         "primary_local_memory_bytes_per_thread,"
+                         "primary_static_shared_memory_bytes,"
+                         "primary_dynamic_shared_memory_bytes,"
+                         "primary_threads_per_block,"
+                         "primary_max_threads_per_block,"
+                         "primary_max_active_blocks_per_sm,"
+                         "auxiliary_registers_per_thread,"
+                         "auxiliary_local_memory_bytes_per_thread,"
+                         "auxiliary_static_shared_memory_bytes,"
+                         "auxiliary_dynamic_shared_memory_bytes,"
+                         "auxiliary_threads_per_block,"
+                         "auxiliary_max_threads_per_block,"
+                         "auxiliary_max_active_blocks_per_sm\n");
             std::fflush(csv_fp);
         }
 
@@ -1376,6 +1653,113 @@ namespace
             }
 
             configureSweepTask(task);
+            const uint8_t source_codebook_id =
+                requireNativeVnniInfo(weights.get(), resolved_format_name)
+                    .codebook_id;
+            if (source_codebook_id != resolved_codebook_id)
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill source codebook identity changed");
+            }
+
+            /*
+             * Resolve AUTO through the real production launcher, then inspect
+             * that exact symbol before timing it. A spilling specialization
+             * is an invalid dispatch target, so it fails the transaction here
+             * rather than contributing even one canonical timing sample.
+             */
+            execution->probeLaunch();
+            int probed_tile_id = -99;
+            int probed_k_partitions = -99;
+            int probed_bk256 = -99;
+            int probed_canonical_kpart = -99;
+            cudaNativeVNNIPrefill_getLastLaunchSelection(
+                &probed_tile_id,
+                &probed_k_partitions,
+                &probed_bk256,
+                &probed_canonical_kpart);
+
+            CUDADensePrefillKernelResources primary_resources{};
+            CUDADensePrefillKernelResources auxiliary_resources{};
+            if (!cudaNativeVNNIPrefill_queryLastLaunchResources(
+                    execution_codebook_id,
+                    shape.n,
+                    shape.k,
+                    gpu_id,
+                    &primary_resources,
+                    &auxiliary_resources))
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill candidate resource query failed");
+            }
+            const int primary_registers =
+                primary_resources.registers_per_thread;
+            const size_t primary_local_bytes =
+                primary_resources.local_memory_bytes_per_thread;
+            const size_t primary_static_shared_bytes =
+                primary_resources.static_shared_memory_bytes;
+            const size_t primary_dynamic_shared_bytes =
+                primary_resources.dynamic_shared_memory_bytes;
+            const int primary_threads = primary_resources.threads_per_block;
+            const int primary_max_threads =
+                primary_resources.max_threads_per_block;
+            const int primary_active_blocks =
+                primary_resources.max_active_blocks_per_sm;
+            const int auxiliary_registers =
+                auxiliary_resources.registers_per_thread;
+            const size_t auxiliary_local_bytes =
+                auxiliary_resources.local_memory_bytes_per_thread;
+            const size_t auxiliary_static_shared_bytes =
+                auxiliary_resources.static_shared_memory_bytes;
+            const size_t auxiliary_dynamic_shared_bytes =
+                auxiliary_resources.dynamic_shared_memory_bytes;
+            const int auxiliary_threads =
+                auxiliary_resources.threads_per_block;
+            const int auxiliary_max_threads =
+                auxiliary_resources.max_threads_per_block;
+            const int auxiliary_active_blocks =
+                auxiliary_resources.max_active_blocks_per_sm;
+            if (primary_registers <= 0 || primary_threads <= 0 ||
+                primary_max_threads < primary_threads ||
+                primary_active_blocks <= 0 || primary_local_bytes != 0 ||
+                auxiliary_local_bytes != 0 ||
+                (auxiliary_threads > 0 &&
+                 (auxiliary_registers <= 0 ||
+                  auxiliary_max_threads < auxiliary_threads ||
+                  auxiliary_active_blocks <= 0)))
+            {
+                std::fprintf(
+                    stderr,
+                    "[TileSweep][resources] rejected %s/%s/M=%d/%s/%s "
+                    "primary={regs=%d,local=%zu,static_smem=%zu,"
+                    "dynamic_smem=%zu,threads=%d,max_threads=%d,"
+                    "active_blocks=%d} auxiliary={regs=%d,local=%zu,"
+                    "static_smem=%zu,dynamic_smem=%zu,threads=%d,"
+                    "max_threads=%d,active_blocks=%d}\n",
+                    resolved_format_name.c_str(),
+                    shape.name.c_str(),
+                    task.m,
+                    task.tile_name.c_str(),
+                    strategyName(task.strat),
+                    primary_registers,
+                    primary_local_bytes,
+                    primary_static_shared_bytes,
+                    primary_dynamic_shared_bytes,
+                    primary_threads,
+                    primary_max_threads,
+                    primary_active_blocks,
+                    auxiliary_registers,
+                    auxiliary_local_bytes,
+                    auxiliary_static_shared_bytes,
+                    auxiliary_dynamic_shared_bytes,
+                    auxiliary_threads,
+                    auxiliary_max_threads,
+                    auxiliary_active_blocks);
+                throw std::runtime_error(
+                    "CUDA dense prefill candidate failed the zero-spill/"
+                    "occupancy eligibility gate");
+            }
+
             const RunResult rr = execution->measure(
                 cfg.warmup_runs, cfg.bench_runs);
             int observed_tile_id = -99;
@@ -1387,13 +1771,23 @@ namespace
                 &observed_k_partitions,
                 &observed_bk256,
                 &observed_canonical_kpart);
+            if (std::tie(
+                    observed_tile_id,
+                    observed_k_partitions,
+                    observed_bk256,
+                    observed_canonical_kpart) !=
+                std::tie(
+                    probed_tile_id,
+                    probed_k_partitions,
+                    probed_bk256,
+                    probed_canonical_kpart))
+            {
+                throw std::runtime_error(
+                    "CUDA dense prefill route changed after resource proof");
+            }
             const size_t byte_mismatches = execution->byteMismatches();
             const auto metrics = computeGemmThroughputMetrics(
                 task.m, shape.n, shape.k, rr.min_us, peak_tops);
-            const uint8_t codebook_id =
-                requireNativeVnniInfo(weights.get(), resolved_format_name)
-                    .codebook_id;
-
             if (timing_csv_fp)
             {
                 const auto samples = execution->timingSamples();
@@ -1406,7 +1800,7 @@ namespace
                         "cuda,prefill,%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,"
                         "%zu,1,%.9f,%a\n",
                         resolved_format_name.c_str(),
-                        static_cast<unsigned>(codebook_id),
+                        static_cast<unsigned>(source_codebook_id),
                         shape.name.c_str(), task.m, shape.n, shape.k,
                         task.tile_name.c_str(), task.tile_id,
                         strategyName(task.strat), task.requested_k_partitions,
@@ -1417,7 +1811,7 @@ namespace
 
             SweepRow &row = rows[task_idx];
             row.format_name = resolved_format_name;
-            row.codebook_id = codebook_id;
+            row.codebook_id = source_codebook_id;
             row.shape_name = shape.name;
             row.m = task.m;
             row.n = shape.n;
@@ -1441,12 +1835,33 @@ namespace
             row.observed_k_partitions = observed_k_partitions;
             row.observed_bk256 = observed_bk256;
             row.observed_canonical_kpart = observed_canonical_kpart;
+            row.primary_registers_per_thread = primary_registers;
+            row.primary_local_memory_bytes_per_thread = primary_local_bytes;
+            row.primary_static_shared_memory_bytes =
+                primary_static_shared_bytes;
+            row.primary_dynamic_shared_memory_bytes =
+                primary_dynamic_shared_bytes;
+            row.primary_threads_per_block = primary_threads;
+            row.primary_max_threads_per_block = primary_max_threads;
+            row.primary_max_active_blocks_per_sm = primary_active_blocks;
+            row.auxiliary_registers_per_thread = auxiliary_registers;
+            row.auxiliary_local_memory_bytes_per_thread =
+                auxiliary_local_bytes;
+            row.auxiliary_static_shared_memory_bytes =
+                auxiliary_static_shared_bytes;
+            row.auxiliary_dynamic_shared_memory_bytes =
+                auxiliary_dynamic_shared_bytes;
+            row.auxiliary_threads_per_block = auxiliary_threads;
+            row.auxiliary_max_threads_per_block = auxiliary_max_threads;
+            row.auxiliary_max_active_blocks_per_sm = auxiliary_active_blocks;
             row_valid[task_idx] = true;
 
             if (csv_fp)
             {
                 std::fprintf(csv_fp,
-                             "%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,%d,%.3f,%.3f,%.4f,%.2f,%d,%zu,%llu,%d,%d,%d,%d,%d,%d\n",
+                             "%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,%d,"
+                             "%.3f,%.3f,%.9f,%.9f,%d,%zu,%llu,%d,%d,%d,%d,%d,%d,"
+                             "%d,%zu,%zu,%zu,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d\n",
                              row.format_name.c_str(),
                              static_cast<unsigned>(row.codebook_id),
                              row.shape_name.c_str(), row.m, row.n, row.k,
@@ -1461,7 +1876,21 @@ namespace
                              row.observed_k_partitions,
                              row.observed_bk256,
                              row.observed_canonical_kpart,
-                             row.canonical_kpart_available ? 1 : 0);
+                             row.canonical_kpart_available ? 1 : 0,
+                             row.primary_registers_per_thread,
+                             row.primary_local_memory_bytes_per_thread,
+                             row.primary_static_shared_memory_bytes,
+                             row.primary_dynamic_shared_memory_bytes,
+                             row.primary_threads_per_block,
+                             row.primary_max_threads_per_block,
+                             row.primary_max_active_blocks_per_sm,
+                             row.auxiliary_registers_per_thread,
+                             row.auxiliary_local_memory_bytes_per_thread,
+                             row.auxiliary_static_shared_memory_bytes,
+                             row.auxiliary_dynamic_shared_memory_bytes,
+                             row.auxiliary_threads_per_block,
+                             row.auxiliary_max_threads_per_block,
+                             row.auxiliary_max_active_blocks_per_sm);
                 std::fflush(csv_fp);
             }
         }

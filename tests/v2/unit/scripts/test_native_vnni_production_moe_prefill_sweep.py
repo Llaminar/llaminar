@@ -3,8 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
+import dataclasses
+import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -33,18 +39,27 @@ from native_vnni_dispatch.production_moe_prefill_sweep import (  # noqa: E402
     CUDA_CANDIDATE_IDS,
     PAIR_CANDIDATE_IDS,
     TIMING_COLUMNS,
+    TRAINER_PROVENANCE_SCHEMA,
     ProductionMoEPrefillCell,
+    _filtered_cells,
+    _run_accelerator_batch,
+    _stage_cell_manifest,
+    combine_production_moe_prefill_cells,
+    load_sweep_plan,
     production_moe_prefill_candidate_ids,
     production_moe_prefill_cell_paths,
     production_moe_prefill_cells,
     run_missing_accelerator_cells,
+    validate_promoted_production_moe_prefill_cell,
     validate_production_moe_prefill_cell,
+    write_sweep_plan,
 )
 from native_vnni_dispatch.moe_production_overlay import (  # noqa: E402
     MoECandidateSurface,
     MoEProductionOverlayKey,
     discover_additive_moe_production_cells,
     generate_moe_production_overlay_include,
+    main as generate_moe_production_overlay,
     require_moe_overlay_surface_totality,
     select_moe_production_overlay_winners,
 )
@@ -55,6 +70,25 @@ _PAIR_PATTERN = re.compile(
     r"__d_tm(?P<down_m>\d+)_tn(?P<down_n>\d+)"
 )
 _CUDA_PATTERN = re.compile(r"g_tn(?P<gate_n>\d+)__d_fixed")
+
+
+def _test_provenance(
+    backend: str,
+    *,
+    binary_digest: str = "sha256:" + "1" * 64,
+    core_digest: str = "sha256:" + "2" * 64,
+) -> dict[str, object]:
+    """Return a structurally valid synthetic Release producer closure."""
+
+    return {
+        "schema_version": TRAINER_PROVENANCE_SCHEMA,
+        "backend": backend,
+        "binary_name": "v2_perf_test_native_vnni_gemm",
+        "binary_sha256": binary_digest,
+        "core_library_name": "libllaminar2_core.so",
+        "core_library_sha256": core_digest,
+        "cmake_build_type": "Release",
+    }
 
 
 class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
@@ -180,6 +214,58 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
                         })
         return aggregate_path, timing_path
 
+    def _commit_test_cells(
+        self,
+        root: Path,
+        cells: tuple[ProductionMoEPrefillCell, ...],
+        *,
+        provenance: dict[str, object] | None = None,
+        invocation_id: str = "test-native-process",
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Publish complete cell transactions from deterministic fixtures."""
+
+        if not cells:
+            raise ValueError("test commit requires at least one cell")
+        backend = cells[0].backend
+        if any(cell.backend != backend for cell in cells):
+            raise ValueError("test commit cannot mix backends")
+        corpus, plan = write_sweep_plan(
+            root,
+            backend,
+            cells,
+            provenance or _test_provenance(backend),
+        )
+        native_process = {
+            "invocation_id": invocation_id,
+            "backend": backend,
+            "device_ordinal": 0,
+            "cell_ids": [cell.cell_id for cell in cells],
+        }
+        for cell in cells:
+            fixture = root / "fixtures" / cell.cell_id
+            fixture.mkdir(parents=True, exist_ok=True)
+            aggregate, timing = self._write_valid_cell(fixture, cell)
+            paths = production_moe_prefill_cell_paths(root, cell)
+            paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(aggregate, paths.aggregate_staging)
+            shutil.copyfile(timing, paths.timing_staging)
+            paths.log_staging.write_text("complete\n", encoding="utf-8")
+            _stage_cell_manifest(
+                paths,
+                cell,
+                corpus,
+                plan,
+                native_process,
+            )
+            os.replace(paths.aggregate_staging, paths.aggregate)
+            os.replace(paths.timing_staging, paths.timing)
+            os.replace(paths.log_staging, paths.log)
+            os.replace(paths.manifest_staging, paths.manifest)
+            validate_promoted_production_moe_prefill_cell(
+                root, cell, corpus
+            )
+        return corpus, plan
+
     def test_every_backend_plan_is_routed_case_by_m_total(self) -> None:
         for backend in ("cuda", "rocm"):
             cells = production_moe_prefill_cells(backend)
@@ -197,6 +283,20 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
                 set(MOE_ROUTING_PROFILES),
             )
             self.assertTrue(all(cell.case.evidence_id for cell in cells))
+
+    def test_cli_matrix_accepts_arbitrary_positive_additive_m_values(self) -> None:
+        anchor = production_moe_prefill_cells("cuda")[0]
+        cells = _filtered_cells(argparse.Namespace(
+            backend="cuda",
+            case=[anchor.case.evidence_id],
+            m=(2, 4, 513),
+            route_profile=["uniform"],
+        ))
+        self.assertEqual({cell.m for cell in cells}, {2, 4, 513})
+        self.assertEqual({cell.case for cell in cells}, {anchor.case})
+        self.assertEqual(
+            {cell.route_profile for cell in cells}, {"uniform"}
+        )
 
     def test_route_profiles_are_unique_per_row_and_change_load_shape(self) -> None:
         summaries = {}
@@ -265,49 +365,303 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
         self.assertEqual(validation.winner_id, CUDA_CANDIDATE_IDS[0])
 
     def test_resume_skips_valid_cells_and_partitions_missing_cells_once(self) -> None:
-        cells = production_moe_prefill_cells("cuda")[:5]
+        all_cells = production_moe_prefill_cells("cuda")
+        first = all_cells[0]
+        first_group = tuple(
+            cell for cell in all_cells
+            if cell.case == first.case
+            and cell.route_profile == first.route_profile
+        )[:3]
+        second_anchor = next(
+            cell for cell in all_cells
+            if cell.case != first.case
+            and cell.route_profile == first.route_profile
+        )
+        second_group = tuple(
+            cell for cell in all_cells
+            if cell.case == second_anchor.case
+            and cell.route_profile == second_anchor.route_profile
+        )[:2]
+        cells = first_group + second_group
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            seed = root / "seed"
-            seed.mkdir()
-            aggregate, timing = self._write_valid_cell(seed, cells[0])
-            completed_paths = production_moe_prefill_cell_paths(root, cells[0])
-            completed_paths.aggregate.parent.mkdir(parents=True)
-            aggregate.replace(completed_paths.aggregate)
-            timing.replace(completed_paths.timing)
+            producer = _test_provenance("cuda")
+            self._commit_test_cells(
+                root,
+                cells[:1],
+                provenance=producer,
+            )
 
-            calls: list[tuple[str, int]] = []
+            calls: list[tuple[tuple[str, ...], int]] = []
             calls_lock = threading.Lock()
             first_wave = threading.Barrier(2)
 
-            def record_cell(
+            def record_batch(
                 _binary: Path,
                 _root: Path,
-                cell: ProductionMoEPrefillCell,
+                batch: tuple[ProductionMoEPrefillCell, ...],
                 device: int,
+                _corpus: dict[str, object],
+                _plan: dict[str, object],
             ) -> None:
                 with calls_lock:
-                    calls.append((cell.cell_id, device))
+                    calls.append((tuple(cell.cell_id for cell in batch), device))
                     call_index = len(calls)
                 if call_index <= 2:
                     first_wave.wait(timeout=5.0)
 
             with patch(
                 "native_vnni_dispatch.production_moe_prefill_sweep."
-                "_run_accelerator_cell",
-                side_effect=record_cell,
+                "_run_accelerator_batch",
+                side_effect=record_batch,
             ):
                 completed = run_missing_accelerator_cells(
-                    Path(sys.executable), root, cells, devices=(0, 1)
+                    Path(sys.executable),
+                    root,
+                    cells,
+                    devices=(0, 1),
+                    producer=producer,
                 )
 
         self.assertCountEqual(completed, cells[1:])
+        flattened = tuple(
+            cell_id for batch, _device in calls for cell_id in batch
+        )
         self.assertCountEqual(
-            (cell_id for cell_id, _device in calls),
+            flattened,
             (cell.cell_id for cell in cells[1:]),
         )
-        self.assertEqual(len(calls), len({cell_id for cell_id, _ in calls}))
-        self.assertEqual({device for _cell_id, device in calls}, {0, 1})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({device for _batch, device in calls}, {0, 1})
+        self.assertEqual(
+            sorted(len(batch) for batch, _device in calls),
+            [2, 2],
+        )
+
+    def test_batched_cells_share_one_authenticated_native_invocation(self) -> None:
+        all_cells = production_moe_prefill_cells("cuda")
+        anchor = all_cells[0]
+        cells = tuple(
+            cell for cell in all_cells
+            if cell.case == anchor.case
+            and cell.route_profile == anchor.route_profile
+        )[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, plan = write_sweep_plan(
+                root,
+                "cuda",
+                cells,
+                _test_provenance("cuda"),
+            )
+
+            def emit_native_batch(
+                command: tuple[str, ...],
+                *,
+                env: dict[str, str],
+                stdout,
+                **_kwargs,
+            ) -> subprocess.CompletedProcess[bytes]:
+                sources = []
+                for cell in cells:
+                    fixture = root / "native-fixtures" / cell.cell_id
+                    fixture.mkdir(parents=True)
+                    sources.append(self._write_valid_cell(fixture, cell))
+                for output_key, source_index, columns in (
+                    (
+                        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CSV",
+                        0,
+                        AGGREGATE_COLUMNS,
+                    ),
+                    (
+                        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_TIMING_CSV",
+                        1,
+                        TIMING_COLUMNS,
+                    ),
+                ):
+                    with Path(env[output_key]).open(
+                        "w", newline="", encoding="utf-8"
+                    ) as destination:
+                        writer = csv.DictWriter(destination, fieldnames=columns)
+                        writer.writeheader()
+                        for pair in sources:
+                            with pair[source_index].open(
+                                newline="", encoding="utf-8"
+                            ) as source:
+                                writer.writerows(csv.DictReader(source))
+                stdout.write(b"simulated native batch\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch(
+                "native_vnni_dispatch.production_moe_prefill_sweep."
+                "subprocess.run",
+                side_effect=emit_native_batch,
+            ):
+                _run_accelerator_batch(
+                    Path(sys.executable),
+                    root,
+                    cells,
+                    1,
+                    corpus,
+                    plan,
+                )
+
+            manifests = [
+                json.loads(
+                    production_moe_prefill_cell_paths(root, cell)
+                    .manifest.read_text(encoding="utf-8")
+                )
+                for cell in cells
+            ]
+            invocation_ids = {
+                manifest["native_process"]["invocation_id"]
+                for manifest in manifests
+            }
+            self.assertEqual(len(invocation_ids), 1)
+            for manifest in manifests:
+                self.assertEqual(
+                    manifest["native_process"]["cell_ids"],
+                    [cell.cell_id for cell in cells],
+                )
+                self.assertEqual(
+                    manifest["native_process"]["device_ordinal"], 1
+                )
+
+    def test_corpus_rejects_changed_binary_or_core_closure(self) -> None:
+        cell = production_moe_prefill_cells("cuda")[0]
+        for changed_field in ("binary_digest", "core_digest"):
+            with self.subTest(changed_field=changed_field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_sweep_plan(
+                    root,
+                    "cuda",
+                    (cell,),
+                    _test_provenance("cuda"),
+                )
+                kwargs = {
+                    changed_field: "sha256:" + "9" * 64,
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "immutable corpus manifest disagrees"
+                ):
+                    write_sweep_plan(
+                        root,
+                        "cuda",
+                        (cell,),
+                        _test_provenance("cuda", **kwargs),
+                    )
+
+    def test_additive_m_and_shape_plans_preserve_committed_cells_and_status(
+        self,
+    ) -> None:
+        baseline = production_moe_prefill_cells("cuda")[0]
+        additive = ProductionMoEPrefillCell(
+            "cuda", baseline.case, 513, baseline.route_profile
+        )
+        supplemental_case = dataclasses.replace(
+            baseline.case,
+            hidden_size=baseline.case.hidden_size + 64,
+            mixture_overlay_keys=(),
+        )
+        supplemental_shape = ProductionMoEPrefillCell(
+            "cuda", supplemental_case, baseline.m, baseline.route_profile
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, first_plan = self._commit_test_cells(root, (baseline,))
+            self.assertNotIn("gguf_manifest_digest", corpus)
+            self.assertNotIn("canonical_gpu_m_buckets", corpus)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            loaded_corpus, loaded_plan = load_sweep_plan(
+                root, "cuda", (baseline,)
+            )
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before, after)
+            self.assertEqual(loaded_corpus, corpus)
+            self.assertEqual(loaded_plan, first_plan)
+
+            second_corpus, second_plan = write_sweep_plan(
+                root,
+                "cuda",
+                (additive,),
+                _test_provenance("cuda"),
+            )
+            self.assertEqual(second_corpus, corpus)
+            self.assertNotEqual(
+                second_plan["plan_digest"], first_plan["plan_digest"]
+            )
+            third_corpus, third_plan = write_sweep_plan(
+                root,
+                "cuda",
+                (supplemental_shape,),
+                _test_provenance("cuda"),
+            )
+            self.assertEqual(third_corpus, corpus)
+            self.assertNotIn(
+                third_plan["plan_digest"],
+                {first_plan["plan_digest"], second_plan["plan_digest"]},
+            )
+            self.assertEqual(len(tuple((root / "plans").glob("*.json"))), 3)
+            validate_promoted_production_moe_prefill_cell(
+                root, baseline, corpus
+            )
+
+    def test_promoted_cell_rejects_tampered_artifact_or_manifest(self) -> None:
+        cell = production_moe_prefill_cells("cuda")[0]
+        for role in ("aggregate", "timing", "log", "manifest"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                corpus, _plan = self._commit_test_cells(root, (cell,))
+                paths = production_moe_prefill_cell_paths(root, cell)
+                path = getattr(paths, role)
+                if role == "manifest":
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    payload["native_process"]["invocation_id"] = "tampered"
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                else:
+                    with path.open("ab") as handle:
+                        handle.write(b"tampered\n")
+                with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                    validate_promoted_production_moe_prefill_cell(
+                        root, cell, corpus
+                    )
+
+    def test_combined_artifacts_are_content_addressed_per_additive_plan(
+        self,
+    ) -> None:
+        baseline = production_moe_prefill_cells("cuda")[0]
+        additive = ProductionMoEPrefillCell(
+            "cuda", baseline.case, 513, baseline.route_profile
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _corpus, first_plan = self._commit_test_cells(root, (baseline,))
+            _corpus, second_plan = self._commit_test_cells(root, (additive,))
+            first_aggregate, first_timing = (
+                combine_production_moe_prefill_cells(root, (baseline,))
+            )
+            second_aggregate, second_timing = (
+                combine_production_moe_prefill_cells(root, (additive,))
+            )
+            self.assertNotEqual(first_aggregate.parent, second_aggregate.parent)
+            for plan, aggregate, timing in (
+                (first_plan, first_aggregate, first_timing),
+                (second_plan, second_aggregate, second_timing),
+            ):
+                manifest = json.loads(
+                    (aggregate.parent / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["plan_digest"], plan["plan_digest"])
+                self.assertTrue(aggregate.is_file())
+                self.assertTrue(timing.is_file())
 
     def test_overlay_discovers_one_complete_additive_runtime_key(self) -> None:
         baseline = production_moe_prefill_cells("rocm")
@@ -323,14 +677,7 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for index, cell in enumerate(additive):
-                seed = root / f"seed-{index}"
-                seed.mkdir()
-                aggregate, timing = self._write_valid_cell(seed, cell)
-                paths = production_moe_prefill_cell_paths(root, cell)
-                paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
-                aggregate.replace(paths.aggregate)
-                timing.replace(paths.timing)
+            self._commit_test_cells(root, additive)
 
             discovered = discover_additive_moe_production_cells(
                 root,
@@ -339,6 +686,37 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
             )
 
         self.assertEqual(set(discovered), set(additive))
+
+    def test_overlay_cli_can_install_an_additive_only_m_selection(self) -> None:
+        baseline = production_moe_prefill_cells("rocm")
+        source = next(
+            cell.case
+            for cell in baseline
+            if cell.case.evidence_id
+            == "h2048_r512_e256_k8_gIQ2_S_uIQ2_S_dIQ3_S"
+        )
+        additive = tuple(
+            ProductionMoEPrefillCell("rocm", source, 513, profile)
+            for profile in MOE_ROUTING_PROFILES
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._commit_test_cells(root, additive)
+            output = root / "overlay.inc"
+            summary = root / "overlay.csv"
+            with patch.object(sys, "argv", [
+                "moe_production_overlay",
+                "--backend", "rocm",
+                "--work-dir", str(root),
+                "--output", str(output),
+                "--summary-csv", str(summary),
+                "--case", source.evidence_id,
+                "--m", "513",
+            ]):
+                self.assertEqual(generate_moe_production_overlay(), 0)
+            self.assertTrue(output.is_file())
+            self.assertIn("513", output.read_text(encoding="utf-8"))
+            self.assertTrue(summary.is_file())
 
     def test_overlay_rejects_half_published_additive_cell(self) -> None:
         baseline = production_moe_prefill_cells("rocm")
@@ -351,6 +729,12 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
         additive = ProductionMoEPrefillCell("rocm", source, 513, "uniform")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            write_sweep_plan(
+                root,
+                "rocm",
+                (additive,),
+                _test_provenance("rocm"),
+            )
             seed = root / "seed"
             seed.mkdir()
             aggregate, _timing = self._write_valid_cell(seed, additive)
@@ -359,7 +743,7 @@ class NativeVNNIProductionMoEPrefillSweepTest(unittest.TestCase):
             aggregate.replace(paths.aggregate)
 
             with self.assertRaisesRegex(
-                ValueError, "has no raw timing sidecar"
+                ValueError, "incomplete committed cell"
             ):
                 discover_additive_moe_production_cells(
                     root,

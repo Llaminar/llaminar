@@ -1141,6 +1141,30 @@ namespace llaminar2
         }
 
         /**
+         * @brief Run one CPU grouped-MTP verifier transaction from host token rows.
+         *
+         * Grouped verification is a semantic execution role rather than an
+         * inference-shape heuristic. Implementations must therefore build the
+         * graph with `ForwardExecutionRole::GroupedMTPVerifier`, including the
+         * recurrent-state capture slots consumed by accepted-state publication.
+         * The rectangular batch may contain rows of different logical lengths;
+         * implementations own padding and must preserve each row's exact length.
+         *
+         * This entrypoint is intentionally host-resident and CPU-only. GPU
+         * production paths must reject it and use the device-token entrypoints
+         * below so token IDs never cross the host boundary during inference.
+         *
+         * @param token_batches Logical verifier token rows, one per request.
+         * @return true when the grouped verifier forward succeeds.
+         */
+        virtual bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches)
+        {
+            (void)token_batches;
+            return false;
+        }
+
+        /**
          * @brief Run one grouped MTP verifier pass from device-resident token IDs.
          *
          * @param token_shadow Host copy of the same token IDs for bookkeeping,

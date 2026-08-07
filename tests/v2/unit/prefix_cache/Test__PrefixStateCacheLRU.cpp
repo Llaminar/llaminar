@@ -1,3 +1,8 @@
+/**
+ * @file Test__PrefixStateCacheLRU.cpp
+ * @brief Unit regressions for prefix-cache lookup, ownership, and tier LRU.
+ */
+
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -68,6 +73,131 @@ TEST(Test__PrefixStateCacheLRU, InsertFindAndTouchUpdatesRecency)
     EXPECT_EQ(cache.stats().lookups, 1u);
     EXPECT_EQ(cache.stats().hits, 1u);
     EXPECT_EQ(cache.stats().stores, 2u);
+}
+
+/**
+ * @brief A prior terminal partial block must extend a later multi-turn prompt.
+ *
+ * Recurrent models store their continuation state on the terminal block. The
+ * next request can append tokens inside that same logical block, so exact
+ * full-width lookup would miss the only byte-correct continuation checkpoint.
+ */
+TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
+{
+    constexpr uint64_t kFingerprint = 0xbeef;
+    constexpr uint64_t kParentHash = 0x1234;
+    constexpr int kBlockIndex = 2;
+    constexpr int kTokenStart = 128;
+    auto backend = std::make_shared<RamPrefixStorageBackend>(256);
+    PrefixStateCache cache(256, backend);
+
+    const std::vector<int32_t> terminal_tokens = {41, 42, 43};
+    const PrefixCacheKey terminal_key = makePrefixCacheKey(
+        kFingerprint,
+        kParentHash,
+        kBlockIndex,
+        kTokenStart,
+        terminal_tokens);
+    auto terminal = backend->allocate(terminal_key, layoutBytes(32));
+    terminal.has_hybrid_state = true;
+    ASSERT_TRUE(cache.insert(terminal));
+
+    const std::vector<int32_t> longer_block = {41, 42, 43, 44, 45};
+    auto match = cache.findLongestTokenPrefix(
+        kFingerprint,
+        kParentHash,
+        kBlockIndex,
+        kTokenStart,
+        longer_block);
+    ASSERT_TRUE(match.has_value());
+    EXPECT_EQ(match->key, terminal_key);
+    EXPECT_TRUE(match->has_hybrid_state);
+    EXPECT_EQ(cache.stats().lookups, 1u);
+    EXPECT_EQ(cache.stats().hits, 1u);
+    EXPECT_EQ(cache.stats().misses, 0u);
+
+    const PrefixCacheKey full_key = makePrefixCacheKey(
+        kFingerprint,
+        kParentHash,
+        kBlockIndex,
+        kTokenStart,
+        longer_block);
+    auto full = backend->allocate(full_key, layoutBytes(32));
+    ASSERT_TRUE(cache.insert(full));
+    match = cache.findLongestTokenPrefix(
+        kFingerprint,
+        kParentHash,
+        kBlockIndex,
+        kTokenStart,
+        longer_block);
+    ASSERT_TRUE(match.has_value());
+    EXPECT_EQ(match->key, full_key)
+        << "An exact block must take precedence over an older terminal prefix";
+}
+
+/**
+ * @brief Rich terminal replacement must retire stale RAM, VRAM, and disk copies.
+ *
+ * A block first observed inside a longer prompt carries ordinary KV payloads.
+ * If a later request ends on that same key, harvest republishes it with MTP and
+ * terminal state. The old disk record must not survive and reappear after the
+ * richer resident block is demoted and hydrated again.
+ */
+TEST(Test__PrefixStateCacheLRU, PreparedReplacementCannotResurrectStaleDiskPayload)
+{
+    const auto dir = tempDir();
+    const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
+
+    constexpr size_t kCacheBudget = 64;
+    auto ram = std::make_shared<RamPrefixStorageBackend>(256);
+    auto disk = makeDiskBackend(dir, 256);
+    ASSERT_TRUE(disk->ready()) << disk->initializationError();
+    PrefixStateCache cache(kCacheBudget, ram, disk);
+
+    const PrefixCacheKey replaced_key = keyFor(7);
+    auto old = ram->allocate(replaced_key, layoutBytes(32));
+    ASSERT_TRUE(old.valid());
+    std::fill(old.kv_storage->begin(), old.kv_storage->end(), 0x11);
+    ASSERT_TRUE(cache.insert(old));
+
+    auto pressure = ram->allocate(keyFor(8), layoutBytes(48));
+    ASSERT_TRUE(pressure.valid());
+    ASSERT_TRUE(cache.insert(pressure));
+    ASSERT_TRUE(cache.isDiskResident(replaced_key));
+
+    auto rich_layout = layoutBytes(32);
+    rich_layout.includes_mtp_state = true;
+    rich_layout.mtp_kv_bytes = 16;
+    ASSERT_TRUE(cache.prepareInsert(replaced_key, rich_layout.totalBytes()));
+    EXPECT_FALSE(cache.contains(replaced_key));
+
+    auto rich = ram->allocate(replaced_key, rich_layout);
+    ASSERT_TRUE(rich.valid());
+    std::fill(rich.kv_storage->begin(), rich.kv_storage->end(), 0x22);
+    ASSERT_NE(rich.mtp_storage, nullptr);
+    std::fill(rich.mtp_storage->begin(), rich.mtp_storage->end(), 0x33);
+    ASSERT_TRUE(cache.insert(rich));
+
+    auto second_pressure = ram->allocate(keyFor(9), layoutBytes(32));
+    ASSERT_TRUE(second_pressure.valid());
+    ASSERT_TRUE(cache.insert(second_pressure));
+    ASSERT_TRUE(cache.isDiskResident(replaced_key));
+
+    const auto hydrated = cache.find(replaced_key);
+    ASSERT_TRUE(hydrated.has_value());
+    EXPECT_TRUE(hydrated->layout.includes_mtp_state);
+    ASSERT_NE(hydrated->kv_storage, nullptr);
+    ASSERT_NE(hydrated->mtp_storage, nullptr);
+    EXPECT_TRUE(std::all_of(
+        hydrated->kv_storage->begin(),
+        hydrated->kv_storage->end(),
+        [](uint8_t value) { return value == 0x22; }));
+    EXPECT_TRUE(std::all_of(
+        hydrated->mtp_storage->begin(),
+        hydrated->mtp_storage->end(),
+        [](uint8_t value) { return value == 0x33; }));
+
+    cleanup();
 }
 
 TEST(Test__PrefixStateCacheLRU, EvictsLeastRecentlyUsedBlocksToFitBudget)

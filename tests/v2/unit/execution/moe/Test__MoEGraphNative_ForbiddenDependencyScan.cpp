@@ -5248,7 +5248,6 @@ namespace llaminar2::test
         const std::vector<std::pair<std::string, std::string>> decode_required_tokens = {
             {"descriptor validator", "native_vnni_desc_shape_ok"},
             {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
-            {"negative descriptor index guard", "if (desc_idx < 0)"},
             {"blank descriptor guard", "!native_vnni_desc_shape_ok<FMT>(desc, N, K)"},
             {"invalid route-row zero fill", "route_output[output_index] = 0.0f;"},
             {"invalid runtime gate-row zero fill", "gate_outputs[slot][n] = 0.0f;"},

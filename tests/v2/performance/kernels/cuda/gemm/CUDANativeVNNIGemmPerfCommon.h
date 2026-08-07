@@ -51,6 +51,16 @@ namespace llaminar2::test::native_vnni_gemm_perf
         std::string name;
         uint8_t codebook_id;
         std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create;
+        uint8_t execution_codebook_id = std::numeric_limits<uint8_t>::max();
+
+        /** Return the runtime codebook after backend weight preparation. */
+        [[nodiscard]] uint8_t runtimeCodebook() const noexcept
+        {
+            return execution_codebook_id ==
+                           std::numeric_limits<uint8_t>::max()
+                       ? codebook_id
+                       : execution_codebook_id;
+        }
     };
 
     inline const std::vector<FormatSpec> kFormats = {
@@ -93,9 +103,9 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"Q8_0", 19, [](size_t n, size_t k)
          { return TestTensorFactory::createQ8_0Random({n, k}); }},
         {"Q8_1", 20, [](size_t n, size_t k)
-         { return TestTensorFactory::createQ8_1Random({n, k}); }},
+         { return TestTensorFactory::createQ8_1Random({n, k}); }, 19},
         {"Q8_K", 21, [](size_t n, size_t k)
-         { return TestTensorFactory::createQ8_KRandom({n, k}); }},
+         { return TestTensorFactory::createQ8_KRandom({n, k}); }, 19},
     };
 
     struct Shape

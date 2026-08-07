@@ -1,3 +1,13 @@
+/**
+ * @file Test__MTPVerifierForwardExecutor.cpp
+ * @brief Routing and transaction tests for typed grouped-MTP verification.
+ *
+ * These tests keep host-token CPU admission distinct from device-token GPU
+ * admission and prove neither path can silently enter ordinary inference APIs.
+ * The numerical verifier and publication contracts are exercised separately;
+ * this suite protects semantic graph-role selection at their shared boundary.
+ */
+
 #include "execution/runner/MTPVerifierForwardExecutor.h"
 
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
@@ -17,10 +27,10 @@ namespace
     /**
      * @brief Small runner double that records which forward entrypoint is used.
      *
-     * The production verifier path has three different entrypoints: host-token
-     * single request, device-token single request, and padded request batch.
-     * This fake keeps the test about routing and graph coordinates rather than
-     * model math.
+     * The production verifier path has distinct host-token CPU and device-token
+     * GPU entrypoints. This fake keeps the test about typed routing and graph
+     * coordinates rather than model math, while retaining ordinary forward
+     * counters so accidental generic admission is directly observable.
      */
     class RecordingInferenceRunner final : public IInferenceRunner
     {
@@ -47,11 +57,27 @@ namespace
                    token_ids_device != nullptr;
         }
 
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override
+        {
+            ++grouped_host_forward_count;
+            last_token_batches = token_batches;
+            last_forward_tokens =
+                token_batches.size() == 1
+                    ? token_batches.front()
+                    : std::vector<int>{};
+            last_forward_seq_len =
+                token_batches.size() == 1
+                    ? static_cast<int>(token_batches.front().size())
+                    : 0;
+            return grouped_host_forward_success;
+        }
+
         bool forward_batch(const std::vector<std::vector<int>> &token_batches) override
         {
-            ++batch_forward_count;
+            ++generic_batch_forward_count;
             last_token_batches = token_batches;
-            return batch_forward_success;
+            return generic_batch_forward_success;
         }
 
         bool forwardBatchWithDeviceTokenIds(
@@ -145,14 +171,16 @@ namespace
 
         int forward_count = 0;
         int device_forward_count = 0;
-        int batch_forward_count = 0;
+        int grouped_host_forward_count = 0;
+        int generic_batch_forward_count = 0;
         int batch_device_forward_count = 0;
         int last_forward_seq_len = 0;
         int last_padded_seq_len = 0;
         const void *last_device_token_ids = nullptr;
         bool forward_success = true;
         bool device_forward_success = true;
-        bool batch_forward_success = true;
+        bool grouped_host_forward_success = true;
+        bool generic_batch_forward_success = true;
         bool batch_device_forward_success = true;
         bool row_indexed_enable_success = true;
         bool row_indexed_disable_success = true;
@@ -234,7 +262,7 @@ namespace
     }
 } // namespace
 
-TEST(Test__MTPVerifierForwardExecutor, SingleRequestUsesHostForward)
+TEST(Test__MTPVerifierForwardExecutor, SingleRequestUsesTypedHostGroupedForward)
 {
     RecordingInferenceRunner runner;
     MTPSpecDecodeVerifierInputPlan plan =
@@ -247,9 +275,10 @@ TEST(Test__MTPVerifierForwardExecutor, SingleRequestUsesHostForward)
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_FALSE(result.used_batch_forward);
     EXPECT_FALSE(result.used_device_token_ids);
-    EXPECT_EQ(runner.forward_count, 1);
+    EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 1);
+    EXPECT_EQ(runner.generic_batch_forward_count, 0);
     EXPECT_EQ(runner.last_forward_seq_len, 3);
     EXPECT_EQ(runner.last_forward_tokens, (std::vector<int>{5, 6, 7}));
     EXPECT_EQ(result.graph_plan.verifier_logit_rows,
@@ -275,13 +304,13 @@ TEST(Test__MTPVerifierForwardExecutor, SingleRequestCanUseDeviceTokenRow)
     EXPECT_TRUE(result.used_device_token_ids);
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 1);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
     EXPECT_EQ(runner.last_forward_seq_len, 2);
     EXPECT_EQ(runner.last_forward_tokens, (std::vector<int>{17, 19}));
 }
 
-TEST(Test__MTPVerifierForwardExecutor, RequestBatchUsesPaddedForwardBatch)
+TEST(Test__MTPVerifierForwardExecutor, RequestBatchUsesTypedHostGroupedForward)
 {
     RecordingInferenceRunner runner;
     MTPSpecDecodeVerifierInputPlan plan =
@@ -299,7 +328,8 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchUsesPaddedForwardBatch)
     EXPECT_FALSE(result.used_device_token_ids);
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
-    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.grouped_host_forward_count, 1);
+    EXPECT_EQ(runner.generic_batch_forward_count, 0);
     EXPECT_EQ(runner.last_token_batches,
               (std::vector<std::vector<int>>{{7, 9}, {11, 12, 13}}));
     EXPECT_EQ(result.graph_plan.padded_seq_len, 3);
@@ -330,7 +360,7 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchCanUsePaddedDeviceTokenRows)
     EXPECT_TRUE(result.used_device_token_ids);
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 1);
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
     EXPECT_EQ(runner.last_padded_seq_len, 2);
@@ -360,7 +390,7 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchDeviceTokenFailureIsReported)
     EXPECT_THAT(result.error, testing::HasSubstr("batched forward failed"));
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 1);
 }
 
@@ -388,7 +418,7 @@ TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionBuildsPublicationPl
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_TRUE(result.forward.used_batch_forward);
-    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.grouped_host_forward_count, 1);
     EXPECT_EQ(runner.last_token_batches,
               (std::vector<std::vector<int>>{{7, 9, 8}, {11, 12, 13}}));
     EXPECT_EQ(runner.row_indexed_enable_count, 1);
@@ -449,7 +479,7 @@ TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCanUsePaddedDeviceT
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_TRUE(result.forward.used_batch_forward);
     EXPECT_TRUE(result.forward.used_device_token_ids);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 1);
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
     EXPECT_EQ(runner.last_padded_seq_len, 2);
@@ -489,7 +519,7 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchFeedsTransactionExecu
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_TRUE(result.forward.used_batch_forward);
-    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.grouped_host_forward_count, 1);
     EXPECT_EQ(runner.last_token_batches,
               (std::vector<std::vector<int>>{{7, 9, 8}, {11, 12, 13}}));
     ASSERT_EQ(result.transaction_plan.step_plans.steps.size(), 2u);
@@ -538,7 +568,7 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchCanUseForwardOptions)
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_TRUE(result.forward.used_device_token_ids);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 1);
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
     EXPECT_EQ(runner.last_token_batches,
@@ -577,7 +607,7 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledDeviceTokenBatchRequiresDevicePo
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, testing::HasSubstr("device_token_ids"));
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 0);
 }
 
@@ -618,7 +648,7 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledHostTokenBatchRejectsDevicePoint
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, testing::HasSubstr("host-token"));
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_EQ(runner.batch_device_forward_count, 0);
 }
 
@@ -644,7 +674,7 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, testing::HasSubstr("not greedy"));
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, ScheduledDeviceOutcomeBatchBuildsTransactionPlan)
@@ -956,7 +986,7 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishReject
     EXPECT_FALSE(owner.hasInFlightBatch());
     EXPECT_EQ(owner.pendingCount(), 1u);
     EXPECT_EQ(runner.forward_count, 0);
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
     EXPECT_THAT(result.error, testing::HasSubstr("publication callback is required"));
 }
 
@@ -1239,7 +1269,7 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionRejectsMissi
 TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReleasesOnForwardFailure)
 {
     RecordingInferenceRunner runner;
-    runner.batch_forward_success = false;
+    runner.grouped_host_forward_success = false;
 
     MTPSpecRequestBatchOwner owner;
     MTPSpecSchedulableRequest first;
@@ -1302,13 +1332,13 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReportsScheduleF
     EXPECT_FALSE(result.released);
     EXPECT_FALSE(owner.hasInFlightBatch());
     EXPECT_THAT(result.error, testing::HasSubstr("scheduling failed"));
-    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.grouped_host_forward_count, 0);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCleansUpAfterForwardFailure)
 {
     RecordingInferenceRunner runner;
-    runner.batch_forward_success = false;
+    runner.grouped_host_forward_success = false;
 
     MTPDecodeCatchupGreedyRequest request0;
     request0.draft_tokens = {7, 9};
@@ -1328,7 +1358,7 @@ TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCleansUpAfterForwar
 
     EXPECT_FALSE(result.ok);
     EXPECT_NE(result.error.find("forward failed"), std::string::npos);
-    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.grouped_host_forward_count, 1);
     EXPECT_EQ(runner.row_indexed_enable_count, 1);
     EXPECT_EQ(runner.row_indexed_disable_count, 1);
     EXPECT_EQ(runner.all_position_enable_count, 1);

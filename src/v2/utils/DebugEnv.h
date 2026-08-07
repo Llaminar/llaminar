@@ -1020,7 +1020,7 @@ namespace llaminar2
         // =================================================================
         // Prefill Graph Capture Configuration
         // =================================================================
-        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum padded raw-prompt graph bucket; never an eager-execution threshold (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
         bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)

@@ -22,6 +22,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
@@ -61,6 +62,8 @@ extern "C"
     int cudaNativeVNNIPrefill_getBK256Mode();
     void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
     bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+    void cudaNativeVNNIPrefill_setExactOverlayEnabled(bool enabled);
+    bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
     void cudaNativeVNNIPrefill_setForceTile(int tile_id);
     void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
@@ -68,6 +71,7 @@ extern "C"
         int *k_partitions,
         int *used_bk256,
         int *used_canonical_kpart);
+    int cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay();
     bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
         uint8_t codebook_id,
         int n,
@@ -90,7 +94,9 @@ namespace
         ScopedCudaPrefillModes()
             : bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
               canonical_kpart_(
-                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode())
+                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode()),
+              exact_overlay_enabled_(
+                  cudaNativeVNNIPrefill_getExactOverlayEnabled())
         {
             cudaNativeVNNIPrefill_getForceTile(&force_tile_);
         }
@@ -101,6 +107,8 @@ namespace
             cudaNativeVNNIPrefill_setBK256Mode(bk256_);
             cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
                 canonical_kpart_);
+            cudaNativeVNNIPrefill_setExactOverlayEnabled(
+                exact_overlay_enabled_);
         }
 
         ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
@@ -110,6 +118,7 @@ namespace
         int force_tile_ = -1;
         int bk256_ = 0;
         bool canonical_kpart_ = false;
+        bool exact_overlay_enabled_ = true;
     };
 
     class ScopedDebugEnvOverride
@@ -1259,6 +1268,191 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistent
 #endif
 }
 
+/**
+ * @test Prove installed Q6_K production overlays and workspace planning agree.
+ *
+ * Exact prefill overlays are consulted twice during graph construction: once
+ * while the kernel declares persistent workspace and again when capture emits
+ * the selected launch. Those decisions must be identical. In particular, a
+ * canonical K-partition winner needs its reduction partials before capture,
+ * whereas a direct full-K winner must not reserve that large buffer.
+ *
+ * This test exercises one authenticated canonical winner and the largest
+ * high-impact direct winner from the Qwen3.6 35B MoE Q6_K sweep. It uses the
+ * ordinary production policy controls throughout; forcing a tile would bypass
+ * the installed overlay and would therefore fail to test the real path.
+ */
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWorkspacePlan)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+    cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+
+    struct OverlayCase
+    {
+        const char *name;
+        int m;
+        int n;
+        int k;
+        int expected_tile;
+        bool expected_canonical_kpart;
+    };
+
+    constexpr std::array<OverlayCase, 2> cases = {{
+        {
+            .name = "expert_gate_up_m64",
+            .m = 64,
+            .n = 512,
+            .k = 2048,
+            .expected_tile = 0,
+            .expected_canonical_kpart = true,
+        },
+        {
+            .name = "gdn_qkv_m512",
+            .m = 512,
+            .n = 8192,
+            .k = 2048,
+            .expected_tile = 3,
+            .expected_canonical_kpart = false,
+        },
+    }};
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        cudaSuccess);
+
+    for (size_t case_index = 0; case_index < cases.size(); ++case_index)
+    {
+        const OverlayCase &test_case = cases[case_index];
+        SCOPED_TRACE(test_case.name);
+
+        auto weight = TestTensorFactory::createQ6_KRandom(
+            {static_cast<size_t>(test_case.n),
+             static_cast<size_t>(test_case.k)},
+            46000u + static_cast<uint32_t>(case_index));
+        ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
+
+        auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr);
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernel);
+        ASSERT_NE(workspace_consumer, nullptr);
+
+        const WorkspaceRequirements requirements =
+            workspace_consumer->getWorkspaceRequirements(
+                test_case.m, test_case.n, test_case.k);
+        const auto *canonical_partials = requirements.find(
+            GemmWorkspaceBuffers::
+                CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+        if (test_case.expected_canonical_kpart)
+        {
+            ASSERT_NE(canonical_partials, nullptr)
+                << "The exact canonical overlay must reserve its reducer "
+                   "partials before graph capture";
+            EXPECT_TRUE(canonical_partials->required);
+            EXPECT_GT(canonical_partials->size_bytes, 0u);
+        }
+        else
+        {
+            EXPECT_EQ(canonical_partials, nullptr)
+                << "A direct exact overlay must not reserve canonical "
+                   "K-partition scratch";
+        }
+
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(
+            gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace_->allocate(requirements));
+        workspace_consumer->bindWorkspace(workspace_.get());
+
+        FP32Tensor input(
+            {static_cast<size_t>(test_case.m),
+             static_cast<size_t>(test_case.k)});
+        FP32Tensor output(
+            {static_cast<size_t>(test_case.m),
+             static_cast<size_t>(test_case.n)});
+        for (int i = 0; i < test_case.m * test_case.k; ++i)
+            input.mutable_data()[i] = dist_(rng_);
+
+        ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+        ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        kernel->setGPUStream(stream);
+        ASSERT_TRUE(kernel->multiply_tensor(
+            &input,
+            &output,
+            test_case.m,
+            test_case.n,
+            test_case.k,
+            true,
+            1.0f,
+            0.0f,
+            nullptr,
+            nullptr,
+            gpu_device_.ordinal,
+            workspace_.get()));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        int selected_tile = -1;
+        int selected_k_partitions = 0;
+        int used_bk256 = 0;
+        int used_canonical_kpart = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selected_tile,
+            &selected_k_partitions,
+            &used_bk256,
+            &used_canonical_kpart);
+
+        EXPECT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(), 1);
+        EXPECT_EQ(selected_tile, test_case.expected_tile);
+        EXPECT_EQ(used_bk256, 0);
+        EXPECT_EQ(
+            used_canonical_kpart,
+            test_case.expected_canonical_kpart ? 1 : 0);
+        EXPECT_EQ(
+            selected_k_partitions > 1,
+            test_case.expected_canonical_kpart);
+
+        /*
+         * Additive tournaments must be able to remeasure this exact key
+         * without using the incumbent overlay as their AUTO baseline. Keep
+         * all other production controls unchanged so provenance alone proves
+         * that the explicit profiler scope owns selection.
+         */
+        cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+        ASSERT_TRUE(kernel->multiply_tensor(
+            &input,
+            &output,
+            test_case.m,
+            test_case.n,
+            test_case.k,
+            true,
+            1.0f,
+            0.0f,
+            nullptr,
+            nullptr,
+            gpu_device_.ordinal,
+            workspace_.get()));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(), 0)
+            << "Profiler bypass must expose the generic AUTO policy";
+        cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+
+        workspace_consumer->unbindWorkspace();
+        workspace_.reset();
+    }
+
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
 TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesCanonicalKpartScratchSlots)
 {
 #ifndef HAVE_CUDA
@@ -1334,7 +1528,8 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesC
         << "Fused concurrent Q/K/V prefill needs one canonical K-partition "
            "partial slot per producer stream.";
 
-    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(
+        gpu_device_, reqs.total_bytes_with_alignment() + 4096);
     ASSERT_TRUE(workspace_->allocate(reqs));
     q_ws->bindWorkspace(workspace_.get());
     k_ws->bindWorkspace(workspace_.get());
@@ -1523,6 +1718,11 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36MoEMixedQKVConcurrentDeco
     reqs.merge(q_ws->getWorkspaceRequirements(M, N_Q, K));
     reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
     reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs,
+        gpu_device_,
+        M,
+        /*projection_count=*/3);
 
     const auto *kpar =
         reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
@@ -1533,9 +1733,10 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36MoEMixedQKVConcurrentDeco
     ASSERT_NE(concurrent_kpar, nullptr)
         << "Concurrent decode must reserve side-stream GEMV partial slots; otherwise "
            "Q/K/V projections can race through the same KPAR reduction buffer.";
-    EXPECT_GE(concurrent_kpar->size_bytes, 7ULL * kpar->size_bytes);
+    EXPECT_GE(concurrent_kpar->size_bytes, 2ULL * kpar->size_bytes);
 
-    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(
+        gpu_device_, reqs.total_bytes_with_alignment() + 4096);
     ASSERT_TRUE(workspace_->allocate(reqs));
     q_ws->bindWorkspace(workspace_.get());
     k_ws->bindWorkspace(workspace_.get());
@@ -1745,12 +1946,18 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentDecodeRepeatsBitwise)
     reqs.merge(q_ws->getWorkspaceRequirements(M, N_Q, K));
     reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
     reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs,
+        gpu_device_,
+        M,
+        /*projection_count=*/3);
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
 
-    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(
+        gpu_device_, reqs.total_bytes_with_alignment() + 4096);
     ASSERT_TRUE(workspace_->allocate(reqs));
     q_ws->bindWorkspace(workspace_.get());
     k_ws->bindWorkspace(workspace_.get());

@@ -20,7 +20,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   persistent workspace and explicit events. Hot paths have no allocation,
   blocking sync, segmentation, or intermediate host observation.
 - Prefix restore preserves graph addresses through producer events. GPU
-  FFN/MTP APIs reject null publication streams.
+  FFN/MTP APIs reject null publication streams. CPU and GPU MTP terminal-hidden
+  mailboxes are capacity-complete arena owners whose addresses remain fixed for
+  the runner lifetime.
 
 ## Canonical CUDA2/ROCm2 LLEP Target
 
@@ -73,6 +75,29 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
 - All-format grouped attention, TurboQuant, MoE routing, GDN, short-conv,
   stochastic target preparation, and draft publication sweeps are serial-row
   byte exact on their production backends and M ranges.
+- The 2026-08-07 partial-terminal prefix/MTP failure was a CPU graph-lifetime
+  defect. Scalar MTP first allocated a one-row terminal-hidden mailbox; later
+  grouped publication replaced it with a wider tensor while cached CPU stages
+  retained the freed address. Every backend now reserves
+  `max(batch capacity, request_count * (depth + 1))` rows in one arena owner
+  before graph construction, and runtime validation forbids allocation,
+  rebinding, or reassignment. A focused scalar-to-four-row pointer-stability
+  regression, typed CPU grouped-verifier routing tests, retained-producer role
+  tests, and all six CPU/CUDA/ROCm ordinary-partial plus MTP-partial restore
+  E2Es pass (`6/6`, `86.83 s` wall time). The KV lifecycle source sanitizer
+  rejects reintroduction of the mutable-owner pattern. `GlobalOrchestrator`
+  now preserves the typed grouped-verifier request across every execute and
+  transfer step in GlobalTP/GlobalPP rank plans instead of erasing that role
+  through generic `forward()` dispatch.
+- The follow-on device-free gate exposed a deterministic MPI/OpenMP Q8 embedding
+  repack defect: a ceil-divided 256-element grouped unpack crossed row boundaries
+  whenever `d_model` contained fewer than eight Q8 blocks or had a block tail.
+  Full-table and vocabulary-range repacks now share one implementation that uses
+  grouped unpack only for complete eight-block groups and the bounded block API
+  for every tail. Instrumented regressions prove short rows never enter grouped
+  unpack while complete 256-element rows retain it. The canonical MPI-wrapped
+  embedding suite passed 20 consecutive runs, the complete Integration tree
+  rebuilt cleanly, and the unit/source gate passed `591/591` in `135.43 s`.
 - CUDA MoE grouped verifier passed every native format at M=2..16 and M=31
   through the real router/expert path after the small-M grouping fusion.
 - Release CUDA2/ROCm2 passed all eight Dynamic/LLEP cells and `166/166` checks
@@ -379,6 +404,54 @@ CUDA_VISIBLE_DEVICES=0 \
 On llama.cpp `5788b51`, three runs gave a `155.4 tok/s` decode median and
 `1122.5 tok/s` prefill median. Promotion retains the stricter historical
 `171.81 tok/s` decode target and requires at least `2245 tok/s` prefill.
+
+### AIME25 HTTP Math And Multi-Turn Gate
+
+`scripts/benchmarks/aime25_http_benchmark.py` owns a Release HTTP server and
+runs the pinned 30-problem `math-ai/aime25` corpus as two requests per problem:
+an initial solution followed by an independent review carrying the complete
+message history. The runner authenticates the dataset, model, executable,
+prompts, sampling policy, and server arguments; proves history with a nonce
+canary; and durably checkpoints each first turn and reviewed result.
+
+The first ROCm1 live probe passed server startup, model loading, and the
+two-request history canary. Problem 0's first turn completed, but its review
+exposed a production chunked-prefill admission defect: a 4096-row chunk followed
+by a 156-row terminal tail was admitted into the fixed 4096 graph bucket, then
+`ForwardExecutionEngine` incorrectly reapplied the 256-row raw-prompt minimum to
+the already admitted tail. The staged fix makes positive `bucket_seq_len` an
+explicit scheduler-admission contract. Focused device-free regressions, the
+shared CUDA/ROCm 256K+1 graph-cache test, and both complete 12-case backend graph
+cache suites are green. Each backend captures one 4096-row graph, replays the 64
+full chunks, and admits the final one-row tail without eager execution or
+recapture.
+
+The follow-on audit found that the same minimum also made ordinary short GPU
+prompts permanently eager. The staged structural fix redefines it as a minimum
+*physical padded bucket* for raw prompts: short prompts are coalesced into that
+bucket and remain graph-cache owned, exact smaller graphs remain capturable,
+and scheduler-admitted tails retain their fixed transaction bucket. The old
+parity-only graph-disable escape hatch is removed. The AIME runner now stops the
+owned server before publishing success and authenticates PerfStats evidence for
+prefill and decode capture plus replay, zero segmented/manual graph execution,
+and zero intermediate D2H. The workflow is backend-neutral across `cpu:N`,
+`cuda:N`, and `rocm:N`; GPU-only execution invariants are required for CUDA and
+ROCm without imposing them on CPU. Its 15 device-free workflow regressions and
+registered CTest gate are green. The full Release tree rebuilt cleanly; the
+fresh 30-problem ROCm run is the remaining live gate.
+
+The exact replay canary also certifies shifted MTP KV restore rather than only
+ordinary prompt KV reuse: owned-server arguments force depth-three MTP plus RAM
+prefix storage, the replay must preserve deterministic response bytes, and the
+completed PerfStats ledger must contain a restore tagged
+`includes_mtp_state=true`. The underlying partial-terminal restore path is now
+green on CPU, CUDA, and ROCm as described in the correctness ledger above.
+
+The CUDA dense-prefill corpus is complete across all 21 source formats:
+`33,075/33,075` authenticated cells produced 25,200 exact runtime overlays from
+Release scorer evidence. The installed generated include compiled in both the
+complete Integration and Release trees. Mixed-format MoE overlay collection
+follows the AIME live proof.
 
 ## Next Gates
 

@@ -1,3 +1,14 @@
+/**
+ * @file MTPVerifierForwardExecutor.cpp
+ * @brief Typed admission and execution for grouped MTP verifier forwards.
+ *
+ * Verifier shape alone cannot identify graph semantics: a short continuation
+ * can be prefill, ordinary decode, or grouped verification. This implementation
+ * admits host and device token plans through explicit runner entrypoints so the
+ * graph receives the grouped-verifier role and publishes the exact recurrent
+ * state required by accepted-prefix commitment.
+ */
+
 #include "MTPVerifierForwardExecutor.h"
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
@@ -58,7 +69,8 @@ namespace llaminar2
                                    result.graph_plan.token_batches,
                                    options.device_token_ids,
                                    result.graph_plan.padded_seq_len)
-                             : runner.forward_batch(result.graph_plan.token_batches);
+                             : runner.forwardGroupedMTPVerifierWithHostTokenIds(
+                                   result.graph_plan.token_batches);
         }
         else
         {
@@ -76,9 +88,8 @@ namespace llaminar2
                                    plan.verifier_input_tokens.data(),
                                    options.device_token_ids,
                                    seq_len)
-                             : runner.forward(
-                                   plan.verifier_input_tokens.data(),
-                                   seq_len);
+                             : runner.forwardGroupedMTPVerifierWithHostTokenIds(
+                                   result.graph_plan.token_batches);
         }
 
         if (!forward_ok)

@@ -325,7 +325,7 @@ TEST(Test__PrefillGraphCache, DefaultConfig_MatchesExpectedDefaults)
 {
     PrefillGraphConfig config;
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.min_seq_len, 256);
+    EXPECT_EQ(config.minimum_padded_bucket_seq_len, 256);
     EXPECT_FALSE(config.trace);
     EXPECT_TRUE(config.buckets_enabled);
     EXPECT_EQ(config.max_cached_entries, 10u);
@@ -731,10 +731,10 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsDisabledConfig)
     EXPECT_EQ(reason, PrefillGraphRejectReason::FeatureDisabled);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsLowSeqLen)
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketBelowFloor)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 256;
+    config.minimum_padded_bucket_seq_len = 256;
     PrefillGraphCache cache(config);
 
     PrefillGraphCacheKey key;
@@ -742,8 +742,38 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsLowSeqLen)
     key.device_id = DeviceId::rocm(0);
     auto graph = buildCapturableGraph(key.device_id);
 
-    auto reason = cache.preflight(graph, key, nullptr, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SeqLenBelowMinimum);
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        false,
+        false,
+        /*real_seq_len=*/32,
+        /*bucket_seq_len=*/64);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsExactGraphBelowPaddedBucketFloor)
+{
+    PrefillGraphConfig config;
+    config.minimum_padded_bucket_seq_len = 256;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = 64;
+    key.device_id = DeviceId::rocm(0);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    const auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        false,
+        false,
+        /*real_seq_len=*/64,
+        /*bucket_seq_len=*/64);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "The minimum coalesces padded raw prompts; it must not authorize eager execution for exact GPU graphs.";
 }
 
 TEST(Test__PrefillGraphCache, Preflight_RejectsCPUDevice)
@@ -908,7 +938,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
 TEST(Test__PrefillGraphCache, Preflight_ExactShapeUsesLazySupportBeforeWarmupReadiness)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     PrefillGraphCache cache(config);
 
     auto key = makeGPUKey(595);
@@ -956,7 +986,7 @@ TEST(Test__PrefillGraphCache, Preflight_ExactShapeUsesLazySupportBeforeWarmupRea
 TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupReadiness)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -1042,7 +1072,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
     auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
 
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -1101,7 +1131,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedMoERoutingWithoutResidentRo
     auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
 
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -1153,7 +1183,7 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingUsesBackendGroupedCa
     auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
 
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -1228,7 +1258,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsEmptyCollectiveSet)
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWithUnsupportedGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1256,7 +1286,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWithUnsupportedGDNSta
 TEST(Test__PrefillGraphCache, Preflight_AcceptsPaddedBucketWithSupportedGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1290,7 +1320,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsPaddedBucketWithSupportedGDNState
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketIfAnyGDNStateLacksContract)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1324,7 +1354,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketIfAnyGDNStateLacksCon
 TEST(Test__PrefillGraphCache, Preflight_RejectsSupportedPaddedGDNWhenStageIsNotCapturable)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1351,7 +1381,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsSupportedPaddedGDNWhenStageIsNotC
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWhenBucketsDisabled)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = false;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1372,7 +1402,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWhenBucketsDisabled)
 TEST(Test__PrefillGraphCache, Preflight_AllowsExactBucketWithGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
     ComputeGraph graph;
@@ -1756,7 +1786,7 @@ TEST(Test__PrefillGraphCache, ToString_RejectReasons)
 {
     EXPECT_STREQ(toString(PrefillGraphRejectReason::None), "None");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::FeatureDisabled), "FeatureDisabled");
-    EXPECT_STREQ(toString(PrefillGraphRejectReason::SeqLenBelowMinimum), "SeqLenBelowMinimum");
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::PaddedBucketBelowMinimum), "PaddedBucketBelowMinimum");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::NotGPUDevice), "NotGPUDevice");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::SnapshotsActive), "SnapshotsActive");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::ActiveMoERebalancing), "ActiveMoERebalancing");

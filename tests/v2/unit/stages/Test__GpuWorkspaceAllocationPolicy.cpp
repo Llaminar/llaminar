@@ -3051,7 +3051,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
         << "Prefix harvest must see the archived row without synchronizing the host.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenRowSelectCachesTrackWorkspaceGeneration)
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenRowSelectCachesRetainImmutableArenaOwner)
 {
     const auto source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
@@ -3108,24 +3108,35 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenRowSelectCachesTrackWo
               std::string::npos)
         << "Request reset must not destroy graph objects whose binding identities remain stable.";
 
-    const auto buffer_replacement = sliceBetween(
+    const auto buffer_validation = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer(",
         "bool DeviceGraphOrchestrator::executeMTPHiddenRowSelect(");
-    const auto compact_buffer_replacement =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(buffer_replacement));
-    EXPECT_NE(compact_buffer_replacement.find(
-                  "mtp_terminal_hidden_device_accepted_rows_select_caches_"),
+    const auto compact_buffer_validation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(buffer_validation));
+    EXPECT_NE(compact_buffer_validation.find(
+                  "arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN)"),
               std::string::npos)
-        << "Replacing the mailbox tensor is a real binding-identity change and must invalidate the exact-count graph family.";
-    EXPECT_NE(compact_buffer_replacement.find(
-                  "mtp_terminal_hidden_request_rows_select_caches_"),
+        << "Runtime validation must prove the mailbox remains arena-owned.";
+    EXPECT_NE(compact_buffer_validation.find(
+                  "arena_->getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN)"),
               std::string::npos)
-        << "Mailbox replacement must invalidate every request-terminal graph's captured output binding.";
-    EXPECT_EQ(compact_buffer_replacement.find(
-                  "mtp_terminal_hidden_request_rows_select_cache_"),
+        << "Runtime validation must compare against the exact immutable owner.";
+    EXPECT_NE(compact_buffer_validation.find(
+                  "state_.prefix_terminal_hidden!=arena_owner"),
               std::string::npos)
-        << "The prompt-width-specific singleton request cache must not return.";
+        << "A changed mailbox binding must fail closed.";
+    EXPECT_EQ(compact_buffer_validation.find("createFP32("),
+              std::string::npos);
+    EXPECT_EQ(compact_buffer_validation.find("registerBuffer("),
+              std::string::npos);
+    EXPECT_EQ(compact_buffer_validation.find("registerExternalBuffer("),
+              std::string::npos);
+    EXPECT_EQ(compact_buffer_validation.find("rebind"),
+              std::string::npos);
+    EXPECT_EQ(compact_buffer_validation.find(".invalidate()"),
+              std::string::npos)
+        << "A runtime mailbox check cannot mutate graph-cache identity.";
 
 }
 
@@ -6295,7 +6306,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         std::string::npos);
     EXPECT_NE(
         compact_greedy_consumer.find(
-            "forward_graph_output_ready_.event"),
+            "selectForwardGraphOutputPublication("
+            "ForwardGraphOutputKind::GroupedVerifier)"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_greedy_consumer.find(
+            "out_handle->response_ready_event=grouped_ready->event"),
         std::string::npos);
     EXPECT_EQ(
         compact_greedy_consumer.find(

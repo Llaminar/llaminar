@@ -1,3 +1,12 @@
+/**
+ * @file Test__MTPGraphConstruction.cpp
+ * @brief Device-free construction, lifecycle, and exact-state tests for MTP.
+ *
+ * These tests exercise the production graph builders and CPU implementations
+ * to prove MTP policy, verifier, recurrent-state, and prefix-cache contracts
+ * without occupying a GPU in the unit gate.
+ */
+
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -2228,6 +2237,82 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequ
                 << " col " << col;
         }
     }
+}
+
+/**
+ * @brief Prove CPU terminal-hidden publication cannot invalidate cached graph pointers.
+ *
+ * A fixed depth-three verifier needs four target rows, but scalar decode first
+ * publishes only one. Historically the CPU path allocated exactly that first
+ * row and replaced the tensor when a later grouped transaction needed four
+ * rows. CPU graph stages retain raw tensor pointers, so that replacement left
+ * previously cached MTP sidecars reading freed storage. Initialization must now
+ * reserve the complete configured capacity and every publication shape must
+ * retain the same arena-owned tensor object and backing address.
+ */
+TEST(Test__MTPGraphConstruction,
+     CPUTerminalHiddenMailboxIsCapacityCompleteAndAddressStable)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.draft_tokens = 3;
+    fixture.config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    fixture.config.mtp.max_request_batch = 1;
+    auto graph_builder =
+        std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/4,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    const TensorBase *const initialized_owner =
+        orchestrator.mtpTerminalHiddenForTesting();
+    ASSERT_NE(initialized_owner, nullptr);
+    ASSERT_GE(initialized_owner->rows(), 4u);
+    const void *const initialized_address = initialized_owner->raw_data();
+    ASSERT_NE(initialized_address, nullptr);
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_GE(hidden->rows(), 4u);
+    float *const hidden_data = hidden->mutable_data();
+    ASSERT_NE(hidden_data, nullptr);
+    for (size_t row = 0; row < 4; ++row)
+    {
+        for (size_t column = 0;
+             column < static_cast<size_t>(fixture.config.d_model);
+             ++column)
+        {
+            hidden_data[
+                row * static_cast<size_t>(fixture.config.d_model) + column] =
+                static_cast<float>((row + 1) * 100 + column + 1);
+        }
+    }
+
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/1);
+    ASSERT_TRUE(orchestrator.refreshMTPTerminalHiddenForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/1));
+    EXPECT_EQ(orchestrator.mtpTerminalHiddenForTesting(), initialized_owner);
+    EXPECT_EQ(
+        orchestrator.mtpTerminalHiddenForTesting()->raw_data(),
+        initialized_address);
+
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/4);
+    ASSERT_TRUE(orchestrator.refreshMTPTerminalHiddenForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/4));
+    EXPECT_EQ(orchestrator.mtpTerminalHiddenForTesting(), initialized_owner);
+    EXPECT_EQ(
+        orchestrator.mtpTerminalHiddenForTesting()->raw_data(),
+        initialized_address);
 }
 
 TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesVariableLengthTerminalRows)
@@ -4661,6 +4746,83 @@ TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPay
     EXPECT_EQ(restored.cached_tokens, static_cast<int>(prefix_tokens.size()));
     EXPECT_EQ(restored.mtp_blocks[0].key.token_count, static_cast<int>(prefix_tokens.size()) - 1);
     EXPECT_EQ(*restored.mtp_blocks[0].kv_storage, *before.mtp_blocks[0].kv_storage);
+}
+
+/**
+ * @brief Restore shifted MTP KV from a terminal block that prefixes a longer block.
+ *
+ * Multi-turn chat commonly extends a prior prompt inside the same configured
+ * cache block. The prior terminal block is shorter than the new request's
+ * lookup block, but it owns the exact shifted MTP KV boundary needed by suffix
+ * prefill. This regression proves lookup chooses that longest token prefix and
+ * population imports its MTP payload rather than silently recomputing it.
+ */
+TEST(Test__MTPGraphConstruction, PartialTerminalBlockRestoresShiftedMTPKVPayload)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.prefix_cache.enabled = true;
+    fixture.config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    fixture.config.prefix_cache.block_size = 4;
+    fixture.config.prefix_cache.terminal_state =
+        PrefixCacheTerminalStateMode::Off;
+    fixture.config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull;
+
+    auto graph_builder =
+        std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    orchestrator.setFrozenWeightSet(
+        makeTinyQwen35MTPFrozenWeightSet(fixture));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> first_prompt = {1, 2, 3};
+    const std::vector<int32_t> first_prefix(
+        first_prompt.begin(), first_prompt.end());
+    ASSERT_NE(
+        orchestrator.forward(
+            first_prompt.data(),
+            static_cast<int>(first_prompt.size()),
+            1),
+        nullptr);
+    const PrefixStateSnapshot before =
+        orchestrator.captureLivePrefixState();
+    ASSERT_TRUE(before.valid);
+    ASSERT_EQ(before.mtp_blocks.size(), 1u);
+    ASSERT_NE(before.mtp_blocks[0].kv_storage, nullptr);
+    ASSERT_TRUE(orchestrator.harvestPrefix(
+        first_prefix,
+        static_cast<int>(first_prefix.size())));
+
+    orchestrator.clear_cache();
+    const std::vector<int32_t> extended_prompt = {1, 2, 3, 4, 5};
+    const PrefixLookupResult hit = orchestrator.lookupPrefix(extended_prompt);
+    ASSERT_TRUE(hit.supported);
+    EXPECT_EQ(hit.cached_tokens, 3);
+    ASSERT_EQ(hit.blocks.size(), 1u);
+    EXPECT_EQ(hit.blocks[0].key.token_count, 3);
+    EXPECT_TRUE(hit.blocks[0].layout.includes_mtp_state);
+    ASSERT_NE(hit.blocks[0].mtp_storage, nullptr);
+
+    ASSERT_TRUE(orchestrator.populatePrefix(hit));
+    const PrefixStateSnapshot restored =
+        orchestrator.captureLivePrefixState();
+    ASSERT_TRUE(restored.valid);
+    ASSERT_EQ(restored.mtp_blocks.size(), 1u);
+    ASSERT_NE(restored.mtp_blocks[0].kv_storage, nullptr);
+    EXPECT_EQ(restored.cached_tokens, 3);
+    EXPECT_EQ(restored.mtp_blocks[0].key.token_count, 2);
+    EXPECT_EQ(
+        *restored.mtp_blocks[0].kv_storage,
+        *before.mtp_blocks[0].kv_storage);
 }
 
 TEST(Test__MTPGraphConstruction, CPUForwardUpdatesShiftedMTPCacheProbe)

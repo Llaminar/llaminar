@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace llaminar2
 {
     /**
@@ -25,8 +27,39 @@ namespace llaminar2
      */
     struct CUDAMoEBatchInvariantPolicy final
     {
+        /**
+         * @brief Capture-time grouped projection engine.
+         *
+         * Runtime verifier groups contain at most the fifteen drafts plus one
+         * target row admitted by the MTP contract. Their tiny row count favors
+         * the independently certified ordered-DP4A launch. Larger prefill owns
+         * enough row reuse to amortize a compact device directory and uses the
+         * integer tensor-core implementation. This is a typed geometry policy,
+         * not a fallback: both values are mandatory byte-exact production
+         * engines and capture chooses exactly one before replay.
+         */
+        enum class GroupedProjectionEngine : uint8_t
+        {
+            OrderedDp4aVerifier = 0,
+            TensorCoreImmaPrefill = 1,
+        };
+
         static constexpr int gate_up_k_partitions = 16;
         static constexpr int down_k_partitions = 16;
+        static constexpr int maximum_verifier_rows = 16;
+
+        /**
+         * @brief Select the mandatory grouped engine for a captured row bucket.
+         * @param rows Positive grouped token-row count.
+         * @return Ordered DP4A for verifier buckets, otherwise grouped IMMA.
+         */
+        static constexpr GroupedProjectionEngine groupedProjectionEngine(
+            int rows) noexcept
+        {
+            return rows <= maximum_verifier_rows
+                       ? GroupedProjectionEngine::OrderedDp4aVerifier
+                       : GroupedProjectionEngine::TensorCoreImmaPrefill;
+        }
 
         /** @return the unique non-dominated warp count for a valid top-k. */
         static constexpr int directDownWarps(int top_k) noexcept

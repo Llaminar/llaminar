@@ -27,11 +27,19 @@ import queue
 import statistics
 import subprocess
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from .format_registry import FORMAT_SPECS, NativeVNNIFormatSpec, registry_digest
+from .corpus_provenance import (
+    TRAINER_PROVENANCE_SCHEMA,
+    mapping_digest as _mapping_digest,
+    require_release_trainer,
+    sha256_file as _sha256_file,
+    trainer_provenance,
+)
 from .prefill_matrix import GPU_PREFILL_M_BUCKETS, gpu_prefill_measurements
 from .shape_manifest import NativeVNNIShape, load_shape_manifest
 
@@ -43,6 +51,20 @@ CUDA_AGGREGATE_COLUMNS = (
     "correctness_pass", "observed_tile_id", "observed_k_partitions",
     "observed_bk256", "observed_canonical_kpart",
     "canonical_kpart_available",
+    "primary_registers_per_thread",
+    "primary_local_memory_bytes_per_thread",
+    "primary_static_shared_memory_bytes",
+    "primary_dynamic_shared_memory_bytes",
+    "primary_threads_per_block",
+    "primary_max_threads_per_block",
+    "primary_max_active_blocks_per_sm",
+    "auxiliary_registers_per_thread",
+    "auxiliary_local_memory_bytes_per_thread",
+    "auxiliary_static_shared_memory_bytes",
+    "auxiliary_dynamic_shared_memory_bytes",
+    "auxiliary_threads_per_block",
+    "auxiliary_max_threads_per_block",
+    "auxiliary_max_active_blocks_per_sm",
 )
 
 ROCM_AGGREGATE_COLUMNS = (
@@ -85,6 +107,23 @@ CUDA_CANDIDATE_IDS = (
 )
 
 CUDA_GENERIC_CANDIDATE_IDS = CUDA_CANDIDATE_IDS[:-1]
+
+
+def _cuda_candidate_is_spill_free(
+    execution_codebook: int,
+    candidate: str,
+) -> bool:
+    """Mirror the compiled no-spill specialization inventory exactly."""
+
+    if not candidate.startswith(("STD:", "KPART:")):
+        return True
+    tile_id = int(candidate.split(":")[1].removeprefix("t"))
+    if execution_codebook in {10, 17}:
+        return tile_id not in {1, 4, 5}
+    if execution_codebook in {8, 9, 13, 14} and candidate.startswith("STD:"):
+        return tile_id not in {1, 4}
+    return True
+
 
 ROCM_CANDIDATE_IDS = (
     "N64/MT16/MB1",
@@ -138,6 +177,9 @@ ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS = frozenset((
 
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_BENCH_RUNS = 10
+SWEEP_PLAN_FILENAME = "production_dense_prefill.plan.json"
+SWEEP_PLAN_SCHEMA = "native-vnni-production-dense-prefill-sweep-v2"
+CELL_MANIFEST_SCHEMA = "native-vnni-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -215,9 +257,20 @@ class CellPaths:
     aggregate: Path
     timing: Path
     log: Path
+    manifest: Path
     aggregate_staging: Path
     timing_staging: Path
     log_staging: Path
+    manifest_staging: Path
+
+
+@dataclass(frozen=True)
+class BatchPaths:
+    """Ephemeral aggregate, timing, and log paths for one native process."""
+
+    aggregate: Path
+    timing: Path
+    log: Path
 
 
 def dense_prefill_candidate_ids(
@@ -236,12 +289,20 @@ def dense_prefill_candidate_ids(
             if source_format.gpu_execution_codebook_id == 0
             else CUDA_GENERIC_CANDIDATE_IDS
         )
-        if canonical_kpart_available:
-            return candidates
-        return tuple(
-            candidate for candidate in candidates
-            if not candidate.startswith("KPART:")
-        )
+        if source_format is not None:
+            execution_codebook = source_format.runtime_codebook(normalized)
+            candidates = tuple(
+                candidate for candidate in candidates
+                if _cuda_candidate_is_spill_free(
+                    execution_codebook, candidate
+                )
+            )
+        if not canonical_kpart_available:
+            candidates = tuple(
+                candidate for candidate in candidates
+                if not candidate.startswith("KPART:")
+            )
+        return candidates
     if normalized == "rocm":
         if (
             source_format is not None
@@ -285,9 +346,74 @@ def _cell_paths(root: Path, cell: DensePrefillCell) -> CellPaths:
         aggregate=stem.with_suffix(".csv"),
         timing=stem.with_suffix(".timing.csv"),
         log=stem.with_suffix(".log"),
+        manifest=stem.with_suffix(".manifest.json"),
         aggregate_staging=stem.with_suffix(".csv.inprogress"),
         timing_staging=stem.with_suffix(".timing.csv.inprogress"),
         log_staging=stem.with_suffix(".log.inprogress"),
+        manifest_staging=stem.with_suffix(".manifest.json.inprogress"),
+    )
+
+
+def _batch_group_key(cell: DensePrefillCell) -> tuple[object, ...]:
+    """Return the state that can share prepared weights in one process.
+
+    The native trainers accept several M buckets while retaining one source
+    format and one matrix geometry. Keeping those fields fixed lets the CUDA
+    and ROCm harnesses prepare/upload the weight once without changing any
+    candidate identity or timing semantics.
+    """
+
+    return (
+        cell.backend,
+        cell.source_format.label,
+        cell.source_format.source_codebook_id,
+        cell.source_format.runtime_codebook(cell.backend),
+        cell.shape.name,
+        cell.shape.n,
+        cell.shape.k,
+    )
+
+
+def _validated_batch_cells(
+    cells: Sequence[DensePrefillCell],
+) -> tuple[DensePrefillCell, ...]:
+    """Validate and order one same-format/same-geometry M batch."""
+
+    ordered = tuple(sorted(cells, key=lambda cell: cell.m))
+    if not ordered:
+        raise ValueError("dense prefill process batch cannot be empty")
+    if any(
+        _batch_group_key(cell) != _batch_group_key(ordered[0])
+        for cell in ordered
+    ):
+        raise ValueError(
+            "dense prefill process batch must retain one format and geometry"
+        )
+    if len({cell.m for cell in ordered}) != len(ordered):
+        raise ValueError("dense prefill process batch contains duplicate M")
+    return ordered
+
+
+def _batch_paths(
+    root: Path,
+    cells: Sequence[DensePrefillCell],
+) -> BatchPaths:
+    """Return collision-resistant staging paths for one process batch."""
+
+    ordered = _validated_batch_cells(cells)
+    digest = hashlib.sha256(json.dumps(
+        [cell.identity for cell in ordered],
+        separators=(",", ":"),
+    ).encode()).hexdigest()[:20]
+    first = ordered[0]
+    stem = (
+        Path(root) / "batches" /
+        f"{first.backend}-{first.source_format.label.lower()}-{digest}"
+    )
+    return BatchPaths(
+        aggregate=stem.with_suffix(".csv.inprogress"),
+        timing=stem.with_suffix(".timing.csv.inprogress"),
+        log=stem.with_suffix(".log.inprogress"),
     )
 
 
@@ -492,6 +618,83 @@ def _read_aggregate_rows(
                     )
                 if candidate == "BK256:full" and observed_bk256 != 1:
                     raise ValueError(f"{context}: forced BK256 route did not execute")
+                primary_registers = int(row["primary_registers_per_thread"])
+                primary_local = int(
+                    row["primary_local_memory_bytes_per_thread"]
+                )
+                primary_static_shared = int(
+                    row["primary_static_shared_memory_bytes"]
+                )
+                primary_dynamic_shared = int(
+                    row["primary_dynamic_shared_memory_bytes"]
+                )
+                primary_threads = int(row["primary_threads_per_block"])
+                primary_max_threads = int(
+                    row["primary_max_threads_per_block"]
+                )
+                primary_active_blocks = int(
+                    row["primary_max_active_blocks_per_sm"]
+                )
+                if (
+                    primary_registers <= 0
+                    or primary_local != 0
+                    or primary_static_shared < 0
+                    or primary_dynamic_shared < 0
+                    or primary_threads <= 0
+                    or primary_max_threads < primary_threads
+                    or primary_active_blocks <= 0
+                ):
+                    raise ValueError(
+                        f"{context}: ineligible CUDA primary resources"
+                    )
+
+                auxiliary_registers = int(
+                    row["auxiliary_registers_per_thread"]
+                )
+                auxiliary_local = int(
+                    row["auxiliary_local_memory_bytes_per_thread"]
+                )
+                auxiliary_static_shared = int(
+                    row["auxiliary_static_shared_memory_bytes"]
+                )
+                auxiliary_dynamic_shared = int(
+                    row["auxiliary_dynamic_shared_memory_bytes"]
+                )
+                auxiliary_threads = int(row["auxiliary_threads_per_block"])
+                auxiliary_max_threads = int(
+                    row["auxiliary_max_threads_per_block"]
+                )
+                auxiliary_active_blocks = int(
+                    row["auxiliary_max_active_blocks_per_sm"]
+                )
+                auxiliary_values = (
+                    auxiliary_registers,
+                    auxiliary_local,
+                    auxiliary_static_shared,
+                    auxiliary_dynamic_shared,
+                    auxiliary_threads,
+                    auxiliary_max_threads,
+                    auxiliary_active_blocks,
+                )
+                if auxiliary_local != 0 or (
+                    auxiliary_threads == 0 and any(auxiliary_values)
+                ) or (
+                    auxiliary_threads > 0
+                    and (
+                        auxiliary_registers <= 0
+                        or auxiliary_static_shared < 0
+                        or auxiliary_dynamic_shared < 0
+                        or auxiliary_max_threads < auxiliary_threads
+                        or auxiliary_active_blocks <= 0
+                    )
+                ):
+                    raise ValueError(
+                        f"{context}: ineligible CUDA auxiliary resources"
+                    )
+                if candidate.startswith("KPART:") != (auxiliary_threads > 0):
+                    raise ValueError(
+                        f"{context}: CUDA reducer resource identity disagrees"
+                    )
             else:
                 if float(row["stddev_us"]) < 0.0 or float(row["gflops"]) <= 0.0:
                     raise ValueError(f"{context}: invalid ROCm timing statistics")
@@ -688,23 +891,24 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(staging, path)
 
 
-def write_sweep_plan(
-    path: Path,
+def _sweep_plan_payload(
     backend: str,
     cells: Sequence[DensePrefillCell],
-    *,
-    warmup_runs: int = DEFAULT_WARMUP_RUNS,
-    bench_runs: int = DEFAULT_BENCH_RUNS,
-) -> None:
-    """Publish the complete immutable matrix and timing cardinality."""
+    trainer: Mapping[str, object],
+    warmup_runs: int,
+    bench_runs: int,
+) -> dict[str, object]:
+    """Construct the complete content-addressed sweep-plan payload."""
 
     normalized = backend.strip().lower()
     if warmup_runs <= 0 or bench_runs <= 0:
         raise ValueError("timing cardinalities must be positive")
     if any(cell.backend != normalized for cell in cells):
         raise ValueError("sweep plan contains a cell for another backend")
+    if trainer.get("backend") != normalized:
+        raise ValueError("trainer provenance belongs to another backend")
     body: dict[str, object] = {
-        "schema_version": "native-vnni-production-dense-prefill-sweep-v1",
+        "schema_version": SWEEP_PLAN_SCHEMA,
         "backend": normalized,
         "format_registry_digest": registry_digest(),
         "shape_manifest_digest": load_shape_manifest().digest(),
@@ -717,24 +921,275 @@ def write_sweep_plan(
         },
         "warmup_runs": warmup_runs,
         "bench_runs": bench_runs,
+        "trainer_provenance": dict(trainer),
+        "trainer_provenance_digest": _mapping_digest(trainer),
         "cells": [cell.canonical_mapping() for cell in cells],
     }
-    body["plan_digest"] = "sha256:" + hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    _write_json_atomic(Path(path), body)
+    body["plan_digest"] = _mapping_digest(body)
+    return body
+
+
+def _read_sweep_plan(path: Path) -> dict[str, object]:
+    """Read and authenticate an existing immutable sweep plan."""
+
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: sweep plan must be a JSON object")
+    if payload.get("schema_version") != SWEEP_PLAN_SCHEMA:
+        raise ValueError(f"{path}: unsupported sweep-plan schema")
+    recorded_digest = payload.get("plan_digest")
+    unsigned = dict(payload)
+    unsigned.pop("plan_digest", None)
+    if recorded_digest != _mapping_digest(unsigned):
+        raise ValueError(f"{path}: sweep-plan digest mismatch")
+    trainer = payload.get("trainer_provenance")
+    if not isinstance(trainer, dict) or (
+        payload.get("trainer_provenance_digest") != _mapping_digest(trainer)
+    ):
+        raise ValueError(f"{path}: trainer provenance digest mismatch")
+    return payload
+
+
+def write_sweep_plan(
+    path: Path,
+    backend: str,
+    cells: Sequence[DensePrefillCell],
+    trainer: Mapping[str, object],
+    *,
+    warmup_runs: int = DEFAULT_WARMUP_RUNS,
+    bench_runs: int = DEFAULT_BENCH_RUNS,
+) -> dict[str, object]:
+    """Create one immutable plan, or prove an existing plan is identical."""
+
+    path = Path(path)
+    expected = _sweep_plan_payload(
+        backend, cells, trainer, warmup_runs, bench_runs
+    )
+    if path.exists():
+        existing = _read_sweep_plan(path)
+        if existing != expected:
+            raise ValueError(
+                f"{path}: immutable sweep plan disagrees with this run; "
+                "use a new corpus directory"
+            )
+        return existing
+    _write_json_atomic(path, expected)
+    return expected
+
+
+def load_sweep_plan(
+    path: Path,
+    backend: str,
+    cells: Sequence[DensePrefillCell],
+    *,
+    warmup_runs: int = DEFAULT_WARMUP_RUNS,
+    bench_runs: int = DEFAULT_BENCH_RUNS,
+) -> dict[str, object]:
+    """Authenticate a plan without mutating it for status or installation."""
+
+    path = Path(path)
+    existing = _read_sweep_plan(path)
+    trainer = existing["trainer_provenance"]
+    assert isinstance(trainer, dict)
+    expected = _sweep_plan_payload(
+        backend, cells, trainer, warmup_runs, bench_runs
+    )
+    if existing != expected:
+        raise ValueError(
+            f"{path}: requested matrix or timing cardinality disagrees with "
+            "the immutable sweep plan"
+        )
+    return existing
+
+
+def load_planned_dense_prefill_cells(
+    path: Path,
+    backend: str,
+) -> tuple[tuple[DensePrefillCell, ...], dict[str, object]]:
+    """Reconstruct the exact matrix named by an authenticated sweep plan."""
+
+    normalized = backend.strip().lower()
+    existing = _read_sweep_plan(Path(path))
+    if existing.get("backend") != normalized:
+        raise ValueError(f"{path}: sweep plan belongs to another backend")
+    planned_rows = existing.get("cells")
+    if not isinstance(planned_rows, list) or not planned_rows:
+        raise ValueError(f"{path}: sweep plan has no cells")
+
+    available = {
+        cell.cell_id: cell
+        for cell in production_dense_prefill_cells(normalized)
+    }
+    selected = []
+    seen: set[str] = set()
+    for index, row in enumerate(planned_rows):
+        if not isinstance(row, dict) or not isinstance(row.get("cell_id"), str):
+            raise ValueError(f"{path}: malformed cell row {index}")
+        cell_id = row["cell_id"]
+        if cell_id in seen:
+            raise ValueError(f"{path}: duplicate planned cell {cell_id}")
+        try:
+            cell = available[cell_id]
+        except KeyError as error:
+            raise ValueError(
+                f"{path}: planned cell {cell_id} is absent from current matrix"
+            ) from error
+        if row != cell.canonical_mapping():
+            raise ValueError(f"{path}: planned cell {cell_id} changed identity")
+        seen.add(cell_id)
+        selected.append(cell)
+
+    cells = tuple(selected)
+    validated = load_sweep_plan(
+        path,
+        normalized,
+        cells,
+        warmup_runs=int(existing["warmup_runs"]),
+        bench_runs=int(existing["bench_runs"]),
+    )
+    return cells, validated
+
+
+def _cell_manifest_payload(
+    paths: CellPaths,
+    cell: DensePrefillCell,
+    plan: Mapping[str, object],
+    native_process: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind one promoted cell to its producer and exact artifact bytes."""
+
+    body: dict[str, object] = {
+        "schema_version": CELL_MANIFEST_SCHEMA,
+        "cell": cell.canonical_mapping(),
+        "plan_digest": plan["plan_digest"],
+        "trainer_provenance_digest": plan["trainer_provenance_digest"],
+        "warmup_runs": plan["warmup_runs"],
+        "bench_runs": plan["bench_runs"],
+        "native_process": dict(native_process),
+        "artifacts": {
+            "aggregate": {
+                "filename": paths.aggregate.name,
+                "sha256": _sha256_file(paths.aggregate_staging),
+            },
+            "timing": {
+                "filename": paths.timing.name,
+                "sha256": _sha256_file(paths.timing_staging),
+            },
+            "log": {
+                "filename": paths.log.name,
+                "sha256": _sha256_file(paths.log_staging),
+            },
+        },
+    }
+    body["manifest_digest"] = _mapping_digest(body)
+    return body
+
+
+def _stage_cell_manifest(
+    paths: CellPaths,
+    cell: DensePrefillCell,
+    plan: Mapping[str, object],
+    native_process: Mapping[str, object],
+) -> None:
+    """Durably stage the commit marker after all cell artifacts validate."""
+
+    payload = _cell_manifest_payload(paths, cell, plan, native_process)
+    paths.manifest_staging.parent.mkdir(parents=True, exist_ok=True)
+    with paths.manifest_staging.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _read_cell_manifest(path: Path) -> dict[str, object]:
+    """Read and authenticate one cell commit marker."""
+
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: cell manifest must be a JSON object")
+    if payload.get("schema_version") != CELL_MANIFEST_SCHEMA:
+        raise ValueError(f"{path}: unsupported cell-manifest schema")
+    recorded_digest = payload.get("manifest_digest")
+    unsigned = dict(payload)
+    unsigned.pop("manifest_digest", None)
+    if recorded_digest != _mapping_digest(unsigned):
+        raise ValueError(f"{path}: cell-manifest digest mismatch")
+    return payload
+
+
+def validate_promoted_production_dense_prefill_cell(
+    root: Path,
+    cell: DensePrefillCell,
+    plan: Mapping[str, object],
+) -> DenseCellValidation:
+    """Prove a committed cell belongs to one exact trainer/plan closure."""
+
+    paths = _cell_paths(Path(root), cell)
+    manifest = _read_cell_manifest(paths.manifest)
+    if manifest.get("cell") != cell.canonical_mapping():
+        raise ValueError(f"{paths.manifest}: cell identity mismatch")
+    for field in (
+        "plan_digest",
+        "trainer_provenance_digest",
+        "warmup_runs",
+        "bench_runs",
+    ):
+        if manifest.get(field) != plan.get(field):
+            raise ValueError(f"{paths.manifest}: {field} mismatch")
+
+    native_process = manifest.get("native_process")
+    if not isinstance(native_process, dict):
+        raise ValueError(f"{paths.manifest}: missing native-process identity")
+    cell_ids = native_process.get("cell_ids")
+    if (
+        native_process.get("backend") != cell.backend
+        or not isinstance(native_process.get("invocation_id"), str)
+        or not native_process["invocation_id"]
+        or not isinstance(native_process.get("device_ordinal"), int)
+        or native_process["device_ordinal"] < 0
+        or not isinstance(cell_ids, list)
+        or cell.cell_id not in cell_ids
+    ):
+        raise ValueError(f"{paths.manifest}: invalid native-process identity")
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "aggregate", "timing", "log"
+    }:
+        raise ValueError(f"{paths.manifest}: incomplete artifact inventory")
+    for role, artifact_path in (
+        ("aggregate", paths.aggregate),
+        ("timing", paths.timing),
+        ("log", paths.log),
+    ):
+        record = artifacts[role]
+        if not isinstance(record, dict) or (
+            record.get("filename") != artifact_path.name
+            or record.get("sha256") != _sha256_file(artifact_path)
+        ):
+            raise ValueError(
+                f"{paths.manifest}: {role} artifact digest mismatch"
+            )
+    return validate_production_dense_prefill_cell(
+        paths.aggregate,
+        paths.timing,
+        cell,
+        bench_runs=int(plan["bench_runs"]),
+    )
 
 
 def _cell_complete(
     root: Path,
     cell: DensePrefillCell,
-    bench_runs: int,
+    plan: Mapping[str, object],
 ) -> bool:
-    paths = _cell_paths(root, cell)
     try:
-        validate_production_dense_prefill_cell(
-            paths.aggregate, paths.timing, cell, bench_runs=bench_runs
-        )
+        validate_promoted_production_dense_prefill_cell(root, cell, plan)
     except (OSError, ValueError):
         return False
     return True
@@ -795,6 +1250,127 @@ def _cell_environment(
     return environment
 
 
+def _batch_environment(
+    cells: Sequence[DensePrefillCell],
+    paths: BatchPaths,
+    device: int,
+    warmup_runs: int,
+    bench_runs: int,
+) -> dict[str, str]:
+    """Build one native-process environment for several exact M cells.
+
+    Only M varies inside a batch. The C++ harness therefore retains the same
+    prepared weight while constructing a fresh persistent execution object for
+    each bucket. Candidate timing remains one native event sample per launch;
+    batching removes setup work but does not combine or amortize timed kernels.
+    """
+
+    ordered = _validated_batch_cells(cells)
+    first = ordered[0]
+    surrogate_paths = CellPaths(
+        aggregate=paths.aggregate,
+        timing=paths.timing,
+        log=paths.log,
+        manifest=paths.log.with_suffix(".manifest.json"),
+        aggregate_staging=paths.aggregate,
+        timing_staging=paths.timing,
+        log_staging=paths.log,
+        manifest_staging=paths.log.with_suffix(".manifest.json.inprogress"),
+    )
+    environment = _cell_environment(
+        first,
+        surrogate_paths,
+        device,
+        warmup_runs,
+        bench_runs,
+    )
+    m_values = ",".join(str(cell.m) for cell in ordered)
+    if first.backend == "cuda":
+        environment["LLAMINAR_TILE_SWEEP_PREFILL_M"] = m_values
+    else:
+        environment["LLAMINAR_ROCM_NVNNI_SWEEP_M"] = m_values
+        environment["LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES"] = str(len(ordered))
+    return environment
+
+
+def _write_csv_rows(
+    path: Path,
+    columns: Sequence[str],
+    rows: Sequence[Mapping[str, str]],
+) -> None:
+    """Durably write one already-staged cell CSV before authentication."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _split_batch_csv(
+    source: Path,
+    root: Path,
+    cells: Sequence[DensePrefillCell],
+    *,
+    timing: bool,
+) -> None:
+    """Split native multi-M output back into independently resumable cells.
+
+    Every row is matched against the immutable cell identity before it reaches
+    a per-cell staging file. Full candidate/sample validation happens after
+    both CSVs have been split, so no final corpus path can be published from a
+    malformed or incomplete batch.
+    """
+
+    ordered = _validated_batch_cells(cells)
+    columns = (
+        _timing_columns(ordered[0].backend)
+        if timing else _aggregate_columns(ordered[0].backend)
+    )
+    cells_by_m = {cell.m: cell for cell in ordered}
+    rows_by_m: dict[int, list[dict[str, str]]] = {
+        cell.m: [] for cell in ordered
+    }
+    with source.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        _require_exact_header(source, reader.fieldnames, columns)
+        for line, row in enumerate(reader, start=2):
+            try:
+                cell = cells_by_m[int(row["m"])]
+            except (KeyError, ValueError) as error:
+                raise ValueError(
+                    f"{source}:{line}: row does not belong to the process batch"
+                ) from error
+            _validate_common_identity(row, cell, f"{source}:{line}")
+            rows_by_m[cell.m].append(dict(row))
+
+    for cell in ordered:
+        if not rows_by_m[cell.m]:
+            raise ValueError(f"{source}: M={cell.m} produced no rows")
+        paths = _cell_paths(root, cell)
+        destination = paths.timing_staging if timing else paths.aggregate_staging
+        _write_csv_rows(destination, columns, rows_by_m[cell.m])
+
+
+def _write_batch_logs(
+    source: Path,
+    root: Path,
+    cells: Sequence[DensePrefillCell],
+) -> None:
+    """Attach the exact native-process log to every promoted cell."""
+
+    payload = source.read_bytes()
+    for cell in _validated_batch_cells(cells):
+        destination = _cell_paths(root, cell).log_staging
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def _run_accelerator_cell(
     binary: Path,
     root: Path,
@@ -802,6 +1378,7 @@ def _run_accelerator_cell(
     device: int,
     warmup_runs: int,
     bench_runs: int,
+    plan: Mapping[str, object],
 ) -> DenseCellValidation:
     """Launch, authenticate, and atomically promote one isolated cell."""
 
@@ -811,8 +1388,15 @@ def _run_accelerator_cell(
         paths.aggregate_staging,
         paths.timing_staging,
         paths.log_staging,
+        paths.manifest_staging,
     ):
         staging.unlink(missing_ok=True)
+    native_process = {
+        "invocation_id": str(uuid.uuid4()),
+        "backend": cell.backend,
+        "device_ordinal": device,
+        "cell_ids": [cell.cell_id],
+    }
     command = (
         str(binary),
         f"--gtest_filter={_BACKEND_TESTS[cell.backend]}",
@@ -841,10 +1425,104 @@ def _run_accelerator_cell(
         cell,
         bench_runs=bench_runs,
     )
+    _stage_cell_manifest(paths, cell, plan, native_process)
     os.replace(paths.aggregate_staging, paths.aggregate)
     os.replace(paths.timing_staging, paths.timing)
     os.replace(paths.log_staging, paths.log)
+    os.replace(paths.manifest_staging, paths.manifest)
+    validate_promoted_production_dense_prefill_cell(root, cell, plan)
     return validation
+
+
+def _run_accelerator_batch(
+    binary: Path,
+    root: Path,
+    cells: Sequence[DensePrefillCell],
+    device: int,
+    warmup_runs: int,
+    bench_runs: int,
+    plan: Mapping[str, object],
+) -> tuple[DenseCellValidation, ...]:
+    """Measure all missing M buckets for one prepared weight transaction.
+
+    The native process emits one combined aggregate and timing sidecar. This
+    function then reconstructs the original per-cell artifacts, authenticates
+    every candidate and every timing sample, and only afterward promotes each
+    cell atomically. A crash can therefore cost at most one format/geometry M
+    batch; previously completed cells remain untouched and immediately
+    resumable.
+    """
+
+    ordered = _validated_batch_cells(cells)
+    paths = _batch_paths(root, ordered)
+    paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
+    for path in (paths.aggregate, paths.timing, paths.log):
+        path.unlink(missing_ok=True)
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        for staging in (
+            cell_paths.aggregate_staging,
+            cell_paths.timing_staging,
+            cell_paths.log_staging,
+            cell_paths.manifest_staging,
+        ):
+            staging.unlink(missing_ok=True)
+
+    native_process = {
+        "invocation_id": str(uuid.uuid4()),
+        "backend": ordered[0].backend,
+        "device_ordinal": device,
+        "cell_ids": [cell.cell_id for cell in ordered],
+    }
+
+    command = (
+        str(binary),
+        f"--gtest_filter={_BACKEND_TESTS[ordered[0].backend]}",
+    )
+    environment = _batch_environment(
+        ordered, paths, device, warmup_runs, bench_runs
+    )
+    with paths.log.open("wb") as log:
+        completed = subprocess.run(
+            command,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        log.flush()
+        os.fsync(log.fileno())
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{ordered[0].backend} dense prefill batch failed on device "
+            f"{device}; inspect {paths.log}"
+        )
+
+    _split_batch_csv(paths.aggregate, root, ordered, timing=False)
+    _split_batch_csv(paths.timing, root, ordered, timing=True)
+    _write_batch_logs(paths.log, root, ordered)
+
+    validations = []
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        validations.append(validate_production_dense_prefill_cell(
+            cell_paths.aggregate_staging,
+            cell_paths.timing_staging,
+            cell,
+            bench_runs=bench_runs,
+        ))
+        _stage_cell_manifest(cell_paths, cell, plan, native_process)
+
+    for cell in ordered:
+        cell_paths = _cell_paths(root, cell)
+        os.replace(cell_paths.aggregate_staging, cell_paths.aggregate)
+        os.replace(cell_paths.timing_staging, cell_paths.timing)
+        os.replace(cell_paths.log_staging, cell_paths.log)
+        os.replace(cell_paths.manifest_staging, cell_paths.manifest)
+        validate_promoted_production_dense_prefill_cell(root, cell, plan)
+    for path in (paths.aggregate, paths.timing, paths.log):
+        path.unlink(missing_ok=True)
+    return tuple(validations)
 
 
 def run_missing_accelerator_cells(
@@ -856,6 +1534,7 @@ def run_missing_accelerator_cells(
     warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
     maximum_new_cells: int | None = None,
+    producer: Mapping[str, object] | None = None,
 ) -> tuple[DensePrefillCell, ...]:
     """Run distinct missing cells concurrently, one worker per physical GPU."""
 
@@ -875,18 +1554,38 @@ def run_missing_accelerator_cells(
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"{backend} trainer binary is not executable: {binary}")
     root = Path(root)
+    producer = (
+        trainer_provenance(binary, backend)
+        if producer is None else dict(producer)
+    )
+    plan = write_sweep_plan(
+        root / SWEEP_PLAN_FILENAME,
+        backend,
+        cells,
+        producer,
+        warmup_runs=warmup_runs,
+        bench_runs=bench_runs,
+    )
     missing = [
         cell for cell in cells
-        if not _cell_complete(root, cell, bench_runs)
+        if not _cell_complete(root, cell, plan)
     ]
     if maximum_new_cells is not None:
         if maximum_new_cells <= 0:
             raise ValueError("maximum_new_cells must be positive")
         missing = missing[:maximum_new_cells]
 
-    work: queue.Queue[DensePrefillCell] = queue.Queue()
+    grouped: dict[tuple[object, ...], list[DensePrefillCell]] = {}
     for cell in missing:
-        work.put(cell)
+        grouped.setdefault(_batch_group_key(cell), []).append(cell)
+    batches = tuple(
+        _validated_batch_cells(group)
+        for _, group in sorted(grouped.items())
+    )
+
+    work: queue.Queue[tuple[DensePrefillCell, ...]] = queue.Queue()
+    for batch in batches:
+        work.put(batch)
     failures: list[BaseException] = []
     completed_cells: list[DensePrefillCell] = []
     lock = threading.Lock()
@@ -895,20 +1594,39 @@ def run_missing_accelerator_cells(
     def worker(device: int) -> None:
         while not stop.is_set():
             try:
-                cell = work.get_nowait()
+                batch = work.get_nowait()
             except queue.Empty:
                 return
             try:
-                _run_accelerator_cell(
-                    binary,
-                    root,
-                    cell,
-                    device,
-                    warmup_runs,
-                    bench_runs,
-                )
+                if len(batch) == 1:
+                    _run_accelerator_cell(
+                        binary,
+                        root,
+                        batch[0],
+                        device,
+                        warmup_runs,
+                        bench_runs,
+                        plan,
+                    )
+                else:
+                    _run_accelerator_batch(
+                        binary,
+                        root,
+                        batch,
+                        device,
+                        warmup_runs,
+                        bench_runs,
+                        plan,
+                    )
                 with lock:
-                    completed_cells.append(cell)
+                    completed_cells.extend(batch)
+                    print(
+                        f"[{backend} device {device}] completed "
+                        f"{len(batch)} cells for "
+                        f"{batch[0].source_format.label}/"
+                        f"{batch[0].shape.name}",
+                        flush=True,
+                    )
             except BaseException as error:  # retain worker traceback object
                 with lock:
                     failures.append(error)
@@ -955,6 +1673,7 @@ def combine_production_dense_prefill_cells(
     root: Path,
     cells: Sequence[DensePrefillCell],
     *,
+    warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
 ) -> tuple[Path, Path]:
     """Require every planned cell and publish deterministic combined corpora."""
@@ -965,15 +1684,17 @@ def combine_production_dense_prefill_cells(
     if any(cell.backend != backend for cell in cells):
         raise ValueError("cannot combine dense prefill backends")
     root = Path(root)
+    plan = load_sweep_plan(
+        root / SWEEP_PLAN_FILENAME,
+        backend,
+        cells,
+        warmup_runs=warmup_runs,
+        bench_runs=bench_runs,
+    )
     paths = []
     for cell in cells:
         cell_paths = _cell_paths(root, cell)
-        validate_production_dense_prefill_cell(
-            cell_paths.aggregate,
-            cell_paths.timing,
-            cell,
-            bench_runs=bench_runs,
-        )
+        validate_promoted_production_dense_prefill_cell(root, cell, plan)
         paths.append(cell_paths)
     aggregate = root / "production_dense_prefill.csv"
     timing = root / "production_dense_prefill.timing.csv"
@@ -1044,6 +1765,8 @@ def main() -> int:
         subparser.add_argument(
             "--bench-runs", type=int, default=DEFAULT_BENCH_RUNS
         )
+    plan_command = subparsers.choices["plan"]
+    plan_command.add_argument("--binary", type=Path, required=True)
     run = subparsers.choices["run"]
     run.add_argument("--binary", type=Path, required=True)
     run.add_argument("--devices", type=_parse_devices, required=True)
@@ -1053,17 +1776,22 @@ def main() -> int:
     if args.warmup_runs <= 0 or args.bench_runs <= 0:
         parser.error("timing cardinalities must be positive")
     cells = _filtered_cells(args)
-    plan_path = args.output_dir / "production_dense_prefill.plan.json"
-    write_sweep_plan(
-        plan_path,
-        args.backend,
-        cells,
-        warmup_runs=args.warmup_runs,
-        bench_runs=args.bench_runs,
-    )
+    plan_path = args.output_dir / SWEEP_PLAN_FILENAME
     if args.command == "plan":
+        producer = trainer_provenance(args.binary, args.backend)
+        require_release_trainer(producer)
+        write_sweep_plan(
+            plan_path,
+            args.backend,
+            cells,
+            producer,
+            warmup_runs=args.warmup_runs,
+            bench_runs=args.bench_runs,
+        )
         print(f"planned {len(cells)} cells in {plan_path}")
     elif args.command == "run":
+        producer = trainer_provenance(args.binary, args.backend)
+        require_release_trainer(producer)
         completed = run_missing_accelerator_cells(
             args.binary,
             args.output_dir,
@@ -1072,11 +1800,19 @@ def main() -> int:
             warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
             maximum_new_cells=args.maximum_new_cells,
+            producer=producer,
         )
         print(f"completed {len(completed)} new cells of {len(cells)} planned")
     elif args.command == "status":
+        plan = load_sweep_plan(
+            plan_path,
+            args.backend,
+            cells,
+            warmup_runs=args.warmup_runs,
+            bench_runs=args.bench_runs,
+        )
         complete = sum(
-            _cell_complete(args.output_dir, cell, args.bench_runs)
+            _cell_complete(args.output_dir, cell, plan)
             for cell in cells
         )
         print(f"{complete}/{len(cells)} cells complete")
@@ -1084,6 +1820,7 @@ def main() -> int:
         aggregate, timing = combine_production_dense_prefill_cells(
             args.output_dir,
             cells,
+            warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
         )
         print(f"combined {len(cells)} cells into {aggregate} and {timing}")

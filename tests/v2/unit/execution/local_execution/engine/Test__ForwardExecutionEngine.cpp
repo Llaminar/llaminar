@@ -8,7 +8,9 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -119,6 +121,8 @@ namespace
             WorkspaceGraphParticipantRole::Decode;
         int sync_logits_calls = 0;
         TensorBase *last_published_logits = nullptr;
+        int committed_forward_output_calls = 0;
+        TensorBase *last_committed_logits = nullptr;
         int pending_all_position_verifier_stream_calls = 0;
         int pending_main_decode_stream_calls = 0;
         int build_decode_policy_calls = 0;
@@ -288,6 +292,13 @@ namespace
             (void)producer_stream;
             sync_logits_calls++;
             return true;
+        }
+
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &output) override
+        {
+            ++committed_forward_output_calls;
+            last_committed_logits = output.logits;
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
@@ -1210,6 +1221,11 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrd
     EXPECT_EQ(host.build_forward_graph_calls, 2);
     EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 2);
     EXPECT_EQ(host.prefill_chunk_maintenance_calls, 2);
+    EXPECT_EQ(host.committed_forward_output_calls, 2)
+        << "Every successful scheduled chunk must cross the engine-owned "
+           "forward-output publication boundary.";
+    EXPECT_EQ(host.last_committed_logits, output.logits)
+        << "The final scheduled chunk must remain the current logits authority.";
     EXPECT_EQ(host.forward_token_offsets, (std::vector<int>{0, 4}));
     EXPECT_EQ(host.forward_real_seq_lens, (std::vector<int>{4, 4}));
     ASSERT_EQ(host.forward_token_batches.size(), 2u);
@@ -1370,6 +1386,65 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBuck
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_forward_input.token_offset, 88);
     EXPECT_EQ(host.last_forward_input.position_offset, 88);
+    EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+/**
+ * @brief Prove that an admitted terminal chunk is not reclassified as a raw
+ * short prompt by the graph-cache minimum-length policy.
+ *
+ * A long request uses one fixed physical graph width for every chunk. Its last
+ * chunk can contain fewer real rows than `LLAMINAR_PREFILL_GRAPH_MIN_SEQ`, but
+ * `bucket_seq_len` records that the scheduler has already admitted that chunk
+ * into the transaction's captured bucket. The execution engine must honor that
+ * admission and reuse/build the bucket graph instead of rejecting the tail.
+ */
+TEST_F(Test__ForwardExecutionEngine,
+       RunPrefillChunk_TerminalTailBelowRawPromptMinimumUsesAdmittedBucket)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "2"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::rocm(0),
+        ComputeBackendType::GPU_ROCM);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> terminal_token = {91};
+    auto base_input = makeTestInput(
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        DeviceId::rocm(0),
+        terminal_token.data(),
+        /*position_ids=*/nullptr);
+    base_input.token_offset = 4096;
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/true);
+    ASSERT_TRUE(plan) << plan.error;
+    ASSERT_TRUE(plan.padding_required);
+    ASSERT_EQ(plan.chunk.real_count, 1);
+    ASSERT_EQ(plan.chunk.bucket_seq_len, 4);
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 1);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
 }
 
@@ -1860,7 +1935,11 @@ TEST_F(Test__ForwardExecutionEngine, Execute_BatchedGpuPrefillSkipsBucketedAdapt
         << "GPU-shaped unit execution must use the host's hardware-free worker context.";
 }
 
-TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucketedGraphCache)
+/**
+ * @brief A short raw GPU prompt is coalesced into the configured minimum
+ * physical graph bucket instead of escaping into permanent eager execution.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqUsesMinimumCapturedBucket)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -1893,19 +1972,25 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucket
 
     ForwardOutput output{};
     EXPECT_TRUE(engine.execute(input, output, host));
+    EXPECT_TRUE(engine.execute(input, output, host))
+        << "The second use of the same physical bucket must enter capture/replay state instead of rebuilding eagerly.";
 
     ASSERT_TRUE(host.has_last_forward_input);
     EXPECT_EQ(host.build_forward_graph_calls, 1);
-    EXPECT_EQ(host.last_token_ids_pointer, tokens.data());
-    EXPECT_EQ(host.last_position_ids_pointer, positions.data());
-    EXPECT_EQ(host.last_token_ids, tokens);
-    EXPECT_EQ(host.last_position_ids, positions);
-    EXPECT_EQ(host.last_forward_input.seq_len, 35);
-    EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
-    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
-    EXPECT_EQ(host.last_workspace_seq_len, 35);
-    EXPECT_TRUE(engine.cacheEmpty())
-        << "Short raw prefill should bypass graph-cache population entirely.";
+    ASSERT_EQ(host.last_token_ids.size(), 256u);
+    EXPECT_TRUE(std::equal(tokens.begin(), tokens.end(), host.last_token_ids.begin()));
+    EXPECT_TRUE(std::all_of(
+        host.last_token_ids.begin() + static_cast<std::ptrdiff_t>(tokens.size()),
+        host.last_token_ids.end(),
+        [](int token) { return token == 0; }));
+    EXPECT_EQ(host.last_position_ids_pointer, nullptr);
+    EXPECT_TRUE(host.last_position_ids.empty());
+    EXPECT_EQ(host.last_forward_input.seq_len, 256);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 35);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 256);
+    EXPECT_EQ(host.last_workspace_seq_len, 256);
+    EXPECT_FALSE(engine.cacheEmpty())
+        << "Every eligible homogeneous-GPU prefill must own graph-cache state.";
 }
 
 /**
@@ -1952,6 +2037,75 @@ TEST_F(Test__ForwardExecutionEngine, Execute_GroupedVerifierPublishesExactWorksp
     EXPECT_TRUE(verifier_graph->is_decode);
     EXPECT_TRUE(verifier_graph->all_position_logits);
     EXPECT_EQ(verifier_graph->signature.seq_len, 5);
+}
+
+/**
+ * @brief All-position logits do not confer verifier-state ownership.
+ *
+ * MTP condition and diagnostic graphs can expose all-position logits while
+ * using decode-shaped geometry. Only a graph admitted with the explicit
+ * GroupedMTPVerifier role captures the recurrent rows that accepted-state
+ * publication may consume. A later condition graph must therefore leave the
+ * retained verifier producer untouched instead of erasing or replacing it.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    Execute_AllPositionConditionCannotReplaceGroupedVerifierProducer)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+
+    const std::vector<int> verifier_tokens = {70, 71};
+    const std::vector<int> verifier_positions = {17, 18};
+    auto verifier_input = makeTestInput(
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        verifier_tokens.data(),
+        verifier_positions.data());
+    verifier_input.execution_role =
+        ForwardExecutionRole::GroupedMTPVerifier;
+
+    ForwardOutput verifier_output{};
+    ASSERT_TRUE(engine.execute(verifier_input, verifier_output, host));
+    const auto verifier_graph_before_condition =
+        engine.lastAllPositionVerifierForwardGraph();
+    ASSERT_TRUE(verifier_graph_before_condition.has_value());
+    EXPECT_EQ(
+        verifier_graph_before_condition->signature.execution_role,
+        ForwardExecutionRole::GroupedMTPVerifier);
+
+    const std::vector<int> condition_tokens = {72};
+    const std::vector<int> condition_positions = {19};
+    auto condition_input = makeTestInput(
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        condition_tokens.data(),
+        condition_positions.data());
+    condition_input.execution_role =
+        ForwardExecutionRole::MTPCondition;
+
+    ForwardOutput condition_output{};
+    ASSERT_TRUE(engine.execute(condition_input, condition_output, host));
+
+    const auto last_graph = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(last_graph.has_value());
+    EXPECT_EQ(
+        last_graph->signature.execution_role,
+        ForwardExecutionRole::MTPCondition);
+
+    const auto retained_verifier_graph =
+        engine.lastAllPositionVerifierForwardGraph();
+    ASSERT_TRUE(retained_verifier_graph.has_value());
+    EXPECT_EQ(
+        retained_verifier_graph->signature.execution_role,
+        ForwardExecutionRole::GroupedMTPVerifier);
+    EXPECT_EQ(
+        retained_verifier_graph->signature,
+        verifier_graph_before_condition->signature);
 }
 
 /**

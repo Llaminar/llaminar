@@ -14,6 +14,8 @@
 
 #include <cuda_runtime.h>
 
+#include "CUDADenseProductionPrefillOverlayGenerated.inc"
+#include "CUDANativeVNNIPrefillDiagnostics.h"
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "utils/DebugEnv.h"
@@ -52,6 +54,7 @@ struct LastLaunchSelection_
     int k_partitions = 1;
     int used_bk256 = 0;
     int used_canonical_kpart = 0;
+    int used_exact_overlay = 0;
 };
 
 // Thread-local because tile sweep benchmarks can launch from multiple worker
@@ -62,13 +65,16 @@ static inline void recordLastLaunchSelection(
     int tile_id,
     int k_partitions,
     bool used_bk256,
-    bool used_canonical_kpart = false)
+    bool used_canonical_kpart = false,
+    bool used_exact_overlay = false)
 {
     g_last_launch_selection.tile_id = tile_id;
     g_last_launch_selection.k_partitions = k_partitions;
     g_last_launch_selection.used_bk256 = used_bk256 ? 1 : 0;
     g_last_launch_selection.used_canonical_kpart =
         used_canonical_kpart ? 1 : 0;
+    g_last_launch_selection.used_exact_overlay =
+        used_exact_overlay ? 1 : 0;
 }
 
 static int querySmCount(CUDAPrefillContext_ *ctx)
@@ -2137,12 +2143,81 @@ namespace
     // instead of accepting an independent reduction geometry.
     static bool g_force_canonical_kpart = false;
 
+    // Profilers must measure the generic policy and every concrete candidate
+    // independently of any previously installed exact cells. Production keeps
+    // this enabled for the lifetime of the process; only the isolated sweep
+    // harness scopes it off while gathering replacement evidence.
+    static bool g_dense_prefill_exact_overlay_enabled = true;
+
     // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
     // Set via LLAMINAR_BK256_MODE env var or extern C API.
     static int g_bk256_force_mode = []()
     {
         return llaminar2::debugEnv().gemm.cuda_bk256_mode;
     }();
+
+    /**
+     * @brief Result of consulting the installed dense-prefill exact overlay.
+     *
+     * `Invalid` is deliberately distinct from `NotSelected`: a malformed
+     * generated entry is a production-policy failure and must never silently
+     * continue through the generic heuristic. `NotSelected` means either that
+     * the runtime key was not explicitly swept or that a profiler force control
+     * owns this process-local launch.
+     */
+    enum class DensePrefillOverlayStatus : uint8_t
+    {
+        NotSelected,
+        Selected,
+        Invalid,
+    };
+
+    /**
+     * @brief Resolve one authenticated dense-prefill launch before capture.
+     *
+     * Exact overlays are keyed only by the runtime-visible codebook and matrix
+     * geometry `(M,N,K)`. Profiler force controls have higher precedence so the
+     * sweep can continue to measure every physical candidate after an overlay
+     * has been installed. Ordinary production has no such controls and sees the
+     * exact overlay before the total generic policy.
+     *
+     * @param codebook Runtime NativeVNNI execution codebook.
+     * @param M Number of prefill rows in the captured bucket.
+     * @param N Projection output width.
+     * @param K Projection reduction width.
+     * @param config Receives the concrete launch tuple on `Selected`.
+     * @return Selection status, retaining malformed generated state as fatal.
+     */
+    DensePrefillOverlayStatus selectDensePrefillOverlay(
+        uint8_t codebook,
+        int M,
+        int N,
+        int K,
+        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig &config)
+    {
+        const bool profiler_override =
+            !g_dense_prefill_exact_overlay_enabled ||
+            g_force_canonical_kpart ||
+            g_force_tile_id >= 0 ||
+            g_bk256_force_mode != 0;
+        if (profiler_override)
+            return DensePrefillOverlayStatus::NotSelected;
+
+        if (!llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
+                codebook, M, N, K, config))
+        {
+            return DensePrefillOverlayStatus::NotSelected;
+        }
+
+        const bool ordinary_tile = config.tile_id >= 0 && config.tile_id <= 5;
+        const bool valid_bk256 =
+            config.bk256 && !config.canonical_kpart &&
+            (config.tile_id == -3 || config.tile_id == -2);
+        const bool valid_bk64 = !config.bk256 && ordinary_tile;
+        return (valid_bk256 || valid_bk64)
+                   ? DensePrefillOverlayStatus::Selected
+                   : DensePrefillOverlayStatus::Invalid;
+    }
 
     // ─── Format complexity classification ─────────────────────────────
     // Format complexity used by the total ordinary-prefill heuristic. Learned
@@ -2394,6 +2469,87 @@ namespace
         return cached_result;
     }
 
+    /** Map a compile-time output geometry back to its stable policy ID. */
+    template <int BM, int BN, int WM, int WN>
+    constexpr int densePrefillTileId()
+    {
+        if constexpr (BM == 64 && BN == 64 && WM == 2 && WN == 2)
+            return 0;
+        if constexpr (BM == 64 && BN == 128 && WM == 2 && WN == 2)
+            return 1;
+        if constexpr (BM == 64 && BN == 128 && WM == 4 && WN == 2)
+            return 2;
+        if constexpr (BM == 64 && BN == 128 && WM == 2 && WN == 4)
+            return 3;
+        if constexpr (BM == 128 && BN == 128 && WM == 4 && WN == 2)
+            return 4;
+        if constexpr (BM == 128 && BN == 128 && WM == 4 && WN == 4)
+            return 5;
+        return -1;
+    }
+
+    /**
+     * @brief Select launch bounds that cannot force compiler spilling.
+     *
+     * The ordinary hint asks 128-thread tiles for three resident CTAs and
+     * wider blocks for two. Exhaustive `cudaFuncGetAttributes` evidence on the
+     * complete codebook/tile/reduction matrix showed that this cap forces local
+     * memory for the cases below. Those exact specializations retain the same
+     * kernel body and launch geometry but request only one resident CTA, which
+     * lets ptxas allocate the registers the decode actually needs. Every other
+     * specialization keeps its stronger occupancy contract. The setup-time
+     * all-codebook resource gate remains authoritative and fails closed if a
+     * future compiler changes either side of this table.
+     */
+    template <uint8_t CB, int BM, int BN, int WM, int WN,
+              bool CanonicalKpart>
+    constexpr int densePrefillMinBlocksHint()
+    {
+        constexpr int tile = densePrefillTileId<BM, BN, WM, WN>();
+        static_assert(tile >= 0, "unregistered dense prefill tile geometry");
+        constexpr int threads = WM * WN * 32;
+        constexpr int ordinary_hint = threads >= 256 ? 2 : 3;
+
+        if constexpr (CB == 10)
+        {
+            if constexpr (CanonicalKpart)
+                return (tile == 0 || tile == 2) ? ordinary_hint : 1;
+            return 1;
+        }
+        if constexpr (CB == 17)
+        {
+            if constexpr (CanonicalKpart)
+                return (tile == 2 || tile == 3) ? ordinary_hint : 1;
+            return tile == 2 ? ordinary_hint : 1;
+        }
+        if constexpr (CanonicalKpart &&
+                      (CB == 0 || CB == 4 || CB == 6 || CB == 11 ||
+                       CB == 12 || CB == 15 || CB == 19))
+        {
+            return tile <= 3 ? ordinary_hint : 1;
+        }
+        return (tile == 0 || tile == 2 || tile == 3)
+                   ? ordinary_hint
+                   : 1;
+    }
+
+    /** Return whether the relaxed specialization is physically spill-free. */
+    template <uint8_t CB>
+    constexpr bool densePrefillTileIsResourceEligible(
+        TileId tile,
+        bool canonical_kpart)
+    {
+        const int tile_id = static_cast<int>(tile);
+        if constexpr (CB == 10 || CB == 17)
+            return tile_id != 1 && tile_id != 4 && tile_id != 5;
+        if constexpr (CB == 8 || CB == 9 || CB == 13 || CB == 14)
+        {
+            if (!canonical_kpart && (tile_id == 1 || tile_id == 4))
+                return false;
+        }
+        return true;
+    }
+
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
     bool launchNativeVNNITC_BK64(
         const int8_t *d_A_int8,
@@ -2421,7 +2577,19 @@ namespace
         // Clear any stale CUDA error from prior operations (e.g. CUTLASS reference path)
         (void)cudaGetLastError();
 
-        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN><<<grid, block, 0, cuda_stream>>>(
+        constexpr int block_size = WM * WN * 32;
+        constexpr int min_blocks = densePrefillMinBlocksHint<
+            CODEBOOK_ID, BM, BN, WM, WN, /*CanonicalKpart=*/false>();
+        nativeVnniTC_BK64<
+            CODEBOOK_ID,
+            BM,
+            BN,
+            WM,
+            WN,
+            /*STAGES_=*/2,
+            /*CANONICAL_KPART=*/false,
+            block_size,
+            min_blocks><<<grid, block, 0, cuda_stream>>>(
             d_A_int8,
             d_payload,
             d_scales,
@@ -2492,6 +2660,9 @@ namespace
         const dim3 block(WM * WN * 32);
 
         (void)cudaGetLastError();
+        constexpr int block_size = WM * WN * 32;
+        constexpr int min_blocks = densePrefillMinBlocksHint<
+            CODEBOOK_ID, BM, BN, WM, WN, /*CanonicalKpart=*/true>();
         nativeVnniTC_BK64<
             CODEBOOK_ID,
             BM,
@@ -2499,7 +2670,9 @@ namespace
             WM,
             WN,
             /*STAGES_=*/2,
-            /*CANONICAL_KPART=*/true><<<grid, block, 0, cuda_stream>>>(
+            /*CANONICAL_KPART=*/true,
+            block_size,
+            min_blocks><<<grid, block, 0, cuda_stream>>>(
             d_A_int8,
             d_payload,
             d_scales,
@@ -2535,6 +2708,18 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 
+    /** Return the exact dynamic shared-memory footprint of one BK256 CTA. */
+    template <int BM, int BN>
+    constexpr int nativeVnniBK256SharedMemoryBytes()
+    {
+        constexpr int scales_b_offset =
+            BM * BK128_STRIDE + BN * BK256_STRIDE;
+        constexpr int scales_a_offset =
+            scales_b_offset + 8 * BN * static_cast<int>(sizeof(uint16_t));
+        constexpr int scales_a_aligned = (scales_a_offset + 3) & ~3;
+        return scales_a_aligned + BM * 8 * static_cast<int>(sizeof(float));
+    }
+
     // =========================================================================
     // BK=256 launch helper: sets >48KB dynamic smem opt-in before first launch
     template <int BM, int BN, int WM, int WN>
@@ -2555,11 +2740,8 @@ namespace
         int serial_m1_k_partitions,
         int serial_m1_uses_ordered_reducer)
     {
-        // Compute dynamic smem size (must match kernel layout: A uses K=128 half)
-        constexpr int SCALES_B_OFF = BM * BK128_STRIDE + BN * BK256_STRIDE;
-        constexpr int SA_OFF = SCALES_B_OFF + 8 * BN * static_cast<int>(sizeof(uint16_t));
-        constexpr int SA_ALIGNED = (SA_OFF + 3) & ~3;
-        constexpr int smem_bytes = SA_ALIGNED + BM * 8 * static_cast<int>(sizeof(float));
+        constexpr int smem_bytes =
+            nativeVnniBK256SharedMemoryBytes<BM, BN>();
 
         /*
          * Ordinary and ordered-M1 kernels have intentionally different
@@ -2657,6 +2839,232 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 
+    using DensePrefillKernelResources = CUDADensePrefillKernelResources;
+
+    /**
+     * @brief Query setup-time resources for one exact kernel function.
+     *
+     * This function is intentionally outside the inference hot path. The
+     * production tournament calls it after one untimed route-resolution probe
+     * and before recording any timing event. Consequently a specialization
+     * that allocates compiler local memory can fail closed without ever
+     * becoming benchmark evidence or an installable dispatch target.
+     */
+    template <typename Kernel>
+    bool queryDensePrefillKernelResources(
+        Kernel kernel,
+        int threads_per_block,
+        size_t dynamic_shared_memory_bytes,
+        DensePrefillKernelResources &resources)
+    {
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        int active_blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                kernel,
+                threads_per_block,
+                dynamic_shared_memory_bytes) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        resources.registers_per_thread = attributes.numRegs;
+        resources.local_memory_bytes_per_thread = attributes.localSizeBytes;
+        resources.static_shared_memory_bytes = attributes.sharedSizeBytes;
+        resources.dynamic_shared_memory_bytes = dynamic_shared_memory_bytes;
+        resources.threads_per_block = threads_per_block;
+        resources.max_threads_per_block = attributes.maxThreadsPerBlock;
+        resources.max_active_blocks_per_sm = active_blocks;
+        return active_blocks > 0;
+    }
+
+    /** Query one BK64 primary and its optional ordered-reducer kernel. */
+    template <uint8_t CB, int BM, int BN, int WM, int WN>
+    bool queryDensePrefillBK64Resources(
+        bool canonical_kpart,
+        DensePrefillKernelResources &primary,
+        DensePrefillKernelResources &auxiliary)
+    {
+        constexpr int threads = WM * WN * 32;
+        bool primary_ok = false;
+        if (canonical_kpart)
+        {
+            constexpr int min_blocks = densePrefillMinBlocksHint<
+                CB, BM, BN, WM, WN, /*CanonicalKpart=*/true>();
+            primary_ok = queryDensePrefillKernelResources(
+                nativeVnniTC_BK64<
+                    CB,
+                    BM,
+                    BN,
+                    WM,
+                    WN,
+                    /*STAGES_=*/2,
+                    /*CANONICAL_KPART=*/true,
+                    threads,
+                    min_blocks>,
+                threads,
+                0,
+                primary);
+            if (!primary_ok)
+                return false;
+            return queryDensePrefillKernelResources(
+                canonical_kpart_reduce,
+                /*threads_per_block=*/256,
+                0,
+                auxiliary);
+        }
+
+        constexpr int min_blocks = densePrefillMinBlocksHint<
+            CB, BM, BN, WM, WN, /*CanonicalKpart=*/false>();
+        primary_ok = queryDensePrefillKernelResources(
+            nativeVnniTC_BK64<
+                CB,
+                BM,
+                BN,
+                WM,
+                WN,
+                /*STAGES_=*/2,
+                /*CANONICAL_KPART=*/false,
+                threads,
+                min_blocks>,
+            threads,
+            0,
+            primary);
+        auxiliary = {};
+        return primary_ok;
+    }
+
+    /** Query one of the six forceable BK64 output geometries. */
+    template <uint8_t CB>
+    bool queryDensePrefillTileResources(
+        int tile_id,
+        bool canonical_kpart,
+        DensePrefillKernelResources &primary,
+        DensePrefillKernelResources &auxiliary)
+    {
+#define QUERY_DENSE_PREFILL_TILE(ID, BM, BN, WM, WN)                         \
+    case ID:                                                                 \
+        return queryDensePrefillBK64Resources<CB, BM, BN, WM, WN>(          \
+            canonical_kpart, primary, auxiliary)
+
+        switch (tile_id)
+        {
+            QUERY_DENSE_PREFILL_TILE(0, 64, 64, 2, 2);
+            QUERY_DENSE_PREFILL_TILE(1, 64, 128, 2, 2);
+            QUERY_DENSE_PREFILL_TILE(2, 64, 128, 4, 2);
+            QUERY_DENSE_PREFILL_TILE(3, 64, 128, 2, 4);
+            QUERY_DENSE_PREFILL_TILE(4, 128, 128, 4, 2);
+            QUERY_DENSE_PREFILL_TILE(5, 128, 128, 4, 4);
+        default:
+            return false;
+        }
+
+#undef QUERY_DENSE_PREFILL_TILE
+    }
+
+    /** Query one Q4_0 BK256 specialization selected by the last probe. */
+    template <int BM, int BN, int WM, int WN>
+    bool queryDensePrefillBK256Resources(
+        bool ordered_reducer,
+        DensePrefillKernelResources &primary,
+        DensePrefillKernelResources &auxiliary)
+    {
+        constexpr int threads = WM * WN * 32;
+        constexpr int dynamic_shared =
+            nativeVnniBK256SharedMemoryBytes<BM, BN>();
+        bool ok = false;
+        if (ordered_reducer)
+        {
+            auto kernel = nativeVnniTC_BK256<BM, BN, WM, WN, true>;
+            if (cudaFuncSetAttribute(
+                    kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    dynamic_shared) != cudaSuccess)
+            {
+                (void)cudaGetLastError();
+                return false;
+            }
+            ok = queryDensePrefillKernelResources(
+                kernel, threads, dynamic_shared, primary);
+        }
+        else
+        {
+            auto kernel = nativeVnniTC_BK256<BM, BN, WM, WN, false>;
+            if (cudaFuncSetAttribute(
+                    kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    dynamic_shared) != cudaSuccess)
+            {
+                (void)cudaGetLastError();
+                return false;
+            }
+            ok = queryDensePrefillKernelResources(
+                kernel, threads, dynamic_shared, primary);
+        }
+        auxiliary = {};
+        return ok;
+    }
+
+    /** Resolve resources for the exact specialization published by a probe. */
+    template <uint8_t CB>
+    bool queryLastDensePrefillKernelResources(
+        int n,
+        int k,
+        int cuda_device_id,
+        DensePrefillKernelResources &primary,
+        DensePrefillKernelResources &auxiliary)
+    {
+        if (g_last_launch_selection.used_bk256)
+        {
+            if constexpr (CB != 0)
+            {
+                return false;
+            }
+            else
+            {
+                CUDAPrefillContext_ context;
+                context.device_id = cuda_device_id;
+                int ordered_reducer = 0;
+                int k_partitions = 0;
+                if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                        CB,
+                        n,
+                        k,
+                        querySmCount(&context),
+                        &ordered_reducer,
+                        &k_partitions) ||
+                    k_partitions <= 0)
+                {
+                    return false;
+                }
+                if (g_last_launch_selection.tile_id == -3)
+                {
+                    return queryDensePrefillBK256Resources<128, 64, 4, 2>(
+                        ordered_reducer != 0, primary, auxiliary);
+                }
+                if (g_last_launch_selection.tile_id == -2)
+                {
+                    return queryDensePrefillBK256Resources<128, 128, 4, 4>(
+                        ordered_reducer != 0, primary, auxiliary);
+                }
+                return false;
+            }
+        }
+
+        return queryDensePrefillTileResources<CB>(
+            g_last_launch_selection.tile_id,
+            g_last_launch_selection.used_canonical_kpart != 0,
+            primary,
+            auxiliary);
+    }
+
     /**
      * @brief Complete Q4_0 large-K route shared by planning and execution.
      *
@@ -2752,6 +3160,20 @@ namespace
         cudaStream_t cuda_stream,
         CUDAPrefillContext_ *prefill_ctx)
     {
+        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig
+            exact_overlay{};
+        const DensePrefillOverlayStatus overlay_status =
+            selectDensePrefillOverlay(CB, M, N, K, exact_overlay);
+        if (overlay_status == DensePrefillOverlayStatus::Invalid)
+            return false;
+        const bool use_exact_overlay =
+            overlay_status == DensePrefillOverlayStatus::Selected;
+        if constexpr (CB != 0)
+        {
+            if (use_exact_overlay && exact_overlay.bk256)
+                return false;
+        }
+
         Q40PrefillRoute q40_route = Q40PrefillRoute::Generic;
 
         // ─── BK256 path (CB=0 only) ──────────────────────────────────
@@ -2760,14 +3182,24 @@ namespace
         // Uses 1 block/SM occupancy, so only helps when BK64 can't fill the GPU.
         if constexpr (CB == 0)
         {
-            q40_route = chooseQ40PrefillRoute(M, N, K, prefill_ctx);
+            if (use_exact_overlay && exact_overlay.bk256)
+            {
+                q40_route = exact_overlay.tile_id == -3
+                                ? Q40PrefillRoute::BK256Narrow
+                                : Q40PrefillRoute::BK256Wide;
+            }
+            else
+            {
+                q40_route = chooseQ40PrefillRoute(M, N, K, prefill_ctx);
+            }
             if (q40_route == Q40PrefillRoute::BK256Narrow ||
                 q40_route == Q40PrefillRoute::BK256Wide)
             {
                 constexpr int sk = 1;
                 if (q40_route == Q40PrefillRoute::BK256Narrow)
                 {
-                    recordLastLaunchSelection(-3, sk, true);
+                    recordLastLaunchSelection(
+                        -3, sk, true, false, use_exact_overlay);
                     return launchNativeVNNITC_BK256<128, 64, 4, 2>(
                         d_A_int8, d_payload, d_scales, d_C_fp32,
                         d_scales_A_block, M, N, K, alpha, beta,
@@ -2776,7 +3208,8 @@ namespace
                         serial_m1_uses_ordered_reducer);
                 }
 
-                recordLastLaunchSelection(-2, sk, true);
+                recordLastLaunchSelection(
+                    -2, sk, true, false, use_exact_overlay);
                 return launchNativeVNNITC_BK256<128, 128, 4, 4>(
                     d_A_int8, d_payload, d_scales, d_C_fp32,
                     d_scales_A_block, M, N, K, alpha, beta,
@@ -2789,7 +3222,11 @@ namespace
         // ─── Tile selection (3-tier priority) ─────────────────────────
         TileChoice tc;
 
-        if constexpr (CB == 0)
+        if (use_exact_overlay)
+        {
+            tc = {static_cast<TileId>(exact_overlay.tile_id)};
+        }
+        else if constexpr (CB == 0)
         {
             if (q40_route == Q40PrefillRoute::ProfiledT64x64)
             {
@@ -2821,10 +3258,30 @@ namespace
 
         // Tile launch: output geometry is selectable; reduction geometry is
         // either one complete K walk or the exact public-M1 partition tree.
+        const bool use_canonical_kpart = use_exact_overlay
+                                             ? exact_overlay.canonical_kpart
+                                             : g_force_canonical_kpart;
+        if (!densePrefillTileIsResourceEligible<CB>(
+                tc.tile, use_canonical_kpart))
+        {
+            /*
+             * An exact overlay or forced profiler identity is a contract and
+             * cannot be silently rewritten. Generic policy, however, must be
+             * total over unseen geometry, so project an ineligible heuristic
+             * choice onto tile 2: the all-codebook inventory proves that tile
+             * spill-free for direct and canonical arithmetic alike.
+             */
+            if (use_exact_overlay ||
+                (g_force_tile_id >= 0 && g_force_tile_id <= 5))
+            {
+                return false;
+            }
+            tc = {TileId::T64x128_w4x2};
+        }
 #define DISPATCH_TILE(BM_, BN_, WM_, WN_)                                              \
     do                                                                                 \
     {                                                                                  \
-        if (g_force_canonical_kpart)                                                   \
+        if (use_canonical_kpart)                                                       \
         {                                                                              \
             if (!serial_m1_uses_ordered_reducer ||                                    \
                 serial_m1_k_partitions <= 1)                                          \
@@ -2833,7 +3290,8 @@ namespace
                 static_cast<int>(tc.tile),                                            \
                 serial_m1_k_partitions,                                               \
                 false,                                                                \
-                true);                                                                \
+                true,                                                                 \
+                use_exact_overlay);                                                   \
             return launchNativeVNNITC_BK64CanonicalKpart<                             \
                 CB, BM_, BN_, WM_, WN_>(                                              \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,                      \
@@ -2841,7 +3299,8 @@ namespace
                 M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,              \
                 prefill_ctx, serial_m1_k_partitions);                                 \
         }                                                                              \
-        recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false);               \
+        recordLastLaunchSelection(                                                    \
+            static_cast<int>(tc.tile), 1, false, false, use_exact_overlay);           \
         return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_>(                       \
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,                 \
             d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,                   \
@@ -2895,6 +3354,18 @@ extern "C"
         return g_force_canonical_kpart;
     }
 
+    /** Enable or bypass installed exact cells for an isolated policy sweep. */
+    void cudaNativeVNNIPrefill_setExactOverlayEnabled(bool enabled)
+    {
+        g_dense_prefill_exact_overlay_enabled = enabled;
+    }
+
+    /** Return whether ordinary production may consult installed exact cells. */
+    bool cudaNativeVNNIPrefill_getExactOverlayEnabled()
+    {
+        return g_dense_prefill_exact_overlay_enabled;
+    }
+
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
         int *tile_id,
         int *k_partitions,
@@ -2910,6 +3381,151 @@ extern "C"
         if (used_canonical_kpart)
             *used_canonical_kpart =
                 g_last_launch_selection.used_canonical_kpart;
+    }
+
+    /**
+     * @brief Report whether the last launch came from an installed exact cell.
+     *
+     * The value is thread-local for the same reason as the remaining launch
+     * diagnostics: sweep workers configure and inspect their own launch
+     * transaction. Production PerfStats uses this provenance to distinguish a
+     * measured overlay from the total generic policy.
+     */
+    int cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay()
+    {
+        return g_last_launch_selection.used_exact_overlay;
+    }
+
+    /**
+     * @brief Query compiler resources for the exact last-launched prefill path.
+     *
+     * A caller first performs one untimed launch on its exact producer stream.
+     * That launch publishes the physical tile/BK256/canonical-reducer identity
+     * in thread-local state. This setup-only query then inspects precisely that
+     * primary specialization and, when present, the ordered reduction kernel.
+     * It performs no allocation, transfer, kernel launch, or synchronization.
+     *
+     * @return `true` when both the primary and any auxiliary specialization
+     *         have valid compiler attributes and non-zero theoretical
+     *         occupancy; `false` for stale or unsupported launch identity.
+     */
+    bool cudaNativeVNNIPrefill_queryLastLaunchResources(
+        uint8_t codebook_id,
+        int n,
+        int k,
+        int cuda_device_id,
+        CUDADensePrefillKernelResources *primary,
+        CUDADensePrefillKernelResources *auxiliary)
+    {
+        if (!primary || !auxiliary || n <= 0 || k <= 0 ||
+            cuda_device_id < 0 ||
+            cudaSetDevice(cuda_device_id) != cudaSuccess)
+        {
+            return false;
+        }
+
+        *primary = {};
+        *auxiliary = {};
+        bool queried = false;
+#define QUERY_LAST_DENSE_PREFILL_CODEBOOK(CB)                                \
+    case CB:                                                                  \
+        queried = queryLastDensePrefillKernelResources<CB>(                  \
+            n, k, cuda_device_id, *primary, *auxiliary);                      \
+        break
+
+        switch (codebook_id)
+        {
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(0);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(4);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(5);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(6);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(7);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(8);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(9);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(10);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(11);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(12);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(13);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(14);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(15);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(16);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(17);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(19);
+        default:
+            return false;
+        }
+
+#undef QUERY_LAST_DENSE_PREFILL_CODEBOOK
+
+        return queried;
+    }
+
+    bool cudaNativeVNNIPrefill_queryCandidateResources(
+        uint8_t codebook_id,
+        int tile_id,
+        int canonical_kpart,
+        int ordered_bk256,
+        int cuda_device_id,
+        CUDADensePrefillKernelResources *primary,
+        CUDADensePrefillKernelResources *auxiliary)
+    {
+        if (!primary || !auxiliary || canonical_kpart < 0 ||
+            canonical_kpart > 1 || ordered_bk256 < 0 ||
+            ordered_bk256 > 1 || cuda_device_id < 0 ||
+            cudaSetDevice(cuda_device_id) != cudaSuccess)
+        {
+            return false;
+        }
+        *primary = {};
+        *auxiliary = {};
+
+        if (tile_id == -3 || tile_id == -2)
+        {
+            if (codebook_id != 0 || canonical_kpart != 0)
+                return false;
+            if (tile_id == -3)
+            {
+                return queryDensePrefillBK256Resources<128, 64, 4, 2>(
+                    ordered_bk256 != 0, *primary, *auxiliary);
+            }
+            return queryDensePrefillBK256Resources<128, 128, 4, 4>(
+                ordered_bk256 != 0, *primary, *auxiliary);
+        }
+        if (tile_id < 0 || tile_id > 5 || ordered_bk256 != 0)
+            return false;
+
+        bool queried = false;
+#define QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(CB)                           \
+    case CB:                                                                  \
+        queried = queryDensePrefillTileResources<CB>(                        \
+            tile_id, canonical_kpart != 0, *primary, *auxiliary);             \
+        break
+
+        switch (codebook_id)
+        {
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(0);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(4);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(5);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(6);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(7);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(8);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(9);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(10);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(11);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(12);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(13);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(14);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(15);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(16);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(17);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(19);
+        default:
+            return false;
+        }
+
+#undef QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK
+
+        return queried;
     }
 
     // Force output-tile geometry for sweep benchmarks. K partitioning remains
@@ -3022,7 +3638,18 @@ extern "C"
             return false;
         }
 
-        if (!g_force_canonical_kpart)
+        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig
+            exact_overlay{};
+        const DensePrefillOverlayStatus overlay_status =
+            selectDensePrefillOverlay(
+                codebook_id, M, N, K, exact_overlay);
+        if (overlay_status == DensePrefillOverlayStatus::Invalid)
+            return false;
+        const bool needs_canonical_kpart =
+            g_force_canonical_kpart ||
+            (overlay_status == DensePrefillOverlayStatus::Selected &&
+             exact_overlay.canonical_kpart);
+        if (!needs_canonical_kpart)
             return true;
 
         int uses_ordered_reducer = 0;
@@ -3251,11 +3878,14 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         int k_partitions = 1;
         int used_bk256 = 0;
         int used_canonical_kpart = 0;
+        int used_exact_overlay = 0;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
             &tile_id,
             &k_partitions,
             &used_bk256,
             &used_canonical_kpart);
+        used_exact_overlay =
+            cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay();
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",
             "cuda_native_vnni_prefill_calls",
@@ -3271,6 +3901,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
                 {"k_partitions", std::to_string(k_partitions)},
                 {"bk256", used_bk256 ? "1" : "0"},
                 {"canonical_kpart", used_canonical_kpart ? "1" : "0"},
+                {"exact_overlay", used_exact_overlay ? "1" : "0"},
                 {"sums_a", d_sums_A_block ? "1" : "0"}});
     }
     return ok;

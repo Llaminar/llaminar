@@ -2897,14 +2897,6 @@ namespace llaminar2::test::parity::qwen36
         std::unique_ptr<ScopedEnvironmentValues> partial_prefix_graph_env;
         if (mode == PrefixRestoreParityMode::PartialHit)
         {
-            const char *disable_prefill_graphs_env =
-                std::getenv("LLAMINAR_PARITY_DISABLE_PREFILL_GRAPHS");
-            const bool disable_prefill_graphs =
-                disable_prefill_graphs_env &&
-                disable_prefill_graphs_env[0] != '\0' &&
-                std::strcmp(disable_prefill_graphs_env, "0") != 0 &&
-                std::strcmp(disable_prefill_graphs_env, "false") != 0 &&
-                std::strcmp(disable_prefill_graphs_env, "FALSE") != 0;
             const int final_remainder =
                 static_cast<int>(prompt_tokens.size()) % block_size;
             std::ostringstream buckets;
@@ -2914,28 +2906,17 @@ namespace llaminar2::test::parity::qwen36
             const std::string bucket_sizes = buckets.str();
 
             /*
-             * Production partial-hit parity intentionally exercises bucketed
-             * prefill graph capture because prefix restore and long-context
-             * replay share that hot path.  The opt-in diagnostic below narrows
-             * root-cause work to non-captured prefill without weakening the
-             * default gate or silently bypassing graph replay in production.
+             * Partial-hit parity always exercises the production bucketed
+             * capture path. Prefix restore and long-context suffix replay share
+             * this lifecycle, so an eager diagnostic mode would leave the
+             * ordering contract unproved.
              */
-            if (disable_prefill_graphs)
-            {
-                partial_prefix_graph_env.reset(new ScopedEnvironmentValues({
-                    {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
-                    {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
-                }));
-            }
-            else
-            {
-                partial_prefix_graph_env.reset(new ScopedEnvironmentValues({
-                    {"LLAMINAR_GPU_GRAPHS", "1"},
-                    {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
-                    {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
-                    {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", bucket_sizes.c_str()},
-                }));
-            }
+            partial_prefix_graph_env.reset(new ScopedEnvironmentValues({
+                {"LLAMINAR_GPU_GRAPHS", "1"},
+                {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+                {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", bucket_sizes.c_str()},
+            }));
         }
 
         auto factory = createOrchestrationRunnerFactory();

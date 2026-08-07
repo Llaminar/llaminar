@@ -1781,39 +1781,6 @@ namespace llaminar2::test::parity
             mutableDebugEnv().reload();
         }
 
-        void configureGraphCaptureParityEnvironment()
-        {
-            const auto policy =
-                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill);
-            if (!policy.enabled ||
-                !policy.require_prefill_graph_capture_on_gpu ||
-                config_.token_ids.empty())
-            {
-                return;
-            }
-
-            const DeviceId device = getDevice();
-            if (!device.is_gpu())
-                return;
-
-            const int token_count =
-                static_cast<int>(config_.token_ids.size());
-            const auto &exec = debugEnv().execution;
-            if (token_count >= exec.prefill_graph_min_seq)
-                return;
-
-            const std::string exact_len =
-                std::to_string(std::max(1, token_count));
-            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", exact_len);
-            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
-            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", exact_len);
-            mutableDebugEnv().reload();
-
-            LOG_INFO("[Parity] GPU prefill graph snapshots require capture; "
-                     "using exact prefill graph bucket seq_len="
-                     << token_count << " for " << getBackendName());
-        }
-
     protected:
         class ParityProfileScope
         {
@@ -2207,8 +2174,6 @@ namespace llaminar2::test::parity
             }
 
             resolveSnapshotDirIfNeeded();
-            configureGraphCaptureParityEnvironment();
-
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
             // OPTIMIZATION: Skip regeneration if snapshots already exist on disk
@@ -3915,52 +3880,24 @@ namespace llaminar2::test::parity
             return config_.graph_snapshot_policy;
         }
 
-        virtual int parityGraphCaptureMinimumPrefillTokens() const
-        {
-            return std::max(1, debugEnv().execution.prefill_graph_min_seq);
-        }
-
-        std::vector<int> makeGraphCaptureEligiblePrefillTokens(
+        std::vector<int> makeBoundedPrefillTokens(
             const std::vector<int> &seed_tokens,
             int max_seq_len = 0) const
         {
             if (seed_tokens.empty())
             {
                 throw std::invalid_argument(
-                    "cannot build graph-capture parity prefill input from empty token list");
+                    "cannot build parity prefill input from an empty token list");
             }
 
-            const int required_tokens = parityGraphCaptureMinimumPrefillTokens();
-            if (max_seq_len > 0 && max_seq_len < required_tokens)
-            {
-                throw std::invalid_argument(
-                    "parity graph-capture prefill input requires at least " +
-                    std::to_string(required_tokens) +
-                    " tokens, but max_seq_len is " +
-                    std::to_string(max_seq_len));
-            }
-
-            const size_t required =
-                static_cast<size_t>(required_tokens);
             const size_t max_allowed =
                 max_seq_len > 0
                     ? static_cast<size_t>(max_seq_len)
                     : std::numeric_limits<size_t>::max();
-            const size_t target =
-                std::min(std::max(seed_tokens.size(), required), max_allowed);
-
-            std::vector<int> tokens;
-            tokens.reserve(target);
-            while (tokens.size() < target)
-            {
-                const size_t remaining = target - tokens.size();
-                const size_t take = std::min(remaining, seed_tokens.size());
-                tokens.insert(
-                    tokens.end(),
-                    seed_tokens.begin(),
-                    seed_tokens.begin() + static_cast<std::ptrdiff_t>(take));
-            }
-            return tokens;
+            const size_t target = std::min(seed_tokens.size(), max_allowed);
+            return std::vector<int>(
+                seed_tokens.begin(),
+                seed_tokens.begin() + static_cast<std::ptrdiff_t>(target));
         }
 
         virtual bool executeActiveParityForward(

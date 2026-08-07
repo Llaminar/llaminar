@@ -109,9 +109,13 @@ explicit target).
 
 ## Profiler attachment and privilege rules
 
-- Use `/usr/local/cuda/bin/nsys` for launch order and timeline diagnosis, then
-  `/usr/local/cuda/bin/ncu` for one targeted launch. Do not start by replaying
-  every kernel through Nsight Compute.
+- Resolve Nsight Systems with `command -v nsys`; the devcontainer package
+  installs it as `/usr/local/bin/nsys`, independently of the CUDA toolkit.
+  Nsight Compute remains `/usr/local/cuda/bin/ncu`.
+- Run both tools through `sudo -E` on hosts where
+  `/proc/driver/nvidia/params` reports `RmProfilingAdminOnly: 1`. An
+  unprivileged `nsys` launch can appear successful while collecting only CUDA
+  graph-construction metadata and no executed kernels.
 - Preserve `LLAMINAR_*` variables across privilege escalation with `sudo -E`,
   or pass the exact variables after `sudo`. Ordinary `sudo` strips them.
 - Pass `--no-mpi-bootstrap` only when profiling or debugging `llaminar2`
@@ -122,6 +126,45 @@ explicit target).
 - Write `.nsys-rep` and `.ncu-rep` artifacts under `/tmp` or another explicit
   result directory, not in the repository.
 
+### Prove profiler attachment before a model run
+
+Do not spend a model load on an unproven profiler setup. First profile a focused
+integration test that executes one eager launch and one captured replay:
+
+```bash
+sudo -E "$(command -v nsys)" profile \
+  --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=node --force-overwrite=true \
+  --output=/tmp/llaminar-nsys-cuda-smoke \
+  ./build_v2_integration/tests/v2/v2_integration_cuda_moe_kernel \
+  --gtest_filter=Test__CUDAMoEKernel.RouteWithTensorsTiledPrefillCapturesAfterWarmup
+
+"$(command -v nsys)" stats --report cuda_gpu_kern_sum,cuda_api_sum \
+  /tmp/llaminar-nsys-cuda-smoke.nsys-rep
+```
+
+The smoke report must contain a `CUDA GPU Kernel Summary`, including both
+launch instances from the focused test. A report containing
+`CUDA_GRAPH_NODE_EVENTS` or `CUDA_GRAPH_EVENTS` but no
+`CUPTI_ACTIVITY_KIND_KERNEL` is **not** an execution trace. Its diagnostics
+normally say `CUDA profiling might have not been started correctly` or report
+only graph-node creation. Check privilege first.
+
+CUDA 13 conditional/device-loop graphs expose a second tool boundary on Ampere:
+the tested Nsight Systems 2025.3 and 2026.1 releases can collect ordinary eager
+and simple captured graphs yet omit all activities from Llaminar's complete
+production conditional graph. Confirm this by comparing the smoke test with the
+real graph report; never disable production graph execution and present the
+eager timeline as production evidence. Use targeted Nsight Compute node
+profiling below for the real graph.
+
+Do not defer `ncu` attachment with `--profile-from-start off` or a late
+`cudaProfilerStart()` range for this graph topology. That technique profiles a
+simple already-instantiated graph, but the tested Llaminar conditional graph
+exposes no inner kernel nodes when profiling begins after graph construction.
+Keep NCU active from process start and use its graph-node kernel filter to
+select one production launch.
+
 ---
 
 ## Step 2: Timeline sanity check with `nsys`
@@ -130,12 +173,12 @@ Use `nsys` to confirm the kernel of interest dominates and to see launch counts 
 
 ```bash
 # --no-mpi-bootstrap is REQUIRED so the profiler attaches to llaminar2, not the mpirun wrapper
-sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true -o /tmp/trace -f true \
+sudo -E "$(command -v nsys)" profile -t cuda --stats=true -o /tmp/trace -f true \
   ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 \
   -m <model>.gguf -p "test" -n 10
 
 # Per-kernel summary (gives the launch order needed for ncu --launch-skip)
-/usr/local/cuda/bin/nsys stats --report cuda_gpu_kern_sum /tmp/trace.nsys-rep
+"$(command -v nsys)" stats --report cuda_gpu_kern_sum /tmp/trace.nsys-rep
 ```
 
 `nsys` also tells you the kernel's mangled name and how many times it launches — both
@@ -144,6 +187,64 @@ needed to target `ncu` precisely.
 > `--no-mpi-bootstrap` is ONLY for profiler/debugger attach (`ncu`/`nsys`/`gdb`/`perf`).
 > It disables NUMA-aware thread pinning, so it gives misleading *performance* numbers —
 > never use it for benchmarks or production.
+
+### Inventory durations inside the complete production graph with NCU
+
+Conditional/device-loop graphs on Ampere may be invisible to Nsight Systems
+even when a simple graph smoke is visible. Use this proven one-counter NCU
+transaction to enumerate the real production graph before selecting a deep
+profile. The critical details are: attach to `llaminar2` directly with
+`--no-mpi-bootstrap`, keep profiling active from process start, request graph
+**node** profiling, use application replay, and filter out model-load kernels
+so the launch budget reaches captured inference:
+
+```bash
+RUNTIME_KERNELS='regex:(buildGrouped|build_active|count_per|cuda_attention|cuda_derive_attention|cuda_gated|cuda_gdn|cuda_q_gate|cuda_short_conv1d|exclusive_scan|float_to_int|fp32_|grouped_|quantize_activations|router_gate|scatter_tokens|shared_expert|softmax_topk|embedding_lookup|fused_|mtpConcat|requestTerminal|cuda_kv|residual_add|rmsnorm|rope_|flash_attention|nativeVnniTC|route_logits|shiftedMTP|ring_append|ring_gather)'
+
+sudo -E /usr/local/cuda/bin/ncu \
+  --target-processes all \
+  --replay-mode application \
+  --graph-profiling node \
+  --kernel-name-base demangled \
+  --kernel-name "$RUNTIME_KERNELS" \
+  --launch-count 1200 \
+  --metrics gpu__time_duration.sum \
+  --clock-control none \
+  --force-overwrite \
+  --export /tmp/llaminar-production-node-duration \
+  ./build_v2_release/llaminar2 benchmark --no-mpi-bootstrap \
+    -m <model.gguf> -d cuda:0 \
+    --prompt-file <fixed-prompt.txt> \
+    --seed <seed> --temperature <temperature> \
+    --mtp --mtp-draft-tokens <depth> \
+    --mtp-depth-policy fixed \
+    --mtp-verify-mode speculative-sampling \
+    <remaining-exact-release-arguments>
+
+/usr/local/cuda/bin/ncu \
+  --import /tmp/llaminar-production-node-duration.ncu-rep \
+  --page raw --csv \
+  > /tmp/llaminar-production-node-duration.csv
+
+# Recover the exact profiler command and target provenance from any report.
+/usr/local/cuda/bin/ncu \
+  --import /tmp/llaminar-production-node-duration.ncu-rep \
+  --page session --csv
+```
+
+Choose `--launch-count` above the expected runtime-node count, then verify the
+CSV reached the terminal graph kernels rather than silently truncating at the
+budget. Sum `gpu__time_duration.sum` by exact demangled kernel name and retain
+call counts plus grid/block geometry; aggregate names without geometry can
+hide one pathological shape behind many cheap launches. This first pass uses
+one metric and is for attribution only. It does not replace warmed unprofiled
+Release timing, and it does not certify occupancy or spills.
+
+If NCU prints `No kernels were profiled`, first run the profiler-attachment
+smoke above, then inspect the report's `Available Kernels`. Do not switch to
+eager execution, segmented graphs, late `cudaProfilerStart()`, or a host-side
+surrogate to make the profiler easier to use; those are different execution
+paths.
 
 ---
 
@@ -174,6 +275,48 @@ sudo /usr/local/cuda/bin/ncu -i /tmp/k_ncu.ncu-rep --page details
 # Inspect the sections supported by the installed Nsight version
 /usr/local/cuda/bin/ncu --list-sections
 ```
+
+### Profile a node inside the real captured graph
+
+`ncu` has a graph-node profiler independent of the Nsight Systems timeline.
+Use it when the Systems version cannot expand Llaminar's conditional graph:
+
+```bash
+sudo -E /usr/local/cuda/bin/ncu \
+  --target-processes all --graph-profiling node \
+  --kernel-name-base demangled \
+  --kernel-name 'regex:<unique-production-kernel-substring>' \
+  --launch-count 1 \
+  --section LaunchStats --section Occupancy --section SpeedOfLight \
+  --section MemoryWorkloadAnalysis \
+  --clock-control none --force-overwrite \
+  --export /tmp/llaminar-real-node \
+  ./build_v2_release/llaminar2 benchmark --no-mpi-bootstrap <exact-release-args>
+
+sudo /usr/local/cuda/bin/ncu \
+  --import /tmp/llaminar-real-node.ncu-rep \
+  --page details --print-details all
+```
+
+Match one unique kernel family and set `--launch-count 1`. Default kernel replay
+backs up device-written memory before each metric pass; with a resident 35B
+model this can take roughly a minute even for one node. Keep the section set
+minimal, or collect a one-pass custom metric list when only spill/vectorization
+proof is needed. Never interpret the profiled duration as canonical latency;
+use the unprofiled Release benchmark for timing.
+
+Kernel families and template winners can change after rebuilding generated
+dispatch. If a selector produces `No kernels were profiled`, read NCU's
+`Available Kernels` list and select the exact current production family. A
+deliberately impossible selector with a one-pass section such as `LaunchStats`
+is a quick inventory probe. Do not carry yesterday's selector into today's
+profile without checking it.
+
+For the Qwen 3.6 35B grouped-prefill path, a proven real-graph selector is
+`regex:groupedImmaProjectionKernel`. `MemoryWorkloadAnalysis` must report zero
+`derived__local_spilling_requests`; `LaunchStats`, `Occupancy`, and
+`SpeedOfLight` supply registers, launch geometry, achieved occupancy, and the
+compute/memory throughput balance.
 
 > 🧹 **MANDATORY CLEANUP after every ncu run** (ncu leaves zombie processes that hold
 > the GPU and corrupt the next run):
@@ -387,11 +530,17 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
 Example resumable CUDA prefill transaction:
 
 ```bash
+# Preflight the complete compiler-resource surface before any long timing run.
+CUDA_VISIBLE_DEVICES=0 \
+LLAMINAR_TILE_RESOURCE_CSV=/tmp/cuda-dense-prefill-resources.csv \
+build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
+  --gtest_filter='CUDANativeVNNIGemmPerf.CompilerResources_AllCodebooksAndCandidates'
+
 PYTHONPATH=tests/v2/performance/kernels python3 -m \
   native_vnni_dispatch.production_dense_prefill_sweep run \
   --backend cuda \
   --output-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill \
-  --binary build_v2_integration/tests/v2/v2_perf_cuda_native_vnni_gemm \
+  --binary build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
   --devices 0,1
 
 PYTHONPATH=tests/v2/performance/kernels python3 -m \
@@ -406,6 +555,16 @@ PYTHONPATH=tests/v2/performance/kernels python3 -m \
   --output src/v2/kernels/cuda/gemm/CUDADenseProductionPrefillOverlayGenerated.inc \
   --summary-csv benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill/overlay.csv
 ```
+
+The resource preflight enumerates every runtime codebook, all six BK64 tiles,
+direct and canonical reduction, and both Q4_0 BK256 arithmetic forms. Its exact
+spill set is a regression. The scorer performs one untimed production-route
+probe for AUTO, queries that exact primary/reducer symbol with
+`cudaFuncGetAttributes`, and rejects nonzero local memory before recording any
+timing event. Aggregate rows carry registers, static/dynamic shared memory,
+actual threads, compiler thread bounds, and active blocks/SM; corpus validation
+authenticates them. Never restore a spilling specialization to the candidate
+inventory merely because an older timing row was fast.
 
 After updating a checked-in generated include, rerun the focused CUDA GEMM route
 regression for the affected shape and the relevant Qwen3.6 CUDA parity cells.

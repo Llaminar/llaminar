@@ -1634,21 +1634,6 @@ namespace llaminar2
         result.prefill_tokens = token_count;
 
         const bool has_gpu = runner_->primaryDeviceId().is_gpu();
-        const auto &execution_env = debugEnv().execution;
-        if (has_gpu &&
-            execution_env.gpu_graphs &&
-            execution_env.prefill_graph_required &&
-            token_count < execution_env.prefill_graph_min_seq)
-        {
-            last_failure_reason_ =
-                "benchmark prompt has " + std::to_string(token_count) +
-                " tokens, below the required prefill graph admission minimum of " +
-                std::to_string(execution_env.prefill_graph_min_seq) +
-                "; provide a prompt with at least that many tokens";
-            if (mpi_ctx_->rank() == 0)
-                LOG_ERROR(last_failure_reason_);
-            return capture_and_return();
-        }
 
         if (config.max_seq_len > 0 && token_count > config.max_seq_len)
         {
@@ -1956,6 +1941,8 @@ namespace llaminar2
                 {"forward_graph", "prefill_graph_phase"},
                 {"forward_graph", "decode_graph_phase"},
                 {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
+                {"kernel", "cuda_moe_grouped_prefill_active_expert_grid_calls"},
+                {"kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"},
             });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
@@ -2085,7 +2072,6 @@ namespace llaminar2
                 }
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
-
             if (mpi_ctx_->rank() == 0)
             {
                 LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"

@@ -13,6 +13,7 @@
 #include <cuda/std/__cccl/assert.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
@@ -15666,9 +15667,79 @@ namespace
                 continue;
             const float weight = grouped_weights[grouped_slot];
             const float value = expert_output[static_cast<size_t>(grouped_slot) * d_model + col];
-            sum += weight * value;
+            sum = moe_accumulate_rn(
+                sum,
+                moe_weight_route_rn(weight, value));
         }
         output[static_cast<size_t>(token) * d_model + col] = sum;
+    }
+
+    /**
+     * @brief Fold already-weighted grouped rows in original router order.
+     *
+     * The grouped IMMA down projection applies a route weight independently to
+     * every public-M1 K partition before reducing those partitions. Its output
+     * is therefore the complete serial route contribution and must not be
+     * multiplied a second time during token publication.
+     */
+    __global__ void grouped_prefill_scatter_contributions_ordered_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ grouped_contributions,
+        const int *__restrict__ original_to_grouped,
+        int seq_len,
+        int top_k,
+        int d_model)
+    {
+        constexpr int kTileN = 64;
+        const int col = blockIdx.x * kTileN + threadIdx.x;
+        const int token = logical_row_from_grid_yz();
+        if (token >= seq_len || col >= d_model)
+            return;
+
+        float sum = 0.0f;
+#pragma unroll 1
+        for (int route = 0; route < top_k; ++route)
+        {
+            const int grouped_slot =
+                original_to_grouped[token * top_k + route];
+            if (grouped_slot >= 0)
+            {
+                sum = moe_accumulate_rn(
+                    sum,
+                    grouped_contributions[
+                        static_cast<size_t>(grouped_slot) * d_model + col]);
+            }
+        }
+        output[static_cast<size_t>(token) * d_model + col] = sum;
+    }
+
+    /**
+     * @brief Publish already-weighted grouped rows into canonical route slots.
+     *
+     * Missing/non-local routes overwrite their complete slot with zero. The
+     * later collective and canonical reducer therefore observe the same route
+     * dimension and FP32 order as serial decode on every participant.
+     */
+    __global__ void grouped_prefill_scatter_contributions_canonical_kernel(
+        float *__restrict__ route_output,
+        const float *__restrict__ grouped_contributions,
+        const int *__restrict__ original_to_grouped,
+        int total_slots,
+        int d_model)
+    {
+        constexpr int kTileN = 64;
+        const int col = blockIdx.x * kTileN + threadIdx.x;
+        const int original_slot = logical_row_from_grid_yz();
+        if (original_slot >= total_slots || col >= d_model)
+            return;
+
+        const int grouped_slot = original_to_grouped[original_slot];
+        route_output[
+            static_cast<size_t>(original_slot) * d_model + col] =
+            grouped_slot >= 0
+                ? grouped_contributions[
+                      static_cast<size_t>(grouped_slot) * d_model + col]
+                : 0.0f;
     }
 
     /**
@@ -19826,6 +19897,8 @@ extern "C"
         const DeviceNativeVNNIMatrixDesc *d_down_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
+        uint32_t *d_group_work_directory,
+        int group_work_directory_entries,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
@@ -19859,6 +19932,8 @@ extern "C"
         int gateup_ordered_tile_n,
         int down_k_partitions,
         int splitk_tile_rows,
+        llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine
+            projection_engine,
         int device_idx,
         void *stream)
     {
@@ -19876,6 +19951,22 @@ extern "C"
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
             return false;
         }
+        using GroupedProjectionEngine =
+            llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine;
+        const bool use_grouped_imma =
+            projection_engine ==
+            GroupedProjectionEngine::TensorCoreImmaPrefill;
+        if (projection_engine !=
+                GroupedProjectionEngine::OrderedDp4aVerifier &&
+            !use_grouped_imma)
+        {
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!d_group_work_directory || group_work_directory_entries <= 0))
+        {
+            return false;
+        }
         const bool use_active_expert_grid = active_expert_slots > 0;
         const bool valid_gateup_k_partitions =
             gateup_k_partitions ==
@@ -19885,7 +19976,7 @@ extern "C"
             gateup_ordered_tile_n >= 64 && gateup_ordered_tile_n <= 256 &&
             (gateup_ordered_tile_n % 32) == 0;
         const bool use_gateup_kpart =
-            use_active_expert_grid && gateup_kpart_requested &&
+            !use_grouped_imma && use_active_expert_grid && gateup_kpart_requested &&
             valid_gateup_k_partitions && d_gate_partials && d_up_partials &&
             d_original_to_grouped && d_original_expert_ids;
         const bool valid_down_k_partitions =
@@ -19895,7 +19986,7 @@ extern "C"
         const bool canonical_publication =
             d_canonical_route_contributions != nullptr;
         const bool use_ordered_down_kpart =
-            use_active_expert_grid && down_kpart_requested &&
+            !use_grouped_imma && use_active_expert_grid && down_kpart_requested &&
             d_original_to_grouped &&
             d_original_expert_ids &&
             (!canonical_publication || d_down_partials) &&
@@ -19909,16 +20000,34 @@ extern "C"
             return false;
         if ((use_gateup_kpart || use_ordered_down_kpart) && splitk_tile_rows <= 0)
             return false;
+        if (use_grouped_imma &&
+            (gateup_kpart_requested || down_kpart_requested))
+        {
+            return false;
+        }
         if (use_active_expert_grid &&
             (!d_active_expert_ids ||
              active_expert_slots > total_slots ||
              active_expert_slots > num_experts))
+            return false;
+        if (use_grouped_imma && use_active_expert_grid &&
+            !d_original_to_grouped)
             return false;
         const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
         const int seq_len = total_slots / top_k;
         if (cudaSetDevice(device_idx) != cudaSuccess)
             return false;
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        /*
+         * A rank with no local routes has already received an overwrite-only
+         * zero publication from its owner. No projection is semantically live,
+         * so capturing empty rectangular GEMMs would only burn replay time and
+         * expose stale scratch. This is an explicit no-work state, not another
+         * execution implementation.
+         */
+        if (!use_active_expert_grid)
+            return true;
 
         {
             // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
@@ -19939,7 +20048,51 @@ extern "C"
                 return false;
         }
 
-        if (use_gateup_kpart)
+        if (use_grouped_imma)
+        {
+            if (!cudaMoEGroupedImma_buildDirectory(
+                    d_group_counts,
+                    d_group_work_directory,
+                    num_experts,
+                    total_slots,
+                    group_work_directory_entries,
+                    device_idx,
+                    stream))
+            {
+                return false;
+            }
+
+            const auto *gate_descriptors = reinterpret_cast<
+                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                    d_gate_desc_table);
+            const auto *up_descriptors = reinterpret_cast<
+                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                    d_up_desc_table);
+            if (!cudaMoEGroupedImma_projectGateUpSwiGlu(
+                    d_scratch_A_int8,
+                    d_scratch_scales,
+                    gate_descriptors,
+                    up_descriptors,
+                    d_group_counts,
+                    d_group_offsets,
+                    d_group_work_directory,
+                    d_scratch_swiglu_int8,
+                    d_scratch_swiglu_scales,
+                    group_work_directory_entries,
+                    num_experts,
+                    total_slots,
+                    intermediate,
+                    d_model,
+                    gateup_codebook_mask,
+                    llaminar2::CUDAMoEBatchInvariantPolicy::
+                        gate_up_k_partitions,
+                    device_idx,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (use_gateup_kpart)
         {
             const int kTileN = gateup_ordered_tile_n;
             constexpr int kReduceTileN = 32;
@@ -20107,9 +20260,13 @@ extern "C"
 #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
         }
 
-        // Separate SwiGLU + blockwise-quant pass. Skipped when fusion is enabled — the fused
-        // gate/up kernel already produced d_scratch_swiglu_int8 / d_scratch_swiglu_scales.
-        if (!use_gateup_kpart && !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
+        // Separate SwiGLU + blockwise-quant pass. Both grouped-IMMA and the
+        // direct fused gate/up kernel publish d_scratch_swiglu_int8/scales in
+        // their epilogues, so only the unfused ordered-DP4A geometry enters
+        // this launch.
+        if (!use_grouped_imma &&
+            !use_gateup_kpart &&
+            !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
         {
             const dim3 grid = make_row_major_grid(
                 static_cast<unsigned int>(intermediate / 32),
@@ -20123,7 +20280,35 @@ extern "C"
                 return false;
         }
 
-        if (use_ordered_down_kpart)
+        if (use_grouped_imma)
+        {
+            const auto *down_descriptors = reinterpret_cast<
+                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                    d_down_desc_table);
+            if (!cudaMoEGroupedImma_project(
+                    d_scratch_swiglu_int8,
+                    d_scratch_swiglu_scales,
+                    down_descriptors,
+                    d_group_counts,
+                    d_group_offsets,
+                    d_group_work_directory,
+                    d_group_weights,
+                    d_scratch_down_out,
+                    group_work_directory_entries,
+                    num_experts,
+                    total_slots,
+                    d_model,
+                    intermediate,
+                    down_codebook_mask,
+                    llaminar2::CUDAMoEBatchInvariantPolicy::
+                        down_k_partitions,
+                    device_idx,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (use_ordered_down_kpart)
         {
             const int kScatterTileN =
                 llaminar2::debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n;
@@ -20322,7 +20507,53 @@ extern "C"
 #undef LAUNCH_GROUPED_DOWN_PREFILL_TM
         }
 
-        if (!use_ordered_down_kpart)
+        if (use_grouped_imma)
+        {
+            constexpr int kTileN = 64;
+            dim3 block(kTileN);
+            if (canonical_publication)
+            {
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(
+                        (d_model + kTileN - 1) / kTileN),
+                    total_slots);
+                grouped_prefill_scatter_contributions_canonical_kernel<<<
+                    grid,
+                    block,
+                    0,
+                    cuda_stream>>>(
+                    d_canonical_route_contributions,
+                    d_scratch_down_out,
+                    d_original_to_grouped,
+                    total_slots,
+                    d_model);
+            }
+            else
+            {
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(
+                        (d_model + kTileN - 1) / kTileN),
+                    seq_len);
+                grouped_prefill_scatter_contributions_ordered_kernel<<<
+                    grid,
+                    block,
+                    0,
+                    cuda_stream>>>(
+                    d_output,
+                    d_scratch_down_out,
+                    d_original_to_grouped,
+                    seq_len,
+                    top_k,
+                    d_model);
+            }
+            if (!finishGroupedPrefillLaunch(
+                    "cudaMoE_grouped_imma_scatter_prefill",
+                    cuda_stream))
+            {
+                return false;
+            }
+        }
+        else if (!use_ordered_down_kpart)
         {
             constexpr int kTileN = 64;
             dim3 block(kTileN);

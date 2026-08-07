@@ -1,3 +1,14 @@
+/**
+ * @file PrefixStateCache.h
+ * @brief Tier-aware prefix-block index, lookup, and LRU ownership contracts.
+ *
+ * Prefix blocks are keyed by model/runtime fingerprint, parent block, token
+ * bytes, and logical position. The cache owns metadata and tier residency;
+ * returned handles retain shared payload ownership so asynchronous consumers
+ * do not hold a contended cache lease. Lookup APIs also understand terminal
+ * partial blocks, which are important for multi-turn prompts whose previous
+ * request boundary falls inside the next request's full cache block.
+ */
 #pragma once
 
 #include "execution/prefix_cache/PrefixCacheStats.h"
@@ -90,12 +101,62 @@ namespace llaminar2
             PrefixBlockHandle device_hot_handle,
             bool repromotion);
         std::optional<PrefixBlockHandle> find(const PrefixCacheKey &key);
+
+        /**
+         * @brief Find the longest installed token prefix of one logical block.
+         *
+         * A previous request can end partway through a cache block. Its
+         * terminal block then owns the exact recurrent/hybrid state required
+         * to continue a later, longer request, but its key hashes fewer tokens
+         * than the later request's full block. This method probes candidate
+         * widths from longest to shortest without charging every metadata
+         * probe as a cache miss, then performs one ordinary find() so tier
+         * hydration, LRU touch, and request statistics remain canonical.
+         *
+         * @param fingerprint Runtime/model fingerprint shared by all candidates.
+         * @param parent_hash Stable hash of the preceding matched block.
+         * @param block_index Logical block index within the token sequence.
+         * @param token_start Logical token offset of this block.
+         * @param tokens Current request's tokens for this block.
+         * @return The longest installed handle, or std::nullopt when no token
+         *         prefix is installed or the selected tier record cannot load.
+         */
+        std::optional<PrefixBlockHandle> findLongestTokenPrefix(
+            uint64_t fingerprint,
+            uint64_t parent_hash,
+            int block_index,
+            int token_start,
+            const std::vector<int32_t> &tokens);
+
         bool contains(const PrefixCacheKey &key) const;
         bool retain(const PrefixCacheKey &key);
         bool release(const PrefixCacheKey &key);
         bool erase(const PrefixCacheKey &key);
         bool clear();
-        bool reserveRam(size_t incoming_bytes);
+
+        /**
+         * @brief Reserve RAM for a newly archived block and retire an old key.
+         *
+         * Terminal harvest can enrich an existing nonterminal block with
+         * recurrent, MTP, and terminal-state payloads under the same token key.
+         * The RAM backend accounts allocations by key, so allocating the new
+         * payload before retiring every old tier copy would alias accounting and
+         * could later resurrect a stale disk record. This method establishes the
+         * required replacement boundary before the caller allocates storage.
+         *
+         * The operation rejects retained resident entries. On success no cache
+         * tier contains @p key and enough cache-managed RAM capacity is available
+         * for @p incoming_bytes. A later allocation or copy failure simply leaves
+         * the key absent; stale payloads are never restored as a fallback.
+         *
+         * @param key Key that the new archive will publish.
+         * @param incoming_bytes Total RAM bytes required by the new archive.
+         * @return true when replacement and capacity preparation both succeed.
+         */
+        bool prepareInsert(
+            const PrefixCacheKey &key,
+            size_t incoming_bytes);
+
         void recordRequestLookup(int requested_tokens,
                                  int matched_tokens,
                                  int matched_blocks);

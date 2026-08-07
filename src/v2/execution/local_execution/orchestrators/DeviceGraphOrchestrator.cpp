@@ -5403,6 +5403,32 @@ namespace llaminar2
                 std::make_unique<MTPSidecarGraphCache>());
         }
 
+        /*
+         * Every MTP graph, including the ordinary CPU executable graph, binds
+         * PREFIX_TERMINAL_HIDDEN by address.  Reserve the largest configured
+         * publication shape before any graph is built so a later transition
+         * from scalar decode to grouped verification cannot replace that
+         * address underneath an already-cached stage.
+         */
+        if (config.mtp.enabled)
+        {
+            const size_t terminal_hidden_row_capacity =
+                static_cast<size_t>(
+                    resolveMTPTerminalHiddenRowCapacity(
+                        state_.batch_size,
+                        config.mtp));
+            if (!arena_->registerBuffer(
+                    BufferId::PREFIX_TERMINAL_HIDDEN,
+                    terminal_hidden_row_capacity,
+                    static_cast<size_t>(config.d_model),
+                    "FP32",
+                    state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register the persistent MTP terminal-hidden archive");
+                return false;
+            }
+        }
+
         if (state_.device_id.is_gpu())
         {
             /*
@@ -5419,28 +5445,12 @@ namespace llaminar2
                     {1,
                      state_.batch_size,
                      config.mtp.max_request_batch}));
-            const size_t terminal_hidden_row_capacity =
-                static_cast<size_t>(
-                    resolveMTPTerminalHiddenRowCapacity(
-                        state_.batch_size,
-                        config.mtp));
             request_batch_geometry_layout_ =
                 DeviceRequestBatchGeometryLayout(
                     static_cast<int>(request_length_capacity));
             if (!request_batch_geometry_layout_.valid())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to declare persistent request-batch geometry layout");
-                return false;
-            }
-            if (config.mtp.enabled &&
-                !arena_->registerBuffer(
-                    BufferId::PREFIX_TERMINAL_HIDDEN,
-                    terminal_hidden_row_capacity,
-                    static_cast<size_t>(config.d_model),
-                    "FP32",
-                    state_.device_id))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register the persistent GPU MTP terminal-hidden archive");
                 return false;
             }
             /*
@@ -5857,6 +5867,58 @@ namespace llaminar2
         logOrchestratorVramTrace(state_.device_id, "arena.after_allocate");
 
         /*
+         * Resolve the capacity-complete terminal-hidden owner immediately
+         * after arena allocation.  CPU stages retain host addresses just as
+         * captured GPU nodes retain device addresses, so both backends obey
+         * the same immutable-owner lifetime even though only GPU needs an
+         * explicit device-storage allocation here.
+         */
+        if (graph_builder_->config().mtp.enabled)
+        {
+            if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP requires an arena-owned terminal-hidden archive");
+                return false;
+            }
+            if (state_.device_id.is_gpu() &&
+                !arena_->allocateDeviceStorage(
+                    BufferId::PREFIX_TERMINAL_HIDDEN,
+                    state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to reserve device storage for the MTP terminal-hidden archive");
+                return false;
+            }
+
+            state_.prefix_terminal_hidden =
+                arena_->getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN);
+            const auto terminal_hidden_device =
+                state_.prefix_terminal_hidden
+                    ? state_.prefix_terminal_hidden->current_device()
+                    : std::optional<DeviceId>{};
+            const bool storage_ready =
+                state_.prefix_terminal_hidden &&
+                (state_.device_id.is_gpu()
+                     ? state_.prefix_terminal_hidden->gpu_data_ptr() != nullptr &&
+                           terminal_hidden_device.has_value() &&
+                           *terminal_hidden_device == state_.device_id
+                     : state_.prefix_terminal_hidden->raw_data() != nullptr);
+            if (!storage_ready ||
+                state_.prefix_terminal_hidden->isMapped() ||
+                state_.prefix_terminal_hidden->rows() <
+                    static_cast<size_t>(
+                        resolveMTPTerminalHiddenRowCapacity(
+                            state_.batch_size,
+                            graph_builder_->config().mtp)) ||
+                state_.prefix_terminal_hidden->cols() <
+                    static_cast<size_t>(state_.d_model))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve the persistent MTP terminal-hidden archive");
+                return false;
+            }
+            state_.mtp_terminal_hidden_current = false;
+        }
+
+        /*
          * Typed GPU MTP graphs bind every scratch address before graph
          * construction starts. Materialize the complete schema-owned family
          * while allocation is still legal so main prefill, grouped verifier,
@@ -5934,44 +5996,6 @@ namespace llaminar2
                 return false;
             }
 
-            /*
-             * Terminal hidden rows participate in both the main-prefill graph
-             * and every later MTP transaction. Their address is therefore part
-             * of graph identity, not a sidecar scratch detail. Resolve the
-             * schema-sized arena owner before any graph can be constructed and
-             * retain that one owner for the complete orchestrator lifetime.
-             */
-            if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP requires an arena-owned terminal-hidden archive");
-                return false;
-            }
-            arena_->allocateDeviceStorage(
-                BufferId::PREFIX_TERMINAL_HIDDEN,
-                state_.device_id);
-            state_.prefix_terminal_hidden =
-                arena_->getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN);
-            const auto terminal_hidden_device =
-                state_.prefix_terminal_hidden
-                    ? state_.prefix_terminal_hidden->current_device()
-                    : std::optional<DeviceId>{};
-            if (!state_.prefix_terminal_hidden ||
-                state_.prefix_terminal_hidden->isMapped() ||
-                !state_.prefix_terminal_hidden->gpu_data_ptr() ||
-                !terminal_hidden_device.has_value() ||
-                *terminal_hidden_device != state_.device_id ||
-                state_.prefix_terminal_hidden->rows() <
-                    static_cast<size_t>(
-                        resolveMTPTerminalHiddenRowCapacity(
-                            state_.batch_size,
-                            graph_builder_->config().mtp)) ||
-                state_.prefix_terminal_hidden->cols() <
-                    static_cast<size_t>(state_.d_model))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve the persistent device-local MTP terminal-hidden archive");
-                return false;
-            }
-            state_.mtp_terminal_hidden_current = false;
         }
 
         /*
@@ -7093,6 +7117,21 @@ namespace llaminar2
             }
             return false;
         }
+        /*
+         * Expert maintenance is a decode-transaction operation, not a raw
+         * forward epilogue.  In particular, an MTP grouped verifier forward is
+         * followed by accepted-state publication or rollback.  Moving experts
+         * here would race that publication, while requiring seq_len == 1 here
+         * silently omits maintenance for the grouped-only MTP path.  The
+         * orchestration boundary calls maybeApplyDecodeBoundaryMaintenance()
+         * after the complete decode transaction instead.
+         */
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::commitSuccessfulForwardOutput(
+        const ForwardOutput &output)
+    {
         if (mtp_verifier_outcome_graph_mode_ !=
             MTPVerifierOutcomeGraphMode::Disabled)
         {
@@ -7118,17 +7157,6 @@ namespace llaminar2
                 "Successful GPU forward could not publish its durable "
                 "ForwardGraphOutputReady dependency");
         }
-
-        /*
-         * Expert maintenance is a decode-transaction operation, not a raw
-         * forward epilogue.  In particular, an MTP grouped verifier forward is
-         * followed by accepted-state publication or rollback.  Moving experts
-         * here would race that publication, while requiring seq_len == 1 here
-         * silently omits maintenance for the grouped-only MTP path.  The
-         * orchestration boundary calls maybeApplyDecodeBoundaryMaintenance()
-         * after the complete decode transaction instead.
-         */
-        return true;
     }
 
     bool DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()
@@ -11705,6 +11733,21 @@ namespace llaminar2
                    /*force_prefill_phase=*/true) != nullptr;
     }
 
+    bool DeviceGraphOrchestrator::forwardGroupedMTPVerifierWithHostTokenIds(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        if (!state_.device_id.is_cpu())
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Host-token grouped MTP verification "
+                "is CPU-only; GPU callers must publish a device-resident token row");
+            return false;
+        }
+        return forwardHostTokenBatchImpl(
+            token_batches,
+            ForwardExecutionRole::GroupedMTPVerifier);
+    }
+
     bool DeviceGraphOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds(
         const int *token_shadow,
         const void *token_ids_device,
@@ -13326,7 +13369,6 @@ namespace llaminar2
             !cache_config_.enabled ||
             !env.gpu_graphs ||
             !env.prefill_graph_buckets ||
-            seq_len < env.prefill_graph_min_seq ||
             pp_stage_config_.has_value() ||
             (pipeline_config_ && pipeline_config_->hasPP()) ||
             compute_all_position_logits_)
@@ -13562,7 +13604,6 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule execution failed");
             return false;
         }
-
         if (input.rehydrate_prefix_runtime_on_device)
         {
             graph_builder_->completePrefixCacheRuntimeStateDeviceRehydration();
@@ -13646,126 +13687,45 @@ namespace llaminar2
         }
         const int required_rows = std::max(1, min_rows);
 
-        if (state_.device_id.is_gpu())
-        {
-            /*
-             * GPU graph construction may only observe the immutable arena
-             * owner installed during initializeBuffers(). Allocating, resizing,
-             * or rebinding here would change an embedded graph pointer and make
-             * the first request materially different from every replay.
-             */
-            const auto arena_owner =
-                arena_ && arena_->isRegistered(
-                              BufferId::PREFIX_TERMINAL_HIDDEN)
-                    ? arena_->getSharedTensor(
+        /*
+         * CPU executable graphs and GPU captured graphs both retain the raw
+         * mailbox address in their stages.  The owner is therefore fixed at
+         * arena initialization on every backend; runtime resize/rebind would
+         * make an already-cached graph observe freed storage.
+         */
+        const auto arena_owner =
+            arena_ && arena_->isRegistered(
                           BufferId::PREFIX_TERMINAL_HIDDEN)
-                    : std::shared_ptr<TensorBase>{};
-            const auto archive_device =
-                state_.prefix_terminal_hidden
-                    ? state_.prefix_terminal_hidden->current_device()
-                    : std::optional<DeviceId>{};
-            if (!arena_owner ||
-                state_.prefix_terminal_hidden != arena_owner ||
-                state_.prefix_terminal_hidden->rows() <
-                    static_cast<size_t>(required_rows) ||
-                state_.prefix_terminal_hidden->cols() <
-                    static_cast<size_t>(state_.d_model) ||
-                state_.prefix_terminal_hidden->isMapped() ||
-                !state_.prefix_terminal_hidden->gpu_data_ptr() ||
-                !archive_device.has_value() ||
-                *archive_device != state_.device_id)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP terminal-hidden archive was not installed as a capacity-complete arena owner before graph construction"
-                          << " required_rows=" << required_rows
-                          << " d_model=" << state_.d_model);
-                return false;
-            }
-            return true;
-        }
-
-        auto register_with_arena = [&]() -> bool
+                ? arena_->getSharedTensor(
+                      BufferId::PREFIX_TERMINAL_HIDDEN)
+                : std::shared_ptr<TensorBase>{};
+        const auto archive_device =
+            state_.prefix_terminal_hidden
+                ? state_.prefix_terminal_hidden->current_device()
+                : std::optional<DeviceId>{};
+        const bool storage_ready =
+            state_.prefix_terminal_hidden &&
+            (state_.device_id.is_gpu()
+                 ? state_.prefix_terminal_hidden->gpu_data_ptr() != nullptr &&
+                       archive_device.has_value() &&
+                       *archive_device == state_.device_id
+                 : state_.prefix_terminal_hidden->raw_data() != nullptr);
+        if (!arena_owner ||
+            state_.prefix_terminal_hidden != arena_owner ||
+            state_.prefix_terminal_hidden->rows() <
+                static_cast<size_t>(required_rows) ||
+            state_.prefix_terminal_hidden->cols() <
+                static_cast<size_t>(state_.d_model) ||
+            state_.prefix_terminal_hidden->isMapped() ||
+            !storage_ready)
         {
-            if (!arena_)
-                return true;
-            if (arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
-            {
-                if (arena_->getTensor(BufferId::PREFIX_TERMINAL_HIDDEN) == state_.prefix_terminal_hidden.get())
-                {
-                    return true;
-                }
-                if (!arena_->bindExternalBuffer(BufferId::PREFIX_TERMINAL_HIDDEN,
-                                                state_.prefix_terminal_hidden.get()))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to rebind MTP terminal hidden with BufferArena");
-                    return false;
-                }
-                return true;
-            }
-            if (!arena_->registerExternalBuffer(BufferId::PREFIX_TERMINAL_HIDDEN,
-                                                state_.prefix_terminal_hidden.get()))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register MTP terminal hidden with BufferArena");
-                return false;
-            }
-            return true;
-        };
-
-        if (state_.prefix_terminal_hidden)
-        {
-            const auto &shape = state_.prefix_terminal_hidden->shape();
-            if (shape.size() == 2 &&
-                shape[0] >= static_cast<size_t>(required_rows) &&
-                shape[1] >= static_cast<size_t>(state_.d_model))
-            {
-                return register_with_arena();
-            }
-            state_.prefix_terminal_hidden.reset();
-            state_.mtp_terminal_hidden_current = false;
-        }
-
-        if (!tensor_factory_ || state_.d_model <= 0)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot allocate MTP terminal hidden buffer without tensor factory/d_model");
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal-hidden archive was not installed as a capacity-complete immutable arena owner before graph construction"
+                      << " required_rows=" << required_rows
+                      << " d_model=" << state_.d_model
+                      << " device=" << state_.device_id.toString());
             return false;
         }
-
-        auto tensor = tensor_factory_->createFP32(
-            {static_cast<size_t>(required_rows), static_cast<size_t>(state_.d_model)},
-            state_.device_id);
-        if (!tensor)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP terminal hidden buffer");
-            return false;
-        }
-
-        state_.prefix_terminal_hidden = std::shared_ptr<TensorBase>(tensor.release());
-        mtp_terminal_hidden_row_select_cache_.invalidate();
-        mtp_terminal_hidden_rows_select_cache_.invalidate();
-        for (auto &cache :
-             mtp_terminal_hidden_contiguous_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_terminal_hidden_device_accepted_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_terminal_hidden_request_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_shifted_prefill_hidden_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        return register_with_arena();
+        return true;
     }
 
     bool DeviceGraphOrchestrator::executeMTPHiddenRowSelect(
@@ -37132,8 +37092,22 @@ namespace llaminar2
         uint64_t parent_hash = 0;
         for (int block = 0; block < complete_blocks; ++block)
         {
-            PrefixCacheKey key = makePrefixKeyForBlock(tokens, block, parent_hash);
-            auto handle = prefix_cache_->find(key);
+            const PrefixCacheKey requested_key =
+                makePrefixKeyForBlock(tokens, block, parent_hash);
+            const int block_start = block * prefix_layout_.block_size;
+            const int block_end = std::min<int>(
+                block_start + prefix_layout_.block_size,
+                tokens.size());
+            const std::vector<int32_t> requested_block_tokens(
+                tokens.begin() + block_start,
+                tokens.begin() + block_end);
+            auto handle = prefix_cache_->findLongestTokenPrefix(
+                prefix_fingerprint_,
+                parent_hash,
+                block,
+                block_start,
+                requested_block_tokens);
+            const PrefixCacheKey key = handle ? handle->key : requested_key;
             if (!handle || !handle->layout.compatiblePayloadShape(prefix_layout_))
             {
                 PerfStatsCollector::addCounter(
@@ -37163,6 +37137,9 @@ namespace llaminar2
                 break;
             }
 
+            const bool terminal_prefix_match =
+                handle->key.token_count < requested_key.token_count;
+
             PerfStatsCollector::addCounter(
                 "prefix_cache",
                 "block_hits",
@@ -37177,7 +37154,26 @@ namespace llaminar2
                     {"terminal_hidden", handle->has_terminal_hidden ? "true" : "false"},
                     {"includes_mtp_state", handle->layout.includes_mtp_state ? "true" : "false"},
                     {"model_runtime_state", handle->has_model_runtime_state ? "true" : "false"},
+                    {"match_kind", terminal_prefix_match ? "terminal_prefix" : "exact_block"},
                 });
+            if (terminal_prefix_match)
+            {
+                PerfStatsCollector::addCounter(
+                    "prefix_cache",
+                    "terminal_partial_block_prefix_hits",
+                    1.0,
+                    "lookup",
+                    state_.device_id.toString(),
+                    {{"block", std::to_string(block)},
+                     {"cached_tokens", std::to_string(
+                         handle->key.token_start + handle->key.token_count)},
+                     {"cached_block_tokens",
+                      std::to_string(handle->key.token_count)},
+                     {"requested_block_tokens",
+                      std::to_string(requested_key.token_count)},
+                     {"includes_hybrid_state",
+                      handle->has_hybrid_state ? "true" : "false"}});
+            }
             if (prefixCacheTraceEnabled())
             {
                 LOG_INFO("[PREFIX_TRACE] lookup hit device=" << state_.device_id.toString()
@@ -37202,6 +37198,15 @@ namespace llaminar2
             result.has_terminal_hidden = handle->has_terminal_hidden;
             result.has_terminal_logits = handle->has_terminal_logits;
             parent_hash = key.stableHash();
+            if (terminal_prefix_match)
+            {
+                /*
+                 * Tokens after the matched terminal prefix belong to suffix
+                 * prefill. They cannot contribute to a child block key until
+                 * the restored recurrent state has consumed them.
+                 */
+                break;
+            }
         }
 
         while (!result.blocks.empty() &&
@@ -38259,7 +38264,9 @@ namespace llaminar2
         {
             PrefixCacheKey key = makePrefixKeyForBlock(tokens, block, parent_hash);
             parent_hash = key.stableHash();
-            if (prefix_cache_->contains(key))
+            const bool terminal_block =
+                (key.token_start + key.token_count) == prompt_token_count;
+            if (prefix_cache_->contains(key) && !terminal_block)
             {
                 if (prefixCacheTraceEnabled())
                 {
@@ -38270,8 +38277,6 @@ namespace llaminar2
                 continue;
             }
 
-            const bool terminal_block =
-                (key.token_start + key.token_count) == prompt_token_count;
             PrefixPayloadLayout block_layout = prefix_layout_;
             if (!terminal_block)
             {
@@ -38298,10 +38303,12 @@ namespace llaminar2
             const size_t total_block_bytes =
                 block_layout.totalBytes() + model_runtime_state_bytes;
 
-            if (!prefix_cache_->reserveRam(total_block_bytes))
+            if (!prefix_cache_->prepareInsert(key, total_block_bytes))
             {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: RAM reserve rejected block_bytes="
-                          << total_block_bytes);
+                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: "
+                          "cache replacement/capacity preparation rejected key="
+                          << key.toHex()
+                          << " block_bytes=" << total_block_bytes);
                 return false;
             }
 
@@ -48648,22 +48655,57 @@ namespace llaminar2
     // Batch Interface Implementation
     // =========================================================================
 
-    bool DeviceGraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
+    bool DeviceGraphOrchestrator::forward_batch(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        return forwardHostTokenBatchImpl(
+            token_batches,
+            ForwardExecutionRole::MainInference);
+    }
+
+    bool DeviceGraphOrchestrator::forwardHostTokenBatchImpl(
+        const std::vector<std::vector<int>> &token_batches,
+        ForwardExecutionRole execution_role)
     {
         // Enable device-scoped logging for this execution
         ScopedDeviceLog device_log(state_.device_id);
 
+        const bool grouped_mtp_verifier =
+            execution_role == ForwardExecutionRole::GroupedMTPVerifier;
+        if (execution_role != ForwardExecutionRole::MainInference &&
+            !grouped_mtp_verifier)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Host-token batch received an "
+                "unsupported execution role");
+            return false;
+        }
+        if (grouped_mtp_verifier && !state_.device_id.is_cpu())
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Host-token grouped MTP verification "
+                "cannot execute on a GPU");
+            return false;
+        }
+
+        const char *operation = grouped_mtp_verifier
+                                    ? "forwardGroupedMTPVerifierWithHostTokenIds"
+                                    : "forward_batch";
+
         if (token_batches.empty())
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] forward_batch() called with empty batch");
+            LOG_ERROR("[DeviceGraphOrchestrator] " << operation
+                                                    << " called with an empty batch");
             return false;
         }
 
         int batch_size = static_cast<int>(token_batches.size());
         if (batch_size > state_.batch_size)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Batch size " << batch_size
-                                                              << " exceeds initialized batch size " << state_.batch_size);
+            LOG_ERROR("[DeviceGraphOrchestrator] " << operation
+                                                    << " batch size " << batch_size
+                                                    << " exceeds initialized batch size "
+                                                    << state_.batch_size);
             return false;
         }
 
@@ -48672,6 +48714,23 @@ namespace llaminar2
         for (const auto &seq : token_batches)
         {
             max_len = std::max(max_len, static_cast<int>(seq.size()));
+        }
+        if (max_len <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] " << operation
+                                                    << " requires at least one token per batch row");
+            return false;
+        }
+        if (grouped_mtp_verifier &&
+            std::any_of(
+                token_batches.begin(),
+                token_batches.end(),
+                [](const auto &row) { return row.empty(); }))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Grouped MTP verifier batches cannot "
+                "contain an empty request row");
+            return false;
         }
         padded_seq_len_ = max_len;
 
@@ -48691,11 +48750,13 @@ namespace llaminar2
 
         /*
          * Only ordinary request-batched prefill needs synthetic terminal-row
-         * logits. Batched MTP verifier forwards also use forward_batch(), but
-         * they intentionally run with all-position logits enabled and carry
-         * their own verifier row metadata plan.
+         * logits. Grouped MTP verification has its own typed role, keeps
+         * all-position logits enabled, and carries explicit verifier-row
+         * metadata. Role identity, rather than mutable logits mode, keeps the
+         * two graph families disjoint.
          */
         const bool compact_prefill_logits =
+            execution_role == ForwardExecutionRole::MainInference &&
             state_.device_id.is_gpu() &&
             batch_size > 1 &&
             !compute_all_position_logits_;
@@ -48760,7 +48821,7 @@ namespace llaminar2
             /*token_ids_device=*/nullptr,
             padded_seq_len_,
             batch_size,
-            ForwardExecutionRole::MainInference,
+            execution_role,
             /*force_prefill_phase=*/false,
             /*force_decode_phase=*/false,
             /*position_ids_device_override=*/nullptr,
@@ -48782,6 +48843,13 @@ namespace llaminar2
                 request_batched_prefill_logits_row_count_ = 0;
         }
 
+        if (!result)
+        {
+            state_.positions = old_positions;
+            state_.sequence_lengths = old_sequence_lengths;
+            return false;
+        }
+
         // Restore actual request progress after the padded graph execution.
         // This is important for:
         // 1. Proper logits extraction (only extract non-padded logits)
@@ -48799,7 +48867,7 @@ namespace llaminar2
             state_.sequence_lengths[i] = old_len + actual_lengths[i];
         }
 
-        return result != nullptr;
+        return true;
     }
 
     const float *DeviceGraphOrchestrator::getLogits(int seq_idx) const

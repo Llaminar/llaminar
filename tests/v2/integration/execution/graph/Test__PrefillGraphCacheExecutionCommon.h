@@ -693,6 +693,21 @@ namespace
             return true;
         }
 
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &output) override
+        {
+            if (!output.execution.valid || !output.execution.stream ||
+                output.execution.device != device_ ||
+                output.logits != output_tensor_)
+            {
+                throw std::logic_error(
+                    "Prefill graph fixture received an invalid successful-output publication");
+            }
+            ++committed_forward_output_calls;
+            last_committed_logits = output.logits;
+            last_committed_execution = output.execution;
+        }
+
         bool prepareLiveStateForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
@@ -939,6 +954,9 @@ namespace
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
         int sync_logits_calls = 0;
+        int committed_forward_output_calls = 0;
+        TensorBase *last_committed_logits = nullptr;
+        ForwardExecutionProvenance last_committed_execution{};
         int last_workspace_seq_len = -1;
         int last_build_seq_len = 0;
         int last_build_bucket_seq_len = 0;
@@ -1748,7 +1766,10 @@ namespace
      * exactly 256K and the first row beyond it. Every chunk publishes its real
      * row count through resident device metadata, and the production KV append
      * stage must advance by those real rows while the same graph executable is
-     * captured once and replayed for the entire logical request.
+     * captured once and replayed for the entire logical request. The fixture
+     * deliberately retains the production 256-row raw-prompt graph minimum:
+     * the one-row tail is scheduler-admitted into the transaction bucket and
+     * must not be mistaken for an independent short prompt.
      */
     TEST_F(PrefillGraphCacheExecutionTest, LongContext256KPlusTailIsMTotal)
     {
@@ -1756,7 +1777,7 @@ namespace
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4096"},
-            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "256"},
             {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
             {"LLAMINAR_VALIDATE_BUFFERS", "0"},
             {"LLAMINAR_VALIDATE_INPUTS", "0"},
@@ -1930,6 +1951,14 @@ namespace
             schedule,
             output,
             *host_));
+
+        EXPECT_EQ(host_->committed_forward_output_calls, 65)
+            << "Every chunk, including the one-row terminal tail, must publish "
+               "through the same successful-forward boundary used by sampling.";
+        EXPECT_EQ(host_->last_committed_logits, output.logits);
+        EXPECT_TRUE(host_->last_committed_execution.valid);
+        EXPECT_EQ(host_->last_committed_execution.graph_seq_len,
+                  kLargeBucketSeqLen);
 
         ASSERT_TRUE(output.execution.valid);
         ASSERT_EQ(output.execution.device, device_);
@@ -2418,13 +2447,14 @@ namespace
             << " capture_replay_diff=" << capture_replay_diff;
     }
 
-    TEST_F(PrefillGraphCacheExecutionTest, ServerStyleRawExecuteReusesPaddedBucketAcrossRealLengths)
+    TEST_F(PrefillGraphCacheExecutionTest, ServerStyleShortRawExecuteUsesMinimumBucketAndReusesAcrossRealLengths)
     {
+        constexpr int kMinimumPhysicalBucket = 256;
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
-            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
-            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "256"},
             {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
             {"LLAMINAR_VALIDATE_BUFFERS", "0"},
             {"LLAMINAR_VALIDATE_INPUTS", "0"},
@@ -2457,16 +2487,16 @@ namespace
         ForwardOutput output;
         const auto signature = bucketedPrefillSignature(
             device_,
-            kExactBucketSeqLen,
+            kMinimumPhysicalBucket,
             /*moe_placement_epoch=*/0,
             /*uses_device_sequence_lengths=*/true);
-        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+        const auto key = prefillGraphKey(device_, kMinimumPhysicalBucket);
 
         ASSERT_TRUE(executeResidentPrefill(input61, output));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_build_seq_len, kMinimumPhysicalBucket);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
-        EXPECT_EQ(host_->last_build_bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_build_bucket_seq_len, kMinimumPhysicalBucket);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
         EXPECT_EQ(
@@ -2527,6 +2557,7 @@ namespace
 
     TEST_F(PrefillGraphCacheExecutionTest, CrossBucketEvictionRecapturesEligibleBucket)
     {
+        constexpr int kEvictionBucketSeqLen = 128;
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
@@ -2546,11 +2577,11 @@ namespace
         input64.seq_len = kExactBucketSeqLen;
         input64.device = device_;
 
-        auto tokens128 = makeSequentialInts(kLargeBucketSeqLen, 8000);
+        auto tokens128 = makeSequentialInts(kEvictionBucketSeqLen, 8000);
         ForwardInput input128;
         input128.token_ids = tokens128.data();
         input128.batch_size = 1;
-        input128.seq_len = kLargeBucketSeqLen;
+        input128.seq_len = kEvictionBucketSeqLen;
         input128.device = device_;
 
         const auto plan64 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
@@ -2567,13 +2598,13 @@ namespace
             kPadTokenId,
             /*allow_padded_execution=*/false);
         ASSERT_TRUE(plan128) << plan128.error;
-        ASSERT_EQ(plan128.chunk.bucket_seq_len, kLargeBucketSeqLen);
+        ASSERT_EQ(plan128.chunk.bucket_seq_len, kEvictionBucketSeqLen);
 
         ForwardOutput output;
         const auto signature64 = bucketedPrefillSignature(device_, kExactBucketSeqLen);
         const auto key64 = prefillGraphKey(device_, kExactBucketSeqLen);
-        const auto signature128 = bucketedPrefillSignature(device_, kLargeBucketSeqLen);
-        const auto key128 = prefillGraphKey(device_, kLargeBucketSeqLen);
+        const auto signature128 = bucketedPrefillSignature(device_, kEvictionBucketSeqLen);
+        const auto key128 = prefillGraphKey(device_, kEvictionBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));

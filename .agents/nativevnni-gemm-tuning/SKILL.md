@@ -68,14 +68,14 @@ scripts/train_native_vnni_dispatch.sh --backend all --install \
   --minimum-passing-domain-percent 0
 ```
 
-The production tree transaction installs learned dispatch only for serial M=1
-and grouped verifier rows. Ordinary dense prefill remains heuristic-only on
-CPU, CUDA, and ROCm and must compile and execute without a generated prefill
-include. Routed CUDA/ROCm MoE prefill has a separate authenticated exact-overlay
-transaction described below; its measured overlays are additive to a total
-generic capture policy. The explicit `--backend cpu-prefill` transaction remains
-available for offline kernel research and corpus analysis, but `--install` is
-intentionally rejected.
+The learned-tree transaction installs dispatch for serial M=1 and grouped
+verifier rows. Ordinary CPU prefill retains its total generic policy. CUDA and
+ROCm dense prefill use the separate authenticated exact-overlay transaction
+described below: measured production cells take precedence, while the generic
+policy remains total for unseen positive M/N/K combinations. Routed CUDA/ROCm
+MoE prefill has its own whole-operation exact-overlay transaction. The explicit
+`--backend cpu-prefill` transaction remains available for offline kernel
+research and corpus analysis, but `--install` is intentionally rejected.
 
 Pass hardware/tool/lane controls after `--`. Do not pass `--shapes` or
 `--shape-partition`; add production overlays to the shared inventory. The
@@ -768,10 +768,11 @@ confirm zero dynamic spill traffic for every promoted production candidate.
 - **Ordinary prefill/GEMM:** sweep every applicable production geometry and all
   21 source formats. CPU uses M={32,128} below 7B, M={32,64} from 7B through
   below 14B, and M={32} at 14B and above; it measures every build/runtime ISA
-  regime.
-CUDA and ROCm use M={64,256,1024,2048,4096,8192,16384}. Exact overlays come
-only from these exact cells; generic rules provide total dispatch for every
-unseen positive M and N/K geometry.
+  regime. CUDA and ROCm consume the exact physical capture inventory from
+  `src/v2/utils/PrefillGraphBuckets.def`; never train virtual long-context M
+  values that production only realizes as repeated captured chunks. Exact
+  overlays come only from these exact cells; generic rules provide total
+  dispatch for every unseen positive M and N/K geometry.
 
 An installable GPU prefill row must compare the complete `M*N` output against
 its certified oracle on the exact producer stream. Use
@@ -784,18 +785,88 @@ download are diagnostic evidence and cannot authorize an overlay. Keep
 zero and NaN-payload sensitivity, full-span mismatch detection, and null-stream
 intolerance.
 
+For dense CUDA/ROCm prefill, use the backend-neutral resumable transaction.
+Every cell is one source format, exact production geometry, and physical graph
+bucket. The runner may place all missing M cells for one format/geometry into
+one native process so prepared weights are uploaded once; it must split and
+authenticate aggregate rows and every native-event sample back into independent
+cell artifacts before atomic promotion. Thus batching changes setup cost only,
+not timing semantics or resume granularity:
+
+The transaction accepts only a `Release` scorer. Its immutable plan hashes the
+exact trainer executable and its resolved `libllaminar2_core.so`; every cell
+publishes a manifest last that binds those hashes, the plan/timing cardinality,
+the shared native-process invocation, and all artifact digests. `status`,
+`combine`, and installation authenticate those manifests without rewriting the
+plan. A rebuilt scorer/core or changed matrix requires a new corpus directory;
+never seed a Release corpus with Integration measurements.
+
+CUDA additionally preflights the complete compiler specialization matrix.
+Only candidates with zero primary and ordered-reducer local memory enter timing;
+the per-row registers, shared-memory footprint, launch width, and active-block
+evidence are authenticated with the native timings. AUTO receives one untimed
+route-resolution probe and is then held to the same exact-symbol resource gate.
+
+```bash
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_dense_prefill_sweep run \
+    --backend <cuda|rocm> --output-dir <work-dir> \
+    --binary <release-native-vnni-prefill-perf-binary> --devices <ordinals>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_dense_prefill_sweep status \
+    --backend <cuda|rocm> --output-dir <work-dir>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_dense_prefill_sweep combine \
+    --backend <cuda|rocm> --output-dir <work-dir>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.dense_production_overlay \
+    --backend <cuda|rocm> --work-dir <work-dir> \
+    --output <backend-generated-include> --summary-csv <summary.csv>
+```
+
+An installed overlay must not contaminate a later additive sweep. The native
+tournament scopes exact-overlay lookup off, so `AUTO` always denotes the total
+generic policy and each forced candidate retains its physical identity.
+Production keeps overlay lookup enabled. A corpus row in which `AUTO` resolves
+through an installed exact cell is invalid evidence and must fail
+authentication.
+
 For routed production MoE prefill, use the same backend-neutral resumable
 transaction for CUDA and ROCm. One worker owns each physical device; every cell
 measures the complete arithmetic-eligible candidate inventory and is promoted
-atomically only after aggregate/raw-timing authentication. `combine` and the
-overlay generator require the entire planned matrix, so an interrupted or
-partial corpus cannot be installed:
+atomically only after aggregate/raw-timing authentication. Missing M values for
+one source tuple, geometry, and route profile share one native process and one
+prepared expert set, while retaining independent timing rows and commit
+manifests per M.
+
+The corpus root is immutable with respect to backend, candidate and route
+semantics, and the exact Release trainer plus resolved
+`libllaminar2_core.so`. Every invocation writes a content-addressed plan under
+`plans/` that binds its selected GGUF source geometries and positive M values;
+a later source geometry or M is therefore an additive plan and reuses
+overlapping committed cells without rewriting the baseline plan. Do not hash
+the whole evolving GGUF inventory into the root contract, because adding one
+new model shape must not strand valid measurements. Each cell manifest is
+promoted last and binds the producing plan, shared native-process invocation,
+device ordinal, and aggregate, raw-timing, and log digests. `status`, `combine`,
+and overlay installation are read-only and authenticate that closure. Orphaned
+files, staging remnants, changed producer bytes, and incomplete route/source
+surfaces are fatal. `combine` publishes beneath
+`combined/<plan-sha256>/` so supplemental plans cannot overwrite an earlier
+aggregate:
 
 ```bash
 PYTHONPATH=tests/v2/performance/kernels \
   python3 -m native_vnni_dispatch.production_moe_prefill_sweep run \
     --backend <cuda|rocm> --output-dir <work-dir> \
     --binary <v2_perf_moe_verifier_prefill> --devices <ordinals>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_moe_prefill_sweep status \
+    --backend <cuda|rocm> --output-dir <work-dir>
 
 PYTHONPATH=tests/v2/performance/kernels \
   python3 -m native_vnni_dispatch.production_moe_prefill_sweep combine \

@@ -2752,6 +2752,13 @@ __global__ void moe_grouped_native_vnni_gate_up_runtime_kernel_t(
     const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
     const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
     const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        gate_outputs[slot][n] = 0.0f;
+        up_outputs[slot][n] = 0.0f;
+        return;
+    }
 
     gate_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
         gate_desc, n, A_int8, scales_A_blockwise, N, K);
@@ -2864,6 +2871,11 @@ __global__ void moe_grouped_native_vnni_down_runtime_route_kernel_t(
     const int blocks_per_row = K / 32;
     const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
     const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
 
     const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
     const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;

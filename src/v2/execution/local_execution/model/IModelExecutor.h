@@ -143,8 +143,16 @@ namespace llaminar2
         int batch_size = 1;
         int seq_len = 0;            ///< Physical rows per sequence captured by the graph
         int *seq_lengths = nullptr; ///< Per-sequence lengths for batched (nullptr = all same)
-        int real_seq_len = 0;   ///< Logical rows for fixed-width execution (0 = seq_len)
-        int bucket_seq_len = 0; ///< Explicit fixed graph width (0 = seq_len)
+        int real_seq_len = 0; ///< Logical rows for fixed-width execution (0 = seq_len).
+        /**
+         * @brief Scheduler-admitted fixed graph width, or zero for raw input.
+         *
+         * A positive value means the prefill scheduler has already selected and
+         * validated this transaction bucket. The execution engine therefore
+         * preserves the bucket for short terminal chunks instead of reapplying
+         * the raw-prompt graph minimum to `real_seq_len`.
+         */
+        int bucket_seq_len = 0;
         /**
          * @brief Absolute token offset of the first real token in this prefill range.
          *

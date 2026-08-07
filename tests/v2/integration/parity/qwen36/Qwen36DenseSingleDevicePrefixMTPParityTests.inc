@@ -53,6 +53,12 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPRestor
     runDenseMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), true);
 }
 
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPPartialTerminalRestore)
+{
+    runDenseMTPPartialTerminalPrefixRestoreParity(
+        QWEN36_DENSE_PREFIX_MTP_CASE());
+}
+
 QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPDynamicDepthRestore)
 {
     runDenseDynamicMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), true);

@@ -86,6 +86,15 @@ namespace
             return true;
         }
 
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override
+        {
+            if (token_batches.size() != 1 || token_batches.front().empty())
+                return false;
+            const auto &tokens = token_batches.front();
+            return forward(tokens.data(), static_cast<int>(tokens.size()));
+        }
+
         bool supportsPrefillChunkSchedule(int seq_len) const override
         {
             return supports_chunk_schedule && seq_len > 0;

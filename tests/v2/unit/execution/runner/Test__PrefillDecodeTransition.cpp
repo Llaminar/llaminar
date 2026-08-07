@@ -266,6 +266,21 @@ namespace
             return !token_batches.empty();
         }
 
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override
+        {
+            ++forward_grouped_mtp_verifier_with_host_token_ids_count_;
+            if (token_batches.empty())
+                return false;
+            if (token_batches.size() == 1)
+            {
+                const auto &tokens = token_batches.front();
+                return !tokens.empty() &&
+                       forward(tokens.data(), static_cast<int>(tokens.size()));
+            }
+            return forward_batch(token_batches);
+        }
+
         bool forwardGroupedMTPVerifierWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
@@ -4856,6 +4871,10 @@ namespace
 
         int forwardCallCount() const { return forward_call_count_; }
         int forwardGroupedMTPVerifierWithDeviceTokenIdsCount() const { return forward_grouped_mtp_verifier_with_device_token_ids_count_; }
+        int forwardGroupedMTPVerifierWithHostTokenIdsCount() const
+        {
+            return forward_grouped_mtp_verifier_with_host_token_ids_count_;
+        }
         int prepareMTPVerifierInputTokensOnDeviceCount() const
         {
             return prepare_mtp_verifier_input_tokens_on_device_count_;
@@ -6587,6 +6606,7 @@ namespace
         std::shared_ptr<FP32Tensor> all_position_logits_local_;
         int forward_call_count_{0};
         int forward_grouped_mtp_verifier_with_device_token_ids_count_{0};
+        int forward_grouped_mtp_verifier_with_host_token_ids_count_{0};
         int prepare_mtp_verifier_input_tokens_on_device_count_{0};
         int prepare_mtp_verifier_input_tokens_host_first_count_{0};
         int prepare_mtp_verifier_input_token_batch_on_device_count_{0};
@@ -15483,6 +15503,9 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(child_ptr->forwardMTPCount(), 1);
+        EXPECT_EQ(
+            child_ptr->forwardGroupedMTPVerifierWithHostTokenIdsCount(),
+            1);
         EXPECT_EQ(child_ptr->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(child_ptr->commitMTPShiftedCount(), 2);
         EXPECT_EQ(child_ptr->lastCommitMTPAlreadyAppended(), 1);
@@ -15538,6 +15561,9 @@ namespace
         ASSERT_TRUE(step1.success()) << step1.error;
         EXPECT_EQ(child_ptr->forwardMTPCount(), 1);
         EXPECT_EQ(child_ptr->forwardMTPFromLastDraftCount(), 2);
+        EXPECT_EQ(
+            child_ptr->forwardGroupedMTPVerifierWithHostTokenIdsCount(),
+            1);
         EXPECT_EQ(child_ptr->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(child_ptr->lastChainedMTPConditionToken(), MockInferenceRunner::MTP_ARGMAX_TOKEN);
         EXPECT_EQ(child_ptr->lastChainedMTPPositionId(), 7);

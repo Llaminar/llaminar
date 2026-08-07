@@ -1638,7 +1638,6 @@ namespace llaminar2
         const bool long_bucketed_prefill =
             exec.gpu_graphs &&
             exec.prefill_graph_buckets &&
-            token_count >= exec.prefill_graph_min_seq &&
             !buckets.empty() &&
             token_count > buckets.back();
 
@@ -7299,6 +7298,27 @@ namespace llaminar2
             return fail_after_checkpoint(
                 "Dynamic MTP graph-family capture capacity is narrower than its admitted device selector");
         }
+        /*
+         * Publish the selected transaction geometry before any response-budget
+         * clipping.  This is the backend-neutral execution ledger for fixed
+         * depth: CPU executes one host-owned grouped transaction at a time,
+         * while CUDA and ROCm hand this same selected/capture geometry to the
+         * device-resident generation parent.  Completion evidence is recorded
+         * separately by verifier counters, so this record cannot certify a
+         * transaction that selected a depth and then failed before execution.
+         */
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "decode_transaction_depth_selections",
+            1.0,
+            "decode",
+            runner_->primaryDeviceId().toString(),
+            {{"depth_policy",
+              mtpDepthPolicyModeToString(mtp.depth_policy.mode)},
+             {"requested_depth",
+              std::to_string(requested_speculative_draft_count)},
+             {"capture_depth",
+              std::to_string(transaction_draft_capacity)}});
         if (materialize_dynamic_generation_loop_this_step)
         {
             PerfStatsCollector::addCounter(

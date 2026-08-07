@@ -1942,6 +1942,8 @@ namespace llaminar2
             const int *tokens,
             int seq_len,
             int batch_size = 1);
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override;
         bool forwardGroupedMTPVerifierWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
@@ -3964,6 +3966,23 @@ namespace llaminar2
             const void *position_ids_device_override = nullptr,
             const int32_t *sequence_lengths_device_override = nullptr,
             std::span<const int> request_real_lengths = {});
+
+        /**
+         * @brief Execute a host-token rectangular batch under an explicit role.
+         *
+         * Ordinary request prefill and CPU grouped verification share padding,
+         * logical-length, and request-progress mechanics, but they must never
+         * infer semantic graph ownership from those dimensions. This helper is
+         * the single place that flattens host rows and forwards the caller's
+         * typed role into graph construction.
+         *
+         * @param token_batches Logical host token rows.
+         * @param execution_role Main inference or grouped-MTP verification.
+         * @return true when the complete forward transaction succeeds.
+         */
+        bool forwardHostTokenBatchImpl(
+            const std::vector<std::vector<int>> &token_batches,
+            ForwardExecutionRole execution_role);
 
         size_t localLogitsVocabColumns(const TensorBase *tensor) const;
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
@@ -6052,6 +6071,24 @@ namespace llaminar2
          * first request and therefore never allocates in a forward hot path.
          */
         bool initializeForwardGraphOutputReadyEvent();
+
+        /**
+         * @brief Commit the semantic result of one successful forward transaction.
+         *
+         * Every successful entry into `ForwardExecutionEngine`, including the
+         * multi-chunk prefill scheduler, must pass through this single boundary.
+         * It closes an armed grouped-verifier outcome transaction and publishes
+         * both the exact current-logits tensor identity and its durable producer
+         * event. Keeping those actions together prevents a caller from returning
+         * usable device logits without making them consumable by the sampler.
+         *
+         * @param output Terminal output and producer provenance from the final
+         *        graph invocation in the transaction.
+         * @throws std::runtime_error if the output does not satisfy an armed
+         *         verifier transaction or cannot publish its durable event.
+         */
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &output) override;
 
         /**
          * @brief Publish one successful GPU forward into the device timeline.
@@ -8866,14 +8903,18 @@ namespace llaminar2
             int first_layer, int last_layer);
 
         /**
-         * @brief Ensure a stable terminal-hidden scratch buffer exists for MTP sidecar input.
+         * @brief Validate the immutable terminal-hidden mailbox for MTP sidecar input.
          *
-         * Most callers need only row zero, which stores the live terminal
-         * hidden state restored from prefix cache or selected from the last
-         * forward. Batched shifted-cache catch-up asks for up to four rows so a
-         * single graph-native MTP sidecar can append several shifted KV rows at
-         * once. Growing the buffer invalidates row-select caches because their
-         * output tensor pointer changes.
+         * Most scalar callers consume row zero, while grouped verification and
+         * shifted-cache catch-up consume several rows. Initialization reserves
+         * the maximum configured row capacity in one arena-owned tensor on
+         * every backend. This method only validates that owner and capacity;
+         * it must never allocate, resize, or rebind because CPU executable
+         * graphs and GPU captured graphs both retain the tensor address.
+         *
+         * @param min_rows Minimum logical row capacity required by the caller.
+         * @return true when the initialization-time mailbox satisfies the
+         *         requested shape and backend-storage contract.
          */
         bool ensureMTPTerminalHiddenBuffer(int min_rows = 1);
 

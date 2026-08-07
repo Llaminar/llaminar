@@ -816,6 +816,16 @@ namespace llaminar2
         bool ensureGroupingBufferCapacity(int total_slots, int num_experts);
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
         /**
+         * @brief Bind the graph-owned compact IMMA work directory.
+         *
+         * The directory is populated from device route counts on every replay.
+         * Binding only resolves its persistent arena address and validates that
+         * the captured bucket's worst-case tile distribution fits.
+         */
+        bool ensureGroupedImmaDirectoryCapacity(
+            int total_slots,
+            int num_experts);
+        /**
          * @brief Bind decode/Q8-publication scratch for the declared row count.
          *
          * `hidden_rows` is independent of `top_k`: grouped verifier routing
@@ -1127,6 +1137,8 @@ namespace llaminar2
         float *d_prefill_swiglu_scales_ = nullptr;
         float *d_prefill_gate_ = nullptr;
         float *d_prefill_up_ = nullptr;
+        uint32_t *d_prefill_imma_directory_ = nullptr;
+        int prefill_imma_directory_entries_cap_ = 0;
         int prefill_slots_cap_ = 0;
         int prefill_d_model_cap_ = 0;
         int prefill_intermediate_cap_ = 0;

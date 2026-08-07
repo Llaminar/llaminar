@@ -267,10 +267,26 @@ namespace llaminar2
          * Returning one row for any format leaves rows 1..M uninitialized and
          * silently turns a valid grouped launch into zero output.
          */
+        /*
+         * A padded continuation-prefill can have a logical suffix width in
+         * the grouped-verifier range even though the captured kernel still
+         * launches the full prefill bucket.  Such a launch uses one shared
+         * AttentionDeviceParams record: FA2 derives each query row's causal
+         * boundary internally and active_query_rows_device suppresses padded
+         * rows.  Classifying that launch from logical width alone leaves the
+         * kernel object advertising M records while compute_tensor() sees the
+         * physical bucket and requires one.
+         *
+         * True grouped verification is never padded: its physical and logical
+         * row counts are identical.  Requiring that identity makes the launch
+         * regime explicit and prevents a partial-prefix suffix from silently
+         * changing the captured attention contract.
+         */
         const bool gpu_grouped_verifier =
             params_.device_id.is_gpu() &&
             params_.batch_size == 1 &&
             params_.causal &&
+            params_.seq_len == logical_seq_len &&
             logical_seq_len > 1 &&
             logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             kv_len > logical_seq_len;

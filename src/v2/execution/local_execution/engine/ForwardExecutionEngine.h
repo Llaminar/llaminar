@@ -225,6 +225,21 @@ namespace llaminar2
             IDeviceContext *ctx,
             void *producer_stream) = 0;
 
+        /**
+         * @brief Commit one successful engine invocation to its semantic owner.
+         *
+         * `ForwardExecutionEngine::execute()` invokes this exactly once before
+         * returning success. The host must publish the exact output tensor and
+         * producer event, and may close any typed transaction armed for the
+         * invocation. Making this an engine-owned callback prevents alternate
+         * callers such as chunk-scheduled prefill from bypassing publication.
+         *
+         * @param output Successful output carrying terminal tensor identity and
+         *        exact producer provenance.
+         */
+        virtual void commitSuccessfulForwardOutput(
+            const ForwardOutput &output) = 0;
+
         // ----- Decode Capture Policy -----
 
         /** Build the GPU graph capture/replay policy for decode steps. */

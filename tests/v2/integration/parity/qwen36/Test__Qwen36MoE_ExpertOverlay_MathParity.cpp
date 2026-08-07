@@ -1312,7 +1312,7 @@ TEST_P(Qwen36MoEExpertOverlayParityTest, SnapshotInfrastructure)
     std::vector<int> snapshot_tokens;
     try
     {
-        snapshot_tokens = makeGraphCaptureEligiblePrefillTokens(
+        snapshot_tokens = makeBoundedPrefillTokens(
             config_.token_ids,
             GetParam().max_seq_len);
     }

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
+import shutil
 import statistics
 import tempfile
 import unittest
@@ -24,6 +26,7 @@ from native_vnni_dispatch.dense_production_overlay import (  # noqa: E402
     DenseOverlayKey,
     collect_dense_overlay_entries,
     render_dense_overlay,
+    validate_dense_overlay_totality,
 )
 from native_vnni_dispatch.prefill_matrix import (  # noqa: E402
     GPU_PREFILL_M_BUCKETS,
@@ -35,18 +38,26 @@ from native_vnni_dispatch.production_dense_prefill_sweep import (  # noqa: E402
     CUDA_GENERIC_CANDIDATE_IDS,
     CUDA_TILE_NAMES,
     CUDA_TIMING_COLUMNS,
+    SWEEP_PLAN_FILENAME,
+    TRAINER_PROVENANCE_SCHEMA,
     ROCM_AGGREGATE_COLUMNS,
     ROCM_CANDIDATE_IDS,
     ROCM_Q6_FULL_TILE_CANDIDATE_IDS,
     ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS,
     ROCM_TIMING_COLUMNS,
+    _batch_environment,
+    _batch_paths,
     _cell_environment,
+    _stage_cell_manifest,
     combine_production_dense_prefill_cells,
     dense_prefill_candidate_ids,
+    load_planned_dense_prefill_cells,
+    load_sweep_plan,
     production_dense_prefill_cell_paths,
     production_dense_prefill_cells,
     run_missing_accelerator_cells,
     validate_production_dense_prefill_cell,
+    validate_promoted_production_dense_prefill_cell,
     write_sweep_plan,
 )
 
@@ -54,10 +65,30 @@ from native_vnni_dispatch.production_dense_prefill_sweep import (  # noqa: E402
 _UINT64_MAX = (1 << 64) - 1
 
 
+def _test_provenance(
+    backend: str,
+    *,
+    binary_digest: str = "sha256:test-binary",
+    core_digest: str = "sha256:test-core",
+) -> dict[str, object]:
+    return {
+        "schema_version": TRAINER_PROVENANCE_SCHEMA,
+        "backend": backend,
+        "binary_name": f"{backend}-trainer",
+        "binary_sha256": binary_digest,
+        "core_library_name": "libllaminar2_core.so",
+        "core_library_sha256": core_digest,
+        "cmake_build_type": "Release",
+    }
+
+
 def _cuda_launch(candidate: str) -> dict[str, object]:
     if candidate == "AUTO":
         return {
             "tile": "AUTO",
+            # Tile 2 is resource-eligible for every compiled runtime codebook.
+            # Synthetic AUTO evidence must obey the same compiler-resource
+            # contract as the native scorer's resolved physical launch.
             "tile_id": -1,
             "strategy": "AUTO",
             "requested_k_partitions": 0,
@@ -148,7 +179,7 @@ def _write_cell(
                     "correctness_pass": 1,
                     "observed_tile_id": (
                         -3 if candidate == "BK256:full"
-                        else 1 if candidate == "AUTO"
+                        else 2 if candidate == "AUTO"
                         else int(candidate.split(":")[1][1:])
                     ),
                     "observed_k_partitions": (
@@ -160,6 +191,34 @@ def _write_cell(
                     ),
                     "canonical_kpart_available": int(
                         canonical_kpart_available
+                    ),
+                    "primary_registers_per_thread": 96,
+                    "primary_local_memory_bytes_per_thread": 0,
+                    "primary_static_shared_memory_bytes": 16384,
+                    "primary_dynamic_shared_memory_bytes": (
+                        65536 if candidate == "BK256:full" else 0
+                    ),
+                    "primary_threads_per_block": (
+                        512 if candidate == "BK256:full" else 128
+                    ),
+                    "primary_max_threads_per_block": (
+                        512 if candidate == "BK256:full" else 128
+                    ),
+                    "primary_max_active_blocks_per_sm": 2,
+                    "auxiliary_registers_per_thread": (
+                        16 if candidate.startswith("KPART:") else 0
+                    ),
+                    "auxiliary_local_memory_bytes_per_thread": 0,
+                    "auxiliary_static_shared_memory_bytes": 0,
+                    "auxiliary_dynamic_shared_memory_bytes": 0,
+                    "auxiliary_threads_per_block": (
+                        256 if candidate.startswith("KPART:") else 0
+                    ),
+                    "auxiliary_max_threads_per_block": (
+                        1024 if candidate.startswith("KPART:") else 0
+                    ),
+                    "auxiliary_max_active_blocks_per_sm": (
+                        4 if candidate.startswith("KPART:") else 0
                     ),
                 })
             else:
@@ -247,6 +306,47 @@ def _write_cell(
     return cell, paths
 
 
+def _commit_test_cells(
+    root: Path,
+    backend: str,
+    cells,
+    *,
+    warmup_runs: int = 2,
+    bench_runs: int = 3,
+    provenance: dict[str, object] | None = None,
+):
+    """Publish real per-cell commit markers for already-written fixtures."""
+
+    cells = tuple(cells)
+    producer = provenance or _test_provenance(backend)
+    plan = write_sweep_plan(
+        root / SWEEP_PLAN_FILENAME,
+        backend,
+        cells,
+        producer,
+        warmup_runs=warmup_runs,
+        bench_runs=bench_runs,
+    )
+    process = {
+        "invocation_id": "test-native-process",
+        "backend": backend,
+        "device_ordinal": 0,
+        "cell_ids": [cell.cell_id for cell in cells],
+    }
+    for cell in cells:
+        paths = production_dense_prefill_cell_paths(root, cell)
+        shutil.copyfile(paths.aggregate, paths.aggregate_staging)
+        shutil.copyfile(paths.timing, paths.timing_staging)
+        shutil.copyfile(paths.log, paths.log_staging)
+        _stage_cell_manifest(paths, cell, plan, process)
+        paths.aggregate_staging.unlink()
+        paths.timing_staging.unlink()
+        paths.log_staging.unlink()
+        os.replace(paths.manifest_staging, paths.manifest)
+        validate_promoted_production_dense_prefill_cell(root, cell, plan)
+    return plan
+
+
 class ProductionDensePrefillSweepTest(unittest.TestCase):
     """Keep the dense corpus comprehensive, exact, and safely resumable."""
 
@@ -283,6 +383,42 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             sum(candidate.startswith("KPART:") for candidate in CUDA_CANDIDATE_IDS),
             len(CUDA_TILE_NAMES),
         )
+        q6_cuda = next(spec for spec in FORMAT_SPECS if spec.label == "Q6_K")
+        self.assertEqual(
+            dense_prefill_candidate_ids("cuda", q6_cuda),
+            (
+                "AUTO",
+                "STD:t0:full",
+                "STD:t2:full",
+                "STD:t3:full",
+                "STD:t5:full",
+                *(f"KPART:t{tile}" for tile in range(6)),
+            ),
+        )
+        for label in ("Q2_K", "IQ1_M"):
+            source_format = next(
+                spec for spec in FORMAT_SPECS if spec.label == label
+            )
+            self.assertEqual(
+                dense_prefill_candidate_ids("cuda", source_format),
+                (
+                    "AUTO",
+                    "STD:t0:full",
+                    "STD:t2:full",
+                    "STD:t3:full",
+                    "KPART:t0",
+                    "KPART:t2",
+                    "KPART:t3",
+                ),
+            )
+        q8_inventories = {
+            dense_prefill_candidate_ids(
+                "cuda",
+                next(spec for spec in FORMAT_SPECS if spec.label == label),
+            )
+            for label in ("Q8_0", "Q8_1", "Q8_K")
+        }
+        self.assertEqual(len(q8_inventories), 1)
         self.assertEqual(dense_prefill_candidate_ids("rocm"), ROCM_CANDIDATE_IDS)
         self.assertEqual(len(ROCM_CANDIDATE_IDS), 27)
         q6 = next(spec for spec in FORMAT_SPECS if spec.label == "Q6_K")
@@ -352,6 +488,35 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                     writer.writerows(rows)
 
                 with self.assertRaisesRegex(ValueError, "failed byte equality"):
+                    validate_production_dense_prefill_cell(
+                        paths.aggregate,
+                        paths.timing,
+                        cell,
+                        bench_runs=3,
+                    )
+
+    def test_cuda_spilling_primary_or_reducer_never_enters_evidence(self) -> None:
+        """Static local memory invalidates even a byte-correct fast row."""
+
+        for candidate_prefix, field in (
+            ("STD:", "primary_local_memory_bytes_per_thread"),
+            ("KPART:", "auxiliary_local_memory_bytes_per_thread"),
+        ):
+            with self.subTest(candidate=candidate_prefix), tempfile.TemporaryDirectory() as tmp:
+                cell, paths = _write_cell(Path(tmp), "cuda", bench_runs=3)
+                with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                target = next(
+                    row for row in rows
+                    if f"{row['strategy']}:".startswith(candidate_prefix)
+                )
+                target[field] = "16"
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=CUDA_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+                with self.assertRaisesRegex(ValueError, "ineligible CUDA"):
                     validate_production_dense_prefill_cell(
                         paths.aggregate,
                         paths.timing,
@@ -438,10 +603,18 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cell, _ = _write_cell(root, "rocm", bench_runs=3)
+            producer = _test_provenance("rocm")
+            _commit_test_cells(
+                root, "rocm", (cell,), provenance=producer
+            )
             binary = root / "trainer"
             binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             binary.chmod(0o755)
             with mock.patch(
+                "native_vnni_dispatch.production_dense_prefill_sweep."
+                "trainer_provenance",
+                return_value=producer,
+            ), mock.patch(
                 "native_vnni_dispatch.production_dense_prefill_sweep._run_accelerator_cell"
             ) as launch:
                 completed = run_missing_accelerator_cells(
@@ -454,6 +627,199 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 )
             self.assertEqual(completed, ())
             launch.assert_not_called()
+
+    def test_changed_binary_or_core_digest_rejects_resume_before_launch(self) -> None:
+        """A rebuilt trainer closure requires a fresh immutable corpus root."""
+
+        for changed in ("binary", "core"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cell, _ = _write_cell(root, "cuda", bench_runs=3)
+                _commit_test_cells(root, "cuda", (cell,))
+                binary = root / "trainer"
+                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binary.chmod(0o755)
+                observed = _test_provenance(
+                    "cuda",
+                    binary_digest=(
+                        "sha256:changed" if changed == "binary"
+                        else "sha256:test-binary"
+                    ),
+                    core_digest=(
+                        "sha256:changed" if changed == "core"
+                        else "sha256:test-core"
+                    ),
+                )
+                with mock.patch(
+                    "native_vnni_dispatch.production_dense_prefill_sweep."
+                    "trainer_provenance",
+                    return_value=observed,
+                ), mock.patch(
+                    "native_vnni_dispatch.production_dense_prefill_sweep."
+                    "_run_accelerator_cell"
+                ) as launch, self.assertRaisesRegex(
+                    ValueError, "immutable sweep plan"
+                ):
+                    run_missing_accelerator_cells(
+                        binary,
+                        root,
+                        (cell,),
+                        (0,),
+                        warmup_runs=2,
+                        bench_runs=3,
+                    )
+                launch.assert_not_called()
+
+    def test_status_validation_never_rewrites_plan_or_timing_contract(self) -> None:
+        """Read-only inspection cannot adapt a corpus to new CLI arguments."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cell, _ = _write_cell(root, "cuda", bench_runs=3)
+            _commit_test_cells(root, "cuda", (cell,))
+            plan_path = root / SWEEP_PLAN_FILENAME
+            original = plan_path.read_bytes()
+
+            load_sweep_plan(
+                plan_path,
+                "cuda",
+                (cell,),
+                warmup_runs=2,
+                bench_runs=3,
+            )
+            self.assertEqual(plan_path.read_bytes(), original)
+            with self.assertRaisesRegex(ValueError, "timing cardinality"):
+                load_sweep_plan(
+                    plan_path,
+                    "cuda",
+                    (cell,),
+                    warmup_runs=2,
+                    bench_runs=4,
+                )
+            self.assertEqual(plan_path.read_bytes(), original)
+
+    def test_batch_cell_manifests_share_one_native_process_identity(self) -> None:
+        """All M cells emitted by one process retain that shared provenance."""
+
+        cells = production_dense_prefill_cells("cuda")
+        anchor = cells[0]
+        same_weight = tuple(
+            cell for cell in cells
+            if cell.source_format == anchor.source_format
+            and cell.shape == anchor.shape
+        )[:3]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in same_weight:
+                _write_cell(root, "cuda", bench_runs=3, cell=cell)
+            _commit_test_cells(root, "cuda", same_weight)
+            manifests = [
+                json.loads(production_dense_prefill_cell_paths(
+                    root, cell
+                ).manifest.read_text(encoding="utf-8"))
+                for cell in same_weight
+            ]
+
+        process_records = [manifest["native_process"] for manifest in manifests]
+        self.assertTrue(all(record == process_records[0] for record in process_records))
+        self.assertEqual(
+            process_records[0]["cell_ids"],
+            [cell.cell_id for cell in same_weight],
+        )
+
+    def test_artifact_mutation_invalidates_promoted_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cell, paths = _write_cell(root, "rocm", bench_runs=3)
+            plan = _commit_test_cells(root, "rocm", (cell,))
+            paths.log.write_text("mutated\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "artifact digest mismatch"):
+                validate_promoted_production_dense_prefill_cell(
+                    root, cell, plan
+                )
+
+    def test_missing_m_buckets_share_one_native_weight_process(self) -> None:
+        """Batching removes setup work without weakening cell-level resume."""
+
+        cells = production_dense_prefill_cells("cuda")
+        anchor = cells[0]
+        same_weight = tuple(
+            cell for cell in cells
+            if cell.source_format == anchor.source_format
+            and cell.shape == anchor.shape
+        )[:3]
+        self.assertEqual(len(same_weight), 3)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "trainer"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with mock.patch(
+                "native_vnni_dispatch.production_dense_prefill_sweep."
+                "trainer_provenance",
+                return_value=_test_provenance("cuda"),
+            ), mock.patch(
+                "native_vnni_dispatch.production_dense_prefill_sweep."
+                "_run_accelerator_batch"
+            ) as batch_launch, mock.patch(
+                "native_vnni_dispatch.production_dense_prefill_sweep."
+                "_run_accelerator_cell"
+            ) as cell_launch:
+                completed = run_missing_accelerator_cells(
+                    binary,
+                    root,
+                    same_weight,
+                    (0,),
+                    warmup_runs=2,
+                    bench_runs=3,
+                )
+
+            self.assertEqual(completed, same_weight)
+            batch_launch.assert_called_once()
+            self.assertEqual(
+                batch_launch.call_args.args[2],
+                same_weight,
+            )
+            cell_launch.assert_not_called()
+
+    def test_batch_environment_varies_only_m_and_preserves_output_identity(self) -> None:
+        """The native process must never mix formats or matrix geometries."""
+
+        cells = production_dense_prefill_cells("rocm")
+        anchor = cells[0]
+        same_weight = tuple(
+            cell for cell in cells
+            if cell.source_format == anchor.source_format
+            and cell.shape == anchor.shape
+        )[:3]
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _batch_paths(Path(tmp), same_weight)
+            environment = _batch_environment(
+                same_weight,
+                paths,
+                device=2,
+                warmup_runs=3,
+                bench_runs=7,
+            )
+
+        self.assertEqual(environment["HIP_VISIBLE_DEVICES"], "2")
+        self.assertEqual(
+            environment["LLAMINAR_ROCM_NVNNI_SWEEP_FORMATS"],
+            anchor.source_format.label,
+        )
+        self.assertEqual(
+            environment["LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES"],
+            anchor.shape.name,
+        )
+        self.assertEqual(
+            environment["LLAMINAR_ROCM_NVNNI_SWEEP_M"],
+            ",".join(str(cell.m) for cell in same_weight),
+        )
+        self.assertEqual(
+            environment["LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES"],
+            str(len(same_weight)),
+        )
 
     def test_device_masks_and_exact_cell_filters_are_backend_specific(self) -> None:
         for backend, device in (("cuda", 1), ("rocm", 3)):
@@ -483,15 +849,70 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             root = Path(tmp)
             cell, _ = _write_cell(root, "cuda", bench_runs=3)
             plan = root / "plan.json"
-            write_sweep_plan(plan, "cuda", (cell,), warmup_runs=2, bench_runs=3)
-            payload = __import__("json").loads(plan.read_text(encoding="utf-8"))
+            payload = write_sweep_plan(
+                plan,
+                "cuda",
+                (cell,),
+                _test_provenance("cuda"),
+                warmup_runs=2,
+                bench_runs=3,
+            )
             self.assertEqual(payload["bench_runs"], 3)
             self.assertEqual(payload["cells"][0]["cell_id"], cell.cell_id)
+            plan.replace(root / SWEEP_PLAN_FILENAME)
+            _commit_test_cells(root, "cuda", (cell,))
             aggregate, timing = combine_production_dense_prefill_cells(
-                root, (cell,), bench_runs=3
+                root, (cell,), warmup_runs=2, bench_runs=3
             )
             self.assertTrue(aggregate.is_file())
             self.assertTrue(timing.is_file())
+
+    def test_filtered_overlay_consumes_the_exact_immutable_plan_matrix(self) -> None:
+        cells = production_dense_prefill_cells("cuda")
+        selected = cells[:2]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in selected:
+                _write_cell(root, "cuda", bench_runs=3, cell=cell)
+            _commit_test_cells(root, "cuda", selected)
+            reconstructed, plan = load_planned_dense_prefill_cells(
+                root / SWEEP_PLAN_FILENAME,
+                "cuda",
+            )
+            self.assertEqual(reconstructed, selected)
+            self.assertEqual(len(plan["cells"]), 2)
+            entries = collect_dense_overlay_entries(
+                root,
+                "cuda",
+                warmup_runs=2,
+                bench_runs=3,
+            )
+            self.assertTrue(entries)
+
+    def test_cuda_overlay_honors_geometry_without_canonical_kpart(self) -> None:
+        """One-partition shapes must not invent absent KPART timing rows."""
+
+        cell = production_dense_prefill_cells("cuda")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_cell(
+                root,
+                "cuda",
+                bench_runs=3,
+                cell=cell,
+                canonical_kpart_available=False,
+            )
+            _commit_test_cells(root, "cuda", (cell,))
+            entries = collect_dense_overlay_entries(
+                root,
+                "cuda",
+                cells=(cell,),
+                warmup_runs=2,
+                bench_runs=3,
+            )
+
+            self.assertEqual(len(entries), 1)
+            self.assertFalse(entries[0].candidate_id.startswith("KPART:"))
 
     def test_overlay_pools_source_aliases_into_one_concrete_runtime_key(self) -> None:
         cells = production_dense_prefill_cells("cuda")
@@ -507,15 +928,20 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             root = Path(tmp)
             for cell in aliases:
                 _write_cell(root, "cuda", bench_runs=3, cell=cell)
+            _commit_test_cells(root, "cuda", aliases)
             entries = collect_dense_overlay_entries(
-                root, "cuda", cells=aliases, bench_runs=3
+                root,
+                "cuda",
+                cells=aliases,
+                warmup_runs=2,
+                bench_runs=3,
             )
             self.assertEqual(len(entries), 1)
             entry = entries[0]
             self.assertEqual(entry.key.execution_codebook, 4)
             self.assertEqual(entry.source_formats, ("IQ4_NL", "IQ4_XS"))
             self.assertEqual(entry.candidate_id, "AUTO")
-            self.assertEqual(entry.launch, (1, 1, 0, 0))
+            self.assertEqual(entry.launch, (2, 1, 0, 0))
             rendered = render_dense_overlay(entries)
             self.assertIn("selectCUDADensePrefillOverlay", rendered)
             self.assertNotIn("AUTO", rendered)
@@ -562,15 +988,66 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             with second.aggregate.open(newline="", encoding="utf-8") as handle:
                 reader = csv.DictReader(handle)
                 rows = list(reader)
-            rows[0]["observed_tile_id"] = "2"
+            rows[0]["observed_tile_id"] = "3"
             with second.aggregate.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=CUDA_AGGREGATE_COLUMNS)
                 writer.writeheader()
                 writer.writerows(rows)
+            _commit_test_cells(root, "cuda", aliases)
             with self.assertRaisesRegex(ValueError, "conflicting physical launches"):
                 collect_dense_overlay_entries(
-                    root, "cuda", cells=aliases, bench_runs=3
+                    root,
+                    "cuda",
+                    cells=aliases,
+                    warmup_runs=2,
+                    bench_runs=3,
                 )
+
+    def test_overlay_totality_rejects_missing_and_spilling_runtime_keys(self) -> None:
+        """Installation cannot omit a planned key or promote a spilling tile."""
+
+        cells = production_dense_prefill_cells("cuda")
+        anchor = next(
+            cell for cell in cells
+            if cell.source_format.runtime_codebook("cuda") == 8
+        )
+        selected = tuple(
+            cell for cell in cells
+            if cell.source_format == anchor.source_format
+            and cell.shape == anchor.shape
+        )[:2]
+        self.assertEqual(len(selected), 2)
+
+        def entry_for(cell, *, tile_id: int = 2) -> DenseOverlayEntry:
+            return DenseOverlayEntry(
+                backend="cuda",
+                key=DenseOverlayKey(
+                    execution_codebook=cell.source_format.runtime_codebook(
+                        "cuda"
+                    ),
+                    m=cell.m,
+                    n=cell.shape.n,
+                    k=cell.shape.k,
+                ),
+                source_formats=(cell.source_format.label,),
+                shape_names=(cell.shape.name,),
+                candidate_id=f"STD:t{tile_id}:full",
+                launch=(tile_id, 1, 0, 0),
+                geometric_mean_regret=0.0,
+                maximum_alias_regret=0.0,
+                geometric_mean_speedup_vs_auto=1.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "not total"):
+            validate_dense_overlay_totality(
+                (entry_for(selected[0]),),
+                selected,
+                "cuda",
+            )
+
+        spilling = tuple(entry_for(cell, tile_id=1) for cell in selected)
+        with self.assertRaisesRegex(ValueError, "compiler-proven to spill"):
+            validate_dense_overlay_totality(spilling, selected, "cuda")
 
 
 if __name__ == "__main__":

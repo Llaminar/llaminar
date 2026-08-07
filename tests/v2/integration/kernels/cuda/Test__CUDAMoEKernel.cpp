@@ -7,6 +7,8 @@
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/SamplingMath.h"
+#include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "tensors/Tensors.h"
 
@@ -1117,7 +1119,13 @@ namespace
     {
         const auto records =
             llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
-        const std::string expected_path = swiglu_path;
+        using GroupedProjectionEngine =
+            llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine;
+        const bool expected_imma =
+            llaminar2::CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(
+                seq_len) == GroupedProjectionEngine::TensorCoreImmaPrefill;
+        const std::string expected_path =
+            expected_imma ? "split_exact_quantizer" : swiglu_path;
         const int total_slots = seq_len * top_k;
         const int active_slots = expected_active_expert_slots >= 0
                                      ? expected_active_expert_slots
@@ -1125,9 +1133,28 @@ namespace
         const std::string expected_total_slots = std::to_string(total_slots);
         const std::string expected_active_slots = std::to_string(active_slots);
         const std::string expected_num_experts = std::to_string(num_experts);
-        const std::string expected_tile = std::to_string(expected_tile_m);
+        const std::string expected_tile =
+            std::to_string(expected_imma ? 16 : expected_tile_m);
+        const std::string effective_gateup_route =
+            expected_imma
+                ? "grouped_imma_prefill"
+                : (expected_gateup_route ? expected_gateup_route : "");
+        const std::string effective_down_route =
+            expected_imma
+                ? "grouped_imma_prefill"
+                : (expected_down_route ? expected_down_route : "");
+        const std::string effective_down_accumulation =
+            expected_imma
+                ? "serial_m1_kpart_in_cta"
+                : (expected_down_accumulation
+                       ? expected_down_accumulation
+                       : "");
+        const std::string effective_policy_source =
+            expected_imma
+                ? "tensor_core_imma_prefill"
+                : (expected_policy_source ? expected_policy_source : "");
         const bool expected_kpart_gateup =
-            expected_gateup_route &&
+            !expected_imma && expected_gateup_route &&
             std::string(expected_gateup_route) == "kpart_prefill";
         const int splitk_tile_rows = std::min(
             seq_len,
@@ -1137,7 +1164,7 @@ namespace
         const std::string expected_splitk_tile_count =
             std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
         const std::string expected_tile_n_text =
-            std::to_string(expected_tile_n);
+            std::to_string(expected_imma ? 32 : expected_tile_n);
         const auto match = std::find_if(
             records.begin(),
             records.end(),
@@ -1156,22 +1183,35 @@ namespace
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&
                        tag_equals("tile_n", expected_tile_n_text) &&
-                       (!expected_policy_source ||
+                       (effective_policy_source.empty() ||
+                        tag_equals("policy_source", effective_policy_source)) &&
+                       (effective_gateup_route.empty() ||
+                        tag_equals("gateup_route", effective_gateup_route)) &&
+                       (effective_down_route.empty() ||
+                        tag_equals("down_route", effective_down_route)) &&
+                       (effective_down_accumulation.empty() ||
                         tag_equals(
-                            "policy_source",
-                            std::string(expected_policy_source))) &&
-                       (!expected_gateup_route ||
-                        tag_equals("gateup_route", std::string(expected_gateup_route))) &&
-                       (!expected_down_route ||
-                        tag_equals("down_route", std::string(expected_down_route))) &&
-                       (!expected_down_accumulation ||
-                        tag_equals("down_accumulation", std::string(expected_down_accumulation))) &&
+                            "down_accumulation",
+                            effective_down_accumulation)) &&
+                       (!expected_imma ||
+                        (tag_equals(
+                             "gateup_geometry_contract",
+                             "tensor_core_imma") &&
+                         tag_equals(
+                             "row_tile_source",
+                             "device_work_directory") &&
+                         tag_equals(
+                             "work_scheduler",
+                             "compact_directory_grid") &&
+                         tag_equals(
+                             "empty_directory_tail",
+                             "sentinel_cta_exit"))) &&
                        (!expected_kpart_gateup ||
                         (tag_equals("splitk_tile_rows", expected_splitk_tile_rows) &&
                          tag_equals("splitk_tile_count", expected_splitk_tile_count)));
             });
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
-                                        << swiglu_path << " seq_len=" << seq_len
+                                        << expected_path << " seq_len=" << seq_len
                                         << " tile_m="
                                         << expected_tile
                                         << "\n"
@@ -20524,8 +20564,14 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         const std::string expected_total_slots = std::to_string(total_slots);
         const std::string expected_active_slots = std::to_string(active_slots);
         const std::string expected_num_experts = std::to_string(num_experts);
-        const std::string expected_tile = std::to_string(expected_tile_m);
-        const std::string expected_tile_n = "128";
+        using GroupedProjectionEngine =
+            llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine;
+        const bool expected_imma =
+            llaminar2::CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(
+                seq_len) == GroupedProjectionEngine::TensorCoreImmaPrefill;
+        const std::string expected_tile =
+            std::to_string(expected_imma ? 16 : expected_tile_m);
+        const std::string expected_tile_n = expected_imma ? "32" : "128";
         const int splitk_tile_rows = std::min(
             seq_len,
             llaminar2::MoEWorkspaceBuffers::kVerifierSplitKTileRows);
@@ -20548,8 +20594,22 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&
                        tag_equals("tile_n", expected_tile_n) &&
-                       tag_equals("splitk_tile_rows", expected_splitk_tile_rows) &&
-                       tag_equals("splitk_tile_count", expected_splitk_tile_count);
+                       (expected_imma
+                            ? (tag_equals(
+                                   "gateup_geometry_contract",
+                                   "tensor_core_imma") &&
+                               tag_equals(
+                                   "row_tile_source",
+                                   "device_work_directory") &&
+                               tag_equals(
+                                   "policy_source",
+                                   "tensor_core_imma_prefill"))
+                            : (tag_equals(
+                                   "splitk_tile_rows",
+                                   expected_splitk_tile_rows) &&
+                               tag_equals(
+                                   "splitk_tile_count",
+                                   expected_splitk_tile_count)));
             });
         ASSERT_NE(it, records.end()) << "missing verifier small-M prefill counter for seq_len="
                                      << seq_len << " tile_m=" << expected_tile_m;
@@ -21790,12 +21850,14 @@ TEST_F(Test__CUDAMoEKernel,
      * Production prefill captures bucket-sized graphs while only a prefix of
      * those rows is live. The 33-row case crosses the large-grouping launch
      * boundary cheaply. M=64 is the first measured exact-overlay key for this
-     * geometry and codebook pair. The 768-row case is the first real Qwen3.6
-     * bucket and reproduces the production launch geometry that a fully
-     * populated verifier-sized sweep cannot exercise.
+     * geometry and codebook pair. Capacity 512 with 434 live rows reproduces
+     * the current CUDA benchmark prompt inside its captured bucket. The
+     * 768-row case crosses the next production bucket while keeping only a
+     * short live prefix, proving padded directory publication independently.
      */
     cases.push_back({.capacity_rows = 33, .logical_rows = 9});
     cases.push_back({.capacity_rows = 64, .logical_rows = 64});
+    cases.push_back({.capacity_rows = 512, .logical_rows = 434});
     cases.push_back({.capacity_rows = 768, .logical_rows = 9});
 
     for (const RoutedPrefillCase test_case : cases)

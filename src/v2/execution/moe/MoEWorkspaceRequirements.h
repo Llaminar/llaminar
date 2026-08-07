@@ -3,6 +3,7 @@
 #include "../local_execution/device/WorkspaceDescriptor.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "../../kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -54,6 +55,8 @@ namespace llaminar2
         constexpr const char *CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE = "cuda_moe_runtime_prefill_gate_desc_table";
         constexpr const char *CUDA_RUNTIME_PREFILL_UP_DESC_TABLE = "cuda_moe_runtime_prefill_up_desc_table";
         constexpr const char *CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE = "cuda_moe_runtime_prefill_down_desc_table";
+        constexpr const char *CUDA_PREFILL_WORK_DIRECTORY =
+            "cuda_moe_prefill_work_directory";
         constexpr const char *CUDA_ROUTER_Q8_GATE_WEIGHTS = "cuda_moe_router_q8_gate_weights";
         constexpr const char *CUDA_ROUTER_Q8_GATE_SCALES = "cuda_moe_router_q8_gate_scales";
 
@@ -344,6 +347,12 @@ namespace llaminar2
             add(reqs, CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);
+            add(reqs, CUDA_PREFILL_WORK_DIRECTORY,
+                cuda::moe::groupedImmaDirectoryEntries(
+                    static_cast<std::size_t>(std::max(1, max_seq_len)) *
+                        static_cast<std::size_t>(std::max(1, top_k)),
+                    static_cast<std::size_t>(num_experts)) *
+                    sizeof(uint32_t));
             return reqs;
         }
 

@@ -16,6 +16,7 @@ from check_kv_state_lifecycle_policy import (  # noqa: E402
     validate_gpu_reset_source,
     validate_interface,
     validate_orchestrator,
+    validate_terminal_hidden_mailbox_lifetime,
 )
 
 
@@ -105,6 +106,35 @@ class TestKVStateLifecyclePolicy(unittest.TestCase):
             "              reset_transaction.cacheContext());",
         )
         self.assertTrue(validate_orchestrator(reordered, ""))
+
+    def test_terminal_hidden_mailbox_rejects_runtime_rebinding(self) -> None:
+        source = """
+        bool DeviceGraphOrchestrator::initializeBuffers(int seq_len) {
+          const auto rows = resolveMTPTerminalHiddenRowCapacity(1, config.mtp);
+          arena_->registerBuffer(
+              BufferId::PREFIX_TERMINAL_HIDDEN, rows, d_model, "FP32", device);
+          state_.prefix_terminal_hidden =
+              arena_->getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN);
+          return true;
+        }
+        bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer(int rows) {
+          const auto arena_owner = arena_->getSharedTensor(
+              BufferId::PREFIX_TERMINAL_HIDDEN);
+          return state_.prefix_terminal_hidden == arena_owner;
+        }
+        """
+        self.assertEqual(validate_terminal_hidden_mailbox_lifetime(source), [])
+
+        rebound = source.replace(
+            "return state_.prefix_terminal_hidden == arena_owner;",
+            "state_.prefix_terminal_hidden = factory->createFP32({rows, d_model});\n"
+            "          arena_->bindExternalBuffer(\n"
+            "              BufferId::PREFIX_TERMINAL_HIDDEN,\n"
+            "              state_.prefix_terminal_hidden.get());\n"
+            "          return true;",
+        )
+        failures = validate_terminal_hidden_mailbox_lifetime(rebound)
+        self.assertTrue(any("forbidden" in failure for failure in failures))
 
 
 if __name__ == "__main__":

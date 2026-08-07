@@ -2048,6 +2048,32 @@ namespace llaminar2
         }
     }
 
+    bool RankOrchestrator::forwardGroupedMTPVerifierWithHostTokenIds(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->forwardGroupedMTPVerifierWithHostTokenIds(
+                token_batches);
+        }
+
+        for (const auto &runner : device_runners_)
+        {
+            if (runner && !runner->primaryDeviceId().is_cpu())
+            {
+                LOG_ERROR(
+                    "RankOrchestrator::forwardGroupedMTPVerifierWithHostTokenIds: "
+                    "host-token verification is invalid for GPU participants");
+                return false;
+            }
+        }
+
+        return forwardHostTokenBatchAcrossDevices(
+            token_batches,
+            &IInferenceRunner::forwardGroupedMTPVerifierWithHostTokenIds,
+            "forwardGroupedMTPVerifierWithHostTokenIds");
+    }
+
     bool RankOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds(
         const int *token_shadow,
         const void *token_ids_device,
@@ -13503,14 +13529,35 @@ namespace llaminar2
 
     bool RankOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
     {
+        return forwardHostTokenBatchAcrossDevices(
+            token_batches,
+            &IInferenceRunner::forward_batch,
+            "forward_batch");
+    }
+
+    bool RankOrchestrator::forwardHostTokenBatchAcrossDevices(
+        const std::vector<std::vector<int>> &token_batches,
+        bool (IInferenceRunner::*entrypoint)(
+            const std::vector<std::vector<int>> &),
+        const char *operation)
+    {
         if (device_runners_.empty())
         {
-            LOG_ERROR("RankOrchestrator::forward_batch: No device runners available");
+            LOG_ERROR("RankOrchestrator::" << operation
+                                            << ": No device runners available");
+            return false;
+        }
+        if (!entrypoint || !operation)
+        {
+            LOG_ERROR(
+                "RankOrchestrator::forwardHostTokenBatchAcrossDevices: missing "
+                "typed child entrypoint or operation identity");
             return false;
         }
 
-        LOG_DEBUG("RankOrchestrator::forward_batch: batch_size=" << token_batches.size()
-                                                                 << ", devices=" << device_runners_.size());
+        LOG_DEBUG("RankOrchestrator::" << operation
+                                        << ": batch_size=" << token_batches.size()
+                                        << ", devices=" << device_runners_.size());
 
         // Launch parallel batch forward passes on all devices
         std::vector<std::future<bool>> futures;
@@ -13521,10 +13568,11 @@ namespace llaminar2
             auto &runner = device_runners_[i];
             if (runner)
             {
+                IInferenceRunner *const child = runner.get();
                 futures.push_back(std::async(std::launch::async,
-                                             [&runner, &token_batches]()
+                                             [child, &token_batches, entrypoint]()
                                              {
-                                                 return runner->forward_batch(token_batches);
+                                                 return (child->*entrypoint)(token_batches);
                                              }));
             }
         }
@@ -13541,7 +13589,9 @@ namespace llaminar2
                 bool success = futures[i].get();
                 if (!success)
                 {
-                    LOG_ERROR("RankOrchestrator::forward_batch: Device " << i << " forward_batch failed");
+                    LOG_ERROR("RankOrchestrator::" << operation
+                                                    << ": Device " << i
+                                                    << " forward failed");
                     all_success = false;
                 }
             }
@@ -13556,26 +13606,33 @@ namespace llaminar2
                 {
                     first_exception = std::current_exception();
                     first_exception_device = i;
-                    LOG_ERROR("RankOrchestrator::forward_batch: Device " << i
-                                                                         << " threw PRIMARY exception: " << error_msg);
+                    LOG_ERROR("RankOrchestrator::" << operation
+                                                    << ": Device " << i
+                                                    << " threw PRIMARY exception: "
+                                                    << error_msg);
                 }
                 else if (is_context_destroyed)
                 {
-                    LOG_WARN("RankOrchestrator::forward_batch: Device " << i
-                                                                        << " threw SECONDARY exception (context destroyed): " << error_msg);
+                    LOG_WARN("RankOrchestrator::" << operation
+                                                   << ": Device " << i
+                                                   << " threw SECONDARY exception (context destroyed): "
+                                                   << error_msg);
                 }
                 else
                 {
-                    LOG_ERROR("RankOrchestrator::forward_batch: Device " << i
-                                                                         << " threw exception: " << error_msg);
+                    LOG_ERROR("RankOrchestrator::" << operation
+                                                    << ": Device " << i
+                                                    << " threw exception: "
+                                                    << error_msg);
                 }
             }
         }
 
         if (first_exception)
         {
-            LOG_ERROR("RankOrchestrator::forward_batch: Re-throwing primary exception from device "
-                      << first_exception_device);
+            LOG_ERROR("RankOrchestrator::" << operation
+                                            << ": Re-throwing primary exception from device "
+                                            << first_exception_device);
             std::rethrow_exception(first_exception);
         }
 

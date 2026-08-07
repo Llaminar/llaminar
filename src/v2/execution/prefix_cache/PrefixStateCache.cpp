@@ -1,9 +1,20 @@
+/**
+ * @file PrefixStateCache.cpp
+ * @brief Implements durable prefix-block indexing and tier-aware LRU lookup.
+ *
+ * Metadata probing is separated from payload acquisition so a longest-prefix
+ * query records one semantic hit or miss even when it examines several token
+ * widths. The final find() remains the sole authority for disk hydration, LRU
+ * movement, and shared payload ownership.
+ */
+
 #include "execution/prefix_cache/PrefixStateCache.h"
 
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <utility>
 
@@ -69,11 +80,20 @@ namespace llaminar2
         auto existing = entries_.find(resident_key);
         if (existing != entries_.end())
         {
-            if (existing->second.block.ref_count > 0)
-            {
-                return false;
-            }
-            erase(resident_key);
+            /*
+             * Replacing an allocation after it has already been created is
+             * unsafe because RamPrefixStorageBackend accounts owners by key.
+             * Production replacement must pass through prepareInsert() before
+             * allocating the new handle.
+             */
+            return false;
+        }
+        if (!preserve_disk_entry &&
+            (disk_entries_.find(resident_key) != disk_entries_.end() ||
+             device_hot_entries_.find(resident_key) !=
+                 device_hot_entries_.end()))
+        {
+            return false;
         }
 
         if (!evictUntilFits(handle.total_bytes))
@@ -100,7 +120,6 @@ namespace llaminar2
         stats_.ram_bytes = used_bytes_;
         addResidentStats(entry.block.handle);
         entries_.emplace(entry.block.handle.key, std::move(entry));
-        (void)preserve_disk_entry;
         return true;
     }
 
@@ -300,6 +319,49 @@ namespace llaminar2
         return it->second.block.handle;
     }
 
+    std::optional<PrefixBlockHandle> PrefixStateCache::findLongestTokenPrefix(
+        uint64_t fingerprint,
+        uint64_t parent_hash,
+        int block_index,
+        int token_start,
+        const std::vector<int32_t> &tokens)
+    {
+        if (fingerprint == 0 || block_index < 0 || token_start < 0 ||
+            tokens.empty())
+        {
+            return std::nullopt;
+        }
+
+        for (size_t token_count = tokens.size(); token_count > 0; --token_count)
+        {
+            std::vector<int32_t> candidate_tokens(
+                tokens.begin(),
+                tokens.begin() + static_cast<std::ptrdiff_t>(token_count));
+            const PrefixCacheKey candidate = makePrefixCacheKey(
+                fingerprint,
+                parent_hash,
+                block_index,
+                token_start,
+                candidate_tokens);
+            if (contains(candidate))
+            {
+                return find(candidate);
+            }
+        }
+
+        /*
+         * Keep one request-level miss in the existing statistics vocabulary.
+         * find() also preserves future behavior if a backend learns to resolve
+         * an exact key without advertising it through contains().
+         */
+        return find(makePrefixCacheKey(
+            fingerprint,
+            parent_hash,
+            block_index,
+            token_start,
+            tokens));
+    }
+
     bool PrefixStateCache::contains(const PrefixCacheKey &key) const
     {
         return entries_.find(key) != entries_.end() ||
@@ -342,8 +404,10 @@ namespace llaminar2
         {
             erased = evictResident(key);
         }
-        removeDeviceHotEntry(key, /*capacity_eviction=*/false);
-        return removeDiskEntry(key) || erased;
+        const bool erased_device_hot =
+            removeDeviceHotEntry(key, /*capacity_eviction=*/false);
+        const bool erased_disk = removeDiskEntry(key);
+        return erased_disk || erased_device_hot || erased;
     }
 
     bool PrefixStateCache::clear()
@@ -399,8 +463,27 @@ namespace llaminar2
         return true;
     }
 
-    bool PrefixStateCache::reserveRam(size_t incoming_bytes)
+    bool PrefixStateCache::prepareInsert(
+        const PrefixCacheKey &key,
+        size_t incoming_bytes)
     {
+        if (!key.valid() || incoming_bytes == 0 ||
+            incoming_bytes > ram_budget_bytes_)
+        {
+            return false;
+        }
+
+        const auto resident = entries_.find(key);
+        if (resident != entries_.end() &&
+            resident->second.block.ref_count > 0)
+        {
+            return false;
+        }
+
+        if (contains(key) && !erase(key))
+        {
+            return false;
+        }
         return evictUntilFits(incoming_bytes);
     }
 

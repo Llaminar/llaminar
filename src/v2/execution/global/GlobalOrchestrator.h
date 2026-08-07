@@ -354,6 +354,19 @@ namespace llaminar2
         // =================================================================
 
         bool forward(const int *tokens, int seq_len) override;
+        /**
+         * @brief Execute a CPU grouped-MTP verifier transaction through GlobalPP/TP.
+         *
+         * The wrapper must preserve `GroupedMTPVerifier` as a semantic graph
+         * role at every local stage. Routing this call through ordinary
+         * `forward()` would build a main-inference graph and omit the recurrent
+         * verifier checkpoints consumed by accepted-state publication.
+         *
+         * @param token_batches Logical verifier rows for every request.
+         * @return True after every local execute/transfer step succeeds.
+         */
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override;
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
@@ -582,6 +595,17 @@ namespace llaminar2
          */
         bool executeStage(const RankStageAction &action,
                           const int *tokens, int seq_len);
+
+        /**
+         * @brief Execute one local stage with the typed grouped-verifier role.
+         *
+         * Pipeline stages without an embedding still receive the logical row
+         * geometry; their graph omits token embedding and consumes the hidden
+         * activation installed by the preceding transfer.
+         */
+        bool executeGroupedMTPVerifierStage(
+            const RankStageAction &action,
+            const std::vector<std::vector<int>> &token_batches);
 
         /**
          * @brief Execute a single TRANSFER step (MPI Send or Recv)

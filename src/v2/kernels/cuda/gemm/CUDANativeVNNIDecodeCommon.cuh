@@ -347,14 +347,35 @@ namespace llaminar2::cuda_native_vnni
                ((hb4 & 0x8u) << 23);
     }
 
-    __device__ __forceinline__ uint32_t iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
+    /**
+     * @brief Apply four IQ sign bits with exact packed-byte arithmetic.
+     *
+     * Expanding this operation as four scalar ternaries makes nvcc emit a long
+     * predicate/negate/permute chain in every IQ-grid decoder. Instead, first
+     * spread the four sign bits into the low bit of four independent bytes.
+     * `__vsub4(0, bits)` then turns each selected byte into `0xff`, and
+     * `(value ^ mask) - mask` performs two's-complement negation independently
+     * in each byte. The result is byte-identical to the scalar expression while
+     * avoiding cross-byte borrows and keeping all four values vectorized.
+     *
+     * IQ grids contain representable signed magnitudes, so negation cannot
+     * encounter the exceptional INT8_MIN value.
+     *
+     * @param grid4 Four positive grid magnitudes packed as signed INT8 bytes.
+     * @param sign_lo4 One sign selector bit for each packed byte.
+     * @return Four signed grid values packed in their original byte order.
+     */
+    __device__ __forceinline__ uint32_t iq_apply_signs_4(
+        uint32_t grid4,
+        uint8_t sign_lo4)
     {
-        const int8_t *grid = reinterpret_cast<const int8_t *>(&grid4);
-        return static_cast<uint32_t>(pack_i8x4(
-            (sign_lo4 & 0x1) ? static_cast<int8_t>(-grid[0]) : grid[0],
-            (sign_lo4 & 0x2) ? static_cast<int8_t>(-grid[1]) : grid[1],
-            (sign_lo4 & 0x4) ? static_cast<int8_t>(-grid[2]) : grid[2],
-            (sign_lo4 & 0x8) ? static_cast<int8_t>(-grid[3]) : grid[3]));
+        const uint32_t sign_bits =
+            (static_cast<uint32_t>(sign_lo4) & 0x1u) |
+            ((static_cast<uint32_t>(sign_lo4) & 0x2u) << 7) |
+            ((static_cast<uint32_t>(sign_lo4) & 0x4u) << 14) |
+            ((static_cast<uint32_t>(sign_lo4) & 0x8u) << 21);
+        const uint32_t sign_mask = __vsub4(0u, sign_bits);
+        return __vsub4(grid4 ^ sign_mask, sign_mask);
     }
 
     template <uint8_t CODEBOOK_ID>

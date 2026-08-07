@@ -451,6 +451,8 @@ namespace llaminar2
          */
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override;
         /**
          * @brief Run a LocalTP forward where every child consumes its own
          *        staged device-token row.
@@ -1466,6 +1468,25 @@ namespace llaminar2
          * (single device or TP domain) based on configuration.
          */
         void initializePPContext();
+
+        /**
+         * @brief Fan a typed host-token batch entrypoint out to all participants.
+         *
+         * The member-function pointer is the semantic policy: callers choose
+         * ordinary batch inference or grouped-MTP verification explicitly. The
+         * shared implementation keeps participant launch, exception handling,
+         * and aggregate batch-state publication identical between the roles.
+         *
+         * @param token_batches Logical host token rows.
+         * @param entrypoint Exact child-runner API to invoke.
+         * @param operation Stable operation name used in fatal diagnostics.
+         * @return true when every participant succeeds.
+         */
+        bool forwardHostTokenBatchAcrossDevices(
+            const std::vector<std::vector<int>> &token_batches,
+            bool (IInferenceRunner::*entrypoint)(
+                const std::vector<std::vector<int>> &),
+            const char *operation);
 
         /**
          * @brief Execute forward pass in TP mode (parallel)

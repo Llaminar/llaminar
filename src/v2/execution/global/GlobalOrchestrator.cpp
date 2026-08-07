@@ -1596,6 +1596,66 @@ namespace llaminar2
         return true;
     }
 
+    bool GlobalOrchestrator::forwardGroupedMTPVerifierWithHostTokenIds(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        if (token_batches.empty() ||
+            std::any_of(
+                token_batches.begin(),
+                token_batches.end(),
+                [](const auto &row) { return row.empty(); }))
+        {
+            LOG_ERROR(
+                "GlobalOrchestrator: grouped MTP verifier requires one or "
+                "more non-empty request rows");
+            return false;
+        }
+
+        last_seq_len_ = static_cast<int>(
+            std::max_element(
+                token_batches.begin(),
+                token_batches.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    return lhs.size() < rhs.size();
+                })
+                ->size());
+
+        for (const auto &step : rank_plan_.steps)
+        {
+            switch (step.type)
+            {
+            case GlobalPPRankPlan::Step::Type::EXECUTE_STAGE:
+                if (step.stage_action.role == RankStageAction::Role::EXECUTE &&
+                    !executeGroupedMTPVerifierStage(
+                        step.stage_action,
+                        token_batches))
+                {
+                    LOG_ERROR(
+                        "GlobalOrchestrator: rank " << config_.rank
+                        << " failed grouped MTP verifier stage "
+                        << step.stage_action.stage_id);
+                    return false;
+                }
+                break;
+            case GlobalPPRankPlan::Step::Type::TRANSFER:
+                if (step.transfer_action.direction !=
+                        RankTransferAction::Direction::NONE &&
+                    !executeTransfer(step.transfer_action))
+                {
+                    LOG_ERROR(
+                        "GlobalOrchestrator: rank " << config_.rank
+                        << " failed grouped MTP verifier transfer (peer="
+                        << step.transfer_action.peer_rank
+                        << " tag=" << step.transfer_action.mpi_tag << ")");
+                    return false;
+                }
+                break;
+            }
+        }
+        return true;
+    }
+
     const float *GlobalOrchestrator::logits() const
     {
         // Only the tail rank (with LM head) has valid logits
@@ -2348,6 +2408,24 @@ namespace llaminar2
         // Pipeline head stages consume tokens directly. Middle/tail stages should
         // already have hidden state populated by a preceding transfer/handoff.
         return runner->forward(action.has_embedding ? tokens : nullptr, seq_len);
+    }
+
+    bool GlobalOrchestrator::executeGroupedMTPVerifierStage(
+        const RankStageAction &action,
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        IInferenceRunner *runner =
+            stage_runners_.runnerForStage(action.stage_id);
+        if (!runner)
+        {
+            LOG_ERROR(
+                "GlobalOrchestrator: rank " << config_.rank
+                << " has no grouped-verifier runner for stage "
+                << action.stage_id);
+            return false;
+        }
+        return runner->forwardGroupedMTPVerifierWithHostTokenIds(
+            token_batches);
     }
 
     // =========================================================================

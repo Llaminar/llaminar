@@ -3829,9 +3829,21 @@ namespace
             pytorch_decode_tokens.begin(),
             pytorch_decode_tokens.begin() + test_case.decode_steps);
 
+        constexpr int kPartialPrefixBlockSize = 4;
+        constexpr int kTerminalPartialPrefixTokens = 3;
         const int block_size = mode == PrefixRestoreParityMode::FullHit
                                    ? static_cast<int>(prompt_tokens.size())
-                                   : 4;
+                                   : kPartialPrefixBlockSize;
+        std::unique_ptr<ScopedDebugEnv> partial_prefix_graph_env;
+        if (mode == PrefixRestoreParityMode::PartialHit)
+        {
+            partial_prefix_graph_env =
+                std::make_unique<ScopedDebugEnv>(
+                    std::initializer_list<std::pair<const char *, const char *>>{
+                        {"LLAMINAR_GPU_GRAPHS", "1"},
+                        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                    });
+        }
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -3857,8 +3869,14 @@ namespace
         std::vector<int32_t> first_prompt = prompt_tokens;
         if (mode == PrefixRestoreParityMode::PartialHit)
         {
-            ASSERT_GT(prompt_tokens.size(), 4u);
-            first_prompt.assign(prompt_tokens.begin(), prompt_tokens.begin() + 4);
+            ASSERT_GT(
+                prompt_tokens.size(),
+                static_cast<size_t>(kTerminalPartialPrefixTokens));
+            first_prompt.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() + kTerminalPartialPrefixTokens);
+            ASSERT_NE(first_prompt.size() % static_cast<size_t>(block_size), 0u)
+                << "partial-prefix seed must terminate inside a cache block";
         }
 
         auto first = cached->generate(first_prompt, test_case.decode_steps, greedy);
@@ -3895,7 +3913,9 @@ namespace
         {
             EXPECT_FALSE(after_second.prefix_request.hit);
             EXPECT_TRUE(after_second.prefix_request.partial_hit);
-            EXPECT_EQ(after_second.prefix_request.matched_tokens, 4);
+            EXPECT_EQ(
+                after_second.prefix_request.matched_tokens,
+                kTerminalPartialPrefixTokens);
             EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
         }
     }

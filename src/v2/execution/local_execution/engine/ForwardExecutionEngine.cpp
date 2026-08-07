@@ -38,7 +38,8 @@ namespace llaminar2
             const auto &env = debugEnv();
             PrefillGraphConfig config;
             config.enabled = env.execution.gpu_graphs;
-            config.min_seq_len = env.execution.prefill_graph_min_seq;
+            config.minimum_padded_bucket_seq_len =
+                std::max(1, env.execution.prefill_graph_min_seq);
             config.trace = env.execution.prefill_graph_trace;
             config.buckets_enabled = env.execution.prefill_graph_buckets;
             config.bucket_sizes = env.execution.prefill_graph_bucket_sizes;
@@ -1190,12 +1191,17 @@ namespace llaminar2
         const bool all_position_logits = host.computeAllPositionLogitsEnabled();
         const bool live_mtp_request_batch_condition =
             host.liveMTPRequestBatchConditionEnabled();
-        if (all_position_logits)
+        const bool grouped_mtp_verifier =
+            input.execution_role ==
+            ForwardExecutionRole::GroupedMTPVerifier;
+        if (grouped_mtp_verifier)
         {
             /*
              * A new verifier attempt owns the publication handle. Clear any
-             * earlier row-snapshot producer before execution so a failed verifier
-             * cannot leave stale snapshots publishable.
+             * earlier row-snapshot producer before execution so a failed
+             * verifier cannot leave stale snapshots publishable. All-position
+             * logits alone are insufficient: condition and diagnostic graphs
+             * may also expose multiple rows but do not own verifier state.
              */
             clearLastAllPositionVerifierForwardGraph();
         }
@@ -1219,8 +1225,7 @@ namespace llaminar2
          * accepted-state publication consumes that exact cached graph and stream.
          */
         const bool role_is_decode =
-            input.execution_role ==
-                ForwardExecutionRole::GroupedMTPVerifier ||
+            grouped_mtp_verifier ||
             input.execution_role ==
                 ForwardExecutionRole::MTPCondition;
         const bool is_decode =
@@ -1272,14 +1277,22 @@ namespace llaminar2
             prefillGraphBucketsAtOrBelowCapacity(
                 env.execution.prefill_graph_bucket_sizes,
                 resident_graph_rows);
-        const int input_real_seq_len = effectiveRealSeqLen(input);
-        const bool prefill_graph_min_seq_met =
-            input_real_seq_len >= env.execution.prefill_graph_min_seq;
-
-        // Prefill graph caching: eligible for GPU devices with gpu_graphs enabled.
-        // The minimum-length gate is evaluated against the caller's real input
-        // before any bucket padding so ordinary short prompts take the normal
-        // prefill path instead of becoming unsupported padded graph attempts.
+        std::vector<int> raw_prefill_buckets = resident_prefill_buckets;
+        const int raw_prefill_bucket_floor =
+            std::max(1, env.execution.prefill_graph_min_seq);
+        raw_prefill_buckets.erase(
+            raw_prefill_buckets.begin(),
+            std::lower_bound(
+                raw_prefill_buckets.begin(),
+                raw_prefill_buckets.end(),
+                raw_prefill_bucket_floor));
+        /*
+         * Every homogeneous GPU prefill is graph-cache eligible. The configured
+         * minimum is a physical-bucket coalescing policy, not permission to run
+         * short prompts eagerly: a 35-row prompt with a 256-row floor captures
+         * the 256-row graph. Explicit chunk schedules retain their already-
+         * admitted bucket, including a short terminal tail.
+         */
         const bool prefill_cache_eligible =
             config_.cache_config.enabled &&
             !is_decode &&
@@ -1287,8 +1300,7 @@ namespace llaminar2
             has_stable_forward_inputs &&
             (is_standard_path || is_partial_pp_path) &&
             input.device.is_gpu() &&
-            env.execution.gpu_graphs &&
-            prefill_graph_min_seq_met;
+            env.execution.gpu_graphs;
 
         ForwardInput effective_input = input;
         std::optional<PrefillChunkRuntimePlan> raw_bucket_plan;
@@ -1303,29 +1315,6 @@ namespace llaminar2
                       << " bucket_seq_len=" << effectiveBucketSeqLen(input)
                       << " device=" << input.device.toString());
             return false;
-        }
-
-        if (!is_decode && input.bucket_seq_len <= 0 && env.execution.prefill_graph_buckets &&
-            prefill_graph_min_seq_met && input.token_ids && input.batch_size == 1)
-        {
-            const int real_seq_len = input_real_seq_len;
-            const auto selection = selectPrefillGraphBucket(
-                real_seq_len,
-                resident_prefill_buckets);
-            if (!selection)
-            {
-                LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill graph request rejected: "
-                          << selection.error << " (seq_len=" << input.seq_len << ")");
-                return false;
-            }
-            if (!selection.exact && !prefill_cache_eligible)
-            {
-                // Non-GPU devices cannot use padded graph buckets — fall through
-                // to unbucketed prefill execution (no error, just skip bucketing).
-                LOG_DEBUG("[ForwardExecutionEngine] Skipping padded bucket for non-GPU device: real_seq_len="
-                          << real_seq_len << " bucket_seq_len=" << selection.bucket_seq_len
-                          << " device=" << input.device.toString());
-            }
         }
 
         const bool bucketed_prefill_eligible =
@@ -1367,11 +1356,20 @@ namespace llaminar2
             }
             else
             {
+                if (raw_prefill_buckets.empty())
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] No resident prefill graph bucket meets the configured raw-prompt floor: floor="
+                        << raw_prefill_bucket_floor
+                        << " resident_graph_rows=" << resident_graph_rows
+                        << "; correct the bucket/capacity contract instead of executing eagerly");
+                    return false;
+                }
                 ForwardInput planning_input = input;
                 planning_input.token_offset = effectiveTokenOffset(input);
                 raw_bucket_plan = prepareSinglePrefillChunkRuntimePlan(
                     planning_input,
-                    resident_prefill_buckets,
+                    raw_prefill_buckets,
                     env.execution.prefill_graph_pad_token_id,
                     /*allow_padded_execution=*/true);
                 if (!raw_bucket_plan || !raw_bucket_plan->chunk)
@@ -1517,6 +1515,8 @@ namespace llaminar2
             }
             if (success && forward_signature.is_bucketed_prefill)
                 enforceBucketedPrefillForwardCapacity(&forward_signature);
+            if (success)
+                host.commitSuccessfulForwardOutput(output);
             return success;
         }
 
@@ -1580,6 +1580,8 @@ namespace llaminar2
                       << effective_input.device.toString());
             return false;
         }
+        if (success)
+            host.commitSuccessfulForwardOutput(output);
         return success;
     }
 
@@ -1590,7 +1592,10 @@ namespace llaminar2
         last_executed_forward_graph_.valid = true;
         last_executed_forward_graph_.signature = signature;
         last_executed_forward_graph_.cache_hit = cache_hit;
-        if (signature.decode && signature.all_position_logits)
+        if (signature.execution_role ==
+                ForwardExecutionRole::GroupedMTPVerifier &&
+            signature.decode &&
+            signature.all_position_logits)
         {
             last_all_position_verifier_graph_.valid = true;
             last_all_position_verifier_graph_.signature = signature;

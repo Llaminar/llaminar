@@ -729,24 +729,6 @@ namespace
         bool previous_ = false;
     };
 
-    class ScopedPrefillGraphMinimumSequenceSetting
-    {
-    public:
-        explicit ScopedPrefillGraphMinimumSequenceSetting(int minimum)
-            : previous_(mutableDebugEnv().execution.prefill_graph_min_seq)
-        {
-            mutableDebugEnv().execution.prefill_graph_min_seq = minimum;
-        }
-
-        ~ScopedPrefillGraphMinimumSequenceSetting()
-        {
-            mutableDebugEnv().execution.prefill_graph_min_seq = previous_;
-        }
-
-    private:
-        int previous_ = 0;
-    };
-
     std::filesystem::path uniqueBenchmarkPromptPath()
     {
         static std::atomic<uint64_t> sequence{0};
@@ -991,7 +973,6 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureFailsWhenProbeNeverCap
 {
     ScopedGpuGraphsSetting force_gpu_graphs(true);
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
-    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
     auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
@@ -1013,7 +994,6 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
 {
     ScopedGpuGraphsSetting force_gpu_graphs(true);
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
-    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     PrefixRuntimeStateSnapshot snapshot;
     PrefillGraphRuntimeProbe graph;
@@ -1056,7 +1036,6 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphReplayRejectsMeasuredCapture)
 {
     ScopedGpuGraphsSetting force_gpu_graphs(true);
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
-    ScopedPrefillGraphMinimumSequenceSetting admit_short_fixture(1);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     PrefixRuntimeStateSnapshot snapshot;
     PrefillGraphRuntimeProbe graph;
@@ -1893,6 +1872,15 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
         {{"gateup_codebook_mask", "0x00000028"},
          {"down_codebook_mask", "0x00000008"},
          {"policy_source", "generic_mixed_codebooks"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
+        "cuda_moe_grouped_prefill_swiglu_path_calls",
+        1.0,
+        "moe",
+        "cuda:0",
+        {{"gateup_geometry_contract", "tensor_core_imma"},
+         {"work_scheduler", "compact_directory_grid"},
+         {"policy_source", "tensor_core_imma_prefill"}});
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
     BenchmarkResult result;
@@ -2229,6 +2217,15 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
          {"policy_source", "generic_mixed_codebooks"}});
     PerfStatsCollector::addCounter(
         "kernel",
+        "cuda_moe_grouped_prefill_swiglu_path_calls",
+        1.0,
+        "moe",
+        "cuda:0",
+        {{"gateup_geometry_contract", "tensor_core_imma"},
+         {"work_scheduler", "compact_directory_grid"},
+         {"policy_source", "tensor_core_imma_prefill"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
         "unrelated_warmup_kernel",
         1.0,
         "warmup",
@@ -2268,6 +2265,9 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
     EXPECT_TRUE(has_record(
         "kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"))
         << "A captured MoE graph must retain its exact launch-policy identity";
+    EXPECT_TRUE(has_record(
+        "kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"))
+        << "A captured CUDA MoE graph must retain its persistent IMMA policy identity";
     EXPECT_FALSE(has_record("kernel", "unrelated_warmup_kernel"))
         << "Retaining one immutable kernel route must not retain the whole noisy domain";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))

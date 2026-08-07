@@ -208,6 +208,79 @@ def validate_orchestrator(header: str, source: str) -> list[str]:
     return failures
 
 
+def validate_terminal_hidden_mailbox_lifetime(source: str) -> list[str]:
+    """Require one initialization-owned MTP terminal-hidden mailbox.
+
+    CPU executable graphs and GPU captured graphs both retain the mailbox
+    tensor address.  Runtime allocation or rebinding can therefore leave an
+    already-cached stage pointing at freed storage even when the replacement
+    tensor has sufficient capacity.
+    """
+
+    failures: list[str] = []
+    initialize_body = extract_function(
+        source,
+        "DeviceGraphOrchestrator::initializeBuffers",
+    )
+    ensure_body = extract_function(
+        source,
+        "DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer",
+    )
+
+    if not initialize_body:
+        failures.append("DeviceGraphOrchestrator initializeBuffers body is missing")
+    else:
+        for required in (
+            "resolveMTPTerminalHiddenRowCapacity(",
+            "registerBuffer(",
+            "BufferId::PREFIX_TERMINAL_HIDDEN",
+            "getSharedTensor(BufferId::PREFIX_TERMINAL_HIDDEN)",
+        ):
+            if required not in initialize_body:
+                failures.append(
+                    "MTP terminal-hidden mailbox initialization is missing: "
+                    f"{required}"
+                )
+
+    if not ensure_body:
+        return failures + [
+            "DeviceGraphOrchestrator ensureMTPTerminalHiddenBuffer body is missing"
+        ]
+
+    for required in ("getSharedTensor(",):
+        if required not in ensure_body:
+            failures.append(
+                "MTP terminal-hidden runtime validator is missing immutable-owner "
+                f"check: {required}"
+            )
+    if not re.search(
+        r"state_\.prefix_terminal_hidden\s*(?:==|!=)\s*arena_owner",
+        ensure_body,
+    ):
+        failures.append(
+            "MTP terminal-hidden runtime validator does not compare state ownership "
+            "with the arena owner"
+        )
+
+    for forbidden in (
+        "createFP32(",
+        "registerExternalBuffer(",
+        "bindExternalBuffer(",
+        "state_.prefix_terminal_hidden.reset(",
+    ):
+        if forbidden in ensure_body:
+            failures.append(
+                "MTP terminal-hidden runtime validator contains forbidden "
+                f"lifetime mutation: {forbidden}"
+            )
+    if re.search(r"state_\.prefix_terminal_hidden\s*=(?!=)", ensure_body):
+        failures.append(
+            "MTP terminal-hidden runtime validator contains forbidden lifetime "
+            "mutation: state_.prefix_terminal_hidden assignment"
+        )
+    return failures
+
+
 def validate_obsolete_symbols(repo_root: pathlib.Path) -> list[str]:
     """Reject retired cache lifecycle names anywhere in production source."""
 
@@ -249,6 +322,11 @@ def validate(repo_root: pathlib.Path) -> list[str]:
         validate_orchestrator(
             orchestrator_header_path.read_text(encoding="utf-8"),
             orchestrator_source_path.read_text(encoding="utf-8"),
+        )
+    )
+    failures.extend(
+        validate_terminal_hidden_mailbox_lifetime(
+            orchestrator_source_path.read_text(encoding="utf-8")
         )
     )
     failures.extend(validate_obsolete_symbols(repo_root))

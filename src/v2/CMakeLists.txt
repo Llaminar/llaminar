@@ -364,6 +364,7 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeVNNIGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
+        kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)

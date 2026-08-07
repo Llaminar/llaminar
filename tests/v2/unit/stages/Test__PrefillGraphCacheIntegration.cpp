@@ -122,7 +122,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     // Create prefill cache with a warmed-up entry
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -145,7 +145,7 @@ TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillExecutabl
 
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -171,7 +171,7 @@ TEST(Test__PrefillGraphCacheIntegration, WorkspaceRebindInvalidatesPrefillCache)
 
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -197,7 +197,7 @@ TEST(Test__PrefillGraphCacheIntegration, PhaseTransitionsInForwardGraphCache)
     ForwardGraphCache fwd_cache;
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     fwd_cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     auto dev = testGPUDevice();
@@ -230,7 +230,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCPUDevice)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto cpu_dev = DeviceId::cpu();
@@ -256,7 +256,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightAllowsSnapshots)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -280,7 +280,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -297,26 +297,33 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
 }
 
 // =============================================================================
-// Test: Preflight rejects when seq_len below minimum
+// Test: Preflight rejects padded physical buckets below the coalescing floor
 // =============================================================================
 
-TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsShortSeqLen)
+TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsPaddedBucketBelowFloor)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 256;
+    config.minimum_padded_bucket_seq_len = 256;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
     auto graph = buildIntegCapturableGraph(dev);
 
     PrefillGraphCacheKey key;
-    key.seq_len = 128; // Below min_seq_len=256
+    key.seq_len = 128;
     key.device_id = dev;
 
     std::unordered_set<std::string> no_collectives;
-    auto reason = cache.preflight(graph, key, &no_collectives, false, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SeqLenBelowMinimum);
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &no_collectives,
+        false,
+        false,
+        /*real_seq_len=*/64,
+        /*bucket_seq_len=*/128);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum);
 }
 
 // =============================================================================
@@ -327,7 +334,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCollectives)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -350,7 +357,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -453,6 +460,10 @@ namespace
         {
             return true;
         }
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &) override
+        {
+        }
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool, IDeviceContext *) const override
         {
@@ -506,7 +517,7 @@ TEST(Test__PrefillGraphCacheIntegration, UnknownKeyReturnsCold)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     PrefillGraphCacheKey key;
@@ -524,7 +535,7 @@ TEST(Test__PrefillGraphCacheIntegration, MultipleSeqLenIndependent)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -556,7 +567,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllResetsEntries)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -586,7 +597,7 @@ TEST(Test__PrefillGraphCacheIntegration, RejectReasonToString)
 {
     EXPECT_NE(toString(PrefillGraphRejectReason::None), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::FeatureDisabled), nullptr);
-    EXPECT_NE(toString(PrefillGraphRejectReason::SeqLenBelowMinimum), nullptr);
+    EXPECT_NE(toString(PrefillGraphRejectReason::PaddedBucketBelowMinimum), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::NotGPUDevice), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::SnapshotsActive), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::ActiveMoERebalancing), nullptr);

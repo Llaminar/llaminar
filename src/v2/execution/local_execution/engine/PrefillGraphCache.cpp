@@ -109,8 +109,8 @@ namespace llaminar2
             return "None";
         case PrefillGraphRejectReason::FeatureDisabled:
             return "FeatureDisabled";
-        case PrefillGraphRejectReason::SeqLenBelowMinimum:
-            return "SeqLenBelowMinimum";
+        case PrefillGraphRejectReason::PaddedBucketBelowMinimum:
+            return "PaddedBucketBelowMinimum";
         case PrefillGraphRejectReason::NotGPUDevice:
             return "NotGPUDevice";
         case PrefillGraphRejectReason::SnapshotsActive:
@@ -235,9 +235,6 @@ namespace llaminar2
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
-        if (key.seq_len < config_.min_seq_len)
-            return PrefillGraphRejectReason::SeqLenBelowMinimum;
-
         if (!key.device_id.is_gpu())
             return PrefillGraphRejectReason::NotGPUDevice;
 
@@ -245,6 +242,8 @@ namespace llaminar2
 
         const bool padded_bucket =
             real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
+        if (padded_bucket && bucket_seq_len < config_.minimum_padded_bucket_seq_len)
+            return PrefillGraphRejectReason::PaddedBucketBelowMinimum;
         const bool support_only_preflight = mode != PrefillGraphPreflightMode::CaptureReady;
         const bool cold_padded_preflight =
             padded_bucket && support_only_preflight;

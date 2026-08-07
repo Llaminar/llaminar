@@ -15,6 +15,7 @@
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
 #include "../kernels/GDNDeviceStateBinding.h"
+#include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <cstddef>
@@ -31,49 +32,6 @@ namespace llaminar2
     struct PreparedEmbeddingHandle;
     struct Q8_1Block;
     class IDeviceContext; // For kernel execute() interface
-
-    /**
-     * @brief Device-readable native-VNNI matrix descriptor.
-     *
-     * This intentionally carries only raw device pointers and compact format
-     * metadata so MoE grouped kernels can select expert weights by descriptor
-     * without depending on backend-specific GEMM classes.
-     */
-    struct DeviceNativeVNNIMatrixDesc
-    {
-        const uint8_t *payload = nullptr;
-        const void *scales = nullptr;
-        const void *mins = nullptr;
-        const void *emins = nullptr;
-        int n = 0;
-        int k = 0;
-        uint32_t blocks_per_row = 0;
-        uint8_t codebook_id = 0;
-        /**
-         * @brief Payload bytes available per quantization block in this allocation.
-         *
-         * Ordinary immutable weight descriptors leave this field at zero because
-         * their allocation exactly matches @ref codebook_id. Reusable transfer
-         * slots set it explicitly so a slot can retain stable pointers while its
-         * active codebook metadata is retargeted for each arriving expert.
-         */
-        uint8_t allocation_payload_bytes_per_block = 0;
-
-        /**
-         * @brief Whether this allocation owns a per-block minimums array.
-         */
-        uint8_t allocation_has_mins = 0;
-
-        /**
-         * @brief Whether this allocation owns a per-block extended-minimums array.
-         */
-        uint8_t allocation_has_emins = 0;
-
-        bool valid() const
-        {
-            return payload && scales && n > 0 && k > 0 && blocks_per_row > 0;
-        }
-    };
 
     // =============================================================================
     // Fused Operation Configuration

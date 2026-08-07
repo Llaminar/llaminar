@@ -2401,10 +2401,10 @@ TEST_F(
             sync_deferral_pos - restore_clear_pos);
     EXPECT_NE(
         restore_clear_body.find(
-            "forward_graph_output_ready_.valid = false"),
+            "clearForwardGraphOutputPublications();"),
         std::string::npos)
-        << "Prefix restore must invalidate forward provenance for the "
-           "discarded logits timeline.";
+        << "Prefix restore must invalidate every typed forward-output "
+           "publication for the discarded logits timeline.";
     EXPECT_EQ(populate_body.find("prefix_cache_->retain"), std::string::npos);
     EXPECT_EQ(terminal_restore_body.find("prefix_cache_->retain"), std::string::npos);
 

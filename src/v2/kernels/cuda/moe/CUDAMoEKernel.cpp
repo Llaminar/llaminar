@@ -13,6 +13,7 @@
 #include "CUDAMoEBatchInvariantPolicy.h"
 
 #include "../gemm/CUDADeviceWorkspace.h"
+#include "../gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
@@ -581,6 +582,7 @@ namespace
         int tile_n,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
+        bool use_grouped_imma,
         bool use_gateup_kpart,
         bool fuse_swiglu_requested,
         bool use_ordered_down_kpart,
@@ -599,10 +601,21 @@ namespace
          * authoritative geometry owner so tests and profilers cannot confuse
          * two launch families with different arithmetic contracts.
          */
-        tags["gateup_geometry_contract"] =
-            use_gateup_kpart ? "ordered_split_k" : "full_k";
-        tags["row_tile_source"] =
-            use_gateup_kpart ? "splitk_tile_rows" : "tile_m";
+        tags["gateup_geometry_contract"] = use_grouped_imma
+                                                   ? "tensor_core_imma"
+                                                   : (use_gateup_kpart
+                                                          ? "ordered_split_k"
+                                                          : "full_k");
+        tags["row_tile_source"] = use_grouped_imma
+                                          ? "device_work_directory"
+                                          : (use_gateup_kpart
+                                                 ? "splitk_tile_rows"
+                                                 : "tile_m");
+        if (use_grouped_imma)
+        {
+            tags["work_scheduler"] = "compact_directory_grid";
+            tags["empty_directory_tail"] = "sentinel_cta_exit";
+        }
         tags["gateup_codebook_mask"] =
             cudaCodebookMaskTag(gateup_codebook_mask);
         tags["down_codebook_mask"] =
@@ -634,25 +647,42 @@ namespace
                 1.0, {}, {}, tags);
         }
 
-        tags["swiglu_path"] =
-            (use_gateup_kpart || fuse_swiglu_requested) ? "fused" : "split";
+        tags["swiglu_path"] = use_grouped_imma
+                                      ? "split_exact_quantizer"
+                                      : ((use_gateup_kpart ||
+                                          fuse_swiglu_requested)
+                                             ? "fused"
+                                             : "split");
         tags["requested_fused_swiglu"] = fuse_swiglu_requested ? "true" : "false";
         if (active_expert_slots > 0)
         {
-            if (use_gateup_kpart)
+            if (use_grouped_imma)
+                tags["gateup_route"] = "grouped_imma_prefill";
+            else if (use_gateup_kpart)
                 tags["gateup_route"] = "kpart_prefill";
             else
                 tags["gateup_route"] = fuse_swiglu_requested
                                            ? "fullk_fused_swiglu_prefill"
                                            : "fullk_prefill";
 
-            tags["down_route"] = use_ordered_down_kpart
-                                     ? "ordered_kpart_prefill"
-                                     : "grouped_prefill";
-            tags["down_accumulation"] = use_ordered_down_kpart
-                                            ? "row_ordered_kpart"
-                                            : (ordered_scatter ? "row_ordered"
-                                                               : "slot_scatter");
+            tags["down_route"] = use_grouped_imma
+                                         ? "grouped_imma_prefill"
+                                         : (use_ordered_down_kpart
+                                                ? "ordered_kpart_prefill"
+                                                : "grouped_prefill");
+            tags["down_accumulation"] = use_grouped_imma
+                                                ? "serial_m1_kpart_in_cta"
+                                                : (use_ordered_down_kpart
+                                                       ? "row_ordered_kpart"
+                                                       : (ordered_scatter
+                                                              ? "row_ordered"
+                                                              : "slot_scatter"));
+            if (use_grouped_imma)
+            {
+                tags["down_publication"] = canonical_route_publication
+                                                ? "route_major_collective"
+                                                : "ordered_direct";
+            }
             if (use_ordered_down_kpart)
             {
                 tags["down_publication"] = canonical_route_publication
@@ -1550,6 +1580,8 @@ extern "C"
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
+        uint32_t *d_group_work_directory,
+        int group_work_directory_entries,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
@@ -1583,6 +1615,8 @@ extern "C"
         int gateup_ordered_tile_n,
         int down_k_partitions,
         int splitk_tile_rows,
+        llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine
+            projection_engine,
         int device_idx,
         void *stream);
 
@@ -1812,6 +1846,8 @@ namespace llaminar2
         d_prefill_swiglu_scales_ = nullptr;
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
+        d_prefill_imma_directory_ = nullptr;
+        prefill_imma_directory_entries_cap_ = 0;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
@@ -2446,6 +2482,48 @@ namespace llaminar2
         prefill_slots_cap_ = total_slots;
         prefill_d_model_cap_ = d_model;
         prefill_intermediate_cap_ = intermediate;
+        return true;
+    }
+
+    bool CUDAMoEKernel::ensureGroupedImmaDirectoryCapacity(
+        int total_slots,
+        int num_experts)
+    {
+        if (total_slots <= 0 || num_experts <= 0 ||
+            num_experts > cuda::moe::kGroupedImmaMaximumExperts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::ensureGroupedImmaDirectoryCapacity] "
+                      "invalid grouped IMMA geometry total_slots="
+                      << total_slots << " num_experts=" << num_experts);
+            return false;
+        }
+
+        const std::size_t required_entries =
+            cuda::moe::groupedImmaDirectoryEntries(
+                static_cast<std::size_t>(total_slots),
+                static_cast<std::size_t>(num_experts));
+        if (d_prefill_imma_directory_ &&
+            prefill_imma_directory_entries_cap_ >=
+                static_cast<int>(required_entries))
+        {
+            return true;
+        }
+
+        void *directory = nullptr;
+        if (!bindWorkspaceBuffer(
+                &directory,
+                MoEWorkspaceBuffers::CUDA_PREFILL_WORK_DIRECTORY,
+                required_entries * sizeof(uint32_t),
+                "grouped IMMA work directory"))
+        {
+            d_prefill_imma_directory_ = nullptr;
+            prefill_imma_directory_entries_cap_ = 0;
+            return false;
+        }
+
+        d_prefill_imma_directory_ = static_cast<uint32_t *>(directory);
+        prefill_imma_directory_entries_cap_ =
+            static_cast<int>(required_entries);
         return true;
     }
 
@@ -6668,8 +6746,15 @@ namespace llaminar2
         const int active_expert_slots = group_active_expert_slots_;
         const int *d_active_expert_ids =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        const bool use_gateup_kpart = active_expert_slots > 0;
-        const CUDAMoEProductionPrefillPolicy prefill_policy =
+        const auto projection_engine =
+            CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(seq_len);
+        const bool use_grouped_imma =
+            projection_engine ==
+            CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine::
+                TensorCoreImmaPrefill;
+        const bool use_gateup_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
@@ -6679,7 +6764,13 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 use_gateup_kpart);
-        if (!validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        if (use_grouped_imma)
+        {
+            prefill_policy.gateup_tile_n = 32;
+            prefill_policy.source = "tensor_core_imma_prefill";
+        }
+        if (use_gateup_kpart &&
+            !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
                       "capture-time prefill policy is invalid"
@@ -6707,7 +6798,8 @@ namespace llaminar2
                       "decode-equivalent grouped prefill requires ordered route maps");
             return false;
         }
-        const bool use_down_ordered_kpart = active_expert_slots > 0;
+        const bool use_down_ordered_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
         const bool publishes_canonical_routes =
             canonical_route_contributions != nullptr;
         if (use_down_ordered_kpart && publishes_canonical_routes &&
@@ -6727,6 +6819,8 @@ namespace llaminar2
                                                   ? "canonical_route_contributions"
                                                   : "output";
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
+            (use_grouped_imma &&
+             !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
             !requireTensorOnDevice(hidden, device, stream, "hidden") ||
             !requireOutputOnDevice(
                 publication_output,
@@ -6834,6 +6928,10 @@ namespace llaminar2
             down_table.device_descs,
             d_group_counts_,
             d_group_offsets_,
+            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+            use_grouped_imma
+                ? prefill_imma_directory_entries_cap_
+                : 0,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
             use_gateup_kpart || use_down_ordered_kpart
@@ -6871,6 +6969,7 @@ namespace llaminar2
             prefill_policy.gateup_tile_n,
             use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
+            projection_engine,
             device_ordinal_,
             stream);
         if (!ok)
@@ -6898,11 +6997,13 @@ namespace llaminar2
                 : output,
             device,
             stream);
-        const int selected_tile_m = use_gateup_kpart
-                                        ? 0
-                                        : selectGroupedPrefillTileM(
-                                              debugEnv().gemm.cuda_moe_prefill_tile_m,
-                                              max_tokens_per_expert);
+        const int selected_tile_m = use_grouped_imma
+                                        ? cuda::moe::kGroupedImmaTileRows
+                                        : (use_gateup_kpart
+                                               ? 0
+                                               : selectGroupedPrefillTileM(
+                                                     debugEnv().gemm.cuda_moe_prefill_tile_m,
+                                                     max_tokens_per_expert));
         const int selected_tile_n = prefill_policy.gateup_tile_n;
         recordGroupedPrefillCounters(
             seq_len,
@@ -6913,6 +7014,7 @@ namespace llaminar2
             selected_tile_n,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
+            use_grouped_imma,
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
@@ -6989,8 +7091,15 @@ namespace llaminar2
             std::min(seq_len, MoEWorkspaceBuffers::kVerifierSplitKTileRows);
         const int splitk_route_slots = splitk_tile_rows * top_k;
         const int active_expert_slots = std::min(total_slots, num_experts);
-        const bool use_gateup_kpart = active_expert_slots > 0;
-        const CUDAMoEProductionPrefillPolicy prefill_policy =
+        const auto projection_engine =
+            CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(seq_len);
+        const bool use_grouped_imma =
+            projection_engine ==
+            CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine::
+                TensorCoreImmaPrefill;
+        const bool use_gateup_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
@@ -7000,7 +7109,13 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 use_gateup_kpart);
-        if (!validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        if (use_grouped_imma)
+        {
+            prefill_policy.gateup_tile_n = 32;
+            prefill_policy.source = "tensor_core_imma_prefill";
+        }
+        if (use_gateup_kpart &&
+            !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
                       "capture-time prefill policy is invalid"
@@ -7030,7 +7145,8 @@ namespace llaminar2
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
-        const bool use_down_ordered_kpart = active_expert_slots > 0;
+        const bool use_down_ordered_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
         const bool publishes_canonical_routes =
             canonical_route_contributions != nullptr;
         if ((use_gateup_kpart || use_down_ordered_kpart) &&
@@ -7058,6 +7174,8 @@ namespace llaminar2
                                                   : "output";
         if (!ensureGroupingBufferCapacity(total_slots, num_experts) ||
             !ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
+            (use_grouped_imma &&
+             !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
             !requireTensorOnDevice(hidden, device, stream, "hidden") ||
             !requireOutputOnDevice(
                 publication_output,
@@ -7154,6 +7272,10 @@ namespace llaminar2
             runtime_down_descs,
             runtime_host_layer.expert_counts,
             runtime_host_layer.expert_offsets,
+            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+            use_grouped_imma
+                ? prefill_imma_directory_entries_cap_
+                : 0,
             runtime_host_layer.grouped_token_ids,
             d_group_original_to_grouped_,
             use_gateup_kpart || use_down_ordered_kpart
@@ -7191,6 +7313,7 @@ namespace llaminar2
             prefill_policy.gateup_tile_n,
             use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
+            projection_engine,
             device_ordinal_,
             stream);
         if (!ok)
@@ -7223,14 +7346,17 @@ namespace llaminar2
             top_k,
             num_experts,
             active_expert_slots,
-            use_gateup_kpart
-                ? 0
-                : selectGroupedPrefillTileM(
-                      debugEnv().gemm.cuda_moe_prefill_tile_m,
-                      max_tokens_per_expert),
+            use_grouped_imma
+                ? cuda::moe::kGroupedImmaTileRows
+                : (use_gateup_kpart
+                       ? 0
+                       : selectGroupedPrefillTileM(
+                             debugEnv().gemm.cuda_moe_prefill_tile_m,
+                             max_tokens_per_expert)),
             prefill_policy.gateup_tile_n,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
+            use_grouped_imma,
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,

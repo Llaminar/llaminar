@@ -61,6 +61,7 @@ namespace
         uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
         TensorBase *last_published_logits = nullptr;
+        int committed_forward_output_calls = 0;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
         int get_pipeline_contexts_calls = 0;
@@ -157,6 +158,13 @@ namespace
             sync_logits_calls++;
             call_sequence.push_back("syncLogits");
             return true;
+        }
+
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &) override
+        {
+            ++committed_forward_output_calls;
+            call_sequence.push_back("commitForwardOutput");
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(

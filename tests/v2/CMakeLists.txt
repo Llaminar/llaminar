@@ -2281,6 +2281,15 @@ add_test(NAME V2_Unit_NativeVNNIProductionDensePrefillSweep
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_dense_prefill_sweep.py
 )
+
+add_test(NAME V2_Unit_Aime25HttpBenchmark
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_aime25_http_benchmark.py
+)
+set_tests_properties(V2_Unit_Aime25HttpBenchmark PROPERTIES
+    LABELS "V2;Unit;Benchmark;HTTP;Server;MultiTurn;AIME25;Math;Resume;Regression"
+    TIMEOUT 30
+)
 set_tests_properties(V2_Unit_NativeVNNIProductionDensePrefillSweep PROPERTIES
     LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dense;Prefill;AllFormat;Trainer;Resume;Regression"
     TIMEOUT 30
@@ -6311,6 +6320,22 @@ add_v2_test(V2_Perf_CUDANativeVNNIGemm
     LABELS "V2;Performance;CUDA;GEMM;Prefill;NativeVNNI;Codebook;Qwen;Tuning;StreamK;Sweep"
     MPI_PROCS 1
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+        COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
+                --gtest_filter=CUDANativeVNNIGemmPerf.CompilerResources_AllCodebooksAndCandidates
+        LABELS "V2;Integration;CUDA;GEMM;Prefill;NativeVNNI;AllFormats;Resources;Occupancy;NoSpills;Regression"
+        MPI_PROCS 1
+    )
+    if(TEST V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks)
+        set_tests_properties(
+            V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+            PROPERTIES
+                RESOURCE_LOCK cuda_gpu_0
+                TIMEOUT 30
+        )
+    endif()
+endif()
 
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16

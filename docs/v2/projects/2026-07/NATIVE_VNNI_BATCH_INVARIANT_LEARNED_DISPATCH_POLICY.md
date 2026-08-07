@@ -1,7 +1,7 @@
 # Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy
 
 - **Date**: 2026-07-18
-- **Status**: Implementation in progress. Exact-point profiler evidence, resumable collection, accelerator-backed fitting, generic totality checks, and authenticated promotion criteria are implemented. The shared overlay inventory covers every declared production geometry and all 21 runtime formats on CPU, CUDA, and ROCm. Decode is measured at M=1 and grouped verification at M=2..16 plus M=31. Best-effort CPU, CUDA, and ROCm M1/grouped policies are installed and production-route smoke-tested; their manually relaxed publication does not satisfy the normal 95%-of-domains, p95-under-5% promotion criterion. Ordinary prefill is intentionally heuristic-only on all three backends, remains total beyond measured points, and must not fail closed on a missing generated corpus. The 2026-07-23 unit gate passes 576/576. The immediate milestone is the full-context MTP E2E matrix, followed by economical retuning of the installed M1/grouped policies. No performance override may waive byte equality, runtime totality, evidence completeness, or route correctness.
+- **Status**: Implementation in progress. Exact-point profiler evidence, resumable collection, accelerator-backed fitting, generic totality checks, and authenticated promotion criteria are implemented. The shared overlay inventory covers every declared production geometry and all 21 runtime formats on CPU, CUDA, and ROCm. Decode is measured at M=1 and grouped verification at M=2..16 plus M=31. Best-effort CPU, CUDA, and ROCm M1/grouped policies are installed and production-route smoke-tested; their manually relaxed publication does not satisfy the normal 95%-of-domains, p95-under-5% promotion criterion. GPU prefill now has separate all-format dense and real mixed-format routed-MoE exact-overlay transactions. They authenticate Release executable closure, native event samples, candidate resources, byte correctness, and per-cell commits; the MoE transaction supports content-addressed additive geometry/M plans. The total generic prefill dispatch remains responsible for unseen positive M and N/K points. CUDA dense evidence collection and the subsequent CUDA/ROCm routed-MoE collection/installation are active milestones, followed by full-context MTP E2E and economy gates. No performance override may waive byte equality, runtime totality, evidence completeness, or route correctness.
 - **Scope**: CPU, CUDA, and ROCm NativeVNNI GEMV/GEMM dispatch for `Fast M=1`, a frozen serial-M1 oracle, bitwise MTP verifier rows `M=2..16` plus the deeper M31 sentinel, and ordinary full-K prefill/large-M GEMM policy generation
 - **Parent project**: [vLLM-Style MTP Project Plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md)
 - **Evidence dashboard**: [vLLM-Style MTP Tuning Dashboard](../2026-06/MTP_VLLM_STYLE_TUNING_DASHBOARD.md)
@@ -3809,6 +3809,11 @@ Common runtime and refresh:
 - `scripts/refresh_native_vnni_dispatch_tables.sh`
 - `tests/v2/performance/kernels/native_vnni_codebooks.py`
 - `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
+- `tests/v2/performance/kernels/native_vnni_dispatch/corpus_provenance.py`
+- `tests/v2/performance/kernels/native_vnni_dispatch/production_dense_prefill_sweep.py`
+- `tests/v2/performance/kernels/native_vnni_dispatch/dense_production_overlay.py`
+- `tests/v2/performance/kernels/native_vnni_dispatch/production_moe_prefill_sweep.py`
+- `tests/v2/performance/kernels/native_vnni_dispatch/moe_production_overlay.py`
 
 CUDA:
 

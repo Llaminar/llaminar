@@ -21,13 +21,17 @@ from typing import Mapping, Sequence
 
 from .production_dense_prefill_sweep import (
     DEFAULT_BENCH_RUNS,
+    DEFAULT_WARMUP_RUNS,
+    SWEEP_PLAN_FILENAME,
     DensePrefillCell,
+    _cuda_candidate_is_spill_free,
     _read_aggregate_rows,
     _read_timing_rows,
     dense_prefill_candidate_ids,
+    load_planned_dense_prefill_cells,
+    load_sweep_plan,
     production_dense_prefill_cell_paths,
-    production_dense_prefill_cells,
-    validate_production_dense_prefill_cell,
+    validate_promoted_production_dense_prefill_cell,
 )
 
 
@@ -54,6 +58,119 @@ class DenseOverlayEntry:
     geometric_mean_regret: float
     maximum_alias_regret: float
     geometric_mean_speedup_vs_auto: float
+
+
+def _expected_overlay_inventory(
+    cells: Sequence[DensePrefillCell],
+    backend: str,
+) -> dict[DenseOverlayKey, tuple[tuple[str, ...], tuple[str, ...]]]:
+    """Collapse source cells into the exact runtime-visible key inventory."""
+
+    grouped: dict[DenseOverlayKey, tuple[set[str], set[str]]] = {}
+    for cell in cells:
+        if cell.backend != backend:
+            raise ValueError(
+                "dense overlay totality inventory contains a foreign backend"
+            )
+        key = DenseOverlayKey(
+            execution_codebook=cell.source_format.runtime_codebook(backend),
+            m=cell.m,
+            n=cell.shape.n,
+            k=cell.shape.k,
+        )
+        source_formats, shape_names = grouped.setdefault(
+            key, (set(), set())
+        )
+        source_formats.add(cell.source_format.label)
+        shape_names.add(cell.shape.name)
+    return {
+        key: (tuple(sorted(source_formats)), tuple(sorted(shape_names)))
+        for key, (source_formats, shape_names) in grouped.items()
+    }
+
+
+def validate_dense_overlay_totality(
+    entries: Sequence[DenseOverlayEntry],
+    cells: Sequence[DensePrefillCell],
+    backend: str,
+) -> None:
+    """Prove exact-key totality, alias coverage, and launch eligibility.
+
+    Exact overlays are additive to generic dispatch, but every cell named by an
+    immutable sweep plan must install exactly one runtime key.  This gate also
+    checks that CUDA winners remain inside the compiler-proven no-spill launch
+    inventory.  It runs before publication, making a partial or stale include
+    structurally impossible to install through the turnkey generator.
+    """
+
+    normalized = backend.strip().lower()
+    expected = _expected_overlay_inventory(cells, normalized)
+    observed: dict[DenseOverlayKey, DenseOverlayEntry] = {}
+    for entry in entries:
+        if entry.backend != normalized:
+            raise ValueError(
+                "dense overlay totality received a foreign backend entry"
+            )
+        if entry.key in observed:
+            raise ValueError(f"duplicate dense overlay key: {entry.key}")
+        observed[entry.key] = entry
+
+    missing = sorted(set(expected) - set(observed))
+    unexpected = sorted(set(observed) - set(expected))
+    if missing or unexpected:
+        raise ValueError(
+            "dense overlay is not total for its immutable sweep plan: "
+            f"missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+    if tuple(entry.key for entry in entries) != tuple(sorted(expected)):
+        raise ValueError("dense overlay keys are not strictly sorted")
+
+    for key, entry in observed.items():
+        expected_formats, expected_shapes = expected[key]
+        if entry.source_formats != expected_formats:
+            raise ValueError(
+                f"{key}: source alias coverage mismatch: "
+                f"expected={expected_formats} observed={entry.source_formats}"
+            )
+        if entry.shape_names != expected_shapes:
+            raise ValueError(
+                f"{key}: exact geometry-name coverage mismatch: "
+                f"expected={expected_shapes} observed={entry.shape_names}"
+            )
+
+        if normalized != "cuda":
+            continue
+        tile_id, k_partitions, bk256, canonical_kpart = entry.launch
+        if bk256:
+            if (
+                key.execution_codebook != 0
+                or tile_id not in {-3, -2}
+                or k_partitions != 1
+                or canonical_kpart
+            ):
+                raise ValueError(f"{key}: invalid CUDA BK256 exact winner")
+            continue
+        if tile_id not in range(6):
+            raise ValueError(f"{key}: invalid CUDA BK64 tile {tile_id}")
+        if canonical_kpart:
+            if k_partitions <= 1:
+                raise ValueError(
+                    f"{key}: canonical CUDA winner has no K partitioning"
+                )
+            candidate = f"KPART:t{tile_id}"
+        else:
+            if k_partitions != 1:
+                raise ValueError(
+                    f"{key}: direct CUDA winner has an invalid partition count"
+                )
+            candidate = f"STD:t{tile_id}:full"
+        if not _cuda_candidate_is_spill_free(
+            key.execution_codebook, candidate
+        ):
+            raise ValueError(
+                f"{key}: CUDA exact winner {candidate} is compiler-proven "
+                "to spill and is ineligible for production"
+            )
 
 
 def _launch_tuple(
@@ -87,14 +204,33 @@ def collect_dense_overlay_entries(
     backend: str,
     *,
     cells: Sequence[DensePrefillCell] | None = None,
+    warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
 ) -> tuple[DenseOverlayEntry, ...]:
     """Validate cells and pool source aliases into runtime dispatch entries."""
 
     normalized = backend.strip().lower()
-    selected_cells = tuple(
-        production_dense_prefill_cells(normalized) if cells is None else cells
-    )
+    if cells is None:
+        selected_cells, plan = load_planned_dense_prefill_cells(
+            Path(root) / SWEEP_PLAN_FILENAME,
+            normalized,
+        )
+        if (
+            int(plan["warmup_runs"]) != warmup_runs
+            or int(plan["bench_runs"]) != bench_runs
+        ):
+            raise ValueError(
+                "overlay timing cardinality disagrees with the sweep plan"
+            )
+    else:
+        selected_cells = tuple(cells)
+        plan = load_sweep_plan(
+            Path(root) / SWEEP_PLAN_FILENAME,
+            normalized,
+            selected_cells,
+            warmup_runs=warmup_runs,
+            bench_runs=bench_runs,
+        )
     if not selected_cells or any(
         cell.backend != normalized for cell in selected_cells
     ):
@@ -112,11 +248,10 @@ def collect_dense_overlay_entries(
     ] = {}
     for cell in selected_cells:
         paths = production_dense_prefill_cell_paths(root, cell)
-        validate_production_dense_prefill_cell(
-            paths.aggregate,
-            paths.timing,
+        validate_promoted_production_dense_prefill_cell(
+            root,
             cell,
-            bench_runs=bench_runs,
+            plan,
         )
         aggregate = _read_aggregate_rows(paths.aggregate, cell)
         timing = _read_timing_rows(
@@ -143,9 +278,14 @@ def collect_dense_overlay_entries(
         shape_names = tuple(sorted({
             cell.shape.name for cell, _, _ in observations
         }))
+        # The aggregate parser has already authenticated the exact launchable
+        # candidate set, including the geometry-dependent canonical-KPART
+        # availability marker. Reconstructing a format-only inventory here
+        # would reintroduce KPART candidates for shapes whose K geometry yields
+        # only one partition and has no corresponding timing evidence.
         candidate_sets = [
-            set(dense_prefill_candidate_ids(normalized, cell.source_format))
-            for cell, _, _ in observations
+            set(aggregate)
+            for _, aggregate, _ in observations
         ]
         common_candidates = set.intersection(*candidate_sets)
         if not common_candidates:
@@ -211,7 +351,13 @@ def collect_dense_overlay_entries(
             maximum_alias_regret=scores[winner][1] - 1.0,
             geometric_mean_speedup_vs_auto=_geometric_mean(auto_speedups),
         ))
-    return tuple(result)
+    entries = tuple(result)
+    validate_dense_overlay_totality(
+        entries,
+        selected_cells,
+        normalized,
+    )
+    return entries
 
 
 def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
@@ -487,11 +633,13 @@ def main() -> int:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary-csv", type=Path, required=True)
+    parser.add_argument("--warmup-runs", type=int, default=DEFAULT_WARMUP_RUNS)
     parser.add_argument("--bench-runs", type=int, default=DEFAULT_BENCH_RUNS)
     args = parser.parse_args()
     entries = collect_dense_overlay_entries(
         args.work_dir,
         args.backend,
+        warmup_runs=args.warmup_runs,
         bench_runs=args.bench_runs,
     )
     write_dense_overlay(args.output, entries)

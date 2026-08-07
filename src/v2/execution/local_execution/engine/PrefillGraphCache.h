@@ -75,7 +75,7 @@ namespace llaminar2
     {
         None,
         FeatureDisabled,        ///< LLAMINAR_GPU_GRAPHS=0
-        SeqLenBelowMinimum,     ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        PaddedBucketBelowMinimum, ///< Padded physical bucket is below the configured coalescing floor
         NotGPUDevice,           ///< CPU device
         SnapshotsActive,        ///< Obsolete: snapshots are post-graph diagnostics.
         ActiveMoERebalancing,   ///< Non-graph-stable dynamic MoE rebalance is active for a padded bucket
@@ -96,7 +96,7 @@ namespace llaminar2
     struct PrefillGraphConfig
     {
         bool enabled = true;                 ///< LLAMINAR_GPU_GRAPHS master flag
-        int min_seq_len = 256;               ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        int minimum_padded_bucket_seq_len = 256; ///< Minimum padded raw-prompt bucket; exact smaller graphs remain capturable
         bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
         bool buckets_enabled = true;         ///< Bucketed capture is on by default; LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out.
         std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES

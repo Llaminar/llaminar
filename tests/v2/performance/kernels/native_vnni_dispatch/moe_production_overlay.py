@@ -28,11 +28,13 @@ from typing import Iterable, Mapping, Sequence
 from .adapters.evidence import raw_corpus_id
 from .production_moe_prefill_sweep import (
     AGGREGATE_COLUMNS,
+    CORPUS_MANIFEST_FILENAME,
     ProductionMoEPrefillCell,
+    load_corpus_manifest,
     production_moe_prefill_cell_paths,
     production_moe_prefill_candidate_ids,
     production_moe_prefill_cells,
-    validate_production_moe_prefill_cell,
+    validate_promoted_production_moe_prefill_cell,
 )
 from .moe_routing_profiles import MOE_ROUTING_PROFILES
 
@@ -223,13 +225,13 @@ def discover_additive_moe_production_cells(
     must not invalidate or rerun every previously authenticated cell. The cell
     filename is derived from its complete identity, so this reader can recover
     a supplemental cell from the first aggregate row, reconstruct its expected
-    path, and then apply the ordinary aggregate/raw-timing validator.
+    path, and then authenticate the complete committed transaction.
 
     A runtime codebook key may have several GGUF source aliases. Installing
     only one of those surfaces would overfit the overlay, so discovery requires
     every known alias at the supplemental M before returning that key. Staging
-    debris, orphaned aggregate/timing files, unknown source cases, and filenames
-    that disagree with the reconstructed identity are fatal.
+    debris, orphaned artifacts, unknown source cases, and filenames that
+    disagree with the reconstructed identity are fatal.
     """
 
     normalized_backend = backend.strip().lower()
@@ -237,6 +239,7 @@ def discover_additive_moe_production_cells(
         raise ValueError(f"unsupported production MoE backend {backend!r}")
 
     root = Path(work_directory)
+    corpus = load_corpus_manifest(root, normalized_backend)
     cell_directory = root / "cells"
     if not cell_directory.is_dir():
         return ()
@@ -250,22 +253,58 @@ def discover_additive_moe_production_cells(
     cases = {
         case.evidence_id: case for case in qwen_moe_routed_prefill_cases()
     }
+    canonical_baseline = production_moe_prefill_cells(normalized_backend)
     baseline_ids = {cell.cell_id for cell in baseline_cells}
+    expected_baseline_ids = {cell.cell_id for cell in canonical_baseline}
+    if baseline_ids != expected_baseline_ids:
+        raise ValueError(
+            "additive discovery requires the complete canonical baseline "
+            "inventory"
+        )
     discovered: dict[str, ProductionMoEPrefillCell] = {}
 
-    aggregate_paths = tuple(sorted(
-        path
-        for path in cell_directory.glob(f"{normalized_backend}-*.csv")
-        if not path.name.endswith(".timing.csv")
-    ))
-    for aggregate_path in aggregate_paths:
-        timing_path = aggregate_path.with_name(
-            aggregate_path.name[:-4] + ".timing.csv"
+    artifact_suffixes = {
+        "aggregate": ".csv",
+        "timing": ".timing.csv",
+        "log": ".log",
+        "manifest": ".manifest.json",
+    }
+    artifacts_by_stem: dict[str, dict[str, Path]] = {}
+    for path in sorted(cell_directory.iterdir()):
+        if not path.is_file():
+            raise ValueError(f"{path}: unexpected cell-corpus directory")
+        if not path.name.startswith(f"{normalized_backend}-"):
+            raise ValueError(f"{path}: artifact belongs to another corpus")
+        matched = next(
+            (
+                (role, suffix)
+                for role, suffix in sorted(
+                    artifact_suffixes.items(),
+                    key=lambda item: len(item[1]),
+                    reverse=True,
+                )
+                if path.name.endswith(suffix)
+            ),
+            None,
         )
-        if not timing_path.is_file():
+        if matched is None:
+            raise ValueError(f"{path}: unknown cell artifact")
+        role, suffix = matched
+        stem = path.name[:-len(suffix)]
+        owned = artifacts_by_stem.setdefault(stem, {})
+        if role in owned:
+            raise ValueError(f"{path}: duplicate {role} artifact")
+        owned[role] = path
+
+    expected_roles = set(artifact_suffixes)
+    for stem, artifacts in sorted(artifacts_by_stem.items()):
+        if set(artifacts) != expected_roles:
             raise ValueError(
-                f"{aggregate_path}: supplemental aggregate has no raw timing sidecar"
+                f"{cell_directory / stem}: incomplete committed cell; "
+                f"missing={sorted(expected_roles - set(artifacts))}, "
+                f"unexpected={sorted(set(artifacts) - expected_roles)}"
             )
+        aggregate_path = artifacts["aggregate"]
         with aggregate_path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             if tuple(reader.fieldnames or ()) != AGGREGATE_COLUMNS:
@@ -295,27 +334,22 @@ def discover_additive_moe_production_cells(
             route_profile,
         )
         expected_paths = production_moe_prefill_cell_paths(root, cell)
-        if aggregate_path != expected_paths.aggregate or timing_path != expected_paths.timing:
+        expected_artifacts = {
+            "aggregate": expected_paths.aggregate,
+            "timing": expected_paths.timing,
+            "log": expected_paths.log,
+            "manifest": expected_paths.manifest,
+        }
+        if artifacts != expected_artifacts:
             raise ValueError(
                 f"{aggregate_path}: supplemental filename disagrees with cell identity"
             )
+        validate_promoted_production_moe_prefill_cell(root, cell, corpus)
         if cell.cell_id in baseline_ids:
             continue
-        validate_production_moe_prefill_cell(aggregate_path, timing_path, cell)
         if cell.cell_id in discovered:
             raise ValueError(f"duplicate supplemental cell {cell.cell_id}")
         discovered[cell.cell_id] = cell
-
-    for timing_path in sorted(
-        cell_directory.glob(f"{normalized_backend}-*.timing.csv")
-    ):
-        aggregate_path = timing_path.with_name(
-            timing_path.name[:-len(".timing.csv")] + ".csv"
-        )
-        if not aggregate_path.is_file():
-            raise ValueError(
-                f"{timing_path}: supplemental timing sidecar has no aggregate"
-            )
 
     cells_by_key: dict[
         MoEProductionOverlayKey,
@@ -359,6 +393,7 @@ def read_authenticated_moe_surfaces(
         raise ValueError(f"unsupported production MoE backend {backend!r}")
     records = []
     require_moe_overlay_surface_totality(cells, backend=normalized_backend)
+    corpus = load_corpus_manifest(work_directory, normalized_backend)
     for cell in cells:
         if cell.backend != normalized_backend:
             raise ValueError(
@@ -366,7 +401,9 @@ def read_authenticated_moe_surfaces(
                 f"{cell.backend} cell"
             )
         paths = production_moe_prefill_cell_paths(work_directory, cell)
-        validate_production_moe_prefill_cell(paths.aggregate, paths.timing, cell)
+        validate_promoted_production_moe_prefill_cell(
+            work_directory, cell, corpus
+        )
         with paths.aggregate.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             if tuple(reader.fieldnames or ()) != AGGREGATE_COLUMNS:
@@ -870,31 +907,32 @@ def main() -> int:
     parser.add_argument("--m", type=int, action="append", default=[])
     args = parser.parse_args()
 
-    baseline_cells = production_moe_prefill_cells(args.backend)
+    baseline_inventory = production_moe_prefill_cells(args.backend)
+    additive_inventory = discover_additive_moe_production_cells(
+        args.work_dir,
+        backend=args.backend,
+        baseline_cells=baseline_inventory,
+    )
+    baseline_ids = {cell.cell_id for cell in baseline_inventory}
+    cells = baseline_inventory + additive_inventory
     if args.case:
         selected_cases = set(args.case)
-        baseline_cells = tuple(
-            cell for cell in baseline_cells
+        cells = tuple(
+            cell for cell in cells
             if cell.case.evidence_id in selected_cases
         )
     if args.m:
         if any(m <= 0 for m in args.m):
             raise ValueError("selected overlay M values must be positive")
         selected_m = set(args.m)
-        baseline_cells = tuple(
-            cell for cell in baseline_cells if cell.m in selected_m
+        cells = tuple(
+            cell for cell in cells if cell.m in selected_m
         )
-    if not baseline_cells:
-        raise ValueError("overlay filters selected no baseline cells")
+    if not cells:
+        raise ValueError("overlay filters selected no authenticated cells")
     require_moe_overlay_surface_totality(
-        baseline_cells, backend=args.backend
+        cells, backend=args.backend
     )
-    additive_cells = discover_additive_moe_production_cells(
-        args.work_dir,
-        backend=args.backend,
-        baseline_cells=baseline_cells,
-    )
-    cells = baseline_cells + additive_cells
     records = read_authenticated_moe_surfaces(
         args.work_dir, cells, backend=args.backend
     )
@@ -905,7 +943,8 @@ def main() -> int:
     evidence_paths = []
     for cell in cells:
         paths = production_moe_prefill_cell_paths(args.work_dir, cell)
-        evidence_paths.extend((paths.aggregate, paths.timing))
+        evidence_paths.extend((paths.aggregate, paths.timing, paths.manifest))
+    evidence_paths.append(args.work_dir / CORPUS_MANIFEST_FILENAME)
     corpus_digest = raw_corpus_id(evidence_paths)
     generated = generate_moe_production_overlay_include(
         winners, backend=args.backend, corpus_digest=corpus_digest
@@ -918,8 +957,9 @@ def main() -> int:
     print(
         f"generated {len(winners)} exact {args.backend.upper()} "
         "production-MoE overlays from "
-        f"{len(baseline_cells)} mandatory and "
-        f"{len(additive_cells)} additive authenticated cells"
+        f"{sum(cell.cell_id in baseline_ids for cell in cells)} canonical and "
+        f"{sum(cell.cell_id not in baseline_ids for cell in cells)} additive "
+        "authenticated cells"
     )
     return 0
 

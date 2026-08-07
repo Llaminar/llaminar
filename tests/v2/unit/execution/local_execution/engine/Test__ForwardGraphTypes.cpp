@@ -1942,7 +1942,7 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
 
     PrefillGraphConfig prefill_config;
     prefill_config.enabled = true;
-    prefill_config.min_seq_len = 1;
+    prefill_config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(prefill_config);
     PrefillGraphCacheKey prefill_key;
     prefill_key.seq_len = 64;
