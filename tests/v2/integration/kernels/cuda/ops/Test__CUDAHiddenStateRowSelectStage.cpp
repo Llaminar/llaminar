@@ -17,6 +17,7 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "memory/BufferArena.h"
 #include "tensors/Tensors.h"
 
@@ -156,6 +157,66 @@ namespace
             }
         }
     }
+#endif
+}
+
+/**
+ * @brief Prove low-level CUDA row helpers cannot adopt the default stream.
+ *
+ * All non-stream arguments are valid device-backed storage, so a missing
+ * stream guard would enqueue real work on stream zero and make these calls
+ * succeed. Rejection therefore tests the API contract rather than an unrelated
+ * invalid-pointer path.
+ */
+TEST(Test__CUDAHiddenStateRowSelectStage,
+     LowLevelLaunchContractsRejectNullStream)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    cudaStream_t setup_stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(
+                  &setup_stream,
+                  cudaStreamNonBlocking),
+              cudaSuccess);
+    FP32Tensor values({1, 1}, DeviceId::cpu());
+    INT32Tensor selected_row(std::vector<size_t>{1});
+    ASSERT_TRUE(values.allocateOnDevice(DeviceId::cuda(0), setup_stream));
+    ASSERT_TRUE(selected_row.allocateOnDevice(
+        DeviceId::cuda(0),
+        setup_stream));
+
+    int host_selected_row = 0;
+    auto *device_value = static_cast<float *>(values.gpu_data_ptr());
+    auto *device_selected_row =
+        static_cast<int *>(selected_row.gpu_data_ptr());
+    EXPECT_FALSE(llaminar2::cuda::uploadRowSelectParam(
+        device_selected_row,
+        &host_selected_row,
+        nullptr));
+    EXPECT_FALSE(llaminar2::cuda::launchRowSelectFP32(
+        device_value,
+        device_value,
+        device_selected_row,
+        /*seq_len=*/1,
+        /*d_model=*/1,
+        nullptr));
+    EXPECT_FALSE(llaminar2::cuda::launchMTPConcatFP32(
+        device_value,
+        device_value,
+        device_value,
+        /*rows=*/1,
+        /*hidden_dim=*/1,
+        nullptr));
+
+    ASSERT_EQ(cudaStreamSynchronize(setup_stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(setup_stream), cudaSuccess);
 #endif
 }
 

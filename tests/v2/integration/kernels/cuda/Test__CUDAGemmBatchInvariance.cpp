@@ -1,17 +1,15 @@
 /**
- * @file Test__CUDAGemmNonDeterminism.cpp
- * @brief Standalone test to reproduce CUDA GEMM non-determinism
+ * @file Test__CUDAGemmBatchInvariance.cpp
+ * @brief Adversarial CUDA GEMM batch-invariance and workspace-ordering tests.
  *
- * Exercises CUDAQuantisedGemmKernel multiply_fused_tensor() in isolation,
- * calling the same kernel with the same input N times and comparing outputs.
+ * Exercises `CUDAQuantisedGemmKernel` projection and fused-projection entry
+ * points with identical inputs, production launch policy, explicit streams,
+ * persistent workspace, and both serial and concurrent projection schedules.
+ * Every retained schedule must reproduce the same output bytes across repeats.
  *
- * This reproduces the issue seen in LocalPP_HOST_CUDA_CPU parity tests
- * where FFN_UP shows massive cosine variance (0.70-0.99) across runs.
- *
- * Tests:
- *  - Self-consistency: same kernel, same input → same output across N calls
- *  - Concurrent vs sequential dispatch
- *  - Shared workspace vs separate workspace
+ * These cases localize failures among kernel arithmetic, side-stream event
+ * ordering, and workspace partition ownership. They deliberately use the real
+ * optimized path; there is no alternate deterministic prefill implementation.
  */
 
 #include <gtest/gtest.h>
@@ -59,15 +57,24 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
-    void cudaNativeVNNIPrefill_setStreamKMode(int mode);
-    int cudaNativeVNNIPrefill_getStreamKMode();
     void cudaNativeVNNIPrefill_setBK256Mode(int mode);
     int cudaNativeVNNIPrefill_getBK256Mode();
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getDeterministicMode();
-    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
-    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
-    void cudaNativeVNNIPrefill_getLastLaunchSelection(int *tile_id, int *split_k, int *used_bk256, int *used_streamk);
+    void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id);
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
+    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+        int *tile_id,
+        int *k_partitions,
+        int *used_bk256,
+        int *used_canonical_kpart);
+    bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        uint8_t codebook_id,
+        int n,
+        int k,
+        int sm_count,
+        int *uses_ordered_reducer,
+        int *k_partitions);
 }
 #endif
 
@@ -81,19 +88,19 @@ namespace
     {
     public:
         ScopedCudaPrefillModes()
-            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
-              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
-              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+            : bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              canonical_kpart_(
+                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode())
         {
-            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_);
         }
 
         ~ScopedCudaPrefillModes()
         {
-            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
-            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setForceTile(force_tile_);
             cudaNativeVNNIPrefill_setBK256Mode(bk256_);
-            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+                canonical_kpart_);
         }
 
         ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
@@ -101,10 +108,8 @@ namespace
 
     private:
         int force_tile_ = -1;
-        int force_split_k_ = 0;
-        int streamk_ = 0;
         int bk256_ = 0;
-        bool deterministic_ = false;
+        bool canonical_kpart_ = false;
     };
 
     class ScopedDebugEnvOverride
@@ -207,9 +212,9 @@ namespace
     {
         ASSERT_EQ(actual.size(), expected.size()) << label;
         EXPECT_EQ(countDiffs(actual.data(), expected.data(), actual.size()), 0u)
-            << label << " changed bitwise across deterministic repeated runs";
+            << label << " changed bitwise across repeated production runs";
         EXPECT_FLOAT_EQ(maxAbsDiff(actual.data(), expected.data(), actual.size()), 0.0f)
-            << label << " drifted across deterministic repeated runs";
+            << label << " drifted across repeated production runs";
     }
 
     int32_t orderedFloatBits(float value)
@@ -291,7 +296,7 @@ namespace
 // Test Fixture
 // ============================================================================
 
-class Test__CUDAGemmNonDeterminism : public CUDATestBase
+class Test__CUDAGemmBatchInvariance : public CUDATestBase
 {
 protected:
     std::mt19937 rng_{42};
@@ -313,25 +318,6 @@ protected:
                 std::make_unique<llaminar2::test::ScopedGPUStream>(gpu_device_);
         return producer_stream_->get();
     }
-
-    struct SplitKComparisonResult
-    {
-        std::string weight_name;
-        int m = 0;
-        int n = 0;
-        int k = 0;
-        int auto_tile = -1;
-        int auto_split_k = 0;
-        int auto_bk256 = 0;
-        int auto_streamk = 0;
-        DiffSummary sk1_repeat;
-        DiffSummary sk2_repeat;
-        DiffSummary skauto_repeat;
-        DiffSummary sk1_vs_sk2;
-        DiffSummary sk1_vs_skauto;
-        double cosine_sk1_vs_sk2 = 0.0;
-        double cosine_sk1_vs_skauto = 0.0;
-    };
 
     bool setupSharedWorkspace(
         const std::vector<ITensorGemm *> &kernels,
@@ -391,172 +377,6 @@ protected:
         workspace_.reset();
     }
 
-#ifdef HAVE_CUDA
-    bool compareSplitKForWeight(const std::string &weight_name, SplitKComparisonResult &result)
-    {
-        auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
-        TensorFactory factory(*mpi_ctx);
-        ModelLoader loader(&factory);
-        if (!tryLoadModel(loader, MODEL_PATH))
-            return false;
-
-        auto weight_base = loader.loadTensor(weight_name, DeviceId::cpu());
-        auto *weight = dynamic_cast<Q4_0Tensor *>(weight_base.get());
-        if (!weight)
-            return false;
-
-        const int M = 9;
-        const int N = static_cast<int>(weight->shape()[0]);
-        const int K = static_cast<int>(weight->shape()[1]);
-
-        if (!weight->ensureOnDevice(gpu_device_))
-            return false;
-
-        auto *kernel = getPreparedKernel(
-            weight, gpu_device_);
-        if (!kernel)
-            return false;
-        kernel->setGPUStream(explicitProducerStream());
-
-        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
-        if (!ws)
-            return false;
-
-        auto reqs = ws->getWorkspaceRequirements(M, N, K);
-        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024);
-        if (!workspace_->allocate(reqs))
-            return false;
-        ws->bindWorkspace(workspace_.get());
-
-        auto input = std::make_unique<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
-        for (int i = 0; i < M * K; ++i)
-            input->mutable_data()[i] = dist_(rng_);
-
-        const int saved_streamk = cudaNativeVNNIPrefill_getStreamKMode();
-        const int saved_bk256 = cudaNativeVNNIPrefill_getBK256Mode();
-        const bool saved_det = cudaNativeVNNIPrefill_getDeterministicMode();
-        int saved_force_tile = -1;
-        int saved_force_sk = 0;
-        cudaNativeVNNIPrefill_getForceTile(&saved_force_tile, &saved_force_sk);
-
-        auto restore_modes = [&]()
-        {
-            cudaNativeVNNIPrefill_setForceTile(saved_force_tile, saved_force_sk);
-            cudaNativeVNNIPrefill_setStreamKMode(saved_streamk);
-            cudaNativeVNNIPrefill_setBK256Mode(saved_bk256);
-            cudaNativeVNNIPrefill_setDeterministicMode(saved_det);
-        };
-
-        auto cleanup = [&]()
-        {
-            ws->unbindWorkspace();
-            workspace_.reset();
-        };
-
-        auto run_projection = [&](int bk256_mode, int tile_id, int split_k, bool deterministic, std::vector<float> &out) -> bool
-        {
-            cudaNativeVNNIPrefill_setBK256Mode(bk256_mode);
-            cudaNativeVNNIPrefill_setStreamKMode(-1);
-            cudaNativeVNNIPrefill_setDeterministicMode(deterministic);
-            cudaNativeVNNIPrefill_setForceTile(tile_id, split_k);
-
-            auto output = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-
-            if (!with_gpu_coherence(
-                    gpu_device_,
-                    {input.get()},
-                    {output.get()},
-                    explicitProducerStream(),
-                    [&]
-                    {
-                        return kernel->multiply_tensor(
-                            input.get(), output.get(), M, N, K,
-                            true, 1.0f, 0.0f, nullptr, nullptr, -1);
-                    }))
-            {
-                return false;
-            }
-
-            const float *data = output->data();
-            out.assign(data, data + static_cast<size_t>(M) * N);
-            return true;
-        };
-
-        std::vector<float> auto_out;
-        if (!run_projection(/*bk256_mode=*/0, /*tile_id=*/-1, /*split_k=*/0, /*deterministic=*/false, auto_out))
-        {
-            restore_modes();
-            cleanup();
-            return false;
-        }
-
-        int auto_tile = -1;
-        int auto_sk = 0;
-        int auto_bk256 = 0;
-        int auto_streamk = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(&auto_tile, &auto_sk, &auto_bk256, &auto_streamk);
-
-        const int forced_bk256_mode = auto_bk256 ? 1 : -1;
-        const int forced_tile_id = auto_bk256 ? -1 : auto_tile;
-        const int auto_forced_sk = (auto_sk > 1) ? auto_sk : 2;
-
-        std::vector<float> sk1_a, sk1_b, sk2_a, sk2_b, skauto_a, skauto_b;
-        const bool ok = run_projection(forced_bk256_mode, forced_tile_id, 1, false, sk1_a) &&
-                        run_projection(forced_bk256_mode, forced_tile_id, 1, false, sk1_b) &&
-                        run_projection(forced_bk256_mode, forced_tile_id, 2, false, sk2_a) &&
-                        run_projection(forced_bk256_mode, forced_tile_id, 2, false, sk2_b) &&
-                        run_projection(forced_bk256_mode, forced_tile_id, auto_forced_sk, false, skauto_a) &&
-                        run_projection(forced_bk256_mode, forced_tile_id, auto_forced_sk, false, skauto_b);
-
-        restore_modes();
-
-        if (!ok)
-        {
-            cleanup();
-            return false;
-        }
-
-        result.weight_name = weight_name;
-        result.m = M;
-        result.n = N;
-        result.k = K;
-        result.auto_tile = auto_tile;
-        result.auto_split_k = auto_sk;
-        result.auto_bk256 = auto_bk256;
-        result.auto_streamk = auto_streamk;
-        result.sk1_repeat = summarizeDiffs(sk1_a.data(), sk1_b.data(), sk1_a.size());
-        result.sk2_repeat = summarizeDiffs(sk2_a.data(), sk2_b.data(), sk2_a.size());
-        result.skauto_repeat = summarizeDiffs(skauto_a.data(), skauto_b.data(), skauto_a.size());
-        result.sk1_vs_sk2 = summarizeDiffs(sk1_a.data(), sk2_a.data(), sk1_a.size());
-        result.sk1_vs_skauto = summarizeDiffs(sk1_a.data(), skauto_a.data(), sk1_a.size());
-        result.cosine_sk1_vs_sk2 = cosineSimilarity(sk1_a.data(), sk2_a.data(), sk1_a.size());
-        result.cosine_sk1_vs_skauto = cosineSimilarity(sk1_a.data(), skauto_a.data(), sk1_a.size());
-
-        cleanup();
-        return true;
-    }
-
-    void printSplitKComparison(const SplitKComparisonResult &result)
-    {
-        std::cout << "Split-K comparison for " << result.weight_name
-                  << " shape=(M=" << result.m << ",N=" << result.n << ",K=" << result.k << ")"
-                  << " auto_tile=" << result.auto_tile
-                  << " auto_split_k=" << result.auto_split_k
-                  << " auto_bk256=" << result.auto_bk256
-                  << " auto_streamk=" << result.auto_streamk << "\n";
-        printDiffSummary("split_k=1 repeat", result.sk1_repeat);
-        printDiffSummary("split_k=2 repeat", result.sk2_repeat);
-        printDiffSummary("split_k=auto repeat", result.skauto_repeat);
-        printDiffSummary("split_k=1 vs split_k=2", result.sk1_vs_sk2);
-        printDiffSummary("split_k=1 vs split_k=auto", result.sk1_vs_skauto);
-        std::cout << "split_k=1 vs split_k=2 cosine="
-                  << std::fixed << std::setprecision(9) << result.cosine_sk1_vs_sk2 << "\n";
-        std::cout << "split_k=1 vs split_k=auto cosine="
-                  << std::fixed << std::setprecision(9) << result.cosine_sk1_vs_skauto << "\n";
-    }
-#endif
 };
 
 // ============================================================================
@@ -567,7 +387,7 @@ protected:
 // with shared workspace, calling multiply_fused_tensor repeatedly.
 // ============================================================================
 
-TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
+TEST_F(Test__CUDAGemmBatchInvariance, FusedGateUp_SelfConsistency)
 {
     if (!std::filesystem::exists(MODEL_PATH))
         GTEST_SKIP() << "Model not found: " << MODEL_PATH;
@@ -718,7 +538,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
 // Mirrors the attention QKV stage: M=9, K=896, N_q=896, N_k=128, N_v=128
 // ============================================================================
 
-TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
+TEST_F(Test__CUDAGemmBatchInvariance, FusedQKV_SelfConsistency)
 {
     if (!std::filesystem::exists(MODEL_PATH))
         GTEST_SKIP() << "Model not found: " << MODEL_PATH;
@@ -873,11 +693,11 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
 // Test: Single multiply_tensor self-consistency (not fused)
 //
 // Calls multiply_tensor() separately for a single kernel N times.
-// If THIS is non-deterministic, it's the inner kernel (split-K atomicAdd).
-// If this is deterministic but fused is not, it's the workspace sharing.
+// A failure here localizes the defect to the projection kernel; a fused-only
+// failure localizes it to stream/event ordering or workspace partitioning.
 // ============================================================================
 
-TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
+TEST_F(Test__CUDAGemmBatchInvariance, SingleKernel_SelfConsistency)
 {
     if (!std::filesystem::exists(MODEL_PATH))
         GTEST_SKIP() << "Model not found: " << MODEL_PATH;
@@ -969,8 +789,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
               << "  min_cos=" << std::fixed << std::setprecision(6) << min_cos
               << " worst_max_abs=" << std::scientific << worst_max_diff << "\n";
 
-    // DIAGNOSTIC: This test reveals whether individual kernel calls are deterministic.
-    // We expect split-K with atomicAdd to show ULP-level diffs, not massive corruption.
+    // Every retained production schedule must repeat bitwise. Any difference is
+    // now a contract violation rather than an expected reduction-order effect.
     EXPECT_GE(min_cos, 0.9999)
         << "Single multiply_tensor is non-deterministic across " << NUM_REPETITIONS << " calls";
 
@@ -981,41 +801,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
     }
 }
 
-// ============================================================================
-// Diagnostic: compare Q-projection split_k=1 vs split_k=2 on the same tile.
-// Disabled by default because this is an investigation aid, not a stable CI test.
-// Run manually with --gtest_also_run_disabled_tests.
-// ============================================================================
-
-TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_QProjection_SplitKComparison)
-{
-#ifndef HAVE_CUDA
-    GTEST_SKIP() << "CUDA build required";
-#else
-    if (!std::filesystem::exists(MODEL_PATH))
-        GTEST_SKIP() << "Model not found: " << MODEL_PATH;
-
-    SplitKComparisonResult result;
-    ASSERT_TRUE(compareSplitKForWeight("blk.0.attn_q.weight", result));
-    printSplitKComparison(result);
-#endif
-}
-
-TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_FFNDown_SplitKComparison)
-{
-#ifndef HAVE_CUDA
-    GTEST_SKIP() << "CUDA build required";
-#else
-    if (!std::filesystem::exists(MODEL_PATH))
-        GTEST_SKIP() << "Model not found: " << MODEL_PATH;
-
-    SplitKComparisonResult result;
-    ASSERT_TRUE(compareSplitKForWeight("blk.0.ffn_down.weight", result));
-    printSplitKComparison(result);
-#endif
-}
-
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_SelfConsistency)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1024,10 +810,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     // bitwise-identical results across repeated invocations.
     ScopedCudaPrefillModes mode_guard;
 
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     const int M = 9;
     const int N = 896;
@@ -1098,31 +882,32 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     EXPECT_GE(min_cos, 0.999999) << "NativeVNNI path should be deterministic";
 
     int selected_tile = -1;
-    int selected_split_k = 0;
+    int selected_k_partitions = 0;
     int used_bk256 = 0;
-    int used_streamk = 0;
+    int used_canonical_kpart = 0;
     cudaNativeVNNIPrefill_getLastLaunchSelection(
-        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+        &selected_tile,
+        &selected_k_partitions,
+        &used_bk256,
+        &used_canonical_kpart);
     std::cout << "NativeVNNI final auto selection: tile=" << selected_tile
-              << " split_k=" << selected_split_k
+              << " k_partitions=" << selected_k_partitions
               << " bk256=" << used_bk256
-              << " streamk=" << used_streamk << "\n";
+              << " canonical_kpart=" << used_canonical_kpart << "\n";
     ws->unbindWorkspace();
     workspace_.reset();
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIsStable)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionScheduleIsStable)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
 
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(true);
 
     const int M = 72;
     const int N = 4864;
@@ -1150,33 +935,45 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
     for (int i = 0; i < M * K; ++i)
         input->mutable_data()[i] = dist_(rng_);
 
-    auto output = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input.get()},
-        {output.get()},
-        explicitProducerStream(),
-        [&]
-        {
-            return kernel->multiply_tensor(
-                input.get(), output.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
-        }));
+    std::vector<float> reference(static_cast<size_t>(M) * N);
+    for (int repetition = 0; repetition < 2; ++repetition)
+    {
+        auto output = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {output.get()},
+            explicitProducerStream(),
+            [&]
+            {
+                return kernel->multiply_tensor(
+                    input.get(), output.get(), M, N, K, true, 1.0f, 0.0f,
+                    nullptr, nullptr, -1);
+            }));
+        const float *data = output->data();
+        if (repetition == 0)
+            std::memcpy(reference.data(), data, reference.size() * sizeof(float));
+        else
+            EXPECT_EQ(countDiffs(reference.data(), data, reference.size()), 0u)
+                << "Production grouped schedule changed bytes across repeats";
+    }
 
     int selected_tile = -1;
-    int selected_split_k = 0;
+    int selected_k_partitions = 0;
     int used_bk256 = 0;
-    int used_streamk = 0;
+    int used_canonical_kpart = 0;
     cudaNativeVNNIPrefill_getLastLaunchSelection(
-        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
-    std::cout << "NativeVNNI grouped-small-M deterministic selection: tile=" << selected_tile
-              << " split_k=" << selected_split_k
+        &selected_tile,
+        &selected_k_partitions,
+        &used_bk256,
+        &used_canonical_kpart);
+    std::cout << "NativeVNNI grouped-small-M production selection: tile=" << selected_tile
+              << " k_partitions=" << selected_k_partitions
               << " bk256=" << used_bk256
-              << " streamk=" << used_streamk << "\n";
-    EXPECT_EQ(selected_split_k, 1)
-        << "deterministic grouped-small-M prefill must avoid split-K accumulation-order drift";
-    EXPECT_EQ(used_streamk, 0)
-        << "deterministic grouped-small-M prefill must avoid stream-K atomic accumulation";
+              << " canonical_kpart=" << used_canonical_kpart << "\n";
+    EXPECT_EQ(selected_k_partitions, 1);
+    EXPECT_EQ(used_canonical_kpart, 0);
 
     ws->unbindWorkspace();
     workspace_.reset();
@@ -1190,12 +987,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
  * The production M=1 and grouped-verifier surfaces consume certified learned
  * dispatch, but prompt prefill intentionally remains on the legacy
  * format/geometry heuristic. Exercise representative Qwen3.6 dense projection
- * geometries in Q4_K and Q5_1, require a legal physical tile and split-K choice,
+ * geometries in Q4_K and Q5_1, require a legal physical tile and reduction schedule,
  * and verify the launcher publishes the exact heuristic selection through
  * PerfStats. A missing learned prefill corpus must therefore neither fail the
  * operation nor silently suppress route telemetry.
  */
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1205,10 +1002,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTota
     PerfStatsCollector::reset();
     ASSERT_TRUE(PerfStatsCollector::isEnabled());
 
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     struct Shape
     {
@@ -1288,19 +1083,20 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTota
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         int selected_tile = -1;
-        int selected_split_k = 0;
+        int selected_k_partitions = 0;
         int used_bk256 = 0;
-        int used_streamk = 0;
+        int used_canonical_kpart = 0;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
-            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+            &selected_tile,
+            &selected_k_partitions,
+            &used_bk256,
+            &used_canonical_kpart);
 
         EXPECT_GE(selected_tile, 0);
         EXPECT_LE(selected_tile, 5);
-        EXPECT_TRUE(
-            selected_split_k == 1 || selected_split_k == 2 ||
-            selected_split_k == 4 || selected_split_k == 8);
+        EXPECT_EQ(selected_k_partitions, 1);
         EXPECT_EQ(used_bk256, 0);
-        EXPECT_EQ(used_streamk, 0);
+        EXPECT_EQ(used_canonical_kpart, 0);
 
         const auto records = PerfStatsCollector::snapshot({"kernel"});
         bool found = false;
@@ -1323,9 +1119,11 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTota
                 found = true;
                 EXPECT_EQ(tag("codebook"), std::to_string(shape.codebook));
                 EXPECT_EQ(tag("tile_id"), std::to_string(selected_tile));
-                EXPECT_EQ(tag("split_k"), std::to_string(selected_split_k));
+                EXPECT_EQ(
+                    tag("k_partitions"),
+                    std::to_string(selected_k_partitions));
                 EXPECT_EQ(tag("bk256"), "0");
-                EXPECT_EQ(tag("streamk"), "0");
+                EXPECT_EQ(tag("canonical_kpart"), "0");
                 EXPECT_EQ(tag("sums_a"), "1")
                     << "Qwen3.6 dense asymmetric NativeVNNI prefill must consume the "
                        "workspace-owned activation block sums instead of recomputing them "
@@ -1348,26 +1146,46 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTota
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorkspaceScratch)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistentWorkspaceScratch)
 {
 #ifdef HAVE_CUDA
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w2x2=*/1, /*split_k=*/2);
-    cudaNativeVNNIPrefill_setStreamKMode(-1);
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w2x2=*/1);
     cudaNativeVNNIPrefill_setBK256Mode(-1);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
 
     constexpr int M = 32;
     constexpr int N = 512;
-    constexpr int K = 512;
+    constexpr int K = 2048;
     constexpr size_t padded_m = 128;
-    constexpr size_t expected_splitk_bytes = 2ULL * padded_m * N * sizeof(float);
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    int sm_count = 0;
+    ASSERT_EQ(
+        cudaDeviceGetAttribute(
+            &sm_count,
+            cudaDevAttrMultiProcessorCount,
+            gpu_device_.cuda_ordinal()),
+        cudaSuccess);
+    int uses_ordered_reducer = 0;
+    int canonical_k_partitions = 0;
+    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        /*Q4_0=*/0,
+        N,
+        K,
+        sm_count,
+        &uses_ordered_reducer,
+        &canonical_k_partitions));
+    ASSERT_EQ(uses_ordered_reducer, 1);
+    ASSERT_GT(canonical_k_partitions, 1);
+    const size_t expected_canonical_bytes =
+        static_cast<size_t>(canonical_k_partitions) *
+        padded_m * N * sizeof(float);
+
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
 
-    auto weight = TestTensorFactory::createQ4_KRandom(
+    auto weight = TestTensorFactory::createQ4_0Random(
         {static_cast<size_t>(N), static_cast<size_t>(K)}, 424242u);
     ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
 
@@ -1378,17 +1196,19 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorksp
     ASSERT_NE(ws, nullptr);
     auto reqs = ws->getWorkspaceRequirements(M, N, K);
 
-    bool found_splitk = false;
+    bool found_canonical_kpart = false;
     for (const auto &buf : reqs.buffers)
     {
-        if (buf.name == GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS)
+        if (buf.name ==
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS)
         {
-            found_splitk = true;
-            EXPECT_GE(buf.size_bytes, expected_splitk_bytes);
+            found_canonical_kpart = true;
+            EXPECT_GE(buf.size_bytes, expected_canonical_bytes);
             EXPECT_TRUE(buf.required);
         }
     }
-    ASSERT_TRUE(found_splitk) << "Forced split-K prefill must declare workspace-owned partials";
+    ASSERT_TRUE(found_canonical_kpart)
+        << "Canonical public-M=1 K partitions must declare persistent partials";
 
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
     ASSERT_TRUE(workspace_->allocate(reqs));
@@ -1420,15 +1240,18 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorksp
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     int selected_tile = -1;
-    int selected_split_k = 0;
+    int selected_k_partitions = 0;
     int used_bk256 = 0;
-    int used_streamk = 0;
+    int used_canonical_kpart = 0;
     cudaNativeVNNIPrefill_getLastLaunchSelection(
-        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+        &selected_tile,
+        &selected_k_partitions,
+        &used_bk256,
+        &used_canonical_kpart);
     EXPECT_EQ(selected_tile, 1);
-    EXPECT_EQ(selected_split_k, 2);
+    EXPECT_EQ(selected_k_partitions, canonical_k_partitions);
     EXPECT_EQ(used_bk256, 0);
-    EXPECT_EQ(used_streamk, 0);
+    EXPECT_EQ(used_canonical_kpart, 1);
 
     ws->unbindWorkspace();
     workspace_.reset();
@@ -1436,22 +1259,42 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorksp
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSplitKScratchSlots)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36QKVConcurrentPrefillUsesCanonicalKpartScratchSlots)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    ScopedDebugEnvOverride concurrent_env(
+        "LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
 
     constexpr int M = 600;
     constexpr int N = 1024;
     constexpr int K = 5120;
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    int sm_count = 0;
+    ASSERT_EQ(
+        cudaDeviceGetAttribute(
+            &sm_count,
+            cudaDevAttrMultiProcessorCount,
+            gpu_device_.cuda_ordinal()),
+        cudaSuccess);
+    int uses_ordered_reducer = 0;
+    int canonical_k_partitions = 0;
+    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        /*Q4_K=*/5,
+        N,
+        K,
+        sm_count,
+        &uses_ordered_reducer,
+        &canonical_k_partitions));
+    ASSERT_EQ(uses_ordered_reducer, 1);
+    ASSERT_GT(canonical_k_partitions, 1);
+
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
 
@@ -1481,12 +1324,15 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSp
     reqs.merge(k_ws->getWorkspaceRequirements(M, N, K));
     reqs.merge(v_ws->getWorkspaceRequirements(M, N, K));
 
-    const auto *splitk =
-        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(splitk, nullptr);
-    EXPECT_GE(splitk->size_bytes,
-              3ULL * 4ULL * 640ULL * static_cast<size_t>(N) * sizeof(float))
-        << "Fused concurrent Q/K/V prefill needs one split-K partial slot per side stream.";
+    const auto *canonical_kpart = reqs.find(
+        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+    ASSERT_NE(canonical_kpart, nullptr);
+    EXPECT_GE(
+        canonical_kpart->size_bytes,
+        3ULL * static_cast<size_t>(canonical_k_partitions) * 640ULL *
+            static_cast<size_t>(N) * sizeof(float))
+        << "Fused concurrent Q/K/V prefill needs one canonical K-partition "
+           "partial slot per producer stream.";
 
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
     ASSERT_TRUE(workspace_->allocate(reqs));
@@ -1525,6 +1371,19 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSp
         workspace_.get()));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
+    int selected_tile = -1;
+    int selected_k_partitions = 0;
+    int used_bk256 = 0;
+    int used_canonical_kpart = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile,
+        &selected_k_partitions,
+        &used_bk256,
+        &used_canonical_kpart);
+    EXPECT_EQ(selected_k_partitions, canonical_k_partitions);
+    EXPECT_EQ(used_bk256, 0);
+    EXPECT_EQ(used_canonical_kpart, 1);
+
     q_ws->unbindWorkspace();
     k_ws->unbindWorkspace();
     v_ws->unbindWorkspace();
@@ -1533,16 +1392,14 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSp
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillLaunches)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillLaunches)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     constexpr int M = 600;
     constexpr int N = 1024;
@@ -1623,16 +1480,14 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillLa
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecodeBindsGemvWorkspace)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecodeBindsGemvWorkspace)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     constexpr int M = 1;
     constexpr int N_Q = 8192;
@@ -1744,9 +1599,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
     printDiffSummary("concurrent-vs-serial K", k_diff);
     printDiffSummary("concurrent-vs-serial V", v_diff);
 
-    EXPECT_LT(q_diff.max_abs, 1e-4f);
-    EXPECT_LT(k_diff.max_abs, 1e-4f);
-    EXPECT_LT(v_diff.max_abs, 1e-4f);
+    EXPECT_EQ(q_diff.diff_count, 0u)
+        << "Concurrent Q projection must retain serial decode bytes";
+    EXPECT_EQ(k_diff.diff_count, 0u)
+        << "Concurrent K projection must retain serial decode bytes";
+    EXPECT_EQ(v_diff.diff_count, 0u)
+        << "Concurrent V projection must retain serial decode bytes";
 
     q_ws->unbindWorkspace();
     k_ws->unbindWorkspace();
@@ -1756,23 +1614,20 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentPrefillAndRepeatsBitwise)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
     ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
     ScopedDebugEnvOverride force_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
-    ASSERT_TRUE(debugEnv().gemm.deterministic);
-    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
-    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+    ASSERT_FALSE(debugEnv().gemm.deterministic);
+    EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_prefill);
 
-    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4, /*split_k=*/4);
-    cudaNativeVNNIPrefill_setStreamKMode(2);
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4);
     cudaNativeVNNIPrefill_setBK256Mode(-1);
-    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
 
     constexpr int M = 72;
     constexpr int N = 1024;
@@ -1814,18 +1669,19 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
                 return gate_kernel->multiply_fused_tensor(
                     input.get(), projections, M, K, nullptr, workspace_.get());
             }))
-            << "deterministic fused prefill repetition " << rep;
+            << "concurrent fused prefill repetition " << rep;
 
         int selected_tile = -1;
-        int selected_split_k = 0;
+        int selected_k_partitions = 0;
         int used_bk256 = 0;
-        int used_streamk = 0;
+        int used_canonical_kpart = 0;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
-            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
-        EXPECT_EQ(selected_split_k, 1)
-            << "LLAMINAR_DETERMINISTIC must clamp forced split-K prefill to serial K";
-        EXPECT_EQ(used_streamk, 0)
-            << "LLAMINAR_DETERMINISTIC must disable Stream-K prefill atomics";
+            &selected_tile,
+            &selected_k_partitions,
+            &used_bk256,
+            &used_canonical_kpart);
+        EXPECT_EQ(selected_k_partitions, 1);
+        EXPECT_EQ(used_canonical_kpart, 0);
 
         const float *gate = out_gate->data();
         const float *up = out_up->data();
@@ -1837,30 +1693,28 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
             ref_up = std::move(up_snapshot);
             continue;
         }
-        expectBitwiseEqual(gate_snapshot, ref_gate, "deterministic fused prefill gate");
-        expectBitwiseEqual(up_snapshot, ref_up, "deterministic fused prefill up");
+        expectBitwiseEqual(gate_snapshot, ref_gate, "concurrent fused prefill gate");
+        expectBitwiseEqual(up_snapshot, ref_up, "concurrent fused prefill up");
     }
 
     cleanupSharedWorkspace({gate_kernel, up_kernel});
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentDecodeAndRepeatsBitwise)
+TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentDecodeRepeatsBitwise)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
     ScopedDebugEnvOverride concurrent_prefill_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
     ScopedDebugEnvOverride concurrent_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
-    ASSERT_TRUE(debugEnv().gemm.deterministic);
-    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+    ASSERT_FALSE(debugEnv().gemm.deterministic);
+    EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
 
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
 
     constexpr int M = 1;
     constexpr int N_Q = 512;
@@ -1932,7 +1786,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
                 return q_kernel->multiply_fused_tensor(
                     input.get(), projections, M, K, nullptr, workspace_.get());
             }))
-            << "deterministic fused decode repetition " << rep;
+            << "concurrent fused decode repetition " << rep;
 
         const float *q = q_output->data();
         const float *k = k_output->data();
@@ -1947,9 +1801,9 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
             ref_v = std::move(v_snapshot);
             continue;
         }
-        expectBitwiseEqual(q_snapshot, ref_q, "deterministic fused decode Q");
-        expectBitwiseEqual(k_snapshot, ref_k, "deterministic fused decode K");
-        expectBitwiseEqual(v_snapshot, ref_v, "deterministic fused decode V");
+        expectBitwiseEqual(q_snapshot, ref_q, "concurrent fused decode Q");
+        expectBitwiseEqual(k_snapshot, ref_k, "concurrent fused decode K");
+        expectBitwiseEqual(v_snapshot, ref_v, "concurrent fused decode V");
     }
 
     q_ws->unbindWorkspace();

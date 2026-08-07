@@ -28,6 +28,7 @@ namespace llaminar2
     namespace sampling_math
     {
         struct DeviceGenerationDepthPolicy;
+        enum class DeviceGenerationLeadingRowDisposition : int32_t;
     }
 
 
@@ -367,6 +368,67 @@ namespace llaminar2
          *               implementations reject nullptr.
          */
         virtual bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) = 0;
+
+        /**
+         * @brief Materialize the next fixed-width prefill bucket from admitted device state.
+         *
+         * The primitive derives the relative source row from
+         * `*cached_tokens_device - request_position_ids_device[0]`. The canonical
+         * KV count is therefore the only progression cursor. It writes one stable
+         * token bucket, one stable absolute-position bucket, the current real row
+         * count, and the physical row stride. Inactive rows receive @p pad_token_id
+         * and deterministic continuation positions.
+         *
+         * GPU implementations must enqueue exactly one graph-capturable,
+         * allocation-free, transfer-free kernel on the explicit non-null stream.
+         * Invalid live geometry is fatal device state and must trap rather than
+         * clamp, retry, or select a host-authored path.
+         *
+         * @param request_token_ids_device Complete admitted INT32 token bank.
+         * @param request_position_ids_device Complete admitted INT32 position bank.
+         * @param request_total_rows_device Device INT32 logical request length.
+         * @param cached_tokens_device Canonical device INT32 main-KV count.
+         * @param request_row_capacity Number of rows available in the admitted bank.
+         * @param bucket_seq_len Physical rows materialized on every graph replay.
+         * @param pad_token_id Token id written to inactive bucket rows.
+         * @param device_id GPU ordinal owning every pointer.
+         * @param stream Exact graph execution stream.
+         * @param out_token_ids_device Stable INT32 token bucket.
+         * @param out_position_ids_device Stable INT32 absolute-position bucket.
+         * @param out_real_rows_device Device INT32 logical row count for this bucket.
+         * @param out_row_stride_device Device INT32 physical bucket stride.
+         * @return true when the kernel was enqueued successfully.
+         */
+        virtual bool enqueuePreparePrefillChunkView(
+            const void *request_token_ids_device,
+            const void *request_position_ids_device,
+            const void *request_total_rows_device,
+            const void *cached_tokens_device,
+            int request_row_capacity,
+            int bucket_seq_len,
+            int pad_token_id,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            void *out_position_ids_device,
+            void *out_real_rows_device,
+            void *out_row_stride_device)
+        {
+            (void)request_token_ids_device;
+            (void)request_position_ids_device;
+            (void)request_total_rows_device;
+            (void)cached_tokens_device;
+            (void)request_row_capacity;
+            (void)bucket_seq_len;
+            (void)pad_token_id;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_position_ids_device;
+            (void)out_real_rows_device;
+            (void)out_row_stride_device;
+            return false;
+        }
 
         // ====================================================================
         // Zero-Copy Mapped Memory Operations (GPU writes directly to host)
@@ -2200,12 +2262,19 @@ namespace llaminar2
          * @param draft_tokens_device Device verifier input row; entry zero is the
          *        first target token and later entries are speculative drafts.
          * @param compare_row_count Number of speculative rows to compare.
+         * @param active_verifier_row_count_device Device scalar containing the
+         *        logical verifier width for this replay.
          * @param stop_tokens_device Fixed-width INT32 stop-token row on device.
          * @param device_id GPU ordinal.
          * @param stream Exact non-null graph execution stream.
          * @param out_token_capacity Capacity of the compact output token row.
          * @param out_tokens_device Compact output token row.
          * @param out_meta_device Compact SamplingMath metadata row.
+         * @param max_state_commit_rows_device Device scalar limiting state rows
+         *        committed at the current maintenance boundary.
+         * @param next_leading_committed_output_count_device Authoritative device
+         *        controller scalar describing whether row zero is an already
+         *        committed carry from the preceding transaction.
          * @return true when the graph-capturable reducer was enqueued.
          */
         virtual bool
@@ -2221,7 +2290,7 @@ namespace llaminar2
             void *out_tokens_device,
             void *out_meta_device,
             const void *max_state_commit_rows_device = nullptr,
-            const void *penalty_policy_device = nullptr)
+            const void *next_leading_committed_output_count_device = nullptr)
         {
             (void)verify_tokens_device;
             (void)draft_tokens_device;
@@ -2234,7 +2303,7 @@ namespace llaminar2
             (void)out_tokens_device;
             (void)out_meta_device;
             (void)max_state_commit_rows_device;
-            (void)penalty_policy_device;
+            (void)next_leading_committed_output_count_device;
             return false;
         }
 
@@ -2284,6 +2353,8 @@ namespace llaminar2
             int request_count,
             int max_new_tokens,
             const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+            sampling_math::DeviceGenerationLeadingRowDisposition
+                initial_leading_row_disposition,
             int response_token_stride,
             void *response_tokens_device,
             int control_stride,
@@ -2294,6 +2365,7 @@ namespace llaminar2
             (void)request_count;
             (void)max_new_tokens;
             (void)depth_policy;
+            (void)initial_leading_row_disposition;
             (void)response_token_stride;
             (void)response_tokens_device;
             (void)control_stride;

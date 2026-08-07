@@ -81,15 +81,23 @@ namespace llaminar2
              *
              * This hook is mandatory for native capture and diagnostic
              * recapture. It runs after stage-owned launch metadata has been
-             * prepared and before `beginCapture()`, because metadata preparation
-             * may itself publish a new device-write event. A capture transaction
-             * must never discover or import that external event from inside its
-             * recorded body.
+             * prepared and before snapshot descriptor preparation so every
+             * arena output already has its final device address. It also joins
+             * metadata producer events to the capture stream. A capture
+             * transaction must never discover or import an external event from
+             * inside its recorded body.
              */
             std::function<bool(const DeviceGraphExecutor::GraphSegment &)> cohere_inputs;
             /// Executes one stage through executor's canonical node path.
             std::function<bool(ComputeNode &)> execute_node;
-            /// Preallocates point-in-time snapshot copy descriptors/storage before capture.
+            /**
+             * @brief Preallocates point-in-time snapshot descriptors/storage.
+             *
+             * The arena frontier is complete before this hook runs. The hook is
+             * host-side preparation only: it must not enqueue stream work,
+             * publish an event, or copy payload bytes. Device-to-device copies
+             * are recorded by @ref record_snapshot_copies after each producer.
+             */
             std::function<bool(ComputeNode &, void *)> prepare_snapshot_copies;
             /// Records point-in-time snapshot copies after direct stage execution.
             std::function<bool(ComputeNode &, void *)> record_snapshot_copies;

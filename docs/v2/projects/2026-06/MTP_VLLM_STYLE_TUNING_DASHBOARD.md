@@ -142,6 +142,21 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   being silently labeled as CUDA storage. The final Integration tree rebuilt
   all 784 affected targets and the device-free unit/source gate passed
   `585/585` in `135.90 s`.
+- Long-context prefill now has an explicit `M=262145` totality gate on CPU,
+  CUDA, and ROCm. The CPU cell uses Qwen2.5-0.5B geometry and one native Q8_1
+  KV layer, processes exactly `64 * 4096 + 1` real rows, and proves native-byte
+  first/final-row identity in `0.52 s`. Each GPU cell captures one 4096-row
+  graph and replays it 64 times plus the one-row tail without per-chunk host
+  slicing, transfer, allocation, or synchronization. A profiler-amplified
+  final-tail miss exposed an unordered diagnostic D2H; the harness now records
+  the terminal graph producer event and consumes it on the explicit observation
+  stream before the sole terminal readback. CUDA and ROCm focused gates pass,
+  including the exact `262145` device KV count. The CUDA materializer winner is
+  32 threads at approximately `3.55 us`, 35 registers, and zero spills. The
+  ROCm winner is 32 threads at `2.56 us` median and `2.734 us` pooled mean versus
+  `2.72/2.890 us` for 256 threads; ISA evidence shows vectorized dwordx4
+  loads/stores, 16 VGPRs, 52 logical SGPRs, and zero scratch, spills, LDS,
+  barriers, or atomics.
 
 ## CUDA LLEP Economy
 
@@ -219,11 +234,20 @@ Matched llama.cpp master comparison, tok/s:
 ### Reproducible ROCm1 SingleDevice Reference
 
 The active ROCm SingleDevice tuning control uses the Qwen3.6-35B-A3B MoE
-model, a fixed 425-token prompt, stochastic sampling, and MTP depth 3. Llaminar
-measures three steady-state graph replays after one warmup; model loading,
-arena construction, graph capture, and the warmup are outside the timing
-sample. MTP prefill is enabled, so each measured prefill includes population
-of both the main and MTP KV caches.
+model, a byte-stable 434-token Qwen assistant-generation prompt, stochastic
+sampling, and MTP depth 3. Llaminar measures three steady-state graph replays
+after one warmup; model loading, arena construction, graph capture, and the
+warmup are outside the timing sample. MTP prefill is enabled, so each measured
+prefill includes population of both the main and MTP KV caches.
+
+`qwen36_mtp_fixed_chat.txt` is the production-valid benchmark prompt. Its
+2,511 bytes have SHA-256
+`63d628982074c2785953dfde6f327e4f0146162a5c51396a48b1f59a239a97ae` and
+contain the exact Qwen user/assistant wrapper generated from the model's GGUF
+chat template. The unwrapped `qwen36_mtp_fixed.txt` remains useful as a raw
+tokenizer/continuation diagnostic, but the model closes that incomplete turn
+with `<|im_end|>` as its first greedy token. Acceptance and throughput from
+that malformed framing are not promotion evidence.
 
 ```bash
 env \
@@ -236,30 +260,44 @@ env \
   -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
   -d rocm:0 --context-length 4096 -n 256 \
   --benchmark-json-output /tmp/llaminar-rocm1-qwen36-35b-mtp-d3.json \
-  --prompt-file /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed.txt \
+  --prompt-file /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed_chat.txt \
   --seed 123 --temperature 0.8 --top-k 40 --top-p 0.9 \
   --mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed \
   --mtp-verify-mode speculative-sampling \
   --moe-residency-maintenance off
 ```
 
-The 2026-08-06 post-correctness baseline is `888.43 tok/s` prefill and
-`126.02 tok/s` decode, with `73.30%` stochastic draft acceptance, zero
-transaction-validation failures, and one warmed 512-row prefill graph (`1663`
-nodes). The prefill rate is `2.19x` the current llama.cpp reference and decode
-is `1.61x` faster than its `78.4 tok/s` median. Decode has crossed the current
-promotion target; the active ROCm1 work is now steady-state MTP prefill
-economy.
+The 2026-08-07 post-exact-GDN/grouped-verifier stochastic baseline is
+`1301.15 tok/s` prefill and `120.39 tok/s` decode, with `72.27%` draft
+acceptance and zero transaction-validation failures. Relative to the active
+`1400/125 tok/s` targets, the remaining shortfall is `7.06%` for prefill and
+`3.69%` for stochastic decode. On the same prompt at temperature zero,
+Llaminar measured `1302.46 tok/s` prefill and `145.36 tok/s` decode with
+`82.94%` acceptance.
 
-The accuracy gate for this baseline publishes the exact physical logits
-surface produced by each forward graph rather than assuming that every
-logical main-model result occupies the canonical logits buffer. A focused
-Release ROCm MTP server suite passed `31/31`, including thinking and
-non-thinking requests that previously repeated their first token. The full
-4096-token long-context run then passed needle placement, strict multi-needle
-JSON, 1024-token structured generation, cache reset, graph replay, and clean
-shutdown checks while emitting `10,195` PerfStats records. Device-free policy
-tests passed `4/4` in `2.70 s`.
+The temperature-zero correctness matrix compares 256 generated token IDs from
+serial and fixed-depth-3 MTP. Llaminar is identical for all 256 tokens on both
+the production-valid prompt and the older raw diagnostic prompt. On the same
+434-token production-valid input, llama.cpp MTP first diverges from its own
+serial decode at generated token 147; it is therefore a useful performance
+reference but not a byte-exact grouped-verifier oracle. The two engines' serial
+lanes first differ at generated token 26, which is an ordinary cross-engine
+kernel-math branch and is independent of Llaminar's internal MTP equivalence.
+
+The focused Release ROCm1 fixed-depth-3 live-server gate passed `19/19`. It
+proved repeated captured-prefill replay; beginning, middle, and end needle
+recall; strict multi-needle JSON; a non-degenerate 1024-token completion; cache
+reset; valid use of `3827/4096` context tokens; oversized-context rejection;
+clean shutdown/VRAM release; and `8,405` PerfStats records. The direct grouped
+verifier operation-equivalence matrix remains green on both CUDA and ROCm for
+M=1..4, the first production transaction/publication, and the M=6
+resident-sidecar device target.
+
+The llama.cpp CLI command below intentionally receives the unwrapped source
+file because `--conversation` applies the GGUF chat template itself. Its
+effective 434-token prompt is byte-equivalent to Llaminar's checked-in
+`qwen36_mtp_fixed_chat.txt`; passing the preformatted file here would wrap it
+twice.
 
 ```bash
 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \

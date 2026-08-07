@@ -499,7 +499,10 @@ namespace llaminar2
          *        production GPU grouped verifier and resident publisher.
          * @return true when admission is unnecessary or has completed.
          */
-        bool admitScalarDeviceResidentGeneration(bool grouped_device_verify);
+        bool admitScalarDeviceResidentGeneration(
+            bool grouped_device_verify,
+            sampling_math::DeviceGenerationLeadingRowDisposition
+                initial_leading_row_disposition);
         /**
          * @brief Admit one complete request-batched GPU generation ledger.
          *
@@ -799,22 +802,143 @@ namespace llaminar2
         std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
         int32_t last_token_{0};                                         // Last token for decode step
-        bool prefill_logits_ready_{false};                              // True when terminal logits already predict the next decode token
-        std::optional<int32_t> ready_sampled_token_;                    // Token already sampled from ready terminal logits
-        std::optional<SamplingParams> ready_sampled_params_;            // Sampling params used to produce ready_sampled_token_
         /**
-         * @brief Device-resident source for @ref ready_sampled_token_.
+         * @brief One already-sampled condition at a ready terminal-logits boundary.
          *
-         * A ready token is sampled one step early from the verifier's bonus
-         * terminal row, then emitted at the beginning of the next decode step.
-         * The host token remains necessary for the served response, but the
-         * next MTP sidecar should consume the token and logical position from
-         * the device mailbox when one is available.  This keeps the real
-         * inference path aligned with vLLM-style resident state publication
-         * instead of re-uploading the same token from a CPU shadow.
+         * Ordinary CPU MTP may materialize a sampled token on the host before
+         * the next public decode call. GPU resident generation instead ends at
+         * an event-published mailbox containing an exact token/position pair.
+         * The controller ledger separately records whether that row still belongs
+         * to the next response or was already returned as a rejection correction.
+         * Those states are deliberately represented by closed enums. In
+         * particular, the device form cannot accidentally carry a host token,
+         * and the host form cannot omit the concrete response token it owns.
+         *
+         * The optional resident handle on a host-visible condition is an
+         * execution optimization: the served response still owns the concrete
+         * token, while the next GPU sidecar consumes the same token and logical
+         * position from its authenticated mailbox. A device-only condition is
+         * different: its token has not crossed into a host execution authority,
+         * so every next-step consumer remains on device until the following
+         * terminal ledger materializes newly emitted response tokens.
          */
-        std::optional<DeviceResidentLogicalSequenceStateHandle>
-            ready_sampled_resident_state_;
+        struct ReadyMTPCondition
+        {
+            /** @brief Authority that owns the exact condition token. */
+            enum class Authority
+            {
+                /** A concrete token has already crossed a response boundary. */
+                HostVisible,
+                /** Only an authenticated device publication owns the token. */
+                DeviceResident,
+            };
+
+            Authority authority = Authority::HostVisible;
+            std::optional<int32_t> host_token;
+            SamplingParams sampling_params;
+            std::optional<DeviceResidentLogicalSequenceStateHandle>
+                resident_state;
+            sampling_math::DeviceGenerationLeadingRowDisposition
+                response_disposition =
+                    sampling_math::DeviceGenerationLeadingRowDisposition::
+                        PendingResponse;
+
+            /**
+             * @brief Construct a host-visible ready condition.
+             * @param token Concrete token already sampled for the response.
+             * @param params Sampling policy that produced @p token.
+             * @param resident Optional device source for subsequent GPU work.
+             */
+            [[nodiscard]] static ReadyMTPCondition hostVisible(
+                int32_t token,
+                const SamplingParams &params,
+                std::optional<DeviceResidentLogicalSequenceStateHandle>
+                    resident = std::nullopt)
+            {
+                return ReadyMTPCondition{
+                    .authority = Authority::HostVisible,
+                    .host_token = token,
+                    .sampling_params = params,
+                    .resident_state = std::move(resident),
+                    .response_disposition =
+                        sampling_math::
+                            DeviceGenerationLeadingRowDisposition::
+                                PendingResponse,
+                };
+            }
+
+            /**
+             * @brief Construct a device-only continuation condition.
+             * @param params Sampling policy embedded in the completed loop.
+             * @param resident Exact terminal mailbox retained by the GPU.
+             * @param disposition Whether the retained row is still owed to the
+             *        response or was emitted by the preceding controller.
+             */
+            [[nodiscard]] static ReadyMTPCondition deviceResident(
+                const SamplingParams &params,
+                DeviceResidentLogicalSequenceStateHandle resident,
+                sampling_math::DeviceGenerationLeadingRowDisposition
+                    disposition)
+            {
+                return ReadyMTPCondition{
+                    .authority = Authority::DeviceResident,
+                    .host_token = std::nullopt,
+                    .sampling_params = params,
+                    .resident_state = std::move(resident),
+                    .response_disposition = disposition,
+                };
+            }
+
+            /** @return true when authority and payload form one legal state. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                const bool resident_valid =
+                    !resident_state.has_value() || resident_state->valid();
+                switch (authority)
+                {
+                case Authority::HostVisible:
+                    return host_token.has_value() && *host_token >= 0 &&
+                           resident_valid &&
+                           response_disposition ==
+                               sampling_math::
+                                   DeviceGenerationLeadingRowDisposition::
+                                       PendingResponse;
+                case Authority::DeviceResident:
+                    return !host_token.has_value() &&
+                           resident_state.has_value() &&
+                           resident_state->coversRequest(0) &&
+                           sampling_math::
+                               valid_device_generation_leading_row_disposition(
+                                   response_disposition);
+                }
+                return false;
+            }
+
+            /** @return true when no host scalar may source this condition. */
+            [[nodiscard]] bool isDeviceResidentOnly() const noexcept
+            {
+                return authority == Authority::DeviceResident;
+            }
+
+            /** @return true when row zero was returned by the prior controller. */
+            [[nodiscard]] bool wasAlreadyEmitted() const noexcept
+            {
+                return response_disposition ==
+                       sampling_math::DeviceGenerationLeadingRowDisposition::
+                           AlreadyEmitted;
+            }
+        };
+
+        /**
+         * @brief Whether current terminal logits already own the next decode edge.
+         *
+         * A missing @ref ready_mtp_condition_ means the token still needs to be
+         * sampled from these logits, as after ordinary prefill. A populated
+         * condition means sampling already happened under the explicitly typed
+         * authority above and must never be repeated.
+         */
+        bool prefill_logits_ready_{false};
+        std::optional<ReadyMTPCondition> ready_mtp_condition_;
         /**
          * @brief Already-emitted correction token that still needs a main verifier row.
          *
@@ -880,26 +1004,120 @@ namespace llaminar2
          */
         std::optional<int> decode_transaction_planning_position_;
         /**
-         * @brief Whether successful prefill still needs one GPU ledger admission.
+         * @brief Typed scheduler lifecycle for the resident generation controller.
          *
-         * Prefill establishes a new request lifecycle, but it does not know the
-         * caller's response budget. The first scalar grouped GPU MTP decode owns
-         * that budget and clears this marker only after every device participant
-         * has initialized and event-published its resident controller.
-         */
-        bool device_generation_admission_pending_{false};
-        /**
-         * @brief Exact response budget accepted by the resident GPU controller.
+         * A pair of independent `pending` and optional-budget fields previously
+         * admitted contradictory states. In particular, a budget-limited public
+         * `decodeStep()` could retire the device controller and clear its budget
+         * while leaving admission closed; the following step then reached the
+         * grouped verifier with no controller transaction to consume. Keeping the
+         * phase and its budget in one type makes that state unrepresentable.
          *
-         * `decode_step_token_budget_` is a caller-facing admission hint whose
-         * zero value means "use the remaining context capacity." Admission
-         * resolves that sentinel exactly once and records the resulting positive
-         * budget here. Terminal validation consumes this value so completion can
-         * never reinterpret a stale caller hint or guess the controller contract.
-         * The scalar is lifecycle metadata only; response progress and stop state
-         * remain exclusively device-owned between admission and terminal result.
+         * This object owns control-plane admission metadata only. Tokens, response
+         * progress, stop state, dynamic depth, KV state, and recurrent state remain
+         * device-owned throughout an active controller transaction.
          */
-        std::optional<int> admitted_device_generation_token_budget_;
+        struct DeviceGenerationAdmissionLifecycle
+        {
+            /** @brief Legal scheduler phases for one request's controller. */
+            enum class Phase
+            {
+                /** No live request may admit a generation controller. */
+                Inactive,
+                /** A live request awaits a positive caller response budget. */
+                AwaitingBudget,
+                /** One resident controller owns the recorded response budget. */
+                ControllerActive,
+            };
+
+            /** Current phase; `admitted_token_budget` is positive only when active. */
+            Phase phase = Phase::Inactive;
+            int admitted_token_budget = 0;
+
+            /**
+             * @brief Reset at an explicit request/session boundary.
+             *
+             * Reset is intentionally unconditional because the underlying runner
+             * joins and retires device work before the orchestration request state
+             * is cleared. It must not be used as recovery inside a live decode.
+             */
+            void reset() noexcept
+            {
+                phase = Phase::Inactive;
+                admitted_token_budget = 0;
+            }
+
+            /**
+             * @brief Open the post-prefill admission boundary.
+             * @return true only for the unique Inactive -> AwaitingBudget edge.
+             */
+            [[nodiscard]] bool openAfterPrefill() noexcept
+            {
+                if (phase != Phase::Inactive || admitted_token_budget != 0)
+                    return false;
+                phase = Phase::AwaitingBudget;
+                return true;
+            }
+
+            /**
+             * @brief Bind one positive budget to a newly published controller.
+             * @param token_budget Exact terminal response capacity admitted on device.
+             * @return true only for AwaitingBudget -> ControllerActive.
+             */
+            [[nodiscard]] bool admitController(int token_budget) noexcept
+            {
+                if (phase != Phase::AwaitingBudget ||
+                    admitted_token_budget != 0 || token_budget <= 0)
+                {
+                    return false;
+                }
+                phase = Phase::ControllerActive;
+                admitted_token_budget = token_budget;
+                return true;
+            }
+
+            /**
+             * @brief Retire a validated terminal ledger.
+             *
+             * A model stop closes the request. Exhausting only the caller's
+             * budget leaves the request live and opens a fresh admission edge for
+             * the next public `decodeStep()`; no device payload is reconstructed.
+             *
+             * @param request_complete Whether model stop semantics ended the request.
+             * @return true only for ControllerActive -> Inactive/AwaitingBudget.
+             */
+            [[nodiscard]] bool retireController(bool request_complete) noexcept
+            {
+                if (phase != Phase::ControllerActive ||
+                    admitted_token_budget <= 0)
+                {
+                    return false;
+                }
+                phase = request_complete
+                            ? Phase::Inactive
+                            : Phase::AwaitingBudget;
+                admitted_token_budget = 0;
+                return true;
+            }
+
+            /** @return true when the next grouped decode must admit a controller. */
+            [[nodiscard]] bool awaitsAdmission() const noexcept
+            {
+                return phase == Phase::AwaitingBudget;
+            }
+
+            /** @return true while exactly one resident controller is active. */
+            [[nodiscard]] bool controllerActive() const noexcept
+            {
+                return phase == Phase::ControllerActive;
+            }
+
+            /** @return Active controller budget, or zero in every other phase. */
+            [[nodiscard]] int tokenBudget() const noexcept
+            {
+                return controllerActive() ? admitted_token_budget : 0;
+            }
+        } device_generation_admission_;
         /**
          * @brief Whether the terminal GPU ledger owns reported adaptive depth.
          *

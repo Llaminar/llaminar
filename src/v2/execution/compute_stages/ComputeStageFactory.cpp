@@ -4,6 +4,9 @@
  */
 
 #include "ComputeStageFactory.h"
+
+#include <stdexcept>
+#include <utility>
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
 #include "stages/AllreduceStage.h"
@@ -57,6 +60,20 @@ namespace llaminar2
         return std::make_unique<FusedQKVGEMMStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedKVGEMM(
+        FusedQKVGEMMStage::Params params)
+    {
+        if (params.wq || params.output_q || params.bias_q || params.n_q != 0 ||
+            params.prepared_ref_q.has_value() ||
+            params.output_q_buffer_id.has_value())
+        {
+            throw std::invalid_argument(
+                "createFusedKVGEMM rejects query state; K/V-only graphs must not bind or publish Q");
+        }
+        params.projection_set = AttentionProjectionSet::KeyValueOnly;
+        return std::make_unique<FusedQKVGEMMStage>(std::move(params));
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedGateUpGEMM(
         const FusedGateUpGEMMStage::Params &params)
     {
@@ -82,6 +99,22 @@ namespace llaminar2
     {
         // Unified: RoPEStage uses KernelFactory at execute-time for device dispatch
         return std::make_unique<RoPEStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createKeyOnlyRoPE(
+        RoPEStage::Params params)
+    {
+        if (!params.K || params.Q || params.Q_out || params.K_out ||
+            params.q_buffer_id || params.q_out_buffer_id ||
+            params.k_out_buffer_id || params.skip_k || params.n_heads != 0 ||
+            params.n_kv_heads <= 0)
+        {
+            throw std::invalid_argument(
+                "createKeyOnlyRoPE requires one in-place K operand, a positive "
+                "KV-head count, and no query/output/skip state");
+        }
+        params.operand_set = RoPEOperandSet::KeyOnly;
+        return std::make_unique<RoPEStage>(std::move(params));
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createResidualAdd(
@@ -322,6 +355,13 @@ namespace llaminar2
         const MTPVerifierPreparationStage::Params &params)
     {
         return std::make_unique<MTPVerifierPreparationStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createPrefillChunkMaterialization(
+        const PrefillChunkMaterializationStage::Params &params)
+    {
+        return std::make_unique<PrefillChunkMaterializationStage>(params);
     }
 
     // =============================================================================

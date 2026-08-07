@@ -23,9 +23,19 @@ namespace llaminar2
      * @brief Canonical graph-prefill bucket sizes used by runtime graph capture
      * and GEMM/GEMV dispatch training.
      */
-    inline constexpr std::array<int, 21> kDefaultPrefillGraphBucketSizes = {
-        64, 128, 256, 384, 512, 544, 576, 600, 608, 640, 672,
-        704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
+    inline constexpr size_t kDefaultPrefillGraphBucketCount =
+        size_t{0}
+#define LLAMINAR_PREFILL_GRAPH_BUCKET(rows) +size_t{1}
+#include "utils/PrefillGraphBuckets.def"
+#undef LLAMINAR_PREFILL_GRAPH_BUCKET
+        ;
+
+    inline constexpr std::array<int, kDefaultPrefillGraphBucketCount>
+        kDefaultPrefillGraphBucketSizes = {
+#define LLAMINAR_PREFILL_GRAPH_BUCKET(rows) rows,
+#include "utils/PrefillGraphBuckets.def"
+#undef LLAMINAR_PREFILL_GRAPH_BUCKET
+    };
 
     /**
      * @brief Runtime verifier depths certified by the default NativeVNNI sweep.

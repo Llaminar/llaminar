@@ -157,6 +157,7 @@ namespace llaminar2
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
+        uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
         bool standard_path = true;
         bool pp_stage_enabled = false;
@@ -187,6 +188,8 @@ namespace llaminar2
                    uses_device_position_ids == other.uses_device_position_ids &&
                    position_policy == other.position_policy &&
                    uses_device_sequence_lengths == other.uses_device_sequence_lengths &&
+                   device_prefill_chunk_capture_identity ==
+                       other.device_prefill_chunk_capture_identity &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
                    standard_path == other.standard_path &&
@@ -227,6 +230,9 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.device_prefill_chunk_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.shifted_mtp_prefill_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));

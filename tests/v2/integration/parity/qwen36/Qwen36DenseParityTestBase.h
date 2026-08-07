@@ -43,14 +43,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef HAVE_CUDA
-extern "C"
-{
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getDeterministicMode();
-}
-#endif
-
 namespace llaminar2::test::parity::qwen36
 {
     enum class DensePrefixParityTopology
@@ -646,15 +638,8 @@ namespace llaminar2::test::parity::qwen36
                 old_deterministic_env_ = old_value;
             }
 
-#ifdef HAVE_CUDA
-            old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
-#endif
-
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(false);
-#endif
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -665,9 +650,6 @@ namespace llaminar2::test::parity::qwen36
                 return;
             }
 
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(old_cuda_prefill_deterministic_);
-#endif
             if (had_old_deterministic_env_)
             {
                 setenv("LLAMINAR_DETERMINISTIC", old_deterministic_env_.c_str(), 1);
@@ -687,9 +669,6 @@ namespace llaminar2::test::parity::qwen36
         bool enabled_ = false;
         bool had_old_deterministic_env_ = false;
         std::string old_deterministic_env_;
-#ifdef HAVE_CUDA
-        bool old_cuda_prefill_deterministic_ = false;
-#endif
     };
 
     inline bool isDenseGpuParityCase(

@@ -88,6 +88,8 @@ namespace llaminar2
             return "GEMM_BIAS";
         case ComputeStageType::GEMM_FUSED_QKV:
             return "GEMM_FUSED_QKV";
+        case ComputeStageType::GEMM_FUSED_KV:
+            return "GEMM_FUSED_KV";
         case ComputeStageType::GEMM_FUSED_GATE_UP:
             return "GEMM_FUSED_GATE_UP";
         case ComputeStageType::RMS_NORM:
@@ -198,6 +200,8 @@ namespace llaminar2
             return "GDN_LIVE_STATE_LOCALIZE";
         case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
             return "GDN_LIVE_STATE_ALLGATHER";
+        case ComputeStageType::PREFILL_CHUNK_MATERIALIZATION:
+            return "PREFILL_CHUNK_MATERIALIZATION";
         case ComputeStageType::Q_GATE_SPLIT:
             return "Q_GATE_SPLIT";
         case ComputeStageType::MTP_CONCAT:

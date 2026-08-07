@@ -419,7 +419,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillSplitKWorkspace_DeclaredForQwenLikeQ4KShape)
+       NativeVNNIPrefillDirectScheduleDeclaresNoKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);
@@ -430,23 +430,16 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     constexpr int kK = 17408;
     auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
 
-    const WorkspaceDescriptor *splitk =
-        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(splitk, nullptr)
-        << "NativeVNNI prefill split-K dispatch must be backed by declared workspace; "
-        << "otherwise selected split-K launches fail at runtime.";
-
-    EXPECT_GT(splitk->size_bytes, 0u)
-        << "The total heuristic may choose its largest split-K arena at a "
-           "smaller row bucket than prompt M, but that arena must be declared.";
     EXPECT_EQ(
-        splitk->regime,
-        WorkspaceExecutionRegime::PrefillOnly)
-        << "Split-K partials are not live during canonical decode or grouped verification.";
+        reqs.find(
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr)
+        << "The direct output-owner schedule folds public-M=1 partitions inside "
+           "each tile and must not reserve a global partial arena.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillSplitKWorkspace_HasConcurrentSlotsForPromptPrefill)
+       NativeVNNIPrefillConcurrentDirectScheduleDoesNotInventKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
@@ -456,27 +449,23 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     constexpr int kN = 5120;
     constexpr int kK = 17408;
     const auto serial_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
-    const WorkspaceDescriptor *serial_splitk =
-        serial_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(serial_splitk, nullptr);
-    ASSERT_GT(serial_splitk->size_bytes, 0u);
+    EXPECT_EQ(
+        serial_reqs.find(
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr);
 
     concurrent_prefill.set(/*enabled=*/true);
     const auto concurrent_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
-    const WorkspaceDescriptor *concurrent_splitk =
-        concurrent_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(concurrent_splitk, nullptr);
-
     EXPECT_EQ(
-        concurrent_splitk->size_bytes,
-        static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) *
-            serial_splitk->size_bytes)
-        << "Concurrent CUDA prefill runs fused projections on side streams, so split-K "
-           "partials need disjoint per-stream slots instead of one serial scratch buffer.";
+        concurrent_reqs.find(
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr)
+        << "Projection concurrency must not allocate K-partition scratch unless "
+           "the selected launch family actually publishes partition partials.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillSplitKWorkspace_CoversMoEExpertSubBatchRows)
+       NativeVNNIPrefillDirectPromptAndExpertSchedulesNeedNoKpartScratch)
 {
     auto weights = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/1011);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
@@ -488,22 +477,14 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     auto prompt_reqs = kernel.getWorkspaceRequirements(kPromptM, kN, kK);
     auto expert_reqs = kernel.getWorkspaceRequirements(kExpertRows, kN, kK);
 
-    const WorkspaceDescriptor *prompt_splitk =
-        prompt_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    const WorkspaceDescriptor *expert_splitk =
-        expert_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(prompt_splitk, nullptr);
-    ASSERT_NE(expert_splitk, nullptr);
-
-    EXPECT_GE(prompt_splitk->size_bytes, expert_splitk->size_bytes)
-        << "MoE grouped prefill can invoke the same gate/up GEMM with any per-expert "
-           "row count up to the prompt length. Workspace planned for the full prompt "
-           "must cover smaller hot-expert sub-batches that select larger split-K.";
-
-    const size_t observed_failure_bytes =
-        static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) * 8u *
-        static_cast<size_t>(paddedPrefillM(kExpertRows)) * kN * sizeof(float);
-    EXPECT_GE(prompt_splitk->size_bytes, observed_failure_bytes);
+    EXPECT_EQ(
+        prompt_reqs.find(
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr);
+    EXPECT_EQ(
+        expert_reqs.find(
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr);
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,

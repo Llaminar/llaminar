@@ -1068,6 +1068,53 @@ TEST(Test__DeviceGenerationController, ContinuationTokenIsTotalForEveryDepthAndB
     }
 }
 
+TEST(Test__DeviceGenerationController,
+     AdmissionCarriesAlreadyEmittedRowWithoutDuplicatingResponse)
+{
+    using namespace llaminar2::sampling_math;
+
+    ControlRow control{};
+    std::array<int32_t, 2> response{-1, -1};
+    ASSERT_TRUE(initialize_device_generation_control(
+        /*max_new_tokens=*/1,
+        static_cast<int>(response.size()),
+        fixedDepthPolicy(1),
+        control.data(),
+        DeviceGenerationLeadingRowDisposition::AlreadyEmitted));
+    EXPECT_EQ(
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount],
+        1);
+    ASSERT_EQ(
+        prepare_device_generation_transaction_budget(
+            /*verifier_row_capacity=*/2,
+            /*maintenance_rows_remaining=*/2,
+            control.data()),
+        1);
+
+    const std::array<int32_t, 2> compact_tokens{41, 42};
+    const MetaRow meta = makeMeta(
+        /*output_count=*/2,
+        /*leading_count=*/1,
+        /*verifier_state_count=*/2,
+        /*accepted_prefix=*/1,
+        /*consumed_rows=*/1,
+        /*all_accepted=*/true);
+    ASSERT_TRUE(append_speculative_outcome_to_device_generation(
+        compact_tokens.data(),
+        static_cast<int>(compact_tokens.size()),
+        meta.data(),
+        static_cast<int>(meta.size()),
+        response.data(),
+        static_cast<int>(response.size()),
+        control.data()));
+
+    EXPECT_EQ(response[0], 42)
+        << "The correction in row zero crossed the preceding response boundary";
+    EXPECT_EQ(response[1], -1);
+    EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 1);
+    EXPECT_EQ(control[kDeviceGenerationControlRemainingTokenCount], 0);
+}
+
 TEST(Test__DeviceGenerationController, StopTokensRemainTheTerminalContinuation)
 {
     using namespace llaminar2::sampling_math;
@@ -1302,6 +1349,18 @@ TEST(Test__DeviceGenerationController, InvalidAdmissionAndMaintenanceFailHard)
     control.fill(-1);
     EXPECT_FALSE(initialize_device_generation_control(
         0, 4, fixedDepthPolicy(3), control.data()));
+    EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
+    EXPECT_EQ(
+        control[kDeviceGenerationControlErrorCode],
+        static_cast<int>(DeviceGenerationError::InvalidInitialization));
+
+    control.fill(-1);
+    EXPECT_FALSE(initialize_device_generation_control(
+        4,
+        4,
+        fixedDepthPolicy(3),
+        control.data(),
+        static_cast<DeviceGenerationLeadingRowDisposition>(7)));
     EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
     EXPECT_EQ(
         control[kDeviceGenerationControlErrorCode],

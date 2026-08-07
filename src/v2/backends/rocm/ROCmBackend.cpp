@@ -15,6 +15,7 @@
 #include "../../utils/VramBillOfMaterials.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
+#include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <stdexcept>
@@ -1201,7 +1202,7 @@ namespace llaminar2
         int out_token_capacity,
         int *out_meta,
         const uint32_t *max_state_commit_rows,
-        const MTPGreedyPenaltyPolicy *penalty_policy,
+        const int *next_leading_committed_output_count,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_advance_speculative_commit_boundary(
@@ -1218,6 +1219,8 @@ namespace llaminar2
         int request_count,
         int max_new_tokens,
         const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition,
         int response_token_stride,
         int control_stride,
         int *control,
@@ -2691,12 +2694,13 @@ namespace llaminar2
             void *out_tokens_device,
             void *out_meta_device,
             const void *max_state_commit_rows_device,
-            const void *penalty_policy_device)
+            const void *next_leading_committed_output_count_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !draft_tokens_device ||
             !active_verifier_row_count_device || !stop_tokens_device ||
-            !penalty_policy_device || compare_row_count < 0 ||
+            !next_leading_committed_output_count_device ||
+            compare_row_count < 0 ||
             out_token_capacity < compare_row_count + 1 ||
             !stream || !out_tokens_device || !out_meta_device)
         {
@@ -2714,7 +2718,8 @@ namespace llaminar2
             out_token_capacity,
             static_cast<int *>(out_meta_device),
             static_cast<const uint32_t *>(max_state_commit_rows_device),
-            static_cast<const MTPGreedyPenaltyPolicy *>(penalty_policy_device),
+            static_cast<const int *>(
+                next_leading_committed_output_count_device),
             device_id,
             stream);
     }
@@ -2758,6 +2763,8 @@ namespace llaminar2
         int request_count,
         int max_new_tokens,
         const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition,
         int response_token_stride,
         void *response_tokens_device,
         int control_stride,
@@ -2768,6 +2775,8 @@ namespace llaminar2
         if (device_id < 0 || device_id >= device_count_ ||
             request_count <= 0 || max_new_tokens <= 0 ||
             !depth_policy.valid() ||
+            !sampling_math::valid_device_generation_leading_row_disposition(
+                initial_leading_row_disposition) ||
             response_token_stride < max_new_tokens ||
             !response_tokens_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
@@ -2781,6 +2790,7 @@ namespace llaminar2
             request_count,
             max_new_tokens,
             depth_policy,
+            initial_leading_row_disposition,
             response_token_stride,
             control_stride,
             static_cast<int *>(control_device),
@@ -4152,6 +4162,48 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmBackend::enqueuePreparePrefillChunkView(
+        const void *request_token_ids_device,
+        const void *request_position_ids_device,
+        const void *request_total_rows_device,
+        const void *cached_tokens_device,
+        int request_row_capacity,
+        int bucket_seq_len,
+        int pad_token_id,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        void *out_position_ids_device,
+        void *out_real_rows_device,
+        void *out_row_stride_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !request_token_ids_device || !request_position_ids_device ||
+            !request_total_rows_device || !cached_tokens_device ||
+            request_row_capacity <= 0 || bucket_seq_len <= 0 ||
+            bucket_seq_len > request_row_capacity || !stream ||
+            !out_token_ids_device || !out_position_ids_device ||
+            !out_real_rows_device || !out_row_stride_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocm::launchPreparePrefillChunkView(
+            static_cast<const int32_t *>(request_token_ids_device),
+            static_cast<const int32_t *>(request_position_ids_device),
+            static_cast<const int32_t *>(request_total_rows_device),
+            static_cast<const int32_t *>(cached_tokens_device),
+            request_row_capacity,
+            bucket_seq_len,
+            static_cast<int32_t>(pad_token_id),
+            static_cast<int32_t *>(out_token_ids_device),
+            static_cast<int32_t *>(out_position_ids_device),
+            static_cast<int32_t *>(out_real_rows_device),
+            static_cast<int32_t *>(out_row_stride_device),
+            stream);
     }
 
     bool ROCmBackend::vectorAddInplace(void *output, const void *input, size_t count,

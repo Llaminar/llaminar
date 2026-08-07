@@ -139,6 +139,27 @@ extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     int *tile_m,
     int *tile_n);
 
+/**
+ * @brief Query the joint exact-overlay-or-generic production pair policy.
+ *
+ * The return values are the configurations embedded at graph capture. This
+ * host-only inspection performs no GPU work and lets the integration suite
+ * prove exact precedence without substituting a test-only launch path.
+ */
+extern "C" bool rocmMoE_grouped_prefill_query_production_pair_config(
+    uint8_t gateup_codebook_id,
+    uint8_t down_codebook_id,
+    int m,
+    int hidden_size,
+    int expert_width,
+    int expert_count,
+    int top_k,
+    int *gateup_tile_m,
+    int *gateup_tile_n,
+    int *down_tile_m,
+    int *down_tile_n,
+    int *exact_overlay);
+
 extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
     const float *logits,
     float *expert_indices, float *expert_weights,
@@ -165,6 +186,44 @@ extern "C" bool hipMoE_materialize_runtime_prefill_plan(
     int num_experts,
     int max_active_experts,
     int device_idx,
+    void *stream);
+
+/**
+ * @brief Launch the production standalone FP32 SwiGLU decode kernel.
+ */
+extern "C" bool hipOps_swiglu_fp32(
+    const float *gate,
+    const float *up,
+    float *output,
+    int size,
+    int device_idx,
+    void *stream);
+
+/**
+ * @brief Publish one or more FP32 rows with the production blockwise Q8 path.
+ */
+extern "C" bool rocmQuantGemm_quantizeActivationsBlockwise(
+    const float *d_A_fp32,
+    int8_t *d_A_int8,
+    float *d_scales_blockwise,
+    int M,
+    int K,
+    int rocm_device_id,
+    void *stream,
+    int block_size);
+
+/**
+ * @brief Launch the production grouped SwiGLU-to-Q8 publisher.
+ */
+extern "C" bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+    const float *const *d_gate_ptrs,
+    const float *const *d_up_ptrs,
+    const int *d_expert_ids,
+    int8_t *d_swiglu_int8,
+    float *d_swiglu_scales,
+    int num_active,
+    int K,
+    int device_id,
     void *stream);
 #endif
 
@@ -1208,6 +1267,153 @@ namespace
     }
 
 } // namespace
+
+/**
+ * @brief Prove exact pair precedence and generic M-totality at capture time.
+ *
+ * The exact witnesses include every routed codebook pair observed in the
+ * Qwen3.6-35B-A3B-MTP UD-IQ3_S graph at the captured M=512 prefill bucket.
+ * The older IQ2_S/IQ3_S M=64 surface remains an independent additive witness.
+ * Nearby and far-out positive M values absent from the exact corpus must remain
+ * dispatchable through the complementary generic policy.
+ */
+TEST(Test__ROCmMoEKernel,
+     ProductionMoEPrefillPairOverlayPrecedesMTotalGenericPolicy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    constexpr uint8_t iq2_s_codebook = 13;
+    constexpr uint8_t iq3_s_codebook = 11;
+    constexpr uint8_t iq4_xs_codebook = 4;
+    constexpr uint8_t q6_k_codebook = 8;
+    constexpr int hidden_size = 2048;
+    constexpr int expert_width = 512;
+    constexpr int expert_count = 256;
+    constexpr int top_k = 8;
+
+    int gateup_tile_m = 0;
+    int gateup_tile_n = 0;
+    int down_tile_m = 0;
+    int down_tile_n = 0;
+    int exact_overlay = 0;
+    const auto expect_exact = [&](
+                                  uint8_t gateup_codebook,
+                                  uint8_t down_codebook,
+                                  int m,
+                                  int expected_gateup_tile_m,
+                                  int expected_gateup_tile_n,
+                                  int expected_down_tile_m,
+                                  int expected_down_tile_n)
+    {
+        gateup_tile_m = gateup_tile_n = 0;
+        down_tile_m = down_tile_n = 0;
+        exact_overlay = 0;
+        ASSERT_TRUE(rocmMoE_grouped_prefill_query_production_pair_config(
+            gateup_codebook,
+            down_codebook,
+            m,
+            hidden_size,
+            expert_width,
+            expert_count,
+            top_k,
+            &gateup_tile_m,
+            &gateup_tile_n,
+            &down_tile_m,
+            &down_tile_n,
+            &exact_overlay));
+        EXPECT_EQ(exact_overlay, 1) << "M=" << m;
+        EXPECT_EQ(gateup_tile_m, expected_gateup_tile_m) << "M=" << m;
+        EXPECT_EQ(gateup_tile_n, expected_gateup_tile_n) << "M=" << m;
+        EXPECT_EQ(down_tile_m, expected_down_tile_m) << "M=" << m;
+        EXPECT_EQ(down_tile_n, expected_down_tile_n) << "M=" << m;
+    };
+    expect_exact(
+        iq2_s_codebook,
+        iq3_s_codebook,
+        /*m=*/64,
+        /*gateup=*/4,
+        128,
+        /*down=*/4,
+        64);
+
+    for (const auto [gateup_codebook, down_codebook] : {
+             std::pair{iq2_s_codebook, iq4_xs_codebook},
+             std::pair{iq2_s_codebook, q6_k_codebook},
+             std::pair{iq3_s_codebook, q6_k_codebook},
+             std::pair{iq2_s_codebook, iq3_s_codebook}})
+    {
+        expect_exact(
+            gateup_codebook,
+            down_codebook,
+            /*m=*/512,
+            /*gateup=*/16,
+            128,
+            /*down=*/16,
+            128);
+    }
+
+    for (const int unseen_m : {
+             1,
+             2,
+             4,
+             8,
+             16,
+             31,
+             63,
+             65,
+             128,
+             425,
+             32768,
+             262145,
+             std::numeric_limits<int>::max()})
+    {
+        gateup_tile_m = gateup_tile_n = 0;
+        down_tile_m = down_tile_n = 0;
+        exact_overlay = -1;
+        ASSERT_TRUE(rocmMoE_grouped_prefill_query_production_pair_config(
+            iq2_s_codebook,
+            iq3_s_codebook,
+            unseen_m,
+            hidden_size,
+            expert_width,
+            expert_count,
+            top_k,
+            &gateup_tile_m,
+            &gateup_tile_n,
+            &down_tile_m,
+            &down_tile_n,
+            &exact_overlay))
+            << "generic production policy is not M-total at M=" << unseen_m;
+        EXPECT_EQ(exact_overlay, 0) << "unexpected exact key at M=" << unseen_m;
+        EXPECT_TRUE(
+            gateup_tile_m == 4 || gateup_tile_m == 8 ||
+            gateup_tile_m == 12 || gateup_tile_m == 16);
+        EXPECT_TRUE(
+            down_tile_m == 4 || down_tile_m == 8 ||
+            down_tile_m == 12 || down_tile_m == 16);
+        EXPECT_TRUE(
+            gateup_tile_n == 64 || gateup_tile_n == 128 ||
+            gateup_tile_n == 256);
+        EXPECT_TRUE(
+            down_tile_n == 64 || down_tile_n == 128 || down_tile_n == 256);
+    }
+
+    EXPECT_FALSE(rocmMoE_grouped_prefill_query_production_pair_config(
+        iq2_s_codebook,
+        iq3_s_codebook,
+        /*m=*/0,
+        hidden_size,
+        expert_width,
+        expert_count,
+        top_k,
+        &gateup_tile_m,
+        &gateup_tile_n,
+        &down_tile_m,
+        &down_tile_n,
+        &exact_overlay));
+#endif
+}
 
 /**
  * @brief Prove terminal LLEP evidence is reduced from the complete ROCm table.
@@ -16252,6 +16458,181 @@ TEST(Test__ROCmMoEKernel, SwiGLU)
 // Test: grouped decode expert down path matches existing sequential ROCm path
 // ============================================================================
 
+/**
+ * @brief Prove fused grouped SwiGLU publication equals serial M=1 bytes.
+ *
+ * Down-projection tests can turn a one-byte activation defect into a small
+ * final FP32 drift whose source is difficult to identify. This boundary test
+ * instead compares the production grouped publisher directly with the exact
+ * serial sequence `standalone SwiGLU -> V4 Q8 publication`. Every grouped row
+ * count from one through the supported MTP depth is exercised so launch-grid
+ * changes cannot create an uncovered arithmetic regime.
+ */
+TEST(Test__ROCmMoEKernel, GroupedSwiGLUQ8PublicationMatchesSerialDecodeBytes)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int device_id = 0;
+    constexpr int max_rows = 16;
+    constexpr int row_width = 256;
+    constexpr int values_per_block = 32;
+    constexpr int blocks_per_row = row_width / values_per_block;
+    const DeviceId device = DeviceId::rocm(device_id);
+    hipStream_t stream = rocmMoETestStream();
+
+    std::array<std::shared_ptr<FP32Tensor>, max_rows> gate_rows;
+    std::array<std::shared_ptr<FP32Tensor>, max_rows> up_rows;
+    std::array<const float *, max_rows> gate_device_ptrs{};
+    std::array<const float *, max_rows> up_device_ptrs{};
+    for (int row = 0; row < max_rows; ++row)
+    {
+        gate_rows[row] = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(row_width)},
+            -2.0f,
+            2.0f,
+            300 + row);
+        up_rows[row] = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(row_width)},
+            -2.0f,
+            2.0f,
+            400 + row);
+        ASSERT_TRUE(gate_rows[row]->ensureOnDevice(device, stream));
+        ASSERT_TRUE(up_rows[row]->ensureOnDevice(device, stream));
+        gate_device_ptrs[row] = static_cast<const float *>(
+            gate_rows[row]->gpu_data_ptr());
+        up_device_ptrs[row] = static_cast<const float *>(
+            up_rows[row]->gpu_data_ptr());
+        ASSERT_NE(gate_device_ptrs[row], nullptr);
+        ASSERT_NE(up_device_ptrs[row], nullptr);
+    }
+
+    HipAllocation device_gate_ptrs(sizeof(float *) * max_rows);
+    HipAllocation device_up_ptrs(sizeof(float *) * max_rows);
+    HipAllocation serial_swiglu(
+        sizeof(float) * max_rows * row_width);
+    HipAllocation serial_q8(
+        sizeof(int8_t) * max_rows * row_width);
+    HipAllocation serial_scales(
+        sizeof(float) * max_rows * blocks_per_row);
+    HipAllocation grouped_q8(
+        sizeof(int8_t) * max_rows * row_width);
+    HipAllocation grouped_scales(
+        sizeof(float) * max_rows * blocks_per_row);
+
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_gate_ptrs.get(),
+            gate_device_ptrs.data(),
+            sizeof(float *) * max_rows,
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_up_ptrs.get(),
+            up_device_ptrs.data(),
+            sizeof(float *) * max_rows,
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    auto *serial_swiglu_values =
+        static_cast<float *>(serial_swiglu.get());
+    auto *serial_q8_values = static_cast<int8_t *>(serial_q8.get());
+    auto *serial_scale_values = static_cast<float *>(serial_scales.get());
+    for (int row = 0; row < max_rows; ++row)
+    {
+        ASSERT_TRUE(hipOps_swiglu_fp32(
+            gate_device_ptrs[row],
+            up_device_ptrs[row],
+            serial_swiglu_values + static_cast<size_t>(row) * row_width,
+            row_width,
+            device_id,
+            stream));
+        ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+            serial_swiglu_values + static_cast<size_t>(row) * row_width,
+            serial_q8_values + static_cast<size_t>(row) * row_width,
+            serial_scale_values + static_cast<size_t>(row) * blocks_per_row,
+            1,
+            row_width,
+            device_id,
+            stream,
+            values_per_block));
+    }
+
+    std::vector<int8_t> expected_q8(max_rows * row_width);
+    std::vector<float> expected_scales(max_rows * blocks_per_row);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(
+        hipMemcpy(
+            expected_q8.data(),
+            serial_q8.get(),
+            expected_q8.size() * sizeof(int8_t),
+            hipMemcpyDeviceToHost),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpy(
+            expected_scales.data(),
+            serial_scales.get(),
+            expected_scales.size() * sizeof(float),
+            hipMemcpyDeviceToHost),
+        hipSuccess);
+
+    std::vector<int8_t> actual_q8(max_rows * row_width);
+    std::vector<float> actual_scales(max_rows * blocks_per_row);
+    for (int active_rows = 1; active_rows <= max_rows; ++active_rows)
+    {
+        SCOPED_TRACE("active_rows=" + std::to_string(active_rows));
+        ASSERT_TRUE(rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+            static_cast<const float *const *>(device_gate_ptrs.get()),
+            static_cast<const float *const *>(device_up_ptrs.get()),
+            nullptr,
+            static_cast<int8_t *>(grouped_q8.get()),
+            static_cast<float *>(grouped_scales.get()),
+            active_rows,
+            row_width,
+            device_id,
+            stream));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const size_t q8_count =
+            static_cast<size_t>(active_rows) * row_width;
+        const size_t scale_count =
+            static_cast<size_t>(active_rows) * blocks_per_row;
+        ASSERT_EQ(
+            hipMemcpy(
+                actual_q8.data(),
+                grouped_q8.get(),
+                q8_count * sizeof(int8_t),
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                actual_scales.data(),
+                grouped_scales.get(),
+                scale_count * sizeof(float),
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+
+        const auto first_q8_mismatch = std::mismatch(
+            actual_q8.begin(),
+            actual_q8.begin() + static_cast<std::ptrdiff_t>(q8_count),
+            expected_q8.begin());
+        ASSERT_EQ(
+            first_q8_mismatch.first,
+            actual_q8.begin() + static_cast<std::ptrdiff_t>(q8_count))
+            << "first Q8 payload mismatch at index "
+            << std::distance(actual_q8.begin(), first_q8_mismatch.first);
+
+        expectBitwiseVerifierRowsEqual(
+            "grouped SwiGLU Q8 scales vs serial decode",
+            actual_scales.data(),
+            expected_scales.data(),
+            scale_count,
+            blocks_per_row);
+    }
+}
+
 TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
 {
     SKIP_IF_NO_ROCM();
@@ -16360,8 +16741,8 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
     const float *seq = sequential_output->data();
     const float *grouped = grouped_output->data();
     ASSERT_FALSE(hasNaNOrInf(grouped, d_model));
-    expectStrictVerifierSimilarity(
-        "ROCm grouped expert down decode Q4_0 must match sequential decode",
+    expectBitwiseVerifierRowsEqual(
+        "ROCm grouped expert down decode Q4_0 must match serial decode bytes",
         grouped,
         seq,
         static_cast<size_t>(d_model),
@@ -16440,21 +16821,15 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
     auto sequential_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto grouped_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto device_routed_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
-    auto parallel_device_routed_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto runtime_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
-    auto parallel_runtime_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     ASSERT_TRUE(sequential_output->ensureOnDevice(device));
     ASSERT_TRUE(grouped_output->ensureOnDevice(device));
     ASSERT_TRUE(device_routed_output->ensureOnDevice(device));
-    ASSERT_TRUE(parallel_device_routed_output->ensureOnDevice(device));
     ASSERT_TRUE(runtime_output->ensureOnDevice(device));
-    ASSERT_TRUE(parallel_runtime_output->ensureOnDevice(device));
     moe_kernel.zeroBuffer(sequential_output.get(), static_cast<size_t>(d_model) * sizeof(float));
     moe_kernel.zeroBuffer(grouped_output.get(), static_cast<size_t>(d_model) * sizeof(float));
     moe_kernel.zeroBuffer(device_routed_output.get(), static_cast<size_t>(d_model) * sizeof(float));
-    moe_kernel.zeroBuffer(parallel_device_routed_output.get(), static_cast<size_t>(d_model) * sizeof(float));
     moe_kernel.zeroBuffer(runtime_output.get(), static_cast<size_t>(d_model) * sizeof(float));
-    moe_kernel.zeroBuffer(parallel_runtime_output.get(), static_cast<size_t>(d_model) * sizeof(float));
 
     for (int i = 0; i < num_active; ++i)
     {
@@ -16500,19 +16875,9 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
     ASSERT_TRUE(routing_indices->ensureOnDevice(device));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device));
 
-    {
-        ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
-        ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
-            gate_ptrs, up_ptrs, routing_indices.get(), routing_weights.get(), table_id,
-            num_active, device_routed_output.get(), d_model, intermediate));
-    }
-
-    {
-        ScopedROCmEnvOverride enable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-        ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
-            gate_ptrs, up_ptrs, routing_indices.get(), routing_weights.get(), table_id,
-            num_active, parallel_device_routed_output.get(), d_model, intermediate));
-    }
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
+        gate_ptrs, up_ptrs, routing_indices.get(), routing_weights.get(), table_id,
+        num_active, device_routed_output.get(), d_model, intermediate));
 
     DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, num_active);
     populateRuntimeDescriptors(host_runtime, nullptr, nullptr, &descs);
@@ -16525,116 +16890,43 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
     ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
-    {
-        ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
-        ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRuntime(
-            gate_ptrs, up_ptrs, device_runtime, table_id,
-            num_active, runtime_output.get(), d_model, intermediate));
-    }
-
-    {
-        ScopedROCmEnvOverride enable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-        ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRuntime(
-            gate_ptrs, up_ptrs, device_runtime, table_id,
-            num_active, parallel_runtime_output.get(), d_model, intermediate));
-    }
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRuntime(
+        gate_ptrs, up_ptrs, device_runtime, table_id,
+        num_active, runtime_output.get(), d_model, intermediate));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipFree(device_runtime), hipSuccess);
 
     ASSERT_TRUE(sequential_output->ensureOnHost(rocmMoETestStream()));
     ASSERT_TRUE(grouped_output->ensureOnHost(rocmMoETestStream()));
     ASSERT_TRUE(device_routed_output->ensureOnHost(rocmMoETestStream()));
-    ASSERT_TRUE(parallel_device_routed_output->ensureOnHost(rocmMoETestStream()));
     ASSERT_TRUE(runtime_output->ensureOnHost(rocmMoETestStream()));
-    ASSERT_TRUE(parallel_runtime_output->ensureOnHost(rocmMoETestStream()));
 
     const float *seq = sequential_output->data();
     const float *grouped = grouped_output->data();
     const float *device_routed = device_routed_output->data();
-    const float *parallel_device_routed = parallel_device_routed_output->data();
     const float *runtime = runtime_output->data();
-    const float *parallel_runtime = parallel_runtime_output->data();
     ASSERT_FALSE(hasNaNOrInf(grouped, d_model));
     ASSERT_FALSE(hasNaNOrInf(device_routed, d_model));
-    ASSERT_FALSE(hasNaNOrInf(parallel_device_routed, d_model));
     ASSERT_FALSE(hasNaNOrInf(runtime, d_model));
-    ASSERT_FALSE(hasNaNOrInf(parallel_runtime, d_model));
-    const double cosine = cosineSimilarity(grouped, seq, d_model);
-    const double l2_err = relativeL2Error(grouped, seq, d_model);
-    const double device_cosine = cosineSimilarity(device_routed, seq, d_model);
-    const double device_l2_err = relativeL2Error(device_routed, seq, d_model);
-    const double runtime_cosine = cosineSimilarity(runtime, seq, d_model);
-    const double runtime_l2_err = relativeL2Error(runtime, seq, d_model);
-    const double parallel_runtime_cosine = cosineSimilarity(parallel_runtime, seq, d_model);
-    const double parallel_runtime_l2_err = relativeL2Error(parallel_runtime, seq, d_model);
-    const double parallel_vs_runtime_cosine = cosineSimilarity(parallel_runtime, runtime, d_model);
-    const double parallel_vs_runtime_l2_err = relativeL2Error(parallel_runtime, runtime, d_model);
-    const double parallel_vs_runtime_max_abs = maxAbsDiff(parallel_runtime, runtime, d_model);
-    const double parallel_device_vs_runtime_cosine = cosineSimilarity(parallel_device_routed, parallel_runtime, d_model);
-    const double parallel_device_vs_runtime_l2_err =
-        relativeL2Error(parallel_device_routed, parallel_runtime, d_model);
-    const double parallel_device_vs_runtime_max_abs =
-        maxAbsDiff(parallel_device_routed, parallel_runtime, d_model);
 
-    expectStrictVerifierSimilarity(
-        (std::string(label) + " grouped expert down decode must match sequential").c_str(),
+    expectBitwiseVerifierRowsEqual(
+        (std::string(label) + " table down decode vs serial row").c_str(),
         grouped,
         seq,
         static_cast<size_t>(d_model),
         static_cast<size_t>(d_model));
-    expectStrictVerifierSimilarity(
-        (std::string(label) + " device-routed grouped expert down decode must match sequential").c_str(),
+    expectBitwiseVerifierRowsEqual(
+        (std::string(label) + " routed down decode vs serial row").c_str(),
         device_routed,
         seq,
         static_cast<size_t>(d_model),
         static_cast<size_t>(d_model));
-    expectStrictVerifierSimilarity(
-        (std::string(label) + " runtime grouped expert down decode must match sequential").c_str(),
+    expectBitwiseVerifierRowsEqual(
+        (std::string(label) + " runtime down decode vs serial row").c_str(),
         runtime,
         seq,
         static_cast<size_t>(d_model),
         static_cast<size_t>(d_model));
-    expectStrictVerifierSimilarity(
-        (std::string(label) + " parallel device-routed grouped expert down decode must match sequential").c_str(),
-        parallel_device_routed,
-        seq,
-        static_cast<size_t>(d_model),
-        static_cast<size_t>(d_model));
-    expectStrictVerifierSimilarity(
-        (std::string(label) + " parallel runtime grouped expert down decode must match sequential").c_str(),
-        parallel_runtime,
-        seq,
-        static_cast<size_t>(d_model),
-        static_cast<size_t>(d_model));
-    EXPECT_GE(parallel_vs_runtime_cosine, 0.99999)
-        << label << " parallel runtime should closely match serial runtime, cosine=" << parallel_vs_runtime_cosine;
-    EXPECT_LE(parallel_vs_runtime_l2_err, 0.002)
-        << label << " parallel runtime should closely match serial runtime, relative L2=" << parallel_vs_runtime_l2_err;
-    EXPECT_LE(parallel_vs_runtime_max_abs, 0.05)
-        << label << " parallel runtime max abs diff vs serial runtime too high: " << parallel_vs_runtime_max_abs;
-    EXPECT_GE(parallel_device_vs_runtime_cosine, 0.999999)
-        << label << " parallel device-routed down should match parallel runtime, cosine="
-        << parallel_device_vs_runtime_cosine;
-    EXPECT_LE(parallel_device_vs_runtime_l2_err, 1.0e-5)
-        << label << " parallel device-routed down should match parallel runtime, relative L2="
-        << parallel_device_vs_runtime_l2_err;
-    EXPECT_LE(parallel_device_vs_runtime_max_abs, 1.0e-4)
-        << label << " parallel device-routed down max abs diff vs parallel runtime too high: "
-        << parallel_device_vs_runtime_max_abs;
-
-    std::cout << "[GroupedExpertDownDecode_" << label << "MatchesSequential] cosine="
-              << std::fixed << std::setprecision(6) << cosine
-              << " l2_err=" << l2_err
-              << " device_cosine=" << device_cosine
-              << " device_l2_err=" << device_l2_err
-              << " runtime_cosine=" << runtime_cosine
-              << " runtime_l2_err=" << runtime_l2_err
-              << " parallel_runtime_cosine=" << parallel_runtime_cosine
-              << " parallel_runtime_l2_err=" << parallel_runtime_l2_err
-              << " parallel_vs_runtime_l2_err=" << parallel_vs_runtime_l2_err
-              << " parallel_vs_runtime_max_abs=" << parallel_vs_runtime_max_abs
-              << " parallel_device_vs_runtime_l2_err=" << parallel_device_vs_runtime_l2_err
-              << " parallel_device_vs_runtime_max_abs=" << parallel_device_vs_runtime_max_abs << std::endl;
 }
 
 TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q5_KMatchesSequential)
@@ -16742,8 +17034,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
     std::vector<std::shared_ptr<FP32Tensor>> device_up_tensors;
     std::vector<std::shared_ptr<FP32Tensor>> runtime_gate_tensors;
     std::vector<std::shared_ptr<FP32Tensor>> runtime_up_tensors;
-    std::vector<std::shared_ptr<FP32Tensor>> kpart_gate_tensors;
-    std::vector<std::shared_ptr<FP32Tensor>> kpart_up_tensors;
     seq_gate_tensors.reserve(num_active);
     seq_up_tensors.reserve(num_active);
     grouped_gate_tensors.reserve(num_active);
@@ -16752,8 +17042,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
     device_up_tensors.reserve(num_active);
     runtime_gate_tensors.reserve(num_active);
     runtime_up_tensors.reserve(num_active);
-    kpart_gate_tensors.reserve(num_active);
-    kpart_up_tensors.reserve(num_active);
 
     std::vector<ITensorGemm::TensorProjectionDesc> projections;
     projections.reserve(num_active * 2);
@@ -16767,8 +17055,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         auto device_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
         auto runtime_gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
         auto runtime_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
-        auto kpart_gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
-        auto kpart_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
         ASSERT_TRUE(seq_gate->ensureOnDevice(device, stream));
         ASSERT_TRUE(seq_up->ensureOnDevice(device, stream));
         ASSERT_TRUE(grouped_gate->ensureOnDevice(device, stream));
@@ -16777,8 +17063,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         ASSERT_TRUE(device_up->ensureOnDevice(device, stream));
         ASSERT_TRUE(runtime_gate->ensureOnDevice(device, stream));
         ASSERT_TRUE(runtime_up->ensureOnDevice(device, stream));
-        ASSERT_TRUE(kpart_gate->ensureOnDevice(device, stream));
-        ASSERT_TRUE(kpart_up->ensureOnDevice(device, stream));
 
         const int expert_id = expert_ids[i];
         projections.emplace_back(gate_kernels[expert_id].get(), seq_gate.get(), intermediate, nullptr, "gate");
@@ -16792,8 +17076,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         device_up_tensors.push_back(std::move(device_up));
         runtime_gate_tensors.push_back(std::move(runtime_gate));
         runtime_up_tensors.push_back(std::move(runtime_up));
-        kpart_gate_tensors.push_back(std::move(kpart_gate));
-        kpart_up_tensors.push_back(std::move(kpart_up));
     }
 
     ASSERT_TRUE(gate_kernels[expert_ids[0]]->multiply_fused_tensor(
@@ -16818,8 +17100,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
     ITensor *device_up_ptrs[num_active] = {};
     ITensor *runtime_gate_ptrs[num_active] = {};
     ITensor *runtime_up_ptrs[num_active] = {};
-    ITensor *kpart_gate_ptrs[num_active] = {};
-    ITensor *kpart_up_ptrs[num_active] = {};
     for (int i = 0; i < num_active; ++i)
     {
         grouped_gate_ptrs[i] = grouped_gate_tensors[i].get();
@@ -16828,8 +17108,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         device_up_ptrs[i] = device_up_tensors[i].get();
         runtime_gate_ptrs[i] = runtime_gate_tensors[i].get();
         runtime_up_ptrs[i] = runtime_up_tensors[i].get();
-        kpart_gate_ptrs[i] = kpart_gate_tensors[i].get();
-        kpart_up_ptrs[i] = kpart_up_tensors[i].get();
     }
 
     const int table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -16857,59 +17135,10 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
     ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
-    {
-        ScopedROCmEnvOverride disable_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "0");
-        ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRuntime(
-            device_runtime, input.get(), table_id, num_active,
-            runtime_gate_ptrs, runtime_up_ptrs, d_model, intermediate));
-    }
-
-    constexpr const char *kKPartCounts[] = {"2", "4", "8", "16"};
-    for (const char *kparts : kKPartCounts)
-    {
-        ScopedROCmEnvOverride deterministic_off("LLAMINAR_DETERMINISTIC", "0");
-        ScopedROCmEnvOverride enable_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1");
-        ScopedROCmEnvOverride set_kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS", kparts);
-        ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRuntime(
-            device_runtime, input.get(), table_id, num_active,
-            kpart_gate_ptrs, kpart_up_ptrs, d_model, intermediate))
-            << label << " K-partition runtime gate/up failed for kparts=" << kparts;
-        (void)hipDeviceSynchronize();
-
-        for (int i = 0; i < num_active; ++i)
-        {
-            ASSERT_TRUE(runtime_gate_tensors[i]->ensureOnHost(stream));
-            ASSERT_TRUE(runtime_up_tensors[i]->ensureOnHost(stream));
-            ASSERT_TRUE(kpart_gate_tensors[i]->ensureOnHost(stream));
-            ASSERT_TRUE(kpart_up_tensors[i]->ensureOnHost(stream));
-
-            const float *runtime_gate = runtime_gate_tensors[i]->data();
-            const float *runtime_up = runtime_up_tensors[i]->data();
-            const float *kpart_gate = kpart_gate_tensors[i]->data();
-            const float *kpart_up = kpart_up_tensors[i]->data();
-
-            const double kpart_gate_cosine = cosineSimilarity(kpart_gate, runtime_gate, intermediate);
-            const double kpart_up_cosine = cosineSimilarity(kpart_up, runtime_up, intermediate);
-            const double kpart_gate_l2 = relativeL2Error(kpart_gate, runtime_gate, intermediate);
-            const double kpart_up_l2 = relativeL2Error(kpart_up, runtime_up, intermediate);
-            const double kpart_gate_max_abs = maxAbsDiff(kpart_gate, runtime_gate, intermediate);
-            const double kpart_up_max_abs = maxAbsDiff(kpart_up, runtime_up, intermediate);
-
-            EXPECT_GE(kpart_gate_cosine, 0.99999)
-                << label << " kpart gate cosine mismatch for active slot " << i << " kparts=" << kparts;
-            EXPECT_GE(kpart_up_cosine, 0.99999)
-                << label << " kpart up cosine mismatch for active slot " << i << " kparts=" << kparts;
-            EXPECT_LE(kpart_gate_l2, 0.0015)
-                << label << " kpart gate relative L2 too high for active slot " << i << " kparts=" << kparts;
-            EXPECT_LE(kpart_up_l2, 0.0015)
-                << label << " kpart up relative L2 too high for active slot " << i << " kparts=" << kparts;
-            EXPECT_LE(kpart_gate_max_abs, 0.03)
-                << label << " kpart gate max abs diff too high for active slot " << i << " kparts=" << kparts;
-            EXPECT_LE(kpart_up_max_abs, 0.03)
-                << label << " kpart up max abs diff too high for active slot " << i << " kparts=" << kparts;
-        }
-    }
-    (void)hipDeviceSynchronize();
+    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRuntime(
+        device_runtime, input.get(), table_id, num_active,
+        runtime_gate_ptrs, runtime_up_ptrs, d_model, intermediate));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipFree(device_runtime), hipSuccess);
 
     for (int i = 0; i < num_active; ++i)
@@ -16922,8 +17151,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         ASSERT_TRUE(device_up_tensors[i]->ensureOnHost(stream));
         ASSERT_TRUE(runtime_gate_tensors[i]->ensureOnHost(stream));
         ASSERT_TRUE(runtime_up_tensors[i]->ensureOnHost(stream));
-        ASSERT_TRUE(kpart_gate_tensors[i]->ensureOnHost(stream));
-        ASSERT_TRUE(kpart_up_tensors[i]->ensureOnHost(stream));
 
         const float *seq_gate = seq_gate_tensors[i]->data();
         const float *seq_up = seq_up_tensors[i]->data();
@@ -16933,8 +17160,6 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         const float *device_up = device_up_tensors[i]->data();
         const float *runtime_gate = runtime_gate_tensors[i]->data();
         const float *runtime_up = runtime_up_tensors[i]->data();
-        const float *kpart_gate = kpart_gate_tensors[i]->data();
-        const float *kpart_up = kpart_up_tensors[i]->data();
 
         ASSERT_FALSE(hasNaNOrInf(grouped_gate, intermediate));
         ASSERT_FALSE(hasNaNOrInf(grouped_up, intermediate));
@@ -16942,128 +17167,82 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         ASSERT_FALSE(hasNaNOrInf(device_up, intermediate));
         ASSERT_FALSE(hasNaNOrInf(runtime_gate, intermediate));
         ASSERT_FALSE(hasNaNOrInf(runtime_up, intermediate));
-        ASSERT_FALSE(hasNaNOrInf(kpart_gate, intermediate));
-        ASSERT_FALSE(hasNaNOrInf(kpart_up, intermediate));
 
-        const double gate_cosine = cosineSimilarity(grouped_gate, seq_gate, intermediate);
-        const double up_cosine = cosineSimilarity(grouped_up, seq_up, intermediate);
-        const double gate_l2 = relativeL2Error(grouped_gate, seq_gate, intermediate);
-        const double up_l2 = relativeL2Error(grouped_up, seq_up, intermediate);
-        const double device_gate_cosine = cosineSimilarity(device_gate, seq_gate, intermediate);
-        const double device_up_cosine = cosineSimilarity(device_up, seq_up, intermediate);
-        const double device_gate_l2 = relativeL2Error(device_gate, seq_gate, intermediate);
-        const double device_up_l2 = relativeL2Error(device_up, seq_up, intermediate);
-        const double runtime_gate_cosine = cosineSimilarity(runtime_gate, seq_gate, intermediate);
-        const double runtime_up_cosine = cosineSimilarity(runtime_up, seq_up, intermediate);
-        const double runtime_gate_l2 = relativeL2Error(runtime_gate, seq_gate, intermediate);
-        const double runtime_up_l2 = relativeL2Error(runtime_up, seq_up, intermediate);
-        const double kpart_gate_cosine = cosineSimilarity(kpart_gate, runtime_gate, intermediate);
-        const double kpart_up_cosine = cosineSimilarity(kpart_up, runtime_up, intermediate);
-        const double kpart_gate_l2 = relativeL2Error(kpart_gate, runtime_gate, intermediate);
-        const double kpart_up_l2 = relativeL2Error(kpart_up, runtime_up, intermediate);
-
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " grouped gate output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " table gate decode vs serial row").c_str(),
             grouped_gate,
             seq_gate,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " grouped up output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " table up decode vs serial row").c_str(),
             grouped_up,
             seq_up,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " device-routed grouped gate output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " routed gate decode vs serial row").c_str(),
             device_gate,
             seq_gate,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " device-routed grouped up output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " routed up decode vs serial row").c_str(),
             device_up,
             seq_up,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " runtime grouped gate output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " runtime gate decode vs serial row").c_str(),
             runtime_gate,
             seq_gate,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        expectStrictVerifierSimilarity(
-            (std::string(label) + " runtime grouped up output must match sequential").c_str(),
+        expectBitwiseVerifierRowsEqual(
+            (std::string(label) + " runtime up decode vs serial row").c_str(),
             runtime_up,
             seq_up,
             static_cast<size_t>(intermediate),
             static_cast<size_t>(intermediate));
-        EXPECT_GE(kpart_gate_cosine, 0.99999)
-            << label << " kpart grouped gate cosine mismatch vs runtime for active slot " << i;
-        EXPECT_GE(kpart_up_cosine, 0.99999)
-            << label << " kpart grouped up cosine mismatch vs runtime for active slot " << i;
-        EXPECT_LE(kpart_gate_l2, 0.0015)
-            << label << " kpart grouped gate relative L2 too high vs runtime for active slot " << i;
-        EXPECT_LE(kpart_up_l2, 0.0015)
-            << label << " kpart grouped up relative L2 too high vs runtime for active slot " << i;
-
-        std::cout << "[GroupedExpertGateUpDecode_" << label
-                  << "] slot=" << i
-                  << " gate_cosine=" << std::fixed << std::setprecision(6) << gate_cosine
-                  << " up_cosine=" << up_cosine
-                  << " gate_l2=" << gate_l2
-                  << " up_l2=" << up_l2
-                  << " device_gate_cosine=" << device_gate_cosine
-                  << " device_up_cosine=" << device_up_cosine
-                  << " device_gate_l2=" << device_gate_l2
-                  << " device_up_l2=" << device_up_l2
-                  << " runtime_gate_cosine=" << runtime_gate_cosine
-                  << " runtime_up_cosine=" << runtime_up_cosine
-                  << " runtime_gate_l2=" << runtime_gate_l2
-                  << " runtime_up_l2=" << runtime_up_l2
-                  << " kpart_gate_cosine=" << kpart_gate_cosine
-                  << " kpart_up_cosine=" << kpart_up_cosine
-                  << " kpart_gate_l2=" << kpart_gate_l2
-                  << " kpart_up_l2=" << kpart_up_l2 << std::endl;
     }
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_0KPartMatchesRuntime)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_0MatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q4_0", [](size_t rows, size_t cols)
                                             { return TestTensorFactory::createQ4_0Random({rows, cols}); });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_IQ4_NLKPartMatchesRuntime)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_IQ4_NLMatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("IQ4_NL", [](size_t rows, size_t cols)
                                             { return TestTensorFactory::createIQ4_NLRandom({rows, cols}); });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_1KPartMatchesRuntime)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_1MatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q4_1", [](size_t rows, size_t cols)
                                             { return TestTensorFactory::createQ4_1Random({rows, cols}); });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_0KPartMatchesRuntime)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_0MatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q5_0", [](size_t rows, size_t cols)
                                             { return TestTensorFactory::createQ5_0Random({rows, cols}); });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_1KPartMatchesRuntime)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_1MatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q5_1", [](size_t rows, size_t cols)
                                             { return TestTensorFactory::createQ5_1Random({rows, cols}); });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_KMatchesFusedProjection)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_KMatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q5_K", [](size_t rows, size_t cols)
@@ -17074,7 +17253,7 @@ TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_KMatchesFusedProjection)
                                             });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_KMatchesFusedProjection)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_KMatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q4_K", [](size_t rows, size_t cols)
@@ -17085,7 +17264,7 @@ TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_KMatchesFusedProjection)
                                             });
 }
 
-TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q6_KMatchesFusedProjection)
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q6_KMatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();
     runGroupedExpertGateUpDecodeFormatMatch("Q6_K", [](size_t rows, size_t cols)
@@ -17223,9 +17402,6 @@ TEST(Test__ROCmMoEKernel, GroupedSharedExpertDecodeCapturesWithStablePointerCach
 TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh)
 {
     SKIP_IF_NO_ROCM();
-
-    ScopedROCmEnvOverride disable_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "0");
-    ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
 
     constexpr int num_experts = 2;
     constexpr int top_k = 1;
@@ -17479,10 +17655,6 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
 
     ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
-    ScopedROCmEnvOverride enable_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1");
-    ScopedROCmEnvOverride set_gateup_kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS", "4");
-    ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
-    ScopedROCmEnvOverride disable_fused_gateup_swiglu("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED", "0");
 
     constexpr int d_model = 2048;
     constexpr int intermediate = 512;
@@ -18661,16 +18833,13 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
     auto grouped_output = TestTensorFactory::createFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(grouped_output->ensureOnDevice(device));
-    {
-        ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
-        moe_kernel.zeroBuffer(grouped_output.get(), static_cast<size_t>(seq_len) * d_model * sizeof(float));
-        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
-            input.get(), grouped_output.get(), gateup_table_id, down_table_id,
-            seq_len, d_model, intermediate, num_experts, top_k));
-    }
+    moe_kernel.zeroBuffer(grouped_output.get(), static_cast<size_t>(seq_len) * d_model * sizeof(float));
+    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+        input.get(), grouped_output.get(), gateup_table_id, down_table_id,
+        seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_TRUE(grouped_output->ensureOnHost(rocmMoETestStream()));
     const float *grouped = grouped_output->data();
-    expectStrictVerifierSimilarity(
+    expectBitwiseVerifierRowsEqual(
         "ROCm grouped prefill must match sequential GPU rows",
         grouped,
         expected.data(),
@@ -18678,23 +18847,12 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
         static_cast<size_t>(d_model));
 
     /*
-     * ROCm serial decode normally uses the parallel down-projection kernel for
-     * top-k > 1.  That path publishes one atomic contribution per original
-     * route slot.  Grouped verifier prefill has already computed expert rows in
-     * grouped-by-expert order, so this regression checks that its final scatter
-     * switches to original-slot atomic publication when parallel-down decode is
-     * enabled.  Otherwise the grouped verifier is close to the deterministic
-     * sequential sum above, but not equivalent to default serial decode.
+     * Exercise the public routed M=1 transaction as the production oracle too.
+     * Grouped prefill may reorder route work for occupancy, but publication must
+     * preserve the same increasing-K dots and original top-k fold byte for byte.
      */
-    std::vector<float> parallel_reference(static_cast<size_t>(seq_len) * d_model, 0.0f);
-    auto grouped_parallel_output = TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    ASSERT_TRUE(grouped_parallel_output->ensureOnDevice(device));
-    {
-        ScopedROCmEnvOverride enable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-        ScopedROCmEnvOverride enable_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1");
-        ScopedROCmEnvOverride set_gateup_kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS", "4");
-
+    std::vector<float> row_decode_reference(
+        static_cast<size_t>(seq_len) * d_model, 0.0f);
         std::array<std::shared_ptr<FP32Tensor>, top_k> gate_rows;
         std::array<std::shared_ptr<FP32Tensor>, top_k> up_rows;
         std::array<ITensor *, top_k> gate_ptrs = {};
@@ -18741,20 +18899,14 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
             ASSERT_TRUE(row_output->ensureOnHost(rocmMoETestStream()));
             std::copy(row_output->data(),
                       row_output->data() + d_model,
-                      parallel_reference.data() + static_cast<size_t>(token) * d_model);
+                      row_decode_reference.data() + static_cast<size_t>(token) * d_model);
         }
 
-        moe_kernel.zeroBuffer(grouped_parallel_output.get(), static_cast<size_t>(seq_len) * d_model * sizeof(float));
-        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
-            input.get(), grouped_parallel_output.get(), gateup_table_id, down_table_id,
-            seq_len, d_model, intermediate, num_experts, top_k));
-    }
-    ASSERT_TRUE(grouped_parallel_output->ensureOnHost(rocmMoETestStream()));
-    expectStrictVerifierSimilarity(
-        "ROCm grouped prefill parallel scatter must match row-by-row parallel decode",
-        grouped_parallel_output->data(),
-        parallel_reference.data(),
-        parallel_reference.size(),
+    expectBitwiseVerifierRowsEqual(
+        "ROCm grouped prefill must match row-by-row production decode",
+        grouped,
+        row_decode_reference.data(),
+        row_decode_reference.size(),
         static_cast<size_t>(d_model));
 }
 
@@ -18904,10 +19056,6 @@ TEST(Test__ROCmMoEKernel, GroupedPrefillMaskedTopK8MatchesRowDecode)
     auto grouped_parallel_output = TestTensorFactory::createFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     ASSERT_TRUE(grouped_parallel_output->ensureOnDevice(device));
-
-    ScopedROCmEnvOverride disable_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "0");
-    ScopedROCmEnvOverride disable_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "0");
-    ScopedROCmEnvOverride disable_fused_gateup_swiglu("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED", "0");
 
     std::array<std::shared_ptr<FP32Tensor>, top_k> gate_rows;
     std::array<std::shared_ptr<FP32Tensor>, top_k> up_rows;
@@ -23602,27 +23750,31 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 int expected_gateup_tile_n = 64;
                 int expected_down_tile_m = 1;
                 int expected_down_tile_n = 64;
+                int expected_exact_overlay = 0;
                 if (seq_len > 8)
                 {
-                    ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
+                    ASSERT_TRUE(
+                        rocmMoE_grouped_prefill_query_production_pair_config(
                         gate_descs.front().codebook_id,
-                        /*projection_role=*/0,
-                        seq_len,
-                        intermediate,
-                        d_model,
-                        &expected_gateup_tile_m,
-                        &expected_gateup_tile_n))
-                        << format_name << " missing generated gate/up policy";
-                    ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
                         down_descs.front().codebook_id,
-                        /*projection_role=*/1,
                         seq_len,
                         d_model,
                         intermediate,
+                        num_experts,
+                        top_k,
+                        &expected_gateup_tile_m,
+                        &expected_gateup_tile_n,
                         &expected_down_tile_m,
-                        &expected_down_tile_n))
-                        << format_name << " missing generated down policy";
+                        &expected_down_tile_n,
+                        &expected_exact_overlay))
+                        << format_name << " missing joint production policy";
                 }
+                const char *expected_policy_source =
+                    seq_len <= 8
+                        ? "direct"
+                        : (expected_exact_overlay != 0
+                               ? "exact_overlay"
+                               : "generic");
                 const std::string expected_gateup_tile_m_text =
                     std::to_string(expected_gateup_tile_m);
                 const std::string expected_gateup_tile_n_text =
@@ -23692,6 +23844,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                                    tag_equals("gateup_tile_n", expected_gateup_tile_n_text.c_str()) &&
                                    tag_equals("down_tile_m", expected_down_tile_m_text.c_str()) &&
                                    tag_equals("down_tile_n", expected_down_tile_n_text.c_str()) &&
+                                   tag_equals("policy_source", expected_policy_source) &&
                                    tag_equals("row_tile", expected_common_row_tile.c_str()) &&
                                    record.count > 0;
                         });
@@ -24226,6 +24379,8 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats
 
 TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode)
 {
+    constexpr std::array<int, 7> production_overlay_rows = {
+        2, 3, 4, 5, 16, 31, 64};
     ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
     ScopedROCmEnvOverride q8_router("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
     ScopedROCmEnvOverride q8_reuse(
@@ -24246,7 +24401,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundaries
         },
         /*masked_local_tp=*/false,
         /*exercise_router_q8_publication=*/true,
-        kGroupedVerifierBoundaryRows);
+        production_overlay_rows);
 }
 
 TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode)
@@ -24309,9 +24464,6 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_Ru
 
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
-    ScopedROCmEnvOverride enable_parallel_down(
-        "LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
@@ -24744,9 +24896,6 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
 
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
-    ScopedROCmEnvOverride enable_parallel_down(
-        "LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(

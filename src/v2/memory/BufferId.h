@@ -32,6 +32,9 @@ namespace llaminar2
         REQUEST_TOKEN_IDS,         ///< Device-owned request token rows admitted once at the API boundary
         REQUEST_POSITION_IDS,      ///< Device-owned absolute request positions paired with REQUEST_TOKEN_IDS
         REQUEST_BATCH_GEOMETRY,    ///< Device-owned real lengths followed by the padded physical row stride
+        PREFILL_CHUNK_TOKEN_IDS,    ///< Captured device materialization of the current request-token bucket
+        PREFILL_CHUNK_POSITION_IDS, ///< Captured device materialization of current absolute-position rows
+        PREFILL_CHUNK_GEOMETRY,     ///< Captured current real-row count followed by the physical bucket stride
         MTP_SHIFTED_PREFILL_TOKEN_IDS, ///< Device-owned shifted condition tokens produced inside the captured prefill graph
         MTP_SHIFTED_PREFILL_POSITION_IDS, ///< Device-owned shifted positions paired with MTP_SHIFTED_PREFILL_TOKEN_IDS
         MTP_SHIFTED_PREFILL_APPEND_LENGTHS, ///< Device-owned real shifted-KV append width for each request
@@ -191,6 +194,12 @@ namespace llaminar2
             return "REQUEST_POSITION_IDS";
         case BufferId::REQUEST_BATCH_GEOMETRY:
             return "REQUEST_BATCH_GEOMETRY";
+        case BufferId::PREFILL_CHUNK_TOKEN_IDS:
+            return "PREFILL_CHUNK_TOKEN_IDS";
+        case BufferId::PREFILL_CHUNK_POSITION_IDS:
+            return "PREFILL_CHUNK_POSITION_IDS";
+        case BufferId::PREFILL_CHUNK_GEOMETRY:
+            return "PREFILL_CHUNK_GEOMETRY";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:

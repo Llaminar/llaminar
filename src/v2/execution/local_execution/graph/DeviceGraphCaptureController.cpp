@@ -2669,40 +2669,13 @@ namespace llaminar2
                 // nodes -> end capture -> instantiate and launch transaction zero.
 
                 /*
-                 * Snapshot copy nodes need their per-stage output descriptors and
-                 * storage allocated before stream capture begins. Some outputs,
-                 * especially in-place collective outputs such as TP allreduce
-                 * tensors, first appear in snapshot publication at the collective
-                 * stage itself. If we discover them while capture is active we
-                 * cannot allocate the destination tensor safely. This prepare
-                 * hook must not copy payload bytes: the point-in-time copy is
-                 * recorded only after the producing stage executes.
-                 */
-                if (hooks.prepare_snapshot_copies)
-                {
-                    for (const auto &stage_name : seg.stage_names)
-                    {
-                        auto *node = graph.getNode(stage_name);
-                        if (!node || !node->stage)
-                            continue;
-                        if (!hooks.prepare_snapshot_copies(*node, capture_stream))
-                        {
-                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot descriptor preparation failed before cached graph capture: "
-                                      << stage_name);
-                            result.reset_cache = true;
-                            result.success = false;
-                            return result;
-                        }
-                    }
-                }
-
-                /*
-                 * This is the mandatory external-event import boundary for
-                 * native capture. It deliberately follows every
-                 * stage-owned metadata/snapshot preparation call: either may
-                 * publish a fresh completion event on an eager stream. The
-                 * complete segment is prejoined before the LocalTP rendezvous,
-                 * making late capture-time event discovery impossible.
+                 * Establish the complete arena frontier before asking stages for
+                 * snapshot descriptors. A descriptor embeds the producer's final
+                 * device pointer; preparing it while an arena output is still
+                 * unbound records either a null pointer or a stale allocation.
+                 * The same frontier pass joins every launch-preparation producer
+                 * event to the exact capture stream, so recording cannot discover
+                 * an external dependency inside beginCapture().
                  */
                 if (!hooks.cohere_inputs)
                 {
@@ -2723,6 +2696,32 @@ namespace llaminar2
                     result.reset_cache = true;
                     result.success = false;
                     return result;
+                }
+
+                /*
+                 * Snapshot copy nodes need their per-stage output descriptors and
+                 * destination storage allocated before stream capture begins.
+                 * Preparation is descriptor-only: it must not copy payload bytes,
+                 * enqueue stream work, or publish a producer event. The exact
+                 * point-in-time D2D copy is recorded only after its producing
+                 * stage executes inside the graph transaction.
+                 */
+                if (hooks.prepare_snapshot_copies)
+                {
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node || !node->stage)
+                            continue;
+                        if (!hooks.prepare_snapshot_copies(*node, capture_stream))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot descriptor preparation failed before cached graph capture: "
+                                      << stage_name);
+                            result.reset_cache = true;
+                            result.success = false;
+                            return result;
+                        }
+                    }
                 }
 
                 /*

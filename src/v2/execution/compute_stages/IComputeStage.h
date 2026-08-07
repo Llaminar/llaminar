@@ -294,6 +294,7 @@ namespace llaminar2
         GEMM,
         GEMM_BIAS,
         GEMM_FUSED_QKV,
+        GEMM_FUSED_KV,
         GEMM_FUSED_GATE_UP,
 
         // Normalization
@@ -377,6 +378,9 @@ namespace llaminar2
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
         GDN_LIVE_STATE_LOCALIZE,  ///< Slice mirrored GDN state into TP-local verifier state
         GDN_LIVE_STATE_ALLGATHER, ///< Gather TP-local GDN state into mirrored decode state
+
+        /** Captured device publication of the current long-prefill request bucket. */
+        PREFILL_CHUNK_MATERIALIZATION,
 
         // Qwen 3.5 FA-specific
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers

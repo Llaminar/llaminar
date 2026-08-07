@@ -2638,6 +2638,291 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseRepla
         << "CUDA M=4 recurrence must leave the same kernel-owned state as four decode steps";
 }
 
+/**
+ * @brief Proves CUDA long-prefill recurrence is M-total and serial-row exact.
+ *
+ * CUDA verifier widths through eight use the grouped recurrent kernel, while
+ * longer requests select the production long-prefill kernel. The sweep starts
+ * immediately above that dispatch boundary, probes powers of two on both
+ * sides, and includes the live 425-row request plus its 512-row capture bucket.
+ * Every output row and the terminal recurrent state must match ordered M=1
+ * decode launches byte-for-byte. This locks the canonical decay-once arithmetic
+ * contract across both launch regimes instead of treating serial decode as a
+ * merely approximate oracle.
+ */
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    RecurrenceLongPrefillQwen36MoEChunkMTotalityMatchesSerialDecodeByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 32;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr int prefill_lengths[] = {
+        9, 16, 31, 32, 63, 64, 127, 128, 425, 512};
+
+    for (const int prefill_len : prefill_lengths)
+    {
+        SCOPED_TRACE("M=" + std::to_string(prefill_len));
+        const size_t output_elems =
+            static_cast<size_t>(prefill_len) * static_cast<size_t>(v_stride);
+
+        const auto Q = makeSequenceRows(
+            prefill_len, qk_stride, prefill_len, prefill_len,
+            0.0037f, 0.0f, 0.0037f);
+        const auto K = makeSequenceRows(
+            prefill_len, qk_stride, prefill_len, prefill_len,
+            -0.0029f, 0.0f, -0.0029f);
+        const auto V = makeSequenceRows(
+            prefill_len, v_stride, prefill_len, prefill_len,
+            0.0043f, 0.0f, 0.0043f);
+        const auto alpha = makeSequenceRows(
+            prefill_len, n_heads, prefill_len, prefill_len,
+            0.037f, 0.0f, 0.037f);
+        const auto beta = makeSequenceRows(
+            prefill_len, n_heads, prefill_len, prefill_len,
+            -0.031f, 0.0f, -0.031f);
+        const auto initial_state = makeInitialState(
+            static_cast<size_t>(state_floats), 0.0017f);
+        const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+        const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+        // CUDA long prefill normalizes Q/K and transforms gate scratch in
+        // place before launching the recurrence. Give the serial oracle its
+        // own pristine inputs so each route performs preprocessing exactly
+        // once, as it does in production.
+        CudaFloatBuffer d_Q_chunk(Q);
+        CudaFloatBuffer d_K_chunk(K);
+        CudaFloatBuffer d_V_chunk(V);
+        CudaFloatBuffer d_alpha_chunk(alpha);
+        CudaFloatBuffer d_beta_chunk(beta);
+        CudaFloatBuffer d_Q_serial(Q);
+        CudaFloatBuffer d_K_serial(K);
+        CudaFloatBuffer d_V_serial(V);
+        CudaFloatBuffer d_alpha_serial(alpha);
+        CudaFloatBuffer d_beta_serial(beta);
+        CudaFloatBuffer d_A_log(A_log);
+        CudaFloatBuffer d_dt_bias(dt_bias);
+        CudaFloatBuffer d_chunk_out(output_elems, 0.0f);
+        CudaFloatBuffer d_serial_out(output_elems, 0.0f);
+        CudaStreamHandle stream;
+
+        CUDAGatedDeltaNet chunk_kernel(cuda_ordinal_);
+        CudaGDNStateOwner chunk_state_owner(chunk_kernel, state_floats);
+        chunk_kernel.setGPUStream(stream.stream);
+        ASSERT_TRUE(chunk_kernel.importState(
+            initial_state.data(), nullptr, stream.stream));
+        ASSERT_TRUE(chunk_kernel.chunk_forward(
+            d_Q_chunk.ptr, d_K_chunk.ptr, d_V_chunk.ptr,
+            d_alpha_chunk.ptr, d_beta_chunk.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_chunk_out.ptr, nullptr,
+            prefill_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+
+        CUDAGatedDeltaNet serial_kernel(cuda_ordinal_);
+        CudaGDNStateOwner serial_state_owner(serial_kernel, state_floats);
+        serial_kernel.setGPUStream(stream.stream);
+        ASSERT_TRUE(serial_kernel.importState(
+            initial_state.data(), nullptr, stream.stream));
+        for (int row = 0; row < prefill_len; ++row)
+        {
+            ASSERT_TRUE(serial_kernel.recurrent_step(
+                d_Q_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                d_K_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                d_V_serial.ptr + static_cast<size_t>(row) * v_stride,
+                d_alpha_serial.ptr + static_cast<size_t>(row) * n_heads,
+                d_beta_serial.ptr + static_cast<size_t>(row) * n_heads,
+                d_A_log.ptr,
+                d_dt_bias.ptr,
+                d_serial_out.ptr + static_cast<size_t>(row) * v_stride,
+                nullptr,
+                n_heads, d_k, d_v,
+                /*use_qk_l2norm=*/true));
+        }
+        checkCuda(
+            cudaStreamSynchronize(stream.stream),
+            "cudaStreamSynchronize(static chunk versus serial decode)");
+
+        std::vector<float> chunk_state(static_cast<size_t>(state_floats));
+        std::vector<float> serial_state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(chunk_kernel.exportState(
+            chunk_state.data(), nullptr, stream.stream));
+        ASSERT_TRUE(serial_kernel.exportState(
+            serial_state.data(), nullptr, stream.stream));
+
+        const auto chunk_out = d_chunk_out.toHost();
+        const auto serial_out = d_serial_out.toHost();
+        const std::string label =
+            "CUDA Qwen3.6 MoE GDN M" + std::to_string(prefill_len);
+        const std::string output_label = label + " long-prefill output";
+        const std::string state_label =
+            label + " long-prefill terminal state";
+        expectByteExactEquivalent(
+            output_label.c_str(),
+            chunk_out,
+            serial_out,
+            /*offset=*/0,
+            output_elems);
+        expectByteExactEquivalent(
+            state_label.c_str(),
+            chunk_state,
+            serial_state,
+            /*offset=*/0,
+            chunk_state.size());
+    }
+}
+
+/**
+ * @brief Proves the CUDA long-prefill route is byte-total for D_K=64.
+ *
+ * The original long kernel hardcoded sixteen state rows for each of eight
+ * reduction splits, which happened to cover D_K=128 but indexed beyond a
+ * D_K=64 state matrix. This compact geometry forces the production long route
+ * for every M above eight and checks both supported normalization policies.
+ * Independent input banks are intentional because the captured preprocessor
+ * transforms Q, K, decay, and beta scratch in place exactly once per route.
+ */
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 4;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr int prefill_lengths[] = {
+        9, 16, 31, 32, 63, 64, 127, 128, 425, 512};
+
+    for (const bool use_qk_l2norm : {false, true})
+    {
+        for (const int prefill_len : prefill_lengths)
+        {
+            SCOPED_TRACE(
+                "D_K=64 M=" + std::to_string(prefill_len) +
+                " l2norm=" + std::to_string(use_qk_l2norm));
+            const size_t output_elems =
+                static_cast<size_t>(prefill_len) *
+                static_cast<size_t>(v_stride);
+
+            const auto Q = makeSequenceRows(
+                prefill_len, qk_stride, prefill_len, prefill_len,
+                0.0073f, 0.0f, 0.0073f);
+            const auto K = makeSequenceRows(
+                prefill_len, qk_stride, prefill_len, prefill_len,
+                -0.0061f, 0.0f, -0.0061f);
+            const auto V = makeSequenceRows(
+                prefill_len, v_stride, prefill_len, prefill_len,
+                0.0089f, 0.0f, 0.0089f);
+            const auto alpha = makeSequenceRows(
+                prefill_len, n_heads, prefill_len, prefill_len,
+                0.043f, 0.0f, 0.043f);
+            const auto beta = makeSequenceRows(
+                prefill_len, n_heads, prefill_len, prefill_len,
+                -0.037f, 0.0f, -0.037f);
+            const auto initial_state = makeInitialState(
+                static_cast<size_t>(state_floats), 0.0023f);
+            const std::vector<float> A_log(
+                static_cast<size_t>(n_heads), -0.47f);
+            const std::vector<float> dt_bias(
+                static_cast<size_t>(n_heads), 0.083f);
+
+            CudaFloatBuffer d_Q_chunk(Q);
+            CudaFloatBuffer d_K_chunk(K);
+            CudaFloatBuffer d_V_chunk(V);
+            CudaFloatBuffer d_alpha_chunk(alpha);
+            CudaFloatBuffer d_beta_chunk(beta);
+            CudaFloatBuffer d_Q_serial(Q);
+            CudaFloatBuffer d_K_serial(K);
+            CudaFloatBuffer d_V_serial(V);
+            CudaFloatBuffer d_alpha_serial(alpha);
+            CudaFloatBuffer d_beta_serial(beta);
+            CudaFloatBuffer d_A_log(A_log);
+            CudaFloatBuffer d_dt_bias(dt_bias);
+            CudaFloatBuffer d_chunk_out(output_elems, 0.0f);
+            CudaFloatBuffer d_serial_out(output_elems, 0.0f);
+            CudaStreamHandle stream;
+
+            CUDAGatedDeltaNet chunk_kernel(cuda_ordinal_);
+            CudaGDNStateOwner chunk_state_owner(
+                chunk_kernel, state_floats);
+            chunk_kernel.setGPUStream(stream.stream);
+            ASSERT_TRUE(chunk_kernel.importState(
+                initial_state.data(), nullptr, stream.stream));
+            ASSERT_TRUE(chunk_kernel.chunk_forward(
+                d_Q_chunk.ptr, d_K_chunk.ptr, d_V_chunk.ptr,
+                d_alpha_chunk.ptr, d_beta_chunk.ptr,
+                d_A_log.ptr, d_dt_bias.ptr,
+                d_chunk_out.ptr, nullptr,
+                prefill_len, n_heads, d_k, d_v,
+                /*chunk_size=*/64, use_qk_l2norm));
+
+            CUDAGatedDeltaNet serial_kernel(cuda_ordinal_);
+            CudaGDNStateOwner serial_state_owner(
+                serial_kernel, state_floats);
+            serial_kernel.setGPUStream(stream.stream);
+            ASSERT_TRUE(serial_kernel.importState(
+                initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row < prefill_len; ++row)
+            {
+                ASSERT_TRUE(serial_kernel.recurrent_step(
+                    d_Q_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                    d_K_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                    d_V_serial.ptr + static_cast<size_t>(row) * v_stride,
+                    d_alpha_serial.ptr + static_cast<size_t>(row) * n_heads,
+                    d_beta_serial.ptr + static_cast<size_t>(row) * n_heads,
+                    d_A_log.ptr,
+                    d_dt_bias.ptr,
+                    d_serial_out.ptr + static_cast<size_t>(row) * v_stride,
+                    nullptr,
+                    n_heads, d_k, d_v,
+                    use_qk_l2norm));
+            }
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(D_K=64 chunk versus serial decode)");
+
+            std::vector<float> chunk_state(
+                static_cast<size_t>(state_floats));
+            std::vector<float> serial_state(
+                static_cast<size_t>(state_floats));
+            ASSERT_TRUE(chunk_kernel.exportState(
+                chunk_state.data(), nullptr, stream.stream));
+            ASSERT_TRUE(serial_kernel.exportState(
+                serial_state.data(), nullptr, stream.stream));
+
+            const std::string label =
+                "CUDA GDN D_K=64 M" + std::to_string(prefill_len) +
+                (use_qk_l2norm ? " normalized" : " scaled");
+            const std::string output_label = label + " long-prefill output";
+            const std::string state_label =
+                label + " long-prefill terminal state";
+            expectByteExactEquivalent(
+                output_label.c_str(),
+                d_chunk_out.toHost(),
+                d_serial_out.toHost(),
+                /*offset=*/0,
+                output_elems);
+            expectByteExactEquivalent(
+                state_label.c_str(),
+                chunk_state,
+                serial_state,
+                /*offset=*/0,
+                chunk_state.size());
+        }
+    }
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
 {
     SKIP_IF_NO_CUDA();

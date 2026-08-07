@@ -16,12 +16,17 @@
 #include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
+#include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
+#include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
 
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
+#include "../native_vnni_dispatch/GPUTrainerVerification.h"
 
 extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     uint8_t codebook_id,
@@ -31,6 +36,16 @@ extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     int k,
     int *tile_m,
     int *tile_n);
+extern "C" bool rocmMoE_grouped_prefill_query_kernel_resources(
+    uint8_t codebook_id,
+    int projection_role,
+    int tile_m,
+    int tile_n,
+    int *registers_per_thread,
+    size_t *local_memory_bytes_per_thread,
+    size_t *static_shared_memory_bytes,
+    int *max_threads_per_block,
+    int *max_active_blocks_per_sm);
 #endif
 
 #include <algorithm>
@@ -47,8 +62,11 @@ extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -252,6 +270,19 @@ namespace
         if (end == value || parsed <= 0)
             return fallback;
         return static_cast<int>(parsed);
+    }
+
+    /** @brief Read a finite positive floating-point trainer control. */
+    double envPositiveDouble(const char *name, double fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return fallback;
+        char *end = nullptr;
+        const double parsed = std::strtod(value, &end);
+        if (end == value || !std::isfinite(parsed) || parsed <= 0.0)
+            return fallback;
+        return parsed;
     }
 
     bool envCsvContainsOrUnset(const char *name, const std::string &candidate)
@@ -1018,9 +1049,9 @@ namespace
         int intermediate,
         int gateup_table,
         int down_table,
+        llaminar2::DeviceId device,
         double *avg_ms)
     {
-        const auto device = llaminar2::DeviceId::rocm(0);
         std::vector<float> decoded;
         decoded.reserve(static_cast<size_t>(rows) * d_model);
 
@@ -1143,8 +1174,17 @@ namespace
         EXPECT_NE(workspace_consumer, nullptr);
         const int workspace_num_experts = std::max(num_experts, routed_num_experts);
         const int workspace_top_k = std::max(top_k, routed_top_k);
+        /*
+         * The grouped side consumes exactly `rows`, but the byte oracle below
+         * replays one token through all top-k experts.  Its split-K gate/up
+         * publication uses the production four-row verifier slab even when
+         * the requested grouped M is one, two, or three.  Size the fixture for
+         * that shared contract so a small-M economy case cannot accidentally
+         * turn an undersized test arena into zero-valued reference output.
+         */
+        constexpr int kSerialOracleVerifierCapacity = 4;
         auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
-            /*max_seq_len=*/rows,
+            /*max_seq_len=*/std::max(rows, kSerialOracleVerifierCapacity),
             d_model,
             intermediate,
             workspace_num_experts,
@@ -1283,7 +1323,7 @@ namespace
         std::vector<float> rowwise = runRowwiseDecode(
             moe.get(), stream, hidden_values, routing_indices, routing_weights,
             rows, top_k, d_model, intermediate,
-            tables.gateup_table_id, tables.down_table_id, &rowwise_ms);
+            tables.gateup_table_id, tables.down_table_id, device, &rowwise_ms);
         CloseMetrics metrics = compareVectors(grouped, rowwise, grouped.size());
 
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
@@ -2149,11 +2189,12 @@ namespace
         bool is_winner = false;
     };
 
-    constexpr std::array<MoEPrefillSweepCandidate, 12> kMoEPrefillSweepCandidates{{
+    constexpr std::array<MoEPrefillSweepCandidate, 13> kMoEPrefillSweepCandidates{{
         {4, 64}, {4, 128}, {4, 256},
         {8, 64}, {8, 128}, {8, 256},
         {12, 64}, {12, 128}, {12, 256},
         {16, 64}, {16, 128}, {16, 256},
+        {20, 128},
     }};
 
     constexpr std::array<MoEPrefillSweepShape, 7> kMoEPrefillSweepShapes{{
@@ -2166,10 +2207,1182 @@ namespace
         {"gate_ratio_8_1", 256, 2048},
     }};
 
-    std::string moePrefillCandidateName(const MoEPrefillSweepCandidate &candidate)
+    /** Immutable compiler-resource evidence for one exact HIP specialization. */
+    struct MoEPrefillKernelResources
+    {
+        int registers_per_thread = 0;
+        size_t local_memory_bytes_per_thread = 0;
+        size_t static_shared_memory_bytes = 0;
+        int max_threads_per_block = 0;
+        int max_active_blocks_per_sm = 0;
+
+        /** @return true when the compiler emitted no per-thread scratch. */
+        [[nodiscard]] bool spillFree() const noexcept
+        {
+            return local_memory_bytes_per_thread == 0;
+        }
+    };
+
+    /**
+     * @brief Inspect one exact candidate without launching it.
+     *
+     * A failed query is fatal because silently timing an uninspected candidate
+     * would make the spill-free tournament policy unverifiable.
+     */
+    MoEPrefillKernelResources queryMoEPrefillKernelResources(
+        uint8_t execution_codebook,
+        int projection_role,
+        const MoEPrefillSweepCandidate &candidate)
+    {
+        MoEPrefillKernelResources resources{};
+        const bool queried = rocmMoE_grouped_prefill_query_kernel_resources(
+            execution_codebook,
+            projection_role,
+            candidate.tile_m,
+            candidate.tile_n,
+            &resources.registers_per_thread,
+            &resources.local_memory_bytes_per_thread,
+            &resources.static_shared_memory_bytes,
+            &resources.max_threads_per_block,
+            &resources.max_active_blocks_per_sm);
+        if (!queried)
+        {
+            throw std::runtime_error(
+                "failed to inspect compiled ROCm MoE grouped-prefill candidate");
+        }
+        return resources;
+    }
+
+    /** @brief Return the stable registry identity for one tile candidate. */
+    std::string moePrefillCandidateName(
+        const MoEPrefillSweepCandidate &candidate)
     {
         return "tm" + std::to_string(candidate.tile_m) +
                "_tn" + std::to_string(candidate.tile_n);
+    }
+
+    /** One independently forceable gate/up plus down candidate pair. */
+    struct MoEPrefillCandidatePair
+    {
+        MoEPrefillSweepCandidate gateup;
+        MoEPrefillSweepCandidate down;
+
+        /** @brief Return a stable, registry-compatible pair identity. */
+        std::string id() const
+        {
+            return "g_" + moePrefillCandidateName(gateup) +
+                   "__d_" + moePrefillCandidateName(down);
+        }
+    };
+
+    /**
+     * @brief Force one exact production candidate pair without reparsing env.
+     *
+     * The selector reads the typed DebugEnv snapshot at capture time. Updating
+     * those four reviewed trainer controls directly avoids four `setenv` plus
+     * configuration reload transactions for every candidate pair.
+     */
+    class ScopedROCmMoEPrefillCandidatePair
+    {
+    public:
+        explicit ScopedROCmMoEPrefillCandidatePair(
+            const MoEPrefillCandidatePair &candidate)
+            : old_gateup_m_(llaminar2::mutableDebugEnv().rocm.moe_prefill_gateup_tile_m),
+              old_gateup_n_(llaminar2::mutableDebugEnv().rocm.moe_prefill_gateup_tile_n),
+              old_down_m_(llaminar2::mutableDebugEnv().rocm.moe_prefill_down_tile_m),
+              old_down_n_(llaminar2::mutableDebugEnv().rocm.moe_prefill_down_tile_n)
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_prefill_gateup_tile_m = candidate.gateup.tile_m;
+            config.moe_prefill_gateup_tile_n = candidate.gateup.tile_n;
+            config.moe_prefill_down_tile_m = candidate.down.tile_m;
+            config.moe_prefill_down_tile_n = candidate.down.tile_n;
+        }
+
+        ScopedROCmMoEPrefillCandidatePair(
+            const ScopedROCmMoEPrefillCandidatePair &) = delete;
+        ScopedROCmMoEPrefillCandidatePair &operator=(
+            const ScopedROCmMoEPrefillCandidatePair &) = delete;
+
+        ~ScopedROCmMoEPrefillCandidatePair()
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_prefill_gateup_tile_m = old_gateup_m_;
+            config.moe_prefill_gateup_tile_n = old_gateup_n_;
+            config.moe_prefill_down_tile_m = old_down_m_;
+            config.moe_prefill_down_tile_n = old_down_n_;
+        }
+
+    private:
+        int old_gateup_m_ = 0;
+        int old_gateup_n_ = 0;
+        int old_down_m_ = 0;
+        int old_down_n_ = 0;
+    };
+
+    /** Reusable HIP event pair for allocation-free candidate timing. */
+    class MoEPrefillEventTimer
+    {
+    public:
+        explicit MoEPrefillEventTimer(hipStream_t stream)
+            : stream_(stream)
+        {
+            if (!stream_)
+            {
+                throw std::runtime_error(
+                    "ROCm MoE prefill timer requires a non-null stream");
+            }
+            if (hipEventCreate(&start_) != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to create ROCm MoE prefill start event");
+            }
+            if (hipEventCreate(&stop_) != hipSuccess)
+            {
+                (void)hipEventDestroy(start_);
+                start_ = nullptr;
+                throw std::runtime_error(
+                    "failed to create ROCm MoE prefill stop event");
+            }
+        }
+
+        MoEPrefillEventTimer(const MoEPrefillEventTimer &) = delete;
+        MoEPrefillEventTimer &operator=(const MoEPrefillEventTimer &) = delete;
+
+        ~MoEPrefillEventTimer()
+        {
+            if (stop_)
+                (void)hipEventDestroy(stop_);
+            if (start_)
+                (void)hipEventDestroy(start_);
+        }
+
+        /** @brief Time repeated graph replay and return milliseconds per replay. */
+        double sample(
+            int iterations,
+            const std::function<bool()> &launch)
+        {
+            if (iterations <= 0 || !launch)
+                throw std::invalid_argument("MoE timer requires positive iterations");
+            if (hipEventRecord(start_, stream_) != hipSuccess)
+                throw std::runtime_error("failed to record MoE timer start");
+            for (int iteration = 0; iteration < iterations; ++iteration)
+                requireHipBenchBody(launch(), "candidate timing replay");
+            if (hipEventRecord(stop_, stream_) != hipSuccess ||
+                hipEventSynchronize(stop_) != hipSuccess)
+            {
+                throw std::runtime_error("failed to complete MoE timer sample");
+            }
+            float elapsed_ms = 0.0f;
+            if (hipEventElapsedTime(&elapsed_ms, start_, stop_) != hipSuccess)
+                throw std::runtime_error("failed to read MoE timer sample");
+            return static_cast<double>(elapsed_ms) /
+                   static_cast<double>(iterations);
+        }
+
+    private:
+        hipStream_t stream_ = nullptr;
+        hipEvent_t start_ = nullptr;
+        hipEvent_t stop_ = nullptr;
+    };
+
+    /**
+     * @brief Persistent device counters for one sweep cell's byte certificates.
+     */
+    class MoEPrefillDeviceByteCertificate
+    {
+    public:
+        MoEPrefillDeviceByteCertificate()
+        {
+            if (hipMalloc(&mismatch_count_, sizeof(uint64_t)) != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to allocate persistent MoE mismatch counter");
+            }
+            if (hipMalloc(&first_mismatch_, sizeof(uint64_t)) != hipSuccess)
+            {
+                (void)hipFree(mismatch_count_);
+                mismatch_count_ = nullptr;
+                throw std::runtime_error(
+                    "failed to allocate persistent MoE first-mismatch counter");
+            }
+        }
+
+        MoEPrefillDeviceByteCertificate(
+            const MoEPrefillDeviceByteCertificate &) = delete;
+        MoEPrefillDeviceByteCertificate &operator=(
+            const MoEPrefillDeviceByteCertificate &) = delete;
+
+        ~MoEPrefillDeviceByteCertificate()
+        {
+            if (first_mismatch_)
+                (void)hipFree(first_mismatch_);
+            if (mismatch_count_)
+                (void)hipFree(mismatch_count_);
+        }
+
+        /**
+         * @brief Compare two device tensors and materialize two terminal words.
+         */
+        std::pair<uint64_t, uint64_t> compare(
+            const float *actual,
+            const float *expected,
+            size_t count,
+            hipStream_t stream)
+        {
+            if (!llaminar2::test::enqueueROCmFP32ByteComparison(
+                    actual,
+                    expected,
+                    count,
+                    mismatch_count_,
+                    first_mismatch_,
+                    stream))
+            {
+                throw std::runtime_error("failed to enqueue MoE byte certificate");
+            }
+            uint64_t host_count = 0;
+            uint64_t host_first = std::numeric_limits<uint64_t>::max();
+            if (hipMemcpyAsync(
+                    &host_count,
+                    mismatch_count_,
+                    sizeof(host_count),
+                    hipMemcpyDeviceToHost,
+                    stream) != hipSuccess ||
+                hipMemcpyAsync(
+                    &host_first,
+                    first_mismatch_,
+                    sizeof(host_first),
+                    hipMemcpyDeviceToHost,
+                    stream) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+            {
+                throw std::runtime_error("failed to read MoE byte certificate");
+            }
+            return {host_count, host_first};
+        }
+
+    private:
+        uint64_t *mismatch_count_ = nullptr;
+        uint64_t *first_mismatch_ = nullptr;
+    };
+
+    /** Screening and robust timing evidence for one exact candidate pair. */
+    struct MoEProductionPairEvidence
+    {
+        MoEPrefillCandidatePair candidate;
+        MoEPrefillKernelResources gateup_resources;
+        MoEPrefillKernelResources down_resources;
+        std::vector<double> screening_samples_ms;
+        std::vector<double> robust_samples_ms;
+        int screening_replays_per_sample = 0;
+        int robust_replays_per_sample = 0;
+        uint64_t bit_mismatches = 0;
+        uint64_t first_bit_mismatch = std::numeric_limits<uint64_t>::max();
+        bool route_counter_ok = false;
+        bool finalist = false;
+        bool winner = false;
+
+        /** @brief Select robust samples when available, otherwise screening. */
+        const std::vector<double> &selectedSamplesMs() const
+        {
+            return robust_samples_ms.empty()
+                       ? screening_samples_ms
+                       : robust_samples_ms;
+        }
+
+        /** @brief Return replay count associated with selected samples. */
+        int selectedReplaysPerSample() const
+        {
+            return robust_samples_ms.empty()
+                       ? screening_replays_per_sample
+                       : robust_replays_per_sample;
+        }
+
+        /** @brief Return the robust or screening median in microseconds. */
+        double medianUs() const
+        {
+            const auto &samples = selectedSamplesMs();
+            if (samples.empty())
+                return std::numeric_limits<double>::infinity();
+            return samples[samples.size() / 2] * 1000.0;
+        }
+    };
+
+    /** @brief Enumerate the complete 12-by-12 production pair space. */
+    std::vector<MoEPrefillCandidatePair> moePrefillCandidatePairs()
+    {
+        std::vector<MoEPrefillCandidatePair> result;
+        result.reserve(
+            kMoEPrefillSweepCandidates.size() *
+            kMoEPrefillSweepCandidates.size());
+        for (const auto &gateup : kMoEPrefillSweepCandidates)
+        {
+            for (const auto &down : kMoEPrefillSweepCandidates)
+                result.push_back({gateup, down});
+        }
+        return result;
+    }
+
+    /**
+     * @brief Resolve one exact ROCm candidate-pair corpus identity.
+     *
+     * An isolated hardware-counter request must identify both projection
+     * geometries. Partial or unknown names are rejected so rocprof can never
+     * attribute one launch to a different gate/up or down specialization.
+     *
+     * @param candidate_id Stable pair identity emitted by the timing corpus.
+     * @return Exact registered pair when the identity is launchable.
+     */
+    std::optional<MoEPrefillCandidatePair> findMoEPrefillCandidatePair(
+        const std::string &candidate_id)
+    {
+        for (const auto &candidate : moePrefillCandidatePairs())
+        {
+            if (candidate.id() == candidate_id)
+                return candidate;
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Prove PerfStats observed both members of one forced pair.
+     */
+    bool observedMoEPrefillCandidatePair(
+        int rows,
+        const MoEPrefillCandidatePair &candidate)
+    {
+        const auto records = llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+        for (const auto &record : records)
+        {
+            if (record.name !=
+                "rocm_moe_grouped_prefill_batch_invariant_calls")
+            {
+                continue;
+            }
+            const auto tag = [&record](const char *name) -> std::string
+            {
+                const auto found = record.tags.find(name);
+                return found == record.tags.end()
+                           ? std::string{}
+                           : found->second;
+            };
+            if (record.count > 0 &&
+                tag("seq_len") == std::to_string(rows) &&
+                tag("gateup_tile_m") ==
+                    std::to_string(candidate.gateup.tile_m) &&
+                tag("gateup_tile_n") ==
+                    std::to_string(candidate.gateup.tile_n) &&
+                tag("down_tile_m") ==
+                    std::to_string(candidate.down.tile_m) &&
+                tag("down_tile_n") ==
+                    std::to_string(candidate.down.tile_n))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Emit one machine-readable mixed-production tournament row.
+     */
+    void writeMoEProductionPairEvidence(
+        std::FILE *csv,
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_vnni_dispatch::MoERoutingProfileStats &route_stats,
+        int rows,
+        const MoEProductionPairEvidence &evidence)
+    {
+        if (!csv)
+            throw std::invalid_argument("MoE production evidence requires a CSV");
+        const auto &selected_samples = evidence.selectedSamplesMs();
+        const auto timing =
+            llaminar2::test::trainer::summarizeSortedTimingSamples(
+                selected_samples);
+        const auto &gate_format =
+            llaminar2::test::quantizedMoEVerifierFormat(
+                routed_case.routed.gate);
+        const auto &up_format =
+            llaminar2::test::quantizedMoEVerifierFormat(
+                routed_case.routed.up);
+        const auto &down_format =
+            llaminar2::test::quantizedMoEVerifierFormat(
+                routed_case.routed.down);
+        std::ostringstream row;
+        row << std::setprecision(17)
+            << "rocm,moe_production_prefill,"
+            << routed_case.evidenceId() << ','
+            << llaminar2::test::native_vnni_dispatch::moeRoutingProfileName(
+                   route_profile) << ','
+            << routed_case.routed.gate << ','
+            << routed_case.routed.up << ','
+            << routed_case.routed.down << ','
+            << static_cast<unsigned>(gate_format.device_execution_codebook_id) << ','
+            << static_cast<unsigned>(up_format.device_execution_codebook_id) << ','
+            << static_cast<unsigned>(down_format.device_execution_codebook_id) << ','
+            << routed_case.hidden_size << ','
+            << routed_case.routed_expert_width << ','
+            << routed_case.expert_count << ','
+            << routed_case.experts_per_token << ','
+            << route_stats.active_experts << ','
+            << route_stats.maximum_assignments << ','
+            << route_stats.assignment_cv << ','
+            << rows << ','
+            << evidence.candidate.id() << ','
+            << evidence.candidate.gateup.tile_m << ','
+            << evidence.candidate.gateup.tile_n << ','
+            << evidence.candidate.down.tile_m << ','
+            << evidence.candidate.down.tile_n << ','
+            << evidence.gateup_resources.local_memory_bytes_per_thread << ','
+            << evidence.down_resources.local_memory_bytes_per_thread << ','
+            << evidence.gateup_resources.registers_per_thread << ','
+            << evidence.down_resources.registers_per_thread << ','
+            << evidence.gateup_resources.static_shared_memory_bytes << ','
+            << evidence.down_resources.static_shared_memory_bytes << ','
+            << evidence.gateup_resources.max_active_blocks_per_sm << ','
+            << evidence.down_resources.max_active_blocks_per_sm << ','
+            << evidence.screening_samples_ms.size() << ','
+            << evidence.screening_replays_per_sample << ','
+            << evidence.robust_samples_ms.size() << ','
+            << evidence.robust_replays_per_sample << ','
+            << selected_samples.size() << ','
+            << evidence.selectedReplaysPerSample() << ','
+            << timing.min * 1000.0 << ','
+            << timing.median * 1000.0 << ','
+            << timing.p95 * 1000.0 << ','
+            << timing.mad * 1000.0 << ','
+            << timing.cv << ','
+            << timing.digest << ','
+            << evidence.bit_mismatches << ','
+            << evidence.first_bit_mismatch << ','
+            << (evidence.route_counter_ok ? 1 : 0) << ','
+            << (evidence.finalist ? 1 : 0) << ','
+            << (evidence.winner ? 1 : 0);
+        const std::string serialized = row.str();
+        std::fprintf(csv, "%s\n", serialized.c_str());
+        std::fflush(csv);
+    }
+
+    /**
+     * @brief Retain every raw event sample from one candidate pair.
+     *
+     * Screening and finalist confirmation are deliberately separate phases.
+     * Keeping both prevents the robust retime from erasing evidence that was
+     * already paid for and lets the adapter diagnose selection bias or clock
+     * drift without rerunning a device sweep.
+     */
+    void writeMoEProductionPairTimingEvidence(
+        std::FILE *timing_csv,
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        int rows,
+        const MoEProductionPairEvidence &evidence)
+    {
+        if (!timing_csv)
+            return;
+        const auto write_phase = [&] (
+            const char *phase,
+            const std::vector<double> &samples_ms,
+            int replays_per_sample)
+        {
+            for (size_t index = 0; index < samples_ms.size(); ++index)
+            {
+                std::fprintf(
+                    timing_csv,
+                    "rocm,moe_production_prefill,%s,%s,%d,%s,%s,%zu,%d,%.9f,%a\n",
+                    routed_case.evidenceId().c_str(),
+                    std::string(
+                        llaminar2::test::native_vnni_dispatch::
+                            moeRoutingProfileName(route_profile)).c_str(),
+                    rows,
+                    evidence.candidate.id().c_str(),
+                    phase,
+                    index,
+                    replays_per_sample,
+                    samples_ms[index] * 1000.0,
+                    samples_ms[index]);
+            }
+        };
+        write_phase(
+            "screening",
+            evidence.screening_samples_ms,
+            evidence.screening_replays_per_sample);
+        write_phase(
+            "robust",
+            evidence.robust_samples_ms,
+            evidence.robust_replays_per_sample);
+        std::fflush(timing_csv);
+    }
+
+    /** Stable two-stage timing policy for one production-shaped sweep cell. */
+    struct MoEProductionSweepSettings
+    {
+        int screening_warmups = 1;
+        int screening_trials = 3;
+        int screening_replays = 2;
+        int robust_warmups = 2;
+        int robust_trials = 15;
+        int robust_replays = 4;
+        int minimum_finalists = 12;
+        int maximum_finalists = 24;
+        double finalist_margin = 0.05;
+        std::string profiler_request_id;
+        std::optional<MoEPrefillCandidatePair> profiler_candidate;
+
+        /** @return true when this process owns one isolated rocprof launch. */
+        [[nodiscard]] bool profiling() const noexcept
+        {
+            return !profiler_request_id.empty();
+        }
+    };
+
+    /** Own one non-default HIP stream for a production sweep cell. */
+    class ScopedMoEPrefillHipStream
+    {
+    public:
+        ScopedMoEPrefillHipStream()
+        {
+            if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) !=
+                hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to create ROCm MoE production sweep stream");
+            }
+        }
+
+        ScopedMoEPrefillHipStream(const ScopedMoEPrefillHipStream &) = delete;
+        ScopedMoEPrefillHipStream &operator=(
+            const ScopedMoEPrefillHipStream &) = delete;
+
+        ~ScopedMoEPrefillHipStream()
+        {
+            if (stream_)
+                (void)hipStreamDestroy(stream_);
+        }
+
+        /** @brief Return the exact stream owned by this sweep cell. */
+        hipStream_t get() const noexcept
+        {
+            return stream_;
+        }
+
+    private:
+        hipStream_t stream_ = nullptr;
+    };
+
+    /** Unbind a preallocated workspace before its manager is destroyed. */
+    class ScopedMoEPrefillWorkspaceBinding
+    {
+    public:
+        ScopedMoEPrefillWorkspaceBinding(
+            llaminar2::IWorkspaceConsumer *consumer,
+            llaminar2::DeviceWorkspaceManager *workspace)
+            : consumer_(consumer)
+        {
+            if (!consumer_ || !workspace)
+            {
+                throw std::invalid_argument(
+                    "MoE production sweep requires a valid workspace binding");
+            }
+            consumer_->bindWorkspace(workspace);
+        }
+
+        ScopedMoEPrefillWorkspaceBinding(
+            const ScopedMoEPrefillWorkspaceBinding &) = delete;
+        ScopedMoEPrefillWorkspaceBinding &operator=(
+            const ScopedMoEPrefillWorkspaceBinding &) = delete;
+
+        ~ScopedMoEPrefillWorkspaceBinding()
+        {
+            consumer_->unbindWorkspace();
+        }
+
+    private:
+        llaminar2::IWorkspaceConsumer *consumer_ = nullptr;
+    };
+
+    /**
+     * @brief Train one real routed-MoE source tuple at one prefill bucket.
+     *
+     * Every expert owns distinct prepared weights so the tournament observes
+     * realistic cache pressure instead of repeatedly reading an aliased proxy.
+     * Route grouping is published once, then every pair captures the production
+     * grouped projection pipeline with an exact forced gate/up and down tile.
+     * The first eligible pair establishes a serial-row-proven device reference;
+     * every pair must match that reference byte-for-byte before timing.
+     *
+     * @param routed_case GGUF-derived source formats and production geometry.
+     * @param rows Original prompt rows in this exact prefill bucket.
+     * @param route_profile Deterministic expert-load distribution under test.
+     * @param device_ordinal Explicit ROCm device assigned by the cell scheduler.
+     * @param settings Screening and finalist timing policy.
+     * @param csv Aggregate candidate evidence destination.
+     * @param timing_csv Optional raw event-sample sidecar.
+     */
+    void runROCmProductionMoERoutedCase(
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        int rows,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        int device_ordinal,
+        const MoEProductionSweepSettings &settings,
+        std::FILE *csv,
+        std::FILE *timing_csv)
+    {
+        if (settings.profiling() != settings.profiler_candidate.has_value())
+        {
+            throw std::invalid_argument(
+                "ROCm profiler request and exact candidate pair must be supplied together");
+        }
+        const std::vector<MoEPrefillCandidatePair> candidates =
+            settings.profiling()
+                ? std::vector<MoEPrefillCandidatePair>{
+                      *settings.profiler_candidate}
+                : moePrefillCandidatePairs();
+        if (rows <= 8)
+        {
+            throw std::invalid_argument(
+                "production MoE prefill tournament requires M greater than eight");
+        }
+        if (routed_case.routed.gate != routed_case.routed.up)
+        {
+            throw std::runtime_error(
+                routed_case.evidenceId() +
+                " has distinct routed gate/up formats, but the production "
+                "fused gate/up kernel requires one common codebook");
+        }
+        if (settings.screening_warmups < 0 ||
+            settings.screening_trials <= 0 ||
+            settings.screening_replays <= 0 ||
+            settings.robust_warmups < 0 ||
+            settings.robust_trials <= 0 ||
+            settings.robust_replays <= 0 ||
+            settings.minimum_finalists <= 0 ||
+            settings.maximum_finalists < settings.minimum_finalists ||
+            (!settings.profiling() &&
+             settings.maximum_finalists > static_cast<int>(candidates.size())) ||
+            settings.finalist_margin <= 0.0)
+        {
+            throw std::invalid_argument(
+                "invalid ROCm MoE production tournament timing policy");
+        }
+
+        if (device_ordinal < 0)
+        {
+            throw std::invalid_argument(
+                "ROCm production sweep device ordinal must be non-negative");
+        }
+        const auto device = llaminar2::DeviceId::rocm(device_ordinal);
+        if (hipSetDevice(device_ordinal) != hipSuccess)
+        {
+            throw std::runtime_error(
+                "failed to select ROCm sweep device " +
+                std::to_string(device_ordinal));
+        }
+        ScopedMoEPrefillHipStream owned_stream;
+        const hipStream_t stream = owned_stream.get();
+
+        llaminar2::ROCmMoEKernel moe_storage(device_ordinal);
+        llaminar2::IMoEKernel *moe = &moe_storage;
+        moe->setGPUStream(stream);
+        auto *workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        if (!workspace_consumer)
+        {
+            throw std::runtime_error(
+                "ROCm MoE production kernel does not expose workspace binding");
+        }
+
+        const auto requirements = llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows,
+            routed_case.hidden_size,
+            routed_case.routed_expert_width,
+            routed_case.expert_count,
+            routed_case.experts_per_token);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            requirements.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
+        {
+            throw std::runtime_error(
+                "failed to allocate persistent ROCm MoE production workspace");
+        }
+        ScopedMoEPrefillWorkspaceBinding workspace_binding(
+            workspace_consumer,
+            workspace.get());
+
+        const auto &gateup_format =
+            llaminar2::test::quantizedMoEVerifierFormat(
+                routed_case.routed.gate);
+        const auto &down_format =
+            llaminar2::test::quantizedMoEVerifierFormat(
+                routed_case.routed.down);
+        std::vector<int> materialized_experts(
+            static_cast<size_t>(routed_case.expert_count));
+        std::iota(materialized_experts.begin(), materialized_experts.end(), 0);
+        auto tables = prepareExpertTables(
+            moe,
+            device,
+            routed_case.expert_count,
+            routed_case.hidden_size,
+            routed_case.routed_expert_width,
+            std::move(materialized_experts),
+            gateup_format,
+            down_format);
+        if (tables.gateup_table_id < 0 || tables.down_table_id < 0)
+        {
+            throw std::runtime_error(
+                "failed to publish production expert descriptor tables");
+        }
+
+        const std::vector<float> hidden_values =
+            makeHiddenValues(rows, routed_case.hidden_size);
+        const std::vector<float> routing_indices =
+            llaminar2::test::native_vnni_dispatch::makeMoERoutingIndices(
+            route_profile,
+            rows,
+            routed_case.experts_per_token,
+            routed_case.expert_count);
+        const auto route_stats =
+            llaminar2::test::native_vnni_dispatch::summarizeMoERoutingProfile(
+                routing_indices,
+                routed_case.expert_count);
+        const std::vector<float> routing_weights = makeRoutingWeights(
+            rows,
+            routed_case.experts_per_token);
+        auto hidden = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)},
+            hidden_values);
+        auto route_indices_tensor = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.experts_per_token)},
+            routing_indices);
+        auto route_weights_tensor = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.experts_per_token)},
+            routing_weights);
+        auto reference_output = makeZeros(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)});
+        auto candidate_output = makeZeros(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)});
+        for (const auto &tensor : {
+                 hidden,
+                 route_indices_tensor,
+                 route_weights_tensor,
+                 reference_output,
+                 candidate_output})
+        {
+            if (!tensor->ensureOnDevice(device, stream))
+            {
+                throw std::runtime_error(
+                    "failed to publish a ROCm MoE production sweep tensor");
+            }
+        }
+
+        const auto prepare_groups = [&]()
+        {
+            return moe->prepareExpertGroupsAsync(
+                route_indices_tensor.get(),
+                route_weights_tensor.get(),
+                rows,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+        };
+        const auto execute_pipeline = [&](llaminar2::ITensor *output)
+        {
+            return moe->executeGroupedPrefillPipeline(
+                hidden.get(),
+                output,
+                tables.gateup_table_id,
+                tables.down_table_id,
+                rows,
+                routed_case.hidden_size,
+                routed_case.routed_expert_width,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+        };
+        requireHipBenchBody(prepare_groups(), "production route preparation");
+        if (hipStreamSynchronize(stream) != hipSuccess)
+        {
+            throw std::runtime_error(
+                "failed to complete production route preparation");
+        }
+
+        const MoEPrefillCandidatePair reference_candidate{
+            {4, 64},
+            {4, 64},
+        };
+        const auto reference_gateup_resources =
+            queryMoEPrefillKernelResources(
+                gateup_format.device_execution_codebook_id,
+                /*projection_role=*/0,
+                reference_candidate.gateup);
+        const auto reference_down_resources =
+            queryMoEPrefillKernelResources(
+                down_format.device_execution_codebook_id,
+                /*projection_role=*/1,
+                reference_candidate.down);
+        if (!reference_gateup_resources.spillFree() ||
+            !reference_down_resources.spillFree())
+        {
+            throw std::runtime_error(
+                "serial-proof reference candidate spills and is ineligible");
+        }
+        {
+            ScopedROCmMoEPrefillCandidatePair forced(reference_candidate);
+            llaminar2::PerfStatsCollector::reset();
+            ScopedHipPerfGraph graph(
+                stream,
+                device_ordinal,
+                "ROCm production MoE prefill reference capture");
+            requireHipBenchBody(
+                execute_pipeline(reference_output.get()),
+                "production reference graph capture");
+            if (!graph.finishAndInstantiate())
+            {
+                throw std::runtime_error(
+                    "failed to instantiate production reference graph");
+            }
+            if (!observedMoEPrefillCandidatePair(
+                    rows,
+                    reference_candidate))
+            {
+                throw std::runtime_error(
+                    "PerfStats did not observe the forced reference pair");
+            }
+            requireHipBenchBody(
+                graph.launch(),
+                "production reference graph replay");
+            if (hipStreamSynchronize(stream) != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to complete production reference replay");
+            }
+        }
+
+        {
+            std::vector<float> reference_host(reference_output->numel());
+            if (hipMemcpyAsync(
+                    reference_host.data(),
+                    reference_output->gpu_data_ptr(),
+                    reference_host.size() * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to materialize serial-proof reference output");
+            }
+            double serial_ms = 0.0;
+            const std::vector<float> serial = runRowwiseDecode(
+                moe,
+                stream,
+                hidden_values,
+                routing_indices,
+                routing_weights,
+                rows,
+                routed_case.experts_per_token,
+                routed_case.hidden_size,
+                routed_case.routed_expert_width,
+                tables.gateup_table_id,
+                tables.down_table_id,
+                device,
+                &serial_ms);
+            const CloseMetrics metrics = compareVectors(
+                reference_host,
+                serial,
+                reference_host.size());
+            if (metrics.bit_mismatch_count != 0 ||
+                metrics.nonfinite_count != 0)
+            {
+                throw std::runtime_error(
+                    "production reference is not byte-equivalent to serial rows");
+            }
+
+            /*
+             * Serial diagnostics reuse kernel-owned workspace. Republish the
+             * immutable production route before any candidate graph is captured
+             * so no diagnostic state can leak into tournament execution.
+             */
+            requireHipBenchBody(
+                prepare_groups(),
+                "post-serial production route preparation");
+            if (hipStreamSynchronize(stream) != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to republish production groups after serial proof");
+            }
+        }
+
+        MoEPrefillEventTimer timer(stream);
+        MoEPrefillDeviceByteCertificate certificate;
+        const auto measure_candidate = [&] (
+            const MoEPrefillCandidatePair &candidate,
+            int warmups,
+            int trials,
+            int replays,
+            bool isolated_profile)
+        {
+            MoEProductionPairEvidence evidence{};
+            evidence.candidate = candidate;
+            evidence.gateup_resources = queryMoEPrefillKernelResources(
+                gateup_format.device_execution_codebook_id,
+                /*projection_role=*/0,
+                candidate.gateup);
+            evidence.down_resources = queryMoEPrefillKernelResources(
+                down_format.device_execution_codebook_id,
+                /*projection_role=*/1,
+                candidate.down);
+            if (!evidence.gateup_resources.spillFree() ||
+                !evidence.down_resources.spillFree())
+            {
+                return evidence;
+            }
+
+            ScopedROCmMoEPrefillCandidatePair forced(candidate);
+            llaminar2::PerfStatsCollector::reset();
+            ScopedHipPerfGraph graph(
+                stream,
+                device_ordinal,
+                "ROCm production MoE prefill candidate capture");
+            requireHipBenchBody(
+                execute_pipeline(candidate_output.get()),
+                "production candidate graph capture");
+            if (!graph.finishAndInstantiate())
+            {
+                throw std::runtime_error(
+                    "failed to instantiate production candidate graph " +
+                    candidate.id());
+            }
+            evidence.route_counter_ok =
+                observedMoEPrefillCandidatePair(rows, candidate);
+            if (!evidence.route_counter_ok)
+            {
+                throw std::runtime_error(
+                    "PerfStats did not observe forced pair " + candidate.id());
+            }
+            for (int warmup = 0; warmup < warmups; ++warmup)
+            {
+                requireHipBenchBody(
+                    graph.launch(),
+                    "production candidate warmup replay");
+            }
+            requireHipBenchBody(
+                graph.launch(),
+                "production candidate byte-certificate replay");
+            const auto mismatch = certificate.compare(
+                reinterpret_cast<const float *>(
+                    candidate_output->gpu_data_ptr()),
+                reinterpret_cast<const float *>(
+                    reference_output->gpu_data_ptr()),
+                candidate_output->numel(),
+                stream);
+            evidence.bit_mismatches = mismatch.first;
+            evidence.first_bit_mismatch = mismatch.second;
+            if (evidence.bit_mismatches != 0)
+            {
+                throw std::runtime_error(
+                    "candidate " + candidate.id() +
+                    " is not byte-equivalent to the serial-proven reference");
+            }
+
+            if (isolated_profile)
+            {
+                /*
+                 * Selected-region rocprof collection remains paused during all
+                 * allocation, upload, route preparation, capture, warmup, and
+                 * device byte certification. Resume for exactly one terminal
+                 * graph replay, then pause before closing the immutable request
+                 * range. Every physical dispatch in the report therefore owns
+                 * this candidate pair; no tournament or setup kernel can leak
+                 * into its feature record.
+                 */
+                if (hipStreamSynchronize(stream) != hipSuccess)
+                {
+                    throw std::runtime_error(
+                        "failed to settle ROCm preconditioning before profiling");
+                }
+                const std::string profiler_range =
+                    "NativeVNNIProfile::" + settings.profiler_request_id;
+                if (roctxRangePushA(profiler_range.c_str()) < 0)
+                {
+                    throw std::runtime_error(
+                        "failed to open isolated ROCm MoE profiler range");
+                }
+                if (roctxProfilerResume(0) != 0)
+                {
+                    (void)roctxRangePop();
+                    throw std::runtime_error(
+                        "failed to resume isolated ROCm MoE profiler collection");
+                }
+                const bool launch_ok = graph.launch();
+                const hipError_t completion = hipStreamSynchronize(stream);
+                const int pause_status = roctxProfilerPause(0);
+                const int range_level = roctxRangePop();
+                if (!launch_ok || completion != hipSuccess || pause_status != 0 ||
+                    range_level < 0)
+                {
+                    throw std::runtime_error(
+                        "isolated ROCm MoE profiler replay failed");
+                }
+                std::fprintf(
+                    stderr,
+                    "[NativeVNNIProfiler][ROCm-MoE-Prefill] request=%s "
+                    "candidate=%s M=%d launches=1\n",
+                    settings.profiler_request_id.c_str(),
+                    candidate.id().c_str(),
+                    rows);
+                return evidence;
+            }
+
+            evidence.screening_samples_ms.reserve(
+                static_cast<size_t>(trials));
+            for (int trial = 0; trial < trials; ++trial)
+            {
+                evidence.screening_samples_ms.push_back(timer.sample(
+                    replays,
+                    [&]()
+                    {
+                        return graph.launch();
+                    }));
+            }
+            std::sort(
+                evidence.screening_samples_ms.begin(),
+                evidence.screening_samples_ms.end());
+            evidence.screening_replays_per_sample = replays;
+            return evidence;
+        };
+
+        if (settings.profiling())
+        {
+            const auto evidence = measure_candidate(
+                candidates.front(),
+                /*warmups=*/2,
+                /*trials=*/1,
+                /*replays=*/1,
+                /*isolated_profile=*/true);
+            if (!evidence.gateup_resources.spillFree() ||
+                !evidence.down_resources.spillFree())
+            {
+                throw std::runtime_error(
+                    "spilling ROCm candidate reached isolated profiling");
+            }
+            return;
+        }
+
+        std::vector<MoEProductionPairEvidence> evidence_rows;
+        evidence_rows.reserve(candidates.size());
+        for (const auto &candidate : candidates)
+        {
+            MoEProductionPairEvidence evidence = measure_candidate(
+                candidate,
+                settings.screening_warmups,
+                settings.screening_trials,
+                settings.screening_replays,
+                /*isolated_profile=*/false);
+            if (!evidence.gateup_resources.spillFree() ||
+                !evidence.down_resources.spillFree())
+            {
+                std::fprintf(
+                    stderr,
+                    "[ROCm MoE production sweep] discard spilling pair %s "
+                    "gate_local=%zu down_local=%zu\n",
+                    candidate.id().c_str(),
+                    evidence.gateup_resources.local_memory_bytes_per_thread,
+                    evidence.down_resources.local_memory_bytes_per_thread);
+                continue;
+            }
+            evidence_rows.push_back(std::move(evidence));
+        }
+        if (evidence_rows.empty())
+        {
+            throw std::runtime_error(
+                "all production MoE candidate pairs were ineligible");
+        }
+
+        std::vector<size_t> order(evidence_rows.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(
+            order.begin(),
+            order.end(),
+            [&evidence_rows](size_t left, size_t right)
+            {
+                return evidence_rows[left].medianUs() <
+                       evidence_rows[right].medianUs();
+            });
+        const double finalist_limit_us =
+            evidence_rows[order.front()].medianUs() *
+            (1.0 + settings.finalist_margin);
+        int finalist_count = 0;
+        for (size_t rank = 0; rank < order.size(); ++rank)
+        {
+            const bool required_rank =
+                rank < static_cast<size_t>(settings.minimum_finalists);
+            const bool near_best =
+                evidence_rows[order[rank]].medianUs() <= finalist_limit_us;
+            if ((!required_rank && !near_best) ||
+                finalist_count >= settings.maximum_finalists)
+            {
+                continue;
+            }
+            evidence_rows[order[rank]].finalist = true;
+            ++finalist_count;
+        }
+
+        for (auto &evidence : evidence_rows)
+        {
+            if (!evidence.finalist)
+                continue;
+            MoEProductionPairEvidence robust = measure_candidate(
+                evidence.candidate,
+                settings.robust_warmups,
+                settings.robust_trials,
+                settings.robust_replays,
+                /*isolated_profile=*/false);
+            evidence.robust_samples_ms =
+                std::move(robust.screening_samples_ms);
+            evidence.robust_replays_per_sample =
+                robust.screening_replays_per_sample;
+            evidence.bit_mismatches = robust.bit_mismatches;
+            evidence.first_bit_mismatch = robust.first_bit_mismatch;
+            evidence.route_counter_ok = robust.route_counter_ok;
+        }
+
+        const auto winner = std::min_element(
+            evidence_rows.begin(),
+            evidence_rows.end(),
+            [](const auto &left, const auto &right)
+            {
+                if (left.finalist != right.finalist)
+                    return left.finalist;
+                return left.medianUs() < right.medianUs();
+            });
+        if (winner == evidence_rows.end() || !winner->finalist)
+        {
+            throw std::runtime_error(
+                "production MoE tournament did not retain a finalist");
+        }
+        winner->winner = true;
+        for (const auto &evidence : evidence_rows)
+        {
+            writeMoEProductionPairEvidence(
+                csv,
+                routed_case,
+                route_profile,
+                route_stats,
+                rows,
+                evidence);
+            writeMoEProductionPairTimingEvidence(
+                timing_csv,
+                routed_case,
+                route_profile,
+                rows,
+                evidence);
+        }
     }
 
     void writeMoEPrefillSweepResult(
@@ -2343,6 +3556,7 @@ namespace
                 shape.intermediate,
                 tables.gateup_table_id,
                 tables.down_table_id,
+                device,
                 &serial_ms);
 
             for (const std::string role : {std::string("gateup"), std::string("down")})
@@ -2363,6 +3577,31 @@ namespace
                             "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_VARIANTS",
                             candidate_name))
                     {
+                        continue;
+                    }
+
+                    /*
+                     * Static resource inspection happens before capture and
+                     * before any timing event is created. A spilling template
+                     * specialization is not a tournament contestant: retaining
+                     * it as a slow observation wastes sweep time and lets a
+                     * future noisy sample accidentally promote an invalid
+                     * production launch.
+                     */
+                    const int projection_role = role == "gateup" ? 0 : 1;
+                    const MoEPrefillKernelResources resources =
+                        queryMoEPrefillKernelResources(
+                            format.device_execution_codebook_id,
+                            projection_role,
+                            candidate);
+                    if (!resources.spillFree())
+                    {
+                        ADD_FAILURE()
+                            << format.label << ' ' << role << ' '
+                            << candidate_name << " uses "
+                            << resources.local_memory_bytes_per_thread
+                            << " local/scratch bytes per thread and was "
+                               "discarded before timing";
                         continue;
                     }
 
@@ -2628,6 +3867,455 @@ namespace
     }
 }
 #endif
+
+TEST(Perf__MoEVerifierPrefill, ROCm_AllFormatGroupedPrefillCandidatesAreSpillFree)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    std::set<uint8_t> inspected_codebooks;
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        if (!inspected_codebooks.insert(
+                format.device_execution_codebook_id).second)
+        {
+            continue;
+        }
+
+        for (int projection_role = 0; projection_role < 2; ++projection_role)
+        {
+            for (const auto &candidate : kMoEPrefillSweepCandidates)
+            {
+                SCOPED_TRACE(
+                    std::string(format.label) + "/" +
+                    (projection_role == 0 ? "gateup/" : "down/") +
+                    moePrefillCandidateName(candidate));
+                const MoEPrefillKernelResources resources =
+                    queryMoEPrefillKernelResources(
+                        format.device_execution_codebook_id,
+                        projection_role,
+                        candidate);
+                EXPECT_EQ(resources.local_memory_bytes_per_thread, 0u)
+                    << "register-spilling candidates must be removed from the "
+                       "compiled launch inventory before a sweep is run";
+                EXPECT_GT(resources.registers_per_thread, 0);
+                EXPECT_GE(resources.max_threads_per_block, candidate.tile_n);
+                EXPECT_GT(resources.max_active_blocks_per_sm, 0);
+            }
+        }
+    }
+    EXPECT_FALSE(inspected_codebooks.empty());
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_DeviceByteCertificateIsExact)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    hipStream_t stream = nullptr;
+    float *actual = nullptr;
+    float *expected = nullptr;
+    uint64_t *mismatch_count = nullptr;
+    uint64_t *first_mismatch = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_EQ(hipMalloc(&actual, 4 * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&expected, 4 * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&mismatch_count, sizeof(uint64_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&first_mismatch, sizeof(uint64_t)), hipSuccess);
+
+    const std::array<uint32_t, 4> actual_bits{
+        0x00000000u, 0x80000000u, 0x7fc00001u, 0x3f800000u};
+    const std::array<uint32_t, 4> expected_bits{
+        0x00000000u, 0x00000000u, 0x7fc00002u, 0x3f800000u};
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            actual,
+            actual_bits.data(),
+            sizeof(actual_bits),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            expected,
+            expected_bits.data(),
+            sizeof(expected_bits),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_TRUE(llaminar2::test::enqueueROCmFP32ByteComparison(
+        actual,
+        expected,
+        actual_bits.size(),
+        mismatch_count,
+        first_mismatch,
+        stream));
+
+    uint64_t host_mismatch_count = 0;
+    uint64_t host_first_mismatch = 0;
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            &host_mismatch_count,
+            mismatch_count,
+            sizeof(host_mismatch_count),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            &host_first_mismatch,
+            first_mismatch,
+            sizeof(host_first_mismatch),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    EXPECT_EQ(host_mismatch_count, 2u);
+    EXPECT_EQ(host_first_mismatch, 1u);
+
+    EXPECT_EQ(hipFree(first_mismatch), hipSuccess);
+    EXPECT_EQ(hipFree(mismatch_count), hipSuccess);
+    EXPECT_EQ(hipFree(expected), hipSuccess);
+    EXPECT_EQ(hipFree(actual), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_ProductionMoEMixtureManifestIsCanonical)
+{
+    using llaminar2::test::native_vnni_dispatch::
+        nativeVnniMoEPrefillMixtureManifest;
+    using llaminar2::test::native_vnni_dispatch::
+        nativeVnniMoERoutedPrefillCases;
+
+    const auto &mixtures = nativeVnniMoEPrefillMixtureManifest();
+    ASSERT_FALSE(mixtures.empty());
+    std::set<std::string> identities;
+    size_t native_vnni_count = 0;
+    const auto &format_cases = llaminar2::test::quantizedVerifierFormats();
+    const auto has_format = [&format_cases](const std::string &label)
+    {
+        return std::any_of(
+            format_cases.begin(),
+            format_cases.end(),
+            [&label](const auto &format)
+            {
+                return label == format.label;
+            });
+    };
+
+    for (const auto &mixture : mixtures)
+    {
+        ASSERT_TRUE(identities.insert(mixture.evidenceId()).second)
+            << mixture.evidenceId();
+        ASSERT_GT(mixture.hidden_size, 0);
+        ASSERT_GT(mixture.routed_expert_width, 0);
+        ASSERT_GT(mixture.shared_expert_width, 0);
+        ASSERT_GT(mixture.expert_count, 0);
+        ASSERT_GT(mixture.experts_per_token, 0);
+        ASSERT_LE(mixture.experts_per_token, mixture.expert_count);
+        ASSERT_FALSE(mixture.uses.empty());
+        if (!mixture.native_vnni_sweepable)
+            continue;
+        ++native_vnni_count;
+        for (const auto &format : mixture.routed.ordered())
+            EXPECT_TRUE(has_format(format)) << mixture.evidenceId() << ' ' << format;
+        for (const auto &format : mixture.shared.ordered())
+            EXPECT_TRUE(has_format(format)) << mixture.evidenceId() << ' ' << format;
+    }
+    EXPECT_GT(native_vnni_count, 0u);
+    EXPECT_LT(native_vnni_count, mixtures.size())
+        << "all-format inventory unexpectedly lost floating/MXFP4 cases";
+
+    const auto &routed_cases = nativeVnniMoERoutedPrefillCases();
+    EXPECT_EQ(routed_cases.size(), 49u)
+        << "the pinned GGUF manifest's routed source-key inventory changed";
+    for (const auto &routed_case : routed_cases)
+    {
+        EXPECT_EQ(routed_case.routed.gate, routed_case.routed.up)
+            << routed_case.evidenceId()
+            << " requires a heterogeneous fused gate/up implementation";
+        EXPECT_FALSE(routed_case.mixture_evidence_ids.empty())
+            << routed_case.evidenceId();
+    }
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_Qwen36_35B_IQ3SProductionMixtureM64)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    using llaminar2::test::native_vnni_dispatch::
+        nativeVnniMoEPrefillMixtureManifest;
+    const auto &manifest = nativeVnniMoEPrefillMixtureManifest();
+    const auto mixture = std::find_if(
+        manifest.begin(),
+        manifest.end(),
+        [](const auto &candidate)
+        {
+            if (candidate.routed.gate != "IQ2_S" ||
+                candidate.routed.up != "IQ2_S" ||
+                candidate.routed.down != "IQ4_XS")
+            {
+                return false;
+            }
+            return std::any_of(
+                candidate.uses.begin(),
+                candidate.uses.end(),
+                [](const auto &use)
+                {
+                    return use.release_id == "Qwen3.6-35B-A3B" &&
+                           use.variant_id == "UD-IQ3_S" &&
+                           use.layers.size() == 37;
+                });
+        });
+    ASSERT_NE(mixture, manifest.end());
+    ASSERT_TRUE(mixture->native_vnni_sweepable);
+    ASSERT_EQ(mixture->expert_count, 256);
+    ASSERT_EQ(mixture->experts_per_token, 8);
+
+    const auto &gateup_format =
+        llaminar2::test::quantizedMoEVerifierFormat(mixture->routed.gate);
+    const auto &down_format =
+        llaminar2::test::quantizedMoEVerifierFormat(mixture->routed.down);
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvOverride iterations_env(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", "1");
+    ScopedEnvOverride warmups_env(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", "0");
+    ScopedEnvOverride rowwise_env(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    const auto result = runROCmCase(
+        /*shared=*/false,
+        /*rows=*/64,
+        mixture->experts_per_token,
+        mixture->expert_count,
+        /*case_name_override=*/"qwen36_35b_ud_iq3s_production_mixture",
+        /*unique_routes=*/true,
+        /*include_terminal_expert=*/false,
+        mixture->hidden_size,
+        mixture->routed_expert_width,
+        &gateup_format,
+        &down_format,
+        /*canonical_route_split=*/false);
+    expectClose(result.metrics);
+    EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+    EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+    printResult(result);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+    if (envInt("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP", 0) == 0)
+    {
+        GTEST_SKIP()
+            << "Set LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP=1 to run the "
+               "GGUF-derived candidate-pair trainer";
+    }
+
+    MoEProductionSweepSettings settings{};
+    settings.screening_warmups = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_SCREEN_WARMUPS", 1);
+    settings.screening_trials = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_SCREEN_TRIALS", 3);
+    settings.screening_replays = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_SCREEN_REPLAYS", 2);
+    settings.robust_warmups = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_ROBUST_WARMUPS", 2);
+    settings.robust_trials = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_ROBUST_TRIALS", 15);
+    settings.robust_replays = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_ROBUST_REPLAYS", 4);
+    settings.minimum_finalists = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_MIN_FINALISTS", 12);
+    settings.maximum_finalists = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 24);
+    settings.finalist_margin = envPositiveDouble(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_FINALIST_MARGIN", 0.05);
+    const std::vector<int> m_values = envCsvInts(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_M",
+        {64, 256, 1024, 2048, 4096, 8192, 16384});
+    const int maximum_cells = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_MAX_CELLS",
+        std::numeric_limits<int>::max());
+    const int device_ordinal = envInt(
+        "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_DEVICE", 0);
+    const char *route_profile_environment =
+        std::getenv("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_ROUTE_PROFILE");
+    if (!route_profile_environment || !*route_profile_environment)
+    {
+        throw std::runtime_error(
+            "ROCm production MoE sweep requires one explicit route profile");
+    }
+    const auto route_profile =
+        llaminar2::test::native_vnni_dispatch::parseMoERoutingProfile(
+            route_profile_environment);
+
+    settings.profiler_request_id =
+        llaminar2::test::native_vnni_dispatch::profilerRequestId();
+    const std::string profiler_candidate_id =
+        llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+            "LLAMINAR_ROCM_MOE_PRODUCTION_PROFILE_CANDIDATE");
+    if (settings.profiling() != !profiler_candidate_id.empty())
+    {
+        throw std::runtime_error(
+            "isolated ROCm MoE profiling requires both a profiler request ID "
+            "and LLAMINAR_ROCM_MOE_PRODUCTION_PROFILE_CANDIDATE");
+    }
+    if (settings.profiling())
+    {
+        settings.profiler_candidate =
+            findMoEPrefillCandidatePair(profiler_candidate_id);
+        if (!settings.profiler_candidate)
+        {
+            throw std::runtime_error(
+                "unknown ROCm MoE production profiler candidate " +
+                profiler_candidate_id);
+        }
+        const std::string selected_cases =
+            llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+                "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_CASES");
+        if (selected_cases.empty() ||
+            selected_cases.find(',') != std::string::npos ||
+            m_values.size() != 1 || maximum_cells != 1)
+        {
+            throw std::runtime_error(
+                "isolated ROCm MoE profiling requires one explicit case, one M, "
+                "and LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_MAX_CELLS=1");
+        }
+    }
+
+    ScopedEnvOverride rowwise_iters(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+
+    std::FILE *csv = settings.profiling() ? nullptr : stdout;
+    bool owns_csv = false;
+    if (!settings.profiling())
+    {
+        if (const char *path =
+                std::getenv("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_CSV");
+            path && *path)
+        {
+            csv = std::fopen(path, "w");
+            ASSERT_NE(csv, nullptr)
+                << "failed to open production MoE aggregate CSV " << path;
+            owns_csv = true;
+        }
+        std::fprintf(
+            csv,
+            "backend,phase,case_id,route_profile,source_gate,source_up,source_down,"
+            "gate_execution_codebook,up_execution_codebook,"
+            "down_execution_codebook,hidden_size,expert_width,expert_count,"
+            "top_k,route_active_experts,route_max_assignments,route_assignment_cv,"
+            "m,candidate_id,gate_tile_m,gate_tile_n,down_tile_m,"
+            "down_tile_n,gate_local_bytes,down_local_bytes,gate_registers,"
+            "down_registers,gate_shared_bytes,down_shared_bytes,"
+            "gate_active_blocks_per_sm,down_active_blocks_per_sm,"
+            "screening_sample_count,screening_replays,robust_sample_count,"
+            "robust_replays,selected_sample_count,selected_replays,min_us,"
+            "median_us,p95_us,mad_us,cv,timing_sample_digest,bit_mismatches,"
+            "first_bit_mismatch,route_counter_ok,finalist,is_winner\n");
+    }
+
+    std::FILE *timing_csv = nullptr;
+    if (!settings.profiling())
+    {
+        if (const char *path =
+                std::getenv("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_TIMING_CSV");
+            path && *path)
+        {
+            timing_csv = std::fopen(path, "w");
+            ASSERT_NE(timing_csv, nullptr)
+                << "failed to open production MoE timing CSV " << path;
+            std::fprintf(
+                timing_csv,
+                "backend,phase,case_id,route_profile,m,candidate_id,timing_phase,"
+                "sample_index,timed_replays,latency_us,latency_ms_hex\n");
+        }
+    }
+
+    int executed_cells = 0;
+    for (const auto &routed_case :
+         llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases())
+    {
+        if (!envCsvContainsOrUnset(
+                "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_CASES",
+                routed_case.evidenceId()) ||
+            !envCsvContainsOrUnset(
+                "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_GATE_FORMATS",
+                routed_case.routed.gate) ||
+            !envCsvContainsOrUnset(
+                "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_DOWN_FORMATS",
+                routed_case.routed.down))
+        {
+            continue;
+        }
+        for (const int rows : m_values)
+        {
+            if (executed_cells >= maximum_cells)
+                break;
+            SCOPED_TRACE(
+                routed_case.evidenceId() + "/route=" +
+                std::string(
+                    llaminar2::test::native_vnni_dispatch::
+                        moeRoutingProfileName(route_profile)) +
+                "/M" + std::to_string(rows));
+            std::fprintf(
+                stderr,
+                "[ROCm MoE production sweep] case=%s route=%s M=%d gate/up=%s "
+                "down=%s hidden=%d expert_width=%d experts=%d top_k=%d\n",
+                routed_case.evidenceId().c_str(),
+                std::string(
+                    llaminar2::test::native_vnni_dispatch::
+                        moeRoutingProfileName(route_profile)).c_str(),
+                rows,
+                routed_case.routed.gate.c_str(),
+                routed_case.routed.down.c_str(),
+                routed_case.hidden_size,
+                routed_case.routed_expert_width,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+            runROCmProductionMoERoutedCase(
+                routed_case,
+                rows,
+                route_profile,
+                device_ordinal,
+                settings,
+                csv,
+                timing_csv);
+            ++executed_cells;
+        }
+        if (executed_cells >= maximum_cells)
+            break;
+    }
+
+    if (owns_csv)
+        ASSERT_EQ(std::fclose(csv), 0);
+    if (timing_csv)
+        ASSERT_EQ(std::fclose(timing_csv), 0);
+    EXPECT_GT(executed_cells, 0)
+        << "production filters selected no GGUF-derived MoE sweep cells";
+#endif
+}
 
 TEST(Perf__MoEVerifierPrefill, ROCm_M1234_RoutedExpertFFNDecodeEquivalent)
 {

@@ -32,7 +32,7 @@ from tests.v2.performance.kernels.native_vnni_dispatch.exact_oracle import (
 
 
 class CPUNativeVNNIVerifierAdapterTest(unittest.TestCase):
-    """Prove route normalization, byte gates, Q8_K, and timing provenance."""
+    """Prove exact-route admission, byte gates, Q8_K, and timing provenance."""
 
     @staticmethod
     def context() -> CPUVerifierAdapterContext:
@@ -107,19 +107,16 @@ class CPUNativeVNNIVerifierAdapterTest(unittest.TestCase):
         self.assertEqual(observation.m, 31)
         self.assertTrue(observation.bitwise_equal)
 
-    def test_wide_request_normalized_to_pairwise_is_retained_but_ineligible(self) -> None:
-        observation = adapt_cpu_verifier_row(
-            self.row("WideRows"), self.context()
-        )
+    def test_wide_request_normalized_to_pairwise_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exact requested production route"):
+            adapt_cpu_verifier_row(self.row("WideRows"), self.context())
 
-        self.assertFalse(observation.supported)
-        self.assertNotEqual(
-            observation.observed_candidate_id,
-            observation.effective_candidate_id,
-        )
-        self.assertFalse(candidate_is_eligible(
-            observation, self.context().serial_m1_policy_hash
-        ))
+    def test_full_k_candidate_in_k_partition_domain_is_rejected(self) -> None:
+        row = self.row("FullKRowChunkGrid")
+        row["k_tiles"] = "4"
+
+        with self.assertRaisesRegex(ValueError, "full-K verifier route"):
+            adapt_cpu_verifier_row(row, self.context())
 
     def test_impossible_build_and_runtime_isa_pair_is_rejected(self) -> None:
         row = self.row()

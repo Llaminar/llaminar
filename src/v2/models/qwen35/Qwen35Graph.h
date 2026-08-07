@@ -203,7 +203,18 @@ namespace llaminar2
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false);
 
-        ComputeGraph buildFAKVCacheAppendGraph(
+        /**
+         * @brief Build the exact shifted-MTP K/V cache-publication sidecar.
+         *
+         * This graph deliberately excludes Q projection, query gating, query
+         * normalization, attention, FFN/MoE, and vocabulary projection. It emits
+         * only the transforms required to derive and append the MTP K/V bytes
+         * from terminal hidden rows and shifted draft tokens.
+         *
+         * @return A graph terminating at the MTP KV append node, or an empty
+         *         graph when required state is absent.
+         */
+        ComputeGraph buildMTPFAKVCacheAppendGraph(
             const LayerWeights &layer,
             ActivationBuffers &buffers,
             int layer_idx,

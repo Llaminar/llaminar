@@ -49,7 +49,7 @@ from .corpus import ObservationCorpus
 from .prefill_matrix import (
     CPU_PREFILL_M_BUCKETS,
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
-    GPU_PREFILL_M_BUCKETS,
+    LEGACY_GPU_PREFILL_M_BUCKETS,
     cpu_prefill_measurements,
 )
 from .shape_manifest import ShapePartition, ShapeRole, load_shape_manifest
@@ -190,7 +190,7 @@ class CPUPrefillSplitManifest:
         elif self.schema_version == V12_SCHEMA_VERSION:
             expected_sealed_m_values = V12_CPU_PREFILL_M_BUCKETS
         else:
-            expected_sealed_m_values = GPU_PREFILL_M_BUCKETS
+            expected_sealed_m_values = LEGACY_GPU_PREFILL_M_BUCKETS
         if self.sealed_m_values != expected_sealed_m_values:
             raise ValueError(
                 "CPU prefill sealed pool must expose every canonical "

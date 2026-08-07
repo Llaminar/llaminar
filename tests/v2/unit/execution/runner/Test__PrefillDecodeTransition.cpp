@@ -1314,6 +1314,27 @@ namespace
             return handle;
         }
 
+        bool observeDeviceResidentNextConditionTokens(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens) override
+        {
+            ++resident_next_condition_token_observation_count_;
+            const DeviceResidentLogicalSequenceStateHandle current =
+                deviceResidentLogicalSequenceState();
+            if (request_count <= 0 || !out_tokens || !current.valid() ||
+                !logical_state.sameMailboxAs(current) ||
+                logical_state.request_count < request_count)
+            {
+                return false;
+            }
+            std::copy_n(
+                resident_next_condition_tokens_.data(),
+                request_count,
+                out_tokens);
+            return true;
+        }
+
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
@@ -4658,16 +4679,36 @@ namespace
         }
 
         bool beginDeviceResidentGeneration(
-            int request_count,
-            int max_new_tokens) override
+            const DeviceGenerationAdmissionRequest &request) override
         {
             ++device_generation_admission_count_;
-            last_device_generation_request_count_ = request_count;
-            last_device_generation_max_new_tokens_ = max_new_tokens;
-            device_generation_admitted_ =
-                request_count > 0 && max_new_tokens > 0;
+            last_device_generation_request_count_ = request.request_count;
+            last_device_generation_max_new_tokens_ = request.max_new_tokens;
+            last_device_generation_initial_leading_row_disposition_ =
+                request.initial_leading_row_disposition;
+            device_generation_admission_dispositions_.push_back(
+                request.initial_leading_row_disposition);
+            device_generation_admitted_ = request.valid();
             device_generation_materialized_ = false;
             device_generation_launched_ = false;
+            if (device_resident_generation_sequence_enabled_ &&
+                device_generation_terminal_sequence_index_ >=
+                    device_generation_terminal_sequence_.size())
+            {
+                device_generation_admitted_ = false;
+                device_generation_terminals_.clear();
+            }
+            else if (device_resident_generation_sequence_enabled_)
+            {
+                device_generation_terminals_ =
+                    device_generation_terminal_sequence_[
+                        device_generation_terminal_sequence_index_];
+                if (!device_generation_terminals_.empty())
+                {
+                    device_generation_terminal_ =
+                        device_generation_terminals_.front();
+                }
+            }
             if (!device_resident_generation_enabled_)
                 device_generation_terminals_.clear();
             device_generation_lifecycle_events_.push_back("admission");
@@ -4804,6 +4845,8 @@ namespace
             out_result->requests = device_generation_terminals_;
             device_generation_launched_ = false;
             device_generation_admitted_ = false;
+            if (device_resident_generation_sequence_enabled_)
+                ++device_generation_terminal_sequence_index_;
             return out_result->valid();
         }
 
@@ -4970,6 +5013,10 @@ namespace
         int residentConditionTokenTargetPublicationCount() const
         {
             return resident_condition_token_target_publication_count_;
+        }
+        int residentNextConditionTokenObservationCount() const
+        {
+            return resident_next_condition_token_observation_count_;
         }
         const std::vector<int32_t> &lastStagedStochasticDraftTokens() const
         {
@@ -5776,6 +5823,17 @@ namespace
         {
             return last_device_generation_max_new_tokens_;
         }
+        sampling_math::DeviceGenerationLeadingRowDisposition
+        lastDeviceGenerationInitialLeadingRowDisposition() const
+        {
+            return last_device_generation_initial_leading_row_disposition_;
+        }
+        const std::vector<
+            sampling_math::DeviceGenerationLeadingRowDisposition> &
+        deviceGenerationAdmissionDispositions() const
+        {
+            return device_generation_admission_dispositions_;
+        }
         const std::vector<std::string> &deviceGenerationLifecycleEvents() const
         {
             return device_generation_lifecycle_events_;
@@ -5786,7 +5844,43 @@ namespace
             device_generation_terminal_ = std::move(terminal);
             device_generation_terminals_ = {device_generation_terminal_};
             device_resident_generation_enabled_ = true;
+            device_resident_generation_sequence_enabled_ = false;
+            device_generation_terminal_sequence_.clear();
+            device_generation_terminal_sequence_index_ = 0;
             device_generation_controller_owned_outcomes_ = true;
+        }
+        /**
+         * @brief Install one scalar terminal ledger per public controller.
+         *
+         * The production controller writes these ledgers on device. This mock
+         * sequence lets a device-free lifecycle regression represent a rejected
+         * terminal followed by its carried-row continuation without rebuilding
+         * either result from host-visible intermediate outcomes.
+         */
+        void enableDeviceResidentGenerationSequence(
+            std::vector<DeviceGenerationTerminalRequestResult> terminals)
+        {
+            device_generation_terminal_sequence_.clear();
+            device_generation_terminal_sequence_.reserve(terminals.size());
+            for (DeviceGenerationTerminalRequestResult &terminal : terminals)
+            {
+                device_generation_terminal_sequence_.push_back(
+                    {std::move(terminal)});
+            }
+            device_generation_terminal_sequence_index_ = 0;
+            device_resident_generation_sequence_enabled_ =
+                !device_generation_terminal_sequence_.empty();
+            device_resident_generation_enabled_ =
+                device_resident_generation_sequence_enabled_;
+            device_generation_controller_owned_outcomes_ =
+                device_resident_generation_sequence_enabled_;
+            if (device_resident_generation_sequence_enabled_)
+            {
+                device_generation_terminals_ =
+                    device_generation_terminal_sequence_.front();
+                device_generation_terminal_ =
+                    device_generation_terminals_.front();
+            }
         }
         /**
          * @brief Mark compact verifier outcomes as owned by the resident loop.
@@ -6002,6 +6096,12 @@ namespace
                 terminal.remaining_token_count =
                     last_device_generation_max_new_tokens_ - output_count;
                 terminal.model_stopped = stopped;
+                terminal.next_leading_row_disposition =
+                    !stopped &&
+                            output_count >
+                                meta[kSpecBatchMetaTargetVerifierStateCommitCount]
+                        ? DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                        : DeviceGenerationLeadingRowDisposition::PendingResponse;
                 terminal.transaction_count = 1;
                 terminal.accepted_speculative_token_count =
                     meta[kSpecBatchMetaAcceptedSpeculativePrefix];
@@ -6559,6 +6659,7 @@ namespace
         int stage_stochastic_draft_tokens_count_{0};
         int stage_stochastic_target_token_count_{0};
         int resident_condition_token_target_publication_count_{0};
+        int resident_next_condition_token_observation_count_{0};
         int device_distribution_request_batch_outcome_count_{0};
         uint64_t last_probability_row_inverse_sample_seed_{0};
         int last_probability_row_inverse_sample_logical_position_{0};
@@ -6581,6 +6682,12 @@ namespace
         int device_generation_admission_count_{0};
         int last_device_generation_request_count_{0};
         int last_device_generation_max_new_tokens_{0};
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            last_device_generation_initial_leading_row_disposition_{
+                sampling_math::DeviceGenerationLeadingRowDisposition::
+                    PendingResponse};
+        std::vector<sampling_math::DeviceGenerationLeadingRowDisposition>
+            device_generation_admission_dispositions_;
         int device_generation_materialization_count_{0};
         int last_device_generation_draft_depth_{0};
         DeviceGenerationLoopTopology last_device_generation_topology_{
@@ -6591,9 +6698,13 @@ namespace
             device_generation_terminal_{};
         std::vector<DeviceGenerationTerminalRequestResult>
             device_generation_terminals_;
+        std::vector<std::vector<DeviceGenerationTerminalRequestResult>>
+            device_generation_terminal_sequence_;
+        size_t device_generation_terminal_sequence_index_{0};
         sampling_math::DeviceGenerationDispatchTicket
             last_device_generation_dispatch_ticket_{};
         bool device_resident_generation_enabled_{false};
+        bool device_resident_generation_sequence_enabled_{false};
         bool device_generation_controller_owned_outcomes_{false};
         bool device_generation_admitted_{false};
         bool device_generation_materialized_{false};
@@ -10803,6 +10914,194 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    /**
+     * @brief Re-admit the resident controller after a budget-limited API return.
+     *
+     * A caller may intentionally request a small number of tokens from each
+     * `decodeStep()` while keeping the same KV/recurrent request alive. The first
+     * terminal ledger therefore closes one controller transaction, not the
+     * request itself. This regression requires the scheduler to reopen admission
+     * and execute a second complete grouped verifier lifecycle; reusing the first
+     * consumed controller or skipping admission is forbidden.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           GroupedGreedyResidentControllerReadmitsAcrossDecodeSteps)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+        ASSERT_FALSE(first.is_complete);
+
+        const GenerationResult second = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(second.success()) << second.error;
+        ASSERT_FALSE(second.is_complete);
+
+        EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 2);
+        EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 2);
+        EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 0)
+            << "A resident terminal continuation is verifier row zero; it must "
+               "not be condition-forwarded through the main graph first";
+        EXPECT_EQ(
+            mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+            1)
+            << "Only the second public decode call begins from the exact "
+               "event-published continuation mailbox";
+        EXPECT_THAT(
+            mock->deviceGenerationLifecycleEvents(),
+            ElementsAre(
+                "admission",
+                "resident_verifier",
+                "materialize:greedy",
+                "launch",
+                "finish",
+                "admission",
+                "resident_verifier",
+                "materialize:greedy",
+                "launch",
+                "finish"));
+        EXPECT_THAT(
+            mock->publicationEvents(),
+            ElementsAre(
+                "device_outcome_publish",
+                "device_outcome_publish"));
+    }
+
+    /**
+     * @brief Carry a rejected correction across controllers without returning it twice.
+     *
+     * Controller one emits the correction but cannot publish state produced by
+     * consuming it. Its terminal mailbox therefore becomes verifier row zero of
+     * controller two with `AlreadyEmitted` ownership. The second response must
+     * begin at the next newly emitted token while all execution inputs remain in
+     * the resident mailbox.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           GroupedResidentRejectionCarryIsNotDuplicatedAcrossDecodeSteps)
+    {
+        using sampling_math::DeviceGenerationLeadingRowDisposition;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/false,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({0, 1});
+        mock->enableDeviceResidentGenerationSequence({
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::VERIFY_REJECT_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .next_leading_row_disposition =
+                    DeviceGenerationLeadingRowDisposition::AlreadyEmitted,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 0,
+                .rejected_transaction_count = 1,
+                .consumed_verifier_row_count = 1,
+                .published_state_commit_count = 1,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            },
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .next_leading_row_disposition =
+                    DeviceGenerationLeadingRowDisposition::PendingResponse,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 1,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            },
+        });
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+        EXPECT_THAT(
+            first.tokens,
+            ElementsAre(
+                MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        const GenerationResult second = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(second.success()) << second.error;
+        EXPECT_THAT(
+            second.tokens,
+            ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(
+            std::count(
+                second.tokens.begin(),
+                second.tokens.end(),
+                MockInferenceRunner::VERIFY_REJECT_TOKEN),
+            0);
+        EXPECT_THAT(
+            mock->deviceGenerationAdmissionDispositions(),
+            ElementsAre(
+                DeviceGenerationLeadingRowDisposition::PendingResponse,
+                DeviceGenerationLeadingRowDisposition::AlreadyEmitted));
+        EXPECT_EQ(mock->residentNextConditionTokenObservationCount(), 0)
+            << "A carried correction is a verifier input, not a direct response token";
+        EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 0)
+            << "The grouped verifier consumes the carried mailbox row directly";
+    }
+
     TEST_F(Test__PrefillDecodeTransition, GroupedHostPublicationDefersRejectedCorrection)
     {
         const std::filesystem::path export_path =
@@ -14275,7 +14574,7 @@ namespace
 
         GenerationResult step2 = runner->decodeStep();
         EXPECT_FALSE(step2.success());
-        EXPECT_NE(step2.error.find("Ready MTP verifier token"), std::string::npos);
+        EXPECT_NE(step2.error.find("Ready MTP condition"), std::string::npos);
         EXPECT_EQ(mock->restoreCount(), 1)
             << "the ready-token sampling-contract guard fails before mutating "
                "runner state, so it should not capture and restore a fresh "
@@ -16486,10 +16785,11 @@ namespace
     /**
      * @brief Continue after a resident terminal response without host state.
      *
-     * A later one-token call first consumes the preceding terminal condition
-     * to produce fresh logits, then publishes and advances the newly sampled
-     * token. The logical-state mailbox supplies sequence position while the
-     * persistent target slot supplies token payload; both handoffs remain D2D.
+     * A later one-token call returns the preceding terminal condition itself,
+     * because that token is already the next serial output but has not yet been
+     * consumed by the main graph. The logical-state mailbox supplies token and
+     * position to shifted publication, while a D2D target-slot copy supplies the
+     * same token to one main-state advance. Only the terminal result crosses D2H.
      */
     TEST_F(Test__PrefillDecodeTransition,
            MTPGpuBudgetClampAfterResidentTerminalUsesDeviceTransactionsOnly)
@@ -16528,6 +16828,8 @@ namespace
             mock->deviceTargetShiftedCommitCount();
         const int target_condition_advances_before =
             mock->targetSampleMainConditionAdvanceCount();
+        const int observations_before =
+            mock->residentNextConditionTokenObservationCount();
 
         runner->setDecodeStepTokenBudget(1);
         GenerationResult direct = runner->decodeStep();
@@ -16541,14 +16843,16 @@ namespace
                   resident_commits_before + 1)
             << "Shifted publication must consume the mailbox-owned token and position.";
         EXPECT_EQ(mock->deviceTargetShiftedCommitCount(),
-                  device_target_commits_before + 1)
-            << "The persistent target slot owns the token payload while the "
-               "resident logical state independently owns its position.";
+                  device_target_commits_before)
+            << "Shifted publication already owns the exact mailbox token and "
+               "must not duplicate that work through the target slot.";
         EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(),
-                  target_condition_advances_before + 2)
-            << "Continuation first consumes the preceding terminal condition, "
-               "then advances the newly emitted token; both are device-owned "
-               "transactions.";
+                  target_condition_advances_before + 1)
+            << "The resident continuation is itself the emitted condition; it "
+               "must enter the main graph exactly once.";
+        EXPECT_EQ(mock->residentNextConditionTokenObservationCount(),
+                  observations_before + 1)
+            << "Only the compact terminal result may cross to the host.";
         EXPECT_EQ(direct.tokens.front(),
                   mock->lastResidentLogicalStateShiftedCommitToken());
     }
@@ -16556,10 +16860,10 @@ namespace
     /**
      * @brief Apply device-only continuation to every LocalTP participant.
      *
-     * Each mirrored participant must consume the same terminal condition and
-     * newly emitted token through its own device-resident mailbox and target
-     * slot. The rank wrapper coordinates these edges without creating a host
-     * token or position authority.
+     * Each mirrored participant must consume the same terminal condition once
+     * through its own mailbox and target slot. The rank wrapper observes one
+     * authoritative compact result from child zero without creating a host token
+     * or position authority for participant execution.
      */
     TEST_F(Test__PrefillDecodeTransition,
            LocalTPGpuBudgetClampAfterResidentTerminalUsesDeviceTransactionsOnly)
@@ -16592,6 +16896,7 @@ namespace
         std::array<int, 2> resident_commits_before{};
         std::array<int, 2> device_target_commits_before{};
         std::array<int, 2> target_advances_before{};
+        std::array<int, 2> observations_before{};
         const std::array<MockInferenceRunner *, 2> children{
             harness.child0,
             harness.child1,
@@ -16607,6 +16912,8 @@ namespace
                 child->deviceTargetShiftedCommitCount();
             target_advances_before[child_index] =
                 child->targetSampleMainConditionAdvanceCount();
+            observations_before[child_index] =
+                child->residentNextConditionTokenObservationCount();
         }
 
         harness.runner->setDecodeStepTokenBudget(1);
@@ -16626,7 +16933,7 @@ namespace
                 resident_commits_before[child_index] + 1);
             EXPECT_EQ(
                 child->deviceTargetShiftedCommitCount(),
-                device_target_commits_before[child_index] + 1);
+                device_target_commits_before[child_index]);
             EXPECT_EQ(child->prepareMTPVerifierInputTokenBatchOnDeviceCount(), 1)
                 << "Only grouped verification uses verifier token staging.";
             EXPECT_EQ(child->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
@@ -16634,9 +16941,14 @@ namespace
                 << "Only grouped verification uses the generic device-token forward.";
             EXPECT_EQ(
                 child->targetSampleMainConditionAdvanceCount(),
-                target_advances_before[child_index] + 2)
-                << "Every participant consumes the preceding terminal condition "
-                   "and advances the newly emitted token on device.";
+                target_advances_before[child_index] + 1)
+                << "Every participant advances the resident terminal condition "
+                   "exactly once on device.";
+            EXPECT_EQ(
+                child->residentNextConditionTokenObservationCount(),
+                observations_before[child_index] +
+                    (child_index == 0 ? 1 : 0))
+                << "Only the primary mirrored head publishes the terminal host result.";
             EXPECT_EQ(direct.tokens.front(),
                       child->lastResidentLogicalStateShiftedCommitToken());
         }

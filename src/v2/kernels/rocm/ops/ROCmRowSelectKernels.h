@@ -1,14 +1,12 @@
 /**
  * @file ROCmRowSelectKernels.h
- * @brief ROCm host wrappers for graph-capturable hidden-state row selection.
+ * @brief ROCm launch contracts for graph-capturable row and prefill selection.
  *
- * This is the HIP counterpart to the CUDA row-select helper. The stage owns a
- * pinned host scalar plus a device scalar; HIP graph capture records the scalar
- * H2D copy and a fixed row-copy kernel so replay can change selected rows by
- * updating the pinned host value before graph launch.
- *
- * Lifecycle: allocation/free are owned by HiddenStateRowSelectStage and should
- * occur during warmup before stream capture begins.
+ * Hidden-state helpers retain their explicitly bounded pre-capture parameter
+ * storage, while long-context prefill consumes only device-owned request banks,
+ * device geometry, and canonical KV progress. Allocation belongs to stage or
+ * arena setup. Every launch and transfer requires the exact non-null stream
+ * supplied by its producer; null never aliases HIP's default stream.
  */
 
 #pragma once
@@ -17,6 +15,27 @@
 
 namespace llaminar2::rocm
 {
+
+    /**
+     * @brief Materialize one graph-stable prefill chunk from a resident request bank.
+     *
+     * The kernel reads canonical KV progress and admitted request geometry on
+     * device. It performs no allocation, transfer, callback, or synchronization.
+     * See IBackend::enqueuePreparePrefillChunkView() for the full contract.
+     */
+    bool launchPreparePrefillChunkView(
+        const int32_t *request_token_ids,
+        const int32_t *request_position_ids,
+        const int32_t *request_total_rows,
+        const int32_t *cached_tokens,
+        int request_row_capacity,
+        int bucket_seq_len,
+        int32_t pad_token_id,
+        int32_t *out_token_ids,
+        int32_t *out_position_ids,
+        int32_t *out_real_rows,
+        int32_t *out_row_stride,
+        void *stream);
 
     /** @brief Allocate pinned host scalar storage for selected row. */
     bool allocateRowSelectHostParam(

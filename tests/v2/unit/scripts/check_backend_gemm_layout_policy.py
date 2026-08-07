@@ -51,6 +51,38 @@ RETIRED_ENTRYPOINTS = (
     "setForceCutlassFallback",
     "isForceCutlassFallback",
     "cudaNativeVNNIPrefill_freeStreamKFixup",
+    "cudaNativeVNNIPrefill_setStreamKMode",
+    "cudaNativeVNNIPrefill_getStreamKMode",
+    "cudaNativeVNNIPrefill_setDeterministicMode",
+    "cudaNativeVNNIPrefill_getDeterministicMode",
+    "CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS",
+    "CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP",
+    "LLAMINAR_FORCE_PREFILL_SPLIT_K",
+    "LLAMINAR_STREAM_K",
+    "LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE",
+    "nvnni_atomic_reduce",
+)
+NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS = (
+    "atomicAdd(",
+    "split_k",
+    "split-K",
+    "SPLIT_K",
+    "Stream-K",
+    "stream-K",
+    "STREAM_K",
+)
+ROCM_NATIVE_VNNI_M1_FORBIDDEN_REDUCTIONS = (
+    "use_atomic_reduce",
+    "atomicAdd(&d_C_fp32[n], result)",
+)
+CUDA_NATIVE_VNNI_GEMV_FORBIDDEN_REDUCTIONS = (
+    "atomicAdd(",
+    "nativeVnniGemv_epilogue",
+    "kTwoPhaseMaxBytes",
+    "debugEnv().gemm.deterministic",
+)
+CPU_NATIVE_VNNI_GROUPED_FALLBACK = re.compile(
+    r"\bverifier_policy\s*=\s*VerifierRowsPolicy::Pairwise\s*;"
 )
 
 
@@ -83,6 +115,40 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                         f"{path.relative_to(repo_root)}: retired GEMM "
                         f"entrypoint {entrypoint} is forbidden"
                     )
+            if path.name == "CUDANativeVNNIPrefillKernels.cu":
+                for token in NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS:
+                    if token in source:
+                        violations.append(
+                            f"{path.relative_to(repo_root)}: CUDA NativeVNNI "
+                            f"prefill reduction token {token!r} is forbidden; "
+                            "retain the public M=1 arithmetic tree"
+                        )
+            if path.name == "ROCmGemvKernel_native_VNNI.hip":
+                for token in ROCM_NATIVE_VNNI_M1_FORBIDDEN_REDUCTIONS:
+                    if token in source:
+                        violations.append(
+                            f"{path.relative_to(repo_root)}: ROCm NativeVNNI "
+                            f"serial-decode reduction token {token!r} is "
+                            "forbidden; retain the ordered K-partition fold"
+                        )
+            if path.name == "CUDANativeVNNIGemvShardImpl.cu.inc":
+                for token in CUDA_NATIVE_VNNI_GEMV_FORBIDDEN_REDUCTIONS:
+                    if token in source:
+                        violations.append(
+                            f"{path.relative_to(repo_root)}: CUDA NativeVNNI "
+                            f"GEMV reduction token {token!r} is forbidden; "
+                            "serial and grouped decode must retain one ordered "
+                            "K-partition publication contract"
+                        )
+            if (
+                path.name == "CPUNativeVNNIGemv.h"
+                and CPU_NATIVE_VNNI_GROUPED_FALLBACK.search(source)
+            ):
+                violations.append(
+                    f"{path.relative_to(repo_root)}: CPU grouped verifier "
+                    "policy substitution is forbidden; reject an invalid "
+                    "physical policy before launch"
+                )
             if not GEMM_OWNED_NAME.search(path.name):
                 continue
             if canonical_root not in path.parents:
@@ -131,10 +197,49 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
 
+        unsafe_prefill = (
+            root
+            / "src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu"
+        )
+        unsafe_prefill.write_text(
+            "void bad(float *p) { atomicAdd(p, 1.0f); }\n",
+            encoding="utf-8",
+        )
+
+        unsafe_rocm_decode = (
+            root
+            / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip"
+        )
+        unsafe_rocm_decode.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_rocm_decode.write_text(
+            "bool use_atomic_reduce = true;\n",
+            encoding="utf-8",
+        )
+
+        unsafe_cuda_decode = (
+            root
+            / "src/v2/kernels/cuda/gemm/"
+            "CUDANativeVNNIGemvShardImpl.cu.inc"
+        )
+        unsafe_cuda_decode.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_cuda_decode.write_text(
+            "void bad(float *p) { atomicAdd(p, 1.0f); }\n",
+            encoding="utf-8",
+        )
+
+        unsafe_cpu_grouped = (
+            root / "src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+        )
+        unsafe_cpu_grouped.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_cpu_grouped.write_text(
+            "verifier_policy = VerifierRowsPolicy::Pairwise;\n",
+            encoding="utf-8",
+        )
+
         violations = find_violations(root)
-        if len(violations) != 5:
+        if len(violations) != 9:
             print(
-                f"expected five ownership violations, found {len(violations)}",
+                f"expected nine ownership violations, found {len(violations)}",
                 file=sys.stderr,
             )
             for violation in violations:

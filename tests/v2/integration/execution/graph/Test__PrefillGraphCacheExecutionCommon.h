@@ -53,7 +53,8 @@ using namespace llaminar2;
 namespace
 {
     constexpr int kExactBucketSeqLen = 64;
-    constexpr int kLargeBucketSeqLen = 128;
+    constexpr int kLargeBucketSeqLen = 4096;
+    constexpr int kLongContextSeqLen = 256 * 1024 + 1;
     constexpr int kHiddenDim = 64;
     constexpr int kKVProbeHeadDim = 32;
     constexpr int kKVProbeHeads = 1;
@@ -500,26 +501,11 @@ namespace
             if (input.seq_len > kLargeBucketSeqLen)
                 return GraphBuildResult("prefill graph cache test exceeded persistent bucket capacity");
 
-            if (use_kv_append_probe_ && !kv_cache_)
+            if (use_kv_append_probe_ &&
+                !initializeKVCacheProbeForTesting())
             {
-                try
-                {
-                    llaminar::v2::kernels::KVCacheConfig config;
-                    config.precision = ActivationPrecision::FP32;
-                    config.device = device_;
-                    config.num_layers = 1;
-                    config.batch_size = 1;
-                    config.max_seq_len = 512;
-                    config.n_kv_heads = kKVProbeHeads;
-                    config.head_dim = kKVProbeHeadDim;
-                    kv_cache_ = llaminar::v2::kernels::KernelFactory::createKVCache(config);
-                }
-                catch (const std::exception &e)
-                {
-                    return GraphBuildResult(std::string("failed to create GPU KV cache probe: ") + e.what());
-                }
-                if (!kv_cache_)
-                    return GraphBuildResult("failed to create GPU KV cache probe");
+                return GraphBuildResult(
+                    "failed to create GPU KV cache probe");
             }
 
             FP32Tensor *input_ptr = input_tensor_;
@@ -788,6 +774,69 @@ namespace
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
 
+        /**
+         * @brief Materialize the persistent KV probe before graph construction.
+         *
+         * Device-owned chunk materialization binds the canonical cached-token
+         * address as graph identity. The cache therefore has to exist before
+         * ForwardExecutionEngine asks this host to build its first graph.
+         */
+        bool initializeKVCacheProbeForTesting()
+        {
+            if (!use_kv_append_probe_)
+                return false;
+            if (kv_cache_)
+                return true;
+            try
+            {
+                llaminar::v2::kernels::KVCacheConfig config;
+                config.precision = ActivationPrecision::FP32;
+                config.device = device_;
+                config.num_layers = 1;
+                config.batch_size = 1;
+                config.max_seq_len = kv_cache_capacity_;
+                config.n_kv_heads = kKVProbeHeads;
+                config.head_dim = kKVProbeHeadDim;
+                kv_cache_ =
+                    llaminar::v2::kernels::KernelFactory::createKVCache(
+                        config);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[PrefillGraphCacheTestHost] Failed to initialize KV probe: "
+                          << e.what());
+                return false;
+            }
+            return kv_cache_ != nullptr;
+        }
+
+        /** @return Canonical device progress address owned by the KV probe. */
+        const int32_t *kvSequenceCachedTokensDeviceForTesting() const
+        {
+            return kv_cache_
+                       ? kv_cache_->deviceSequenceCachedTokenCountPtr(0)
+                       : nullptr;
+        }
+
+        /**
+         * @brief Set the logical capacity of the lazily-created KV probe.
+         *
+         * The capacity is immutable once the cache exists because changing it
+         * would replace device addresses embedded in captured executables.
+         * Long-context tests call this before their first graph build, while
+         * ordinary lifecycle tests retain the compact default allocation.
+         *
+         * @param max_tokens Positive logical token capacity.
+         * @return true when the capacity was accepted before cache creation.
+         */
+        bool setKVCacheCapacityForTesting(int max_tokens)
+        {
+            if (max_tokens <= 0 || kv_cache_)
+                return false;
+            kv_cache_capacity_ = max_tokens;
+            return true;
+        }
+
         /// @brief Enable the real GPU RoPE dynamic-position consumer.
         void setUseRoPEProbe(bool enabled) { use_rope_probe_ = enabled; }
 
@@ -828,8 +877,19 @@ namespace
             return kv_cache_ ? kv_cache_->get_cached_tokens(0, 0) : 0;
         }
 
-        /// @brief Return the device mirror of the probe KV cached-token count.
-        int kvDeviceCachedTokensForTesting() const
+        /**
+         * @brief Read the device-owned probe count on one exact observation stream.
+         *
+         * The caller must first enqueue any producer-event dependency required
+         * by that stream. Synchronizing only the observation stream then proves
+         * the transfer cannot accidentally rely on unrelated device work.
+         *
+         * @param observation_stream Explicit stream for the terminal D2H copy,
+         *        or null to use the fixture's backend stream in legacy tests.
+         * @return Cached-token count, or -1 when the observation contract fails.
+         */
+        int kvDeviceCachedTokensForTesting(
+            void *observation_stream = nullptr) const
         {
             if (!kv_cache_ || !ctx_)
                 return -1;
@@ -842,14 +902,14 @@ namespace
                 return -1;
 
             int value = -1;
-            void *stream = nullptr;
-            if (device_.is_cuda())
+            void *stream = observation_stream;
+            if (!stream && device_.is_cuda())
             {
                 stream = GPUDeviceContextPool::instance()
                              .getNvidiaContext(device_.toKernelDeviceIndex())
                              .defaultStream();
             }
-            else if (device_.is_rocm())
+            else if (!stream && device_.is_rocm())
             {
                 stream = GPUDeviceContextPool::instance()
                              .getAMDContext(device_.toKernelDeviceIndex())
@@ -866,7 +926,12 @@ namespace
             {
                 return -1;
             }
-            ctx_->synchronize();
+            if (!backend->synchronizeStream(
+                    stream,
+                    device_.toKernelDeviceIndex()))
+            {
+                return -1;
+            }
             return value;
         }
 
@@ -1014,6 +1079,7 @@ namespace
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
         bool use_rope_probe_ = false;       ///< Whether to append real GPU RoPEStage after residual add.
+        int kv_cache_capacity_ = 512;       ///< Immutable logical capacity selected before lazy cache creation.
         bool rebalance_requested_on_boundary_ = false;
         bool bump_epoch_on_maintenance_ = false;
         uint64_t topology_delta_on_maintenance_ = 0;
@@ -1671,6 +1737,330 @@ namespace
         EXPECT_EQ(snapshot->topology_signature, 0x4400u);
         EXPECT_EQ(snapshot->capture_phase, "replay");
         EXPECT_EQ(snapshot->recapture_reason, "none");
+    }
+
+    /**
+     * @brief Prove 256K-context chunk totality through one captured GPU graph.
+     *
+     * A 256K request contains 64 complete 4096-row prefill buckets. The extra
+     * token deliberately creates a sixty-fifth padded bucket, exercising the
+     * two boundaries most likely to hide an off-by-one or padded-row advance:
+     * exactly 256K and the first row beyond it. Every chunk publishes its real
+     * row count through resident device metadata, and the production KV append
+     * stage must advance by those real rows while the same graph executable is
+     * captured once and replayed for the entire logical request.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, LongContext256KPlusTailIsMTotal)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4096"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "1"},
+        });
+        PerfStatsCollector::reset();
+
+        host_->setUseKVAppendProbe(true);
+        ASSERT_TRUE(host_->setKVCacheCapacityForTesting(kLongContextSeqLen));
+        ASSERT_TRUE(host_->initializeKVCacheProbeForTesting());
+
+        IBackend *backend = getBackendFor(device_);
+        ASSERT_NE(backend, nullptr);
+        void *admission_stream = nullptr;
+        if (device_.is_cuda())
+        {
+            admission_stream = GPUDeviceContextPool::instance()
+                                   .getNvidiaContext(
+                                       device_.toKernelDeviceIndex())
+                                   .defaultStream();
+        }
+        else if (device_.is_rocm())
+        {
+            admission_stream = GPUDeviceContextPool::instance()
+                                   .getAMDContext(
+                                       device_.toKernelDeviceIndex())
+                                   .defaultStream();
+        }
+        ASSERT_NE(admission_stream, nullptr);
+
+        std::vector<int32_t> request_tokens(
+            static_cast<size_t>(kLongContextSeqLen));
+        std::vector<int32_t> request_positions(
+            static_cast<size_t>(kLongContextSeqLen));
+        for (int row = 0; row < kLongContextSeqLen; ++row)
+        {
+            request_tokens[static_cast<size_t>(row)] = 17000 + row;
+            request_positions[static_cast<size_t>(row)] = row;
+        }
+        /*
+         * Bind every captured address through the same semantic arena slots as
+         * production.  The harness owns these tensors until teardown, while
+         * discardAllCachedGraphs() below releases executable references before
+         * that ownership ends.
+         */
+        auto *request_token_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_TOKEN_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLongContextSeqLen)},
+                request_tokens);
+        auto *request_position_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_POSITION_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLongContextSeqLen)},
+                request_positions);
+        auto *request_total_rows =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_BATCH_GEOMETRY,
+                std::vector<size_t>{1},
+                std::vector<int32_t>{kLongContextSeqLen});
+        auto *chunk_token_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_TOKEN_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLargeBucketSeqLen)});
+        auto *chunk_position_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_POSITION_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLargeBucketSeqLen)});
+        auto *chunk_geometry =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_GEOMETRY,
+                std::vector<size_t>{2});
+        ASSERT_TRUE(request_token_bank->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(request_position_bank->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(request_total_rows->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_token_bank->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_position_bank->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_geometry->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(backend->synchronizeStream(
+            admission_stream,
+            device_.toKernelDeviceIndex()));
+
+        const int32_t *cached_tokens_device =
+            host_->kvSequenceCachedTokensDeviceForTesting();
+        ASSERT_NE(cached_tokens_device, nullptr);
+        constexpr uint64_t kChunkCaptureIdentity = UINT64_C(0x25600001);
+        ForwardInput input;
+        input.token_ids = nullptr;
+        input.token_ids_device = chunk_token_bank->gpu_data_ptr();
+        input.position_ids = nullptr;
+        input.position_ids_device = chunk_position_bank->gpu_data_ptr();
+        input.position_policy = ForwardPositionPolicy::ExplicitRows;
+        input.batch_size = 1;
+        input.seq_len = kLongContextSeqLen;
+        input.real_seq_len = kLongContextSeqLen;
+        input.sequence_lengths_device =
+            static_cast<const int32_t *>(chunk_geometry->gpu_data_ptr());
+        input.device = device_;
+        input.device_prefill_chunk = DevicePrefillChunkGraphBinding{
+            .backend = backend,
+            .request_token_ids_device = static_cast<const int32_t *>(
+                request_token_bank->gpu_data_ptr()),
+            .request_position_ids_device = static_cast<const int32_t *>(
+                request_position_bank->gpu_data_ptr()),
+            .request_total_rows_device = static_cast<const int32_t *>(
+                request_total_rows->gpu_data_ptr()),
+            .cached_tokens_device = cached_tokens_device,
+            .chunk_token_ids_device = static_cast<int32_t *>(
+                chunk_token_bank->gpu_data_ptr()),
+            .chunk_position_ids_device = static_cast<int32_t *>(
+                chunk_position_bank->gpu_data_ptr()),
+            .chunk_real_rows_device = static_cast<int32_t *>(
+                chunk_geometry->gpu_data_ptr()),
+            .chunk_row_stride_device = static_cast<int32_t *>(
+                                           chunk_geometry->gpu_data_ptr()) +
+                                       1,
+            .request_row_capacity = kLongContextSeqLen,
+            .bucket_seq_len = kLargeBucketSeqLen,
+            .pad_token_id = kPadTokenId,
+            .capture_identity = kChunkCaptureIdentity,
+        };
+        ASSERT_TRUE(input.device_prefill_chunk->valid());
+
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = {kLargeBucketSeqLen};
+        policy.fixed_chunk_real_tokens = kLargeBucketSeqLen;
+        policy.real_token_count = kLongContextSeqLen;
+
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input,
+            policy,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 65u);
+
+        int expected_offset = 0;
+        uint64_t real_rows = 0;
+        for (size_t index = 0; index < schedule.chunks.size(); ++index)
+        {
+            const auto &plan = schedule.chunks[index];
+            SCOPED_TRACE(index);
+            EXPECT_EQ(plan.chunk_index, static_cast<int>(index));
+            EXPECT_EQ(plan.chunk.token_offset, expected_offset);
+            EXPECT_EQ(plan.chunk.bucket_seq_len, kLargeBucketSeqLen);
+            const int expected_real_rows =
+                index + 1 == schedule.chunks.size()
+                    ? 1
+                    : kLargeBucketSeqLen;
+            EXPECT_EQ(plan.chunk.real_count, expected_real_rows);
+            expected_offset += plan.chunk.real_count;
+            real_rows += static_cast<uint64_t>(plan.chunk.real_count);
+        }
+        EXPECT_EQ(expected_offset, kLongContextSeqLen);
+        EXPECT_EQ(real_rows, static_cast<uint64_t>(kLongContextSeqLen));
+
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->runPrefillChunkSchedule(
+            input,
+            schedule,
+            output,
+            *host_));
+
+        ASSERT_TRUE(output.execution.valid);
+        ASSERT_EQ(output.execution.device, device_);
+        ASSERT_NE(output.execution.stream, nullptr);
+
+        /*
+         * Cached replay is deliberately asynchronous. Terminal diagnostics
+         * therefore consume its exact producer edge before reading any KV or
+         * chunk state on the fixture's observation stream. A profiler can
+         * stretch the final replay enough to expose this ordering requirement;
+         * relying on ordinary launch timing made the old test intermittently
+         * observe 262144 rows before the one-row tail append completed.
+         */
+        const int device_ordinal = device_.toKernelDeviceIndex();
+        void *const raw_completion_event =
+            backend->createEvent(device_ordinal);
+        ASSERT_NE(raw_completion_event, nullptr);
+        const std::shared_ptr<void> completion_event(
+            raw_completion_event,
+            [backend, device_ordinal](void *event)
+            {
+                backend->destroyEvent(event, device_ordinal);
+            });
+        ASSERT_TRUE(backend->recordEvent(
+            completion_event.get(),
+            device_ordinal,
+            output.execution.stream));
+        ASSERT_TRUE(backend->streamWaitEvent(
+            admission_stream,
+            completion_event.get(),
+            device_ordinal));
+
+        EXPECT_EQ(host_->build_calls, 1)
+            << "Every 4096-row chunk must share one stable graph topology.";
+        EXPECT_EQ(host_->maintenance_calls, 0);
+        EXPECT_EQ(
+            host_->kvDeviceCachedTokensForTesting(admission_stream),
+            kLongContextSeqLen)
+            << "The padded one-row tail must advance KV by one, not 4096.";
+
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kLargeBucketSeqLen,
+            host_->placement_epoch,
+            /*uses_device_sequence_lengths=*/true);
+        auto device_chunk_signature = signature;
+        device_chunk_signature.uses_device_token_ids = true;
+        device_chunk_signature.uses_device_position_ids = true;
+        device_chunk_signature.position_policy =
+            ForwardPositionPolicy::ExplicitRows;
+        device_chunk_signature.device_prefill_chunk_capture_identity =
+            kChunkCaptureIdentity;
+        const auto key = prefillGraphKey(
+            device_,
+            kLargeBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+        const auto snapshot = engine_->prefillGraphCacheSnapshot(
+            device_chunk_signature,
+            key);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(snapshot->warmup_count, 1u);
+        EXPECT_EQ(snapshot->capture_count, 1u);
+        EXPECT_EQ(snapshot->replay_count, 64);
+        EXPECT_GE(snapshot->node_count, 2u)
+            << "The complete residual-plus-KV probe must be one non-empty graph.";
+        EXPECT_EQ(snapshot->chunk_index, 64);
+        EXPECT_EQ(snapshot->real_token_start, 256 * 1024);
+        EXPECT_EQ(snapshot->real_token_count, 1);
+        EXPECT_EQ(snapshot->real_token_end, kLongContextSeqLen);
+        EXPECT_EQ(snapshot->capture_phase, "replay");
+        EXPECT_EQ(snapshot->recapture_reason, "none");
+
+        const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+        const PerfStatsCollector::Tags terminal_replay_tags = {
+            {"bucket_seq_len", std::to_string(kLargeBucketSeqLen)},
+            {"cache_phase", "ready"},
+            {"capture_phase", "replay"},
+            {"chunk_index", "64"},
+            {"domain_id", "single"},
+            {"participant_id", "0"},
+            {"placement_epoch", "0"},
+            {"real_token_count", "1"},
+            {"real_token_end", std::to_string(kLongContextSeqLen)},
+            {"real_token_start", std::to_string(256 * 1024)},
+            {"recapture_reason", "none"},
+            {"topology_signature", "0"}};
+        EXPECT_DOUBLE_EQ(
+            findPrefillGraphLifecycleCounter(records, terminal_replay_tags),
+            1.0);
+
+        std::array<int32_t, 4> terminal_tokens{};
+        std::array<int32_t, 4> terminal_positions{};
+        std::array<int32_t, 2> terminal_geometry{};
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_tokens.data(),
+            chunk_token_bank->gpu_data_ptr(),
+            terminal_tokens.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_positions.data(),
+            chunk_position_bank->gpu_data_ptr(),
+            terminal_positions.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_geometry.data(),
+            chunk_geometry->gpu_data_ptr(),
+            terminal_geometry.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->synchronizeStream(
+            admission_stream,
+            device_.toKernelDeviceIndex()));
+        EXPECT_EQ(terminal_geometry[0], 1);
+        EXPECT_EQ(terminal_geometry[1], kLargeBucketSeqLen);
+        EXPECT_EQ(terminal_tokens[0], request_tokens.back());
+        EXPECT_EQ(terminal_tokens[1], kPadTokenId);
+        EXPECT_EQ(terminal_tokens[2], kPadTokenId);
+        EXPECT_EQ(terminal_tokens[3], kPadTokenId);
+        EXPECT_EQ(terminal_positions[0], kLongContextSeqLen - 1);
+        EXPECT_EQ(terminal_positions[1], kLongContextSeqLen);
+        EXPECT_EQ(terminal_positions[2], kLongContextSeqLen + 1);
+        EXPECT_EQ(terminal_positions[3], kLongContextSeqLen + 2);
+
+        engine_->discardAllCachedGraphs();
+        PerfStatsCollector::reset();
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleForcedRebalanceRecapturesNewPlacementEpoch)

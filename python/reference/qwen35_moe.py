@@ -400,13 +400,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             moe_block = sidecar_layer.mlp
 
             def _router(_mod, _inp, out):
+                # Qwen3_5MoeTopKRouter returns softmax probabilities as
+                # out[0], despite naming that value `router_logits` in
+                # Transformers.  Llaminar's MOE_ROUTER_OUTPUT contract is the
+                # actual linear projection before softmax, so reconstruct that
+                # exact semantic boundary from the hook input and gate weight.
+                hidden = _inp[0] if isinstance(_inp, tuple) else _inp
+                raw_router_logits = F.linear(
+                    hidden.reshape(-1, _mod.hidden_dim), _mod.weight
+                )
+                _capture_mtp(
+                    captures, "MTP0_MOE_ROUTER_OUTPUT", raw_router_logits
+                )
                 if isinstance(out, tuple) and len(out) >= 3:
-                    _capture_mtp(captures, "MTP0_MOE_ROUTER_OUTPUT", out[0])
                     _capture_mtp(captures, "MTP0_MOE_ROUTING_WEIGHTS", out[1])
                     _capture_mtp(captures, "MTP0_MOE_ROUTING_INDICES", out[2].float())
-                else:
-                    router_logits = out[0] if isinstance(out, tuple) else out
-                    _capture_mtp(captures, "MTP0_MOE_ROUTER_OUTPUT", router_logits)
 
             handles.append(moe_block.gate.register_forward_hook(_router))
             handles.append(moe_block.experts.register_forward_hook(
@@ -824,19 +832,28 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
 
             # Router output (gate) + routing indices and weights
             def _router(mod, inp, out, i=idx):
+                # The module's first returned value has already passed through
+                # softmax.  Capture the pre-softmax linear projection so this
+                # snapshot has the same meaning as Llaminar's router-logit
+                # workspace and PipelineStage.MOE_ROUTER_OUTPUT documentation.
+                hidden = inp[0] if isinstance(inp, tuple) else inp
+                raw_router_logits = F.linear(
+                    hidden.reshape(-1, mod.hidden_dim), mod.weight
+                )
+                if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
+                    self.capture_stage(
+                        PipelineStage.MOE_ROUTER_OUTPUT,
+                        raw_router_logits,
+                        i,
+                    )
                 if isinstance(out, tuple) and len(out) >= 3:
-                    # gate returns (router_logits, routing_weights, selected_experts)
-                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
-                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, out[0], i)
+                    # gate returns (softmax probabilities, normalized top-k
+                    # weights, selected experts).
                     if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
                         self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
                     if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
                         # selected_experts is int64 — store as float for snapshot compat
                         self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
-                else:
-                    router_logits = out[0] if isinstance(out, tuple) else out
-                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
-                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, router_logits, i)
             self._hook_handles.append(
                 moe_block.gate.register_forward_hook(_router)
             )

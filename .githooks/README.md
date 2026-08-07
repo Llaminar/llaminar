@@ -13,15 +13,16 @@ Feature branches run this 7-step suite:
 
 1. **Integration build** - Configures and builds `build_v2_integration` with CUDA and ROCm enabled.
 2. **Unit tests** - Runs all `^V2_Unit_` tests in parallel.
-3. **Focused integration tests** - Runs `^V2_Integration_GroupedVerifierRows_` to prove grouped verifier rows are bitwise serial-decode equivalent across CPU, CUDA, ROCm, and supported tensor formats/codebooks.
+3. **Focused integration tests** - Proves all-format grouped verifier rows are bitwise serial-decode equivalent, CUDA/ROCm tuning certificates compare complete buffers on explicit streams, 256K-plus-tail prefill is M-total on CPU/CUDA/ROCm, and the Qwen3.6 stochastic MTP depth matrix remains green.
 4. **Focused parity baseline** - Runs the model-family parity baseline through `.githooks/run_parity_baseline.sh`.
 5. **Release build** - Configures and builds `build_v2_release` with CUDA and ROCm enabled for E2E tests.
 6. **E2E server integration tests** - Runs CPU, CUDA, ROCm, long-context, and MoE rebalance probes.
 7. **Performance regression benchmarks** - Runs `.githooks/run_benchmark_check.sh`.
 
 On `develop` and `master`, the hook also runs the broader `^V2_Integration_`
-suite after the focused grouped-verifier gate. The broader sweep excludes
-`Parity`, `RCCL`, and `GroupedVerifierRows` because those have dedicated gates.
+suite after the focused integration gate. The broader sweep excludes `Parity`,
+`RCCL`, `GroupedVerifierRows`, and `LongContextMTotality` because those have
+dedicated gates.
 
 ### Installation
 
@@ -80,6 +81,7 @@ cmake -B build_v2_integration -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration 
 cmake --build build_v2_integration --parallel
 ctest --test-dir build_v2_integration -R "^V2_Unit_" --output-on-failure --parallel
 ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_(PrefillGraphCacheLongContextMTotality_(CUDA|ROCm)|PrefillLongContextMTotality_CPU)$' --output-on-failure --parallel
 .githooks/run_parity_baseline.sh build_v2_integration
 
 cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON
@@ -100,9 +102,10 @@ Use `--no-verify` only for work in progress. PR merges must pass the gates.
 
 ### CI/CD Integration
 
-GitHub Actions runs the same unit and focused grouped-verifier integration
-commands in the builder-image job. Runtime-image jobs then run release-container
-E2E and benchmark gates.
+GitHub Actions runs the same unit, grouped-verifier, full-buffer trainer
+certificate, and long-context prefill M-totality integration commands in the
+builder-image job. Runtime-image jobs
+then run release-container E2E and benchmark gates.
 
 ## Future Hooks
 

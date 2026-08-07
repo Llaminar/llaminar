@@ -43,6 +43,13 @@ from python.reference.generate_qwen35_pipeline_snapshots import (
 )
 
 
+# Increment whenever an existing snapshot key changes semantic meaning.  The
+# C++ integration harness authenticates this marker before reusing expensive
+# 35B sidecar fixtures, preventing an old-but-present NPY file from silently
+# masquerading as the current reference contract.
+MTP_SIDECAR_SNAPSHOT_SCHEMA = 2
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate PyTorch Qwen 3.5 MoE pipeline reference snapshots",
@@ -145,6 +152,9 @@ Examples:
             verbose=args.verbose,
         )
         total += mtp_total
+        (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
+            f"{MTP_SIDECAR_SNAPSHOT_SCHEMA}\n", encoding="ascii"
+        )
         print(f"  Captured {mtp_total} MTP sidecar snapshots")
 
     # Write metadata

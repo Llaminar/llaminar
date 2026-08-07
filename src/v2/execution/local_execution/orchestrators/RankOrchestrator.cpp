@@ -10666,13 +10666,15 @@ namespace llaminar2
     }
 
     bool RankOrchestrator::beginDeviceResidentGeneration(
-        int request_count,
-        int max_new_tokens)
+        const DeviceGenerationAdmissionRequest &request)
     {
-        if (request_count <= 0 || max_new_tokens <= 0)
+        if (!request.valid())
         {
             LOG_ERROR("[RankOrchestrator] Invalid device-resident generation admission: requests="
-                      << request_count << " max_new_tokens=" << max_new_tokens);
+                      << request.request_count << " max_new_tokens="
+                      << request.max_new_tokens << " leading_row_disposition="
+                      << static_cast<int>(
+                             request.initial_leading_row_disposition));
             return false;
         }
         materialized_device_generation_execution_policy_.reset();
@@ -10700,15 +10702,14 @@ namespace llaminar2
             if (!participants[participant] ||
                 !participants[participant]
                      ->beginDeviceResidentGeneration(
-                         request_count,
-                         max_new_tokens))
+                         request))
             {
                 LOG_ERROR("[RankOrchestrator] Device-resident generation admission failed on participant "
                           << participant);
                 return false;
             }
         }
-        admitted_device_generation_max_new_tokens_ = max_new_tokens;
+        admitted_device_generation_max_new_tokens_ = request.max_new_tokens;
         return true;
     }
 

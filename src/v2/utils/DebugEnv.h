@@ -401,13 +401,10 @@ namespace llaminar2
 
         bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
         int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
-        int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
         int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
-        int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
-        int cuda_moe_gateup_kparts = 16;          ///< K partitions for the mandatory decode-equivalent grouped MoE gate/up CUDA path (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, proven default 16)
-        int cuda_moe_down_kparts = 16;            ///< K partitions for the mandatory decode-equivalent grouped MoE SwiGLU down CUDA path (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, proven default 16)
-        int cuda_moe_ordered_kpart_tile_n = 128;  ///< Warp-aligned output columns per ordered split-K CUDA block (LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
-        int cuda_moe_down_direct_warps = 9;       ///< Warps per block for scratch-free ordered grouped-down publication (LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS, valid 8..16, proven top-9 default 9; capture-time geometry)
+        int cuda_moe_gateup_ordered_kpart_tile_n = 128; ///< Warp-aligned output columns per ordered split-K CUDA gate/up producer block (LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
+        bool cuda_moe_gateup_ordered_kpart_tile_n_override_active = false; ///< True only when an explicit environment or trainer override must supersede generated capture-time dispatch.
+        int cuda_moe_down_ordered_kpart_tile_n = 128;   ///< Warp-aligned output columns per ordered split-K CUDA down producer block used for canonical route publication (LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -536,72 +533,40 @@ namespace llaminar2
             const char *bk256_env = std::getenv("LLAMINAR_BK256_MODE");
             cuda_bk256_mode = bk256_env ? std::atoi(bk256_env) : 0;
 
-            const char *stream_k_env = std::getenv("LLAMINAR_STREAM_K");
-            cuda_stream_k_mode = stream_k_env ? std::atoi(stream_k_env) : 0;
-
             const char *force_tile_env = std::getenv("LLAMINAR_FORCE_PREFILL_TILE");
             cuda_force_prefill_tile = force_tile_env ? std::atoi(force_tile_env) : -1;
 
-            const char *force_split_k_env = std::getenv("LLAMINAR_FORCE_PREFILL_SPLIT_K");
-            cuda_force_prefill_split_k = force_split_k_env ? std::atoi(force_split_k_env) : 0;
-
-            // CUDA grouped MoE gate/up split-K partition count. The ordered
-            // K-part path is mandatory because verifier batches must execute
-            // the same reduction tree as serial decode. The production-model
-            // stochastic A/B gate is part of this proof: changing partition
-            // geometry must not change even one generated token. Keep the
-            // proven geometry until a candidate passes that gate in addition
-            // to the all-format grouped-kernel sweep.
-            cuda_moe_gateup_kparts = 16;
-            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPARTS");
-            if (moe_gateup_kparts_env)
+            // Gate/up and canonical down publication are independent kernels.
+            // Their block widths affect occupancy but not arithmetic, so keep
+            // the two launch-policy axes explicit instead of forcing both
+            // projections through one historical shared knob. Both values are
+            // capture-time geometry and therefore remain whole-warp widths in
+            // the practical Ampere occupancy range.
+            cuda_moe_gateup_ordered_kpart_tile_n = 128;
+            cuda_moe_gateup_ordered_kpart_tile_n_override_active = false;
+            const char *moe_gateup_ordered_tile_n_env =
+                std::getenv("LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N");
+            if (moe_gateup_ordered_tile_n_env)
             {
-                const int requested = std::atoi(moe_gateup_kparts_env);
-                // gate/up GEMV has K=2048 (64 K-blocks); allow up to 32 partitions
-                // to raise block/wave occupancy on the under-utilized decode grid.
-                if (requested == 2 || requested == 4 || requested == 8 ||
-                    requested == 16 || requested == 32)
-                    cuda_moe_gateup_kparts = requested;
-            }
-            // CUDA grouped MoE SwiGLU down split-K partition count. The
-            // ordered reduction is deterministic and remains enabled in
-            // LLAMINAR_DETERMINISTIC mode. As with gate/up, partition-count
-            // promotion requires byte equality at production model geometry;
-            // relaxed kernel similarity is not a sufficient MTP contract.
-            cuda_moe_down_kparts = 16;
-            const char *moe_down_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPARTS");
-            if (moe_down_kparts_env)
-            {
-                const int requested = std::atoi(moe_down_kparts_env);
-                // down GEMV has K=512 (16 K-blocks); allow up to 16 partitions.
-                if (requested == 2 || requested == 4 || requested == 8 ||
-                    requested == 16)
-                    cuda_moe_down_kparts = requested;
-            }
-            // The ordered split-K scatter owns one output column per thread,
-            // so changing block width does not alter arithmetic. Restrict the
-            // capture-time geometry to whole warps and a practical Ampere
-            // occupancy range; 128 is the production-model-proven default.
-            cuda_moe_ordered_kpart_tile_n = 128;
-            const char *moe_ordered_tile_n_env =
-                std::getenv("LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N");
-            if (moe_ordered_tile_n_env)
-            {
-                const int requested = std::atoi(moe_ordered_tile_n_env);
+                const int requested = std::atoi(moe_gateup_ordered_tile_n_env);
                 if (requested >= 64 && requested <= 256 &&
                     (requested % 32) == 0)
                 {
-                    cuda_moe_ordered_kpart_tile_n = requested;
+                    cuda_moe_gateup_ordered_kpart_tile_n = requested;
+                    cuda_moe_gateup_ordered_kpart_tile_n_override_active = true;
                 }
             }
-            cuda_moe_down_direct_warps = 9;
-            const char *moe_down_direct_warps_env =
-                std::getenv("LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS");
-            if (moe_down_direct_warps_env)
+            cuda_moe_down_ordered_kpart_tile_n = 128;
+            const char *moe_down_ordered_tile_n_env =
+                std::getenv("LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N");
+            if (moe_down_ordered_tile_n_env)
             {
-                const int requested = std::atoi(moe_down_direct_warps_env);
-                if (requested >= 8 && requested <= 16)
-                    cuda_moe_down_direct_warps = requested;
+                const int requested = std::atoi(moe_down_ordered_tile_n_env);
+                if (requested >= 64 && requested <= 256 &&
+                    (requested % 32) == 0)
+                {
+                    cuda_moe_down_ordered_kpart_tile_n = requested;
+                }
             }
             // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
             // It reduces router GEMV traffic and lets the grouped gate/up decode
@@ -2723,13 +2688,10 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
+     * - `LLAMINAR_ROCM_NVNNI_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeVNNI GEMM specialization
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
-     * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
-     * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
-     * - `LLAMINAR_ROCM_MOE_GATEUP_KPARTS=<2|4|8|16>` - K partitions for grouped MoE gate/up decode projection (default: 4)
-     * - `LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED=0` - Disable grouped gate/up K-part reduction fused directly into SwiGLU Q8 quantization (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
@@ -2791,9 +2753,9 @@ namespace llaminar2
         int nvnni_min_blocks = -1;                 ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
         bool nvnni_force_n64 = false;              ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
         bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
+        int nvnni_full_tiles = -1;                 ///< Native-VNNI edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NVNNI_FULL_TILES)
         int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
         int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
-        bool nvnni_atomic_reduce = false;          ///< Fuse GEMV reduce via atomicAdd (eliminates reduce kernel) (LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE)
         bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
@@ -2812,14 +2774,10 @@ namespace llaminar2
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
         bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
         bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
-        int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row tile override (-1=generated policy; 4/8/12/16 valid)
+        int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
         int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)
-        int moe_prefill_down_tile_m = -1;          ///< Grouped prefill down expert-row tile override (-1=generated policy; 4/8/12/16 valid)
+        int moe_prefill_down_tile_m = -1;          ///< Grouped prefill down expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
         int moe_prefill_down_tile_n = -1;          ///< Grouped prefill down output-column tile override (-1=generated policy; 64/128/256 valid)
-        bool moe_parallel_down_decode = true;      ///< Enable parallel-expert grouped MoE decode down projection (LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        bool moe_gateup_kpart_decode = true;       ///< Enable K-partitioned grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int moe_gateup_kparts = 4;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
-        bool moe_gateup_swiglu_quant_fused = true; ///< Fuse K-part gate/up reduce into grouped SwiGLU Q8 quantization (LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
         int topk_smallk_partial_blocks = 0;        ///< Override small-k top-k partial block cap (LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS, valid 0|16|32|64|128; 0=auto)
 
@@ -2877,9 +2835,9 @@ namespace llaminar2
             nvnni_min_blocks = -1;
             nvnni_force_n64 = false;
             nvnni_force_n128 = false;
+            nvnni_full_tiles = -1;
             nvnni_gemv_kb = -1;
             nvnni_gemv_target_waves = -1;
-            nvnni_atomic_reduce = false;
             nvnni_disable_generated = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
@@ -2902,10 +2860,6 @@ namespace llaminar2
             moe_prefill_gateup_tile_n = -1;
             moe_prefill_down_tile_m = -1;
             moe_prefill_down_tile_n = -1;
-            moe_parallel_down_decode = true;
-            moe_gateup_kpart_decode = true;
-            moe_gateup_kparts = 4;
-            moe_gateup_swiglu_quant_fused = true;
             moe_device_routed_decode = true;
             topk_smallk_partial_blocks = 0;
             repack_slots = 3;
@@ -3162,6 +3116,12 @@ namespace llaminar2
                 nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
             }
 
+            const char *nvnni_full_tiles_env = std::getenv("LLAMINAR_ROCM_NVNNI_FULL_TILES");
+            if (nvnni_full_tiles_env)
+            {
+                nvnni_full_tiles = std::clamp(std::atoi(nvnni_full_tiles_env), -1, 1);
+            }
+
             const char *nvnni_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_KB");
             if (nvnni_gemv_kb_env)
             {
@@ -3172,12 +3132,6 @@ namespace llaminar2
             if (nvnni_gemv_target_waves_env)
             {
                 nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
-            }
-
-            const char *nvnni_atomic_reduce_env = std::getenv("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE");
-            if (nvnni_atomic_reduce_env)
-            {
-                nvnni_atomic_reduce = (std::atoi(nvnni_atomic_reduce_env) != 0);
             }
 
             const char *nvnni_disable_generated_env = std::getenv("LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED");
@@ -3306,35 +3260,9 @@ namespace llaminar2
             moe_prefill_down_tile_n = read_moe_prefill_tile(
                 "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N", -1);
 
-            const char *moe_parallel_down_decode_env = std::getenv("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE");
-            if (moe_parallel_down_decode_env)
-            {
-                moe_parallel_down_decode = (std::atoi(moe_parallel_down_decode_env) != 0);
-            }
-
-            const char *moe_gateup_kpart_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE");
-            if (moe_gateup_kpart_decode_env)
-            {
-                moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_decode_env) != 0);
-            }
-            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPARTS");
-            if (moe_gateup_kparts_env)
-            {
-                const int requested = std::atoi(moe_gateup_kparts_env);
-                if (requested == 2 || requested == 4 || requested == 8 || requested == 16)
-                {
-                    moe_gateup_kparts = requested;
-                }
-            }
-            const char *moe_gateup_swiglu_quant_fused_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED");
-            if (moe_gateup_swiglu_quant_fused_env)
-            {
-                moe_gateup_swiglu_quant_fused = (std::atoi(moe_gateup_swiglu_quant_fused_env) != 0);
-            }
             const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
             if (deterministic_env && std::atoi(deterministic_env) != 0)
             {
-                nvnni_atomic_reduce = false;
                 concurrent_prefill = false;
                 concurrent_decode = false;
                 gdn_concurrent_decode = false;
@@ -3344,9 +3272,6 @@ namespace llaminar2
                 moe_router_wave_topk = false;
                 moe_grouped_decode_router = false;
                 moe_reuse_router_q8_hidden = false;
-                moe_parallel_down_decode = false;
-                moe_gateup_kpart_decode = false;
-                moe_gateup_swiglu_quant_fused = false;
             }
 
             const char *moe_device_routed_decode_env = std::getenv("LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE");

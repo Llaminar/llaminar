@@ -22,6 +22,7 @@
 
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
+#include "execution/mtp/MTPVerifierPolicy.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -267,9 +268,16 @@ namespace
 
         const int expected_routed_top_k = 8;
         const int expected_routed_experts = 256;
+        const int expected_physical_seq_len =
+            mtpVerifierPhysicalRowBucket(
+                expected_seq_len,
+                sampling_math::kSpeculativeBatchMaxOutputTokens);
+        ASSERT_GE(expected_physical_seq_len, expected_seq_len)
+            << "ROCm verifier test requested an invalid logical row count";
         const int expected_total_slots =
-            expected_seq_len * expected_routed_top_k;
-        const std::string seq_len_tag = std::to_string(expected_seq_len);
+            expected_physical_seq_len * expected_routed_top_k;
+        const std::string seq_len_tag =
+            std::to_string(expected_physical_seq_len);
         const std::string total_slots_tag =
             std::to_string(expected_total_slots);
 
@@ -331,8 +339,10 @@ namespace
             });
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm MoE grouped verifier did not exercise the batch-invariant "
-               "direct verifier path for M="
-            << expected_seq_len << ".\n"
+               "direct verifier path for logical M="
+            << expected_seq_len
+            << " in canonical physical bucket M="
+            << expected_physical_seq_len << ".\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
         const auto router_q8_reuse = std::find_if(
@@ -346,12 +356,14 @@ namespace
                        tag_equals(record, "top_k", "8") &&
                        tag_equals(record,
                                   "descriptor_source",
-                                  "static_table");
+                                  "runtime_table");
             });
         ASSERT_NE(router_q8_reuse, records.end())
             << "ROCm MoE grouped verifier did not reuse the router-owned Q8 "
-               "hidden rows for M="
-            << expected_seq_len << ".\n"
+               "hidden rows for logical M="
+            << expected_seq_len
+            << " in canonical physical bucket M="
+            << expected_physical_seq_len << ".\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
         const auto shared_grouped_table_prefill = std::find_if(
@@ -545,6 +557,68 @@ namespace
             /*serial_setup_token_count=*/0);
         PerfStatsCollector::reset();
     }
+
+    /**
+     * @brief Prove resident-mailbox and direct-device sidecar inputs are exact.
+     *
+     * The token path reproduces an accepted-prefix transaction followed by a
+     * stochastic rejection.  The shared parity helper first proves the grouped
+     * target rows and accepted-state publication against an independent serial
+     * runner.  It then compares every materialized operation in the real
+     * resident sidecar with a direct device-target sidecar restored from the
+     * exact same device checkpoint.  This removes PyTorch quantization near ties
+     * from the oracle while retaining the production graph, kernels, and
+     * resident event handoff.
+     */
+    void runMoEResidentSidecarInputEquivalenceCase(VerifierBackend backend)
+    {
+        ScopedEnvironmentValues sidecar_diagnostics({
+            {"LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        const std::vector<int32_t> serial_token_path{
+            1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+            18255, 279,  12515, 303,   34904, 314,   18016, 321,
+            17676, 11,   321,   279,   5820,  310,   7534,  836,
+            21030, 43776, 279,   3594,  557,   40473, 321,   7478,
+        };
+        /*
+         * The exact-GDN correction converged CUDA and ROCm on the same serial
+         * stochastic outcome for this authenticated trajectory.  Keep the
+         * value explicit so either backend changing its serial math still
+         * fails independently before the resident/direct sidecar comparison.
+         */
+        constexpr int32_t serial_rejection_token = 248046;
+
+        PerfStatsCollector::reset();
+        runMoEMainVerifierGroupedRowsMatchSerialDecode(
+            moeBenchmarkPromptCase(backend),
+            /*verifier_row_count=*/6,
+            /*serial_setup_token_count=*/12,
+            /*exercise_shifted_row_maintenance=*/true,
+            /*configured_draft_tokens=*/15,
+            /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+            serial_token_path,
+            /*exercise_device_rebalance_maintenance=*/false,
+            /*accepted_grouped_rows_before_verifier=*/2,
+            /*grouped_publication_tokens=*/{
+                34904,
+                314,
+                17676,
+                321,
+                18016,
+                11,
+            },
+            /*stochastic_summary_params=*/
+                qwen36MoEProductionStochasticSamplingParams(),
+            /*expected_stochastic_rejection_token=*/serial_rejection_token,
+            /*stochastic_first_token_is_pending=*/true,
+            /*expected_stochastic_accepted_prefix=*/2,
+            /*verify_resident_sidecar_input_equivalence=*/true);
+        PerfStatsCollector::reset();
+    }
 } // namespace
 
 #define LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS(BACKEND_LABEL, BACKEND_ENUM) \
@@ -613,6 +687,20 @@ TEST(
     MoEROCm_M2_FirstProductionPublicationAfterBenchmarkPrompt)
 {
     runMoEFirstProductionPublicationCase(VerifierBackend::ROCm);
+}
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoECUDA_M6_ResidentSidecarMatchesDirectDeviceTarget)
+{
+    runMoEResidentSidecarInputEquivalenceCase(VerifierBackend::CUDA);
+}
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoEROCm_M6_ResidentSidecarMatchesDirectDeviceTarget)
+{
+    runMoEResidentSidecarInputEquivalenceCase(VerifierBackend::ROCm);
 }
 
 int main(int argc, char **argv)

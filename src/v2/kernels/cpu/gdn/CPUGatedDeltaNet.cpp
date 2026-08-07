@@ -37,93 +37,6 @@
 #include <immintrin.h>
 #endif
 
-#if defined(__AVX512F__)
-// =========================================================================
-// Fast AVX-512 exp/sigmoid approximations
-//
-// exp(x) via range reduction: exp(x) = 2^n · P(f)
-//   n = round(x · log2(e)),  f = x·log2(e) - n ∈ [-0.5, 0.5]
-//   P(f) = degree-5 Horner polynomial for 2^f
-//   2^n via IEEE-754 exponent bit-shift (scalef)
-//
-// Same polynomial used in CPUShortConvolution and GatedRMSNormStage.
-// =========================================================================
-
-static inline __m512 avx512_fast_exp(__m512 vx)
-{
-    const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
-    const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
-    const __m512 vc0 = _mm512_set1_ps(1.0f);
-    const __m512 vc1 = _mm512_set1_ps(0.693147180559945f);
-    const __m512 vc2 = _mm512_set1_ps(0.240226506959101f);
-    const __m512 vc3 = _mm512_set1_ps(0.055504108664822f);
-    const __m512 vc4 = _mm512_set1_ps(0.009618129107629f);
-    const __m512 vc5 = _mm512_set1_ps(0.001333355814642f);
-
-    __m512 vt = _mm512_mul_ps(vx, vlog2e);
-    __m512 vn = _mm512_roundscale_ps(vt, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m512 vf = _mm512_sub_ps(vt, vn);
-
-    __m512 vpoly = _mm512_fmadd_ps(vc5, vf, vc4);
-    vpoly = _mm512_fmadd_ps(vpoly, vf, vc3);
-    vpoly = _mm512_fmadd_ps(vpoly, vf, vc2);
-    vpoly = _mm512_fmadd_ps(vpoly, vf, vc1);
-    vpoly = _mm512_fmadd_ps(vpoly, vf, vc0);
-
-    return _mm512_scalef_ps(vpoly, vn);
-}
-
-static inline __m512 avx512_fast_sigmoid(__m512 vx)
-{
-    __m512 vneg = _mm512_sub_ps(_mm512_setzero_ps(), vx);
-    __m512 vexp_neg = avx512_fast_exp(vneg);
-    __m512 vone = _mm512_set1_ps(1.0f);
-    return _mm512_div_ps(vone, _mm512_add_ps(vone, vexp_neg));
-}
-#endif
-
-#if defined(__AVX2__)
-// =========================================================================
-// Fast AVX2 exp/sigmoid approximations (8-wide YMM)
-// Same polynomial as AVX-512 version but processes 8 floats instead of 16.
-// =========================================================================
-
-static inline __m256 avx2_fast_exp(__m256 vx)
-{
-    const __m256 vlog2e = _mm256_set1_ps(1.4426950408889634f);
-    const __m256 vc0 = _mm256_set1_ps(1.0f);
-    const __m256 vc1 = _mm256_set1_ps(0.693147180559945f);
-    const __m256 vc2 = _mm256_set1_ps(0.240226506959101f);
-    const __m256 vc3 = _mm256_set1_ps(0.055504108664822f);
-    const __m256 vc4 = _mm256_set1_ps(0.009618129107629f);
-    const __m256 vc5 = _mm256_set1_ps(0.001333355814642f);
-
-    __m256 vt = _mm256_mul_ps(vx, vlog2e);
-    __m256 vn = _mm256_round_ps(vt, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m256 vf = _mm256_sub_ps(vt, vn);
-
-    __m256 vpoly = _mm256_fmadd_ps(vc5, vf, vc4);
-    vpoly = _mm256_fmadd_ps(vpoly, vf, vc3);
-    vpoly = _mm256_fmadd_ps(vpoly, vf, vc2);
-    vpoly = _mm256_fmadd_ps(vpoly, vf, vc1);
-    vpoly = _mm256_fmadd_ps(vpoly, vf, vc0);
-
-    // Reconstruct 2^n via IEEE754 exponent field
-    __m256i vi_n = _mm256_cvtps_epi32(vn);
-    vi_n = _mm256_add_epi32(vi_n, _mm256_set1_epi32(127));
-    __m256 v2n = _mm256_castsi256_ps(_mm256_slli_epi32(vi_n, 23));
-    return _mm256_mul_ps(vpoly, v2n);
-}
-
-static inline __m256 avx2_fast_sigmoid(__m256 vx)
-{
-    __m256 vneg = _mm256_sub_ps(_mm256_setzero_ps(), vx);
-    __m256 vexp_neg = avx2_fast_exp(vneg);
-    __m256 vone = _mm256_set1_ps(1.0f);
-    return _mm256_div_ps(vone, _mm256_add_ps(vone, vexp_neg));
-}
-#endif
-
 #include <vector>
 
 #include "../simd/AVX2Helpers.h"
@@ -859,90 +772,6 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Named ISA implementations: batch exp + sigmoid
-    // =========================================================================
-
-    static void gdn_batch_exp_sigmoid_scalar(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        for (int hh = 0; hh < n_heads; ++hh)
-        {
-            gate[base + hh] = std::exp(gate[base + hh]);
-            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
-        }
-    }
-
-#if defined(__AVX2__)
-    static void gdn_batch_exp_sigmoid_avx2(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        int hh = 0;
-        const int hh_vec = n_heads & ~7;
-        for (; hh < hh_vec; hh += 8)
-        {
-            __m256 vg = _mm256_loadu_ps(gate + base + hh);
-            _mm256_storeu_ps(gate + base + hh, avx2::fast_exp(vg));
-            __m256 vb = _mm256_loadu_ps(beta_raw + base + hh);
-            _mm256_storeu_ps(beta_sig + base + hh, avx2::fast_sigmoid(vb));
-        }
-        for (; hh < n_heads; ++hh)
-        {
-            gate[base + hh] = std::exp(gate[base + hh]);
-            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
-        }
-    }
-#endif
-
-#if defined(__AVX512F__)
-    static void gdn_batch_exp_sigmoid_avx512(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        int hh = 0;
-        const int hh_vec = n_heads & ~15;
-        for (; hh < hh_vec; hh += 16)
-        {
-            __m512 vg = _mm512_loadu_ps(gate + base + hh);
-            _mm512_storeu_ps(gate + base + hh, avx512_fast_exp(vg));
-            __m512 vb = _mm512_loadu_ps(beta_raw + base + hh);
-            _mm512_storeu_ps(beta_sig + base + hh, avx512_fast_sigmoid(vb));
-        }
-        for (; hh < n_heads; ++hh)
-        {
-            gate[base + hh] = std::exp(gate[base + hh]);
-            beta_sig[base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[base + hh]));
-        }
-    }
-#endif
-
-// Stubs for when ISA is unavailable at compile time
-#if !defined(__AVX2__)
-    static void gdn_batch_exp_sigmoid_avx2(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        gdn_batch_exp_sigmoid_scalar(gate, beta_raw, beta_sig, base, n_heads);
-    }
-#endif
-#if !defined(__AVX512F__)
-    static void gdn_batch_exp_sigmoid_avx512(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        gdn_batch_exp_sigmoid_avx2(gate, beta_raw, beta_sig, base, n_heads);
-    }
-#endif
-
-    static inline void gdn_batch_exp_sigmoid(
-        float *gate, const float *beta_raw, float *beta_sig,
-        int base, int n_heads)
-    {
-        ISA_DISPATCH_VOID(gdn_batch_exp_sigmoid, gate, beta_raw, beta_sig, base, n_heads);
-    }
-
-    // =========================================================================
     // Recurrent step (decode, seq_len=1)
     // =========================================================================
 
@@ -1644,20 +1473,22 @@ namespace llaminar2
                         gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
                     }
 
-                    // Gates — precompute decay = exp(g) here in the parallel
-                    // phase so Phase 2 avoids 595×16 serial exp() calls.
+                    // Compute the exact decode gate expressions while tokens
+                    // are already distributed across the OpenMP team. The old
+                    // AVX fast-exp batch changed arithmetic between prefill and
+                    // decode; keeping these canonical expressions here both
+                    // preserves parallelism and removes a second head traversal.
                     const int gi = t * n_heads + h;
                     const float x = alpha[gi] + dt_bias[h];
                     const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                    gate_scratch_[gi] = A_log[h] * sp; // store g, NOT exp(g) yet
+                    gate_scratch_[gi] = std::exp(A_log[h] * sp);
+                    beta_sig_scratch_[gi] =
+                        1.0f / (1.0f + std::exp(-beta_raw[gi]));
 
                     // Zero output
                     std::memset(output + out_off, 0, d_v * sizeof(float));
                 }
 
-                // Batch exp(g) and sigmoid across all heads for this token.
-                gdn_batch_exp_sigmoid(gate_scratch_.data(), beta_raw, beta_sig_scratch_.data(),
-                                      t * n_heads, n_heads);
             }
             // implicit barrier between omp-for regions
 

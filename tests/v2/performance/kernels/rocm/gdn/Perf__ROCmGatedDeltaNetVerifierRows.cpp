@@ -311,7 +311,155 @@ namespace
         DeviceFloatBuffer snapshots;
         DeviceIntScalar accepted_row;
     };
+
+    /**
+     * @brief Exact Qwen3.6-35B-A3B prefill recurrence fixture.
+     *
+     * The production model owns 32 value heads with 128 key and value
+     * dimensions and the dashboard prompt contains 425 real rows.  Keeping
+     * this case separate from the verifier fixture avoids allocating a
+     * 425-row state-snapshot matrix: ordinary prefill commits only the live
+     * terminal state and passes no speculative capture rows.
+     */
+    class GdnPrefillBenchmarkFixture
+    {
+    public:
+        static constexpr int kRows = 425;
+        static constexpr int kHeads = 32;
+        static constexpr int kKeyWidth = 128;
+        static constexpr int kValueWidth = 128;
+        static constexpr int kStateFloats =
+            kHeads * kKeyWidth * kValueWidth;
+        static constexpr int kQkRowFloats = kHeads * kKeyWidth;
+        static constexpr int kValueRowFloats = kHeads * kValueWidth;
+
+        GdnPrefillBenchmarkFixture()
+            : q(static_cast<size_t>(kRows) * kQkRowFloats),
+              k(static_cast<size_t>(kRows) * kQkRowFloats),
+              v(static_cast<size_t>(kRows) * kValueRowFloats),
+              alpha(static_cast<size_t>(kRows) * kHeads),
+              beta(static_cast<size_t>(kRows) * kHeads),
+              a_log(kHeads),
+              dt_bias(kHeads),
+              output(static_cast<size_t>(kRows) * kValueRowFloats),
+              state(kStateFloats)
+        {}
+
+        /** @brief Launch the exact production prefill recurrence once. */
+        void launch()
+        {
+            const bool launched = rocmGDN_chunk_forward(
+                q.get(),
+                k.get(),
+                v.get(),
+                alpha.get(),
+                beta.get(),
+                a_log.get(),
+                dt_bias.get(),
+                output.get(),
+                state.get(),
+                state.get(),
+                kRows,
+                kHeads,
+                kKeyWidth,
+                kValueWidth,
+                /*use_qk_l2norm=*/true,
+                /*state_snapshots=*/nullptr,
+                /*snapshot_stride_floats=*/0,
+                /*max_snapshot_rows=*/0,
+                /*device_idx=*/0,
+                timing.stream);
+            if (!launched)
+                throw std::runtime_error("rocmGDN_chunk_forward prefill launch failed");
+        }
+
+        /** @brief Measure repeated device execution behind one terminal event. */
+        double timeAverageUs(int warmups, int iterations)
+        {
+            for (int i = 0; i < warmups; ++i)
+                launch();
+            checkHip(
+                hipEventRecord(timing.start, timing.stream),
+                "hipEventRecord(prefill start)");
+            for (int i = 0; i < iterations; ++i)
+                launch();
+            checkHip(
+                hipEventRecord(timing.stop, timing.stream),
+                "hipEventRecord(prefill stop)");
+            checkHip(
+                hipEventSynchronize(timing.stop),
+                "hipEventSynchronize(prefill stop)");
+            float elapsed_ms = 0.0f;
+            checkHip(
+                hipEventElapsedTime(&elapsed_ms, timing.start, timing.stop),
+                "hipEventElapsedTime(prefill)");
+            return static_cast<double>(elapsed_ms) * 1000.0 /
+                   static_cast<double>(iterations);
+        }
+
+        ROCmDeviceSelection device;
+        ROCmTimingContext timing;
+        DeviceFloatBuffer q;
+        DeviceFloatBuffer k;
+        DeviceFloatBuffer v;
+        DeviceFloatBuffer alpha;
+        DeviceFloatBuffer beta;
+        DeviceFloatBuffer a_log;
+        DeviceFloatBuffer dt_bias;
+        DeviceFloatBuffer output;
+        DeviceFloatBuffer state;
+    };
 } // namespace
+
+/** @brief Gate the exact 425-row Qwen3.6 production prefill recurrence. */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, Qwen36ProductionPrefillM425)
+{
+    GdnPrefillBenchmarkFixture fixture;
+    const double average_us = fixture.timeAverageUs(
+        /*warmups=*/10,
+        /*iterations=*/50);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "backend,case,M,heads,d_k,d_v,avg_us\n"
+              << "rocm,gdn_prefill,"
+              << GdnPrefillBenchmarkFixture::kRows << ','
+              << GdnPrefillBenchmarkFixture::kHeads << ','
+              << GdnPrefillBenchmarkFixture::kKeyWidth << ','
+              << GdnPrefillBenchmarkFixture::kValueWidth << ','
+              << average_us << '\n';
+    EXPECT_LT(
+        average_us,
+        positiveEnv("LLAMINAR_ROCM_GDN_PREFILL_M425_MAX_US", 5000.0));
+}
+
+/**
+ * @brief Expose exactly one production Qwen 3.6 M=425 prefill dispatch to rocprof.
+ *
+ * Counter collection must describe one kernel candidate, not a timing loop or
+ * a mixture of warmup and measurement launches. The fixture binds persistent
+ * buffers before this test enters its one-iteration timing boundary, allowing
+ * rocprof to attach occupancy, VALU, LDS, and scratch evidence to precisely the
+ * specialized long-prefill kernel certified by the byte-equivalence suite.
+ */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, ProfilerAttachmentQwen36PrefillM425)
+{
+    GdnPrefillBenchmarkFixture fixture;
+    const double elapsed_us = fixture.timeAverageUs(
+        /*warmups=*/0,
+        /*iterations=*/1);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "backend,case,M,heads,d_k,d_v,profiled_us\n"
+              << "rocm,gdn_prefill_profiler_attachment,"
+              << GdnPrefillBenchmarkFixture::kRows << ','
+              << GdnPrefillBenchmarkFixture::kHeads << ','
+              << GdnPrefillBenchmarkFixture::kKeyWidth << ','
+              << GdnPrefillBenchmarkFixture::kValueWidth << ','
+              << elapsed_us << '\n';
+    // Profiling intentionally perturbs event duration; the repeated case above
+    // owns latency, while this assertion proves the isolated dispatch completed.
+    EXPECT_GT(elapsed_us, 0.0);
+}
 
 /** @brief Gate the production M=1 ROCm recurrent-step latency. */
 TEST(Perf__ROCmGatedDeltaNetVerifierRows, M1Decode)

@@ -46,6 +46,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeVNNIGemmShard.h"
 
 #ifndef LLAMINAR_ROCM_NATIVE_VNNI_SHARD
 #error "ROCmNativeVNNIGemmShardImpl.hip.inc requires a physical shard index"
@@ -151,7 +152,7 @@ struct NVNNIGemmTraits {
     // performance depends critically on decode complexity (3B_LM_Head M=128):
     //
     //   Pattern S (simple decode):    streaming wins (Q4_0 0.82x vs coop 0.74x)
-    //   Pattern D (dual-scale):       streaming wins (Q3_K 0.54x vs coop 0.44x)
+    //   Pattern D (dual-scale):       streaming can win for lookup-heavy formats
     //   Pattern A (asymmetric):       coop wins     (Q4_1 0.61x vs streaming 0.49x)
     //   Pattern DA (dual-scale+asym): coop wins 2×  (Q2_K 0.34x vs streaming 0.15x)
     //
@@ -159,6 +160,9 @@ struct NVNNIGemmTraits {
     // causes register spilling.  Cooperative shares A-data through LDS,
     // reducing per-thread register pressure by ~20-30%.
     //
+    // Q6_K is deliberately redirected to the cooperative family for wide
+    // production-prefill geometries below: current gfx906 measurements across
+    // M=32..1024 show 11-17% lower latency than this older streaming policy.
     // IQ1_M's four activation-group sums are computed cooperatively once per
     // row/block and consumed from LDS by all output-column owners. This makes
     // the streaming family both exact and economical for IQ1_M.
@@ -1093,7 +1097,13 @@ __device__ __forceinline__ void load_serial_m1_partition_sum(
     }
 }
 
-template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int MIN_BLOCKS = 2, int UNROLL_G = 4>
+template <int N_TILE,
+          int BPT,
+          int M_TILE,
+          NativeVNNIGemmFormat FMT,
+          int MIN_BLOCKS = 2,
+          int UNROLL_G = 4,
+          bool FULL_TILES = false>
 __global__ __launch_bounds__(256, MIN_BLOCKS)
 void native_vnni_gemm_kernel(
     const int8_t*    __restrict__ d_A_int8,       // [M × K] INT8 activations, row-major
@@ -1168,18 +1178,6 @@ void native_vnni_gemm_kernel(
             ordered_partition_sum[mm][nn] = 0.0f;
         }
 
-    // Pre-load per-row activation scales (one per M-row this thread owns)
-    // When blockwise scales are active, per-block scales are applied inside
-    // accumulate_block_gemm and the epilogue scale is 1.0f.
-    float scale_a[M_PER_THREAD];
-    #pragma unroll
-    for (int mm = 0; mm < M_PER_THREAD; ++mm)
-    {
-        const int gm = m_block + m_base + mm;
-        scale_a[mm] = d_scales_A_blockwise ? 1.0f
-                     : ((gm < M) ? d_scales_A[gm] : 0.0f);
-    }
-
     // K dimensions
     const int blocks_per_row = K / 32;
     const int total_k_groups = K / 4;
@@ -1205,9 +1203,16 @@ void native_vnni_gemm_kernel(
     const bool a_m_safe = (m_block + M_TILE <= M);
     const bool b_n_safe = (n_block + N_TILE <= N);
     const int  safe_k   = blocks_per_row / BPT;  // tiles with full K coverage
-    const int  num_safe = (a_m_safe && b_n_safe)
-                        ? (safe_k < num_block_tiles ? safe_k : num_block_tiles)
-                        : 0;
+    // FULL_TILES is selected only by a launch-site divisibility proof. Keeping
+    // that fact in the kernel type lets LLVM erase the checked-load loop and
+    // scalar output tail completely. Those paths otherwise retain thread and
+    // pointer geometry across the whole K loop, which creates scratch traffic
+    // even though production transformer dimensions never take either edge.
+    const int num_safe = FULL_TILES
+        ? num_block_tiles
+        : ((a_m_safe && b_n_safe)
+               ? (safe_k < num_block_tiles ? safe_k : num_block_tiles)
+               : 0);
 
     // Reinterpret A as int32_t* for vectorized loads (4 packed INT8 per int32)
     const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
@@ -1260,7 +1265,7 @@ void native_vnni_gemm_kernel(
     // PRELOAD: Load first tile (tile 0) into buf[0]
     // =========================================================================
     {
-        const bool tile0_safe = (num_safe > 0);
+        const bool tile0_safe = FULL_TILES || (num_safe > 0);
 
         // A loads
         #pragma unroll
@@ -1438,7 +1443,10 @@ void native_vnni_gemm_kernel(
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm) {
                     const int gm = m_block + m_base + mm;
-                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                    sa_blk[mm] = (FULL_TILES || gm < M)
+                        ? d_scales_A_blockwise[
+                              static_cast<int64_t>(gm) * blocks_per_row + gblk]
+                        : 0.0f;
                 }
             } else {
                 #pragma unroll
@@ -1601,7 +1609,10 @@ void native_vnni_gemm_kernel(
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm) {
                     const int gm = m_block + m_base + mm;
-                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                    sa_blk[mm] = (FULL_TILES || gm < M)
+                        ? d_scales_A_blockwise[
+                              static_cast<int64_t>(gm) * blocks_per_row + gblk]
+                        : 0.0f;
                 }
             } else {
                 #pragma unroll
@@ -1697,7 +1708,10 @@ void native_vnni_gemm_kernel(
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm) {
                     const int gm = m_block + m_base + mm;
-                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                    sa_blk[mm] = (FULL_TILES || gm < M)
+                        ? d_scales_A_blockwise[
+                              static_cast<int64_t>(gm) * blocks_per_row + gblk]
+                        : 0.0f;
                 }
             } else {
                 #pragma unroll
@@ -1745,14 +1759,22 @@ void native_vnni_gemm_kernel(
     for (int mm = 0; mm < M_PER_THREAD; ++mm)
     {
         const int m_idx = m_block + m_base + mm;
-        if (m_idx >= M) continue;
+        if constexpr (!FULL_TILES)
+        {
+            if (m_idx >= M)
+                continue;
+        }
 
-        const float sa = scale_a[mm];
+        // Keep row scales out of the K-loop live range. The former prologue
+        // array survived until this epilogue and forced three values into
+        // scratch in the production Q6_K N128/M32 binary. Blockwise-scaled
+        // rows already consumed their scale inside each ordered K block.
+        const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[m_idx];
 
         if constexpr (N_PER_THREAD >= 4)
         {
             // Vectorized store path
-            if (n_base + N_PER_THREAD - 1 < N)
+            if constexpr (FULL_TILES)
             {
                 const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
                 #pragma unroll
@@ -1768,13 +1790,33 @@ void native_vnni_gemm_kernel(
             }
             else
             {
-                // Scalar fallback for boundary columns
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                if (n_base + N_PER_THREAD - 1 < N)
                 {
-                    const int n_idx = n_base + nn;
-                    if (n_idx < N)
-                        d_output[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn] * sa;
+                    const int64_t row_off =
+                        static_cast<int64_t>(m_idx) * N + n_base;
+                    #pragma unroll
+                    for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                    {
+                        float4 out;
+                        out.x = acc[mm][chunk + 0] * sa;
+                        out.y = acc[mm][chunk + 1] * sa;
+                        out.z = acc[mm][chunk + 2] * sa;
+                        out.w = acc[mm][chunk + 3] * sa;
+                        *reinterpret_cast<float4*>(d_output + row_off + chunk) = out;
+                    }
+                }
+                else
+                {
+                    // Scalar publication is reserved for a genuine N edge.
+                    #pragma unroll
+                    for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    {
+                        const int n_idx = n_base + nn;
+                        if (n_idx < N)
+                            d_output[
+                                static_cast<int64_t>(m_idx) * N + n_idx] =
+                                acc[mm][nn] * sa;
+                    }
                 }
             }
         }
@@ -2489,8 +2531,19 @@ static bool launch_native_vnni_gemm(
                                int n_tile,
                                int m_tile,
                                int min_blocks,
-                               int unroll) -> bool
+                               int unroll,
+                               bool full_tiles,
+                               const void* function) -> bool
     {
+        rocmNativeVNNIPrefill_recordLastLaunchSelection(
+            static_cast<uint8_t>(FMT),
+            n_tile,
+            m_tile,
+            min_blocks,
+            unroll,
+            full_tiles,
+            function,
+            BLOCK_SIZE);
         if (stream_capture_active)
             return true;
         return report_launch_status(
@@ -2507,17 +2560,25 @@ static bool launch_native_vnni_gemm(
     {
         constexpr int NT = decltype(n_tile_tag)::value;
         constexpr int MT = decltype(m_tile_tag)::value;
+        constexpr bool Q6_CHECKED_MB2_SPILLS =
+            FMT == NVNNI_GEMM_Q6_K &&
+            ((NT == 64 && MT == 64) || (NT == 128 && MT == 32));
+        constexpr int MB = Q6_CHECKED_MB2_SPILLS ? 1 : 2;
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
+        const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false>));
 
         clear_launch_error();
-        native_vnni_gemm_kernel<NT, BPT, MT, FMT>
+        native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                 serial_m1_kblocks);
 
-        return complete_launch("default", NT, MT, 2, 4);
+        return complete_launch(
+            Q6_CHECKED_MB2_SPILLS ? "q6_checked_mb1" : "default",
+            NT, MT, MB, 4, /*full_tiles=*/false, function);
     };
 
     // 3-wave variant: MIN_BLOCKS=3 tells compiler to target ≤84 VGPRs
@@ -2527,6 +2588,8 @@ static bool launch_native_vnni_gemm(
         constexpr int MT = decltype(m_tile_tag)::value;
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
+        const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>));
 
         clear_launch_error();
         native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
@@ -2535,7 +2598,8 @@ static bool launch_native_vnni_gemm(
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                 serial_m1_kblocks);
 
-        return complete_launch("three_wave", NT, MT, 3, 4);
+        return complete_launch(
+            "three_wave", NT, MT, 3, 4, /*full_tiles=*/false, function);
     };
 
     // Streaming LM_Head variant: zero barriers, zero LDS, 3-wave occupancy
@@ -2557,6 +2621,8 @@ static bool launch_native_vnni_gemm(
                     ? (MT * bpr * 4 * sizeof(int32_t))
                 : 0;
         const size_t shared_bytes = sum_a_bytes;
+        const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+            streaming_lm_head_kernel<MT, FMT>));
 
         clear_launch_error();
         streaming_lm_head_kernel<MT, FMT>
@@ -2565,68 +2631,153 @@ static bool launch_native_vnni_gemm(
                 d_output, d_scales_A, d_scales_A_blockwise, M, N, K,
                 serial_m1_kblocks);
 
-        return complete_launch("streaming_lm_head", N_PER_WG, MT, 3, 0);
+        return complete_launch(
+            "streaming_lm_head",
+            N_PER_WG,
+            MT,
+            3,
+            0,
+            /*full_tiles=*/false,
+            function);
     };
 
-    auto launch_config = [&](int n_tile, int m_tile_cfg, int min_blocks, int unroll) -> bool
+    auto launch_exact_config = [&](auto n_tile_tag,
+                                   auto m_tile_tag,
+                                   auto min_blocks_tag,
+                                   auto unroll_tag,
+                                   auto full_tiles_tag) -> bool
     {
-        if (min_blocks != 1 && min_blocks != 2)
-            return false;
-
-#define NVNNI_CONFIG_LAUNCH(NT, MT, MB, UG) \
-        { \
-            dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
-            dim3 block(BLOCK_SIZE, 1, 1); \
-            clear_launch_error(); \
-            native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
-                <<<grid, block, 0, hip_stream>>>( \
-                    d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
-                    d_output, d_scales_A, M, N, K, d_scales_A_blockwise, \
-                    serial_m1_kblocks); \
-            return complete_launch("configured", NT, MT, MB, UG); \
-        }
-
-#define NVNNI_CONFIG_LAUNCH_UG(NT, MT, MB) \
-        switch (unroll) { \
-            case 0:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 0) \
-            case 1:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 1) \
-            case 2:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 2) \
-            default: NVNNI_CONFIG_LAUNCH(NT, MT, MB, 4) \
-        }
-
-#define NVNNI_CONFIG_LAUNCH_MB(NT, MT) \
-        switch (min_blocks) { \
-            case 1:  NVNNI_CONFIG_LAUNCH_UG(NT, MT, 1) \
-            default: NVNNI_CONFIG_LAUNCH_UG(NT, MT, 2) \
-        }
-
-#define NVNNI_CONFIG_LAUNCH_MT(NT) \
-        switch (m_tile_cfg) { \
-            case 16: NVNNI_CONFIG_LAUNCH_MB(NT, 16) \
-            case 64: NVNNI_CONFIG_LAUNCH_MB(NT, 64) \
-            default: NVNNI_CONFIG_LAUNCH_MB(NT, 32) \
-        }
-
-        switch (n_tile)
+        constexpr int NT = decltype(n_tile_tag)::value;
+        constexpr int MT = decltype(m_tile_tag)::value;
+        constexpr int MB = decltype(min_blocks_tag)::value;
+        constexpr int UG = decltype(unroll_tag)::value;
+        constexpr bool FULL_TILES = decltype(full_tiles_tag)::value;
+        constexpr bool Q6_CHECKED_SPILLS =
+            FMT == NVNNI_GEMM_Q6_K && !FULL_TILES && MB == 2 &&
+            ((NT == 64 && MT == 64) || (NT == 128 && MT == 32));
+        if constexpr (Q6_CHECKED_SPILLS)
         {
-        case 64:
-            NVNNI_CONFIG_LAUNCH_MT(64)
-        case 128:
-            // N128/MT64 is intentionally not a supported trained mode; the
-            // generator rejects stale CSVs that claim it as a winner.
-            switch (m_tile_cfg)
-            {
-            case 16: NVNNI_CONFIG_LAUNCH_MB(128, 16)
-            default: NVNNI_CONFIG_LAUNCH_MB(128, 32)
-            }
-        default:
+            // This source-level rejection prevents the known spilling Q6_K
+            // specialization from becoming a launchable override or even a
+            // compiled dispatch target. The trainer inventory mirrors it.
+            return false;
+        }
+        else
+        {
+            const dim3 grid(
+                FULL_TILES ? N / NT : (N + NT - 1) / NT,
+                FULL_TILES ? M / MT : (M + MT - 1) / MT,
+                1);
+            const dim3 block(BLOCK_SIZE, 1, 1);
+            const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                native_vnni_gemm_kernel<
+                    NT, BPT, MT, FMT, MB, UG, FULL_TILES>));
+            clear_launch_error();
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG, FULL_TILES>
+                <<<grid, block, 0, hip_stream>>>(
+                    d_A_int8,
+                    d_payload,
+                    d_block_scales,
+                    d_block_mins,
+                    d_block_emins,
+                    d_output,
+                    d_scales_A,
+                    M,
+                    N,
+                    K,
+                    d_scales_A_blockwise,
+                    serial_m1_kblocks);
+            return complete_launch(
+                FULL_TILES ? "configured_full_tiles" : "configured_checked",
+                NT,
+                MT,
+                MB,
+                UG,
+                FULL_TILES,
+                function);
+        }
+    };
+
+    auto launch_config = [&](int n_tile,
+                             int m_tile_cfg,
+                             int min_blocks,
+                             int unroll,
+                             bool full_tiles) -> bool
+    {
+        if ((min_blocks != 1 && min_blocks != 2) ||
+            (unroll != 0 && unroll != 1 && unroll != 2 && unroll != 4))
+        {
+            return false;
+        }
+        if (full_tiles &&
+            ((M % m_tile_cfg) != 0 || (N % n_tile) != 0 ||
+             (K % (BPT * 32)) != 0))
+        {
             return false;
         }
 
-#undef NVNNI_CONFIG_LAUNCH_MT
-#undef NVNNI_CONFIG_LAUNCH_MB
-#undef NVNNI_CONFIG_LAUNCH_UG
-#undef NVNNI_CONFIG_LAUNCH
+        auto dispatch_unroll = [&](auto nt, auto mt, auto mb, auto full)
+        {
+            switch (unroll)
+            {
+            case 0:
+                return launch_exact_config(
+                    nt, mt, mb, std::integral_constant<int, 0>{}, full);
+            case 1:
+                return launch_exact_config(
+                    nt, mt, mb, std::integral_constant<int, 1>{}, full);
+            case 2:
+                return launch_exact_config(
+                    nt, mt, mb, std::integral_constant<int, 2>{}, full);
+            default:
+                return launch_exact_config(
+                    nt, mt, mb, std::integral_constant<int, 4>{}, full);
+            }
+        };
+
+        auto dispatch_min_blocks = [&](auto nt, auto mt, auto full)
+        {
+            if (min_blocks == 1)
+                return dispatch_unroll(
+                    nt, mt, std::integral_constant<int, 1>{}, full);
+            return dispatch_unroll(
+                nt, mt, std::integral_constant<int, 2>{}, full);
+        };
+
+        auto dispatch_m_tile = [&](auto nt, auto full)
+        {
+            if (m_tile_cfg == 16)
+                return dispatch_min_blocks(
+                    nt, std::integral_constant<int, 16>{}, full);
+            if (m_tile_cfg == 32)
+                return dispatch_min_blocks(
+                    nt, std::integral_constant<int, 32>{}, full);
+            if (n_tile == 64 && m_tile_cfg == 64 && !full_tiles)
+                return dispatch_min_blocks(
+                    nt, std::integral_constant<int, 64>{}, full);
+            return false;
+        };
+
+        auto dispatch_n_tile = [&](auto full)
+        {
+            if (n_tile == 64)
+                return dispatch_m_tile(
+                    std::integral_constant<int, 64>{}, full);
+            if (n_tile == 128 && m_tile_cfg != 64)
+                return dispatch_m_tile(
+                    std::integral_constant<int, 128>{}, full);
+            return false;
+        };
+
+        if (full_tiles)
+        {
+            // The extra proof-carrying template surface is currently compiled
+            // only for Q6_K, the production hotspot that justified it.
+            if constexpr (FMT == NVNNI_GEMM_Q6_K)
+                return dispatch_n_tile(std::true_type{});
+            return false;
+        }
+        return dispatch_n_tile(std::false_type{});
     };
 
     // M_TILE selection: minimize row waste (same as INT8 V7)
@@ -2665,14 +2816,15 @@ static bool launch_native_vnni_gemm(
     // ENV VAR OVERRIDE DISPATCH (for tuning sweeps)
     //
     // When any LLAMINAR_ROCM_NVNNI_* override is set, bypass the default
-    // heuristic and launch the exact kernel variant specified.  This generates
-    // extra template instantiations only for Pattern S formats (Q4_0, IQ4_NL)
-    // to keep compile time reasonable.
+    // heuristic and launch the exact kernel variant specified. Full-tile
+    // specializations are compiled only for Q6_K; checked candidates retain
+    // the existing all-format template surface.
     // =========================================================================
     const auto& env = llaminar2::debugEnv().rocm;
     const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
                                 env.nvnni_min_blocks > 0 ||
-                                env.nvnni_force_n64 || env.nvnni_force_n128);
+                                env.nvnni_force_n64 || env.nvnni_force_n128 ||
+                                env.nvnni_full_tiles >= 0);
     if (has_overrides) {
         int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
         const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
@@ -2681,7 +2833,12 @@ static bool launch_native_vnni_gemm(
                               env.nvnni_force_n64 ? false : use_n128;
         if (eff_n128 && eff_mt > 32)
             eff_mt = 32;
-        return launch_config(eff_n128 ? 128 : 64, eff_mt, eff_min_blocks, eff_unroll);
+        return launch_config(
+            eff_n128 ? 128 : 64,
+            eff_mt,
+            eff_min_blocks,
+            eff_unroll,
+            env.nvnni_full_tiles == 1);
     }
 
     // =========================================================================
@@ -2711,6 +2868,8 @@ static bool launch_native_vnni_gemm(
             constexpr int MT = decltype(m_tile_tag)::value;
             dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
             dim3 block(BLOCK_SIZE, 1, 1);
+            const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                native_vnni_gemm_kernel<NT, BPT, MT, FMT, 1, 2>));
 
             clear_launch_error();
             native_vnni_gemm_kernel<NT, BPT, MT, FMT, 1, 2>
@@ -2719,7 +2878,14 @@ static bool launch_native_vnni_gemm(
                     d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                     serial_m1_kblocks);
 
-            return complete_launch("simple_symmetric_mb1_ug2", NT, MT, 1, 2);
+            return complete_launch(
+                "simple_symmetric_mb1_ug2",
+                NT,
+                MT,
+                1,
+                2,
+                /*full_tiles=*/false,
+                function);
         };
 
         using N64_  = std::integral_constant<int, 64>;
@@ -2750,6 +2916,25 @@ static bool launch_native_vnni_gemm(
     using M32  = std::integral_constant<int, 32>;
     using M64  = std::integral_constant<int, 64>;
     using M8   = std::integral_constant<int, 8>;
+
+    // Q6_K is the dominant Qwen 3.6 dense-prefill codebook. A complete sweep of
+    // every physical graph bucket and all active 35B MoE geometries proves that
+    // N128/M32 full tiles are byte-identical and spill-free. M=600 is the sole
+    // non-M32-aligned capture; its common winner is checked N128/M16/MB1. Both
+    // routes retain serial-M1 K partition boundaries and arithmetic order.
+    if constexpr (FMT == NVNNI_GEMM_Q6_K)
+    {
+        if (M >= 32)
+        {
+            const bool full_tiles =
+                (M % 32) == 0 &&
+                (N % 128) == 0 &&
+                (K % (BPT * 32)) == 0;
+            if (full_tiles)
+                return launch_config(128, 32, 2, 4, true);
+            return launch_config(128, 16, 1, 4, false);
+        }
+    }
 
     // =========================================================================
     // STREAMING DISPATCH: LM_Head-like shapes (massive N, moderate K)

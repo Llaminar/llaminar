@@ -260,6 +260,19 @@ namespace llaminar2
         mutable std::vector<float> router_logits_;
 
         /**
+         * @brief Graph-stable view of the backend-owned raw router logits.
+         *
+         * GPU routing computes raw logits into the persistent
+         * `moe_route_logits` workspace before the top-k selection kernel reads
+         * them. The production route intentionally has no host mirror. This
+         * non-owning tensor view lets the graph snapshot manifest record an
+         * ordered device-to-device copy from that exact producer-owned address.
+         * It is created while binding the graph workspace, never from execute(),
+         * and is destroyed before the workspace binding is released.
+         */
+        std::unique_ptr<ITensor> router_logits_device_view_;
+
+        /**
          * @brief Graph-local MoE kernel and optional non-owning test override.
          *
          * A router may share this owner only with its paired routed-expert
@@ -292,6 +305,19 @@ namespace llaminar2
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,
             int seq_len, int top_k) const;
+
+        /**
+         * @brief Bind diagnostic metadata to the canonical GPU logits buffer.
+         *
+         * This method performs host-side setup only. It neither launches GPU
+         * work nor allocates device memory. A successful binding proves that
+         * snapshot capture and routing arithmetic refer to the same persistent
+         * graph-workspace address.
+         *
+         * @return True for CPU/unbound state, or when the complete GPU logits
+         *         view was bound to the current workspace.
+         */
+        bool bindRouterLogitsDeviceView();
 
     };
 

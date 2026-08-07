@@ -3869,6 +3869,16 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
                 const_cast<int *>(generation_control),
                 llaminar2::sampling_math::
                     DeviceGenerationError::InvalidDepthSelector);
+            llaminar2::sampling_math::
+                initialize_invalid_speculative_batch_outcome(
+                    out_tokens,
+                    out_token_capacity,
+                    out_meta);
+            if constexpr (RetainFirstTransactionDiagnostic)
+            {
+                if (first_transaction_diagnostic)
+                    first_transaction_diagnostic->valid = 0;
+            }
         }
     }
     __syncthreads();
@@ -4166,7 +4176,7 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
     int out_token_capacity,
     int *__restrict__ out_meta,
     const uint32_t *__restrict__ max_state_commit_rows,
-    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ penalty_policy)
+    const int *__restrict__ next_leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -4192,10 +4202,13 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
                                      static_cast<uint32_t>(active_rows)
             ? static_cast<int>(*max_state_commit_rows)
             : active_rows;
+    /*
+     * The response ledger, not sampling history, owns whether row zero is a
+     * carry from the preceding transaction.  Reading the controller scalar
+     * directly keeps that lifecycle device-resident and graph-replayable.
+     */
     const int leading_committed_output_count =
-        penalty_policy && penalty_policy->first_token_already_in_history != 0
-            ? 1
-            : 0;
+        *next_leading_committed_output_count;
     llaminar2::sampling_math::summarize_greedy_speculative_verify_batch_at_commit_boundary(
         draft_tokens[0],
         verify_tokens,
@@ -4282,6 +4295,8 @@ __global__ void rocm_initialize_device_generation_kernel(
     int request_count,
     int max_new_tokens,
     llaminar2::sampling_math::DeviceGenerationDepthPolicy depth_policy,
+    llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
+        initial_leading_row_disposition,
     int response_token_stride,
     int control_stride,
     int *__restrict__ control)
@@ -4297,7 +4312,8 @@ __global__ void rocm_initialize_device_generation_kernel(
         max_new_tokens,
         response_token_stride,
         depth_policy,
-        request_control);
+        request_control,
+        initial_leading_row_disposition);
 }
 
 /**
@@ -6892,14 +6908,14 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
     int out_token_capacity,
     int *out_meta,
     const uint32_t *max_state_commit_rows,
-    const llaminar2::MTPGreedyPenaltyPolicy *penalty_policy,
+    const int *next_leading_committed_output_count,
     int device_idx,
     void *stream)
 {
     if (compare_row_count < 0 ||
         out_token_capacity < compare_row_count + 1 ||
         !verify_tokens || !draft_tokens || !active_verifier_row_count ||
-        !stop_tokens || !penalty_policy ||
+        !stop_tokens || !next_leading_committed_output_count ||
         !out_tokens || !out_meta || !stream)
     {
         return false;
@@ -6921,7 +6937,7 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
         out_token_capacity,
         out_meta,
         max_state_commit_rows,
-        penalty_policy);
+        next_leading_committed_output_count);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -6985,6 +7001,8 @@ bool rocmOps_initialize_device_generation(
     int request_count,
     int max_new_tokens,
     const llaminar2::sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+    llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
+        initial_leading_row_disposition,
     int response_token_stride,
     int control_stride,
     int *control,
@@ -6993,6 +7011,9 @@ bool rocmOps_initialize_device_generation(
 {
     if (request_count <= 0 || max_new_tokens <= 0 ||
         !depth_policy.valid() ||
+        !llaminar2::sampling_math::
+            valid_device_generation_leading_row_disposition(
+                initial_leading_row_disposition) ||
         response_token_stride < max_new_tokens ||
         control_stride <
             llaminar2::sampling_math::kDeviceGenerationControlCount ||
@@ -7016,6 +7037,7 @@ bool rocmOps_initialize_device_generation(
         request_count,
         max_new_tokens,
         depth_policy,
+        initial_leading_row_disposition,
         response_token_stride,
         control_stride,
         control);

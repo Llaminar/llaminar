@@ -992,8 +992,7 @@ namespace llaminar2
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool beginDeviceResidentGeneration(
-            int request_count,
-            int max_new_tokens) override;
+            const DeviceGenerationAdmissionRequest &request) override;
         /**
          * @brief Reduce participant MTP loop policies into one rank policy.
          *

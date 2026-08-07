@@ -6,9 +6,10 @@
  * one format-specific payload tile into transient shared-memory INT8 values,
  * then feeds the common `mma.sync.m16n8k32` fragment path. Launch policy is
  * responsible for exposing enough independent output tiles to fill the GPU
- * while retaining one increasing-K FP32 accumulation walk per output value;
- * split-K and Stream-K candidates that alter that arithmetic are diagnostic
- * only and are never selected by production automatic dispatch.
+ * while retaining the public M=1 FP32 reduction tree for every output value.
+ * The only K-parallel schedule is the public M=1 partition schedule followed
+ * by the same ascending ordered reducer. Independent partial trees and atomic
+ * accumulation are absent because neither can satisfy byte equivalence.
  */
 
 #include <cuda_runtime.h>
@@ -19,7 +20,6 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -36,25 +36,22 @@ extern "C" bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
     int *k_partitions);
 
 // =========================================================================
-// Per-device prefill context — replaces process-global statics for SM count
-// cache and stream-K fixup buffer.  Owned by KernelFactory, one per device.
+// Per-device prefill context. Owned by KernelFactory, one per device.
 // =========================================================================
 struct CUDAPrefillContext_
 {
     int sm_count = 0;
     int device_id = -1;
-    float *workspace_splitk_partials = nullptr;
-    size_t workspace_splitk_partials_size = 0;
-    float *workspace_fixup_buf = nullptr;
-    size_t workspace_fixup_buf_size = 0;
+    float *workspace_canonical_kpart_partials = nullptr;
+    size_t workspace_canonical_kpart_partials_size = 0;
 };
 
 struct LastLaunchSelection_
 {
     int tile_id = -1;
-    int split_k = 1;
+    int k_partitions = 1;
     int used_bk256 = 0;
-    int used_streamk = 0;
+    int used_canonical_kpart = 0;
 };
 
 // Thread-local because tile sweep benchmarks can launch from multiple worker
@@ -63,14 +60,15 @@ static thread_local LastLaunchSelection_ g_last_launch_selection;
 
 static inline void recordLastLaunchSelection(
     int tile_id,
-    int split_k,
+    int k_partitions,
     bool used_bk256,
-    int used_streamk)
+    bool used_canonical_kpart = false)
 {
     g_last_launch_selection.tile_id = tile_id;
-    g_last_launch_selection.split_k = split_k;
+    g_last_launch_selection.k_partitions = k_partitions;
     g_last_launch_selection.used_bk256 = used_bk256 ? 1 : 0;
-    g_last_launch_selection.used_streamk = used_streamk;
+    g_last_launch_selection.used_canonical_kpart =
+        used_canonical_kpart ? 1 : 0;
 }
 
 static int querySmCount(CUDAPrefillContext_ *ctx)
@@ -85,25 +83,23 @@ static int querySmCount(CUDAPrefillContext_ *ctx)
     return ctx->sm_count;
 }
 
-static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
+static float *getCanonicalKpartPartials(
+    CUDAPrefillContext_ *ctx,
+    size_t required_bytes,
+    cudaStream_t stream)
 {
-    if (ctx->workspace_fixup_buf && ctx->workspace_fixup_buf_size >= required_bytes)
+    // The ordered reducer consumes every public-M1 partition slot. Some legal
+    // schedules have trailing empty partitions, so stale workspace contents
+    // must not survive from an earlier request or projection.
+    if (ctx->workspace_canonical_kpart_partials &&
+        ctx->workspace_canonical_kpart_partials_size >= required_bytes)
     {
-        cudaMemsetAsync(ctx->workspace_fixup_buf, 0, required_bytes, stream);
-        return ctx->workspace_fixup_buf;
-    }
-    return nullptr;
-}
-
-static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
-{
-    // Split-K reducers consume every partition slot. Some legal dispatches have
-    // trailing empty K partitions, so stale workspace contents must not survive
-    // from an earlier request or projection.
-    if (ctx->workspace_splitk_partials && ctx->workspace_splitk_partials_size >= required_bytes)
-    {
-        cudaMemsetAsync(ctx->workspace_splitk_partials, 0, required_bytes, stream);
-        return ctx->workspace_splitk_partials;
+        cudaMemsetAsync(
+            ctx->workspace_canonical_kpart_partials,
+            0,
+            required_bytes,
+            stream);
+        return ctx->workspace_canonical_kpart_partials;
     }
     return nullptr;
 }
@@ -118,9 +114,9 @@ namespace
     [[maybe_unused]] constexpr int SMEM_STRIDE_64 = BK64 + SMEM_PAD_64; // 80, 16-byte aligned for ldmatrix
 
     // ─── Sweep-derived tile dispatch ───────────────────────────────────
-    // Tile configurations validated via exhaustive sweep across 336 shapes,
-    // 12 tile/warp configs, and 4 split_k values (15,984 measurements).
-    // Overall penalty vs per-shape oracle: +2.2%.
+    // Tile configurations validated across production geometries. K reduction
+    // is not a free tuning dimension: only full-K and canonical public-M1
+    // partition schedules are admissible.
 
     enum class TileId : uint8_t
     {
@@ -135,21 +131,16 @@ namespace
     struct TileChoice
     {
         TileId tile;
-        int split_k;
     };
 
-    // ─── Split-K two-phase reduce kernel ───────────────────────────────
-    // Sums SPLIT_K partial results into the final output buffer C.
-    // Each z-slice of the GEMM wrote its partial to partials[z * M * N].
-    // This kernel sums across z-slices for each (m, n) element.
-    // Also applies beta * C_existing + bias if present.
-    // Grid: ceil(M*N / 256), Block: 256
-    __global__ void splitk_reduce(
+    // Fold public-M1 K-partition partials into the final output. The loop order
+    // is part of the byte-equivalence contract and must remain ascending.
+    __global__ void canonical_kpart_reduce(
         const float *__restrict__ partials,
         float *__restrict__ C,
         const float *__restrict__ C_existing,
         const float *__restrict__ bias,
-        int M, int N, int split_k,
+        int M, int N, int k_partitions,
         float beta)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -158,7 +149,7 @@ namespace
             return;
 
         float sum = 0.0f;
-        for (int z = 0; z < split_k; ++z)
+        for (int z = 0; z < k_partitions; ++z)
             sum += partials[z * total + idx];
 
         if (beta != 0.0f && C_existing)
@@ -280,25 +271,11 @@ namespace
     //                 BM=64  (4 warps) → target 3 blocks/SM (≤170 regs/thread).
     // STAGES_=1: single-buffered (half smem, no load/compute overlap, higher occupancy).
     // STAGES_=2: double-buffered (overlaps decode(next) with compute(current)).
-    template <uint8_t CODEBOOK_ID, int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
+    template <uint8_t CODEBOOK_ID, int BM, int BN, int WARPS_M, int WARPS_N,
               int STAGES_ = 2,
-              bool STREAM_K = false,
-              bool FIXUP_TWO_PASS = false,
+              bool CANONICAL_KPART = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
-              // Stream-K tile loop: the outer while-loop keeps all global-memory
-              // pointer registers (~16 GP regs) alive across iterations, requiring
-              // ~124 regs total. With MIN_BLOCKS=2 (64-reg cap), this causes
-              // catastrophic spilling. MIN_BLOCKS=1 (128-reg cap) avoids spills.
-              //
-              // COMPILER INSIGHT: A bounded for-loop (e.g. `for(i=0;i<4;i++)`) with
-              // compile-time-constant upper bound achieves REG:64 STACK:0 — the
-              // compiler can drop/reload pointers from ld.param between iterations.
-              // However, the k-loop compute pipeline itself degrades at 64 regs:
-              // 32 accumulator regs (WM=2×WN=4×4) leave only 32 for pipeline state,
-              // shared memory pointers, and ILP — resulting in 2× slower per-tile
-              // throughput that 2× occupancy cannot overcome.
-              int MIN_BLOCKS_HINT = STREAM_K ? 1
-                                    : (STAGES_ == 1)
+              int MIN_BLOCKS_HINT = (STAGES_ == 1)
                                         ? ((BLOCK_SIZE_ >= 256) ? 3 : 4)
                                         : ((BLOCK_SIZE_ >= 256) ? 2 : 3)>
     __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeVnniTC_BK64(
@@ -318,8 +295,7 @@ namespace
         float alpha,
         float beta,
         int serial_m1_k_partitions,
-        int serial_m1_uses_ordered_reducer,
-        float *__restrict__ tmp_fixup)
+        int serial_m1_uses_ordered_reducer)
     {
 #if __CUDA_ARCH__ >= 800
         constexpr int NUM_WARPS = WARPS_M * WARPS_N;
@@ -342,38 +318,37 @@ namespace
         static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
         static_assert(WARP_M % 16 == 0);
         static_assert(WARP_N % 8 == 0);
-        static_assert(!STREAM_K || SPLIT_K == 1, "Stream-K and Split-K are mutually exclusive");
-        static_assert(!FIXUP_TWO_PASS || STREAM_K, "FIXUP_TWO_PASS requires STREAM_K");
-
         const int warp_id = threadIdx.x >> 5;
         const int lane_id = threadIdx.x & 31;
         const int wr = warp_id / WARPS_N;
         const int wc = warp_id % WARPS_N;
         const int gid = lane_id >> 2;
 
-        int block_m = 0, block_n = 0;
-        if constexpr (!STREAM_K)
-        {
-            block_m = blockIdx.x * BM;
-            block_n = blockIdx.y * BN;
-        }
+        const int block_m = blockIdx.x * BM;
+        const int block_n = blockIdx.y * BN;
 
         const int num_q40_blocks = K / 32;
         const int num_k_tiles_total = (num_q40_blocks + 1) / 2; // ceil: handles K%64!=0
+        int canonical_block_begin = 0;
+        int canonical_block_end = num_q40_blocks;
         int kt_begin = 0;
         int kt_end = num_k_tiles_total;
         int num_k_iters = num_k_tiles_total;
-        if constexpr (!STREAM_K)
+        if constexpr (CANONICAL_KPART)
         {
-            if constexpr (SPLIT_K > 1)
-            {
-                const int tiles_per_part = (num_k_tiles_total + SPLIT_K - 1) / SPLIT_K;
-                kt_begin = static_cast<int>(blockIdx.z) * tiles_per_part;
-                kt_end = min(kt_begin + tiles_per_part, num_k_tiles_total);
-            }
-            num_k_iters = kt_end - kt_begin;
-            if (num_k_iters <= 0)
+            if (serial_m1_k_partitions <= 1)
                 return;
+            const int blocks_per_partition =
+                (num_q40_blocks + serial_m1_k_partitions - 1) /
+                serial_m1_k_partitions;
+            canonical_block_begin =
+                static_cast<int>(blockIdx.z) * blocks_per_partition;
+            canonical_block_end = min(
+                num_q40_blocks,
+                canonical_block_begin + blocks_per_partition);
+            kt_begin = canonical_block_begin / 2;
+            kt_end = (canonical_block_end + 1) / 2;
+            num_k_iters = kt_end - kt_begin;
         }
 
         // Compile-time traits for this codebook
@@ -419,7 +394,7 @@ namespace
         auto commit_serial_m1_partition =
             [&](int completed_block) __attribute__((always_inline))
         {
-            if constexpr (STREAM_K || SPLIT_K != 1)
+            if constexpr (CANONICAL_KPART)
                 return;
             if (!serial_m1_uses_ordered_reducer)
                 return;
@@ -846,9 +821,8 @@ namespace
             }
         };
 
-        const bool is_interior_tile = (!STREAM_K) ? ((block_m + BM <= M) && (block_n + BN <= N)) : false;
-        // Mutable copy for stream-K tile loop (modified per-tile; standard path uses const above)
-        bool is_interior_tile_mut = is_interior_tile;
+        const bool is_interior_tile =
+            (block_m + BM <= M) && (block_n + BN <= N);
 
         auto compute_k_tile_interior = [&](int stage, int kt) __attribute__((always_inline))
         {
@@ -859,6 +833,14 @@ namespace
                 const int kb = kb0 + half;
                 if (kb >= num_q40_blocks)
                     break; // K-tail: second q-block doesn't exist
+                if constexpr (CANONICAL_KPART)
+                {
+                    if (kb < canonical_block_begin ||
+                        kb >= canonical_block_end)
+                    {
+                        continue;
+                    }
+                }
                 const int k_offset = half * 32;
                 const int scale_slot = half;
 
@@ -1152,6 +1134,14 @@ namespace
                 const int kb = kb0 + half;
                 if (kb >= num_q40_blocks)
                     break; // K-tail: second q-block doesn't exist
+                if constexpr (CANONICAL_KPART)
+                {
+                    if (kb < canonical_block_begin ||
+                        kb >= canonical_block_end)
+                    {
+                        continue;
+                    }
+                }
                 const int k_offset = half * 32;
                 const int scale_slot = half;
 
@@ -1386,225 +1376,9 @@ namespace
             }
         };
 
-        // ── Dispatch: stream-K tile loop or standard single-tile ─────
-        if constexpr (STREAM_K)
+        // One output tile follows either the full-K walk or the exact
+        // public-M1 K-partition boundaries.
         {
-            // Stream-K uses atomicAdd on pre-zeroed buffer — no need for beta/bias epilogue.
-            (void)beta;
-            (void)C_existing;
-            (void)bias;
-            if constexpr (!FIXUP_TWO_PASS)
-                (void)tmp_fixup;
-
-            // ── Stream-K tile loop (optimized) ──────────────────────────
-            // Key optimizations vs naive stream-K:
-            // 1. Full tiles (this CTA owns entire K-reduction) use direct store
-            //    with interior fast path — matches standard epilogue exactly.
-            // 2. Partial tiles (K-range split across CTAs) use atomicAdd on
-            //    pre-zeroed C.
-            // 3. Integer division (kbc → tile_idx, kt_begin) computed ONCE for
-            //    the first tile; subsequent tiles use incremental tile_idx++.
-            {
-                const int ntx = (N + BN - 1) / BN;
-                const int nty = (M + BM - 1) / BM;
-                const int total_work = nty * ntx * num_k_tiles_total;
-                int kbc = static_cast<int>(
-                    (long long)blockIdx.x * total_work / gridDim.x);
-                const int kbc_stop = static_cast<int>(
-                    (long long)(blockIdx.x + 1) * total_work / gridDim.x);
-
-                // First tile: compute tile index and K-offset via division (only once)
-                int cur_tile_idx = kbc / num_k_tiles_total;
-                int cur_kt_begin = kbc % num_k_tiles_total;
-
-#pragma unroll 1
-                while (kbc < kbc_stop)
-                {
-                    const int local_kt_end = min(num_k_tiles_total,
-                                                 cur_kt_begin + (kbc_stop - kbc));
-                    const int ty = cur_tile_idx / ntx;
-                    const int tx = cur_tile_idx % ntx;
-                    block_m = ty * BM;
-                    block_n = tx * BN;
-                    kt_begin = cur_kt_begin;
-                    kt_end = local_kt_end;
-                    num_k_iters = kt_end - kt_begin;
-                    is_interior_tile_mut = (block_m + BM <= M) && (block_n + BN <= N);
-
-                    // Full tile: this CTA owns the complete K-reduction (no sharing)
-                    const bool is_full_tile = (cur_kt_begin == 0) &&
-                                              (local_kt_end == num_k_tiles_total);
-
-                    // ── Inline zero_acc ──
-#pragma unroll
-                    for (int i = 0; i < WM; ++i)
-#pragma unroll
-                        for (int j = 0; j < WN; ++j)
-#pragma unroll
-                            for (int e = 0; e < 4; ++e)
-                            {
-                                acc[i][j][e] = 0.0f;
-                                serial_acc[i][j][e] = 0.0f;
-                            }
-
-                    // ── Inline k-loop (run_pipeline) ──
-                    if constexpr (STAGES_ == 1)
-                    {
-                        for (int ki = 0; ki < num_k_iters; ++ki)
-                        {
-                            const int kt = kt_begin + ki;
-                            load_A_tile(0, kt);
-                            cp_async_commit();
-                            decode_B_direct(0, kt);
-                            load_scales_A(0, kt);
-                            cp_async_wait<0>();
-                            __syncthreads();
-                            if (is_interior_tile_mut)
-                                compute_k_tile_interior(0, kt);
-                            else
-                                compute_k_tile_border(0, kt);
-                            if (ki + 1 < num_k_iters)
-                                __syncthreads();
-                        }
-                    }
-                    else
-                    {
-                        load_A_tile(0, kt_begin);
-                        cp_async_commit();
-                        decode_B_direct(0, kt_begin);
-                        load_scales_A(0, kt_begin);
-                        cp_async_wait<0>();
-                        __syncthreads();
-                        for (int ki = 0; ki < num_k_iters; ++ki)
-                        {
-                            const int stage = ki & 1;
-                            const int kt = kt_begin + ki;
-                            if (ki + 1 < num_k_iters)
-                            {
-                                load_A_tile(stage ^ 1, kt + 1);
-                                cp_async_commit();
-                                decode_B_direct(stage ^ 1, kt + 1);
-                                load_scales_A(stage ^ 1, kt + 1);
-                            }
-                            if (is_interior_tile_mut)
-                                compute_k_tile_interior(stage, kt);
-                            else
-                                compute_k_tile_border(stage, kt);
-                            if (ki + 1 < num_k_iters)
-                            {
-                                cp_async_wait<0>();
-                                __syncthreads();
-                            }
-                        }
-                    }
-
-                    // ── Epilogue: direct store for full tiles, atomicAdd for partials ──
-                    if constexpr (FIXUP_TWO_PASS)
-                    {
-                        const int ntx_local = (N + BN - 1) / BN;
-                        const int tile_idx_f = (block_m / BM) * ntx_local + (block_n / BN);
-                        float *__restrict__ tile_base = tmp_fixup + static_cast<long long>(tile_idx_f) * (BM * BN);
-#pragma unroll
-                        for (int wj = 0; wj < WN; ++wj)
-                        {
-                            const int local_n = wc * WARP_N + wj * 8;
-                            const int lc0 = local_n + frag_col(lane_id, 0);
-                            const int lc1 = local_n + frag_col(lane_id, 1);
-#pragma unroll
-                            for (int wi = 0; wi < WM; ++wi)
-                            {
-                                const int local_m = wr * WARP_M + wi * 16;
-#pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const int lr = local_m + frag_row(lane_id, e);
-                                    const int lc = (e & 1) ? lc1 : lc0;
-                                    atomicAdd(&tile_base[lr * BN + lc], acc[wi][wj][e] * alpha);
-                                }
-                            }
-                        }
-                    }
-                    else if (is_full_tile)
-                    {
-                        // ── Full tile: direct store (matches standard epilogue) ──
-                        // This CTA owns the complete K-reduction — no other CTA
-                        // writes to these output elements. Use direct store with
-                        // interior fast path (no bounds check, no atomicAdd).
-#pragma unroll
-                        for (int wj = 0; wj < WN; ++wj)
-                        {
-                            const int tile_n = block_n + wc * WARP_N + wj * 8;
-                            const int gc0 = tile_n + frag_col(lane_id, 0);
-                            const int gc1 = tile_n + frag_col(lane_id, 1);
-#pragma unroll
-                            for (int wi = 0; wi < WM; ++wi)
-                            {
-                                const int tile_m = block_m + wr * WARP_M + wi * 16;
-
-                                if (is_interior_tile_mut)
-                                {
-                                    // Interior fast path: 4 direct stores, no bounds check
-                                    const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
-                                    const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
-                                    const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
-                                    const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
-                                    C[out_idx0] = acc[wi][wj][0] * alpha;
-                                    C[out_idx1] = acc[wi][wj][1] * alpha;
-                                    C[out_idx2] = acc[wi][wj][2] * alpha;
-                                    C[out_idx3] = acc[wi][wj][3] * alpha;
-                                }
-                                else
-                                {
-                                    // Border: direct store with bounds check
-#pragma unroll
-                                    for (int e = 0; e < 4; ++e)
-                                    {
-                                        const int gr = tile_m + frag_row(lane_id, e);
-                                        const int gc = (e & 1) ? gc1 : gc0;
-                                        if (gr < M && gc < N)
-                                            C[gr * N + gc] = acc[wi][wj][e] * alpha;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // ── Partial tile: atomicAdd on pre-zeroed C ──
-                        // K-range is split across CTAs; use atomicAdd for correctness.
-#pragma unroll
-                        for (int wj = 0; wj < WN; ++wj)
-                        {
-                            const int tile_n = block_n + wc * WARP_N + wj * 8;
-                            const int gc0 = tile_n + frag_col(lane_id, 0);
-                            const int gc1 = tile_n + frag_col(lane_id, 1);
-#pragma unroll
-                            for (int wi = 0; wi < WM; ++wi)
-                            {
-                                const int tile_m = block_m + wr * WARP_M + wi * 16;
-#pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const int gr = tile_m + frag_row(lane_id, e);
-                                    const int gc = (e & 1) ? gc1 : gc0;
-                                    if (gr < M && gc < N)
-                                        atomicAdd(&C[gr * N + gc], acc[wi][wj][e] * alpha);
-                                }
-                            }
-                        }
-                    }
-
-                    // Advance to next tile (no division needed — incremental tracking)
-                    kbc += (num_k_tiles_total - cur_kt_begin);
-                    cur_tile_idx++;
-                    cur_kt_begin = 0; // all subsequent tiles start at K=0
-                    __syncthreads();
-                }
-            }
-        }
-        else
-        {
-            // ── Standard path: inline code matching baseline exactly ─────
             // No lambda wrapping — keeps variables const and avoids capture overhead.
 
 #pragma unroll
@@ -1618,67 +1392,70 @@ namespace
                         serial_acc[i][j][e] = 0.0f;
                     }
 
-            if constexpr (STAGES_ == 1)
+            if (num_k_iters > 0)
             {
-                // ── Single-buffered main loop ────────────────────────────────
-                for (int ki = 0; ki < num_k_iters; ++ki)
+                if constexpr (STAGES_ == 1)
                 {
-                    const int kt = kt_begin + ki;
-
-                    load_A_tile(0, kt);
-                    cp_async_commit();
-                    decode_B_direct(0, kt); // runs while cp.async for A is in-flight
-                    load_scales_A(0, kt);
-                    cp_async_wait<0>();
-                    __syncthreads(); // A load + B decode both complete
-
-                    if (is_interior_tile)
-                        compute_k_tile_interior(0, kt);
-                    else
-                        compute_k_tile_border(0, kt);
-
-                    if (ki + 1 < num_k_iters)
-                        __syncthreads(); // ensure all warps done before overwriting smem
-                }
-            }
-            else
-            {
-                // ── Double-buffered pipeline (STAGES_=2) ─────────────────────
-                load_A_tile(0, kt_begin);
-                cp_async_commit();
-                decode_B_direct(0, kt_begin);
-                load_scales_A(0, kt_begin);
-                cp_async_wait<0>();
-                __syncthreads();
-
-                for (int ki = 0; ki < num_k_iters; ++ki)
-                {
-                    const int stage = ki & 1;
-                    const int kt = kt_begin + ki;
-
-                    if (ki + 1 < num_k_iters)
+                    // ── Single-buffered main loop ────────────────────────
+                    for (int ki = 0; ki < num_k_iters; ++ki)
                     {
-                        load_A_tile(stage ^ 1, kt + 1);
+                        const int kt = kt_begin + ki;
+
+                        load_A_tile(0, kt);
                         cp_async_commit();
-                        decode_B_direct(stage ^ 1, kt + 1);
-                        load_scales_A(stage ^ 1, kt + 1);
-                    }
-
-                    if (is_interior_tile)
-                        compute_k_tile_interior(stage, kt);
-                    else
-                        compute_k_tile_border(stage, kt);
-
-                    if (ki + 1 < num_k_iters)
-                    {
+                        decode_B_direct(0, kt);
+                        load_scales_A(0, kt);
                         cp_async_wait<0>();
                         __syncthreads();
+
+                        if (is_interior_tile)
+                            compute_k_tile_interior(0, kt);
+                        else
+                            compute_k_tile_border(0, kt);
+
+                        if (ki + 1 < num_k_iters)
+                            __syncthreads();
+                    }
+                }
+                else
+                {
+                    // ── Double-buffered pipeline (STAGES_=2) ─────────────
+                    load_A_tile(0, kt_begin);
+                    cp_async_commit();
+                    decode_B_direct(0, kt_begin);
+                    load_scales_A(0, kt_begin);
+                    cp_async_wait<0>();
+                    __syncthreads();
+
+                    for (int ki = 0; ki < num_k_iters; ++ki)
+                    {
+                        const int stage = ki & 1;
+                        const int kt = kt_begin + ki;
+
+                        if (ki + 1 < num_k_iters)
+                        {
+                            load_A_tile(stage ^ 1, kt + 1);
+                            cp_async_commit();
+                            decode_B_direct(stage ^ 1, kt + 1);
+                            load_scales_A(stage ^ 1, kt + 1);
+                        }
+
+                        if (is_interior_tile)
+                            compute_k_tile_interior(stage, kt);
+                        else
+                            compute_k_tile_border(stage, kt);
+
+                        if (ki + 1 < num_k_iters)
+                        {
+                            cp_async_wait<0>();
+                            __syncthreads();
+                        }
                     }
                 }
             }
 
             float output_alpha = alpha;
-            if constexpr (SPLIT_K == 1)
+            if constexpr (!CANONICAL_KPART)
             {
                 if (serial_m1_uses_ordered_reducer)
                 {
@@ -1696,11 +1473,10 @@ namespace
             // Epilogue: write accumulators to global memory
             const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
-            // Two-phase split-K: each z-slice writes to partials at offset
-            // blockIdx.z * M * N. The reduce kernel sums across z-slices.
-            // For SPLIT_K == 1, C points to the final output directly.
+            // Canonical K-partition CTAs write private z slices. The ordered
+            // reducer applies beta and bias after folding those slices.
             float *__restrict__ C_out = C;
-            if constexpr (SPLIT_K > 1)
+            if constexpr (CANONICAL_KPART)
                 C_out = C + blockIdx.z * M * N;
 
 #pragma unroll
@@ -1720,14 +1496,14 @@ namespace
                     const int tile_m = block_m + wr * WARP_M + wi * 16;
                     const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
 
-                    if (interior && (simple_epilogue || SPLIT_K > 1))
+                    if (interior && (simple_epilogue || CANONICAL_KPART))
                     {
                         const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
                         const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
                         const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                         const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                        // Direct stores: for SPLIT_K > 1, beta/bias handled by reduce kernel
+                        // Canonical partials defer beta and bias to the reducer.
                         C_out[out_idx0] = acc[wi][wj][0] * output_alpha;
                         C_out[out_idx1] = acc[wi][wj][1] * output_alpha;
                         C_out[out_idx2] = acc[wi][wj][2] * output_alpha;
@@ -1746,14 +1522,13 @@ namespace
                             const int out_idx = gr * N + gc;
                             float val = acc[wi][wj][e] * output_alpha;
 
-                            if constexpr (SPLIT_K == 1)
+                            if constexpr (!CANONICAL_KPART)
                             {
                                 if (beta != 0.0f && C_existing)
                                     val += beta * C_existing[out_idx];
                                 if (bias)
                                     val += (e & 1) ? bias1 : bias0;
                             }
-                            // Direct store: for SPLIT_K > 1, beta/bias handled by reduce kernel
                             C_out[out_idx] = val;
                         }
                     }
@@ -1776,7 +1551,6 @@ namespace
         (void)beta;
         (void)serial_m1_k_partitions;
         (void)serial_m1_uses_ordered_reducer;
-        (void)tmp_fixup;
 #endif
     }
 
@@ -1804,7 +1578,7 @@ namespace
     constexpr int BK128_PAD = 16;
     constexpr int BK128_STRIDE = BK128 + BK128_PAD; // 144, 16-byte aligned
 
-    template <int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
+    template <int BM, int BN, int WARPS_M, int WARPS_N,
               bool ORDERED_M1 = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
               int MIN_BLOCKS_HINT = (BLOCK_SIZE_ >= 512 ? 1 : 2)>
@@ -1835,10 +1609,6 @@ namespace
 
         static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
         static_assert(WARP_M % 16 == 0 && WARP_N % 8 == 0);
-        static_assert(
-            !ORDERED_M1 || SPLIT_K == 1,
-            "Ordered public-M1 emulation owns the complete K reduction");
-
         const int warp_id = threadIdx.x >> 5;
         const int lane_id = threadIdx.x & 31;
         const int wr = warp_id / WARPS_N;
@@ -1850,16 +1620,8 @@ namespace
 
         const int num_q40_blocks = K / 32;
         const int num_outer_tiles = (num_q40_blocks + 7) / 8;
-        int ot_begin = 0;
-        int ot_end = num_outer_tiles;
-        if constexpr (SPLIT_K > 1)
-        {
-            const int tiles_per_part = (num_outer_tiles + SPLIT_K - 1) / SPLIT_K;
-            ot_begin = static_cast<int>(blockIdx.z) * tiles_per_part;
-            ot_end = min(ot_begin + tiles_per_part, num_outer_tiles);
-        }
-        if (ot_end <= ot_begin)
-            return;
+        constexpr int ot_begin = 0;
+        const int ot_end = num_outer_tiles;
 
         // Dynamic shared memory: exceeds 48KB static limit for BM=128
         // Layout: smem_A (K=128 half) | smem_B (K=256 full) | smem_scales_B | smem_sa
@@ -2289,12 +2051,6 @@ namespace
             ORDERED_M1 ? 1.0f : alpha;
         const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
-        // Two-phase split-K: each z-slice writes to partials at offset
-        // blockIdx.z * M * N. The reduce kernel sums across z-slices.
-        float *__restrict__ C_out = C;
-        if constexpr (SPLIT_K > 1)
-            C_out = C + blockIdx.z * M * N;
-
 #pragma unroll
         for (int wj = 0; wj < WN; ++wj)
         {
@@ -2312,20 +2068,20 @@ namespace
                 const int tile_m = block_m + wr * WARP_M + wi * 16;
                 const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
 
-                if (interior && (simple_epilogue || SPLIT_K > 1))
+                if (interior && simple_epilogue)
                 {
                     const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
                     const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
                     const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                     const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                    C_out[out_idx0] =
+                    C[out_idx0] =
                         __fmul_rn(acc[wi][wj][0], output_alpha);
-                    C_out[out_idx1] =
+                    C[out_idx1] =
                         __fmul_rn(acc[wi][wj][1], output_alpha);
-                    C_out[out_idx2] =
+                    C[out_idx2] =
                         __fmul_rn(acc[wi][wj][2], output_alpha);
-                    C_out[out_idx3] =
+                    C[out_idx3] =
                         __fmul_rn(acc[wi][wj][3], output_alpha);
                     continue;
                 }
@@ -2342,14 +2098,11 @@ namespace
                         float val =
                             __fmul_rn(acc[wi][wj][e], output_alpha);
 
-                        if constexpr (SPLIT_K == 1)
-                        {
-                            if (beta != 0.0f && C_existing)
-                                val += beta * C_existing[out_idx];
-                            if (bias)
-                                val += (e & 1) ? bias1 : bias0;
-                        }
-                        C_out[out_idx] = val;
+                        if (beta != 0.0f && C_existing)
+                            val += beta * C_existing[out_idx];
+                        if (bias)
+                            val += (e & 1) ? bias1 : bias0;
+                        C[out_idx] = val;
                     }
                 }
             }
@@ -2372,27 +2125,17 @@ namespace
     }
 
     // =========================================================================
-    // Tile/split-k force: override the heuristic for sweep benchmarks.
-    //   g_force_tile_id: -1 = auto (heuristic), 0..5 = TileId enum value
-    //   g_force_split_k:  0 = auto (heuristic), 1..8 = forced split-K value
+    // Tile force: override output geometry for sweep benchmarks. K reduction
+    // policy is intentionally not forceable independently of public M=1.
     // =========================================================================
     static int g_force_tile_id = []()
     {
         return llaminar2::debugEnv().gemm.cuda_force_prefill_tile;
     }();
-    static int g_force_split_k = []()
-    {
-        return llaminar2::debugEnv().gemm.cuda_force_prefill_split_k;
-    }();
-
-    // Deterministic mode remains a diagnostic control for explicitly forced
-    // candidates. Production auto dispatch is batch invariant unconditionally:
-    // it never needs this switch to reject atomic or differently parenthesized
-    // K reductions.
-    static bool g_deterministic_mode = []()
-    {
-        return llaminar2::debugEnv().gemm.deterministic;
-    }();
+    // Candidate control for the economical K-parallel implementation. This
+    // route inherits the exact public M=1 partition count and boundaries
+    // instead of accepting an independent reduction geometry.
+    static bool g_force_canonical_kpart = false;
 
     // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
     // Set via LLAMINAR_BK256_MODE env var or extern C API.
@@ -2455,15 +2198,15 @@ namespace
          * proved that 64x64 preserves every result byte for all asymmetric and
          * dual-scale codebooks while exposing eight independent output tiles.
          * Depending on payload complexity, the measured speedup was 1.69x to
-         * 2.21x. The winning path retains split_k=1, so this is purely an output
-         * geometry change and does not re-parenthesize the canonical K sum.
+         * 2.21x. This is purely an output-geometry change and does not
+         * re-parenthesize the canonical K sum.
          *
          * Keep the upper M boundary explicit. Rows above the verifier witness
          * domain remain total through the general prefill heuristic; extending
          * this overlay requires a new byte-exact tournament at those work sizes.
          */
         if (M >= 2 && M <= 31 && N == 512 && K == 2048)
-            return {TileId::T64x64_w2x2, 1};
+            return {TileId::T64x64_w2x2};
 
         /*
          * Qwen3.6 MoE GDN QKV projection, 128-row graph bucket.
@@ -2480,25 +2223,24 @@ namespace
         if (M == 128 && N == 8192 && K == 2048)
         {
             if (codebook == 5 || codebook == 7)
-                return {TileId::T64x128_w2x4, 1};
+                return {TileId::T64x128_w2x4};
             if (codebook == 16)
-                return {TileId::T64x128_w4x2, 1};
+                return {TileId::T64x128_w4x2};
         }
 
-        // Well-filling: enough tiles to saturate SMs → w2x2, no split-K
+        // Well-filling: enough output tiles to saturate SMs; prefer w2x2.
         if (t64x128 >= SM)
-            return {TileId::T64x128_w2x2, 1};
+            return {TileId::T64x128_w2x2};
 
         /*
-         * Underfilled shapes still retain one ordered K walk per output row.
-         * Split-K partials cannot reconstruct the serial FP32 addition sequence:
-         * reducing two rounded partition sums changes parenthesization. Recover
-         * occupancy with output geometry, not a mathematically different K tree.
+         * Underfilled shapes still retain the public M=1 arithmetic tree per
+         * output row. Independently rounded partition sums would change
+         * parenthesization, so occupancy comes from output geometry instead.
          */
-        return {TileId::T64x128_w2x2, 1};
+        return {TileId::T64x128_w2x2};
     }
 
-    // ─── Sweep-derived tile + split_k heuristic ───────────────────────
+    // ─── Sweep-derived output-tile heuristic ──────────────────────────
     // Fills-first strategy: prefer the largest output tile family that fills the
     // GPU while preserving one canonical, increasing-K reduction per row.
     // Within 64×128, warp config depends on real tile count:
@@ -2512,10 +2254,7 @@ namespace
     {
         // Force-tile override for sweep benchmarks
         if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
-        {
-            const int sk = (g_force_split_k > 0) ? g_force_split_k : 1;
-            return {static_cast<TileId>(g_force_tile_id), sk};
-        }
+            return {static_cast<TileId>(g_force_tile_id)};
 
         // Asymmetric/dual-scale formats: specialized heuristic biased
         // toward w2x2 due to higher register pressure from min-correction
@@ -2574,11 +2313,11 @@ namespace
                 // w4x4 for adequate tiles + K + M
                 if ((t128 >= 56 && ki >= 7 && M >= 512) ||
                     (t128 >= 128 && ki >= 16))
-                    return {TileId::T128x128_w4x4, 1};
-                return {TileId::T128x128_w4x2, 1};
+                    return {TileId::T128x128_w4x4};
+                return {TileId::T128x128_w4x2};
             }
             // Demote to 64×128
-            return {pick_warp(t64x128, ki), 1};
+            return {pick_warp(t64x128, ki)};
         }
 
         // ═══ TIER 2: 64×128 fills ═══
@@ -2586,21 +2325,21 @@ namespace
         {
             // Prefer 64×64 for small K + high tile parallelism
             if (ki <= 7 && t64 >= (5 * SM / 2))
-                return {TileId::T64x64_w2x2, 1};
+                return {TileId::T64x64_w2x2};
             if (ki <= 14 && t64x128 < (13 * SM / 10) && t64 >= 2 * SM)
-                return {TileId::T64x64_w2x2, 1};
+                return {TileId::T64x64_w2x2};
 
             const TileId warp = pick_warp(t64x128, ki);
 
             // 128×128 override for very large K at moderate M.
             if (M >= 256 && ki >= 40 && t128 >= 32 && t64x128 <= (3 * SM / 2))
-                return {TileId::T128x128_w4x2, 1};
+                return {TileId::T128x128_w4x2};
 
             // Prefer the larger tile when its output grid remains economical.
             if (M >= 128 && ki >= 40 && t128 >= 32 && t64x128 >= (3 * SM / 2))
-                return {TileId::T128x128_w4x2, 1};
+                return {TileId::T128x128_w4x2};
 
-            return {warp, 1};
+            return {warp};
         }
 
         // ═══ TIER 3: 64×64 fills ═══
@@ -2615,11 +2354,11 @@ namespace
                 // Further upgrade for very large K when a useful output grid
                 // remains available.
                 if (t128 >= 16 && ki >= 40 && M >= 128)
-                    return {TileId::T128x128_w4x2, 1};
+                    return {TileId::T128x128_w4x2};
 
-                return {warp, 1};
+                return {warp};
             }
-            return {TileId::T64x64_w2x2, 1};
+            return {TileId::T64x64_w2x2};
         }
 
         // ═══ TIER 4: Nothing fills → finest useful output tile ═══
@@ -2636,7 +2375,7 @@ namespace
         {
             tile = TileId::T64x64_w2x2;
         }
-        return {tile, 1};
+        return {tile};
     }
 
     bool isAmperePlus(int device_id)
@@ -2655,7 +2394,7 @@ namespace
         return cached_result;
     }
 
-    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN, int SPLIT_K = 1>
+    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
     bool launchNativeVNNITC_BK64(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
@@ -2673,41 +2412,22 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx = nullptr,
         int serial_m1_k_partitions = 1,
         int serial_m1_uses_ordered_reducer = 0)
     {
-        const int num_k_tiles = (K / 32 + 1) / 2; // ceil: handles K%64!=0
-        int kt_per_part = num_k_tiles;
-        if constexpr (SPLIT_K > 1)
-            kt_per_part = (num_k_tiles + SPLIT_K - 1) / SPLIT_K;
-        if (kt_per_part <= 0)
-            return false;
-
-        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
+        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
         const dim3 block(WM * WN * 32);
-
-        // Two-phase split-K: allocate partials, pass as C, reduce after
-        float *d_kernel_C = d_C_fp32;
-        if constexpr (SPLIT_K > 1)
-        {
-            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
-            if (!partials)
-                return false;
-            d_kernel_C = partials;
-        }
 
         // Clear any stale CUDA error from prior operations (e.g. CUTLASS reference path)
         (void)cudaGetLastError();
 
-        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, SPLIT_K><<<grid, block, 0, cuda_stream>>>(
+        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN><<<grid, block, 0, cuda_stream>>>(
             d_A_int8,
             d_payload,
             d_scales,
             d_mins,
             d_emins,
-            d_kernel_C,
+            d_C_fp32,
             d_scales_A_block,
             d_sums_A_block,
             d_C_existing,
@@ -2718,59 +2438,23 @@ namespace
             alpha,
             beta,
             serial_m1_k_partitions,
-            serial_m1_uses_ordered_reducer,
-            nullptr);
-        if (cudaGetLastError() != cudaSuccess)
-            return false;
-
-        // Launch reduce kernel to sum partials into final output
-        if constexpr (SPLIT_K > 1)
-        {
-            const int total = M * N;
-            const int threads = 256;
-            const int blocks = (total + threads - 1) / threads;
-            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
-                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
-                M, N, SPLIT_K, beta);
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
-        }
-        return true;
+            serial_m1_uses_ordered_reducer);
+        return cudaGetLastError() == cudaSuccess;
     }
 
-    // =========================================================================
-    // Stream-K diagnostic mode: 0/-1 = disabled, 1 = force one-pass,
-    // 2 = force two-pass. Atomic Stream-K is intentionally absent from automatic
-    // production dispatch because its scheduler-dependent reduction cannot meet
-    // the batch-invariant publication contract.
-    // =========================================================================
-    static int g_stream_k_force_mode = []()
-    {
-        return llaminar2::debugEnv().gemm.cuda_stream_k_mode;
-    }();
-
-    // =========================================================================
-    // Bias-add kernel: adds per-column bias to C (launched after stream-K GEMM)
-    // C[row, col] += bias[col] for all (row, col) in [M, N].
-    // =========================================================================
-    __global__ void streamk_add_bias(
-        float *__restrict__ C,
-        const float *__restrict__ bias,
-        int M,
-        int N)
-    {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const int total = M * N;
-        if (idx < total)
-            C[idx] += bias[idx % N];
-    }
-
-    // =========================================================================
-    // Stream-K launch helper: launches the persistent GEMM kernel with nsm
-    // blocks, then a fixup kernel to accumulate partial sums.
-    // =========================================================================
+    /**
+     * @brief Launch tensor-core prefill with the public M=1 K-partition tree.
+     *
+     * Each grid-Z CTA owns exactly one partition from the generated serial
+     * decode schedule. Partitions write disjoint FP32 partials, including an
+     * explicit zero for an empty trailing partition, and
+     * `canonical_kpart_reduce`
+     * publishes them in ascending partition order. This recovers K-parallel
+     * occupancy without introducing atomics or changing a single FP32
+     * parenthesis relative to public M=1 decode.
+     */
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
-    bool launchNativeVNNITC_BK64_StreamK(
+    bool launchNativeVNNITC_BK64CanonicalKpart(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
         const uint16_t *d_scales,
@@ -2787,229 +2471,73 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx)
+        CUDAPrefillContext_ *prefill_ctx,
+        int serial_m1_k_partitions)
     {
-        const int nsm = querySmCount(prefill_ctx);
-
-        // Query how many blocks the hardware can run concurrently per SM,
-        // given the kernel's compiled register and shared memory usage.
-        // This lets us fill more SM slots when registers permit (e.g., 128-thread
-        // tiles typically fit 2 blocks/SM, doubling occupancy vs 1 block/SM).
-        constexpr int BLOCK_SIZE_SK = WM * WN * 32;
-        int max_blocks_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm,
-            nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, 1, 2, true>,
-            BLOCK_SIZE_SK, 0);
-        // Cap at 2 to limit work fragmentation; at least 1
-        const int occ_mult = max(1, min(max_blocks_per_sm, 2));
-        const int grid_blocks = occ_mult * nsm;
-
-        (void)cudaGetLastError();
-
-        // Stream-K with atomicAdd requires C to be zeroed so that all blocks
-        // can safely atomicAdd their partial sums.  Beta is not supported
-        // because there is no ordering guarantee on which block writes first.
-        // Bias is handled as a post-hoc add after the GEMM completes.
-        if (beta != 0.0f)
+        if (!prefill_ctx || serial_m1_k_partitions <= 1)
             return false;
 
-        cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+        const size_t partials_bytes =
+            static_cast<size_t>(serial_m1_k_partitions) * M * N *
+            sizeof(float);
+        float *partials = getCanonicalKpartPartials(
+            prefill_ctx, partials_bytes, cuda_stream);
+        if (!partials)
+            return false;
 
-        // Main kernel: grid_blocks persistent blocks. Partial tiles use
-        // atomicAdd directly on C (no fixup buffer or fixup kernel needed).
-        const dim3 grid(grid_blocks, 1, 1);
+        const dim3 grid(
+            (M + BM - 1) / BM,
+            (N + BN - 1) / BN,
+            serial_m1_k_partitions);
         const dim3 block(WM * WN * 32);
 
-        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, /*SPLIT_K=*/1, /*STAGES_=*/2, /*STREAM_K=*/true><<<grid, block, 0, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            d_C_fp32,
-            d_scales_A_block,
-            d_sums_A_block,
-            nullptr, // d_C_existing: not supported with stream-K
-            nullptr, // d_bias: applied post-hoc below
-            M, N, K,
-            alpha, 0.0f,
-            1, 0,
-            nullptr); // No fixup buffer needed — partials use atomicAdd on C
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[StreamK] Kernel launch failed: %s (M=%d N=%d K=%d grid=%d occ_mult=%d)\n",
-                    cudaGetErrorString(err), M, N, K, grid_blocks, occ_mult);
-            return false;
-        }
-
-        // Post-hoc bias add: safe because GEMM writes are complete before
-        // this kernel reads C (CUDA stream ordering guarantees).
-        if (d_bias != nullptr)
-        {
-            const int total_elems = M * N;
-            constexpr int BIAS_THREADS = 256;
-            const int bias_blocks = (total_elems + BIAS_THREADS - 1) / BIAS_THREADS;
-            streamk_add_bias<<<bias_blocks, BIAS_THREADS, 0, cuda_stream>>>(
-                d_C_fp32, d_bias, M, N);
-            err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr, "[StreamK] Bias-add kernel failed: %s\n", cudaGetErrorString(err));
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    // =========================================================================
-    // Stream-K two-pass fixup kernel: copies tile-indexed fixup buffer to C
-    // with M/N bounds checking. One thread block per output tile.
-    // =========================================================================
-    template <int BM, int BN>
-    __global__ void streamk_fixup_copy(
-        const float *__restrict__ fixup,
-        float *__restrict__ C,
-        int M,
-        int N,
-        int ntx)
-    {
-        const int tile_idx = blockIdx.x;
-        const int ty = tile_idx / ntx;
-        const int tx = tile_idx % ntx;
-        const int block_m = ty * BM;
-        const int block_n = tx * BN;
-
-        const float *__restrict__ tile_data = fixup + tile_idx * (BM * BN);
-
-        // Each thread handles multiple elements via grid-stride within the tile
-        for (int i = threadIdx.x; i < BM * BN; i += blockDim.x)
-        {
-            const int lr = i / BN; // BN is power of 2 → compiler uses shift
-            const int lc = i % BN; // BN is power of 2 → compiler uses mask
-            const int gr = block_m + lr;
-            const int gc = block_n + lc;
-            if (gr < M && gc < N)
-                C[gr * N + gc] = tile_data[i];
-        }
-    }
-
-    // =========================================================================
-    // Stream-K two-pass launch helper: main kernel writes partial sums to a
-    // flat tile-indexed fixup buffer (atomicAdd, no M/N bounds check), then a
-    // lightweight fixup kernel copies fixup→C with bounds checking.
-    //
-    // The main kernel uses MIN_BLOCKS_HINT=2, targeting ≤64 regs/thread for
-    // 2 blocks/SM (66.67% occupancy) on 512-thread tiles. The simpler epilogue
-    // (no runtime N multiply, no M/N bounds checks) eliminates ~12 gap
-    // registers that forced the one-pass variant to 128 regs / 1 block/SM.
-    // =========================================================================
-    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
-    bool launchNativeVNNITC_BK64_StreamK_TwoPass(
-        const int8_t *d_A_int8,
-        const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
-        float *d_C_fp32,
-        const float *d_scales_A_block,
-        const int32_t *d_sums_A_block,
-        int M,
-        int N,
-        int K,
-        float alpha,
-        float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx)
-    {
-        // Two-pass stream-K only supports beta=0, no bias (same constraint as one-pass)
-        if (beta != 0.0f || d_bias != nullptr)
-            return false;
-
-        const int nsm = querySmCount(prefill_ctx);
-        const int ntx = (N + BN - 1) / BN;
-        const int nty = (M + BM - 1) / BM;
-        const int total_tiles = ntx * nty;
-
-        // Query occupancy for the two-pass kernel (FIXUP_TWO_PASS=true → MIN_BLOCKS_HINT=2)
-        constexpr int BLOCK_SIZE_SK = WM * WN * 32;
-        int max_blocks_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm,
-            nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, 1, 2, /*STREAM_K=*/true, /*FIXUP_TWO_PASS=*/true>,
-            BLOCK_SIZE_SK, 0);
-        const int occ_mult = max(1, min(max_blocks_per_sm, 2));
-        const int grid_blocks = occ_mult * nsm;
-
         (void)cudaGetLastError();
-
-        // Allocate tile-indexed fixup buffer: total_tiles × BM × BN floats
-        const size_t fixup_bytes = static_cast<size_t>(total_tiles) * BM * BN * sizeof(float);
-        float *fixup_buf = getOrAllocFixupBuffer(prefill_ctx, fixup_bytes, cuda_stream);
-        if (!fixup_buf)
-            return false;
-
-        // Main kernel: writes partial sums to fixup buffer via atomicAdd.
-        // No M/N bounds checks — fixup buffer covers full padded tiles.
-        const dim3 grid(grid_blocks, 1, 1);
-        const dim3 block(BLOCK_SIZE_SK);
-
-        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, /*SPLIT_K=*/1, /*STAGES_=*/2,
-                          /*STREAM_K=*/true, /*FIXUP_TWO_PASS=*/true><<<grid, block, 0, cuda_stream>>>(
+        nativeVnniTC_BK64<
+            CODEBOOK_ID,
+            BM,
+            BN,
+            WM,
+            WN,
+            /*STAGES_=*/2,
+            /*CANONICAL_KPART=*/true><<<grid, block, 0, cuda_stream>>>(
             d_A_int8,
             d_payload,
             d_scales,
             d_mins,
             d_emins,
-            d_C_fp32,
+            partials,
             d_scales_A_block,
             d_sums_A_block,
             d_C_existing,
             d_bias,
-            M, N, K,
-            alpha, beta,
-            1, 0,
-            fixup_buf);
-
+            M,
+            N,
+            K,
+            alpha,
+            beta,
+            serial_m1_k_partitions,
+            /*serial_m1_uses_ordered_reducer=*/1);
         if (cudaGetLastError() != cudaSuccess)
             return false;
 
-        // Fixup kernel: copy from tile-indexed fixup buffer to C with M/N bounds checking.
-        // One thread block per output tile, 256 threads each.
-        constexpr int FIXUP_THREADS = 256;
-        streamk_fixup_copy<BM, BN><<<total_tiles, FIXUP_THREADS, 0, cuda_stream>>>(
-            fixup_buf, d_C_fp32, M, N, ntx);
-
+        const int total = M * N;
+        constexpr int threads = 256;
+        const int blocks = (total + threads - 1) / threads;
+        canonical_kpart_reduce<<<blocks, threads, 0, cuda_stream>>>(
+            partials,
+            d_C_fp32,
+            d_C_existing,
+            d_bias,
+            M,
+            N,
+            serial_m1_k_partitions,
+            beta);
         return cudaGetLastError() == cudaSuccess;
     }
 
     // =========================================================================
-    // Stream-K eligibility is explicit and diagnostic only. Automatic production
-    // dispatch must preserve the canonical increasing-K FP32 reduction.
-    // =========================================================================
-    bool shouldUseStreamK(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
-    {
-        (void)M;
-        (void)N;
-        (void)K;
-        (void)bm;
-        (void)bn;
-        (void)prefill_ctx;
-
-        // Deterministic mode rejects even an explicitly requested diagnostic.
-        if (g_deterministic_mode)
-            return false;
-
-        return g_stream_k_force_mode > 0;
-    }
-
     // BK=256 launch helper: sets >48KB dynamic smem opt-in before first launch
-    template <int BM, int BN, int WM, int WN, int SPLIT_K = 1>
+    template <int BM, int BN, int WM, int WN>
     bool launchNativeVNNITC_BK256(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
@@ -3024,7 +2552,6 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx,
         int serial_m1_k_partitions,
         int serial_m1_uses_ordered_reducer)
     {
@@ -3033,12 +2560,6 @@ namespace
         constexpr int SA_OFF = SCALES_B_OFF + 8 * BN * static_cast<int>(sizeof(uint16_t));
         constexpr int SA_ALIGNED = (SA_OFF + 3) & ~3;
         constexpr int smem_bytes = SA_ALIGNED + BM * 8 * static_cast<int>(sizeof(float));
-
-        if constexpr (SPLIT_K > 1)
-        {
-            if (serial_m1_uses_ordered_reducer)
-                return false;
-        }
 
         /*
          * Ordinary and ordered-M1 kernels have intentionally different
@@ -3059,7 +2580,6 @@ namespace
                         BN,
                         WM,
                         WN,
-                        SPLIT_K,
                         true>;
                 attribute_status = cudaFuncSetAttribute(
                     fn_ptr,
@@ -3074,7 +2594,6 @@ namespace
                         BN,
                         WM,
                         WN,
-                        SPLIT_K,
                         false>;
                 attribute_status = cudaFuncSetAttribute(
                     fn_ptr,
@@ -3086,26 +2605,8 @@ namespace
             smem_configured[ordered_index] = true;
         }
 
-        const int num_outer_tiles = (K / 32 + 7) / 8;
-        int ot_per_part = num_outer_tiles;
-        if constexpr (SPLIT_K > 1)
-            ot_per_part = (num_outer_tiles + SPLIT_K - 1) / SPLIT_K;
-        if (ot_per_part <= 0)
-            return false;
-
-        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
+        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
         const dim3 block(WM * WN * 32);
-
-        // Two-phase split-K: allocate partials, pass as C, reduce after
-        float *d_kernel_C = d_C_fp32;
-        if constexpr (SPLIT_K > 1)
-        {
-            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
-            if (!partials)
-                return false;
-            d_kernel_C = partials;
-        }
 
         (void)cudaGetLastError(); // clear stale errors
 
@@ -3116,12 +2617,11 @@ namespace
                 BN,
                 WM,
                 WN,
-                SPLIT_K,
                 true><<<grid, block, smem_bytes, cuda_stream>>>(
                 d_A_int8,
                 d_payload,
                 d_scales,
-                d_kernel_C,
+                d_C_fp32,
                 d_scales_A_block,
                 d_C_existing,
                 d_bias,
@@ -3139,12 +2639,11 @@ namespace
                 BN,
                 WM,
                 WN,
-                SPLIT_K,
                 false><<<grid, block, smem_bytes, cuda_stream>>>(
                 d_A_int8,
                 d_payload,
                 d_scales,
-                d_kernel_C,
+                d_C_fp32,
                 d_scales_A_block,
                 d_C_existing,
                 d_bias,
@@ -3155,32 +2654,8 @@ namespace
                 beta,
                 serial_m1_k_partitions);
         }
-        if (cudaGetLastError() != cudaSuccess)
-            return false;
-
-        if constexpr (SPLIT_K > 1)
-        {
-            const int total = M * N;
-            const int threads = 256;
-            const int blocks = (total + threads - 1) / threads;
-            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
-                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
-                M, N, SPLIT_K, beta);
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
-        }
-        return true;
+        return cudaGetLastError() == cudaSuccess;
     }
-
-    struct PrefillWorkspacePlan
-    {
-        int tile_id = -1;
-        int split_k = 1;
-        int streamk = 0;
-        bool bk256 = false;
-        size_t splitk_partials_bytes = 0;
-        size_t streamk_fixup_bytes = 0;
-    };
 
     /**
      * @brief Complete Q4_0 large-K route shared by planning and execution.
@@ -3221,6 +2696,8 @@ namespace
                 : Q40PrefillRoute::BK256Wide;
         };
 
+        if (g_force_canonical_kpart)
+            return Q40PrefillRoute::Generic;
         if (g_bk256_force_mode > 0)
             return bk256_geometry();
         if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
@@ -3247,123 +2724,6 @@ namespace
         return Q40PrefillRoute::Generic;
     }
 
-    void tileShape(TileId tile, int &bm, int &bn)
-    {
-        switch (tile)
-        {
-        case TileId::T64x64_w2x2:
-            bm = 64;
-            bn = 64;
-            return;
-        case TileId::T64x128_w2x2:
-        case TileId::T64x128_w4x2:
-        case TileId::T64x128_w2x4:
-            bm = 64;
-            bn = 128;
-            return;
-        case TileId::T128x128_w4x2:
-        case TileId::T128x128_w4x4:
-            bm = 128;
-            bn = 128;
-            return;
-        }
-        bm = 64;
-        bn = 128;
-    }
-
-    template <uint8_t CB>
-    PrefillWorkspacePlan planGenericPrefillWorkspace(
-        int M,
-        int N,
-        int K,
-        CUDAPrefillContext_ *prefill_ctx)
-    {
-        PrefillWorkspacePlan plan;
-
-        if constexpr (CB == 0)
-        {
-            const Q40PrefillRoute route =
-                chooseQ40PrefillRoute(M, N, K, prefill_ctx);
-            switch (route)
-            {
-            case Q40PrefillRoute::BK256Narrow:
-            case Q40PrefillRoute::BK256Wide:
-            {
-                /*
-                 * BK256 retains one ordered K walk. A two-part workspace
-                 * reduction is deterministic in scheduling but not equivalent
-                 * in FP32 parenthesization, so it is not a production candidate.
-                 */
-                constexpr int sk = 1;
-                plan.tile_id =
-                    route == Q40PrefillRoute::BK256Narrow ? -3 : -2;
-                plan.split_k = sk;
-                plan.bk256 = true;
-                return plan;
-            }
-            case Q40PrefillRoute::ProfiledT64x64:
-            {
-                /*
-                 * Lock the measured winner directly instead of passing through
-                 * the older generic heuristic, whose eight-block T64x128
-                 * choice remains underfilled at the N=1024 boundary.
-                 */
-                plan.tile_id =
-                    static_cast<int>(TileId::T64x64_w2x2);
-                plan.split_k = 1;
-                return plan;
-            }
-            case Q40PrefillRoute::Generic:
-                break;
-            }
-        }
-
-        TileChoice tc;
-        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
-        {
-            tc = {static_cast<TileId>(g_force_tile_id),
-                  (g_force_split_k > 0) ? g_force_split_k : 1};
-        }
-        else
-        {
-            constexpr FormatComplexity complexity = getFormatComplexity(CB);
-            tc = choosePrefillTile(
-                M, N, K, prefill_ctx, complexity, CB);
-        }
-
-        if (g_deterministic_mode && tc.split_k > 1)
-            tc.split_k = 1;
-
-        plan.tile_id = static_cast<int>(tc.tile);
-        plan.split_k = tc.split_k;
-
-        int bm = 64;
-        int bn = 128;
-        tileShape(tc.tile, bm, bn);
-
-        if constexpr (CB == 0)
-        {
-            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)
-            {
-                const int ntx = (N + bn - 1) / bn;
-                const int nty = (M + bm - 1) / bm;
-                const int total_tiles = ntx * nty;
-                plan.streamk = 2;
-                plan.streamk_fixup_bytes = static_cast<size_t>(total_tiles) * bm * bn * sizeof(float);
-                return plan;
-            }
-            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, bm, bn, prefill_ctx))
-            {
-                plan.streamk = 1;
-                return plan;
-            }
-        }
-
-        if (tc.split_k > 1)
-            plan.splitk_partials_bytes = static_cast<size_t>(tc.split_k) * M * N * sizeof(float);
-        return plan;
-    }
-
     // =========================================================================
     // Unified prefill dispatch: single format-agnostic path for ALL codebooks.
     //
@@ -3371,7 +2731,7 @@ namespace
     //   1. BK256 path (CB=0 only): large-K shapes where BK64 can't fill GPU
     //   2. Force-tile override (g_force_tile_id): for sweep benchmarks
     //   3. Total heuristic dispatch (choosePrefillTile with format complexity)
-    //   4. Tile launch: StreamK evaluation (CB=0 only) → standard split_k
+    //   4. Tile launch: full-K or exact public-M1 K partitioning
     // =========================================================================
     template <uint8_t CB>
     bool launchGenericPrefillBK64(
@@ -3407,20 +2767,20 @@ namespace
                 constexpr int sk = 1;
                 if (q40_route == Q40PrefillRoute::BK256Narrow)
                 {
-                    recordLastLaunchSelection(-3, sk, true, 0);
-                    return launchNativeVNNITC_BK256<128, 64, 4, 2, sk>(
+                    recordLastLaunchSelection(-3, sk, true);
+                    return launchNativeVNNITC_BK256<128, 64, 4, 2>(
                         d_A_int8, d_payload, d_scales, d_C_fp32,
                         d_scales_A_block, M, N, K, alpha, beta,
-                        d_C_existing, d_bias, cuda_stream, prefill_ctx,
+                        d_C_existing, d_bias, cuda_stream,
                         serial_m1_k_partitions,
                         serial_m1_uses_ordered_reducer);
                 }
 
-                recordLastLaunchSelection(-2, sk, true, 0);
-                return launchNativeVNNITC_BK256<128, 128, 4, 4, sk>(
+                recordLastLaunchSelection(-2, sk, true);
+                return launchNativeVNNITC_BK256<128, 128, 4, 4>(
                     d_A_int8, d_payload, d_scales, d_C_fp32,
                     d_scales_A_block, M, N, K, alpha, beta,
-                    d_C_existing, d_bias, cuda_stream, prefill_ctx,
+                    d_C_existing, d_bias, cuda_stream,
                     serial_m1_k_partitions,
                     serial_m1_uses_ordered_reducer);
             }
@@ -3433,12 +2793,11 @@ namespace
         {
             if (q40_route == Q40PrefillRoute::ProfiledT64x64)
             {
-                tc = {TileId::T64x64_w2x2, 1};
+                tc = {TileId::T64x64_w2x2};
             }
             else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
             {
-                tc = {static_cast<TileId>(g_force_tile_id),
-                      (g_force_split_k > 0) ? g_force_split_k : 1};
+                tc = {static_cast<TileId>(g_force_tile_id)};
             }
             else
             {
@@ -3451,8 +2810,7 @@ namespace
         else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
         {
             // Force-tile: bypass everything for sweep benchmarks
-            tc = {static_cast<TileId>(g_force_tile_id),
-                  (g_force_split_k > 0) ? g_force_split_k : 1};
+            tc = {static_cast<TileId>(g_force_tile_id)};
         }
         else
         {
@@ -3461,103 +2819,59 @@ namespace
                 M, N, K, prefill_ctx, complexity, CB);
         }
 
-        // Deterministic mode also clamps an explicitly forced diagnostic. Auto
-        // dispatch already returns split_k=1 for every production geometry.
-        if (g_deterministic_mode && tc.split_k > 1)
-            tc.split_k = 1;
-
-        // ─── Tile launch with optional diagnostic Stream-K (CB=0) ─────
-#define DISPATCH_TILE_SK(BM_, BN_, WM_, WN_)                                            \
-    do                                                                                  \
-    {                                                                                   \
-        if constexpr (CB == 0)                                                          \
-        {                                                                               \
-            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)   \
-            {                                                                           \
-                recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 2);      \
-                return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
-                    prefill_ctx);                                                       \
-            }                                                                           \
-            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx)) \
-            {                                                                           \
-                recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 1);      \
-                return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
-                    prefill_ctx);                                                       \
-            }                                                                           \
-        }                                                                               \
-        switch (tc.split_k)                                                             \
-        {                                                                               \
-        case 8:                                                                         \
-            recordLastLaunchSelection(static_cast<int>(tc.tile), 8, false, 0);          \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
-                serial_m1_uses_ordered_reducer);                                        \
-        case 4:                                                                         \
-            recordLastLaunchSelection(static_cast<int>(tc.tile), 4, false, 0);          \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
-                serial_m1_uses_ordered_reducer);                                        \
-        case 2:                                                                         \
-            recordLastLaunchSelection(static_cast<int>(tc.tile), 2, false, 0);          \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
-                serial_m1_uses_ordered_reducer);                                        \
-        default:                                                                        \
-            recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 0);          \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
-                serial_m1_uses_ordered_reducer);                                        \
-        }                                                                               \
+        // Tile launch: output geometry is selectable; reduction geometry is
+        // either one complete K walk or the exact public-M1 partition tree.
+#define DISPATCH_TILE(BM_, BN_, WM_, WN_)                                              \
+    do                                                                                 \
+    {                                                                                  \
+        if (g_force_canonical_kpart)                                                   \
+        {                                                                              \
+            if (!serial_m1_uses_ordered_reducer ||                                    \
+                serial_m1_k_partitions <= 1)                                          \
+                return false;                                                          \
+            recordLastLaunchSelection(                                                \
+                static_cast<int>(tc.tile),                                            \
+                serial_m1_k_partitions,                                               \
+                false,                                                                \
+                true);                                                                \
+            return launchNativeVNNITC_BK64CanonicalKpart<                             \
+                CB, BM_, BN_, WM_, WN_>(                                              \
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,                      \
+                d_C_fp32, d_scales_A_block, d_sums_A_block,                           \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,              \
+                prefill_ctx, serial_m1_k_partitions);                                 \
+        }                                                                              \
+        recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false);               \
+        return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_>(                       \
+            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,                 \
+            d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,                   \
+            d_C_existing, d_bias, cuda_stream,                                        \
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer);                  \
     } while (0)
 
         switch (tc.tile)
         {
         case TileId::T64x64_w2x2:
-            DISPATCH_TILE_SK(64, 64, 2, 2);
+            DISPATCH_TILE(64, 64, 2, 2);
         case TileId::T64x128_w2x2:
-            DISPATCH_TILE_SK(64, 128, 2, 2);
+            DISPATCH_TILE(64, 128, 2, 2);
         case TileId::T64x128_w4x2:
-            DISPATCH_TILE_SK(64, 128, 4, 2);
+            DISPATCH_TILE(64, 128, 4, 2);
         case TileId::T64x128_w2x4:
-            DISPATCH_TILE_SK(64, 128, 2, 4);
+            DISPATCH_TILE(64, 128, 2, 4);
         case TileId::T128x128_w4x2:
-            DISPATCH_TILE_SK(128, 128, 4, 2);
+            DISPATCH_TILE(128, 128, 4, 2);
         case TileId::T128x128_w4x4:
-            DISPATCH_TILE_SK(128, 128, 4, 4);
+            DISPATCH_TILE(128, 128, 4, 4);
         }
 
-#undef DISPATCH_TILE_SK
+#undef DISPATCH_TILE
         return false; // unreachable
     }
 }
 
 extern "C"
 {
-    // Stream-K force mode: 0=auto(heuristic), 1=force ON, -1=force OFF
-    void cudaNativeVNNIPrefill_setStreamKMode(int mode)
-    {
-        g_stream_k_force_mode = mode;
-    }
-
-    int cudaNativeVNNIPrefill_getStreamKMode()
-    {
-        return g_stream_k_force_mode;
-    }
-
     // BK256 force mode: 0=auto(heuristic), 1=force ON, -1=force OFF
     void cudaNativeVNNIPrefill_setBK256Mode(int mode)
     {
@@ -3569,49 +2883,46 @@ extern "C"
         return g_bk256_force_mode;
     }
 
-    // Deterministic mode API: disables stream-K and enables parity-preserving
-    // dispatch rules in the BK64 prefill path.
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled)
+    /** Select the exact public-M1 ordered K-partition candidate for a sweep. */
+    void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled)
     {
-        g_deterministic_mode = enabled;
+        g_force_canonical_kpart = enabled;
     }
 
-    bool cudaNativeVNNIPrefill_getDeterministicMode()
+    /** Return whether the exact public-M1 K-partition candidate is forced. */
+    bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode()
     {
-        return g_deterministic_mode;
+        return g_force_canonical_kpart;
     }
 
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
         int *tile_id,
-        int *split_k,
+        int *k_partitions,
         int *used_bk256,
-        int *used_streamk)
+        int *used_canonical_kpart)
     {
         if (tile_id)
             *tile_id = g_last_launch_selection.tile_id;
-        if (split_k)
-            *split_k = g_last_launch_selection.split_k;
+        if (k_partitions)
+            *k_partitions = g_last_launch_selection.k_partitions;
         if (used_bk256)
             *used_bk256 = g_last_launch_selection.used_bk256;
-        if (used_streamk)
-            *used_streamk = g_last_launch_selection.used_streamk;
+        if (used_canonical_kpart)
+            *used_canonical_kpart =
+                g_last_launch_selection.used_canonical_kpart;
     }
 
-    // Force-tile/split-k override for sweep benchmarks.
-    //   tile_id: -1 = auto, 0..5 = TileId enum (T64x64_w2x2 .. T128x128_w4x4)
-    //   split_k: 0 = auto, 1..8 = forced split-K value
-    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k)
+    // Force output-tile geometry for sweep benchmarks. K partitioning remains
+    // bound to the public M=1 arithmetic contract.
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id)
     {
         g_force_tile_id = tile_id;
-        g_force_split_k = split_k;
     }
 
-    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k)
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id)
     {
         if (tile_id)
             *tile_id = g_force_tile_id;
-        if (split_k)
-            *split_k = g_force_split_k;
     }
 
     // Return the number of tiles for a given tile config + shape
@@ -3659,17 +2970,14 @@ extern "C"
 
     void cudaPrefillContext_bindWorkspace(
         CUDAPrefillContext *ctx,
-        float *splitk_partials,
-        size_t splitk_partials_bytes,
-        float *streamk_fixup,
-        size_t streamk_fixup_bytes)
+        float *canonical_kpart_partials,
+        size_t canonical_kpart_partials_bytes)
     {
         if (!ctx)
             return;
-        ctx->workspace_splitk_partials = splitk_partials;
-        ctx->workspace_splitk_partials_size = splitk_partials_bytes;
-        ctx->workspace_fixup_buf = streamk_fixup;
-        ctx->workspace_fixup_buf_size = streamk_fixup_bytes;
+        ctx->workspace_canonical_kpart_partials = canonical_kpart_partials;
+        ctx->workspace_canonical_kpart_partials_size =
+            canonical_kpart_partials_bytes;
     }
 
     bool cudaNativeVNNIPrefill_getWorkspacePlan(
@@ -3678,88 +2986,66 @@ extern "C"
         int N,
         int K,
         int cuda_device_id,
-        size_t *splitk_partials_bytes,
-        size_t *streamk_fixup_bytes,
-        int *planned_split_k,
-        int *planned_streamk)
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions)
     {
-        if (splitk_partials_bytes)
-            *splitk_partials_bytes = 0;
-        if (streamk_fixup_bytes)
-            *streamk_fixup_bytes = 0;
-        if (planned_split_k)
-            *planned_split_k = 1;
-        if (planned_streamk)
-            *planned_streamk = 0;
+        if (canonical_kpart_partials_bytes)
+            *canonical_kpart_partials_bytes = 0;
+        if (planned_k_partitions)
+            *planned_k_partitions = 1;
         if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
             return false;
 
         CUDAPrefillContext_ temp_ctx;
         temp_ctx.device_id = cuda_device_id;
 
-        PrefillWorkspacePlan plan;
         switch (codebook_id)
         {
         case 0:
-            plan = planGenericPrefillWorkspace<0>(M, N, K, &temp_ctx);
-            break;
         case 4:
-            plan = planGenericPrefillWorkspace<4>(M, N, K, &temp_ctx);
-            break;
         case 5:
-            plan = planGenericPrefillWorkspace<5>(M, N, K, &temp_ctx);
-            break;
         case 6:
-            plan = planGenericPrefillWorkspace<6>(M, N, K, &temp_ctx);
-            break;
         case 7:
-            plan = planGenericPrefillWorkspace<7>(M, N, K, &temp_ctx);
-            break;
         case 8:
-            plan = planGenericPrefillWorkspace<8>(M, N, K, &temp_ctx);
-            break;
         case 9:
-            plan = planGenericPrefillWorkspace<9>(M, N, K, &temp_ctx);
-            break;
         case 10:
-            plan = planGenericPrefillWorkspace<10>(M, N, K, &temp_ctx);
-            break;
         case 11:
-            plan = planGenericPrefillWorkspace<11>(M, N, K, &temp_ctx);
-            break;
         case 12:
-            plan = planGenericPrefillWorkspace<12>(M, N, K, &temp_ctx);
-            break;
         case 13:
-            plan = planGenericPrefillWorkspace<13>(M, N, K, &temp_ctx);
-            break;
         case 14:
-            plan = planGenericPrefillWorkspace<14>(M, N, K, &temp_ctx);
-            break;
         case 15:
-            plan = planGenericPrefillWorkspace<15>(M, N, K, &temp_ctx);
-            break;
         case 16:
-            plan = planGenericPrefillWorkspace<16>(M, N, K, &temp_ctx);
-            break;
         case 17:
-            plan = planGenericPrefillWorkspace<17>(M, N, K, &temp_ctx);
-            break;
         case 19:
-            plan = planGenericPrefillWorkspace<19>(M, N, K, &temp_ctx);
             break;
         default:
             return false;
         }
 
-        if (splitk_partials_bytes)
-            *splitk_partials_bytes = plan.splitk_partials_bytes;
-        if (streamk_fixup_bytes)
-            *streamk_fixup_bytes = plan.streamk_fixup_bytes;
-        if (planned_split_k)
-            *planned_split_k = plan.split_k;
-        if (planned_streamk)
-            *planned_streamk = plan.streamk;
+        if (!g_force_canonical_kpart)
+            return true;
+
+        int uses_ordered_reducer = 0;
+        int k_partitions = 0;
+        if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                codebook_id,
+                N,
+                K,
+                querySmCount(&temp_ctx),
+                &uses_ordered_reducer,
+                &k_partitions) ||
+            uses_ordered_reducer == 0 || k_partitions <= 1)
+        {
+            return false;
+        }
+
+        if (canonical_kpart_partials_bytes)
+        {
+            *canonical_kpart_partials_bytes =
+                static_cast<size_t>(k_partitions) * M * N * sizeof(float);
+        }
+        if (planned_k_partitions)
+            *planned_k_partitions = k_partitions;
         return true;
     }
 } // extern "C"
@@ -3962,11 +3248,14 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     if (ok && llaminar2::PerfStatsCollector::isEnabled())
     {
         int tile_id = -1;
-        int split_k = 1;
+        int k_partitions = 1;
         int used_bk256 = 0;
-        int used_streamk = 0;
+        int used_canonical_kpart = 0;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
-            &tile_id, &split_k, &used_bk256, &used_streamk);
+            &tile_id,
+            &k_partitions,
+            &used_bk256,
+            &used_canonical_kpart);
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",
             "cuda_native_vnni_prefill_calls",
@@ -3979,9 +3268,9 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
                 {"tile_id", std::to_string(tile_id)},
-                {"split_k", std::to_string(split_k)},
+                {"k_partitions", std::to_string(k_partitions)},
                 {"bk256", used_bk256 ? "1" : "0"},
-                {"streamk", std::to_string(used_streamk)},
+                {"canonical_kpart", used_canonical_kpart ? "1" : "0"},
                 {"sums_a", d_sums_A_block ? "1" : "0"}});
     }
     return ok;

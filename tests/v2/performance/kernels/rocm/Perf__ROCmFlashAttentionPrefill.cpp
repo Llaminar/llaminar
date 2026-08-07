@@ -8,7 +8,7 @@
  * **Tuning Vectors**:
  * - KV type: FP32, FP16, Q8_1
  * - n_heads: TP-sliced head counts
- * - seq_len: 128, 256, 512, 1024 (typical prefill lengths)
+ * - seq_len: 128, 256, 425, 512, 1024 (typical and production prefill lengths)
  *
  * **Key insight**: Unlike decode (split-K), the prefill kernel has NO KV splitting.
  * Grid = (n_heads, num_q_tiles, batch). Occupancy comes from q-tiles × heads.
@@ -44,7 +44,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     int hipFlashAttn_prefill_fa2_fp16(
         const float *Q, const void *K, const void *V, float *O,
@@ -53,7 +54,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     int hipFlashAttn_prefill_fa2_q8_1(
         const float *Q, const void *K, const void *V, float *O,
@@ -62,7 +64,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 }
 
 namespace
@@ -96,6 +99,7 @@ namespace
     static constexpr ModelConfig kQwen7B = {"Qwen2.5-7B", 28, 4, 128};
     static constexpr ModelConfig kQwen14B = {"Qwen2.5-14B", 40, 8, 128};
     static constexpr ModelConfig kQwen32B = {"Qwen2.5-32B", 40, 8, 128};
+    static constexpr ModelConfig kQwen36MoE = {"Qwen3.6-35B-A3B", 16, 2, 256};
 
     static constexpr ModelConfig kAllModels[] = {
         kQwen05B, kQwen3B, kQwen7B, kQwen14B, kQwen32B};
@@ -239,11 +243,13 @@ namespace
             // Allocate device memory
             float *d_Q = nullptr, *d_O = nullptr;
             void *d_K = nullptr, *d_V = nullptr;
+            hipStream_t stream = nullptr;
 
             (void)hipMalloc(&d_Q, q_size * sizeof(float));
             (void)hipMalloc(&d_K, k_bytes);
             (void)hipMalloc(&d_V, v_bytes);
             (void)hipMalloc(&d_O, out_size * sizeof(float));
+            (void)hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
 
             // Initialize Q with random data
             {
@@ -305,7 +311,7 @@ namespace
                     v = static_cast<uint8_t>(rng() & 0xFF);
                 (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Lambda to dispatch based on KV type
             auto launch = [&]() -> int
@@ -318,21 +324,24 @@ namespace
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 case KVType::FP16:
                     return hipFlashAttn_prefill_fa2_fp16(
                         d_Q, d_K, d_V, d_O,
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 case KVType::Q8_1:
                     return hipFlashAttn_prefill_fa2_q8_1(
                         d_Q, d_K, d_V, d_O,
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 }
                 return -1;
             };
@@ -347,7 +356,7 @@ namespace
                     goto cleanup;
                 }
             }
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Benchmark with HIP events
             {
@@ -360,8 +369,7 @@ namespace
 
                 for (int i = 0; i < BENCH_ITERS; ++i)
                 {
-                    (void)hipDeviceSynchronize();
-                    (void)hipEventRecord(ev_start, nullptr);
+                    (void)hipEventRecord(ev_start, stream);
 
                     int rc = launch();
                     if (rc != 0)
@@ -372,7 +380,7 @@ namespace
                         goto cleanup;
                     }
 
-                    (void)hipEventRecord(ev_stop, nullptr);
+                    (void)hipEventRecord(ev_stop, stream);
                     (void)hipEventSynchronize(ev_stop);
 
                     float ms = 0.0f;
@@ -395,6 +403,7 @@ namespace
             (void)hipFree(d_K);
             (void)hipFree(d_V);
             (void)hipFree(d_O);
+            (void)hipStreamDestroy(stream);
 
             return result;
 #endif
@@ -649,6 +658,24 @@ namespace
             /*seq_lengths=*/{128, 256, 512, 1024},
             /*tp_degrees=*/{1, 2, 4},
             {KVType::FP32, KVType::FP16, KVType::Q8_1});
+    }
+
+    /**
+     * @brief Measure the exact ROCm single-device attention geometry used by
+     *        the Qwen3.6-35B-A3B production prefill benchmark.
+     *
+     * The 425-row point is the deterministic dashboard prompt length.  It is
+     * deliberately isolated from the broad model sweep so ISA/resource tuning
+     * can iterate in seconds and rocprof can attach to one unambiguous kernel
+     * specialization.
+     */
+    TEST_F(ROCmFlashAttentionPrefillPerf, Qwen36MoE_Production425_FP16)
+    {
+        runKVTypeSweep(
+            kQwen36MoE,
+            /*seq_lengths=*/{425},
+            /*tp_degrees=*/{1},
+            {KVType::FP16});
     }
 
     // ---------------------------------------------------------------------------

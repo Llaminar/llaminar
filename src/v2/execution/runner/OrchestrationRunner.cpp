@@ -1781,10 +1781,8 @@ namespace llaminar2
         mtp_bypass_reason_.clear();
         mtp_stats_ = {};
         device_generation_terminal_ledger_authoritative_ = false;
-        admitted_device_generation_token_budget_.reset();
-        ready_sampled_token_.reset();
-        ready_sampled_params_.reset();
-        ready_sampled_resident_state_.reset();
+        device_generation_admission_.reset();
+        ready_mtp_condition_.reset();
         pending_mtp_condition_token_.reset();
         pending_mtp_condition_params_.reset();
         pending_mtp_condition_resident_state_.reset();
@@ -1935,9 +1933,7 @@ namespace llaminar2
                           << " bypass_reason=" << coordinated_hit.bypass_reason);
 
                 prefill_logits_ready_ = false;
-                ready_sampled_token_.reset();
-                ready_sampled_params_.reset();
-                ready_sampled_resident_state_.reset();
+                ready_mtp_condition_.reset();
                 pending_mtp_condition_token_.reset();
                 pending_mtp_condition_params_.reset();
                 pending_mtp_condition_resident_state_.reset();
@@ -2348,11 +2344,9 @@ namespace llaminar2
         mtp_bypass_reason_.clear();
         mtp_stats_ = {};
         device_generation_terminal_ledger_authoritative_ = false;
-        admitted_device_generation_token_budget_.reset();
+        device_generation_admission_.reset();
         prefix_request_summary_ = {};
-        ready_sampled_token_.reset();
-        ready_sampled_params_.reset();
-        ready_sampled_resident_state_.reset();
+        ready_mtp_condition_.reset();
         prefill_logits_ready_ = false;
         pending_mtp_condition_token_.reset();
         pending_mtp_condition_params_.reset();
@@ -2360,15 +2354,20 @@ namespace llaminar2
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
         decode_transaction_planning_position_.reset();
-        device_generation_admission_pending_ =
-            runner_->primaryDeviceId().is_gpu();
         last_token_ = next_states.front().last_token;
 
         if (!runner_->forward_batch(converted))
         {
-            device_generation_admission_pending_ = false;
+            device_generation_admission_.reset();
             clearBatchedDecodeState();
             return setError("Forward batch failed during request-batched prefill");
+        }
+        if (runner_->primaryDeviceId().is_gpu() &&
+            !device_generation_admission_.openAfterPrefill())
+        {
+            clearBatchedDecodeState();
+            return setError(
+                "Request-batched GPU prefill could not open its unique device-generation admission boundary");
         }
 
         /*
@@ -4946,8 +4945,7 @@ namespace llaminar2
         if (!runner_ || !runner_->primaryDeviceId().is_gpu())
         {
             decode_transaction_planning_position_.reset();
-            device_generation_admission_pending_ = false;
-            admitted_device_generation_token_budget_.reset();
+            device_generation_admission_.reset();
             return true;
         }
         if (committed_tokens < 0)
@@ -4974,8 +4972,12 @@ namespace llaminar2
          * this initializer preserves one transaction-position lifecycle for
          * ordinary, greedy-MTP, and stochastic-MTP decode.
          */
-        admitted_device_generation_token_budget_.reset();
-        device_generation_admission_pending_ = true;
+        device_generation_admission_.reset();
+        if (!device_generation_admission_.openAfterPrefill())
+        {
+            return setError(
+                "GPU prefill could not open its unique device-generation admission boundary");
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "gpu_decode_transaction_position_initializations",
@@ -4989,22 +4991,23 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::admitScalarDeviceResidentGeneration(
-        bool grouped_device_verify)
+        bool grouped_device_verify,
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition)
     {
-        if (!grouped_device_verify || !device_generation_admission_pending_)
+        if (!grouped_device_verify)
             return true;
+        if (!device_generation_admission_.awaitsAdmission())
+        {
+            return setError(
+                "GPU grouped MTP generation reached a decode boundary without an admission-ready controller lifecycle");
+        }
         if (!runner_ || !decode_transaction_planning_position_.has_value() ||
             *decode_transaction_planning_position_ < 0)
         {
             return setError(
                 "GPU grouped MTP generation admission has no initialized prefill boundary");
         }
-        if (admitted_device_generation_token_budget_.has_value())
-        {
-            return setError(
-                "GPU grouped MTP generation admission encountered an unclosed resident response ledger");
-        }
-
         int response_budget = decode_step_token_budget_;
         if (response_budget <= 0)
         {
@@ -5021,16 +5024,23 @@ namespace llaminar2
                 "GPU grouped MTP generation admission has no positive response capacity");
         }
 
-        if (!runner_->beginDeviceResidentGeneration(
-                /*request_count=*/1,
-                response_budget))
+        const DeviceGenerationAdmissionRequest admission{
+            .request_count = 1,
+            .max_new_tokens = response_budget,
+            .initial_leading_row_disposition =
+                initial_leading_row_disposition,
+        };
+        if (!runner_->beginDeviceResidentGeneration(admission))
         {
             return setError(
                 "Failed to admit the device-resident GPU generation response ledger");
         }
 
-        admitted_device_generation_token_budget_ = response_budget;
-        device_generation_admission_pending_ = false;
+        if (!device_generation_admission_.admitController(response_budget))
+        {
+            return setError(
+                "GPU grouped MTP generation could not bind its response budget to the admitted controller");
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_admission_boundaries",
@@ -5039,6 +5049,11 @@ namespace llaminar2
             {},
             {{"request_count", "1"},
              {"response_budget", std::to_string(response_budget)},
+             {"initial_leading_committed_output_count",
+              std::to_string(
+                  sampling_math::
+                      device_generation_leading_committed_output_count(
+                          initial_leading_row_disposition))},
              {"boundary", "first_scalar_grouped_mtp_decode"}});
         return true;
     }
@@ -5053,15 +5068,10 @@ namespace llaminar2
             return setError(
                 "Request-batched device generation admission requires one complete GPU request set");
         }
-        if (!device_generation_admission_pending_)
+        if (!device_generation_admission_.awaitsAdmission())
         {
             return setError(
                 "Request-batched device generation reached sampling without an open prefill admission boundary");
-        }
-        if (admitted_device_generation_token_budget_.has_value())
-        {
-            return setError(
-                "Request-batched device generation encountered an unclosed resident response ledger");
         }
 
         int maximum_committed_tokens = 0;
@@ -5093,15 +5103,24 @@ namespace llaminar2
         }
 
         if (!runner_->beginDeviceResidentGeneration(
-                request_count,
-                response_budget))
+                DeviceGenerationAdmissionRequest{
+                    .request_count = request_count,
+                    .max_new_tokens = response_budget,
+                    .initial_leading_row_disposition =
+                        sampling_math::
+                            DeviceGenerationLeadingRowDisposition::
+                                PendingResponse,
+                }))
         {
             return setError(
                 "Failed to admit the request-batched device generation response ledger");
         }
 
-        admitted_device_generation_token_budget_ = response_budget;
-        device_generation_admission_pending_ = false;
+        if (!device_generation_admission_.admitController(response_budget))
+        {
+            return setError(
+                "Request-batched device generation could not bind its response budget to the admitted controller");
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_admission_boundaries",
@@ -5379,7 +5398,7 @@ namespace llaminar2
 
         const int request_count = publication_request.requestCount();
         const int admitted_token_budget =
-            admitted_device_generation_token_budget_.value_or(0);
+            device_generation_admission_.tokenBudget();
         if (admitted_token_budget <= 0 ||
             static_cast<int>(batched_request_states_.size()) != request_count)
         {
@@ -5560,8 +5579,12 @@ namespace llaminar2
             {},
             terminal_tags);
 
-        admitted_device_generation_token_budget_.reset();
-        device_generation_admission_pending_ = false;
+        if (!device_generation_admission_.controllerActive())
+        {
+            return fail(
+                "Request-batched terminal ledger lost its active controller lifecycle before retirement");
+        }
+        device_generation_admission_.reset();
         device_generation_terminal_ledger_authoritative_ = true;
         clearBatchedDecodeState();
         return result;
@@ -5659,16 +5682,25 @@ namespace llaminar2
         const int response_count =
             static_cast<int>(request_result.tokens.size());
         const int admitted_token_budget =
-            admitted_device_generation_token_budget_.value_or(0);
+            device_generation_admission_.tokenBudget();
         if (admitted_token_budget <= 0 || response_count <= 0 ||
             request_result.remaining_token_count < 0 ||
+            !sampling_math::
+                valid_device_generation_leading_row_disposition(
+                    request_result.next_leading_row_disposition) ||
+            (request_result.model_stopped &&
+             request_result.next_leading_row_disposition !=
+                 sampling_math::DeviceGenerationLeadingRowDisposition::
+                     PendingResponse) ||
             response_count + request_result.remaining_token_count !=
                 admitted_token_budget ||
             (request_result.remaining_token_count > 0 &&
              !request_result.model_stopped) ||
             request_result.transaction_count <= 0 ||
             request_result.published_state_commit_count < 0 ||
-            request_result.published_state_commit_count > response_count + 1)
+            request_result.published_state_commit_count > response_count + 1 ||
+            (!request_result.model_stopped &&
+             request_result.published_state_commit_count <= 0))
         {
             return fail(
                 std::string("Device-resident ") + sampling_name +
@@ -5680,6 +5712,11 @@ namespace llaminar2
                 std::to_string(admitted_token_budget) +
                 " model_stopped=" +
                 (request_result.model_stopped ? "true" : "false") +
+                " next_leading_committed_output_count=" +
+                std::to_string(
+                    sampling_math::
+                        device_generation_leading_committed_output_count(
+                            request_result.next_leading_row_disposition)) +
                 " transaction_count=" +
                 std::to_string(request_result.transaction_count) +
                 " published_state_commit_count=" +
@@ -5698,15 +5735,48 @@ namespace llaminar2
                     : last_error_);
         }
 
+        std::optional<ReadyMTPCondition> terminal_ready_condition;
+        if (!request_result.model_stopped)
+        {
+            /*
+             * Exhausting the caller's response budget is not a model-state
+             * boundary. The final compact publication has already committed
+             * the exact verifier prefix and sampled the token that belongs at
+             * the next logical position. finishDeviceResidentGeneration()
+             * leaves that mailbox live by contract; preserve the authenticated
+             * handle itself and never infer the continuation from the last
+             * host-visible response token.
+             */
+            DeviceResidentLogicalSequenceStateHandle resident_condition =
+                runner_->deviceResidentLogicalSequenceState();
+            if (!resident_condition.coversRequest(0) ||
+                resident_condition.device != terminal.device ||
+                resident_condition.device != runner_->primaryDeviceId())
+            {
+                return fail(
+                    std::string("Device-resident ") + sampling_name +
+                    " MTP terminal ledger has no matching live continuation mailbox");
+            }
+            terminal_ready_condition =
+                ReadyMTPCondition::deviceResident(
+                    active_sampling_params_,
+                    std::move(resident_condition),
+                    request_result.next_leading_row_disposition);
+            if (!terminal_ready_condition->valid())
+            {
+                return fail(
+                    std::string("Device-resident ") + sampling_name +
+                    " MTP terminal continuation is incomplete");
+            }
+        }
+
         pending_mtp_condition_token_.reset();
         pending_mtp_condition_params_.reset();
         pending_mtp_condition_resident_state_.reset();
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
-        prefill_logits_ready_ = false;
-        ready_sampled_token_.reset();
-        ready_sampled_params_.reset();
-        ready_sampled_resident_state_.reset();
+        prefill_logits_ready_ = terminal_ready_condition.has_value();
+        ready_mtp_condition_ = std::move(terminal_ready_condition);
 
         for (const int32_t token : request_result.tokens)
         {
@@ -5770,7 +5840,13 @@ namespace llaminar2
         mtp_stats_.depth_policy_demotions += static_cast<uint64_t>(
             request_result.depth_demotion_count);
         mtp_stats_.current_depth = request_result.final_draft_depth;
-        admitted_device_generation_token_budget_.reset();
+        if (!device_generation_admission_.retireController(
+                request_result.model_stopped))
+        {
+            return fail(
+                std::string("Device-resident ") + sampling_name +
+                " MTP could not retire its controller into the next explicit request phase");
+        }
 
         const PerfStatsCollector::Tags terminal_tags{
             {"path", "device_resident_generation_loop"},
@@ -5919,10 +5995,8 @@ namespace llaminar2
         }
 
         const bool use_ready_logits = prefill_logits_ready_;
-        const std::optional<int32_t> ready_sampled_token = ready_sampled_token_;
-        const std::optional<SamplingParams> ready_sampled_params = ready_sampled_params_;
-        const std::optional<DeviceResidentLogicalSequenceStateHandle>
-            ready_sampled_resident_state = ready_sampled_resident_state_;
+        const std::optional<ReadyMTPCondition> ready_condition =
+            ready_mtp_condition_;
         const std::optional<int32_t> pending_condition_token =
             pending_mtp_condition_token_;
         const std::optional<SamplingParams> pending_condition_params =
@@ -5936,9 +6010,7 @@ namespace llaminar2
         const std::optional<SamplingParams> prelaunched_first_sidecar_params =
             prelaunched_mtp_first_sidecar_params_;
         prefill_logits_ready_ = false;
-        ready_sampled_token_.reset();
-        ready_sampled_params_.reset();
-        ready_sampled_resident_state_.reset();
+        ready_mtp_condition_.reset();
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
         PrefixStateSnapshot rollback_checkpoint;
@@ -5965,9 +6037,7 @@ namespace llaminar2
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
                                            std::string{}, {{"reason", message}});
             prefill_logits_ready_ = use_ready_logits;
-            ready_sampled_token_ = ready_sampled_token;
-            ready_sampled_params_ = ready_sampled_params;
-            ready_sampled_resident_state_ = ready_sampled_resident_state;
+            ready_mtp_condition_ = ready_condition;
             pending_mtp_condition_token_ = pending_condition_token;
             pending_mtp_condition_params_ = pending_condition_params;
             pending_mtp_condition_resident_state_ =
@@ -6064,9 +6134,7 @@ namespace llaminar2
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
                                            std::string{}, {{"reason", message}});
             prefill_logits_ready_ = use_ready_logits;
-            ready_sampled_token_ = ready_sampled_token;
-            ready_sampled_params_ = ready_sampled_params;
-            ready_sampled_resident_state_ = ready_sampled_resident_state;
+            ready_mtp_condition_ = ready_condition;
             pending_mtp_condition_token_ = pending_condition_token;
             pending_mtp_condition_params_ = pending_condition_params;
             pending_mtp_condition_resident_state_ =
@@ -6129,29 +6197,30 @@ namespace llaminar2
             return std::nullopt;
         };
 
-        if (use_ready_logits && ready_sampled_token.has_value())
+        if (ready_condition.has_value())
         {
             /*
-             * A ready verifier token is sampled one decode step before it is
-             * consumed. Treat it as part of the atomic MTP transaction: if the
-             * active sampling contract changed, consuming the cached token would
-             * silently mix two sampling regimes in one request.
+             * A ready verifier condition is sampled one decode boundary before
+             * it is consumed. Treat its authority and sampling contract as one
+             * atomic state: a detached condition or a changed policy would mix
+             * two sampling regimes in one request.
              */
-            if (!ready_sampled_params.has_value())
+            if (!use_ready_logits)
             {
                 return fail_after_checkpoint(
-                    "Ready MTP verifier token is missing the sampling parameters that produced it");
+                    "Ready MTP condition exists without a terminal-logits boundary");
             }
-            if (!samplingParamsEqual(*ready_sampled_params, active_sampling_params_))
+            if (!ready_condition->valid())
             {
                 return fail_after_checkpoint(
-                    "Ready MTP verifier token was sampled with different sampling parameters");
+                    "Ready MTP condition has an invalid authority payload");
             }
-            if (ready_sampled_resident_state.has_value() &&
-                !ready_sampled_resident_state->valid())
+            if (!samplingParamsEqual(
+                    ready_condition->sampling_params,
+                    active_sampling_params_))
             {
                 return fail_after_checkpoint(
-                    "Ready MTP verifier token resident logical-state handle is stale or incomplete");
+                    "Ready MTP condition was sampled with different sampling parameters");
             }
         }
 
@@ -6287,7 +6356,7 @@ namespace llaminar2
          * consumes the pending marker.
          */
         const bool materialize_dynamic_generation_loop_this_step =
-            device_generation_admission_pending_ &&
+            device_generation_admission_.awaitsAdmission() &&
             use_grouped_outcome_device_resident_publication_verifier &&
             mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         const bool use_grouped_outcome_host_publication_verifier =
@@ -6338,11 +6407,11 @@ namespace llaminar2
             pending_condition_candidate &&
             (use_grouped_outcome_host_publication_verifier ||
              use_grouped_outcome_device_resident_publication_verifier);
-        const bool ready_sampled_has_resident_state =
+        const bool ready_condition_has_resident_state =
             use_ready_logits &&
-            ready_sampled_token.has_value() &&
-            ready_sampled_resident_state.has_value() &&
-            ready_sampled_resident_state->valid();
+            ready_condition.has_value() &&
+            ready_condition->resident_state.has_value() &&
+            ready_condition->resident_state->valid();
         std::optional<DeviceResidentLogicalSequenceStateHandle>
             first_token_resident_state;
         if (use_pending_condition_row &&
@@ -6350,9 +6419,9 @@ namespace llaminar2
         {
             first_token_resident_state = pending_condition_resident_state;
         }
-        else if (ready_sampled_has_resident_state)
+        else if (ready_condition_has_resident_state)
         {
-            first_token_resident_state = ready_sampled_resident_state;
+            first_token_resident_state = ready_condition->resident_state;
         }
         if (use_pending_condition_row)
         {
@@ -6726,18 +6795,22 @@ namespace llaminar2
                     return std::string(
                         "MTP transaction produced a stale ready-token resident logical-state handle");
                 }
-                ready_sampled_token_ = *ready_token;
-                ready_sampled_params_ = active_sampling_params_;
-                ready_sampled_resident_state_ = ready_condition_resident_state;
+                ready_mtp_condition_ = ReadyMTPCondition::hostVisible(
+                    *ready_token,
+                    active_sampling_params_,
+                    ready_condition_resident_state);
+                if (!ready_mtp_condition_->valid())
+                {
+                    return std::string(
+                        "MTP transaction produced an invalid host-visible ready condition");
+                }
                 pending_mtp_condition_token_.reset();
                 pending_mtp_condition_params_.reset();
                 pending_mtp_condition_resident_state_.reset();
             }
             else
             {
-                ready_sampled_token_.reset();
-                ready_sampled_params_.reset();
-                ready_sampled_resident_state_.reset();
+                ready_mtp_condition_.reset();
             }
 
             for (size_t i = static_cast<size_t>(emitted_token_start_index);
@@ -7240,8 +7313,12 @@ namespace llaminar2
                   std::to_string(transaction_draft_capacity)},
                  {"authority", "device_generation_controller"}});
         }
+        const bool first_condition_was_already_emitted =
+            use_pending_condition_row ||
+            (use_ready_logits && ready_condition.has_value() &&
+             ready_condition->wasAlreadyEmitted());
         const int first_token_output_budget_cost =
-            use_pending_condition_row ? 0 : 1;
+            first_condition_was_already_emitted ? 0 : 1;
         const int pre_sample_effective_draft_count =
             decode_step_token_budget_ > 0
                 ? std::min(
@@ -7261,7 +7338,7 @@ namespace llaminar2
         const bool admit_device_generation_this_step =
             use_grouped_outcome_device_resident_publication_verifier &&
             pre_sample_effective_draft_count > 0;
-        if (device_generation_admission_pending_ &&
+        if (device_generation_admission_.awaitsAdmission() &&
             admit_device_generation_this_step)
         {
             PerfStatsCollector::addCounter(
@@ -7281,7 +7358,12 @@ namespace llaminar2
                  {"selection_boundary", "pre_first_draft"}});
         }
         if (!admitScalarDeviceResidentGeneration(
-                admit_device_generation_this_step))
+                admit_device_generation_this_step,
+                first_condition_was_already_emitted
+                    ? sampling_math::
+                          DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                    : sampling_math::
+                          DeviceGenerationLeadingRowDisposition::PendingResponse))
         {
             return fail_after_checkpoint(
                 last_error_.empty()
@@ -7312,11 +7394,11 @@ namespace llaminar2
 
         int32_t first_token = -1;
         bool first_token_device_target_slot_available = false;
-        bool first_token_is_pending_condition = false;
+        const bool first_token_is_already_emitted_condition =
+            first_condition_was_already_emitted;
         if (use_pending_condition_row)
         {
             first_token = condition_token;
-            first_token_is_pending_condition = true;
             PerfStatsCollector::addCounter(
                 "mtp",
                 "first_token_pending_condition_rows",
@@ -7325,9 +7407,10 @@ namespace llaminar2
                 {},
                 {{"token", std::to_string(first_token)}});
         }
-        else if (use_ready_logits && ready_sampled_token.has_value())
+        else if (use_ready_logits && ready_condition.has_value() &&
+                 ready_condition->host_token.has_value())
         {
-            first_token = *ready_sampled_token;
+            first_token = *ready_condition->host_token;
             PerfStatsCollector::addCounter("mtp", "first_token_ready_cache_hits", 1.0, "decode");
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -7336,6 +7419,31 @@ namespace llaminar2
                 "decode",
                 {},
                 {{"token", std::to_string(first_token)}});
+        }
+        else if (use_ready_logits && ready_condition.has_value() &&
+                 ready_condition->isDeviceResidentOnly())
+        {
+            /*
+             * The terminal generation loop sampled this condition on device
+             * after committing the exact previous verifier prefix. Its fused
+             * publisher already refreshed canonical target slot zero and the
+             * logical-state mailbox. Keep a sentinel only in diagnostic host
+             * vectors; every production sidecar/verifier consumer below reads
+             * the authenticated device sources.
+             */
+            first_token = kDeferredMTPFirstTokenShadow;
+            first_token_device_target_slot_available = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "first_token_resident_continuation_uses",
+                1.0,
+                "decode",
+                {},
+                {{"publication_generation",
+                  std::to_string(
+                      ready_condition->resident_state
+                          ->publication_generation)},
+                 {"host_token_materializations", "0"}});
         }
         else
         {
@@ -7754,6 +7862,38 @@ namespace llaminar2
             PerfStatsCollector::addCounter("mtp", "budget_limited_direct_emits", 1.0, "decode");
             PerfStatsCollector::addCounter("mtp", "output_tokens", 1.0, "decode");
 
+            if (first_token == kDeferredMTPFirstTokenShadow)
+            {
+                /*
+                 * A one-token response budget has no grouped verifier ledger in
+                 * which to return this already-sampled condition token. Observe
+                 * exactly the compact mailbox row at the public result boundary;
+                 * execution below continues to consume the mailbox and target
+                 * slot directly, so this host value never becomes an execution
+                 * input or a replacement state authority.
+                 */
+                if (!first_token_resident_state.has_value() ||
+                    !first_token_resident_state->coversRequest(0) ||
+                    !runner_->observeDeviceResidentNextConditionTokens(
+                        *first_token_resident_state,
+                        /*request_count=*/1,
+                        &first_token) ||
+                    first_token < 0 || first_token >= vocab)
+                {
+                    return fail_after_checkpoint(
+                        "MTP GPU budget-limited direct emit could not materialize its terminal resident token");
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "budget_limited_direct_emit_terminal_token_materializations",
+                    1.0,
+                    "decode",
+                    runner_->primaryDeviceId().toString(),
+                    {{"boundary", "host_result"},
+                     {"bytes", std::to_string(sizeof(first_token))},
+                     {"execution_authority", "device_mailbox"}});
+            }
+
             const bool first_token_is_stop =
                 std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
             if (!first_token_is_stop)
@@ -7943,7 +8083,8 @@ namespace llaminar2
         bool first_token_is_stop =
             first_token != kDeferredMTPFirstTokenShadow &&
             std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
-        if (first_token_is_stop && !first_token_is_pending_condition)
+        if (first_token_is_stop &&
+            !first_token_is_already_emitted_condition)
         {
             /*
              * A host-visible stop token selected from the current target row is
@@ -7990,7 +8131,7 @@ namespace llaminar2
         draft_tokens.push_back(first_token);
         Sampler draft_sampler = sampler_;
         if ((stochastic_verify || use_sampling_penalties) &&
-            !first_token_is_pending_condition &&
+            !first_token_is_already_emitted_condition &&
             first_token != kDeferredMTPFirstTokenShadow)
         {
             draft_sampler.record_token(first_token);
@@ -8260,7 +8401,7 @@ namespace llaminar2
             pending_condition_has_resident_state &&
             use_device_draft_token_sidecar;
         const bool use_resident_ready_condition_sidecar =
-            ready_sampled_has_resident_state &&
+            ready_condition_has_resident_state &&
             use_device_draft_token_sidecar;
         auto prelaunch_matches_resident_state =
             [&](const std::optional<DeviceResidentLogicalSequenceStateHandle> &expected)
@@ -8280,7 +8421,8 @@ namespace llaminar2
             (use_sidecar_stream_handoff_for_stochastic ||
              use_sidecar_stream_handoff_for_grouped_greedy) &&
             ((use_resident_ready_condition_sidecar &&
-              prelaunch_matches_resident_state(ready_sampled_resident_state)) ||
+              prelaunch_matches_resident_state(
+                  ready_condition->resident_state)) ||
              (use_resident_pending_condition_sidecar &&
               prelaunch_matches_resident_state(pending_condition_resident_state)));
         if (prelaunched_first_sidecar_resident_state.has_value() &&
@@ -8346,7 +8488,7 @@ namespace llaminar2
                         {
                             sidecar_ok = runner_
                                 ->forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(
-                                    *ready_sampled_resident_state,
+                                    *ready_condition->resident_state,
                                     /*request_index=*/0,
                                     draft_idx,
                                     sample_host_shadow);
@@ -8409,7 +8551,7 @@ namespace llaminar2
                              */
                             sidecar_ok =
                                 runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
-                                    *ready_sampled_resident_state,
+                                    *ready_condition->resident_state,
                                     /*request_index=*/0);
                             if (sidecar_ok)
                             {
@@ -8477,7 +8619,7 @@ namespace llaminar2
                     {
                         sidecar_ok =
                             runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
-                                *ready_sampled_resident_state,
+                                *ready_condition->resident_state,
                                 /*request_index=*/0);
                     }
                     else if (use_resident_pending_condition_sidecar)
@@ -9994,7 +10136,7 @@ namespace llaminar2
         const MTPVisibleStateCommitPlan visible_state_commit_plan =
             planMTPVisibleStateCommit(
                 static_cast<int>(draft_tokens.size()),
-                first_token_is_pending_condition ? 1 : 0,
+                first_token_is_already_emitted_condition ? 1 : 0,
                 decode_step_token_budget_);
         if (!visible_state_commit_plan)
         {
@@ -10016,7 +10158,7 @@ namespace llaminar2
               std::to_string(
                   visible_state_commit_plan.remaining_output_budget)},
              {"pending_condition_input",
-              first_token_is_pending_condition ? "true" : "false"},
+              first_token_is_already_emitted_condition ? "true" : "false"},
              {"response_boundary_clipped",
               visible_state_commit_plan.response_boundary_clipped
                   ? "true"
@@ -10874,7 +11016,7 @@ namespace llaminar2
                 catchup.main_forward_token_count + correction_forward_count;
             result.is_complete = result.is_complete || stopped_on_output;
             const int emitted_token_start_index =
-                first_token_is_pending_condition ? 1 : 0;
+                first_token_is_already_emitted_condition ? 1 : 0;
             if (emitted_token_start_index >
                 static_cast<int>(accepted_tokens.size()))
             {
@@ -11036,7 +11178,7 @@ namespace llaminar2
                  {"ready_token", std::to_string(ready_token)},
                  {"raw_ready_token", std::to_string(raw_ready_token)},
                  {"pending_condition_input",
-                  first_token_is_pending_condition ? "true" : "false"},
+                  first_token_is_already_emitted_condition ? "true" : "false"},
                  {"next_pending_condition_token",
                   next_pending_condition_token.has_value()
                       ? std::to_string(*next_pending_condition_token)
@@ -12232,6 +12374,13 @@ namespace llaminar2
                 {
                     return decodeStepMTP();
                 }
+                if (ready_mtp_condition_.has_value() &&
+                    ready_mtp_condition_->isDeviceResidentOnly())
+                {
+                    result.error =
+                        "Device-resident MTP continuation cannot cross into a depth-zero serial decode transaction";
+                    return result;
+                }
                 prelaunched_mtp_first_sidecar_resident_state_.reset();
                 prelaunched_mtp_first_sidecar_params_.reset();
                 recordMTPDepthZeroBypass();
@@ -12259,33 +12408,43 @@ namespace llaminar2
             // prefill logits instead of re-feeding the last prompt token.
             // This avoids processing the last token twice (which corrupts GDN
             // recurrence state and creates duplicate KV cache entries).
-            if (ready_sampled_token_.has_value())
+            if (ready_mtp_condition_.has_value())
             {
-                if (!ready_sampled_params_.has_value())
+                if (!ready_mtp_condition_->valid())
                 {
                     result.error =
-                        "Ready MTP verifier token is missing the sampling parameters that produced it";
+                        "Ready MTP condition has an invalid authority payload";
                     return result;
                 }
-                if (!samplingParamsEqual(*ready_sampled_params_, active_sampling_params_))
+                if (!samplingParamsEqual(
+                        ready_mtp_condition_->sampling_params,
+                        active_sampling_params_))
                 {
                     result.error =
-                        "Ready MTP verifier token was sampled with different sampling parameters";
+                        "Ready MTP condition was sampled with different sampling parameters";
                     return result;
                 }
-                ready_token_for_decode = ready_sampled_token_;
-                ready_sampled_token_.reset();
-                ready_sampled_params_.reset();
-                ready_sampled_resident_state_.reset();
+                if (ready_mtp_condition_->isDeviceResidentOnly())
+                {
+                    result.error =
+                        "Device-resident MTP continuation reached the serial decode sampler";
+                    return result;
+                }
+                ready_token_for_decode =
+                    ready_mtp_condition_->host_token;
+                ready_mtp_condition_.reset();
             }
             prefill_logits_ready_ = false;
             LOG_TRACE("[decodeStep] Using prefill logits (skipping forward)");
         }
         else
         {
-            ready_sampled_token_.reset();
-            ready_sampled_params_.reset();
-            ready_sampled_resident_state_.reset();
+            if (ready_mtp_condition_.has_value())
+            {
+                result.error =
+                    "Ready MTP condition exists without a terminal-logits boundary";
+                return result;
+            }
             LOG_TRACE("[decodeStep] Running forward with last_token_=" << last_token_);
             /*
              * Single-token decode produces logits that are immediately
@@ -12696,9 +12855,7 @@ namespace llaminar2
              * committing, or forwarding the terminal token on any device.
              */
             prefill_logits_ready_ = false;
-            ready_sampled_token_.reset();
-            ready_sampled_params_.reset();
-            ready_sampled_resident_state_.reset();
+            ready_mtp_condition_.reset();
             PerfStatsCollector::addCounter(
                 "mtp",
                 "forced_stop_token_state_mutations_skipped",
@@ -12727,9 +12884,7 @@ namespace llaminar2
             }
 
             prefill_logits_ready_ = false;
-            ready_sampled_token_.reset();
-            ready_sampled_params_.reset();
-            ready_sampled_resident_state_.reset();
+            ready_mtp_condition_.reset();
 
             /*
              * Request policy selected `token` on the host, but execution state
@@ -12808,9 +12963,7 @@ namespace llaminar2
             if (prefill_logits_ready_)
             {
                 prefill_logits_ready_ = false;
-                ready_sampled_token_.reset();
-                ready_sampled_params_.reset();
-                ready_sampled_resident_state_.reset();
+                ready_mtp_condition_.reset();
             }
             else if (!token_is_stop)
             {
@@ -13256,9 +13409,7 @@ namespace llaminar2
         ::malloc_trim(0);
 #endif
         prefill_logits_ready_ = false;
-        ready_sampled_token_.reset();
-        ready_sampled_params_.reset();
-        ready_sampled_resident_state_.reset();
+        ready_mtp_condition_.reset();
         pending_mtp_condition_token_.reset();
         pending_mtp_condition_params_.reset();
         pending_mtp_condition_resident_state_.reset();
@@ -13266,8 +13417,7 @@ namespace llaminar2
         prelaunched_mtp_first_sidecar_params_.reset();
         device_moe_maintenance_published_in_decode_step_ = false;
         decode_transaction_planning_position_.reset();
-        device_generation_admission_pending_ = false;
-        admitted_device_generation_token_budget_.reset();
+        device_generation_admission_.reset();
         device_generation_terminal_ledger_authoritative_ = false;
         clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);

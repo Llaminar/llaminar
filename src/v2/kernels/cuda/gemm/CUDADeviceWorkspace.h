@@ -2,9 +2,9 @@
  * @file CUDADeviceWorkspace.h
  * @brief Per-device GPU workspace for CUDA kernel dispatch.
  *
- * Replaces process-global static state (g_rm_cache, getKparPartials,
- * g_streamk_fixup_buf, g_ws) with properly scoped, lifecycle-managed
- * objects.  Owned by KernelFactory, one per device, freed on clearCache().
+ * Provides stable, lifecycle-managed arenas for canonical decode and prefill
+ * K-partition reductions. Owned by KernelFactory, one per device, and released
+ * when its prepared-kernel cache is cleared.
  *
  * Thread safety: Each workspace is single-device.  The row-major cache
  * has its own mutex for concurrent GEMV dispatch from graph replay.
@@ -30,7 +30,7 @@ extern "C"
     /** Per-weight row-major transpose (ROWPAR acceleration). */
     typedef struct CUDARowMajorWeights_ CUDARowMajorWeights;
 
-    /** Per-device prefill workspace (stream-K fixup buffer). */
+    /** Per-device prefill workspace for canonical public-M1 K partials. */
     typedef struct CUDAPrefillContext_ CUDAPrefillContext;
 
     /** Per-device cuBLAS workspace (handle + FP16 staging). */
@@ -80,20 +80,16 @@ extern "C"
     void cudaPrefillContext_destroy(CUDAPrefillContext *ctx);
     void cudaPrefillContext_bindWorkspace(
         CUDAPrefillContext *ctx,
-        float *splitk_partials,
-        size_t splitk_partials_bytes,
-        float *streamk_fixup,
-        size_t streamk_fixup_bytes);
+        float *canonical_kpart_partials,
+        size_t canonical_kpart_partials_bytes);
     bool cudaNativeVNNIPrefill_getWorkspacePlan(
         uint8_t codebook_id,
         int M,
         int N,
         int K,
         int cuda_device_id,
-        size_t *splitk_partials_bytes,
-        size_t *streamk_fixup_bytes,
-        int *planned_split_k,
-        int *planned_streamk);
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions);
 
     // -----------------------------------------------------------------
     // cuBLAS context lifetime

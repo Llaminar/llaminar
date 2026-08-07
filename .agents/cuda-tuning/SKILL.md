@@ -339,13 +339,16 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    The wrapper intentionally uses proxy hit-rate thresholds for `family-smoke`;
    production fallback-family/exact thresholds apply only to `qwen36` and `all`.
 
-4. Generate prefill tables with
-   `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py`.
-   This reads `TileSweep_AllStrategies` CSVs, validates codebook ids through the
-   shared `tests/v2/performance/kernels/native_vnni_codebooks.py` map, skips
-   off-policy `M` rows by default, can merge an existing generated include via
-   `--base-include`, and emits
-   `src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc`.
+4. Collect and install dense prefill exact overlays through the resumable
+   `native_vnni_dispatch.production_dense_prefill_sweep` transaction. It owns
+   the all-format Qwen geometry/M inventory, one process per physical GPU,
+   per-candidate native-event timing sidecars, byte certificates, atomic cell
+   publication, resume validation, and deterministic combination. CUDA
+   candidates are only AUTO, direct BK64 output tiles, BK256, and the exact
+   public-M=1 K-partition tree; an independently chosen reduction tree is not a
+   launchable or benchmarkable candidate. Generate the include only after
+   `combine` authenticates every planned cell, using
+   `native_vnni_dispatch.dense_production_overlay`.
 5. When debugging the decode trainer itself, the lower-level flow is
    `Perf__CUDANativeVNNIDecodeTrainer.cpp` ->
    `analyze_cuda_native_vnni_decode_trainer.py` -> the common compiler under
@@ -372,26 +375,36 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    before candidate timing and size its `DeviceWorkspaceManager` from
    `IWorkspaceConsumer::getWorkspaceRequirements()`; fixed 512 MiB budgets fail
    on giant LM-head small-M partial buffers.
-6. Validate generated artifacts with
-   `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
-   and the CUDA generator alias tests:
-   `V2_Unit_CUDAPrefillDispatchGeneratorAliases`,
+6. Validate generated artifacts with the transaction unit suite,
    `V2_Unit_CUDAGemvDispatchGeneratorAliases`, and
    `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`. For decode trainer changes,
    include `V2_Unit_GpuWorkspaceAllocationPolicy` so the explicit-stream
-   trainer contract is checked.
+   trainer contract is checked. CUDA prefill installation additionally requires
+   `V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats` and the
+   backend GEMM source-policy gate; a timing winner without byte equality is an
+   invalid corpus row, not an installable exception.
 
-Example prefill-generation shape:
+Example resumable CUDA prefill transaction:
 
 ```bash
-python3 tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py \
-  --input benchmark_results/cuda_dense_mtp/.../Q4_K_sweep.csv \
-  --base-include src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc \
-  --output /tmp/CUDANativeVNNIPrefillDispatchGenerated.inc \
-  --summary /tmp/cuda_prefill_dispatch_summary.txt
+PYTHONPATH=tests/v2/performance/kernels python3 -m \
+  native_vnni_dispatch.production_dense_prefill_sweep run \
+  --backend cuda \
+  --output-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill \
+  --binary build_v2_integration/tests/v2/v2_perf_cuda_native_vnni_gemm \
+  --devices 0,1
 
-python3 tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py \
-  /tmp/CUDANativeVNNIPrefillDispatchGenerated.inc
+PYTHONPATH=tests/v2/performance/kernels python3 -m \
+  native_vnni_dispatch.production_dense_prefill_sweep combine \
+  --backend cuda \
+  --output-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill
+
+PYTHONPATH=tests/v2/performance/kernels python3 -m \
+  native_vnni_dispatch.dense_production_overlay \
+  --backend cuda \
+  --work-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill \
+  --output src/v2/kernels/cuda/gemm/CUDADenseProductionPrefillOverlayGenerated.inc \
+  --summary-csv benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill/overlay.csv
 ```
 
 After updating a checked-in generated include, rerun the focused CUDA GEMM route

@@ -178,7 +178,20 @@ namespace llaminar2
         {
             const int remaining = policy.real_token_count - local_offset;
             const int real_count = std::min(remaining, chunk_target);
-            auto selected = selectPrefillGraphBucket(real_count, buckets);
+            /*
+             * An explicit chunk interval is also a fixed physical graph
+             * contract.  In particular, its final short tail must replay the
+             * same captured bucket instead of silently selecting a smaller
+             * graph from a multi-bucket policy.  The live row count remains
+             * `real_count`; only the immutable execution width is selected
+             * from `chunk_target`.
+             */
+            const int bucket_requirement =
+                policy.fixed_chunk_real_tokens > 0
+                    ? chunk_target
+                    : real_count;
+            auto selected =
+                selectPrefillGraphBucket(bucket_requirement, buckets);
             if (!selected)
             {
                 schedule.error = selected.error;

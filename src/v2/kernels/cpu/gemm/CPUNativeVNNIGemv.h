@@ -230,11 +230,11 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
-     * @brief Return an explicit full-K N-block width or a caller fallback.
+     * @brief Return an explicit full-K N-block width or the ambient width.
      */
     inline int verifierRowsPolicyNBlockChunks(
         VerifierRowsPolicy policy,
-        int fallback)
+        int ambient_n_block_chunks)
     {
         switch (policy)
         {
@@ -252,18 +252,48 @@ namespace llaminar2::cpu::native_vnni
         case VerifierRowsPolicy::Pairwise:
         case VerifierRowsPolicy::WideRows:
         case VerifierRowsPolicy::FullKRowChunkGrid:
-            return fallback;
+            return ambient_n_block_chunks;
         }
-        return fallback;
+        return ambient_n_block_chunks;
     }
 
     /**
-     * @brief Normalize a requested policy to its unique physical grouped route.
+     * @brief Test whether a physical grouped policy supports this runtime.
      *
-     * A nominal N-block width wider than the complete N inventory aliases a
-     * narrower launch. WideRows likewise aliases Pairwise when the active ISA
-     * or runtime M cannot execute a three/four-row microkernel. Publishing the
-     * normalized identity prevents duplicate labels from entering the learner.
+     * This is a launchability predicate, not a policy selector. An explicit
+     * policy that returns false must be rejected before launch; substituting a
+     * different grouped implementation would let timing evidence and runtime
+     * dispatch claim an arithmetic schedule that did not execute.
+     *
+     * @param policy Physical grouped schedule selected by policy dispatch.
+     * @param use_avx512 Whether the active runtime ISA is AVX-512.
+     * @param M Number of grouped rows in this invocation.
+     * @param serial_k_tiles K partitions selected by production serial M=1.
+     * @return True exactly when @p policy can execute this runtime geometry.
+     */
+    inline bool verifierRowsPolicySupportsRuntime(
+        VerifierRowsPolicy policy,
+        bool use_avx512,
+        int M,
+        int serial_k_tiles)
+    {
+        if (policy == VerifierRowsPolicy::Auto)
+            return false;
+        if (policy == VerifierRowsPolicy::WideRows)
+            return use_avx512 && M >= 3;
+        if (verifierRowsPolicyRequiresFullK(policy))
+            return serial_k_tiles <= 1;
+        return true;
+    }
+
+    /**
+     * @brief Canonicalize an N-grid policy to its unique physical route.
+     *
+     * A nominal N-block width wider than the complete N inventory produces the
+     * same launch grid as a narrower width. Canonicalizing that geometry keeps
+     * duplicate labels out of telemetry without changing the selected kernel,
+     * row tile, K arithmetic, or output bytes. Unsupported ISA, M, and K-tile
+     * combinations are rejected separately and are never canonicalized here.
      */
     inline VerifierRowsPolicy normalizeVerifierRowsPolicy(
         VerifierRowsPolicy policy,
@@ -271,11 +301,8 @@ namespace llaminar2::cpu::native_vnni
         bool use_avx512,
         int M)
     {
-        if (policy == VerifierRowsPolicy::WideRows &&
-            (!use_avx512 || M < 3))
-        {
-            return VerifierRowsPolicy::Pairwise;
-        }
+        (void)use_avx512;
+        (void)M;
         if (policy == VerifierRowsPolicy::FullKTwoRowNbc2 && n_chunks <= 1)
             return VerifierRowsPolicy::FullKTwoRowNbc1;
         if (verifierRowsPolicyUsesFullKPairGrid(policy))
@@ -3385,24 +3412,33 @@ namespace llaminar2::cpu::native_vnni
                       num_threads,
                       cfg.k_tiles)
                 : verifier_policy_override;
-        VerifierRowsPolicy verifier_policy = normalizeVerifierRowsPolicy(
-            selected_policy, N_chunks, use_avx512, M);
-        if (verifierRowsPolicyRequiresFullK(verifier_policy) &&
-            cfg.k_tiles > 1)
+        if (!verifierRowsPolicySupportsRuntime(
+                selected_policy, use_avx512, M, cfg.k_tiles))
         {
-            if (verifier_policy_override == VerifierRowsPolicy::Auto)
+            if (selected_policy == VerifierRowsPolicy::WideRows)
             {
-                throw std::runtime_error(
-                    "Generated CPU grouped verifier policy selected a full-K "
-                    "schedule for a serial M=1 K-partition domain");
+                throw std::invalid_argument(
+                    verifier_policy_override == VerifierRowsPolicy::Auto
+                        ? "Generated CPU grouped verifier policy selected "
+                          "WideRows without AVX-512 M>=3 support"
+                        : "Explicit CPU grouped verifier WideRows policy "
+                          "requires AVX-512 and M>=3");
             }
-            /*
-             * Explicit trainer requests must remain observable as unsupported
-             * evidence. Execute the established Pairwise K-partition route and
-             * publish its physical identity; route mismatch then prevents the
-             * requested full-K label from entering timing or policy fitting.
-             */
-            verifier_policy = VerifierRowsPolicy::Pairwise;
+            throw std::invalid_argument(
+                verifier_policy_override == VerifierRowsPolicy::Auto
+                    ? "Generated CPU grouped verifier policy selected a full-K "
+                      "schedule for a serial M=1 K-partition domain"
+                    : "Explicit CPU grouped verifier full-K policy is invalid "
+                      "for a serial M=1 K-partition domain");
+        }
+        const VerifierRowsPolicy verifier_policy = normalizeVerifierRowsPolicy(
+            selected_policy, N_chunks, use_avx512, M);
+        if (verifier_policy_override != VerifierRowsPolicy::Auto &&
+            verifier_policy != selected_policy)
+        {
+            throw std::invalid_argument(
+                "Explicit CPU grouped verifier policy aliases a different "
+                "physical N-grid for this geometry");
         }
         const bool use_wide_rows =
             verifier_policy == VerifierRowsPolicy::WideRows;
@@ -3425,12 +3461,11 @@ namespace llaminar2::cpu::native_vnni
                 : policy_n_block_chunks;
 
         /*
-         * Route identity is part of the grouped verifier contract.  WideRows
-         * has a distinct implementation only for AVX512 M=3/4; M=2 and all
-         * AVX2/scalar requests intentionally normalize to Pairwise.  Publishing
-         * both requested and effective policy prevents trainers and production
-         * diagnostics from mistaking a normalized launch for a measured wide
-         * candidate.
+         * Route identity is part of the grouped verifier contract. Unsupported
+         * ISA/M/K combinations and explicit N-grid aliases have already failed
+         * above, so an explicit request must publish the exact implementation
+         * it named. Auto dispatch may still publish a canonicalized N-grid when
+         * a generic rule names a width wider than the physical N inventory.
          */
         if (publish_verifier_route && PerfStatsCollector::isEnabled())
         {

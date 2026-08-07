@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "utils/DebugEnv.h"
 
 #include <cstdlib>
@@ -60,7 +61,7 @@ namespace
 }
 
 /**
- * @brief Lock in the production-model-proven CUDA MoE partition geometry.
+ * @brief Lock in CUDA MoE arithmetic while retaining geometry controls.
  *
  * Empty environment values exercise the same invalid-override branch as an
  * unset variable while keeping the process-global test environment reversible.
@@ -68,19 +69,19 @@ namespace
  * token stream is byte-stable; a faster candidate is promoted only after that
  * stronger gate passes.
  */
-TEST(Test__DeterministicMode, CudaMoEOrderedKPartDefaultsUseProductionProvenGeometry)
+TEST(Test__DeterministicMode, CudaMoEArithmeticPolicyIsFixedAndGeometryDefaultsAreExplicit)
 {
     ScopedEnv env({
-        {"LLAMINAR_CUDA_MOE_GATEUP_KPARTS", ""},
-        {"LLAMINAR_CUDA_MOE_DOWN_KPARTS", ""},
-        {"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", ""},
-        {"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", ""},
+        {"LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N", ""},
+        {"LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N", ""},
     });
 
-    EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_kparts, 16);
-    EXPECT_EQ(debugEnv().gemm.cuda_moe_down_kparts, 16);
-    EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 128);
-    EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 9);
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::gate_up_k_partitions, 16);
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::down_k_partitions, 16);
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n, 128);
+    EXPECT_FALSE(
+        debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active);
+    EXPECT_EQ(debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n, 128);
 }
 
 /**
@@ -93,45 +94,50 @@ TEST(Test__DeterministicMode, CudaMoEOrderedKPartDefaultsUseProductionProvenGeom
 TEST(Test__DeterministicMode, CudaMoEOrderedKPartTileRequiresWarpAlignedGeometry)
 {
     {
-        ScopedEnv env({{"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", "192"}});
-        EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 192);
+        ScopedEnv env({
+            {"LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N", "192"},
+            {"LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N", "224"},
+        });
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n, 192);
+        EXPECT_TRUE(
+            debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active);
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n, 224);
     }
     {
-        ScopedEnv env({{"LLAMINAR_CUDA_MOE_ORDERED_KPART_TILE_N", "190"}});
-        EXPECT_EQ(debugEnv().gemm.cuda_moe_ordered_kpart_tile_n, 128);
+        ScopedEnv env({
+            {"LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N", "190"},
+            {"LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N", "33"},
+        });
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n, 128);
+        EXPECT_FALSE(
+            debugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active);
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n, 128);
     }
 }
 
 /**
- * @brief Bound scratch-free grouped-down launches to legal whole-warp blocks.
+ * @brief Assign exactly one direct-down warp to every valid router slot.
  *
- * The kernel derives route ownership from the captured block width. Keeping
- * this override between eight and sixteen warps guarantees enough workers for
- * the production top-k range without exceeding CUDA's 512-thread block size.
+ * Extra warps are idle and strictly dominated; fewer warps serialize routes.
+ * The typed arithmetic policy therefore derives geometry from top-k instead
+ * of accepting a mutable process-wide override.
  */
-TEST(Test__DeterministicMode, CudaMoEDownDirectWarpGeometryIsBounded)
+TEST(Test__DeterministicMode, CudaMoEDownDirectWarpGeometryMatchesTopK)
 {
-    {
-        ScopedEnv env({{"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", "11"}});
-        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 11);
-    }
-    {
-        ScopedEnv env({{"LLAMINAR_CUDA_MOE_DOWN_DIRECT_WARPS", "7"}});
-        EXPECT_EQ(debugEnv().gemm.cuda_moe_down_direct_warps, 9);
-    }
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::directDownWarps(1), 1);
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::directDownWarps(4), 4);
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::directDownWarps(8), 8);
+    EXPECT_EQ(CUDAMoEBatchInvariantPolicy::directDownWarps(16), 16);
 }
 
-TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreservesOrderedCudaKPart)
+TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutes)
 {
     ScopedEnv env({
         {"LLAMINAR_DETERMINISTIC", "1"},
         {"LLAMINAR_CUDA_CONCURRENT_PREFILL", "1"},
         {"LLAMINAR_CUDA_CONCURRENT_DECODE", "1"},
-        {"LLAMINAR_CUDA_MOE_GATEUP_KPARTS", "8"},
-        {"LLAMINAR_CUDA_MOE_DOWN_KPARTS", "4"},
         {"LLAMINAR_CUDA_MOE_ROUTER_Q8", "1"},
         {"LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
-        {"LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_PREFILL", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
         {"LLAMINAR_ROCM_GDN_CONCURRENT_DECODE", "1"},
@@ -139,8 +145,6 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreserves
         {"LLAMINAR_ROCM_MOE_ROUTER_FP16", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1"},
-        {"LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1"},
-        {"LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1"},
     });
 
     const auto &env_snapshot = debugEnv();
@@ -148,12 +152,9 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreserves
 
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_prefill);
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_decode);
-    EXPECT_EQ(env_snapshot.gemm.cuda_moe_gateup_kparts, 8);
-    EXPECT_EQ(env_snapshot.gemm.cuda_moe_down_kparts, 4);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_router_q8);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
 
-    EXPECT_FALSE(env_snapshot.rocm.nvnni_atomic_reduce);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_prefill);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_decode);
     EXPECT_FALSE(env_snapshot.rocm.gdn_concurrent_decode);
@@ -161,8 +162,6 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreserves
     EXPECT_FALSE(env_snapshot.rocm.moe_router_fp16);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_kpart_decode);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_wave_topk);
-    EXPECT_FALSE(env_snapshot.rocm.moe_parallel_down_decode);
-    EXPECT_FALSE(env_snapshot.rocm.moe_gateup_kpart_decode);
 }
 
 

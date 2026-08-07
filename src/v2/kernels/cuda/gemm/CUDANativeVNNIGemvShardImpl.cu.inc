@@ -8,14 +8,11 @@
  *                    two-phase reduction via partials buffer (no atomicAdd contention)
  *   - **Direct**:   Small N ≤ 512 (KV projections) — one thread per column, smem A broadcast
  *
- *   KPar Hybrid Reduction:
- *   Small non-verifier partial sets (≤256KB) use two phases: each CTA writes
- *     `d_partials[split_idx * N + n]`, then an ordered reducer publishes `d_C[n]`.
- *   Large non-verifier partial sets may use atomic accumulation when the caller
- *     does not require batch invariance. Publication-sensitive serial M=1 and
- *     grouped verifier work always materializes partitions and reduces
- *     them in increasing partition order. The verifier contract therefore keeps
- *     K parallelism without allowing scheduler-dependent floating-point atomics.
+ *   KPar Ordered Reduction:
+ *   Every CTA writes `d_partials[split_idx * N + n]`, then one ordered reducer
+ *   publishes `d_C[n]`. Serial M=1 and grouped verifier calls inherit the same
+ *   generated K-partition boundaries and increasing-partition FP32 fold. There
+ *   is no completion-order publication regime.
  *
  * All kernels decode the compact native payload inline and use dp4a for INT8 dot products.
  * The A (activation) vector is cached in shared memory once per K-block, eliminating
@@ -242,7 +239,7 @@ namespace
         int mkg = 0;
         int max_kb = 0;
         int exact_kb = 0;
-        int force_two_phase = 0; // 0=auto, 1=force 2-phase, 2=force atomic
+        int force_two_phase = 1; // Corpus ABI: 1 for ordered KPAR, 0 otherwise.
     };
     static SweepOverride g_sweep;
     /** Trainer-only grouped row-reuse override; zero selects production policy. */
@@ -909,8 +906,6 @@ namespace
                 kb = std::min(kb, max_kb);
         }
 
-        if (llaminar2::debugEnv().gemm.deterministic)
-            return 1;
         return std::max(1, kb);
     }
 
@@ -1021,10 +1016,10 @@ namespace
     // Each CTA processes a slice of K-blocks for CPT columns.
     // A vector cached in shared memory per K-block.
     //
-    // TWO_PHASE=true:  writes partials to d_C[split_idx * N + n] (no atomics)
-    // TWO_PHASE=false: atomic accumulation to d_C[n] (legacy fallback)
+    // Every partition writes its disjoint persistent partial row. The ordered
+    // reducer below is the sole owner of final output publication.
     // =====================================================================
-    template <int TILE_N, int CPT, uint8_t CB, bool TWO_PHASE = false>
+    template <int TILE_N, int CPT, uint8_t CB>
     __global__ void nativeVnniGemv_kpar(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -1101,9 +1096,9 @@ namespace
                                                          llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
 
                 int32_t packed_groups[8];
-                // Always use vectorized decode: fewer instructions (e.g. 2 int4
-                // loads vs 8 int32 for Q8_0), same DRAM traffic.  Previously
-                // gated on TWO_PHASE but the choice is orthogonal to output path.
+                // Always use vectorized decode: fewer instructions (for
+                // example, two int4 loads instead of eight int32 loads for
+                // Q8_0) with the same DRAM traffic.
                 llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
 
                 const float contribution = native_vnni_block_contribution_rn<CB>(
@@ -1119,17 +1114,14 @@ namespace
             }
         }
 
-// Output: two-phase (direct write to partials) or atomic fallback
+// Output: one disjoint row in the persistent K-partition workspace.
 #pragma unroll
         for (int c = 0; c < CPT; ++c)
         {
             const int n = n_base + c;
             if (n < N)
             {
-                if constexpr (TWO_PHASE)
-                    d_C[split_idx * N + n] = alpha * acc[c];
-                else
-                    atomicAdd(&d_C[n], alpha * acc[c]);
+                d_C[split_idx * N + n] = alpha * acc[c];
             }
         }
     }
@@ -1522,27 +1514,6 @@ namespace
         d_C[n] = sum;
     }
 
-    // =====================================================================
-    // Epilogue kernel: apply beta/bias after atomic KPAR accumulation
-    //
-    // Used by the atomic fallback path where d_C already has the accumulated
-    // alpha * A * W sum via atomicAdd.  Applies beta * C_existing + bias.
-    // =====================================================================
-    __global__ void nativeVnniGemv_epilogue(
-        float *__restrict__ d_C,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias,
-        int N, float beta)
-    {
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (n >= N)
-            return;
-        if (beta != 0.0f && d_C_existing)
-            d_C[n] += beta * d_C_existing[n];
-        if (d_bias)
-            d_C[n] += d_bias[n];
-    }
-
     /** Return the row owned by one `m16n8k32` accumulator element. */
     __device__ __forceinline__ int verifierMmaFragmentRow(int lane, int element)
     {
@@ -1870,7 +1841,7 @@ namespace
      * independent Z-grid tiles instead of compiling another kernel or changing
      * the arithmetic performed for an existing row.
      */
-    template <int ROWS_PER_TILE, int TILE_N, int CPT, uint8_t CB, bool TWO_PHASE = false>
+    template <int ROWS_PER_TILE, int TILE_N, int CPT, uint8_t CB>
     __global__ void nativeVnniGemv_kpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -2009,16 +1980,8 @@ namespace
                     const int row = row_base + tile_row;
                     if (row >= M)
                         continue;
-                    if constexpr (TWO_PHASE)
-                    {
-                        d_C[(static_cast<size_t>(split_idx) * M + row) * N + n] =
-                            alpha * acc[tile_row][c];
-                    }
-                    else
-                    {
-                        atomicAdd(&d_C[static_cast<size_t>(row) * N + n],
-                                  alpha * acc[tile_row][c]);
-                    }
+                    d_C[(static_cast<size_t>(split_idx) * M + row) * N + n] =
+                        alpha * acc[tile_row][c];
                 }
             }
         }
@@ -2104,16 +2067,6 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
-    // Two-phase partials buffer threshold (bytes).
-    // Shapes with partials ≤ this use two-phase (no atomics); larger use atomic.
-    //
-    // Empirical results (Q4_0, RTX 3090, mkg=4):
-    //   128KB  3B_Attn:    +8.7% win (12.5% → 21.2%)
-    //   136KB  0.5B_FFN_Up:+2.2% win
-    //   401KB  7B_Attn:    -5.5% loss (atomic contention negligible, reduce overhead dominates)
-    //   704KB  3B_FFN_Up:  -4.4% loss
-    static constexpr size_t kTwoPhaseMaxBytes = 256 * 1024;
-
     template <
         int TILE_N,
         int CPT,
@@ -2158,12 +2111,28 @@ namespace
         g_last_effective_kb = kb_capped;
 
         /*
-         * Grouped verifier publication is always two-phase. A force-atomic
-         * sweep candidate is rejected instead of silently measuring a schedule-
-         * dependent kernel that can never satisfy batch invariance.
+         * The generated serial-M1 policy owns the arithmetic contract that the
+         * grouped verifier must reproduce. KPAR candidates publish an ordered
+         * sum of several K partitions and therefore require the explicit
+         * two-phase reducer encoded by `force_two_phase == 1`.
+         *
+         * WIDE and DIRECT candidates are different: serial M=1 owns exactly one
+         * K partition (`force_two_phase == 0`). Their economical grouped
+         * implementation still materializes several rows together in the
+         * persistent partials tile, but the publication kernel copies that sole
+         * accumulator and applies beta/bias without introducing an FP32 add.
+         * Rejecting this contract as though it were KPAR made every generated
+         * WIDE/DIRECT verifier policy an unlaunchable production state.
          */
-        if (force_two_phase == 2 && g_sweep.active)
+        if constexpr (MATCH_WIDE_SERIAL)
+        {
+            if (force_two_phase != 0)
+                return false;
+        }
+        else if (force_two_phase != 1)
+        {
             return false;
+        }
 
         /*
          * The reduction arena is a reusable row tile, not a semantic M limit.
@@ -2207,7 +2176,7 @@ namespace
                     ? d_C_existing + static_cast<size_t>(row_base) * N
                     : nullptr;
 
-            nativeVnniGemv_kpar_small_m<ROWS_PER_TILE, TILE_N, CPT, CB, true>
+            nativeVnniGemv_kpar_small_m<ROWS_PER_TILE, TILE_N, CPT, CB>
                 <<<grid, THREADS, 0, stream>>>(
                     tile_a, d_payload, d_scales, d_mins, d_emins,
                     d_partials, tile_scales, tile_m, N, K, kb_capped, alpha);
@@ -2956,8 +2925,7 @@ namespace
              * serial decode uses for each accepted row.
              */
             const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
-            const int dispatch_m =
-                decode_equivalent_m1 ? 1 : (llaminar2::debugEnv().gemm.deterministic ? 2 : M);
+            const int dispatch_m = decode_equivalent_m1 ? 1 : M;
             const bool dispatch_policy_graph_captured =
                 decode_equivalent_m1
                     ? kCanonicalDecodePolicyGraphCaptured
@@ -3194,8 +3162,6 @@ namespace
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
         const int num_sms = querySmCount(gemv_ctx);
-        const bool debug_deterministic = llaminar2::debugEnv().gemm.deterministic;
-        const bool verifier_decode_equivalent = decodeEquivalentM1ConfigActive();
         const int kb_capped = resolveKparKBlocks(
             grid_n, k_groups, num_sms,
             target_waves, min_kgroups_per_cta, max_kb, exact_kb);
@@ -3203,59 +3169,28 @@ namespace
             return false;
         g_last_effective_kb = kb_capped;
 
-        const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
-        bool use_two_phase;
-        if (debug_deterministic || verifier_decode_equivalent)
-            use_two_phase = true;
-        else if (force_two_phase == 1)
-            use_two_phase = true;
-        else if (force_two_phase == 2)
-            use_two_phase = false;
-        else
-            use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
+        if (force_two_phase != 1)
+            return false;
 
         dim3 grid(grid_n, kb_capped);
 
-        if (use_two_phase)
+        float *d_partials = getKparPartials(
+            gemv_ctx, static_cast<size_t>(kb_capped) * N);
+        if (!d_partials)
+            return false;
+
+        nativeVnniGemv_kpar<TILE_N, CPT, CB><<<grid, THREADS, 0, stream>>>(
+            d_A_int8, d_payload, d_scales, d_mins, d_emins,
+            d_partials, d_scales_A, N, K, kb_capped, alpha);
         {
-            float *d_partials = getKparPartials(
-                gemv_ctx, static_cast<size_t>(kb_capped) * N);
-            if (!d_partials)
+            const cudaError_t launch_error = cudaGetLastError();
+            if (launch_error != cudaSuccess)
                 return false;
-
-            nativeVnniGemv_kpar<TILE_N, CPT, CB, true><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_partials, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            const int rblk = (N + 255) / 256;
-            nativeVnniGemv_reduce<<<rblk, 256, 0, stream>>>(
-                d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta);
         }
-        else
-        {
-            cudaMemsetAsync(d_C, 0, static_cast<size_t>(N) * sizeof(float), stream);
 
-            nativeVnniGemv_kpar<TILE_N, CPT, CB, false><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            if ((beta != 0.0f && d_C_existing) || d_bias)
-            {
-                const int eblk = (N + 255) / 256;
-                nativeVnniGemv_epilogue<<<eblk, 256, 0, stream>>>(
-                    d_C, d_C_existing, d_bias, N, beta);
-            }
-        }
+        const int reduction_blocks = (N + 255) / 256;
+        nativeVnniGemv_reduce<<<reduction_blocks, 256, 0, stream>>>(
+            d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta);
 
         return cudaGetLastError() == cudaSuccess;
     }
@@ -3607,7 +3542,8 @@ extern "C"
     //
     // kernel_family: 0=WIDE, 1=KPAR, 2=DIRECT
     // exact_kb: 0=generated occupancy policy, >0=one exact trainer schedule
-    // force_two_phase: 0=auto, 1=force two-phase, 2=force atomic
+    // force_two_phase is retained in corpus ABI v1 as an authenticated
+    // invariant: KPAR requires 1 (ordered partials), all other families use 0.
     // =====================================================================
     void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
@@ -3615,6 +3551,12 @@ extern "C"
         int exact_kb,
         int force_two_phase)
     {
+        const bool kpar = kernel_family == 1;
+        if ((kpar && force_two_phase != 1) ||
+            (!kpar && force_two_phase != 0))
+        {
+            std::terminate();
+        }
         g_sweep.active = true;
         g_sweep.kernel_family = kernel_family;
         g_sweep.tile_n = tile_n;

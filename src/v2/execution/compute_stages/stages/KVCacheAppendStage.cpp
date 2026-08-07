@@ -92,8 +92,15 @@ namespace llaminar2
             KVCacheAppendSemantics::DecodeEquivalentVerifier)
             return false;
 
+        /*
+         * A one-row verifier transaction is the zero-draft boundary of the
+         * same grouped contract, not a different serial execution mode.  All
+         * cache backends accept one or more verifier rows, which keeps M=1
+         * total and lets the graph exercise the identical publication path at
+         * every supported verifier depth.
+         */
         if (!params_.kv_cache || params_.layer_idx < 0 || params_.seq_idx < 0 ||
-            request_rows < 2)
+            request_rows < 1)
         {
             LOG_ERROR("[KVCacheAppendStage] Invalid grouped verifier cache-publication contract"
                       << " rows=" << request_rows

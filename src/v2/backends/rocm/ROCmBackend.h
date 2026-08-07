@@ -535,7 +535,7 @@ namespace llaminar2
             void *out_tokens_device,
             void *out_meta_device,
             const void *max_state_commit_rows_device = nullptr,
-            const void *penalty_policy_device = nullptr) override;
+            const void *next_leading_committed_output_count_device = nullptr) override;
         bool enqueueAdvanceSpeculativeCommitBoundary(
             void *meta_device,
             int request_count,
@@ -550,6 +550,8 @@ namespace llaminar2
             int request_count,
             int max_new_tokens,
             const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+            sampling_math::DeviceGenerationLeadingRowDisposition
+                initial_leading_row_disposition,
             int response_token_stride,
             void *response_tokens_device,
             int control_stride,
@@ -747,6 +749,20 @@ namespace llaminar2
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
         bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) override;
+        bool enqueuePreparePrefillChunkView(
+            const void *request_token_ids_device,
+            const void *request_position_ids_device,
+            const void *request_total_rows_device,
+            const void *cached_tokens_device,
+            int request_row_capacity,
+            int bucket_seq_len,
+            int pad_token_id,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            void *out_position_ids_device,
+            void *out_real_rows_device,
+            void *out_row_stride_device) override;
         /**
          * @brief Enqueue an in-device copy on an explicit ROCm stream.
          *

@@ -469,13 +469,13 @@ namespace llaminar2
             (!kv_cache_only && missing("output.logits", output.logits)) ||
             (gather_global_tp_mtp_logits &&
              missing("output.gathered_logits", output.gathered_logits)) ||
-            missing("output.q", output.q) ||
+            (!kv_cache_only && missing("output.q", output.q)) ||
             missing("output.k", output.k) ||
             missing("output.v", output.v) ||
             (phase_split_mtp_kv_handoff && missing("output.k_full_prefill", output.k_full_prefill)) ||
             (phase_split_mtp_kv_handoff && missing("output.v_full_prefill", output.v_full_prefill)) ||
-            missing("output.q_raw", output.q_raw) ||
-            missing("output.q_gate", output.q_gate) ||
+            (!kv_cache_only && missing("output.q_raw", output.q_raw)) ||
+            (!kv_cache_only && missing("output.q_gate", output.q_gate)) ||
             (!kv_cache_only && missing("output.attn_output", output.attn_output)) ||
             (!kv_cache_only && missing("output.attn_proj", output.attn_proj)) ||
             (!kv_cache_only && missing("output.gate", output.gate)) ||
@@ -613,7 +613,6 @@ namespace llaminar2
         ActivationBuffers mtp_buffers;
         mtp_buffers.current_hidden = output.projected;
         mtp_buffers.normalized = output.norm_hidden;
-        mtp_buffers.Q = output.q;
         mtp_buffers.K = output.k;
         mtp_buffers.V = output.v;
         mtp_buffers.K_full_prefill = output.k_full_prefill;
@@ -623,24 +622,28 @@ namespace llaminar2
         mtp_buffers.gate = output.gate;
         mtp_buffers.up = output.up;
         mtp_buffers.ffn_output = output.ffn_output;
-        mtp_buffers.extensions[BufferId::MTP_FA_Q_RAW] = output.q_raw;
-        mtp_buffers.extensions[BufferId::MTP_FA_GATE] = output.q_gate;
         mtp_buffers.binding_ids = {
             {BufferId::HIDDEN_STATE, BufferId::MTP_PROJECTED},
             {BufferId::NORMALIZED, BufferId::MTP_NORM_HIDDEN},
-            {BufferId::Q_PROJ, BufferId::MTP_Q_PROJ},
             {BufferId::K_PROJ, BufferId::MTP_K_PROJ},
             {BufferId::V_PROJ, BufferId::MTP_V_PROJ},
             {BufferId::K_FULL_PREFILL, BufferId::MTP_K_FULL_PREFILL},
             {BufferId::V_FULL_PREFILL, BufferId::MTP_V_FULL_PREFILL},
-            {BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW},
-            {BufferId::FA_GATE, BufferId::MTP_FA_GATE},
             {BufferId::ATTN_OUTPUT, BufferId::MTP_ATTN_OUTPUT},
             {BufferId::ATTN_PROJ, BufferId::MTP_ATTN_PROJ},
             {BufferId::GATE_PROJ, BufferId::MTP_GATE_PROJ},
             {BufferId::UP_PROJ, BufferId::MTP_UP_PROJ},
             {BufferId::FFN_OUTPUT, BufferId::MTP_FFN_OUTPUT},
         };
+        if (!kv_cache_only)
+        {
+            mtp_buffers.Q = output.q;
+            mtp_buffers.extensions[BufferId::MTP_FA_Q_RAW] = output.q_raw;
+            mtp_buffers.extensions[BufferId::MTP_FA_GATE] = output.q_gate;
+            mtp_buffers.binding_ids.emplace(BufferId::Q_PROJ, BufferId::MTP_Q_PROJ);
+            mtp_buffers.binding_ids.emplace(BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW);
+            mtp_buffers.binding_ids.emplace(BufferId::FA_GATE, BufferId::MTP_FA_GATE);
+        }
         if (mtp_moe && !kv_cache_only)
         {
             mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
@@ -657,7 +660,7 @@ namespace llaminar2
         {
             const std::string sidecar_stage_prefix =
                 "MTP" + std::to_string(depth_idx) + "_";
-            ComputeGraph kv_append = buildFAKVCacheAppendGraph(
+            ComputeGraph kv_append = buildMTPFAKVCacheAppendGraph(
                 weights.fa_block,
                 mtp_buffers,
                 /*layer_idx=*/0,
@@ -1516,7 +1519,7 @@ namespace llaminar2
     //   5. Wo GEMM on gated attention output
     // =========================================================================
 
-    ComputeGraph Qwen35Graph::buildFAKVCacheAppendGraph(
+    ComputeGraph Qwen35Graph::buildMTPFAKVCacheAppendGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
         int layer_idx,
@@ -1534,7 +1537,7 @@ namespace llaminar2
         ComputeGraph graph;
         if (!kv_cache)
         {
-            LOG_ERROR("[Qwen35Graph::buildFAKVCacheAppendGraph] KV-only graph requires a KV cache");
+            LOG_ERROR("[Qwen35Graph::buildMTPFAKVCacheAppendGraph] KV-only graph requires a KV cache");
             return graph;
         }
 
@@ -1543,40 +1546,34 @@ namespace llaminar2
                                  : stage_prefix_override;
         const int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
-        const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;
         const WeightBinding *wk_binding = layer.wk_binding ? layer.wk_binding : layer_bindings.wk;
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
 
         addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
                             total_tokens, layer_idx, device);
 
-        TensorBase *fa_q_raw = buffers.get(buffers.idFor(BufferId::FA_Q_RAW));
-        TensorBase *fa_gate = buffers.get(buffers.idFor(BufferId::FA_GATE));
-        if (!fa_q_raw || !fa_gate || !layer.wq || !layer.wk || !layer.wv)
+        if (!buffers.normalized || !buffers.K || !buffers.V ||
+            !layer.wk || !layer.wv)
         {
-            LOG_ERROR("[Qwen35Graph::buildFAKVCacheAppendGraph] Missing FA projection inputs");
+            LOG_ERROR("[Qwen35Graph::buildMTPFAKVCacheAppendGraph] Missing K/V projection state");
             return ComputeGraph{};
         }
 
         const int k = config_.d_model;
-        const int q_n = static_cast<int>(layer.wq->shape()[0]);
         const int k_n = static_cast<int>(layer.wk->shape()[0]);
         const int v_n = static_cast<int>(layer.wv->shape()[0]);
-        const bool force_decode_equivalent_qkv_verifier_prefill =
+        const bool force_decode_equivalent_kv_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             config_.usesMTPGroupedDecodeEquivalentRows();
 
-        graph.addNode(prefix + "qkv_proj",
-                      ComputeStageFactory::createFusedQKVGEMM({
+        const std::string kv_projection = prefix + "kv_proj";
+        graph.addNode(kv_projection,
+                      ComputeStageFactory::createFusedKVGEMM({
                           .device_id = device,
                           .input = buffers.normalized,
                           .m = total_tokens,
                           .k = k,
-                          .wq = layer.wq,
-                          .output_q = fa_q_raw,
-                          .n_q = q_n,
-                          .bias_q = layer.q_bias,
                           .wk = layer.wk,
                           .output_k = buffers.K,
                           .n_k = k_n,
@@ -1586,67 +1583,29 @@ namespace llaminar2
                           .n_v = v_n,
                           .bias_v = layer.v_bias,
                           .input_buffer_id = buffers.idFor(BufferId::NORMALIZED),
-                          .output_q_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
                           .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                           .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
-                          .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
-                          .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_kv_prefill,
                           .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                           .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
-        graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
+        graph.addDependency(kv_projection, prefix + "attn_norm");
 
-        auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
-        graph.addNode(prefix + "q_gate_split",
-                      ComputeStageFactory::createQGateSplit({
-                          .device_id = device,
-                          .input = fa_q_raw,
-                          .output_q = buffers.Q,
-                          .output_gate = fa_gate,
-                          .seq_len = total_tokens,
-                          .n_heads = local_n_heads,
-                          .head_dim = config_.head_dim,
-                          .input_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
-                          .output_q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
-                          .output_gate_buffer_id = buffers.idFor(BufferId::FA_GATE),
-                      }),
-                      device);
-        graph.addDependency(prefix + "q_gate_split", prefix + "qkv_proj");
-
-        const bool has_qk_norms = addQKNorms(
-            graph, prefix, buffers, layer,
-            local_n_heads, local_n_kv_heads, total_tokens, device,
-            prefix + "q_gate_split",
-            prefix + "qkv_proj");
-        std::vector<std::string> cache_source_dependencies;
-        if (has_qk_norms)
-        {
-            cache_source_dependencies.push_back(prefix + "q_norm");
-            cache_source_dependencies.push_back(prefix + "k_norm");
-        }
-        else
-        {
-            cache_source_dependencies.push_back(prefix + "q_gate_split");
-            cache_source_dependencies.push_back(prefix + "qkv_proj");
-        }
-
-        std::string rope_node = addRoPE(
-            graph, prefix, buffers,
-            local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
-
-        if (has_qk_norms)
-        {
-            graph.addDependency(rope_node, prefix + "q_norm");
-            graph.addDependency(rope_node, prefix + "k_norm");
-        }
-        else
-        {
-            graph.addDependency(rope_node, prefix + "q_gate_split");
-            graph.addDependency(rope_node, prefix + "qkv_proj");
-        }
+        const int local_n_kv_heads = resolveLocalHeadCounts().second;
+        const std::string key_terminal = addKeyCachePublicationTransforms(
+            graph,
+            prefix,
+            buffers,
+            layer,
+            local_n_kv_heads,
+            total_tokens,
+            position_ids,
+            position_ids_device,
+            device,
+            kv_projection);
 
         const std::string kv_append = addKVCacheAppend(
             graph,
@@ -1658,8 +1617,8 @@ namespace llaminar2
             kv_cache,
             sequence_lengths_device,
             device,
-            rope_node,
-            cache_source_dependencies,
+            key_terminal,
+            {key_terminal},
             layer_idx_is_cache_local,
             first_seq_idx);
         graph.setTerminalNode(kv_append);

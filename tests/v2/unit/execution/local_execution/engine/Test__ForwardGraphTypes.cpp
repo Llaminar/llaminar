@@ -2963,7 +2963,11 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
         {
             return node.stage && node.stage->execute(&ctx);
         },
-        .prepare_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .prepare_snapshot_copies = [&](ComputeNode &, void *stream)
+        {
+            transaction_order.emplace_back("prepare_snapshot_copies");
+            return stream == cache.capture_stream && coherence_calls == 1;
+        },
         .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
         .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
         .capture_boundary = [&](const std::string &, void *stream)
@@ -2993,9 +2997,12 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     EXPECT_NE(prep_stage->last_stream_, nullptr);
     EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
     EXPECT_EQ(coherence_calls, 1);
-    ASSERT_GE(transaction_order.size(), 2u);
+    ASSERT_GE(transaction_order.size(), 3u);
     EXPECT_EQ(transaction_order.front(), "cohere_inputs");
-    EXPECT_EQ(transaction_order[1], "capture_boundary")
+    EXPECT_EQ(transaction_order[1], "prepare_snapshot_copies")
+        << "Snapshot descriptors must observe arena outputs only after their "
+           "stable device addresses have been established.";
+    EXPECT_EQ(transaction_order[2], "capture_boundary")
         << "External producer events must be joined before the domain-level "
            "capture-begin rendezvous.";
 

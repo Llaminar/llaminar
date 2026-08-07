@@ -1059,20 +1059,25 @@ namespace
     /**
      * @test Native-VNNI GEMV is bitwise stable across repeated runs.
      *
-     * Guards against the CUDA-style failure mode where split-K atomics or
-     * shared scratch make repeated runs diverge. This shape is large enough
-     * to exercise the GEMV scatter+reduce path (KB > 1) on ROCm.
+     * Guards the production M=1 contract itself, rather than relying on a
+     * grouped-verifier test to infer what serial decode did. This shape and
+     * forced KB exercise the persistent-partial, fixed-order reducer (KB > 1)
+     * and PerfStats proves that exact route was launched on every repetition.
      */
-    TEST_F(NativeVNNIGEMVTest, Q4_0_RepeatedRuns_AreBitwiseStable_OnScatterReduceShape)
+    TEST_F(NativeVNNIGEMVTest, Q4_0_SerialM1OrderedKPartitionIsBitwiseStableAndPublished)
     {
         if (!has_rocm_device_)
         {
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        const int M = 1;
-        const int N = 3584;
-        const int K = 3584;
+        ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+        NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
+        PerfStatsCollector::reset();
+
+        constexpr int M = 1;
+        constexpr int N = 3584;
+        constexpr int K = 3584;
         constexpr int kRepeatRuns = 5;
 
         auto weights = TestTensorFactory::createQ4_0Random(
@@ -1107,20 +1112,45 @@ namespace
             const size_t mismatch = firstBitwiseMismatchIndex(reference, snapshot);
             EXPECT_EQ(mismatch, reference.size())
                 << "run=" << run
-                << " first_mismatch=" << mismatch
-                << " reference=" << reference[mismatch]
-                << " candidate=" << snapshot[mismatch];
+                << " first_mismatch=" << mismatch;
 
             if (mismatch != reference.size())
             {
+                ADD_FAILURE()
+                    << "reference=" << reference[mismatch]
+                    << " candidate=" << snapshot[mismatch];
                 break;
             }
         }
 
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        const auto route = std::find_if(
+            records.begin(),
+            records.end(),
+            [=](const PerfStatRecord &record)
+            {
+                return record.name == "rocm_native_vnni_small_m_launch" &&
+                       record.tags.count("m") != 0 &&
+                       record.tags.at("m") == "1" &&
+                       record.tags.count("n") != 0 &&
+                       record.tags.at("n") == std::to_string(N) &&
+                       record.tags.count("k") != 0 &&
+                       record.tags.at("k") == std::to_string(K) &&
+                       record.tags.count("kb") != 0 &&
+                       record.tags.at("kb") == "4" &&
+                       record.tags.count("path") != 0 &&
+                       record.tags.at("path") == "split_reduce";
+            });
+        ASSERT_NE(route, records.end())
+            << "serial M=1 must publish its fixed-order K-partition route\n"
+            << PerfStatsCollector::summaryString({"kernel"}, 0);
+        EXPECT_GE(route->value, static_cast<double>(kRepeatRuns));
+
         cleanupWorkspace(kernel);
+        PerfStatsCollector::reset();
     }
 
-    TEST_F(NativeVNNIGEMVTest, VerifierRowsUseSplitReduceWhenDeterministicModeRejectsAtomic)
+    TEST_F(NativeVNNIGEMVTest, VerifierRowsUseOrderedKPartitionWithoutGraphCapture)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1130,15 +1160,12 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
-        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1");
+        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "0");
         ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
         NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
         PerfStatsCollector::reset();
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
-        ASSERT_TRUE(debugEnv().gemm.deterministic);
-        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
+        EXPECT_FALSE(debugEnv().execution.gpu_graphs);
 
         constexpr int M = 2;
         constexpr int N = 512;
@@ -1161,7 +1188,6 @@ namespace
 
         const auto records = PerfStatsCollector::snapshot({"kernel"});
         bool found_split_reduce = false;
-        bool found_atomic_reduce = false;
         for (const auto &record : records)
         {
             if (record.name != "rocm_native_vnni_small_m_launch")
@@ -1177,22 +1203,19 @@ namespace
                 continue;
             }
             found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
-            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
         }
 
         EXPECT_TRUE(found_split_reduce)
-            << "deterministic ROCm native-VNNI small-M GEMV must use ordered split-reduce"
+            << "ROCm native-VNNI small-M GEMV must use ordered K-partition reduction"
             << "\n"
             << PerfStatsCollector::summaryString({"kernel"}, 0);
-        EXPECT_FALSE(found_atomic_reduce)
-            << "LLAMINAR_DETERMINISTIC must beat both GPU-graph and env-requested atomic reduce";
 
         cleanupWorkspace(kernel);
         PerfStatsCollector::reset();
 #endif
     }
 
-    TEST_F(NativeVNNIGEMVTest, VerifierRowsUnderGpuGraphsUseWorkspaceSplitReduce)
+    TEST_F(NativeVNNIGEMVTest, VerifierRowsUnderGpuGraphsUseOrderedKPartition)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1202,16 +1225,12 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "0");
         ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
         NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
         PerfStatsCollector::reset();
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
         EXPECT_TRUE(debugEnv().execution.gpu_graphs);
-        EXPECT_FALSE(debugEnv().gemm.deterministic);
-        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
 
         constexpr int M = 2;
         constexpr int N = 512;
@@ -1234,7 +1253,6 @@ namespace
 
         const auto records = PerfStatsCollector::snapshot({"kernel"});
         bool found_split_reduce = false;
-        bool found_atomic_reduce = false;
         for (const auto &record : records)
         {
             if (record.name != "rocm_native_vnni_small_m_launch")
@@ -1250,15 +1268,12 @@ namespace
                 continue;
             }
             found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
-            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
         }
 
         EXPECT_TRUE(found_split_reduce)
-            << "ROCm GPU-graph small-M GEMV should use declared workspace split-reduce by default"
+            << "ROCm GPU-graph small-M GEMV must use declared workspace K-partition reduction"
             << "\n"
             << PerfStatsCollector::summaryString({"kernel"}, 0);
-        EXPECT_FALSE(found_atomic_reduce)
-            << "Atomic small-M GEMV is an explicit ROCm tuning mode, not a graph-capture default";
 
         cleanupWorkspace(kernel);
         PerfStatsCollector::reset();

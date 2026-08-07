@@ -3570,13 +3570,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
  * the public production GEMM entry point; no deterministic mode or row-replay
  * implementation substitutes for the optimized grouped implementation.
  *
- * Seventeen independent production M=1 launches establish the serial-decode
- * oracle for the first ordinary-prefill tile. The optimized M=17 launch and
- * every larger exact/bucket launch must publish that prefix byte-for-byte.
- * Each finite M-totality witness also compares its final active row with an
- * independent M=1 launch. The final row walks every tile residue and boundary
- * in the exhaustive range, while the prefix prevents a broken implementation
- * from preserving only its boundary row.
+ * Independent production M=1 launches establish the complete serial-decode
+ * oracle through the largest bucket. The oracle remains device-resident while
+ * it is assembled, then crosses D2H once. Every active word from every exact-M
+ * and padded-bucket launch must match the corresponding serial row, including
+ * exact graph-bucket thresholds and all interior rows.
  * Allocations, stream creation, preparation, and workspace binding are reused
  * for all witnesses of one format. Only result bytes are downloaded, keeping
  * the test sensitive to device arithmetic without making setup dominate the
@@ -3589,8 +3587,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
 
 #ifdef HAVE_ROCM
     const DeviceId device = DeviceId::rocm(0);
-    constexpr int canonical_prefix_rows =
-        kDefaultNativeVNNIVerifierRowCapacity + 1;
     uint64_t geometry_index = 0;
 
     for (const auto &geometry :
@@ -3656,25 +3652,29 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                 {1u, static_cast<size_t>(K)});
             auto serial_output = TestTensorFactory::createFP32(
                 {1u, static_cast<size_t>(N)});
+            auto serial_rows = TestTensorFactory::createFP32(
+                {static_cast<size_t>(maximum_bucket_rows),
+                 static_cast<size_t>(N)});
             ASSERT_TRUE(input->ensureOnDevice(device, stream));
             ASSERT_TRUE(exact_output->allocateOnDevice(device, stream));
             ASSERT_TRUE(bucket_output->allocateOnDevice(device, stream));
             ASSERT_TRUE(serial_input->allocateOnDevice(device, stream));
             ASSERT_TRUE(serial_output->allocateOnDevice(device, stream));
+            ASSERT_TRUE(serial_rows->allocateOnDevice(device, stream));
 
             /*
-             * Build the oracle from the real public M=1 dispatch. Device-to-
-             * device row copies preserve the exact FP32 source bytes and keep
-             * every operation ordered on the kernel stream. No host-side GEMV
-             * or dequantized reference participates in the expected result.
+             * Build the complete oracle from the real public M=1 dispatch.
+             * Device-to-device row copies preserve exact FP32 bytes and keep
+             * the entire construction ordered on the kernel stream. The one
+             * terminal D2H below cannot perturb any candidate launch.
              */
             const size_t serial_row_input_bytes =
                 static_cast<size_t>(K) * sizeof(float);
             const size_t serial_row_output_bytes =
                 static_cast<size_t>(N) * sizeof(float);
-            std::vector<float> serial_decode_prefix(
-                static_cast<size_t>(canonical_prefix_rows) * N);
-            for (int row = 0; row < canonical_prefix_rows; ++row)
+            std::vector<float> serial_decode_rows(
+                static_cast<size_t>(maximum_bucket_rows) * N);
+            for (int row = 0; row < maximum_bucket_rows; ++row)
             {
                 ASSERT_EQ(
                     hipMemcpyAsync(
@@ -3697,42 +3697,23 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                     << "serial row=" << row;
                 ASSERT_EQ(
                     hipMemcpyAsync(
-                        serial_decode_prefix.data() +
+                        static_cast<float *>(serial_rows->gpu_data_ptr()) +
                             static_cast<size_t>(row) * N,
                         serial_output->gpu_data_ptr(),
                         serial_row_output_bytes,
-                        hipMemcpyDeviceToHost,
+                        hipMemcpyDeviceToDevice,
                         stream),
                     hipSuccess);
             }
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-            ASSERT_TRUE(kernel->multiply_tensor(
-                input.get(),
-                exact_output.get(),
-                canonical_prefix_rows,
-                N,
-                K));
-            const size_t canonical_prefix_values =
-                static_cast<size_t>(canonical_prefix_rows) * N;
-            std::vector<float> canonical_prefix(canonical_prefix_values);
             ASSERT_EQ(
                 hipMemcpyAsync(
-                    canonical_prefix.data(),
-                    exact_output->gpu_data_ptr(),
-                    canonical_prefix_values * sizeof(float),
+                    serial_decode_rows.data(),
+                    serial_rows->gpu_data_ptr(),
+                    serial_decode_rows.size() * sizeof(float),
                     hipMemcpyDeviceToHost,
                     stream),
                 hipSuccess);
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            expectBitwiseFP32RowsEqual(
-                std::string(
-                    "ROCm NativeVNNI ordinary-prefill M=17 versus serial M=1 format=") +
-                    format.label,
-                canonical_prefix.data(),
-                serial_decode_prefix.data(),
-                canonical_prefix_values,
-                static_cast<size_t>(N));
 
             for (const auto &test_case : geometry.row_cases)
             {
@@ -3755,34 +3736,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                     N,
                     K));
 
-                const int final_active_row =
-                    test_case.active_rows - 1;
-                ASSERT_EQ(
-                    hipMemcpyAsync(
-                        serial_input->gpu_data_ptr(),
-                        static_cast<const float *>(input->gpu_data_ptr()) +
-                            static_cast<size_t>(final_active_row) * K,
-                        serial_row_input_bytes,
-                        hipMemcpyDeviceToDevice,
-                        stream),
-                    hipSuccess);
-                TransferEngine::publishCurrentDeviceWrite(
-                    serial_input.get(),
-                    stream);
-                ASSERT_TRUE(kernel->multiply_tensor(
-                    serial_input.get(),
-                    serial_output.get(),
-                    1,
-                    N,
-                    K))
-                    << "serial final active row=" << final_active_row;
-
                 const size_t active_values =
                     static_cast<size_t>(test_case.active_rows) * N;
                 std::vector<float> exact_host(active_values);
                 std::vector<float> bucket_host(active_values);
-                std::vector<float> serial_final_row(
-                    static_cast<size_t>(N));
                 ASSERT_EQ(
                     hipMemcpyAsync(
                         exact_host.data(),
@@ -3799,14 +3756,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                         hipMemcpyDeviceToHost,
                         stream),
                     hipSuccess);
-                ASSERT_EQ(
-                    hipMemcpyAsync(
-                        serial_final_row.data(),
-                        serial_output->gpu_data_ptr(),
-                        serial_row_output_bytes,
-                        hipMemcpyDeviceToHost,
-                        stream),
-                    hipSuccess);
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
                 expectBitwiseFP32RowsEqual(
@@ -3820,21 +3769,20 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                     active_values,
                     static_cast<size_t>(N));
                 expectBitwiseFP32RowsEqual(
-                    std::string("ROCm NativeVNNI canonical M=17 prefix format=") +
+                    std::string("ROCm NativeVNNI exact M versus serial rows format=") +
                         format.label + " active M=" +
                         std::to_string(test_case.active_rows),
                     exact_host.data(),
-                    canonical_prefix.data(),
-                    canonical_prefix_values,
+                    serial_decode_rows.data(),
+                    active_values,
                     static_cast<size_t>(N));
                 expectBitwiseFP32RowsEqual(
-                    std::string("ROCm NativeVNNI final active row versus serial M=1 format=") +
+                    std::string("ROCm NativeVNNI bucket active rows versus serial M=1 format=") +
                         format.label + " active M=" +
                         std::to_string(test_case.active_rows),
-                    exact_host.data() +
-                        static_cast<size_t>(final_active_row) * N,
-                    serial_final_row.data(),
-                    static_cast<size_t>(N),
+                    bucket_host.data(),
+                    serial_decode_rows.data(),
+                    active_values,
                     static_cast<size_t>(N));
             }
 
@@ -5659,7 +5607,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     EXPECT_EQ(route_record->device, "rocm:0");
     EXPECT_EQ(route_record->tags.at("codebook"), "5");
 
-    double graph_atomic_launches = 0.0;
     double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
     {
@@ -5677,23 +5624,14 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         }
 
         if (record.tags.count("path") != 0 &&
-            record.tags.at("path") == "atomic_reduce" &&
-            record.tags.count("kb") != 0 &&
-            std::stoi(record.tags.at("kb")) > 1)
-        {
-            graph_atomic_launches += record.value;
-        }
-        if (record.tags.count("path") != 0 &&
             record.tags.at("path") == "split_reduce")
         {
             graph_split_reduce_launches += record.value;
         }
     }
 
-    EXPECT_EQ(graph_atomic_launches, 0.0)
-        << "GPU-graph Qwen3.6 small-M FFN down should not silently force atomic K-partitioning";
     EXPECT_GE(graph_split_reduce_launches, 1.0)
-        << "GPU-graph Qwen3.6 small-M FFN down should use declared workspace split/reduce by default";
+        << "GPU-graph Qwen3.6 small-M FFN down must use ordered workspace K-partition reduction";
 
     PerfStatsCollector::reset();
 }
@@ -6923,7 +6861,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     double shared_quant_calls = 0.0;
     double batched_projection_calls = 0.0;
     double graph_direct_launches = 0.0;
-    double graph_atomic_launches = 0.0;
     double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
     {
@@ -6987,13 +6924,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
                 graph_direct_launches += record.value;
             }
             if (record.tags.count("path") != 0 &&
-                record.tags.at("path") == "atomic_reduce" &&
-                record.tags.count("kb") != 0 &&
-                std::stoi(record.tags.at("kb")) > 1)
-            {
-                graph_atomic_launches += record.value;
-            }
-            if (record.tags.count("path") != 0 &&
                 record.tags.at("path") == "split_reduce")
             {
                 graph_split_reduce_launches += record.value;
@@ -7009,10 +6939,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         << "The batched qkv/z subgroup should quantize activations once";
     EXPECT_GE(batched_projection_calls, 2.0)
         << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
-    EXPECT_EQ(graph_atomic_launches, 0.0)
-        << "GPU-graph Qwen3.6 batched GDN qkv/z should not silently force atomic K-partitioning";
     EXPECT_GE(graph_direct_launches + graph_split_reduce_launches, 1.0)
-        << "GPU-graph Qwen3.6 batched GDN qkv/z should use a graph-native non-atomic verifier launch";
+        << "GPU-graph Qwen3.6 batched GDN qkv/z must use a graph-native ordered verifier launch";
 
     PerfStatsCollector::reset();
 }
@@ -7289,16 +7217,38 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSeri
     }
 }
 
+/**
+ * @brief Regress the ROCm grouped-prefill FP32 expression tree at every M.
+ *
+ * Q4_0 was the first all-codegroup witness that exposed grouped prefill using
+ * algebraically similar, but differently rounded, block commits and fused
+ * SwiGLU/Q8 publication. Keeping this focused case separate from the Cartesian
+ * sweep makes that structural defect cheap to reproduce while still crossing
+ * the route-owned/expert-tiled boundary and the extended M=31 probe.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     ROCmMoERoutedVerifierRuntimeM_Q4_0MatchesSerialDecodeBytes)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    const auto formats = nativeMoECodegroupCases();
+    ASSERT_FALSE(formats.empty());
+    ASSERT_EQ(formats.front().codebook_id, 0u);
+    ASSERT_STREQ(formats.front().label, "Q4_0");
+
+    runROCmMoECodegroupVerifierRowsMatchSerialDecode(
+        formats.front(), formats.front(), kGroupedVerifierRuntimeRows);
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierRuntimeM_AllNativeCodegroupsMatchSerialDecode)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
-    ScopedEnv force_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1");
-    ScopedEnv force_gateup_kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS", "4");
-    ScopedEnv force_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
-    ScopedEnv force_fused_swiglu_quant("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED", "1");
 
     /*
      * The grouped routed MoE verifier path is a composition of codebook

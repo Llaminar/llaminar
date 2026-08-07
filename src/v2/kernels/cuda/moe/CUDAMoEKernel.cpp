@@ -10,8 +10,10 @@
  */
 
 #include "CUDAMoEKernel.h"
+#include "CUDAMoEBatchInvariantPolicy.h"
 
 #include "../gemm/CUDADeviceWorkspace.h"
+#include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -26,6 +28,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -431,6 +434,124 @@ namespace
         return 16;
     }
 
+    /** Stable generic width used when an exact production key was not swept. */
+    constexpr int kCUDAMoEGenericGateUpOrderedTileN = 128;
+
+    /** Capture-time launch geometry and its reviewable dispatch provenance. */
+    struct CUDAMoEProductionPrefillPolicy
+    {
+        int gateup_tile_n = 0;
+        const char *source = "missing";
+    };
+
+    /** Return whether a width names one compiled arithmetic-neutral candidate. */
+    bool validCUDAMoEGateUpOrderedTileN(int tile_n) noexcept
+    {
+        return tile_n >= 64 && tile_n <= 256 && (tile_n % 32) == 0;
+    }
+
+    /** Return the sole execution codebook represented by a descriptor mask. */
+    int singleCUDAMoECodebook(uint32_t codebook_mask) noexcept
+    {
+        if (codebook_mask == 0 ||
+            (codebook_mask & (codebook_mask - 1U)) != 0U)
+        {
+            return -1;
+        }
+
+        int codebook = 0;
+        while ((codebook_mask >>= 1U) != 0U)
+            ++codebook;
+        return codebook;
+    }
+
+    /**
+     * @brief Format one descriptor-table codebook mask for stable PerfStats.
+     *
+     * CUDA and ROCm route diagnostics intentionally use the same fixed-width
+     * hexadecimal representation. This preserves every descriptor bit, makes
+     * mixed tables visible, and lets benchmark tooling compare backend records
+     * without interpreting signed decimal values or locale-specific output.
+     * Launch policy continues to consume the original integer mask.
+     *
+     * @param codebook_mask Exact OR-reduction of every descriptor codebook id.
+     * @return Lowercase fixed-width hexadecimal in @c 0x00000000 form.
+     */
+    std::string cudaCodebookMaskTag(uint32_t codebook_mask)
+    {
+        char text[11]{};
+        std::snprintf(text, sizeof(text), "0x%08x", codebook_mask);
+        return text;
+    }
+
+    /**
+     * @brief Select the complete CUDA gate/up geometry before graph capture.
+     *
+     * Exact Qwen production keys take precedence over the total generic policy.
+     * Heterogeneous descriptor tables cannot name one exact codebook pair and
+     * therefore retain the generic width explicitly. The Perf__ tournament is
+     * the sole higher-precedence control: its active bit distinguishes a forced
+     * 128-thread candidate from the ordinary generic value 128. Any malformed
+     * selected width remains invalid and causes the production caller to fail;
+     * it is never replaced after selection.
+     */
+    CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
+        int seq_len,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k,
+        bool use_gateup_kpart)
+    {
+        if (!use_gateup_kpart)
+            return {kCUDAMoEGenericGateUpOrderedTileN, "direct"};
+        if (gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
+            seq_len <= 0 || hidden_size <= 0 || expert_width <= 0 ||
+            expert_count <= 0 || top_k <= 0 || top_k > expert_count)
+        {
+            return {};
+        }
+
+        CUDAMoEProductionPrefillPolicy policy{
+            kCUDAMoEGenericGateUpOrderedTileN,
+            "generic_mixed_codebooks"};
+        const int gateup_codebook =
+            singleCUDAMoECodebook(gateup_codebook_mask);
+        const int down_codebook = singleCUDAMoECodebook(down_codebook_mask);
+        if (gateup_codebook >= 0 && down_codebook >= 0)
+        {
+            policy.source = "generic";
+            int exact_tile_n = 0;
+            if (llaminar2::cuda::generated::
+                    selectCUDAMoEProductionPrefillOverlay(
+                        static_cast<uint8_t>(gateup_codebook),
+                        static_cast<uint8_t>(down_codebook),
+                        hidden_size,
+                        expert_width,
+                        expert_count,
+                        top_k,
+                        seq_len,
+                        exact_tile_n))
+            {
+                policy.gateup_tile_n = exact_tile_n;
+                policy.source = "exact_overlay";
+            }
+        }
+
+        const auto &gemm = llaminar2::debugEnv().gemm;
+        if (gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active)
+        {
+            policy.gateup_tile_n =
+                gemm.cuda_moe_gateup_ordered_kpart_tile_n;
+            policy.source = "explicit_override";
+        }
+        if (!validCUDAMoEGateUpOrderedTileN(policy.gateup_tile_n))
+            return {};
+        return policy;
+    }
+
     llaminar2::PerfStatsCollector::Tags groupedPrefillTags(
         int seq_len,
         int top_k,
@@ -458,19 +579,53 @@ namespace
         int active_expert_slots,
         int tile_m,
         int tile_n,
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
         bool use_gateup_kpart,
         bool fuse_swiglu_requested,
         bool use_ordered_down_kpart,
         bool ordered_scatter,
         bool canonical_route_publication,
-        int splitk_tile_rows)
+        int splitk_tile_rows,
+        const char *policy_source)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
+        /*
+         * `tile_m` belongs only to the full-K grouped launcher.  Ordered KPART
+         * instead traverses a bounded row workspace named by
+         * `splitk_tile_rows`; reporting only the legacy numeric fields made a
+         * zero `tile_m` look like missing geometry to downstream gates.  Keep
+         * both legacy dimensions for corpus compatibility, but publish the
+         * authoritative geometry owner so tests and profilers cannot confuse
+         * two launch families with different arithmetic contracts.
+         */
+        tags["gateup_geometry_contract"] =
+            use_gateup_kpart ? "ordered_split_k" : "full_k";
+        tags["row_tile_source"] =
+            use_gateup_kpart ? "splitk_tile_rows" : "tile_m";
+        tags["gateup_codebook_mask"] =
+            cudaCodebookMaskTag(gateup_codebook_mask);
+        tags["down_codebook_mask"] =
+            cudaCodebookMaskTag(down_codebook_mask);
+        tags["policy_source"] = policy_source ? policy_source : "missing";
         if (use_gateup_kpart || use_ordered_down_kpart)
         {
             tags["splitk_tile_rows"] = std::to_string(splitk_tile_rows);
             tags["splitk_tile_count"] =
                 std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
+        }
+        if (use_gateup_kpart)
+        {
+            tags["gateup_k_partitions"] = std::to_string(
+                llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
+            tags["gateup_ordered_tile_n"] = std::to_string(tile_n);
+        }
+        if (use_ordered_down_kpart)
+        {
+            tags["down_k_partitions"] = std::to_string(
+                llaminar2::CUDAMoEBatchInvariantPolicy::down_k_partitions);
+            tags["down_ordered_tile_n"] = std::to_string(
+                llaminar2::debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n);
         }
         if (active_expert_slots > 0)
         {
@@ -506,7 +661,7 @@ namespace
                 if (!canonical_route_publication)
                 {
                     tags["down_direct_warps"] = std::to_string(
-                        llaminar2::debugEnv().gemm.cuda_moe_down_direct_warps);
+                        llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k));
                 }
             }
         }
@@ -698,6 +853,59 @@ namespace
 extern "C"
 {
     bool cudaNativeVNNIInitIQGridTables_tuned();
+
+    /**
+     * @brief Query the capture-time CUDA production-MoE prefill policy.
+     *
+     * This host-only inspection shares the exact production selector and does
+     * no CUDA work. Integration tests use it to prove exact-overlay precedence
+     * and total generic dispatch for unseen positive M values.
+     *
+     * @param gateup_codebook_id Uniform gate/up execution codebook.
+     * @param down_codebook_id Uniform down execution codebook.
+     * @param m Number of token rows embedded in the captured graph.
+     * @param hidden_size Model hidden width.
+     * @param expert_width Routed expert intermediate width.
+     * @param expert_count Number of routed experts.
+     * @param top_k Number of selected routes per token.
+     * @param gateup_tile_n Receives the ordered gate/up block width.
+     * @param exact_overlay Receives one only when an exact overlay supplied the
+     *        selected width; explicit trainer overrides report zero.
+     * @return true when the selected policy names a compiled launch geometry.
+     */
+    bool cudaMoE_grouped_prefill_query_production_config(
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int m,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k,
+        int *gateup_tile_n,
+        int *exact_overlay)
+    {
+        if (gateup_codebook_id >= 32 || down_codebook_id >= 32 ||
+            !gateup_tile_n || !exact_overlay)
+        {
+            return false;
+        }
+        const CUDAMoEProductionPrefillPolicy policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                uint32_t{1} << gateup_codebook_id,
+                uint32_t{1} << down_codebook_id,
+                m,
+                hidden_size,
+                expert_width,
+                expert_count,
+                top_k,
+                /*use_gateup_kpart=*/true);
+        if (!validCUDAMoEGateUpOrderedTileN(policy.gateup_tile_n))
+            return false;
+        *gateup_tile_n = policy.gateup_tile_n;
+        *exact_overlay =
+            std::strcmp(policy.source, "exact_overlay") == 0 ? 1 : 0;
+        return true;
+    }
 
     bool cudaMoE_route_logits(
         const float *hidden, const float *gate_weights, float *logits,
@@ -1372,6 +1580,7 @@ extern "C"
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
+        int gateup_ordered_tile_n,
         int down_k_partitions,
         int splitk_tile_rows,
         int device_idx,
@@ -6460,10 +6669,31 @@ namespace llaminar2
         const int *d_active_expert_ids =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
         const bool use_gateup_kpart = active_expert_slots > 0;
+        const CUDAMoEProductionPrefillPolicy prefill_policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                gateup_table.codebook_mask,
+                down_table.codebook_mask,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k,
+                use_gateup_kpart);
+        if (!validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "capture-time prefill policy is invalid"
+                      << " seq_len=" << seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " num_experts=" << num_experts
+                      << " top_k=" << top_k);
+            return false;
+        }
         if (use_gateup_kpart &&
             !ensureGroupedGateUpKPartScratchCapacity(
                 splitk_route_slots,
-                debugEnv().gemm.cuda_moe_gateup_kparts,
+                CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
                 intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
@@ -6482,7 +6712,7 @@ namespace llaminar2
             canonical_route_contributions != nullptr;
         if (use_down_ordered_kpart && publishes_canonical_routes &&
             !ensureGroupedDownKPartScratchCapacity(
-                debugEnv().gemm.cuda_moe_down_kparts,
+                CUDAMoEBatchInvariantPolicy::down_k_partitions,
                 d_model,
                 splitk_route_slots))
         {
@@ -6637,8 +6867,9 @@ namespace llaminar2
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
-            use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
+            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+            prefill_policy.gateup_tile_n,
+            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
             device_ordinal_,
             stream);
@@ -6667,10 +6898,12 @@ namespace llaminar2
                 : output,
             device,
             stream);
-        const int selected_tile_m = selectGroupedPrefillTileM(
-            debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert);
-        const int selected_tile_n =
-            use_gateup_kpart ? 64 : 128;
+        const int selected_tile_m = use_gateup_kpart
+                                        ? 0
+                                        : selectGroupedPrefillTileM(
+                                              debugEnv().gemm.cuda_moe_prefill_tile_m,
+                                              max_tokens_per_expert);
+        const int selected_tile_n = prefill_policy.gateup_tile_n;
         recordGroupedPrefillCounters(
             seq_len,
             top_k,
@@ -6678,12 +6911,15 @@ namespace llaminar2
             active_expert_slots,
             selected_tile_m,
             selected_tile_n,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
             ordered_scatter_overwrites_output,
             canonical_route_contributions != nullptr,
-            splitk_tile_rows);
+            splitk_tile_rows,
+            prefill_policy.source);
         return true;
     }
 
@@ -6754,6 +6990,27 @@ namespace llaminar2
         const int splitk_route_slots = splitk_tile_rows * top_k;
         const int active_expert_slots = std::min(total_slots, num_experts);
         const bool use_gateup_kpart = active_expert_slots > 0;
+        const CUDAMoEProductionPrefillPolicy prefill_policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                gateup_table.codebook_mask,
+                down_table.codebook_mask,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k,
+                use_gateup_kpart);
+        if (!validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "capture-time prefill policy is invalid"
+                      << " seq_len=" << seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " num_experts=" << num_experts
+                      << " top_k=" << top_k);
+            return false;
+        }
         /*
          * Runtime grouped verifier prefill must mirror the public M=1 runtime
          * decode route.  CUDA serial decode uses split-K gate/up for tiny MoE
@@ -6766,7 +7023,7 @@ namespace llaminar2
         if (use_gateup_kpart &&
             !ensureGroupedGateUpKPartScratchCapacity(
                 splitk_route_slots,
-                debugEnv().gemm.cuda_moe_gateup_kparts,
+                CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
                 intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
@@ -6785,7 +7042,7 @@ namespace llaminar2
         }
         if (use_down_ordered_kpart && publishes_canonical_routes &&
             !ensureGroupedDownKPartScratchCapacity(
-                debugEnv().gemm.cuda_moe_down_kparts,
+                CUDAMoEBatchInvariantPolicy::down_k_partitions,
                 d_model,
                 splitk_route_slots))
         {
@@ -6930,8 +7187,9 @@ namespace llaminar2
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
-            use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
+            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+            prefill_policy.gateup_tile_n,
+            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
             device_ordinal_,
             stream);
@@ -6965,14 +7223,21 @@ namespace llaminar2
             top_k,
             num_experts,
             active_expert_slots,
-            selectGroupedPrefillTileM(debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert),
-            use_gateup_kpart ? 64 : 128,
+            use_gateup_kpart
+                ? 0
+                : selectGroupedPrefillTileM(
+                      debugEnv().gemm.cuda_moe_prefill_tile_m,
+                      max_tokens_per_expert),
+            prefill_policy.gateup_tile_n,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
             true,
             canonical_route_contributions != nullptr,
-            splitk_tile_rows);
+            splitk_tile_rows,
+            prefill_policy.source);
         return true;
     }
 
@@ -7247,7 +7512,7 @@ namespace llaminar2
             !requireTensorElements(input, static_cast<size_t>(d_model), "input", "groupedExpertGateUpDecodeFromTable"))
             return false;
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] "
@@ -7430,7 +7695,7 @@ namespace llaminar2
             return false;
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] "
@@ -7510,7 +7775,7 @@ namespace llaminar2
             return false;
         }
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] "
@@ -7791,7 +8056,7 @@ namespace llaminar2
         if (!d_output)
             return false;
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] "
@@ -7981,8 +8246,8 @@ namespace llaminar2
         }
 
         const int gateup_k_partitions =
-            debugEnv().gemm.cuda_moe_gateup_kparts;
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(
                 top_k, gateup_k_partitions, intermediate) ||
             !ensureGroupedDownKPartScratchCapacity(
@@ -8119,8 +8384,8 @@ namespace llaminar2
         }
 
         const int gateup_k_partitions =
-            debugEnv().gemm.cuda_moe_gateup_kparts;
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(
                 num_active, gateup_k_partitions, intermediate) ||
             !ensureGroupedDownKPartScratchCapacity(
@@ -8269,7 +8534,7 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
             return false;
 
-        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int gateup_k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(
                 top_k, gateup_k_partitions, intermediate))
         {
@@ -8277,7 +8542,7 @@ namespace llaminar2
                       "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedDownKPartScratchCapacity(
                 down_k_partitions, d_model, top_k))
         {
@@ -8552,7 +8817,7 @@ namespace llaminar2
 
         // Ordered K-part decode is the production contract. If its partial
         // scratch cannot be sized, fail instead of changing arithmetic.
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
@@ -8750,7 +9015,7 @@ namespace llaminar2
 
         // Split-K raises occupancy while its ordered reduction preserves the
         // serial-decode arithmetic tree used by grouped verifier batches.
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] "

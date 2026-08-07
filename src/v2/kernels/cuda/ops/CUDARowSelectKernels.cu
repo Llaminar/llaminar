@@ -1,11 +1,13 @@
 /**
  * @file CUDARowSelectKernels.cu
- * @brief CUDA implementation of graph-capturable hidden-state row selection.
+ * @brief CUDA kernels for graph-capturable row and prefill-window selection.
  *
- * The row copy uses a fixed kernel signature and launch shape for a fixed
- * bucket. The selected row is read from a device scalar that is updated by a
- * captured host-to-device copy, allowing one captured graph executable to replay
- * with different real prompt lengths inside the same bucket.
+ * Row-selection entry points compact hidden-state rows into persistent graph
+ * buffers. The prefill materializer derives each request window entirely from
+ * admitted device tensors and canonical device KV progress, allowing one fixed
+ * graph executable to serve every chunk of a long prompt. Every launch requires
+ * the exact non-null producer stream; no kernel in this file may infer ordering
+ * from CUDA's default stream.
  */
 
 #include "CUDARowSelectKernels.h"
@@ -20,6 +22,97 @@ namespace llaminar2::cuda
 {
     namespace
     {
+        /**
+         * @brief Build one resident prefill bucket from canonical request/KV state.
+         *
+         * Every thread independently derives the immutable source window from
+         * device scalars. No inter-block barrier or atomic is needed because
+         * this kernel does not advance KV progress; the later captured append
+         * stage is its sole writer. Full four-row groups use 128-bit token and
+         * position transfers when both source and destination addresses permit.
+         */
+        __global__ void preparePrefillChunkViewKernel(
+            const int32_t *__restrict__ request_token_ids,
+            const int32_t *__restrict__ request_position_ids,
+            const int32_t *__restrict__ request_total_rows,
+            const int32_t *__restrict__ cached_tokens,
+            int request_row_capacity,
+            int bucket_seq_len,
+            int32_t pad_token_id,
+            int32_t *__restrict__ out_token_ids,
+            int32_t *__restrict__ out_position_ids,
+            int32_t *__restrict__ out_real_rows,
+            int32_t *__restrict__ out_row_stride)
+        {
+            const int total_rows = *request_total_rows;
+            const int request_first_position = request_position_ids[0];
+            const int cached_row_count = *cached_tokens;
+            const int source_start = cached_row_count - request_first_position;
+            const bool geometry_valid =
+                total_rows > 0 && total_rows <= request_row_capacity &&
+                source_start >= 0 && source_start < total_rows &&
+                bucket_seq_len > 0 && bucket_seq_len <= request_row_capacity;
+            const int global_thread =
+                static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            if (!geometry_valid)
+            {
+                if (global_thread == 0)
+                    asm volatile("trap;");
+                return;
+            }
+
+            const int real_rows = min(bucket_seq_len, total_rows - source_start);
+            if (global_thread == 0)
+            {
+                *out_real_rows = real_rows;
+                *out_row_stride = bucket_seq_len;
+            }
+
+            const int vector_count = (bucket_seq_len + 3) / 4;
+            const int grid_stride =
+                static_cast<int>(blockDim.x * gridDim.x);
+            const bool aligned_vector_path =
+                ((reinterpret_cast<uintptr_t>(request_token_ids + source_start) |
+                  reinterpret_cast<uintptr_t>(request_position_ids + source_start) |
+                  reinterpret_cast<uintptr_t>(out_token_ids) |
+                  reinterpret_cast<uintptr_t>(out_position_ids)) &
+                 uintptr_t{0x0f}) == 0;
+
+            for (int vector_index = global_thread;
+                 vector_index < vector_count;
+                 vector_index += grid_stride)
+            {
+                const int row = vector_index * 4;
+                if (row + 3 < real_rows && aligned_vector_path)
+                {
+                    reinterpret_cast<int4 *>(out_token_ids)[vector_index] =
+                        reinterpret_cast<const int4 *>(
+                            request_token_ids + source_start)[vector_index];
+                    reinterpret_cast<int4 *>(out_position_ids)[vector_index] =
+                        reinterpret_cast<const int4 *>(
+                            request_position_ids + source_start)[vector_index];
+                    continue;
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    const int output_row = row + lane;
+                    if (output_row >= bucket_seq_len)
+                        break;
+                    const bool active = output_row < real_rows;
+                    out_token_ids[output_row] =
+                        active
+                            ? request_token_ids[source_start + output_row]
+                            : pad_token_id;
+                    out_position_ids[output_row] =
+                        active
+                            ? request_position_ids[source_start + output_row]
+                            : request_first_position + source_start + output_row;
+                }
+            }
+        }
+
         /// @brief Copy one selected FP32 row using a grid-stride loop over columns.
         __global__ void rowSelectFP32Kernel(
             const float *__restrict__ input,
@@ -515,7 +608,7 @@ namespace llaminar2::cuda
         const int *host_selected_row,
         void *stream)
     {
-        if (!device_selected_row || !host_selected_row)
+        if (!device_selected_row || !host_selected_row || !stream)
             return false;
         auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
         return ok(cudaMemcpyAsync(
@@ -551,7 +644,8 @@ namespace llaminar2::cuda
         int d_model,
         void *stream)
     {
-        if (!input || !output || !device_selected_row || seq_len <= 0 || d_model <= 0)
+        if (!input || !output || !device_selected_row || seq_len <= 0 ||
+            d_model <= 0 || !stream)
             return false;
 
         constexpr int threads_per_block = 256;
@@ -970,7 +1064,8 @@ namespace llaminar2::cuda
         int hidden_dim,
         void *stream)
     {
-        if (!hidden || !embedding || !output || rows <= 0 || hidden_dim <= 0)
+        if (!hidden || !embedding || !output || rows <= 0 ||
+            hidden_dim <= 0 || !stream)
             return false;
 
         constexpr int threads_per_block = 256;
@@ -984,6 +1079,70 @@ namespace llaminar2::cuda
             rows,
             hidden_dim);
         return ok(cudaGetLastError());
+    }
+
+    bool launchPreparePrefillChunkView(
+        const int32_t *request_token_ids,
+        const int32_t *request_position_ids,
+        const int32_t *request_total_rows,
+        const int32_t *cached_tokens,
+        int request_row_capacity,
+        int bucket_seq_len,
+        int32_t pad_token_id,
+        int32_t *out_token_ids,
+        int32_t *out_position_ids,
+        int32_t *out_real_rows,
+        int32_t *out_row_stride,
+        void *stream)
+    {
+        if (!request_token_ids || !request_position_ids ||
+            !request_total_rows || !cached_tokens ||
+            request_row_capacity <= 0 || bucket_seq_len <= 0 ||
+            bucket_seq_len > request_row_capacity || !out_token_ids ||
+            !out_position_ids || !out_real_rows || !out_row_stride || !stream)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Prefill chunk materialization received an incomplete launch contract");
+            return false;
+        }
+
+        /*
+         * One warp owns each independent run of vector groups.  A 4096-row
+         * production bucket contains only 1024 int4 groups; using a conventional
+         * 256-thread block collapses that work onto four SMs on GA102.  Warp-sized
+         * blocks expose 32 independent blocks without adding threads, arithmetic,
+         * or memory traffic, which is the useful occupancy dimension for this
+         * small graph prelude.
+         */
+        constexpr int threads_per_block = 32;
+        const int vector_count = (bucket_seq_len + 3) / 4;
+        const int blocks = std::max(
+            1,
+            std::min(128, (vector_count + threads_per_block - 1) /
+                              threads_per_block));
+        preparePrefillChunkViewKernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            reinterpret_cast<cudaStream_t>(stream)>>>(
+            request_token_ids,
+            request_position_ids,
+            request_total_rows,
+            cached_tokens,
+            request_row_capacity,
+            bucket_seq_len,
+            pad_token_id,
+            out_token_ids,
+            out_position_ids,
+            out_real_rows,
+            out_row_stride);
+        const cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARowSelectKernels] Prefill chunk materialization launch failed: "
+                      << cudaGetErrorString(status));
+            return false;
+        }
+        return true;
     }
 
 } // namespace llaminar2::cuda

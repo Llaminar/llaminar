@@ -1061,6 +1061,7 @@ extern "C"
         const float *d_weights,
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
+        float *d_ordered_down_partials,
         float *d_output,
         int num_active,
         int N,
@@ -1079,6 +1080,7 @@ extern "C"
         float *d_swiglu_scales,
         float *d_output,
         float *d_canonical_route_contributions,
+        float *d_ordered_route_scratch,
         int num_active,
         int N,
         int K,
@@ -1095,6 +1097,8 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        float *d_gate_partials,
+        float *d_up_partials,
         bool hidden_prequantized,
         int num_active,
         int N,
@@ -1111,108 +1115,13 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        float *d_gate_partials,
+        float *d_up_partials,
         bool hidden_prequantized,
         int num_active,
         int N,
         int K,
         int num_experts,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-        const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        float *d_gate_partials,
-        float *d_up_partials,
-        int num_active,
-        int N,
-        int K,
-        uint8_t codebook_id,
-        int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-        const float *d_hidden,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        float *d_gate_partials,
-        float *d_up_partials,
-        int num_active,
-        int N,
-        int K,
-        int num_experts,
-        uint8_t codebook_id,
-        int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
-        const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const int *d_expert_ids,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        float *d_gate_partials,
-        float *d_up_partials,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        int num_active,
-        int N,
-        int K,
-        uint8_t codebook_id,
-        int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart(
-        const float *d_hidden,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        float *d_gate_partials,
-        float *d_up_partials,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        int num_active,
-        int N,
-        int K,
-        int num_experts,
-        uint8_t codebook_id,
-        int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        bool swiglu_prequantized,
-        float *d_output,
-        int num_active,
-        int N,
-        int K,
         uint8_t codebook_id,
         int device_idx,
         void *stream);
@@ -1226,24 +1135,7 @@ extern "C"
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
         float *d_output,
-        int num_active,
-        int N,
-        int K,
-        int num_experts,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream);
-
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        bool swiglu_prequantized,
-        float *d_output,
+        float *d_ordered_route_scratch,
         int num_active,
         int N,
         int K,
@@ -1330,6 +1222,20 @@ extern "C"
         int *tile_m,
         int *tile_n);
 
+    bool rocmMoE_grouped_prefill_query_production_pair_config(
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int m,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k,
+        int *gateup_tile_m,
+        int *gateup_tile_n,
+        int *down_tile_m,
+        int *down_tile_n,
+        int *exact_overlay);
+
 }
 
 namespace
@@ -1346,6 +1252,14 @@ namespace
     {
         std::string tile_m;
         std::string tile_n;
+    };
+
+    /** Joint production policy and provenance recorded for one captured pair. */
+    struct MoEPrefillPairPolicyTags
+    {
+        MoEPrefillPolicyTags gateup;
+        MoEPrefillPolicyTags down;
+        std::string source;
     };
 
     /**
@@ -1369,51 +1283,84 @@ namespace
     }
 
     /**
-     * @brief Describe the exact grouped-prefill policy used by one projection.
+     * @brief Format a descriptor-table codebook mask for stable PerfStats tags.
      *
-     * Direct M<=8 execution has a fixed one-row, 64-column launch and bypasses
-     * the long-prefill trainer. Long-prefill tables with one codebook query the
-     * same generated selector used by the HIP launcher. Heterogeneous tables are
-     * reported as @c mixed because each instantiated codebook can select a
-     * different tile inside the same pipeline call. A @c missing value indicates
-     * an internal invariant violation: the pipeline should already have failed
-     * before publishing telemetry when no generated policy exists.
+     * Fixed-width hexadecimal preserves every bit and makes uniform and mixed
+     * tables visually distinguishable without depending on locale or signed
+     * integer formatting. The resulting string is diagnostic metadata only;
+     * launch policy continues to consume the original integer mask.
      *
-     * @param codebook_mask Descriptor-table execution-codebook mask.
-     * @param projection_role Zero for gate/up and one for down projection.
-     * @param seq_len Number of original token rows in this prefill call.
-     * @param n Projection output width.
-     * @param k Projection reduction width.
-     * @return String values suitable for stable PerfStats tags.
+     * @param codebook_mask Exact OR-reduction of all descriptor codebook ids.
+     * @return Lowercase fixed-width hexadecimal in @c 0x00000000 form.
      */
-    MoEPrefillPolicyTags queryMoEPrefillPolicyTags(
-        uint32_t codebook_mask,
-        int projection_role,
+    std::string codebookMaskTag(uint32_t codebook_mask)
+    {
+        char text[11]{};
+        std::snprintf(text, sizeof(text), "0x%08x", codebook_mask);
+        return text;
+    }
+
+    /**
+     * @brief Describe the joint policy embedded in one grouped-prefill graph.
+     *
+     * This query has the complete exact-overlay key and therefore cannot report
+     * a generic role geometry while production executes a model-specific pair.
+     * Mixed descriptor tables continue to launch one generated generic policy
+     * per execution codebook and are explicitly reported as mixed. A missing
+     * uniform policy is an internal invariant violation: the launch must already
+     * have failed rather than publishing misleading telemetry.
+     */
+    MoEPrefillPairPolicyTags queryMoEPrefillPairPolicyTags(
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
         int seq_len,
-        int n,
-        int k)
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k)
     {
         if (seq_len <= 8)
-            return {"1", "64"};
+            return {{"1", "64"}, {"1", "64"}, "direct"};
 
-        const int codebook = singleCodebookFromMask(codebook_mask);
-        if (codebook < 0)
-            return {"mixed", "mixed"};
-
-        int tile_m = 0;
-        int tile_n = 0;
-        if (!rocmMoE_grouped_prefill_query_tile_config(
-                static_cast<uint8_t>(codebook),
-                projection_role,
-                seq_len,
-                n,
-                k,
-                &tile_m,
-                &tile_n))
+        const int gateup_codebook =
+            singleCodebookFromMask(gateup_codebook_mask);
+        const int down_codebook = singleCodebookFromMask(down_codebook_mask);
+        if (gateup_codebook < 0 || down_codebook < 0)
         {
-            return {"missing", "missing"};
+            return {
+                {"mixed", "mixed"},
+                {"mixed", "mixed"},
+                "generic_mixed_codebooks"};
         }
-        return {std::to_string(tile_m), std::to_string(tile_n)};
+
+        int gateup_tile_m = 0;
+        int gateup_tile_n = 0;
+        int down_tile_m = 0;
+        int down_tile_n = 0;
+        int exact_overlay = 0;
+        if (!rocmMoE_grouped_prefill_query_production_pair_config(
+                static_cast<uint8_t>(gateup_codebook),
+                static_cast<uint8_t>(down_codebook),
+                seq_len,
+                hidden_size,
+                expert_width,
+                expert_count,
+                top_k,
+                &gateup_tile_m,
+                &gateup_tile_n,
+                &down_tile_m,
+                &down_tile_n,
+                &exact_overlay))
+        {
+            return {
+                {"missing", "missing"},
+                {"missing", "missing"},
+                "missing"};
+        }
+        return {
+            {std::to_string(gateup_tile_m), std::to_string(gateup_tile_n)},
+            {std::to_string(down_tile_m), std::to_string(down_tile_n)},
+            exact_overlay != 0 ? "exact_overlay" : "generic"};
     }
 
     bool tryGroupedDecodeGateLogits(
@@ -1718,6 +1665,7 @@ namespace llaminar2
         d_grouped_down_descs_ = nullptr;
         d_grouped_swiglu_int8_ = nullptr;
         d_grouped_swiglu_scales_ = nullptr;
+        d_grouped_down_partials_ = nullptr;
         d_grouped_gate_output_ptrs_ = nullptr;
         d_grouped_up_output_ptrs_ = nullptr;
         d_grouped_gateup_expert_ids_ = nullptr;
@@ -1747,16 +1695,15 @@ namespace llaminar2
         d_prefill_swiglu_scales_ = nullptr;
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
+        d_prefill_work_directory_ = nullptr;
 
         max_write_heads_experts_ = 0;
         staging_capacity_ = 0;
         grouped_decode_active_cap_ = 0;
         grouped_decode_intermediate_cap_ = 0;
+        grouped_decode_d_model_cap_ = 0;
         grouped_gateup_active_cap_ = 0;
         grouped_gateup_d_model_cap_ = 0;
-        grouped_gateup_kpart_active_cap_ = 0;
-        grouped_gateup_kpart_partitions_cap_ = 0;
-        grouped_gateup_kpart_intermediate_cap_ = 0;
         shared_gate_scratch_capacity_ = 0;
         route_logits_capacity_ = 0;
         route_logits_partials_capacity_ = 0;
@@ -3274,9 +3221,13 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::ensureGroupedDecodeCapacity(int num_active, int intermediate)
+    bool ROCmMoEKernel::ensureGroupedDecodeCapacity(
+        int num_active,
+        int intermediate,
+        int d_model)
     {
-        if (num_active <= 0 || intermediate <= 0 || (intermediate % 32) != 0)
+        if (num_active <= 0 || intermediate <= 0 || d_model <= 0 ||
+            (intermediate % 32) != 0)
             return false;
 
         if (!setMoEDevice(device_ordinal_, "ensureGroupedDecodeCapacity"))
@@ -3285,10 +3236,12 @@ namespace llaminar2
         const int blocks_per_row = intermediate / 32;
         const bool pointer_capacity_ok = grouped_decode_active_cap_ >= num_active;
         const bool activation_capacity_ok = grouped_decode_intermediate_cap_ >= intermediate;
-        if (pointer_capacity_ok && activation_capacity_ok &&
+        const bool output_capacity_ok = grouped_decode_d_model_cap_ >= d_model;
+        if (pointer_capacity_ok && activation_capacity_ok && output_capacity_ok &&
             d_grouped_gate_ptrs_ && d_grouped_up_ptrs_ && d_grouped_decode_weights_ &&
             d_grouped_expert_ids_ && d_grouped_down_descs_ &&
-            d_grouped_swiglu_int8_ && d_grouped_swiglu_scales_)
+            d_grouped_swiglu_int8_ && d_grouped_swiglu_scales_ &&
+            d_grouped_down_partials_)
         {
             return true;
         }
@@ -3320,7 +3273,16 @@ namespace llaminar2
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_swiglu_scales_),
                                  MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,
                                  static_cast<size_t>(num_active) * blocks_per_row * sizeof(float),
-                                 "ensureGroupedDecodeCapacity(swiglu_scales)"))
+                                 "ensureGroupedDecodeCapacity(swiglu_scales)") ||
+            !bindWorkspaceBuffer(
+                reinterpret_cast<void **>(
+                    &d_grouped_down_partials_),
+                MoEWorkspaceBuffers::DOWN_PARTIALS,
+                static_cast<size_t>(num_active) *
+                    static_cast<size_t>(
+                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    static_cast<size_t>(d_model) * sizeof(float),
+                "ensureGroupedDecodeCapacity(ordered_down_partials)"))
         {
             d_grouped_gate_ptrs_ = nullptr;
             d_grouped_up_ptrs_ = nullptr;
@@ -3329,13 +3291,16 @@ namespace llaminar2
             d_grouped_down_descs_ = nullptr;
             d_grouped_swiglu_int8_ = nullptr;
             d_grouped_swiglu_scales_ = nullptr;
+            d_grouped_down_partials_ = nullptr;
             grouped_decode_active_cap_ = 0;
             grouped_decode_intermediate_cap_ = 0;
+            grouped_decode_d_model_cap_ = 0;
             return false;
         }
 
         grouped_decode_active_cap_ = num_active;
         grouped_decode_intermediate_cap_ = intermediate;
+        grouped_decode_d_model_cap_ = d_model;
         return true;
     }
 
@@ -3352,7 +3317,9 @@ namespace llaminar2
             grouped_gateup_d_model_cap_ >= d_model &&
             d_grouped_gate_output_ptrs_ && d_grouped_up_output_ptrs_ &&
             d_grouped_gateup_expert_ids_ &&
-            d_grouped_hidden_int8_ && d_grouped_hidden_scales_)
+            d_grouped_hidden_int8_ && d_grouped_hidden_scales_ &&
+            d_grouped_gateup_gate_partials_ &&
+            d_grouped_gateup_up_partials_)
         {
             return true;
         }
@@ -3376,13 +3343,31 @@ namespace llaminar2
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_hidden_scales_),
                                  MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
                                  static_cast<size_t>(blocks_per_row) * sizeof(float),
-                                 "ensureGroupedGateUpCapacity(hidden_scales)"))
+                                 "ensureGroupedGateUpCapacity(hidden_scales)") ||
+            !bindWorkspaceBuffer(
+                reinterpret_cast<void **>(&d_grouped_gateup_gate_partials_),
+                MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
+                static_cast<size_t>(num_active) *
+                    static_cast<size_t>(
+                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    static_cast<size_t>(d_model) * sizeof(float),
+                "ensureGroupedGateUpCapacity(gate_partials)") ||
+            !bindWorkspaceBuffer(
+                reinterpret_cast<void **>(&d_grouped_gateup_up_partials_),
+                MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
+                static_cast<size_t>(num_active) *
+                    static_cast<size_t>(
+                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    static_cast<size_t>(d_model) * sizeof(float),
+                "ensureGroupedGateUpCapacity(up_partials)"))
         {
             d_grouped_gate_output_ptrs_ = nullptr;
             d_grouped_up_output_ptrs_ = nullptr;
             d_grouped_gateup_expert_ids_ = nullptr;
             d_grouped_hidden_int8_ = nullptr;
             d_grouped_hidden_scales_ = nullptr;
+            d_grouped_gateup_gate_partials_ = nullptr;
+            d_grouped_gateup_up_partials_ = nullptr;
             grouped_gateup_active_cap_ = 0;
             grouped_gateup_d_model_cap_ = 0;
             return false;
@@ -3390,51 +3375,6 @@ namespace llaminar2
 
         grouped_gateup_active_cap_ = num_active;
         grouped_gateup_d_model_cap_ = d_model;
-        return true;
-    }
-
-    bool ROCmMoEKernel::ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate)
-    {
-        if (num_active <= 0 || intermediate <= 0 ||
-            !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 || k_partitions == 16))
-        {
-            return false;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "ensureGroupedGateUpKPartScratchCapacity"))
-            return false;
-
-        if (d_grouped_gateup_gate_partials_ && d_grouped_gateup_up_partials_ &&
-            grouped_gateup_kpart_active_cap_ >= num_active &&
-            grouped_gateup_kpart_partitions_cap_ >= k_partitions &&
-            grouped_gateup_kpart_intermediate_cap_ >= intermediate)
-        {
-            return true;
-        }
-
-        const size_t partial_count = static_cast<size_t>(num_active) *
-                                     static_cast<size_t>(k_partitions) *
-                                     static_cast<size_t>(intermediate);
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_gate_partials_),
-                                 MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
-                                 partial_count * sizeof(float),
-                                 "ensureGroupedGateUpKPartScratchCapacity(gate)") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_up_partials_),
-                                 MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
-                                 partial_count * sizeof(float),
-                                 "ensureGroupedGateUpKPartScratchCapacity(up)"))
-        {
-            d_grouped_gateup_gate_partials_ = nullptr;
-            d_grouped_gateup_up_partials_ = nullptr;
-            grouped_gateup_kpart_active_cap_ = 0;
-            grouped_gateup_kpart_partitions_cap_ = 0;
-            grouped_gateup_kpart_intermediate_cap_ = 0;
-            return false;
-        }
-
-        grouped_gateup_kpart_active_cap_ = num_active;
-        grouped_gateup_kpart_partitions_cap_ = k_partitions;
-        grouped_gateup_kpart_intermediate_cap_ = intermediate;
         return true;
     }
 
@@ -6477,6 +6417,8 @@ namespace llaminar2
             d_up_output_ptrs,
             d_grouped_hidden_int8_,
             d_grouped_hidden_scales_,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
             false,
             num_active,
             intermediate,
@@ -6636,78 +6578,30 @@ namespace llaminar2
             return false;
         }
 
-        const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
         /*
-         * Masked explicit-routing decode is the M=1 production contract for
-         * LocalTP expert-id-apportioned verifier rows. Non-local route slots are
-         * represented as -1 entries, and the grouped runtime-M verifier publisher
-         * must be byte-identical to this path before its partial output is
-         * allreduced with peer shards.  Split-K gate/up changes the FP32 reduction
-         * tree, so masked verifier decode stays on the single-reduction grouped
-         * kernel even when the ordinary ROCm decode tuning knob is enabled.
+         * Gate/up owns one increasing-K accumulator per route and output column.
+         * That arithmetic is the decode contract for both explicit routing and
+         * runtime placement. Split-K variants are deliberately absent because
+         * reducing partition totals changes the FP32 addition tree.
          */
-        const bool masked_decode_equivalent_routing = (expert_mask != nullptr);
-        const bool use_kpart_gateup =
-            !masked_decode_equivalent_routing &&
-            debugEnv().rocm.moe_gateup_kpart_decode;
-        if (use_kpart_gateup && !groupedDecodeSupportsCodebook(table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] "
-                      "K-part gate/up decode was requested but codebook "
-                      << static_cast<int>(table.codebook_id) << " is unsupported");
-            return false;
-        }
-        if (use_kpart_gateup && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
-            return false;
-        }
-
-        /*
-         * Serial decode and grouped verifier execution must use the same
-         * gate/up reduction plan.  The verifier owns explicit routing tensors,
-         * so it cannot call the runtime-table entry point directly; instead it
-         * selects the matching table-descriptor kernel variant here.  This keeps
-         * LocalTP MTP verifier rows bitwise aligned with ordinary decode while
-         * remaining device-resident and graph-capturable.
-         */
-        const bool ok = use_kpart_gateup
-                            ? rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_gateup_expert_ids_,
-                                  d_grouped_gate_output_ptrs_,
-                                  d_grouped_up_output_ptrs_,
-                                  d_grouped_hidden_int8_,
-                                  d_grouped_hidden_scales_,
-                                  false,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  getStream())
-                            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_gateup_expert_ids_,
-                                  d_grouped_gate_output_ptrs_,
-                                  d_grouped_up_output_ptrs_,
-                                  d_grouped_hidden_int8_,
-                                  d_grouped_hidden_scales_,
-                                  false,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  getStream());
+        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_grouped_gateup_expert_ids_,
+            d_grouped_gate_output_ptrs_,
+            d_grouped_up_output_ptrs_,
+            d_grouped_hidden_int8_,
+            d_grouped_hidden_scales_,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            false,
+            top_k,
+            intermediate,
+            d_model,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
 
         if (ok)
         {
@@ -6802,75 +6696,29 @@ namespace llaminar2
             return false;
         }
 
-        const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_kpart_gateup = debugEnv().rocm.moe_gateup_kpart_decode;
-        if (use_kpart_gateup && !groupedDecodeSupportsCodebook(table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but codebook "
-                      << static_cast<int>(table.codebook_id) << " is unsupported");
-            return false;
-        }
-        if (use_kpart_gateup && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
-            return false;
-        }
         const bool reuse_router_q8_hidden =
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
 
-        bool ok = false;
-        if (use_kpart_gateup)
-        {
-            ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-                d_hidden,
-                runtime_layer,
-                d_expert_ids,
-                d_gate_output_ptrs,
-                d_up_output_ptrs,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                d_grouped_gateup_gate_partials_,
-                d_grouped_gateup_up_partials_,
-                top_k,
-                intermediate,
-                d_model,
-                table.num_experts,
-                table.codebook_id,
-                k_partitions,
-                device_ordinal_,
-                getStream());
-            if (!ok)
-            {
-                LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
-                          "K-part gate/up runtime kernel failed");
-                return false;
-            }
-        }
-
-        if (!use_kpart_gateup)
-        {
-            ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
-                d_hidden,
-                runtime_layer,
-                d_expert_ids,
-                d_gate_output_ptrs,
-                d_up_output_ptrs,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                top_k,
-                intermediate,
-                d_model,
-                table.num_experts,
-                table.codebook_id,
-                device_ordinal_,
-                getStream());
-        }
+        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+            d_hidden,
+            runtime_layer,
+            d_expert_ids,
+            d_gate_output_ptrs,
+            d_up_output_ptrs,
+            gateup_hidden_int8,
+            gateup_hidden_scales,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            reuse_router_q8_hidden,
+            top_k,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
 
         if (ok)
         {
@@ -7069,7 +6917,7 @@ namespace llaminar2
             !setMoEDevice(device_ordinal_,
                           "prepareGroupedRuntimeDecodeLaunchState") ||
             !ensureGroupedGateUpCapacity(top_k, d_model) ||
-            !ensureGroupedDecodeCapacity(top_k, intermediate) ||
+            !ensureGroupedDecodeCapacity(top_k, intermediate, d_model) ||
             !ensureGroupedPrefillScratchCapacity(
                 top_k, d_model, intermediate))
         {
@@ -7204,7 +7052,7 @@ namespace llaminar2
             }
         }
         if (!ensureGroupedGateUpCapacity(num_active, d_model) ||
-            !ensureGroupedDecodeCapacity(num_active, intermediate) ||
+            !ensureGroupedDecodeCapacity(num_active, intermediate, d_model) ||
             !ensureGroupedGateUpDecodeMetadata(expert_ids, num_active) ||
             !ensureGroupedDownDecodeMetadata(
                 expert_ids, expert_weights, num_active))
@@ -7365,7 +7213,7 @@ namespace llaminar2
          * tensors. If a graph would need to upload/allocate here, fail loudly.
          */
         if (!ensureGroupedGateUpCapacity(top_k, d_model) ||
-            !ensureGroupedDecodeCapacity(top_k, intermediate) ||
+            !ensureGroupedDecodeCapacity(top_k, intermediate, d_model) ||
             !ensureGroupedPrefillScratchCapacity(top_k, d_model, intermediate))
         {
             return false;
@@ -7511,32 +7359,11 @@ namespace llaminar2
             return false;
         }
 
-        const int gateup_k_partitions = debugEnv().rocm.moe_gateup_kparts;
         /*
-         * Runtime grouped decode is the serial-row oracle for MTP verifier
-         * publication.  ROCm split-K gate/up reductions are fast, but they do
-         * not produce the same FP32 byte stream as the grouped verifier
-         * prefill kernels for IQ2/IQ4-style expert weights.  Keep this
-         * production decode entry point on the deterministic single-reduction
-         * gate/up path until a generated split-K policy is proven
-         * byte-identical for every codebook in the verifier sweep.
+         * Gate/up follows the same complete increasing-K dot-product contract
+         * as serial decode. Partition totals are not an interchangeable result:
+         * adding those totals changes FP32 grouping and therefore token bytes.
          */
-        const bool use_gateup_kpart = false;
-        if (use_gateup_kpart && !groupedDecodeSupportsCodebook(gateup_table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but codebook "
-                      << static_cast<int>(gateup_table.codebook_id) << " is unsupported");
-            return false;
-        }
-        if (use_gateup_kpart &&
-            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
-            return false;
-        }
-        const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
             allow_router_q8_reuse &&
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
@@ -7549,116 +7376,24 @@ namespace llaminar2
         }
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
-        /*
-         * Parallel down publishes route contributions with atomics.  Even when
-         * the numerical delta is only a few ULPs, the operation is not
-         * batch-invariant against grouped verifier rows because the atomic
-         * arrival order is not the serial top-k accumulation order.  Use the
-         * ordered serial-down publication in runtime decode so M=1 serial rows
-         * and grouped runtime-M verifier rows share one byte-stable contract.
-         */
-        const bool use_parallel_down = false;
-        if (use_parallel_down && !groupedDecodeSupportsCodebook(down_table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "parallel down decode was requested but codebook "
-                      << static_cast<int>(down_table.codebook_id) << " is unsupported");
-            return false;
-        }
-        const bool use_gateup_swiglu_quant_fused =
-            use_gateup_kpart &&
-            debugEnv().rocm.moe_gateup_swiglu_quant_fused &&
-            use_parallel_down;
-        if (use_gateup_swiglu_quant_fused &&
-            (!d_grouped_swiglu_int8_ || !d_grouped_swiglu_scales_))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "fused gate/up SwiGLU quant path was requested but scratch is unavailable");
-            return false;
-        }
-
-        bool gateup_ok = false;
-        bool swiglu_prequantized = false;
-        if (use_gateup_swiglu_quant_fused)
-        {
-            gateup_ok =
-                rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
-                    d_hidden,
-                    decode_gate_descs,
-                    decode_up_descs,
-                    d_expert_ids,
-                    gateup_hidden_int8,
-                    gateup_hidden_scales,
-                    reuse_router_q8_hidden,
-                    d_grouped_gateup_gate_partials_,
-                    d_grouped_gateup_up_partials_,
-                    d_grouped_swiglu_int8_,
-                    d_grouped_swiglu_scales_,
-                    top_k,
-                    intermediate,
-                    d_model,
-                    gateup_table.codebook_id,
-                    gateup_k_partitions,
-                    device_ordinal_,
-                    stream);
-            swiglu_prequantized = gateup_ok;
-            if (!gateup_ok)
-            {
-                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                          "K-part fused gate/up SwiGLU quant kernel failed");
-                return false;
-            }
-        }
-
-        if (!gateup_ok && use_gateup_kpart)
-        {
-            gateup_ok =
-                rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                    d_hidden,
-                    decode_gate_descs,
-                    decode_up_descs,
-                    d_expert_ids,
-                    d_gate_ptrs,
-                    d_up_ptrs,
-                    gateup_hidden_int8,
-                    gateup_hidden_scales,
-                    reuse_router_q8_hidden,
-                    d_grouped_gateup_gate_partials_,
-                    d_grouped_gateup_up_partials_,
-                    top_k,
-                    intermediate,
-                    d_model,
-                    gateup_table.codebook_id,
-                    gateup_k_partitions,
-                    device_ordinal_,
-                    stream);
-            if (!gateup_ok)
-            {
-                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                          "K-part gate/up kernel failed");
-                return false;
-            }
-        }
-
-        if (!gateup_ok && !use_gateup_kpart)
-        {
-            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
-                d_hidden,
-                decode_gate_descs,
-                decode_up_descs,
-                d_expert_ids,
-                d_gate_ptrs,
-                d_up_ptrs,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                top_k,
-                intermediate,
-                d_model,
-                gateup_table.codebook_id,
-                device_ordinal_,
-                stream);
-        }
+        const bool gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            d_hidden,
+            decode_gate_descs,
+            decode_up_descs,
+            d_expert_ids,
+            d_gate_ptrs,
+            d_up_ptrs,
+            gateup_hidden_int8,
+            gateup_hidden_scales,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            reuse_router_q8_hidden,
+            top_k,
+            intermediate,
+            d_model,
+            gateup_table.codebook_id,
+            device_ordinal_,
+            stream);
         if (!gateup_ok)
             return false;
 
@@ -7672,40 +7407,23 @@ namespace llaminar2
             return false;
         }
 
-        const bool down_ok =
-            use_parallel_down
-                ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
-                      d_down_gate_ptrs,
-                      d_down_up_ptrs,
-                      decode_down_descs,
-                      d_expert_ids,
-                      d_weights,
-                      d_grouped_swiglu_int8_,
-                      d_grouped_swiglu_scales_,
-                      swiglu_prequantized,
-                      d_output,
-                      top_k,
-                      d_model,
-                      intermediate,
-                      down_table.codebook_id,
-                      device_ordinal_,
-                      stream)
-                : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-                      d_down_gate_ptrs,
-                      d_down_up_ptrs,
-                      decode_down_descs,
-                      d_expert_ids,
-                      d_weights,
-                      d_grouped_swiglu_int8_,
-                      d_grouped_swiglu_scales_,
-                      d_output,
-                      d_canonical_route_contributions,
-                      top_k,
-                      d_model,
-                      intermediate,
-                      down_table.codebook_id,
-                      device_ordinal_,
-                      stream);
+        const bool down_ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            d_down_gate_ptrs,
+            d_down_up_ptrs,
+            decode_down_descs,
+            d_expert_ids,
+            d_weights,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            d_canonical_route_contributions,
+            d_grouped_down_partials_,
+            top_k,
+            d_model,
+            intermediate,
+            down_table.codebook_id,
+            device_ordinal_,
+            stream);
         if (!down_ok)
             return false;
 
@@ -7719,7 +7437,7 @@ namespace llaminar2
             "rocm_moe_grouped_decode_fused_calls",
             counter_source,
             top_k, d_model, intermediate,
-            use_parallel_down ? "fused_parallel_down" : "fused_serial_down");
+            "ordered_route_parallel_down");
         return true;
     }
 
@@ -7763,7 +7481,7 @@ namespace llaminar2
             }
         }
 
-        if (!ensureGroupedDecodeCapacity(num_active, intermediate))
+        if (!ensureGroupedDecodeCapacity(num_active, intermediate, d_model))
             return false;
 
         if (!ensureGroupedDownDecodeMetadata(expert_ids, expert_weights, num_active))
@@ -7817,6 +7535,7 @@ namespace llaminar2
             d_grouped_swiglu_scales_,
             d_output,
             nullptr,
+            d_grouped_down_partials_,
             num_active,
             d_model,
             intermediate,
@@ -7866,7 +7585,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureGroupedDecodeCapacity(top_k, intermediate))
+        if (!ensureGroupedDecodeCapacity(top_k, intermediate, d_model))
             return false;
 
         const DeviceId device = DeviceId::rocm(device_ordinal_);
@@ -7954,65 +7673,28 @@ namespace llaminar2
         }
 
         /*
-         * LocalTP masked decode has to publish resident expert contributions in
-         * original top-k order and skip non-local slots deterministically.  The
-         * parallel down kernel uses atomic adds and therefore cannot define the
-         * byte-stable M=1 oracle for grouped verifier rows.
+         * Routes execute concurrently into unique rows. The canonical helper
+         * then folds those rows in original top-k order, including zero rows for
+         * non-local experts, so masked and unmasked decode share one reduction
+         * tree without floating-point atomics.
          */
-        const bool masked_decode_equivalent_routing = (expert_mask != nullptr);
-        const bool use_parallel_down =
-            !masked_decode_equivalent_routing &&
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1;
-        if (use_parallel_down && !groupedDecodeSupportsCodebook(table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] "
-                      "parallel down decode was requested but codebook "
-                      << static_cast<int>(table.codebook_id) << " is unsupported");
-            return false;
-        }
-
-        /*
-         * The verifier path enters with explicit route tensors rather than a
-         * DeviceMoELayerRuntime, but it still has to select the same down-proj
-         * reduction variant as serial decode.  Otherwise LocalTP MTP rows can
-         * be routed to the same experts and still drift after the weighted down
-         * projection because runtime decode used the parallel accumulator while
-         * grouped verifier execution used a different table helper.
-         */
-        const bool ok = use_parallel_down
-                            ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
-                                  d_grouped_gate_ptrs_,
-                                  d_grouped_up_ptrs_,
-                                  table.device_descs,
-                                  d_grouped_expert_ids_,
-                                  d_weights,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  false,
-                                  d_output,
-                                  top_k,
-                                  d_model,
-                                  intermediate,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  getStream())
-                            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                  d_grouped_gate_ptrs_,
-                                  d_grouped_up_ptrs_,
-                                  table.device_descs,
-                                  d_grouped_expert_ids_,
-                                  d_weights,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  d_output,
-                                  nullptr,
-                                  top_k,
-                                  d_model,
-                                  intermediate,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  getStream());
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            d_grouped_gate_ptrs_,
+            d_grouped_up_ptrs_,
+            table.device_descs,
+            d_grouped_expert_ids_,
+            d_weights,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            nullptr,
+            d_grouped_down_partials_,
+            top_k,
+            d_model,
+            intermediate,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
 
         if (ok)
             markDeviceWritten(output, device, getStream());
@@ -8048,7 +7730,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureGroupedDecodeCapacity(top_k, intermediate))
+        if (!ensureGroupedDecodeCapacity(top_k, intermediate, d_model))
             return false;
 
         std::array<const float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
@@ -8084,49 +7766,23 @@ namespace llaminar2
             return false;
         }
 
-        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
-        if (use_parallel_down && !groupedDecodeSupportsCodebook(table.codebook_id))
-        {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRuntime] "
-                      "parallel down decode was requested but codebook "
-                      << static_cast<int>(table.codebook_id) << " is unsupported");
-            return false;
-        }
-
-        const bool ok = use_parallel_down
-                            ? rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_weights,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  false,
-                                  d_output,
-                                  top_k,
-                                  d_model,
-                                  intermediate,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  getStream())
-                            : rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_weights,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  d_output,
-                                  top_k,
-                                  d_model,
-                                  intermediate,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  getStream());
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+            d_gate_ptrs,
+            d_up_ptrs,
+            runtime_layer,
+            d_expert_ids,
+            d_weights,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            d_grouped_down_partials_,
+            top_k,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
 
         if (ok)
         {
@@ -8182,7 +7838,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureGroupedDecodeCapacity(num_active, intermediate))
+        if (!ensureGroupedDecodeCapacity(num_active, intermediate, d_model))
             return false;
 
         const float *host_gate_ptrs[16] = {};
@@ -8236,6 +7892,7 @@ namespace llaminar2
             d_grouped_decode_weights_,
             d_grouped_swiglu_int8_,
             d_grouped_swiglu_scales_,
+            d_grouped_down_partials_,
             d_output,
             num_active,
             d_model,
@@ -9629,6 +9286,37 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Resolve the dedicated graph-persistent adaptive work directory.
+     *
+     * The directory is not interchangeable with the compact active-expert-id
+     * list: the adaptive planner publishes two live counts and two independent
+     * tile spans into it on every replay. Binding the named region here keeps
+     * that mutable lifetime explicit and prevents future grouping code from
+     * aliasing a buffer embedded in a captured projection graph.
+     */
+    bool ROCmMoEKernel::ensureGroupedPrefillWorkDirectoryCapacity(
+        int total_slots,
+        int num_experts)
+    {
+        if (total_slots <= 0 || num_experts <= 0)
+            return false;
+        const std::size_t words =
+            MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(
+                static_cast<std::size_t>(total_slots),
+                static_cast<std::size_t>(num_experts));
+        if (!bindWorkspaceBuffer(
+                reinterpret_cast<void **>(&d_prefill_work_directory_),
+                MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,
+                words * sizeof(uint32_t),
+                "ensureGroupedPrefillWorkDirectoryCapacity"))
+        {
+            d_prefill_work_directory_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
     bool ROCmMoEKernel::executeGroupedPrefillPipeline(
         ITensor *hidden, ITensor *output,
         int gateup_desc_table_id,
@@ -9670,16 +9358,12 @@ namespace llaminar2
 
         const int total_slots = seq_len * top_k;
         const int active_expert_slots = group_active_expert_slots_;
-        int *d_group_work_directory =
-            (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        if (active_expert_slots > 0 && !d_group_work_directory)
-        {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] grouped work-directory storage missing");
-            return false;
-        }
 
         // Ensure scratch buffers
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
+            return false;
+        if (!ensureGroupedPrefillWorkDirectoryCapacity(
+                total_slots, num_experts))
             return false;
 
         // Join the hidden-state producer and the exact publication target to
@@ -9777,7 +9461,7 @@ namespace llaminar2
             d_group_original_to_grouped_,
             d_original_expert_ids_for_pipeline,
             d_group_weights_,
-            d_group_work_directory,
+            reinterpret_cast<int *>(d_prefill_work_directory_),
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -9824,23 +9508,18 @@ namespace llaminar2
             getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
-            const MoEPrefillPolicyTags gateup_policy =
-                queryMoEPrefillPolicyTags(
+            const MoEPrefillPairPolicyTags policy =
+                queryMoEPrefillPairPolicyTags(
                     gateup_table.codebook_mask,
-                    /*projection_role=*/0,
-                    seq_len,
-                    intermediate,
-                    d_model);
-            const MoEPrefillPolicyTags down_policy =
-                queryMoEPrefillPolicyTags(
                     down_table.codebook_mask,
-                    /*projection_role=*/1,
                     seq_len,
                     d_model,
-                    intermediate);
+                    intermediate,
+                    num_experts,
+                    top_k);
             const std::string common_row_tile =
-                gateup_policy.tile_m == down_policy.tile_m
-                    ? gateup_policy.tile_m
+                policy.gateup.tile_m == policy.down.tile_m
+                    ? policy.gateup.tile_m
                     : "mixed";
             PerfStatsCollector::addCounter(
                 "kernel",
@@ -9854,6 +9533,10 @@ namespace llaminar2
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
+                    {"gateup_codebook_mask",
+                     codebookMaskTag(gateup_table.codebook_mask)},
+                    {"down_codebook_mask",
+                     codebookMaskTag(down_table.codebook_mask)},
                     {"gateup_route",
                      seq_len > 8
                          ? (reuse_router_q8_hidden
@@ -9866,10 +9549,11 @@ namespace llaminar2
                      seq_len > 8
                          ? "expert_tiled_partials_ordered_publish"
                          : "direct_ordered_publish"},
-                    {"gateup_tile_m", gateup_policy.tile_m},
-                    {"gateup_tile_n", gateup_policy.tile_n},
-                    {"down_tile_m", down_policy.tile_m},
-                    {"down_tile_n", down_policy.tile_n},
+                    {"gateup_tile_m", policy.gateup.tile_m},
+                    {"gateup_tile_n", policy.gateup.tile_n},
+                    {"down_tile_m", policy.down.tile_m},
+                    {"down_tile_n", policy.down.tile_n},
+                    {"policy_source", policy.source},
                     {"row_tile", common_row_tile},
                     {"grouping", "static"}});
         }
@@ -9942,7 +9626,10 @@ namespace llaminar2
         }
 
         const int total_slots = seq_len * top_k;
-        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
+        if (!ensureGroupedPrefillScratchCapacity(
+                total_slots, d_model, intermediate) ||
+            !ensureGroupedPrefillWorkDirectoryCapacity(
+                total_slots, num_experts))
             return false;
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         void *stream = getStream();
@@ -9953,19 +9640,13 @@ namespace llaminar2
          * performs validation and pointer arithmetic only, never allocation.
          */
         if (total_slots > group_slots_cap_ ||
-            !d_group_active_expert_ids_ ||
             !d_group_original_to_grouped_)
         {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
-                                     static_cast<size_t>(num_experts) * sizeof(int),
-                                     "executeGroupedPrefillPipelineFromPublishedRuntimePlan(group_active_expert_ids)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
                                      MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
                                      static_cast<size_t>(total_slots) * sizeof(int),
                                      "executeGroupedPrefillPipelineFromPublishedRuntimePlan(group_original_to_grouped)"))
             {
-                d_group_active_expert_ids_ = nullptr;
                 d_group_original_to_grouped_ = nullptr;
                 LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] runtime grouping workspace is required");
                 return false;
@@ -10062,7 +9743,7 @@ namespace llaminar2
             d_group_original_to_grouped_,
             runtime_host_layer.route_expert_ids,
             runtime_host_layer.grouped_route_weights,
-            d_group_active_expert_ids_,
+            reinterpret_cast<int *>(d_prefill_work_directory_),
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -10108,23 +9789,18 @@ namespace llaminar2
             getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
-            const MoEPrefillPolicyTags gateup_policy =
-                queryMoEPrefillPolicyTags(
+            const MoEPrefillPairPolicyTags policy =
+                queryMoEPrefillPairPolicyTags(
                     gateup_table.codebook_mask,
-                    /*projection_role=*/0,
-                    seq_len,
-                    intermediate,
-                    d_model);
-            const MoEPrefillPolicyTags down_policy =
-                queryMoEPrefillPolicyTags(
                     down_table.codebook_mask,
-                    /*projection_role=*/1,
                     seq_len,
                     d_model,
-                    intermediate);
+                    intermediate,
+                    num_experts,
+                    top_k);
             const std::string common_row_tile =
-                gateup_policy.tile_m == down_policy.tile_m
-                    ? gateup_policy.tile_m
+                policy.gateup.tile_m == policy.down.tile_m
+                    ? policy.gateup.tile_m
                     : "mixed";
             PerfStatsCollector::addCounter(
                 "kernel",
@@ -10138,6 +9814,10 @@ namespace llaminar2
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
+                    {"gateup_codebook_mask",
+                     codebookMaskTag(gateup_table.codebook_mask)},
+                    {"down_codebook_mask",
+                     codebookMaskTag(down_table.codebook_mask)},
                     {"gateup_route",
                      seq_len > 8
                          ? (reuse_router_q8_hidden
@@ -10150,10 +9830,11 @@ namespace llaminar2
                      seq_len > 8
                          ? "expert_tiled_partials_ordered_publish"
                          : "direct_ordered_publish"},
-                    {"gateup_tile_m", gateup_policy.tile_m},
-                    {"gateup_tile_n", gateup_policy.tile_n},
-                    {"down_tile_m", down_policy.tile_m},
-                    {"down_tile_n", down_policy.tile_n},
+                    {"gateup_tile_m", policy.gateup.tile_m},
+                    {"gateup_tile_n", policy.gateup.tile_n},
+                    {"down_tile_m", policy.down.tile_m},
+                    {"down_tile_n", policy.down.tile_n},
+                    {"policy_source", policy.source},
                     {"row_tile", common_row_tile},
                     {"grouping", "runtime"}});
         }

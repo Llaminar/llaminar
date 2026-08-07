@@ -9,8 +9,8 @@
 # Feature branches run a 7-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Focused integration tests (grouped verifier decode-equivalence +
-#      Qwen3.6 stochastic MTP depth matrix)
+#   3. Focused integration tests (grouped verifier decode-equivalence,
+#      long-context prefill M-totality, and Qwen3.6 stochastic MTP depth matrix)
 #   4. Focused parity baseline (56 tests, all model families, sequential)
 #   5. E2E release build
 #   6. E2E server integration tests
@@ -101,13 +101,15 @@ echo ""
 # Step 3: Run Focused Integration Tests
 # This gate is intentionally small and high-signal: grouped verifier rows must
 # be bitwise-equivalent to serial decode across CPU, CUDA, ROCm, and supported
-# tensor formats/codebooks. The stochastic Qwen3.6 matrix then proves Dense and
-# MoE speculative sampling at fixed depths 1/2/3 and dynamic depth across CPU,
-# CUDA, and ROCm, including Dense CUDA/ROCm LocalTP, MoE CUDA/ROCm ExpertOverlay
-# LocalTP, and MoE CPU NodeLocalTP. It also covers MoE Dynamic/LLEP + prefix
-# cache rows so TP/EP path-exercise regressions fail before the heavier gates.
+# tensor formats/codebooks. The 256K-plus-tail prefill stress then proves chunk,
+# padding, graph-replay, and KV-cache M-totality on all three backends. The
+# stochastic Qwen3.6 matrix proves Dense and MoE speculative sampling at fixed
+# depths 1/2/3 and dynamic depth across CPU, CUDA, and ROCm, including Dense
+# CUDA/ROCm LocalTP, MoE CUDA/ROCm ExpertOverlay LocalTP, and MoE CPU
+# NodeLocalTP. It also covers MoE Dynamic/LLEP + prefix cache rows so TP/EP
+# path-exercise regressions fail before the heavier gates.
 FOCUSED_INTEG_STEP=3
-echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows + stochastic MTP matrix)...${NC}"
+echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows + long prefill M-totality + stochastic MTP matrix)...${NC}"
 echo ""
 
 set +e
@@ -121,6 +123,25 @@ if [ $FOCUSED_INTEG_EXIT_CODE -ne 0 ]; then
     echo ""
     echo -e "${YELLOW}Re-run standalone for details:${NC}"
     echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R \"^V2_Integration_GroupedVerifierRows_\" --output-on-failure --parallel${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+
+LONG_PREFILL_M_TOTALITY_REGEX='^V2_Integration_(CUDA_MoERowGridMTotality|PrefillGraphCacheLongContextMTotality_(CUDA|ROCm)|PrefillLongContextMTotality_CPU|(CUDA|ROCm)TrainerFullBufferByteCertificate)$'
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "$LONG_PREFILL_M_TOTALITY_REGEX" --output-on-failure --parallel
+LONG_PREFILL_M_TOTALITY_EXIT_CODE=$?
+set -e
+
+if [ $LONG_PREFILL_M_TOTALITY_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo -e "${RED}Focused integration tests failed: long-context prefill has a chunk, padding, graph-replay, or KV-cache M-totality defect.${NC}"
+    echo ""
+    echo -e "${YELLOW}Re-run standalone for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R '$LONG_PREFILL_M_TOTALITY_REGEX' --output-on-failure --parallel${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"
@@ -150,16 +171,17 @@ echo -e "${GREEN}✓ Focused integration tests passed${NC}"
 echo ""
 
 # Step 4 (develop/master only): Run Broader Integration Tests
-# The broad integration sweep excludes Parity, RCCL, and GroupedVerifierRows:
-# parity has its own focused baseline, RCCL has known driver-level flakiness,
-# and grouped verifier rows already ran as the dedicated focused gate above.
+# The broad integration sweep excludes Parity, RCCL, GroupedVerifierRows, and
+# LongContextMTotality: parity has its own focused baseline, RCCL has known
+# driver-level flakiness, and the other families already ran in the focused
+# integration gate above.
 if $FULL_SUITE; then
     INTEG_STEP=4
-    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding Parity, RCCL & GroupedVerifierRows)...${NC}"
+    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding dedicated focused families)...${NC}"
     echo ""
 
     set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL|GroupedVerifierRows" --output-on-failure
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL|GroupedVerifierRows|LongContextMTotality|MoERowGridMTotality|TrainerFullBufferByteCertificate" --output-on-failure
     INTEG_EXIT_CODE=$?
     set -e
 

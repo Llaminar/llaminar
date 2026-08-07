@@ -5977,6 +5977,29 @@ namespace
             const auto &packed = kernel->packedWeights();
             const size_t weight_bytes =
                 packed.native_interleaved.size() + packed.payload.size();
+            const NativeVNNITileConfig serial_geometry = computeTileConfig(
+                N,
+                K,
+                1,
+                packed.payload_bytes,
+                omp_get_max_threads());
+            const auto candidate_is_forceable =
+                [&](const Candidate &candidate, int runtime_m)
+            {
+                if (!verifierRowsPolicySupportsRuntime(
+                        candidate.policy,
+                        effective_runtime_isa == "AVX512",
+                        runtime_m,
+                        serial_geometry.k_tiles))
+                {
+                    return false;
+                }
+                return normalizeVerifierRowsPolicy(
+                           candidate.policy,
+                           (N + 63) / 64,
+                           effective_runtime_isa == "AVX512",
+                           runtime_m) == candidate.policy;
+            };
 
             for (int M : verifier_rows)
             {
@@ -6052,6 +6075,12 @@ namespace
                             if (!batch_request)
                                 continue;
                         }
+                        ASSERT_TRUE(candidate_is_forceable(candidate, M))
+                            << "CPU profiler manifest requested non-forceable "
+                               "grouped candidate "
+                            << candidate.canonical_id << " for M=" << M
+                            << " N=" << N << " K=" << K
+                            << " serial_k_tiles=" << serial_geometry.k_tiles;
 
                         std::vector<float> grouped(
                             static_cast<size_t>(M) * static_cast<size_t>(N),
@@ -6249,6 +6278,8 @@ namespace
                     {
                         continue;
                     }
+                    if (!candidate_is_forceable(candidate, M))
+                        continue;
                     std::vector<float> grouped(
                         static_cast<size_t>(M) * static_cast<size_t>(N),
                         0.0f);
@@ -6280,7 +6311,7 @@ namespace
                      * fused descriptor entry point. A direct grouped launch
                      * is therefore insufficient admission evidence: the same
                      * candidate must survive descriptor planning, publish the
-                     * same normalized physical identity, and preserve every
+                     * same exact physical identity, and preserve every
                      * serial-row byte through that production scheduler.
                      *
                      * Keep two descriptors here. A one-projection call would
@@ -6344,24 +6375,8 @@ namespace
                         << candidate.route_name
                         << " fused projection 1 changed across repeats";
 
-                    const NativeVNNITileConfig serial_geometry =
-                        computeTileConfig(
-                            N,
-                            K,
-                            1,
-                            packed.payload_bytes,
-                            omp_get_max_threads());
-                    VerifierRowsPolicy expected_fused_policy =
-                        normalizeVerifierRowsPolicy(
-                            candidate.policy,
-                            (N + 63) / 64,
-                            effective_runtime_isa == "AVX512",
-                            M);
-                    if (serial_geometry.k_tiles > 1 &&
-                        verifierRowsPolicyRequiresFullK(expected_fused_policy))
-                    {
-                        expected_fused_policy = VerifierRowsPolicy::Pairwise;
-                    }
+                    const VerifierRowsPolicy expected_fused_policy =
+                        candidate.policy;
                     const bool expected_fused_wide_rows =
                         expected_fused_policy == VerifierRowsPolicy::WideRows &&
                         effective_runtime_isa == "AVX512" && M >= 3;
@@ -6444,16 +6459,12 @@ namespace
                         route.build_isa == build_isa &&
                         route.isa == effective_runtime_isa &&
                         route.effective_policy == candidate.route_name;
-                    /*
-                     * A normalized request is retained as negative support
-                     * evidence, but it is not an independently forceable
-                     * candidate and therefore cannot win dispatch. One sample
-                     * proves the observed call remains executable without
-                     * spending the promotion timing budget on the same
-                     * effective Pairwise route a second time.
-                     */
-                    const int candidate_warmups = route_ok ? warmups : 0;
-                    const int candidate_samples = route_ok ? samples : 1;
+                    ASSERT_TRUE(route_ok)
+                        << format.name << " M=" << M << " candidate="
+                        << candidate.route_name
+                        << " did not publish its exact physical route";
+                    const int candidate_warmups = warmups;
+                    const int candidate_samples = samples;
                     const StrongTimingMeasurement timing =
                         timeStrongTrainerCandidate(
                             candidate_warmups,
@@ -6466,18 +6477,15 @@ namespace
                         comparison.bitwiseEqual() &&
                         repeat_byte_mismatches == 0 &&
                         numerical_correctness;
-                    if (route_ok)
-                    {
-                        EXPECT_TRUE(comparison.bitwiseEqual())
-                            << format.name << " M=" << M << " candidate="
-                            << candidate.route_name
-                            << " is a forceable production grouped route and "
-                               "must be byte-identical to serial M=1 decode";
-                        EXPECT_EQ(repeat_byte_mismatches, 0u)
-                            << format.name << " M=" << M << " candidate="
-                            << candidate.route_name
-                            << " changed native output bytes across repeats";
-                    }
+                    EXPECT_TRUE(comparison.bitwiseEqual())
+                        << format.name << " M=" << M << " candidate="
+                        << candidate.route_name
+                        << " is a forceable production grouped route and "
+                           "must be byte-identical to serial M=1 decode";
+                    EXPECT_EQ(repeat_byte_mismatches, 0u)
+                        << format.name << " M=" << M << " candidate="
+                        << candidate.route_name
+                        << " changed native output bytes across repeats";
                     const double speedup =
                         timing.evidence.median > 0.0
                             ? serial_timing.evidence.median /

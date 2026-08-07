@@ -14,7 +14,7 @@
  *   1. Reuse router-owned Q8 rows, or quantize each original hidden row once.
  *   2. Build a packed expert/tile directory entirely on the device.
  *   3. Decode each gate/up weight block once for a trained 4/8/12/16-row tile
- *      while retaining the exact increasing-K accumulation order of serial decode.
+ *      while retaining serial M=1 partition boundaries and reduction order.
  *   4. Quantize exact SwiGLU rows for the down projection.
  *   5. Decode each down weight block once per independently trained row tile
  *      into route partials.
@@ -24,9 +24,9 @@
  * The long-prefill projection kernels expose 64/128/256 output-column lanes and
  * 4/8/12/16-row tiles. Production dispatch comes exclusively from the checked-in
  * all-format trainer output; a missing policy is a hard failure. No production
- * path uses floating-point atomics, row replay, host-authored work metadata, or
- * scheduler-dependent reduction order, so grouped verifier publication remains
- * byte-identical to serial row decode.
+ * path uses floating-point atomics, row replay, replay-time host-authored work
+ * metadata, or scheduler-dependent reduction order, so grouped verifier
+ * publication remains byte-identical to serial row decode.
  *
  * @see ROCmGemvKernel_native_VNNI.hip for decode grouped kernels (M=1)
  * @see ROCmNativeVNNIGemmShardImpl.hip.inc for non-grouped prefill GEMM
@@ -39,8 +39,11 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../common/NativeVNNIGroupedDecodePolicy.h"
+#include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
 #include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
+#include "ROCmMoEProductionPrefillOverlayGenerated.inc"
 
 // Local copy of DeviceNativeVNNIMatrixDesc to avoid pulling in x86-only headers
 // Must stay in sync with src/v2/tensors/TensorKernels.h
@@ -81,6 +84,34 @@ enum NativeVNNIFormatPrefill : uint8_t {
     NVNNI_PF_IQ1_M   = 17,
     NVNNI_PF_Q8_0    = 19,
 };
+
+/**
+ * @brief Capture-time serial-M1 split-K policy carried into grouped prefill.
+ *
+ * A NativeVNNI codebook and matrix geometry select a generated serial-decode
+ * K-partition count. That count changes FP32 arithmetic because each partition
+ * starts from zero and an ordered reducer then adds the independently rounded
+ * partials. Grouped prefill therefore carries the complete codebook-indexed
+ * policy by value in its graph-captured kernel arguments. Mixed-codebook down
+ * tables can select the correct entry on device without consulting the host.
+ */
+struct MoEPrefillSerialM1KPartitionPolicy
+{
+    uint8_t by_codebook[32] = {};
+
+    /** Return the captured partition count, or zero for an invalid codebook. */
+    __host__ __device__ int forCodebook(uint8_t codebook_id) const
+    {
+        return codebook_id < 32 ? static_cast<int>(by_codebook[codebook_id]) : 0;
+    }
+};
+
+extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
+    uint8_t codebook_id,
+    int N,
+    int K,
+    int* kb,
+    int* target_waves_per_cu);
 
 // Compile-time format properties for prefill (mirrors NVNNITraits in GEMV)
 template <NativeVNNIFormatPrefill FMT>
@@ -129,80 +160,6 @@ __device__ __forceinline__ bool prefill_native_vnni_desc_shape_ok(
            desc.codebook_id == static_cast<uint8_t>(FMT) &&
            (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
            (!Traits::is_dual_scale_asym || desc.emins);
-}
-
-/**
- * @brief Serial-GEMV-shaped correction term for dual-scale NativeVNNI formats.
- *
- * ROCm serial MoE down decode computes the base dual-scale dot first, then adds
- * a helper-returned correction for Q2_K asymmetric minima and IQ1_M delta signs.
- * MTP verifier grouped prefill needs to match that FP32 expression tree exactly;
- * writing the correction inline is enough for the HIP compiler to choose a
- * slightly different rounding sequence on IQ1_M and break bitwise publication.
- */
-template <NativeVNNIFormatPrefill FMT>
-__device__ __forceinline__ float moe_prefill_native_vnni_dual_scale_correction(
-    const int32_t* __restrict__ a4,
-    const uint8_t* __restrict__ payload,
-    const uint32_t* __restrict__ emin_base,
-    size_t linear,
-    float scale_lo,
-    float scale_hi,
-    float scale_ab)
-{
-    using Traits = PrefillNVNNITraits<FMT>;
-    float correction = 0.0f;
-
-    if constexpr (Traits::is_dual_scale_asym)
-    {
-        constexpr int32_t ones = 0x01010101;
-        int32_t sum_a_lo = 0;
-        int32_t sum_a_hi = 0;
-#pragma unroll
-        for (int g = 0; g < 4; ++g)
-            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
-#pragma unroll
-        for (int g = 4; g < 8; ++g)
-            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
-
-        const uint32_t emin_packed = emin_base[linear];
-        const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
-        const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
-        const float min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
-        const float min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
-        correction += (static_cast<float>(sum_a_lo) * min_lo +
-                       static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
-    }
-
-    if constexpr (FMT == NVNNI_PF_IQ1_M)
-    {
-        constexpr float IQ1S_DELTA = 0.125f;
-        constexpr int32_t ones = 0x01010101;
-        const uint8_t qh0 = payload[4];
-        const uint8_t qh1 = payload[5];
-
-        const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(
-            a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-        const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(
-            a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-        const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(
-            a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-        const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(
-            a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
-
-        const float delta0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-
-        correction += ((delta0 * static_cast<float>(sum_a_g0) +
-                        delta1 * static_cast<float>(sum_a_g1)) * scale_lo +
-                       (delta2 * static_cast<float>(sum_a_g2) +
-                        delta3 * static_cast<float>(sum_a_g3)) * scale_hi) *
-                      scale_ab;
-    }
-
-    return correction;
 }
 
 // IQ grid lookup tables (separate copies for this TU — initialized via
@@ -295,7 +252,8 @@ void moe_prefill_hidden_quantize_rows_kernel(
     for (int mask = 16; mask > 0; mask >>= 1)
         abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
 
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
     const float inv_scale = 1.0f / scale;
 
     // Write scale (one per block, lane 0 writes)
@@ -304,9 +262,10 @@ void moe_prefill_hidden_quantize_rows_kernel(
         scales_out[static_cast<size_t>(original_token) * blocks_per_row + block_in_row] = scale;
 
     // Quantize and write
-    const float qval = val * inv_scale;
     A_int8_out[static_cast<size_t>(original_token) * K + k] =
-        static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        static_cast<int8_t>(
+            llaminar2::rocm::decode_equivalent::quantizeQ8(
+                val, inv_scale));
 }
 
 
@@ -616,8 +575,9 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
  * code reuse: it prevents a row-tiled optimization from accidentally changing
  * the order of a dual-scale base term, an asymmetric minimum correction, or an
  * IQ1_M delta correction.  The caller may share the decoded weight payload
- * across several independent rows, but each row invokes this helper once per K
- * block and therefore retains serial decode's increasing-K accumulation order.
+ * across several independent rows. Each serial partition starts from zero and
+ * invokes this helper once per K block before its independently rounded result
+ * enters the ordered partition reducer.
  *
  * @tparam FMT NativeVNNI codebook represented by @p desc.
  * @param desc Prepared device descriptor for one expert matrix.
@@ -668,8 +628,82 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             scale_lo,
             scale_hi,
             scale_ab);
-        acc += moe_prefill_native_vnni_dual_scale_correction<FMT>(
-            a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
+
+        if constexpr (Traits::is_dual_scale_asym)
+        {
+            constexpr int32_t ones = 0x01010101;
+            int32_t sum_a_lo = 0;
+            int32_t sum_a_hi = 0;
+#pragma unroll
+            for (int g = 0; g < 4; ++g)
+                sum_a_lo = __builtin_amdgcn_sdot4(
+                    a4[g], ones, sum_a_lo, false);
+#pragma unroll
+            for (int g = 4; g < 8; ++g)
+                sum_a_hi = __builtin_amdgcn_sdot4(
+                    a4[g], ones, sum_a_hi, false);
+
+            const uint32_t emin_packed = emin_base[linear];
+            const uint16_t emin_lo_bits =
+                static_cast<uint16_t>(emin_packed);
+            const uint16_t emin_hi_bits =
+                static_cast<uint16_t>(emin_packed >> 16);
+            const float min_lo = __half2float(
+                *reinterpret_cast<const __half*>(&emin_lo_bits));
+            const float min_hi = __half2float(
+                *reinterpret_cast<const __half*>(&emin_hi_bits));
+            acc = rocm_native_vnni_commit_dual_scale_correction(
+                acc,
+                sum_a_lo,
+                sum_a_hi,
+                min_lo,
+                min_hi,
+                scale_ab);
+        }
+
+        if constexpr (FMT == NVNNI_PF_IQ1_M)
+        {
+            constexpr float IQ1S_DELTA = 0.125f;
+            constexpr int32_t ones = 0x01010101;
+            const uint8_t qh0 = payload[4];
+            const uint8_t qh1 = payload[5];
+
+            const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(
+                a4[1], ones,
+                __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+            const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(
+                a4[3], ones,
+                __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+            const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(
+                a4[5], ones,
+                __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+            const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(
+                a4[7], ones,
+                __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+            const float delta0 =
+                (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float delta1 =
+                (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float delta2 =
+                (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float delta3 =
+                (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            acc = rocm_native_vnni_commit_iq1_m_delta_correction(
+                acc,
+                sum_a_g0,
+                sum_a_g1,
+                sum_a_g2,
+                sum_a_g3,
+                delta0,
+                delta1,
+                delta2,
+                delta3,
+                scale_lo,
+                scale_hi,
+                scale_ab);
+        }
     }
     else
     {
@@ -681,7 +715,8 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         const uint16_t scale_bits = scale_base[linear];
         const float block_d =
             __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-        acc += static_cast<float>(dot) * block_d * scale_ab;
+        acc = rocm_native_vnni_commit_single_scale_block(
+            acc, dot, block_d, scale_ab);
 
         if constexpr (Traits::is_asymmetric)
         {
@@ -694,7 +729,8 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const uint16_t min_bits = min_base[linear];
             const float block_m =
                 __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            acc += static_cast<float>(sum_a) * block_m * scale_ab;
+            acc = rocm_native_vnni_commit_single_scale_correction(
+                acc, sum_a, block_m, scale_ab);
         }
     }
 
@@ -754,6 +790,84 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     }
 
     return acc;
+}
+
+/**
+ * @brief Reproduce serial M=1 split-K partials and their ordered reduction.
+ *
+ * This function keeps all partials local to the owning output lane. It does not
+ * replay rows or materialize a global split-K workspace: each partition runs
+ * the canonical block accumulator from zero, and the lane adds completed
+ * partials in increasing partition order with the same explicit RN operation
+ * used by serial decode's reducer kernel.
+ *
+ * @tparam FMT NativeVNNI codebook represented by @p desc.
+ * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use an LDS copy.
+ * @param desc Prepared matrix descriptor.
+ * @param n Output column owned by this lane.
+ * @param slot_A Quantized activation row.
+ * @param slot_scales Per-block activation scales.
+ * @param N Matrix output width.
+ * @param k_partitions Exact effective serial-M1 partition count.
+ * @param staged_iq2s_grid Optional LDS-resident IQ2_S codebook.
+ * @return Byte-equivalent serial-M1 result for this output element.
+ */
+template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+__device__ __forceinline__ float moe_prefill_dot_desc_serial_m1(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ slot_A,
+    const float* __restrict__ slot_scales,
+    int N,
+    int k_partitions,
+    const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
+{
+    const int blocks_per_row = static_cast<int>(desc.blocks_per_row);
+    if (k_partitions <= 0 ||
+        k_partitions > blocks_per_row ||
+        k_partitions >
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return 0.0f;
+    }
+
+    if (k_partitions == 1)
+    {
+        return moe_prefill_dot_desc_range<FMT, USE_STAGED_IQ2_S>(
+            desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            0,
+            blocks_per_row,
+            staged_iq2s_grid);
+    }
+
+    const int blocks_per_partition =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
+    float total = 0.0f;
+#pragma unroll 1
+    for (int partition = 0; partition < k_partitions; ++partition)
+    {
+        const int begin = partition * blocks_per_partition;
+        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        const float partial = begin < end
+                                  ? moe_prefill_dot_desc_range<
+                                        FMT, USE_STAGED_IQ2_S>(
+                                        desc,
+                                        n,
+                                        slot_A,
+                                        slot_scales,
+                                        N,
+                                        begin,
+                                        end,
+                                        staged_iq2s_grid)
+                                  : 0.0f;
+        total = rocm_native_vnni_accumulate_rn(total, partial);
+    }
+    return total;
 }
 
 /**
@@ -869,6 +983,7 @@ moe_prefill_prepare_dual_scale_block_terms(
  * @param slot_scales Activation block scales, normally staged in LDS.
  * @param N Matrix output width.
  * @param blocks_per_row Number of 32-element K blocks.
+ * @param k_partitions Exact effective serial-M1 partition count.
  * @return Exact output on subgroup lane zero; other lanes return an unused zero.
  */
 template <
@@ -882,6 +997,7 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
     const float* __restrict__ slot_scales,
     int N,
     int blocks_per_row,
+    int k_partitions,
     const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
     static_assert(K_LANES == 2 || K_LANES == 4,
@@ -893,56 +1009,81 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
             FMT != NVNNI_PF_IQ1_M,
         "subgroup dot requires a correction-free dual-scale format");
     const int subgroup_lane = static_cast<int>(threadIdx.x) & (K_LANES - 1);
-    float accumulator = 0.0f;
-
-    for (int first_block = 0;
-         first_block < blocks_per_row;
-         first_block += K_LANES)
+    if (k_partitions <= 0 ||
+        k_partitions > blocks_per_row ||
+        k_partitions >
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
     {
-        const int block_index = first_block + subgroup_lane;
-        MoEPrefillDualScaleBlockTerms local{};
-        if (block_index < blocks_per_row)
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return 0.0f;
+    }
+
+    const int blocks_per_partition =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
+    float total = 0.0f;
+#pragma unroll 1
+    for (int partition = 0; partition < k_partitions; ++partition)
+    {
+        const int begin = partition * blocks_per_partition;
+        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        float partial = 0.0f;
+
+        for (int first_block = begin;
+             first_block < end;
+             first_block += K_LANES)
         {
-            local = moe_prefill_prepare_dual_scale_block_terms<
-                FMT, USE_STAGED_IQ2_S>(
-                desc,
-                n,
-                slot_A,
-                slot_scales,
-                N,
-                block_index,
-                staged_iq2s_grid);
-        }
+            const int block_index = first_block + subgroup_lane;
+            MoEPrefillDualScaleBlockTerms local{};
+            if (block_index < end)
+            {
+                local = moe_prefill_prepare_dual_scale_block_terms<
+                    FMT, USE_STAGED_IQ2_S>(
+                    desc,
+                    n,
+                    slot_A,
+                    slot_scales,
+                    N,
+                    block_index,
+                    staged_iq2s_grid);
+            }
 
 #pragma unroll
-        for (int source_lane = 0; source_lane < K_LANES; ++source_lane)
-        {
-            const int32_t low_dot =
-                __shfl(local.low_dot, source_lane, K_LANES);
-            const int32_t high_dot =
-                __shfl(local.high_dot, source_lane, K_LANES);
-            const float low_scale =
-                __shfl(local.low_scale, source_lane, K_LANES);
-            const float high_scale =
-                __shfl(local.high_scale, source_lane, K_LANES);
-            const float activation_scale =
-                __shfl(local.activation_scale, source_lane, K_LANES);
-
-            if (subgroup_lane == 0 &&
-                first_block + source_lane < blocks_per_row)
+            for (int source_lane = 0; source_lane < K_LANES; ++source_lane)
             {
-                accumulator = rocm_native_vnni_commit_dual_scale_block(
-                    accumulator,
-                    low_dot,
-                    high_dot,
-                    low_scale,
-                    high_scale,
-                    activation_scale);
+                const int32_t low_dot =
+                    __shfl(local.low_dot, source_lane, K_LANES);
+                const int32_t high_dot =
+                    __shfl(local.high_dot, source_lane, K_LANES);
+                const float low_scale =
+                    __shfl(local.low_scale, source_lane, K_LANES);
+                const float high_scale =
+                    __shfl(local.high_scale, source_lane, K_LANES);
+                const float activation_scale =
+                    __shfl(local.activation_scale, source_lane, K_LANES);
+
+                if (subgroup_lane == 0 &&
+                    first_block + source_lane < end)
+                {
+                    partial = rocm_native_vnni_commit_dual_scale_block(
+                        partial,
+                        low_dot,
+                        high_dot,
+                        low_scale,
+                        high_scale,
+                        activation_scale);
+                }
             }
+        }
+
+        if (subgroup_lane == 0)
+        {
+            total = k_partitions == 1
+                        ? partial
+                        : rocm_native_vnni_accumulate_rn(total, partial);
         }
     }
 
-    return subgroup_lane == 0 ? accumulator : 0.0f;
+    return subgroup_lane == 0 ? total : 0.0f;
 }
 
 namespace
@@ -963,6 +1104,14 @@ namespace
     /** Maximum expert id representable by the compact device work directory. */
     constexpr uint32_t kMoEPrefillExpertMask =
         (uint32_t{1} << kMoEPrefillExpertBits) - 1u;
+    /** Trainer/runtime tile-row marker for device-adaptive TM12/TM16 work. */
+    constexpr int kMoEPrefillAdaptiveTileRows = 20;
+    /** Number of count words preceding adaptive TM12 and TM16 spans. */
+    constexpr int kMoEPrefillAdaptiveDirectoryHeaderWords = 2;
+    /** Header word publishing the live compact TM12 span length. */
+    constexpr int kMoEPrefillAdaptiveTile12CountWord = 0;
+    /** Header word publishing the live compact TM16 span length. */
+    constexpr int kMoEPrefillAdaptiveTile16CountWord = 1;
     /** Sentinel written to unused graph-captured work-directory entries. */
     constexpr uint32_t kMoEPrefillUnusedTile = UINT32_MAX;
 }
@@ -1060,6 +1209,179 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     }
 }
 
+/** Projection role used by the device-owned adaptive tile planner. */
+enum class MoEPrefillAdaptiveProjectionRole : int
+{
+    GateUp = 0,
+    Down = 1,
+};
+
+/**
+ * @brief Choose TM12 or TM16 from one expert's live grouped-row count.
+ *
+ * Gate/up makes one projection-wide choice. TM16 is used only when every active
+ * expert contains exactly 16 rows, where it removes one third of the workgroups
+ * without mixing a lower-occupancy specialization into the replay. Every other
+ * live distribution uses TM12. This distinction matters on gfx906: the TM12
+ * gate/up kernel occupies four blocks per CU at 64 VGPRs, whereas TM16 occupies
+ * three at 72 VGPRs. Launching both for one skewed distribution costs more than
+ * the handful of TM16 tiles save.
+ *
+ * Down projection is less register-bound, so it chooses the tile with fewer
+ * padded row evaluations; ties favor TM16's greater weight reuse. These choices
+ * change only grouping of independent rows. Each row still traverses K and
+ * reduces partials in the serial-M1 order implemented by the fixed
+ * specializations.
+ *
+ * @param count Number of live rows owned by one expert.
+ * @param gateup_all_active_counts_are_16 Device-reduced projection-wide gate/up
+ *        predicate. It is ignored for the down projection.
+ * @return The exact fixed specialization that owns this expert's rows.
+ */
+template <MoEPrefillAdaptiveProjectionRole ROLE>
+__device__ __forceinline__ int moe_prefill_adaptive_tile_rows(
+    int count,
+    bool gateup_all_active_counts_are_16)
+{
+    if constexpr (ROLE == MoEPrefillAdaptiveProjectionRole::GateUp)
+        return gateup_all_active_counts_are_16 ? 16 : 12;
+
+    const int padded_12 = ((count + 11) / 12) * 12;
+    const int padded_16 = ((count + 15) / 16) * 16;
+    return padded_12 < padded_16 ? 12 : 16;
+}
+
+/**
+ * @brief Build compact TM12 and TM16 spans entirely from device row counts.
+ *
+ * One planner emits a two-word device header followed by independently compact
+ * TM12 and TM16 spans. Each projection specialization receives its own span and
+ * live count, so it never launches the other specialization's conservative
+ * capacity merely to reject tagged entries. Both launches remain permanently
+ * present in the captured graph; replay therefore needs neither a conditional
+ * graph node nor host-authored route state.
+ *
+ * @tparam ROLE Gate/up or down projection selection policy.
+ */
+template <MoEPrefillAdaptiveProjectionRole ROLE>
+__global__ __launch_bounds__(kMoEPrefillMaxExperts, 1)
+void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
+    const int* __restrict__ group_counts,
+    uint32_t* __restrict__ directory,
+    int num_experts,
+    int max_tile12_tiles,
+    int max_tile16_tiles)
+{
+    const int tid = threadIdx.x;
+    if (num_experts <= 0 || num_experts > kMoEPrefillMaxExperts ||
+        max_tile12_tiles <= 0 || max_tile16_tiles <= 0)
+    {
+        if (tid == 0)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+
+    __shared__ int inclusive_tile12_counts[kMoEPrefillMaxExperts];
+    __shared__ int inclusive_tile16_counts[kMoEPrefillMaxExperts];
+    int count = tid < num_experts ? group_counts[tid] : 0;
+    if (count < 0)
+    {
+        if (tid < num_experts)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        count = 0;
+    }
+
+    bool gateup_all_active_counts_are_16 = false;
+    if constexpr (ROLE == MoEPrefillAdaptiveProjectionRole::GateUp)
+    {
+        /*
+         * Reuse the TM12 prefix array for an exact projection-wide predicate
+         * before populating the real directory counts. The scan is integer-only
+         * and has a fixed synchronization tree, so no route-dependent atomic or
+         * host observation enters the captured transaction.
+         */
+        inclusive_tile12_counts[tid] = count > 0 && count != 16 ? 1 : 0;
+        __syncthreads();
+        for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
+        {
+            const int addend = tid >= stride
+                                   ? inclusive_tile12_counts[tid - stride]
+                                   : 0;
+            __syncthreads();
+            inclusive_tile12_counts[tid] += addend;
+            __syncthreads();
+        }
+        gateup_all_active_counts_are_16 =
+            inclusive_tile12_counts[kMoEPrefillMaxExperts - 1] == 0;
+    }
+
+    const int tile_rows = count > 0
+                              ? moe_prefill_adaptive_tile_rows<ROLE>(
+                                    count,
+                                    gateup_all_active_counts_are_16)
+                              : 12;
+    const int expert_tiles =
+        count > 0 ? (count + tile_rows - 1) / tile_rows : 0;
+    inclusive_tile12_counts[tid] = tile_rows == 12 ? expert_tiles : 0;
+    inclusive_tile16_counts[tid] = tile_rows == 16 ? expert_tiles : 0;
+    __syncthreads();
+
+    for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
+    {
+        const int tile12_addend = tid >= stride
+                                      ? inclusive_tile12_counts[tid - stride]
+                                      : 0;
+        const int tile16_addend = tid >= stride
+                                      ? inclusive_tile16_counts[tid - stride]
+                                      : 0;
+        __syncthreads();
+        inclusive_tile12_counts[tid] += tile12_addend;
+        inclusive_tile16_counts[tid] += tile16_addend;
+        __syncthreads();
+    }
+
+    const int total_tile12 =
+        inclusive_tile12_counts[kMoEPrefillMaxExperts - 1];
+    const int total_tile16 =
+        inclusive_tile16_counts[kMoEPrefillMaxExperts - 1];
+    if (total_tile12 > max_tile12_tiles || total_tile16 > max_tile16_tiles)
+    {
+        if (tid == 0)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+
+    if (tid == 0)
+    {
+        directory[kMoEPrefillAdaptiveTile12CountWord] =
+            static_cast<uint32_t>(total_tile12);
+        directory[kMoEPrefillAdaptiveTile16CountWord] =
+            static_cast<uint32_t>(total_tile16);
+    }
+
+    if (tid < num_experts && count > 0)
+    {
+        const bool owns_tile16 = tile_rows == 16;
+        const int first_tile =
+            tid == 0
+                ? 0
+                : (owns_tile16
+                       ? inclusive_tile16_counts[tid - 1]
+                       : inclusive_tile12_counts[tid - 1]);
+        uint32_t* const owned_directory =
+            directory + kMoEPrefillAdaptiveDirectoryHeaderWords +
+            (owns_tile16 ? max_tile12_tiles : 0);
+        for (int tile = 0; tile < expert_tiles; ++tile)
+        {
+            const uint32_t first_row =
+                static_cast<uint32_t>(tile * tile_rows);
+            owned_directory[first_tile + tile] =
+                (first_row << kMoEPrefillExpertBits) |
+                static_cast<uint32_t>(tid);
+        }
+    }
+}
+
 /**
  * @brief Batch-invariant expert-tiled gate/up projection for long prefill.
  *
@@ -1100,7 +1422,9 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     int input_is_original_rows,
     int N,
     int K,
-    int num_experts)
+    int k_partitions,
+    int num_experts,
+    const uint32_t* __restrict__ adaptive_tile_count)
 {
     static_assert(TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
@@ -1112,8 +1436,13 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int projection_role = static_cast<int>(blockIdx.z);
     if (directory_index >= max_directory_tiles || n >= N || projection_role > 1)
         return;
+    if (adaptive_tile_count &&
+        directory_index >= static_cast<int>(*adaptive_tile_count))
+    {
+        return;
+    }
 
-    const uint32_t packed_tile = work_directory[directory_index];
+    uint32_t packed_tile = work_directory[directory_index];
     if (packed_tile == kMoEPrefillUnusedTile)
         return;
 
@@ -1144,87 +1473,116 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
 
     float* projection_out = projection_role == 0 ? gate_out : up_out;
     const int blocks_per_row = K / 32;
+    if (k_partitions <= 0 ||
+        k_partitions > blocks_per_row ||
+        k_partitions >
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
     const uint8_t* payload_base = desc.payload;
 
     __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
     __shared__ float staged_scales[TILE_M];
-    float accumulators[TILE_M] = {};
+    float totals[TILE_M] = {};
+    const int blocks_per_partition =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
 
-    for (int b = 0; b < blocks_per_row; ++b)
+#pragma unroll 1
+    for (int partition = 0; partition < k_partitions; ++partition)
     {
-        const size_t linear =
-            static_cast<size_t>(b) * static_cast<size_t>(N) +
-            static_cast<size_t>(n);
-        constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
-        const uint8_t* payload = payload_base + linear * payload_bytes;
-        int32_t packed_groups[8];
-        moe_prefill_decode_groups<FMT>(payload, packed_groups);
+        float partials[TILE_M] = {};
+        const int begin = partition * blocks_per_partition;
+        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        for (int b = begin; b < end; ++b)
+        {
+            const size_t linear =
+                static_cast<size_t>(b) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+            const uint8_t* payload = payload_base + linear * payload_bytes;
+            int32_t packed_groups[8];
+            moe_prefill_decode_groups<FMT>(payload, packed_groups);
 
-        const int staged_words = rows_in_tile * 8;
-        for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
-        {
-            const int local_row = word >> 3;
-            const int group = word & 7;
-            const int grouped_slot = first_grouped_slot + local_row;
-            int input_row = grouped_slot;
-            if (input_is_original_rows)
+            const int staged_words = rows_in_tile * 8;
+            for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
             {
-                const int source_index = group_token_indices[grouped_slot];
-                input_row = grouped_indices_are_route_slots
-                                ? (source_index / top_k)
-                                : source_index;
+                const int local_row = word >> 3;
+                const int group = word & 7;
+                const int grouped_slot = first_grouped_slot + local_row;
+                int input_row = grouped_slot;
+                if (input_is_original_rows)
+                {
+                    const int source_index = group_token_indices[grouped_slot];
+                    input_row = grouped_indices_are_route_slots
+                                    ? (source_index / top_k)
+                                    : source_index;
+                }
+                if (input_row < 0 ||
+                    input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+                {
+                    moe_prefill_fail_fast_invalid_grouped_index();
+                    return;
+                }
+                const int32_t* input_words = reinterpret_cast<const int32_t*>(
+                    A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
+                    static_cast<size_t>(b) * 32u);
+                staged_A[word] = input_words[group];
             }
-            if (input_row < 0 ||
-                input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+            for (int local_row = threadIdx.x;
+                 local_row < rows_in_tile;
+                 local_row += blockDim.x)
             {
-                moe_prefill_fail_fast_invalid_grouped_index();
-                return;
+                const int grouped_slot = first_grouped_slot + local_row;
+                int input_row = grouped_slot;
+                if (input_is_original_rows)
+                {
+                    const int source_index = group_token_indices[grouped_slot];
+                    input_row = grouped_indices_are_route_slots
+                                    ? (source_index / top_k)
+                                    : source_index;
+                }
+                if (input_row < 0 ||
+                    input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+                {
+                    moe_prefill_fail_fast_invalid_grouped_index();
+                    return;
+                }
+                staged_scales[local_row] = scales_A_blockwise[
+                    static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
+                    static_cast<size_t>(b)];
             }
-            const int32_t* input_words = reinterpret_cast<const int32_t*>(
-                A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
-                static_cast<size_t>(b) * 32u);
-            staged_A[word] = input_words[group];
+            __syncthreads();
+
+#pragma unroll
+            for (int local_row = 0; local_row < TILE_M; ++local_row)
+            {
+                if (local_row >= rows_in_tile)
+                    break;
+                partials[local_row] =
+                    moe_prefill_accumulate_decoded_block<FMT>(
+                        desc,
+                        linear,
+                        payload,
+                        packed_groups,
+                        staged_A + local_row * 8,
+                        staged_scales[local_row],
+                        partials[local_row]);
+            }
+            __syncthreads();
         }
-        for (int local_row = threadIdx.x;
-             local_row < rows_in_tile;
-             local_row += blockDim.x)
-        {
-            const int grouped_slot = first_grouped_slot + local_row;
-            int input_row = grouped_slot;
-            if (input_is_original_rows)
-            {
-                const int source_index = group_token_indices[grouped_slot];
-                input_row = grouped_indices_are_route_slots
-                                ? (source_index / top_k)
-                                : source_index;
-            }
-            if (input_row < 0 ||
-                input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
-            {
-                moe_prefill_fail_fast_invalid_grouped_index();
-                return;
-            }
-            staged_scales[local_row] = scales_A_blockwise[
-                static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
-                static_cast<size_t>(b)];
-        }
-        __syncthreads();
 
 #pragma unroll
         for (int local_row = 0; local_row < TILE_M; ++local_row)
         {
             if (local_row >= rows_in_tile)
                 break;
-            accumulators[local_row] = moe_prefill_accumulate_decoded_block<FMT>(
-                desc,
-                linear,
-                payload,
-                packed_groups,
-                staged_A + local_row * 8,
-                staged_scales[local_row],
-                accumulators[local_row]);
+            totals[local_row] = k_partitions == 1
+                                    ? partials[local_row]
+                                    : rocm_native_vnni_accumulate_rn(
+                                          totals[local_row], partials[local_row]);
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -1235,7 +1593,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         const int grouped_slot = first_grouped_slot + local_row;
         projection_out[
             static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = accumulators[local_row];
+            static_cast<size_t>(n)] = totals[local_row];
     }
 }
 
@@ -1248,12 +1606,11 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
  * slot, one trained output-column tile, and one projection role.
  * `blockIdx.z == 0` computes gate while `blockIdx.z == 1` computes up. The two
  * projections have no arithmetic dependency, so exposing them as independent
- * workgroups improves occupancy without changing either projection's
- * increasing-K dot order or adding another graph launch. The route-to-grouped
- * inverse map skips
- * non-local routes and directs valid results to compact expert scratch, so the
- * launch has exactly `2 * seq_len * top_k` projection-row work rather than a
- * sparse expert-by-max-M rectangle. FP32 gate/up scratch is written exactly
+ * workgroups improves occupancy without changing either projection's serial-M1
+ * partition tree or adding another graph launch. The route-to-grouped inverse
+ * map skips non-local routes and directs valid results to compact expert
+ * scratch, so the launch has exactly `2 * seq_len * top_k` projection-row work
+ * rather than a sparse expert-by-max-M rectangle. FP32 gate/up scratch is written exactly
  * like the M=1 decode-table path before one grouped SwiGLU quantization pass
  * consumes it.
  */
@@ -1278,6 +1635,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     int input_is_original_rows,
     int N,
     int K,
+    int k_partitions,
     int num_experts)
 {
     static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
@@ -1301,8 +1659,8 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
      * codebook is only 8 KiB. The IQ2_S specialization uses four waves per
      * workgroup and cooperatively copies the immutable table into LDS once.
      * Every output lane then reads the identical uint64_t entries from LDS;
-     * its dot products, dual-scale commits, corrections, and increasing-K
-     * accumulation order are unchanged.
+     * its dot products, dual-scale commits, corrections, partition boundaries,
+     * and ordered partition reduction are unchanged.
      *
      * Dynamic shared storage is zero bytes for every other codebook, so this
      * specialization cannot silently tax their occupancy or alter their
@@ -1408,6 +1766,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
             slot_scales,
             N,
             blocks_per_row,
+            k_partitions,
             staged_iq2s_grid);
         if ((static_cast<int>(threadIdx.x) & (K_LANES - 1)) == 0)
             projection_out[out_index] = value;
@@ -1415,14 +1774,13 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     else
     {
         projection_out[out_index] =
-            moe_prefill_dot_desc_range<FMT, STAGE_IQ2_S_GRID>(
+            moe_prefill_dot_desc_serial_m1<FMT, STAGE_IQ2_S_GRID>(
                 desc,
                 n,
                 slot_A,
                 slot_scales,
                 N,
-                0,
-                blocks_per_row,
+                k_partitions,
                 staged_iq2s_grid);
     }
 }
@@ -1437,7 +1795,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
  *
  * @tparam FMT NativeVNNI execution codebook.
  * @tparam TILE_N Output columns owned by one workgroup before K subdivision.
- * @tparam K_LANES Adjacent lanes preparing independent increasing-K blocks.
+ * @tparam K_LANES Adjacent lanes preparing blocks within one serial partition.
  * @param stream Non-null graph-capture stream that owns this launch.
  * @param A_int8 Quantized input rows.
  * @param scales_A_blockwise Per-row activation scales.
@@ -1453,6 +1811,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
  * @param input_is_original_rows Whether activation rows are token-owned.
  * @param N Projection output width.
  * @param K Projection reduction width.
+ * @param k_partitions Exact effective serial-M1 partition count.
  * @param num_experts Number of descriptors in each table.
  */
 template <
@@ -1475,6 +1834,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     int input_is_original_rows,
     int N,
     int K,
+    int k_partitions,
     int num_experts)
 {
     constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
@@ -1508,6 +1868,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
         input_is_original_rows,
         N,
         K,
+        k_partitions,
         num_experts);
 }
 
@@ -1538,6 +1899,7 @@ void launch_moe_grouped_gate_up_route_owned(
     int input_is_original_rows,
     int N,
     int K,
+    int k_partitions,
     int num_experts)
 {
     if constexpr (FMT == NVNNI_PF_IQ2_S)
@@ -1548,7 +1910,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, num_experts);
+                N, K, k_partitions, num_experts);
         }
         else
         {
@@ -1556,7 +1918,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, num_experts);
+                N, K, k_partitions, num_experts);
         }
     }
     else if constexpr (FMT == NVNNI_PF_Q6_K)
@@ -1565,7 +1927,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, num_experts);
+            N, K, k_partitions, num_experts);
     }
     else
     {
@@ -1573,7 +1935,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, num_experts);
+            N, K, k_partitions, num_experts);
     }
 }
 
@@ -1603,11 +1965,12 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
     const int k = block_in_row * 32 + lane;
     if (k >= intermediate) return;
 
-    // Compute SwiGLU: silu(gate) * up = (gate / (1 + exp(-gate))) * up
+    // Use the exact serial-decode exponential and reciprocal instruction tree.
     const size_t idx = static_cast<size_t>(global_slot) * intermediate + k;
     const float g = gate_data[idx];
     const float u = up_data[idx];
-    const float val = (g / (1.0f + expf(-g))) * u;
+    const float val =
+        llaminar2::rocm::decode_equivalent::swigluValue(g, u);
 
     // Warp-cooperative max reduction for quantization
     float abs_val = fabsf(val);
@@ -1615,16 +1978,18 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
     for (int mask = 16; mask > 0; mask >>= 1)
         abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
 
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
     const float inv_scale = 1.0f / scale;
 
     const int blocks_per_row = intermediate / 32;
     if (lane == 0)
         scales_out[static_cast<size_t>(global_slot) * blocks_per_row + block_in_row] = scale;
 
-    const float qval = val * inv_scale;
     A_int8_out[static_cast<size_t>(global_slot) * intermediate + k] =
-        static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        static_cast<int8_t>(
+            llaminar2::rocm::decode_equivalent::quantizeQ8(
+                val, inv_scale));
 }
 
 /**
@@ -1654,7 +2019,9 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     int max_directory_tiles,
     int N,
     int K,
-    int num_experts)
+    int k_partitions,
+    int num_experts,
+    const uint32_t* __restrict__ adaptive_tile_count)
 {
     static_assert(TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
@@ -1665,8 +2032,13 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     const int directory_index = static_cast<int>(blockIdx.y);
     if (directory_index >= max_directory_tiles || n >= N)
         return;
+    if (adaptive_tile_count &&
+        directory_index >= static_cast<int>(*adaptive_tile_count))
+    {
+        return;
+    }
 
-    const uint32_t packed_tile = work_directory[directory_index];
+    uint32_t packed_tile = work_directory[directory_index];
     if (packed_tile == kMoEPrefillUnusedTile)
         return;
 
@@ -1695,58 +2067,87 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         return;
 
     const int blocks_per_row = K / 32;
+    if (k_partitions <= 0 ||
+        k_partitions > blocks_per_row ||
+        k_partitions >
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
     const uint8_t* payload_base = desc.payload;
     __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
     __shared__ float staged_scales[TILE_M];
-    float accumulators[TILE_M] = {};
+    float totals[TILE_M] = {};
+    const int blocks_per_partition =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
 
-    for (int b = 0; b < blocks_per_row; ++b)
+#pragma unroll 1
+    for (int partition = 0; partition < k_partitions; ++partition)
     {
-        const size_t linear =
-            static_cast<size_t>(b) * static_cast<size_t>(N) +
-            static_cast<size_t>(n);
-        constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
-        const uint8_t* payload = payload_base + linear * payload_bytes;
-        int32_t packed_groups[8];
-        moe_prefill_decode_groups<FMT>(payload, packed_groups);
+        float partials[TILE_M] = {};
+        const int begin = partition * blocks_per_partition;
+        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        for (int b = begin; b < end; ++b)
+        {
+            const size_t linear =
+                static_cast<size_t>(b) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+            const uint8_t* payload = payload_base + linear * payload_bytes;
+            int32_t packed_groups[8];
+            moe_prefill_decode_groups<FMT>(payload, packed_groups);
 
-        const int staged_words = rows_in_tile * 8;
-        for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
-        {
-            const int local_row = word >> 3;
-            const int group = word & 7;
-            const int grouped_slot = first_grouped_slot + local_row;
-            const int32_t* input_words = reinterpret_cast<const int32_t*>(
-                A_int8 + static_cast<size_t>(grouped_slot) * static_cast<size_t>(K) +
-                static_cast<size_t>(b) * 32u);
-            staged_A[word] = input_words[group];
+            const int staged_words = rows_in_tile * 8;
+            for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
+            {
+                const int local_row = word >> 3;
+                const int group = word & 7;
+                const int grouped_slot = first_grouped_slot + local_row;
+                const int32_t* input_words = reinterpret_cast<const int32_t*>(
+                    A_int8 + static_cast<size_t>(grouped_slot) * static_cast<size_t>(K) +
+                    static_cast<size_t>(b) * 32u);
+                staged_A[word] = input_words[group];
+            }
+            for (int local_row = threadIdx.x;
+                 local_row < rows_in_tile;
+                 local_row += blockDim.x)
+            {
+                const int grouped_slot = first_grouped_slot + local_row;
+                staged_scales[local_row] = scales_A_blockwise[
+                    static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
+                    static_cast<size_t>(b)];
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int local_row = 0; local_row < TILE_M; ++local_row)
+            {
+                if (local_row >= rows_in_tile)
+                    break;
+                partials[local_row] =
+                    moe_prefill_accumulate_decoded_block<FMT>(
+                        desc,
+                        linear,
+                        payload,
+                        packed_groups,
+                        staged_A + local_row * 8,
+                        staged_scales[local_row],
+                        partials[local_row]);
+            }
+            __syncthreads();
         }
-        for (int local_row = threadIdx.x;
-             local_row < rows_in_tile;
-             local_row += blockDim.x)
-        {
-            const int grouped_slot = first_grouped_slot + local_row;
-            staged_scales[local_row] = scales_A_blockwise[
-                static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
-                static_cast<size_t>(b)];
-        }
-        __syncthreads();
 
 #pragma unroll
         for (int local_row = 0; local_row < TILE_M; ++local_row)
         {
             if (local_row >= rows_in_tile)
                 break;
-            accumulators[local_row] = moe_prefill_accumulate_decoded_block<FMT>(
-                desc,
-                linear,
-                payload,
-                packed_groups,
-                staged_A + local_row * 8,
-                staged_scales[local_row],
-                accumulators[local_row]);
+            totals[local_row] = k_partitions == 1
+                                    ? partials[local_row]
+                                    : rocm_native_vnni_accumulate_rn(
+                                          totals[local_row], partials[local_row]);
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -1757,7 +2158,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         const int grouped_slot = first_grouped_slot + local_row;
         down_partials[
             static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = accumulators[local_row];
+            static_cast<size_t>(n)] = totals[local_row];
     }
 }
 
@@ -1821,65 +2222,64 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
  * generic while still reusing the exact same per-codebook dot helper as the
  * grouped gate/up kernels and serial decode.
  */
-__device__ __forceinline__ float moe_prefill_dot_desc_range_dispatch(
+__device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
     const DeviceNativeVNNIMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
     int N,
-    int b_start,
-    int b_end)
+    int k_partitions)
 {
     switch (static_cast<NativeVNNIFormatPrefill>(desc.codebook_id))
     {
     case NVNNI_PF_Q4_0:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q4_0>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_0>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ4_NL:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ4_NL>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_NL>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q4_1:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q4_1>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_1>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q5_0:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q5_0>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q5_0>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q5_1:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q5_1>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q5_1>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q6_K:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q6_K>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q6_K>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q3_K:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q3_K>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q3_K>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q2_K:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q2_K>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q2_K>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ3_S:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ3_S>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ3_S>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ3_XXS:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ3_XXS>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ3_XXS>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ2_S:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_S>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_S>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ2_XS:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_XS>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_XS>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ2_XXS:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_XXS>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_XXS>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ1_S:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ1_S>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ1_S>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_IQ1_M:
-        return moe_prefill_dot_desc_range<NVNNI_PF_IQ1_M>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ1_M>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q8_0:
-        return moe_prefill_dot_desc_range<NVNNI_PF_Q8_0>(
-            desc, n, slot_A, slot_scales, N, b_start, b_end);
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q8_0>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     default:
         moe_prefill_fail_fast_invalid_grouped_index();
         return 0.0f;
@@ -1906,12 +2306,18 @@ __device__ __forceinline__ float moe_prefill_down_dot(
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
     int N,
-    int blocks_per_row)
+    int blocks_per_row,
+    const MoEPrefillSerialM1KPartitionPolicy& k_partition_policy)
 {
     if constexpr (FORMAT_TAG == kMoEPrefillMixedCodebookTag)
     {
-        return moe_prefill_dot_desc_range_dispatch(
-            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+        return moe_prefill_dot_desc_serial_m1_dispatch(
+            desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            k_partition_policy.forCodebook(desc.codebook_id));
     }
     else
     {
@@ -1928,8 +2334,14 @@ __device__ __forceinline__ float moe_prefill_down_dot(
             moe_prefill_fail_fast_invalid_grouped_index();
             return 0.0f;
         }
-        return moe_prefill_dot_desc_range<kFormat>(
-            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+        return moe_prefill_dot_desc_serial_m1<kFormat>(
+            desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            k_partition_policy.forCodebook(
+                static_cast<uint8_t>(kFormat)));
     }
 }
 
@@ -1965,7 +2377,8 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
     int top_k,
     int N,
     int K,
-    int num_experts)
+    int num_experts,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy)
 {
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -1994,7 +2407,13 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
         const float* slot_scales =
             swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
         const float expert_acc = moe_prefill_down_dot<FORMAT_TAG>(
-            desc, n, slot_A, slot_scales, N, blocks_per_row);
+            desc,
+            n,
+            slot_A,
+            slot_scales,
+            N,
+            blocks_per_row,
+            k_partition_policy);
         const float weighted_route = rocm_native_vnni_weight_route_rn(
             grouped_weights[grouped_slot], expert_acc);
         total = rocm_native_vnni_accumulate_rn(total, weighted_route);
@@ -2025,7 +2444,8 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     int total_slots,
     int N,
     int K,
-    int num_experts)
+    int num_experts,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy)
 {
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -2053,7 +2473,13 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     const float* slot_scales =
         swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
     const float expert_acc = moe_prefill_down_dot<FORMAT_TAG>(
-        desc, n, slot_A, slot_scales, N, blocks_per_row);
+        desc,
+        n,
+        slot_A,
+        slot_scales,
+        N,
+        blocks_per_row,
+        k_partition_policy);
     route_output[output_index] = rocm_native_vnni_weight_route_rn(
         grouped_weights[grouped_slot], expert_acc);
 }
@@ -2128,7 +2554,7 @@ void moe_reduce_canonical_route_contributions_kernel(
 // buckets use direct route-owned projection. Long prefill builds a compact
 // device work directory, reuses decoded expert weights across row tiles, and
 // publishes materialized down rows in original top-k order. No path uses FP32
-// atomics, host synchronization, or host-authored launch metadata.
+// atomics, host synchronization, or replay-time host-authored work metadata.
 // ============================================================================
 
 namespace
@@ -2147,14 +2573,108 @@ namespace
         int columns = 0;
     };
 
+    /** Joint gate/up and down policy chosen once for one captured MoE graph. */
+    struct MoEPrefillPairConfig
+    {
+        MoEPrefillTileConfig gateup{};
+        MoEPrefillTileConfig down{};
+        bool exact_overlay = false;
+    };
+
     bool moe_prefill_valid_tile_rows(int rows)
     {
-        return rows == 4 || rows == 8 || rows == 12 || rows == 16;
+        return rows == 4 || rows == 8 || rows == 12 || rows == 16 ||
+               rows == kMoEPrefillAdaptiveTileRows;
     }
 
     bool moe_prefill_valid_tile_columns(int columns)
     {
         return columns == 64 || columns == 128 || columns == 256;
+    }
+
+    /** Return the sole execution codebook in a descriptor mask, if any. */
+    int moe_prefill_single_codebook(uint32_t codebook_mask)
+    {
+        if (codebook_mask == 0 ||
+            (codebook_mask & (codebook_mask - 1u)) != 0u)
+        {
+            return -1;
+        }
+
+        int codebook = 0;
+        while ((codebook_mask >>= 1u) != 0u)
+            ++codebook;
+        return codebook;
+    }
+
+    /**
+     * @brief Resolve every codebook's exact serial-M1 split-K policy for capture.
+     *
+     * The generated decode selector is queried only while the graph is being
+     * constructed. The resulting fixed-size value becomes an ordinary captured
+     * kernel argument, so graph replay performs no host lookup or transfer. A
+     * missing or out-of-range policy is fatal to graph construction rather than
+     * silently changing the arithmetic tree.
+     */
+    bool moe_prefill_resolve_serial_m1_k_partitions(
+        uint32_t codebook_mask,
+        int n,
+        int k,
+        MoEPrefillSerialM1KPartitionPolicy& policy)
+    {
+        if (codebook_mask == 0 || n <= 0 || k <= 0 || (k % 32) != 0)
+            return false;
+
+        bool resolved_any = false;
+        for (uint8_t codebook_id = 0; codebook_id < 32; ++codebook_id)
+        {
+            if ((codebook_mask &
+                 (uint32_t{1} << static_cast<uint32_t>(codebook_id))) == 0)
+            {
+                continue;
+            }
+
+            int k_partitions = 0;
+            if (!rocmGemv_native_vnni_query_serial_m1_config(
+                    codebook_id,
+                    n,
+                    k,
+                    &k_partitions,
+                    nullptr) ||
+                k_partitions <= 0 ||
+                k_partitions > k / 32 ||
+                k_partitions >
+                    llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            {
+                return false;
+            }
+
+            policy.by_codebook[codebook_id] =
+                static_cast<uint8_t>(k_partitions);
+            resolved_any = true;
+        }
+        return resolved_any;
+    }
+
+    /** Apply explicit trainer controls after generated production selection. */
+    void moe_prefill_apply_tile_override(
+        MoEPrefillProjectionRole role,
+        MoEPrefillTileConfig &config)
+    {
+        const auto &env = llaminar2::debugEnv().rocm;
+        if (role == MoEPrefillProjectionRole::GateUp)
+        {
+            if (env.moe_prefill_gateup_tile_m > 0)
+                config.rows = env.moe_prefill_gateup_tile_m;
+            if (env.moe_prefill_gateup_tile_n > 0)
+                config.columns = env.moe_prefill_gateup_tile_n;
+            return;
+        }
+
+        if (env.moe_prefill_down_tile_m > 0)
+            config.rows = env.moe_prefill_down_tile_m;
+        if (env.moe_prefill_down_tile_n > 0)
+            config.columns = env.moe_prefill_down_tile_n;
     }
 
     /**
@@ -2175,7 +2695,6 @@ namespace
         int n,
         int k)
     {
-        const auto& env = llaminar2::debugEnv().rocm;
         MoEPrefillTileConfig config{};
         llaminar2::rocm::generated::ROCmMoEGroupedPrefillConfig generated{};
         const uint8_t role_id =
@@ -2187,21 +2706,78 @@ namespace
         }
         config.rows = generated.tile_m;
         config.columns = generated.tile_n;
-        if (role == MoEPrefillProjectionRole::GateUp)
-        {
-            if (env.moe_prefill_gateup_tile_m > 0)
-                config.rows = env.moe_prefill_gateup_tile_m;
-            if (env.moe_prefill_gateup_tile_n > 0)
-                config.columns = env.moe_prefill_gateup_tile_n;
-        }
-        else
-        {
-            if (env.moe_prefill_down_tile_m > 0)
-                config.rows = env.moe_prefill_down_tile_m;
-            if (env.moe_prefill_down_tile_n > 0)
-                config.columns = env.moe_prefill_down_tile_n;
-        }
+        moe_prefill_apply_tile_override(role, config);
         return config;
+    }
+
+    /**
+     * @brief Select one joint production policy for a uniform-codebook pair.
+     *
+     * Exact production overlays have precedence over the complementary generic
+     * role tables. A key miss is expected for an unseen geometry or positive M
+     * and therefore retains the total generic policy. By contrast, a malformed
+     * exact entry remains selected and invalid so the launch fails hard instead
+     * of silently hiding a corrupt generated artifact.
+     */
+    MoEPrefillPairConfig moe_prefill_select_pair_config(
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
+        int m,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k)
+    {
+        MoEPrefillPairConfig pair{};
+        const int gateup_codebook =
+            moe_prefill_single_codebook(gateup_codebook_mask);
+        const int down_codebook =
+            moe_prefill_single_codebook(down_codebook_mask);
+        if (gateup_codebook < 0 || down_codebook < 0)
+            return pair;
+
+        pair.gateup = moe_prefill_select_tile_config(
+            MoEPrefillProjectionRole::GateUp,
+            static_cast<NativeVNNIFormatPrefill>(gateup_codebook),
+            m,
+            expert_width,
+            hidden_size);
+        pair.down = moe_prefill_select_tile_config(
+            MoEPrefillProjectionRole::Down,
+            static_cast<NativeVNNIFormatPrefill>(down_codebook),
+            m,
+            hidden_size,
+            expert_width);
+
+        llaminar2::rocm::generated::ROCmMoEProductionPrefillOverlayConfig
+            exact{};
+        if (!llaminar2::rocm::generated::selectROCmMoEProductionPrefillOverlay(
+                static_cast<uint8_t>(gateup_codebook),
+                static_cast<uint8_t>(down_codebook),
+                hidden_size,
+                expert_width,
+                expert_count,
+                top_k,
+                m,
+                exact))
+        {
+            return pair;
+        }
+
+        pair.gateup = {
+            .rows = exact.gateup_tile_m,
+            .columns = exact.gateup_tile_n,
+        };
+        pair.down = {
+            .rows = exact.down_tile_m,
+            .columns = exact.down_tile_n,
+        };
+        pair.exact_overlay = true;
+        moe_prefill_apply_tile_override(
+            MoEPrefillProjectionRole::GateUp, pair.gateup);
+        moe_prefill_apply_tile_override(
+            MoEPrefillProjectionRole::Down, pair.down);
+        return pair;
     }
 
     int moe_prefill_directory_capacity(
@@ -2216,6 +2792,186 @@ namespace
         return conservative_bound < total_slots
                    ? conservative_bound
                    : total_slots;
+    }
+
+    /**
+     * @brief Read immutable compiler resources for one HIP kernel function.
+     *
+     * Candidate training calls this before the first launch.  In particular,
+     * `localSizeBytes` is the runtime's authoritative static indication that
+     * the compiler assigned per-thread scratch/local memory.  Such a candidate
+     * is not eligible for timing because register spilling is a launch-policy
+     * defect, not a performance feature for the learner to rediscover.
+     */
+    bool moe_prefill_query_function_resources(
+        const void* function,
+        int block_threads,
+        int* registers_per_thread,
+        size_t* local_memory_bytes_per_thread,
+        size_t* static_shared_memory_bytes,
+        int* max_threads_per_block,
+        int* max_active_blocks_per_sm)
+    {
+        if (!function || block_threads <= 0 || !registers_per_thread ||
+            !local_memory_bytes_per_thread || !static_shared_memory_bytes ||
+            !max_threads_per_block || !max_active_blocks_per_sm)
+        {
+            return false;
+        }
+
+        hipFuncAttributes attributes{};
+        if (hipFuncGetAttributes(&attributes, function) != hipSuccess)
+            return false;
+
+        int active_blocks = 0;
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                function,
+                block_threads,
+                /*dynamicSMemSize=*/0) != hipSuccess ||
+            active_blocks <= 0)
+        {
+            return false;
+        }
+
+        *registers_per_thread = attributes.numRegs;
+        *local_memory_bytes_per_thread = attributes.localSizeBytes;
+        *static_shared_memory_bytes = attributes.sharedSizeBytes;
+        *max_threads_per_block = attributes.maxThreadsPerBlock;
+        *max_active_blocks_per_sm = active_blocks;
+        return attributes.numRegs > 0 &&
+               attributes.maxThreadsPerBlock >= block_threads;
+    }
+
+    /**
+     * @brief Resolve one role-specific template specialization for inspection.
+     */
+    template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
+    bool moe_prefill_query_candidate_resources(
+        MoEPrefillProjectionRole role,
+        int* registers_per_thread,
+        size_t* local_memory_bytes_per_thread,
+        size_t* static_shared_memory_bytes,
+        int* max_threads_per_block,
+        int* max_active_blocks_per_sm)
+    {
+        const void* function = nullptr;
+        if (role == MoEPrefillProjectionRole::GateUp)
+        {
+            function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<
+                    FMT, TILE_M, TILE_N>));
+        }
+        else
+        {
+            function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                moe_grouped_down_batch_invariant_tiled_prefill_kernel<
+                    FMT, TILE_M, TILE_N>));
+        }
+        return moe_prefill_query_function_resources(
+            function,
+            TILE_N,
+            registers_per_thread,
+            local_memory_bytes_per_thread,
+            static_shared_memory_bytes,
+            max_threads_per_block,
+            max_active_blocks_per_sm);
+    }
+
+    /**
+     * @brief Inspect every kernel embedded by one adaptive projection choice.
+     *
+     * Adaptive dispatch is a single capture-time policy choice, but its replay
+     * consists of the device directory planner followed by the TM12 and TM16
+     * projection specializations. The trainer must reject the choice when any
+     * member spills or cannot sustain useful occupancy, so this query reports
+     * the maximum pressure and minimum execution ceiling across all three
+     * kernels. Reporting only one projection specialization would let an
+     * uninspected kernel enter the production graph through a misleadingly
+     * healthy candidate record.
+     *
+     * @tparam FMT NativeVNNI codebook used by both projection kernels.
+     * @tparam TILE_N Output-column width and projection block size.
+     * @param role Gate/up or down projection role.
+     * @param registers_per_thread Receives the largest VGPR allocation.
+     * @param local_memory_bytes_per_thread Receives the largest spill footprint.
+     * @param static_shared_memory_bytes Receives the largest LDS allocation.
+     * @param max_threads_per_block Receives the smallest launch ceiling.
+     * @param max_active_blocks_per_sm Receives the smallest occupancy ceiling.
+     * @return true only when the planner and both projections can be inspected.
+     */
+    template <NativeVNNIFormatPrefill FMT, int TILE_N>
+    bool moe_prefill_query_adaptive_candidate_resources(
+        MoEPrefillProjectionRole role,
+        int* registers_per_thread,
+        size_t* local_memory_bytes_per_thread,
+        size_t* static_shared_memory_bytes,
+        int* max_threads_per_block,
+        int* max_active_blocks_per_sm)
+    {
+        int registers[3] = {};
+        size_t local_memory[3] = {};
+        size_t shared_memory[3] = {};
+        int max_threads[3] = {};
+        int active_blocks[3] = {};
+
+        if (!moe_prefill_query_candidate_resources<FMT, 12, TILE_N>(
+                role,
+                &registers[0],
+                &local_memory[0],
+                &shared_memory[0],
+                &max_threads[0],
+                &active_blocks[0]) ||
+            !moe_prefill_query_candidate_resources<FMT, 16, TILE_N>(
+                role,
+                &registers[1],
+                &local_memory[1],
+                &shared_memory[1],
+                &max_threads[1],
+                &active_blocks[1]))
+        {
+            return false;
+        }
+
+        const void* planner =
+            role == MoEPrefillProjectionRole::GateUp
+                ? reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                      moe_grouped_build_adaptive_prefill_tile_directory_kernel<
+                          MoEPrefillAdaptiveProjectionRole::GateUp>))
+                : reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                      moe_grouped_build_adaptive_prefill_tile_directory_kernel<
+                          MoEPrefillAdaptiveProjectionRole::Down>));
+        if (!moe_prefill_query_function_resources(
+                planner,
+                kMoEPrefillMaxExperts,
+                &registers[2],
+                &local_memory[2],
+                &shared_memory[2],
+                &max_threads[2],
+                &active_blocks[2]))
+        {
+            return false;
+        }
+
+        *registers_per_thread = registers[0];
+        *local_memory_bytes_per_thread = local_memory[0];
+        *static_shared_memory_bytes = shared_memory[0];
+        *max_threads_per_block = max_threads[0];
+        *max_active_blocks_per_sm = active_blocks[0];
+        for (int member = 1; member < 3; ++member)
+        {
+            if (registers[member] > *registers_per_thread)
+                *registers_per_thread = registers[member];
+            if (local_memory[member] > *local_memory_bytes_per_thread)
+                *local_memory_bytes_per_thread = local_memory[member];
+            if (shared_memory[member] > *static_shared_memory_bytes)
+                *static_shared_memory_bytes = shared_memory[member];
+            if (max_threads[member] < *max_threads_per_block)
+                *max_threads_per_block = max_threads[member];
+            if (active_blocks[member] < *max_active_blocks_per_sm)
+                *max_active_blocks_per_sm = active_blocks[member];
+        }
+        return true;
     }
 }
 
@@ -2271,6 +3027,195 @@ bool rocmMoE_grouped_prefill_query_tile_config(
     return true;
 }
 
+/**
+ * @brief Query the complete capture-time policy for one production MoE pair.
+ *
+ * Unlike the role-only trainer query, this API has every runtime key used by
+ * the exact overlay. It therefore reports the same joint gate/up and down
+ * geometry that the production launcher will embed in a captured graph. An
+ * unseen exact key remains valid through the complementary generic tables and
+ * reports @p exact_overlay as zero.
+ *
+ * @param gateup_codebook_id Uniform gate/up execution codebook.
+ * @param down_codebook_id Uniform down execution codebook.
+ * @param m Number of original token rows.
+ * @param hidden_size Model hidden width.
+ * @param expert_width Routed expert intermediate width.
+ * @param expert_count Number of routed experts.
+ * @param top_k Routes selected per token.
+ * @param gateup_tile_m Receives the gate/up expert-row tile.
+ * @param gateup_tile_n Receives the gate/up output-column tile.
+ * @param down_tile_m Receives the down expert-row tile.
+ * @param down_tile_n Receives the down output-column tile.
+ * @param exact_overlay Receives one for an exact overlay and zero for generic.
+ * @return true when both selected configurations name compiled candidates.
+ */
+bool rocmMoE_grouped_prefill_query_production_pair_config(
+    uint8_t gateup_codebook_id,
+    uint8_t down_codebook_id,
+    int m,
+    int hidden_size,
+    int expert_width,
+    int expert_count,
+    int top_k,
+    int *gateup_tile_m,
+    int *gateup_tile_n,
+    int *down_tile_m,
+    int *down_tile_n,
+    int *exact_overlay)
+{
+    if (gateup_codebook_id >= 32 || down_codebook_id >= 32 ||
+        m <= 0 || hidden_size <= 0 || expert_width <= 0 ||
+        expert_count <= 0 || top_k <= 0 || top_k > expert_count ||
+        !gateup_tile_m || !gateup_tile_n || !down_tile_m || !down_tile_n ||
+        !exact_overlay)
+    {
+        return false;
+    }
+
+    const MoEPrefillPairConfig pair = moe_prefill_select_pair_config(
+        uint32_t{1} << gateup_codebook_id,
+        uint32_t{1} << down_codebook_id,
+        m,
+        hidden_size,
+        expert_width,
+        expert_count,
+        top_k);
+    if (!moe_prefill_valid_tile_rows(pair.gateup.rows) ||
+        !moe_prefill_valid_tile_columns(pair.gateup.columns) ||
+        !moe_prefill_valid_tile_rows(pair.down.rows) ||
+        !moe_prefill_valid_tile_columns(pair.down.columns))
+    {
+        return false;
+    }
+
+    *gateup_tile_m = pair.gateup.rows;
+    *gateup_tile_n = pair.gateup.columns;
+    *down_tile_m = pair.down.rows;
+    *down_tile_n = pair.down.columns;
+    *exact_overlay = pair.exact_overlay ? 1 : 0;
+    return true;
+}
+
+/**
+ * @brief Query static resources for one compiled grouped-prefill candidate.
+ *
+ * This inspection performs no allocation, launch, transfer, or synchronization.
+ * It is the pre-timing eligibility gate used by the exhaustive trainer.  A
+ * successful query with non-zero `local_memory_bytes_per_thread` identifies a
+ * register-spilling specialization and therefore excludes that specialization
+ * from the launch tournament.
+ *
+ * @param codebook_id NativeVNNI execution codebook compiled into the decoder.
+ * @param projection_role Zero for gate/up, one for down.
+ * @param tile_m Candidate expert-row tile.
+ * @param tile_n Candidate output-column tile and physical block width.
+ * @param registers_per_thread Receives compiler-assigned VGPR usage.
+ * @param local_memory_bytes_per_thread Receives compiler-owned scratch bytes.
+ * @param static_shared_memory_bytes Receives compiler-owned LDS bytes.
+ * @param max_threads_per_block Receives the kernel's launch ceiling.
+ * @param max_active_blocks_per_sm Receives occupancy at this block geometry.
+ * @return true only when the exact compiled specialization can be inspected.
+ */
+bool rocmMoE_grouped_prefill_query_kernel_resources(
+    uint8_t codebook_id,
+    int projection_role,
+    int tile_m,
+    int tile_n,
+    int* registers_per_thread,
+    size_t* local_memory_bytes_per_thread,
+    size_t* static_shared_memory_bytes,
+    int* max_threads_per_block,
+    int* max_active_blocks_per_sm)
+{
+    if (projection_role < 0 || projection_role > 1 ||
+        !moe_prefill_valid_tile_rows(tile_m) ||
+        !moe_prefill_valid_tile_columns(tile_n))
+    {
+        return false;
+    }
+
+    const auto role = projection_role == 0
+                          ? MoEPrefillProjectionRole::GateUp
+                          : MoEPrefillProjectionRole::Down;
+
+    #define QUERY_TILE_N(FMT, TM) \
+        do { \
+            switch (tile_n) { \
+            case 64: return moe_prefill_query_candidate_resources<FMT, TM, 64>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            case 128: return moe_prefill_query_candidate_resources<FMT, TM, 128>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            case 256: return moe_prefill_query_candidate_resources<FMT, TM, 256>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            default: return false; \
+            } \
+        } while (0)
+
+    #define QUERY_ADAPTIVE_TILE_N(FMT) \
+        do { \
+            switch (tile_n) { \
+            case 64: return moe_prefill_query_adaptive_candidate_resources<FMT, 64>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            case 128: return moe_prefill_query_adaptive_candidate_resources<FMT, 128>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            case 256: return moe_prefill_query_adaptive_candidate_resources<FMT, 256>( \
+                role, registers_per_thread, local_memory_bytes_per_thread, \
+                static_shared_memory_bytes, max_threads_per_block, \
+                max_active_blocks_per_sm); \
+            default: return false; \
+            } \
+        } while (0)
+
+    #define QUERY_TILE_M(FMT) \
+        do { \
+            switch (tile_m) { \
+            case 4: QUERY_TILE_N(FMT, 4); \
+            case 8: QUERY_TILE_N(FMT, 8); \
+            case 12: QUERY_TILE_N(FMT, 12); \
+            case 16: QUERY_TILE_N(FMT, 16); \
+            case kMoEPrefillAdaptiveTileRows: QUERY_ADAPTIVE_TILE_N(FMT); \
+            default: return false; \
+            } \
+        } while (0)
+
+    switch (static_cast<NativeVNNIFormatPrefill>(codebook_id))
+    {
+    case NVNNI_PF_Q4_0: QUERY_TILE_M(NVNNI_PF_Q4_0);
+    case NVNNI_PF_IQ4_NL: QUERY_TILE_M(NVNNI_PF_IQ4_NL);
+    case NVNNI_PF_Q4_1: QUERY_TILE_M(NVNNI_PF_Q4_1);
+    case NVNNI_PF_Q5_0: QUERY_TILE_M(NVNNI_PF_Q5_0);
+    case NVNNI_PF_Q5_1: QUERY_TILE_M(NVNNI_PF_Q5_1);
+    case NVNNI_PF_Q6_K: QUERY_TILE_M(NVNNI_PF_Q6_K);
+    case NVNNI_PF_Q3_K: QUERY_TILE_M(NVNNI_PF_Q3_K);
+    case NVNNI_PF_Q2_K: QUERY_TILE_M(NVNNI_PF_Q2_K);
+    case NVNNI_PF_IQ3_S: QUERY_TILE_M(NVNNI_PF_IQ3_S);
+    case NVNNI_PF_IQ3_XXS: QUERY_TILE_M(NVNNI_PF_IQ3_XXS);
+    case NVNNI_PF_IQ2_S: QUERY_TILE_M(NVNNI_PF_IQ2_S);
+    case NVNNI_PF_IQ2_XS: QUERY_TILE_M(NVNNI_PF_IQ2_XS);
+    case NVNNI_PF_IQ2_XXS: QUERY_TILE_M(NVNNI_PF_IQ2_XXS);
+    case NVNNI_PF_IQ1_S: QUERY_TILE_M(NVNNI_PF_IQ1_S);
+    case NVNNI_PF_IQ1_M: QUERY_TILE_M(NVNNI_PF_IQ1_M);
+    case NVNNI_PF_Q8_0: QUERY_TILE_M(NVNNI_PF_Q8_0);
+    default: break;
+    }
+
+    #undef QUERY_TILE_M
+    #undef QUERY_ADAPTIVE_TILE_N
+    #undef QUERY_TILE_N
+    return false;
+}
+
 bool rocmMoE_grouped_prefill_pipeline(
     // Input
     const float*  d_hidden,              // [seq_len, d_model] FP32 hidden states
@@ -2287,7 +3232,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int*    d_original_to_grouped,  // [seq_len * top_k] required route slot -> grouped slot
     const int*    d_original_expert_ids,  // [seq_len * top_k] required unless num_experts == 1
     const float*  d_group_weights,       // [total_slots] routing weights
-    int*          d_group_work_directory,// [max(total_slots,num_experts)], device scratch
+    int*          d_group_work_directory,// dedicated header + TM12/TM16 device spans
     // Scratch buffers (caller provides, sized for total_slots)
     int8_t*       d_scratch_A_int8,      // [total_slots, max(d_model, intermediate)]
     float*        d_scratch_scales,      // [total_slots, max_blocks_per_row]
@@ -2330,6 +3275,44 @@ bool rocmMoE_grouped_prefill_pipeline(
     const bool canonical_publication =
         d_canonical_route_contributions != nullptr;
     const bool use_expert_row_tiles = seq_len > 8;
+    const bool has_uniform_codebook_pair =
+        moe_prefill_single_codebook(gateup_codebook_mask) >= 0 &&
+        moe_prefill_single_codebook(down_codebook_mask) >= 0;
+    const MoEPrefillPairConfig pair_config =
+        use_expert_row_tiles && has_uniform_codebook_pair
+            ? moe_prefill_select_pair_config(
+                  gateup_codebook_mask,
+                  down_codebook_mask,
+                  seq_len,
+                  d_model,
+                  intermediate,
+                  num_experts,
+                  top_k)
+            : MoEPrefillPairConfig{};
+    if (use_expert_row_tiles && has_uniform_codebook_pair &&
+        (!moe_prefill_valid_tile_rows(pair_config.gateup.rows) ||
+         !moe_prefill_valid_tile_columns(pair_config.gateup.columns) ||
+         !moe_prefill_valid_tile_rows(pair_config.down.rows) ||
+         !moe_prefill_valid_tile_columns(pair_config.down.columns)))
+    {
+        return false;
+    }
+
+    MoEPrefillSerialM1KPartitionPolicy gateup_k_partition_policy{};
+    MoEPrefillSerialM1KPartitionPolicy down_k_partition_policy{};
+    if (!moe_prefill_resolve_serial_m1_k_partitions(
+            gateup_codebook_mask,
+            intermediate,
+            d_model,
+            gateup_k_partition_policy) ||
+        !moe_prefill_resolve_serial_m1_k_partitions(
+            down_codebook_mask,
+            d_model,
+            intermediate,
+            down_k_partition_policy))
+    {
+        return false;
+    }
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
@@ -2407,6 +3390,80 @@ bool rocmMoE_grouped_prefill_pipeline(
         return capacity;
     };
 
+    /** Capture-time addresses and conservative bounds for two device spans. */
+    struct AdaptiveDirectoryView
+    {
+        uint32_t* header = nullptr;
+        uint32_t* tile12 = nullptr;
+        uint32_t* tile16 = nullptr;
+        int tile12_capacity = 0;
+        int tile16_capacity = 0;
+
+        /** @return true when every captured pointer and bound is usable. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return header && tile12 && tile16 &&
+                   tile12_capacity > 0 && tile16_capacity > 0;
+        }
+    };
+
+    const auto build_adaptive_work_directory = [&] (
+        MoEPrefillProjectionRole role) -> AdaptiveDirectoryView
+    {
+        const int tile12_capacity = moe_prefill_directory_capacity(
+            total_slots, num_experts, /*minimum adaptive tile=*/12);
+        const int tile16_capacity =
+            role == MoEPrefillProjectionRole::GateUp
+                ? (total_slots < num_experts ? total_slots : num_experts)
+                : moe_prefill_directory_capacity(
+                      total_slots,
+                      num_experts,
+                      /*maximum adaptive tile=*/16);
+        auto* const header =
+            reinterpret_cast<uint32_t*>(d_group_work_directory);
+        AdaptiveDirectoryView view{
+            .header = header,
+            .tile12 = header + kMoEPrefillAdaptiveDirectoryHeaderWords,
+            .tile16 = header + kMoEPrefillAdaptiveDirectoryHeaderWords +
+                      tile12_capacity,
+            .tile12_capacity = tile12_capacity,
+            .tile16_capacity = tile16_capacity,
+        };
+        if (!view.valid())
+            return {};
+
+        dim3 directory_block(kMoEPrefillMaxExperts);
+        if (role == MoEPrefillProjectionRole::GateUp)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(
+                    moe_grouped_build_adaptive_prefill_tile_directory_kernel<
+                        MoEPrefillAdaptiveProjectionRole::GateUp>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                header,
+                num_experts,
+                tile12_capacity,
+                tile16_capacity);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(
+                    moe_grouped_build_adaptive_prefill_tile_directory_kernel<
+                        MoEPrefillAdaptiveProjectionRole::Down>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                header,
+                num_experts,
+                tile12_capacity,
+                tile16_capacity);
+        }
+        directory_tile_rows = 0;
+        current_directory_capacity = 0;
+        return view;
+    };
+
     const int blocks_per_d_model = d_model / 32;
 
     // =========================================================================
@@ -2432,7 +3489,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     //
     // Verifier buckets retain the low-latency route-owned geometry. Long prefill
     // consumes the compact device directory and amortizes weight decode across
-    // Trained expert-row tiles preserve every row's serial increasing-K order.
+    // rows. Trained expert-row tiles preserve every row's serial-M1 partition
+    // boundaries and ordered partial reduction.
     // =========================================================================
     {
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
@@ -2446,7 +3504,50 @@ bool rocmMoE_grouped_prefill_pipeline(
                     reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
                     d_original_to_grouped, d_original_expert_ids, gate_descs, up_descs, \
                     d_scratch_gate, d_scratch_up, total_slots, seq_len, top_k, \
-                    1, intermediate, d_model, num_experts); \
+                    1, intermediate, d_model, \
+                    gateup_k_partition_policy.forCodebook( \
+                        static_cast<uint8_t>(FMT)), num_experts); \
+            } while (0)
+        #define LAUNCH_GATEUP_ADAPTIVE(FMT, TN) \
+            do { \
+                const AdaptiveDirectoryView adaptive_directory = \
+                    build_adaptive_work_directory( \
+                        MoEPrefillProjectionRole::GateUp); \
+                if (!adaptive_directory.valid()) \
+                    return false; \
+                dim3 tile12_grid((intermediate + TN - 1) / TN, \
+                                 adaptive_directory.tile12_capacity, 2); \
+                dim3 tile16_grid((intermediate + TN - 1) / TN, \
+                                 adaptive_directory.tile16_capacity, 2); \
+                dim3 expert_block(TN); \
+                hipLaunchKernelGGL( \
+                    HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, 12, TN>), \
+                    tile12_grid, expert_block, 0, hip_stream, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
+                    d_group_token_indices, d_group_counts, d_group_offsets, \
+                    adaptive_directory.tile12, \
+                    gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
+                    adaptive_directory.tile12_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
+                    1, intermediate, d_model, \
+                    gateup_k_partition_policy.forCodebook( \
+                        static_cast<uint8_t>(FMT)), num_experts, \
+                    adaptive_directory.header + \
+                        kMoEPrefillAdaptiveTile12CountWord); \
+                hipLaunchKernelGGL( \
+                    HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
+                    tile16_grid, expert_block, 0, hip_stream, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
+                    d_group_token_indices, d_group_counts, d_group_offsets, \
+                    adaptive_directory.tile16, \
+                    gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
+                    adaptive_directory.tile16_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
+                    1, intermediate, d_model, \
+                    gateup_k_partition_policy.forCodebook( \
+                        static_cast<uint8_t>(FMT)), num_experts, \
+                    adaptive_directory.header + \
+                        kMoEPrefillAdaptiveTile16CountWord); \
             } while (0)
         #define LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, TN) \
             do { \
@@ -2464,7 +3565,9 @@ bool rocmMoE_grouped_prefill_pipeline(
                     reinterpret_cast<const uint32_t*>(d_group_work_directory), \
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
-                    1, intermediate, d_model, num_experts); \
+                    1, intermediate, d_model, \
+                    gateup_k_partition_policy.forCodebook( \
+                        static_cast<uint8_t>(FMT)), num_experts, nullptr); \
             } while (0)
 
         #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
@@ -2484,6 +3587,14 @@ bool rocmMoE_grouped_prefill_pipeline(
                 case 8:  DISPATCH_GATEUP_TILE_N(FMT, 8, CONFIG); break; \
                 case 12: DISPATCH_GATEUP_TILE_N(FMT, 12, CONFIG); break; \
                 case 16: DISPATCH_GATEUP_TILE_N(FMT, 16, CONFIG); break; \
+                case kMoEPrefillAdaptiveTileRows: \
+                    switch ((CONFIG).columns) { \
+                    case 64:  LAUNCH_GATEUP_ADAPTIVE(FMT, 64); break; \
+                    case 128: LAUNCH_GATEUP_ADAPTIVE(FMT, 128); break; \
+                    case 256: LAUNCH_GATEUP_ADAPTIVE(FMT, 256); break; \
+                    default: return false; \
+                    } \
+                    break; \
                 default: return false; \
                 } \
             } while (0)
@@ -2495,8 +3606,10 @@ bool rocmMoE_grouped_prefill_pipeline(
                     if (!use_expert_row_tiles) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
                     } else { \
-                        const MoEPrefillTileConfig candidate = moe_prefill_select_tile_config( \
-                            MoEPrefillProjectionRole::GateUp, FMT, seq_len, intermediate, d_model); \
+                        const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
+                            ? pair_config.gateup \
+                            : moe_prefill_select_tile_config( \
+                                  MoEPrefillProjectionRole::GateUp, FMT, seq_len, intermediate, d_model); \
                         if (!moe_prefill_valid_tile_rows(candidate.rows) || \
                             !moe_prefill_valid_tile_columns(candidate.columns)) \
                             return false; \
@@ -2531,6 +3644,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         #undef LAUNCH_GATEUP_IF_PRESENT
         #undef DISPATCH_GATEUP_CONFIG
         #undef DISPATCH_GATEUP_TILE_N
+        #undef LAUNCH_GATEUP_ADAPTIVE
         #undef LAUNCH_GATEUP_EXPERT_TILED
         #undef LAUNCH_GATEUP_ROUTE_OWNED
 
@@ -2577,7 +3691,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                             d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
                             d_original_to_grouped, d_original_expert_ids, d_group_weights, \
                             d_canonical_route_contributions, total_slots, d_model, \
-                            intermediate, num_experts); \
+                            intermediate, num_experts, down_k_partition_policy); \
                     } else { \
                         dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len); \
                         hipLaunchKernelGGL( \
@@ -2585,7 +3699,8 @@ bool rocmMoE_grouped_prefill_pipeline(
                             grid, block, 0, hip_stream, \
                             d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
                             d_original_to_grouped, d_original_expert_ids, d_group_weights, \
-                            d_output, seq_len, top_k, d_model, intermediate, num_experts); \
+                            d_output, seq_len, top_k, d_model, intermediate, num_experts, \
+                            down_k_partition_policy); \
                     } \
                 } while (0)
 
@@ -2643,8 +3758,45 @@ bool rocmMoE_grouped_prefill_pipeline(
                         grid, expert_block, 0, hip_stream, \
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
                         d_group_counts, d_group_offsets, \
-                        reinterpret_cast<const uint32_t*>(d_group_work_directory), \
-                        d_scratch_gate, candidate_directory_capacity, d_model, intermediate, num_experts); \
+                            reinterpret_cast<const uint32_t*>(d_group_work_directory), \
+                            d_scratch_gate, candidate_directory_capacity, d_model, intermediate, \
+                            down_k_partition_policy.forCodebook( \
+                            static_cast<uint8_t>(FMT)), num_experts, nullptr); \
+                } while (0)
+            #define LAUNCH_DOWN_ADAPTIVE(FMT, TN) \
+                do { \
+                    const AdaptiveDirectoryView adaptive_directory = \
+                        build_adaptive_work_directory( \
+                            MoEPrefillProjectionRole::Down); \
+                    if (!adaptive_directory.valid()) \
+                        return false; \
+                    dim3 tile12_grid((d_model + TN - 1) / TN, \
+                                     adaptive_directory.tile12_capacity); \
+                    dim3 tile16_grid((d_model + TN - 1) / TN, \
+                                     adaptive_directory.tile16_capacity); \
+                    dim3 expert_block(TN); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, 12, TN>), \
+                        tile12_grid, expert_block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, \
+                        adaptive_directory.tile12, \
+                        d_scratch_gate, adaptive_directory.tile12_capacity, d_model, intermediate, \
+                        down_k_partition_policy.forCodebook( \
+                            static_cast<uint8_t>(FMT)), num_experts, \
+                        adaptive_directory.header + \
+                            kMoEPrefillAdaptiveTile12CountWord); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
+                        tile16_grid, expert_block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, \
+                        adaptive_directory.tile16, \
+                        d_scratch_gate, adaptive_directory.tile16_capacity, d_model, intermediate, \
+                        down_k_partition_policy.forCodebook( \
+                            static_cast<uint8_t>(FMT)), num_experts, \
+                        adaptive_directory.header + \
+                            kMoEPrefillAdaptiveTile16CountWord); \
                 } while (0)
 
             #define DISPATCH_DOWN_TILE_N(FMT, TM, CONFIG) \
@@ -2664,14 +3816,24 @@ bool rocmMoE_grouped_prefill_pipeline(
                     case 8:  DISPATCH_DOWN_TILE_N(FMT, 8, CONFIG); break; \
                     case 12: DISPATCH_DOWN_TILE_N(FMT, 12, CONFIG); break; \
                     case 16: DISPATCH_DOWN_TILE_N(FMT, 16, CONFIG); break; \
+                    case kMoEPrefillAdaptiveTileRows: \
+                        switch ((CONFIG).columns) { \
+                        case 64:  LAUNCH_DOWN_ADAPTIVE(FMT, 64); break; \
+                        case 128: LAUNCH_DOWN_ADAPTIVE(FMT, 128); break; \
+                        case 256: LAUNCH_DOWN_ADAPTIVE(FMT, 256); break; \
+                        default: return false; \
+                        } \
+                        break; \
                     default: return false; \
                     } \
                 } while (0)
             #define LAUNCH_DOWN_IF_PRESENT(FMT) \
                 do { \
                     if (down_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
-                        const MoEPrefillTileConfig candidate = moe_prefill_select_tile_config( \
-                            MoEPrefillProjectionRole::Down, FMT, seq_len, d_model, intermediate); \
+                        const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
+                            ? pair_config.down \
+                            : moe_prefill_select_tile_config( \
+                                  MoEPrefillProjectionRole::Down, FMT, seq_len, d_model, intermediate); \
                         if (!moe_prefill_valid_tile_rows(candidate.rows) || \
                             !moe_prefill_valid_tile_columns(candidate.columns)) \
                             return false; \
@@ -2699,6 +3861,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             #undef LAUNCH_DOWN_IF_PRESENT
             #undef DISPATCH_DOWN_CONFIG
             #undef DISPATCH_DOWN_TILE_N
+            #undef LAUNCH_DOWN_ADAPTIVE
             #undef LAUNCH_DOWN_EXPERT_TILED
 
             if (!launched_down)

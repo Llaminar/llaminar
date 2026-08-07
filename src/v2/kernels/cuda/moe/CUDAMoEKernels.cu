@@ -13,6 +13,7 @@
 #include <cuda/std/__cccl/assert.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -36,6 +37,38 @@ namespace
         llaminar2::DeviceMoELLEPLayerPlanScratch;
 
     constexpr int kThreads = 256;
+    constexpr unsigned int kCudaGridYDimensionLimit = 65535u;
+
+    /**
+     * @brief Build a row-major CUDA grid with total positive-row coverage.
+     *
+     * CUDA's Y and Z launch dimensions are each limited to 65,535 blocks on
+     * the supported devices. Production MoE work naturally reaches
+     * `M * top_k` rows, so a 16K-token top-8 prefill already exceeds one Y
+     * dimension. Kernels using this grid recover their logical row with
+     * `logical_row_from_grid_yz()`; X remains available for column tiling.
+     *
+     * @param column_blocks Positive number of independent X tiles per row.
+     * @param logical_rows Positive number of semantic rows to cover.
+     * @return A legal three-dimensional launch geometry with no row holes.
+     */
+    dim3 make_row_major_grid(unsigned int column_blocks, int logical_rows)
+    {
+        assert(column_blocks > 0 && logical_rows > 0);
+        const unsigned int rows = static_cast<unsigned int>(logical_rows);
+        const unsigned int rows_y =
+            std::min(rows, kCudaGridYDimensionLimit);
+        const unsigned int rows_z = (rows + rows_y - 1u) / rows_y;
+        assert(rows_z <= kCudaGridYDimensionLimit);
+        return dim3(column_blocks, rows_y, rows_z);
+    }
+
+    /** @return The semantic row encoded across the Y/Z grid dimensions. */
+    __device__ __forceinline__ int logical_row_from_grid_yz()
+    {
+        return static_cast<int>(
+            blockIdx.y + blockIdx.z * static_cast<unsigned int>(gridDim.y));
+    }
     /**
      * Number of scalar output columns owned by one canonical finalizer block.
      *
@@ -11797,7 +11830,7 @@ namespace
         // as float4. The original flat 1D layout paid an integer div+mod (idx/d_model,
         // idx%d_model) per element and used scalar copies; this version removes both.
         // d_model is a multiple of 32 (enforced) → safe to treat the row as float4.
-        const int token_slot = blockIdx.y;
+        const int token_slot = logical_row_from_grid_yz();
         if (token_slot >= num_tokens)
             return;
         const int n4 = d_model >> 2;
@@ -11865,7 +11898,7 @@ namespace
         // distinct output token (caller guarantees uniqueness — original used a plain
         // non-atomic +=, preserved here), so the read-modify-write per float4 is race
         // free. Removes the per-element div/mod and vectorizes the accumulate.
-        const int token_slot = blockIdx.y;
+        const int token_slot = logical_row_from_grid_yz();
         if (token_slot >= num_tokens)
             return;
         const int n4 = d_model >> 2;
@@ -14930,7 +14963,7 @@ namespace
         int grouped_indices_are_route_slots,
         int K)
     {
-        const int slot = blockIdx.y;
+        const int slot = logical_row_from_grid_yz();
         if (slot >= total_slots)
             return;
 
@@ -14948,13 +14981,6 @@ namespace
             grouped_indices_are_route_slots ? (source_index / top_k) : source_index;
         if (source_token < 0 || source_token >= max_tokens)
         {
-            if (block_idx == 0 && lane == 0)
-            {
-                printf("grouped_prefill_invalid_source_token slot=%d index=%d token=%d "
-                       "max_tokens=%d top_k=%d route_slot_mode=%d\\n",
-                       slot, source_index, source_token, max_tokens, top_k,
-                       grouped_indices_are_route_slots);
-            }
             FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                 "grouped prefill gather references an invalid source token");
             return;
@@ -15453,7 +15479,7 @@ namespace
         int K)
     {
         const int block_idx = blockIdx.x;
-        const int slot = blockIdx.y;
+        const int slot = logical_row_from_grid_yz();
         const int lane = threadIdx.x;
         const int col = block_idx * 32 + lane;
         if (slot >= total_slots || lane >= 32 || col >= K)
@@ -15590,7 +15616,7 @@ namespace
     {
         constexpr int kTileN = 64;
         const int col = blockIdx.x * kTileN + threadIdx.x;
-        const int slot = blockIdx.y;
+        const int slot = logical_row_from_grid_yz();
         if (slot >= total_slots || col >= d_model)
             return;
 
@@ -15626,7 +15652,7 @@ namespace
     {
         constexpr int kTileN = 64;
         const int col = blockIdx.x * kTileN + threadIdx.x;
-        const int token = blockIdx.y;
+        const int token = logical_row_from_grid_yz();
         if (token >= seq_len || col >= d_model)
             return;
 
@@ -16565,7 +16591,7 @@ namespace
     {
         constexpr int kTileN = 256;
         const int n = blockIdx.x * kTileN + threadIdx.x;
-        const int token = blockIdx.y;
+        const int token = logical_row_from_grid_yz();
         if (token >= seq_len || n >= d_model)
             return;
 
@@ -16603,7 +16629,7 @@ namespace
         int participant_count,
         const int *__restrict__ device_effective_seq_len)
     {
-        const int bank_row = blockIdx.y;
+        const int bank_row = logical_row_from_grid_yz();
         const int participant = bank_row / seq_len;
         const int token = bank_row - participant * seq_len;
         if (participant >= participant_count || token >= seq_len)
@@ -16682,7 +16708,7 @@ namespace
         const int *__restrict__ device_effective_seq_len)
     {
         const int output_tile = static_cast<int>(blockIdx.x);
-        const int token = static_cast<int>(blockIdx.y);
+        const int token = logical_row_from_grid_yz();
         const int first_column =
             output_tile * kCanonicalMoEOutputTileColumns;
         const int unbounded_last_column =
@@ -17008,6 +17034,100 @@ namespace
             moe_weight_route_rn(route_weights[route], expert_value);
     }
 
+    /** Static compiler and occupancy evidence for one exact CUDA kernel. */
+    struct GroupedPrefillKernelResources
+    {
+        int registers_per_thread = 0;
+        size_t local_memory_bytes_per_thread = 0;
+        size_t static_shared_memory_bytes = 0;
+        int max_threads_per_block = 0;
+        int max_active_blocks_per_sm = 0;
+    };
+
+    /**
+     * @brief Inspect one CUDA kernel at its exact production block width.
+     *
+     * This helper performs no allocation, launch, transfer, or synchronization.
+     * `cudaFuncGetAttributes` exposes compiler-owned local memory, which is the
+     * authoritative pre-timing spill gate; the occupancy query then reports the
+     * number of resident blocks at the candidate's physical thread geometry.
+     */
+    template <typename Kernel>
+    bool query_grouped_prefill_kernel_resources(
+        Kernel kernel,
+        int block_threads,
+        GroupedPrefillKernelResources *resources)
+    {
+        if (!resources || block_threads <= 0)
+            return false;
+
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+        if (block_threads > attributes.maxThreadsPerBlock)
+            return false;
+
+        int active_blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                kernel,
+                block_threads,
+                0) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        *resources = GroupedPrefillKernelResources{
+            .registers_per_thread = attributes.numRegs,
+            .local_memory_bytes_per_thread = attributes.localSizeBytes,
+            .static_shared_memory_bytes = attributes.sharedSizeBytes,
+            .max_threads_per_block = attributes.maxThreadsPerBlock,
+            .max_active_blocks_per_sm = active_blocks,
+        };
+        return active_blocks > 0;
+    }
+
+    /**
+     * @brief Resolve the codebook-specialized producer used by one role.
+     *
+     * Component zero is ordered gate/up split-K production, component one is
+     * non-collective direct down publication, and component two is canonical
+     * route-major down production for collective execution. Common reduction
+     * and gather kernels are queried separately because they are not codebook
+     * specializations and must not be accidentally attributed to a candidate.
+     */
+    template <uint8_t CodebookId>
+    bool query_grouped_prefill_codebook_component(
+        int component,
+        int block_threads,
+        GroupedPrefillKernelResources *resources)
+    {
+        switch (component)
+        {
+        case 0:
+            return query_grouped_prefill_kernel_resources(
+                grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CodebookId>,
+                block_threads,
+                resources);
+        case 1:
+            return query_grouped_prefill_kernel_resources(
+                grouped_prefill_down_canonical_kpart_fused_direct_kernel<CodebookId>,
+                block_threads,
+                resources);
+        case 2:
+            return query_grouped_prefill_kernel_resources(
+                grouped_prefill_down_canonical_kpart_scatter_kernel<CodebookId>,
+                block_threads,
+                resources);
+        default:
+            return false;
+        }
+    }
+
     int blocksFor(int count)
     {
         return (count + kThreads - 1) / kThreads;
@@ -17039,6 +17159,177 @@ namespace
 
 extern "C"
 {
+    /**
+     * @brief Inspect the production row-major Y/Z launch decomposition.
+     *
+     * This side-effect-free query gives focused regressions access to the exact
+     * geometry used by every large-M MoE launcher. It performs no CUDA runtime
+     * operation, allocation, transfer, launch, or synchronization.
+     *
+     * @param column_blocks Positive X-dimension column tile count.
+     * @param logical_rows Positive semantic row count.
+     * @param grid_x Receives the physical X dimension.
+     * @param grid_y Receives the bounded physical Y dimension.
+     * @param grid_z Receives the Y-overflow plane count.
+     * @return true when the requested positive geometry is representable.
+     */
+    bool cudaMoE_query_row_major_grid(
+        unsigned int column_blocks,
+        int logical_rows,
+        unsigned int *grid_x,
+        unsigned int *grid_y,
+        unsigned int *grid_z)
+    {
+        if (column_blocks == 0 || logical_rows <= 0 ||
+            !grid_x || !grid_y || !grid_z)
+        {
+            return false;
+        }
+
+        const dim3 grid = make_row_major_grid(column_blocks, logical_rows);
+        *grid_x = grid.x;
+        *grid_y = grid.y;
+        *grid_z = grid.z;
+        return grid.x == column_blocks &&
+               grid.y > 0 && grid.y <= kCudaGridYDimensionLimit &&
+               grid.z > 0 && grid.z <= kCudaGridYDimensionLimit;
+    }
+
+    /**
+     * @brief Query static resources for one production grouped-prefill kernel.
+     *
+     * The query is deliberately side-effect free: it performs no allocation,
+     * launch, copy, or synchronization. Candidate components are inspected at
+     * their exact physical block width so a trainer can reject compiler spills
+     * before graph capture and can attach honest occupancy evidence to the
+     * candidate it eventually times.
+     *
+     * Component identities are stable and intentionally explicit:
+     * - 0: codebook-specialized ordered gate/up split-K producer;
+     * - 1: codebook-specialized non-collective direct down producer;
+     * - 2: codebook-specialized canonical-route down split-K producer;
+     * - 3: common hidden gather and blockwise quantizer;
+     * - 4: common gate/up split-K reduction and SwiGLU quantizer;
+     * - 5: common canonical-route down split-K reduction.
+     *
+     * @param codebook_id NativeVNNI execution codebook for components 0..2.
+     * @param component Stable component identity described above.
+     * @param block_threads Exact production block width in CUDA threads.
+     * @param registers_per_thread Receives compiler-assigned registers.
+     * @param local_memory_bytes_per_thread Receives compiler local scratch;
+     *        any non-zero value disqualifies a tuning candidate.
+     * @param static_shared_memory_bytes Receives static shared memory bytes.
+     * @param max_threads_per_block Receives the compiled launch ceiling.
+     * @param max_active_blocks_per_sm Receives occupancy at `block_threads`.
+     * @return true only when the exact compiled kernel can be inspected.
+     */
+    bool cudaMoE_grouped_prefill_query_kernel_resources(
+        uint8_t codebook_id,
+        int component,
+        int block_threads,
+        int *registers_per_thread,
+        size_t *local_memory_bytes_per_thread,
+        size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm)
+    {
+        if (!registers_per_thread || !local_memory_bytes_per_thread ||
+            !static_shared_memory_bytes || !max_threads_per_block ||
+            !max_active_blocks_per_sm)
+        {
+            return false;
+        }
+
+        GroupedPrefillKernelResources resources{};
+        bool queried = false;
+        switch (component)
+        {
+        case 3:
+            queried = block_threads == kWarpsPerQuantBlock * 32 &&
+                      query_grouped_prefill_kernel_resources(
+                          grouped_prefill_gather_quantize_blockwise_kernel,
+                          block_threads,
+                          &resources);
+            break;
+        case 4:
+            queried = block_threads == 32 &&
+                      query_grouped_prefill_kernel_resources(
+                          grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel,
+                          block_threads,
+                          &resources);
+            break;
+        case 5:
+            queried = block_threads == 64 &&
+                      query_grouped_prefill_kernel_resources(
+                          grouped_prefill_down_canonical_kpart_reduce_kernel,
+                          block_threads,
+                          &resources);
+            break;
+        default:
+            break;
+        }
+
+        if (component >= 0 && component <= 2)
+        {
+            const bool valid_width =
+                ((component == 0 || component == 2) &&
+                 block_threads >= 64 && block_threads <= 256 &&
+                 (block_threads % 32) == 0) ||
+                (component == 1 && block_threads >= 256 &&
+                 block_threads <= 512 && (block_threads % 32) == 0);
+            if (!valid_width)
+                return false;
+
+#define QUERY_GROUPED_PREFILL_CODEBOOK(CB)                                      \
+    case CB:                                                                    \
+        queried = query_grouped_prefill_codebook_component<CB>(                 \
+            component, block_threads, &resources);                              \
+        break
+
+            switch (codebook_id)
+            {
+                QUERY_GROUPED_PREFILL_CODEBOOK(0);
+                QUERY_GROUPED_PREFILL_CODEBOOK(4);
+                QUERY_GROUPED_PREFILL_CODEBOOK(5);
+                QUERY_GROUPED_PREFILL_CODEBOOK(6);
+                QUERY_GROUPED_PREFILL_CODEBOOK(7);
+                QUERY_GROUPED_PREFILL_CODEBOOK(8);
+                QUERY_GROUPED_PREFILL_CODEBOOK(9);
+                QUERY_GROUPED_PREFILL_CODEBOOK(10);
+                QUERY_GROUPED_PREFILL_CODEBOOK(11);
+                QUERY_GROUPED_PREFILL_CODEBOOK(12);
+                QUERY_GROUPED_PREFILL_CODEBOOK(13);
+                QUERY_GROUPED_PREFILL_CODEBOOK(14);
+                QUERY_GROUPED_PREFILL_CODEBOOK(15);
+                QUERY_GROUPED_PREFILL_CODEBOOK(16);
+                QUERY_GROUPED_PREFILL_CODEBOOK(17);
+                QUERY_GROUPED_PREFILL_CODEBOOK(19);
+            case kMixedCodebookSentinel:
+                if (component == 1 || component == 2)
+                {
+                    queried = query_grouped_prefill_codebook_component<
+                        kMixedCodebookSentinel>(
+                        component, block_threads, &resources);
+                }
+                break;
+            default:
+                return false;
+            }
+
+#undef QUERY_GROUPED_PREFILL_CODEBOOK
+        }
+
+        if (!queried)
+            return false;
+        *registers_per_thread = resources.registers_per_thread;
+        *local_memory_bytes_per_thread =
+            resources.local_memory_bytes_per_thread;
+        *static_shared_memory_bytes = resources.static_shared_memory_bytes;
+        *max_threads_per_block = resources.max_threads_per_block;
+        *max_active_blocks_per_sm = resources.max_active_blocks_per_sm;
+        return true;
+    }
+
     bool cudaMoE_publish_current_batch_llep_evidence_to_generation_control(
         const void *runtime_layers,
         int layer_count,
@@ -18102,7 +18393,9 @@ extern "C"
         {
             // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
             const int n4 = d_model >> 2;
-            dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+            const dim3 grid = make_row_major_grid(
+                static_cast<unsigned int>((n4 + kThreads - 1) / kThreads),
+                num_tokens);
             gather_tokens_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
                 hidden, batch_buffer, token_indices, num_tokens, d_model);
         }
@@ -18138,7 +18431,9 @@ extern "C"
         {
             // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
             const int n4 = d_model >> 2;
-            dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+            const dim3 grid = make_row_major_grid(
+                static_cast<unsigned int>((n4 + kThreads - 1) / kThreads),
+                num_tokens);
             scatter_add_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
                 output, expert_output, token_indices, weights, num_tokens, d_model);
         }
@@ -19092,8 +19387,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
-                                         k_partitions == 16 || k_partitions == 32);
+        const bool valid_k_partitions =
+            k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
             !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
             !d_gate_partials || !d_up_partials ||
@@ -19187,8 +19483,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
-                                         k_partitions == 16 || k_partitions == 32);
+        const bool valid_k_partitions =
+            k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if (!d_hidden || !d_runtime_layer || !d_expert_ids ||
             !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
             !d_gate_partials || !d_up_partials ||
@@ -19279,8 +19576,8 @@ extern "C"
         void *stream)
     {
         const bool valid_k_partitions =
-            (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
-             k_partitions == 16);
+            k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
             !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials ||
             (!d_output && !d_canonical_route_contributions) ||
@@ -19394,8 +19691,8 @@ extern "C"
         void *stream)
     {
         const bool valid_k_partitions =
-            (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
-             k_partitions == 16);
+            k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::down_k_partitions;
         if (!d_gate_ptrs || !d_up_ptrs || !d_runtime_layer || !d_expert_ids || !d_weights ||
             !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials || !d_output ||
             num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
@@ -19465,6 +19762,61 @@ extern "C"
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart reduce");
     }
 
+    /**
+     * @brief Execute the complete device-resident CUDA routed-MoE prefill path.
+     *
+     * The caller supplies persistent graph-owned tensors and scratch. Gate/up
+     * and down arithmetic use the fixed partition counts in
+     * `CUDAMoEBatchInvariantPolicy`; only the gate/up producer block width is a
+     * capture-time dispatch choice. Changing that width redistributes output
+     * columns without changing the per-element reduction order, which is why an
+     * authenticated exact overlay may tune it while partition counts may not.
+     *
+     * @param d_hidden FP32 token rows resident on `device_idx`.
+     * @param d_prequantized_hidden Optional compatible Q8 activation rows.
+     * @param d_prequantized_hidden_scales Scales paired with prequantized rows.
+     * @param d_gate_desc_table Device descriptor table for expert gate weights.
+     * @param d_up_desc_table Device descriptor table for expert up weights.
+     * @param d_down_desc_table Device descriptor table for expert down weights.
+     * @param d_group_counts Per-expert route counts published by the planner.
+     * @param d_group_offsets Exclusive offsets into grouped route storage.
+     * @param d_group_token_indices Grouped token or route-slot indices.
+     * @param d_original_to_grouped Original-route to grouped-route mapping.
+     * @param d_original_expert_ids Expert id for every original route slot.
+     * @param d_active_expert_ids Compact active-expert ids for launch grids.
+     * @param d_group_weights Router weights in grouped route order.
+     * @param d_scratch_A_int8 Persistent gathered Q8 activation payload.
+     * @param d_scratch_scales Persistent gathered activation scales.
+     * @param d_scratch_gate Persistent direct-path gate output scratch.
+     * @param d_scratch_up Persistent direct-path up output scratch.
+     * @param d_gate_partials Ordered gate split-K partials.
+     * @param d_up_partials Ordered up split-K partials.
+     * @param d_scratch_swiglu_int8 Persistent fused SwiGLU Q8 payload.
+     * @param d_scratch_swiglu_scales Persistent fused SwiGLU scales.
+     * @param d_down_partials Ordered down split-K partials.
+     * @param d_scratch_down_out Persistent grouped down-output scratch.
+     * @param d_output Final token-major output, or null for canonical publish.
+     * @param d_canonical_route_contributions Optional route-major publication.
+     * @param num_experts Total logical routed experts.
+     * @param d_model Hidden width in scalar elements.
+     * @param intermediate Routed expert intermediate width.
+     * @param max_tokens_per_expert Planner-owned grouped-row capacity.
+     * @param total_slots Exact `M * top_k` route-slot count.
+     * @param top_k Number of selected experts per token.
+     * @param active_expert_slots Number of compact active expert groups.
+     * @param grouped_indices_are_route_slots Whether grouped indices name slots.
+     * @param gateup_codebook_id Uniform gate/up codebook or mixed sentinel.
+     * @param down_codebook_id Uniform down codebook or mixed sentinel.
+     * @param gateup_codebook_mask Every gate/up codebook present in the table.
+     * @param down_codebook_mask Every down codebook present in the table.
+     * @param gateup_k_partitions Fixed byte-equivalent gate/up partition count.
+     * @param gateup_ordered_tile_n Capture-time gate/up producer block width.
+     * @param down_k_partitions Fixed byte-equivalent down partition count.
+     * @param splitk_tile_rows Persistent partial-scratch row tile capacity.
+     * @param device_idx CUDA ordinal that owns every supplied pointer.
+     * @param stream Exact non-null producer stream embedded by graph capture.
+     * @return true after all launches have been enqueued without launch errors.
+     */
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
         const int8_t *d_prequantized_hidden,
@@ -19504,6 +19856,7 @@ extern "C"
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
+        int gateup_ordered_tile_n,
         int down_k_partitions,
         int splitk_tile_rows,
         int device_idx,
@@ -19515,7 +19868,7 @@ extern "C"
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out ||
             (!d_output && !d_canonical_route_contributions) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-            max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            max_tokens_per_expert <= 0 || total_slots <= 0 || !stream ||
             top_k <= 0 || top_k > kMaxTopK ||
             active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0)
@@ -19525,17 +19878,19 @@ extern "C"
         }
         const bool use_active_expert_grid = active_expert_slots > 0;
         const bool valid_gateup_k_partitions =
-            (gateup_k_partitions == 2 || gateup_k_partitions == 4 ||
-             gateup_k_partitions == 8 || gateup_k_partitions == 16 ||
-             gateup_k_partitions == 32);
+            gateup_k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         const bool gateup_kpart_requested = gateup_k_partitions > 0;
+        const bool valid_gateup_ordered_tile_n =
+            gateup_ordered_tile_n >= 64 && gateup_ordered_tile_n <= 256 &&
+            (gateup_ordered_tile_n % 32) == 0;
         const bool use_gateup_kpart =
             use_active_expert_grid && gateup_kpart_requested &&
             valid_gateup_k_partitions && d_gate_partials && d_up_partials &&
             d_original_to_grouped && d_original_expert_ids;
         const bool valid_down_k_partitions =
-            (down_k_partitions == 2 || down_k_partitions == 4 ||
-             down_k_partitions == 8 || down_k_partitions == 16);
+            down_k_partitions ==
+            llaminar2::CUDAMoEBatchInvariantPolicy::down_k_partitions;
         const bool down_kpart_requested = down_k_partitions > 0;
         const bool canonical_publication =
             d_canonical_route_contributions != nullptr;
@@ -19545,7 +19900,8 @@ extern "C"
             d_original_expert_ids &&
             (!canonical_publication || d_down_partials) &&
             valid_down_k_partitions;
-        if (gateup_kpart_requested && !use_gateup_kpart)
+        if (gateup_kpart_requested &&
+            (!use_gateup_kpart || !valid_gateup_ordered_tile_n))
             return false;
         if (down_k_partitions > 0 && !valid_down_k_partitions)
             return false;
@@ -19560,14 +19916,19 @@ extern "C"
             return false;
         const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
         const int seq_len = total_slots / top_k;
-        cudaSetDevice(device_idx);
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         {
             // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
             // block so each block covers kWarpsPerQuantBlock*32 columns. grid.x rounds up.
             const int blocks_per_row = d_model / 32;
-            dim3 grid((blocks_per_row + kWarpsPerQuantBlock - 1) / kWarpsPerQuantBlock, total_slots);
+            const dim3 grid = make_row_major_grid(
+                static_cast<unsigned int>(
+                    (blocks_per_row + kWarpsPerQuantBlock - 1) /
+                    kWarpsPerQuantBlock),
+                total_slots);
             dim3 block(kWarpsPerQuantBlock * 32);
             grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_hidden, d_prequantized_hidden, d_prequantized_hidden_scales,
@@ -19580,7 +19941,7 @@ extern "C"
 
         if (use_gateup_kpart)
         {
-            const int kTileN = llaminar2::debugEnv().gemm.cuda_moe_ordered_kpart_tile_n;
+            const int kTileN = gateup_ordered_tile_n;
             constexpr int kReduceTileN = 32;
             dim3 block(kTileN);
             dim3 reduce_block(kReduceTileN);
@@ -19750,7 +20111,9 @@ extern "C"
         // gate/up kernel already produced d_scratch_swiglu_int8 / d_scratch_swiglu_scales.
         if (!use_gateup_kpart && !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
         {
-            dim3 grid(intermediate / 32, total_slots);
+            const dim3 grid = make_row_major_grid(
+                static_cast<unsigned int>(intermediate / 32),
+                total_slots);
             dim3 block(32);
             grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_scratch_gate, d_scratch_up,
@@ -19763,10 +20126,10 @@ extern "C"
         if (use_ordered_down_kpart)
         {
             const int kScatterTileN =
-                llaminar2::debugEnv().gemm.cuda_moe_ordered_kpart_tile_n;
+                llaminar2::debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n;
             constexpr int kReduceTileN = 64;
             const int kDirectWarpsPerBlock =
-                llaminar2::debugEnv().gemm.cuda_moe_down_direct_warps;
+                llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k);
             const int N = d_model;
             const int K = intermediate;
             dim3 scatter_block(kScatterTileN);
@@ -19965,7 +20328,10 @@ extern "C"
             dim3 block(kTileN);
             if (d_original_to_grouped)
             {
-                dim3 grid((d_model + kTileN - 1) / kTileN, seq_len);
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(
+                        (d_model + kTileN - 1) / kTileN),
+                    seq_len);
                 grouped_prefill_scatter_weighted_ordered_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_output, d_scratch_down_out,
                     d_original_to_grouped, d_group_weights,
@@ -19973,7 +20339,10 @@ extern "C"
             }
             else
             {
-                dim3 grid((d_model + kTileN - 1) / kTileN, total_slots);
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(
+                        (d_model + kTileN - 1) / kTileN),
+                    total_slots);
                 grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_output, d_scratch_down_out,
                     d_group_token_indices, d_group_weights,
@@ -20004,7 +20373,9 @@ extern "C"
 
         cudaSetDevice(device_idx);
         constexpr int kThreads = 256;
-        dim3 grid((d_model + kThreads - 1) / kThreads, seq_len);
+        const dim3 grid = make_row_major_grid(
+            static_cast<unsigned int>((d_model + kThreads - 1) / kThreads),
+            seq_len);
         reduce_canonical_route_contributions_kernel<<<
             grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             d_route_contributions, d_output, seq_len, top_k, d_model);
@@ -20034,9 +20405,11 @@ extern "C"
         cudaSetDevice(device_idx);
         constexpr int kThreadsPerBlock = 256;
         const int vector_columns = (d_model + 3) / 4;
-        dim3 grid(
-            std::max(1, (vector_columns + kThreadsPerBlock - 1) /
-                            kThreadsPerBlock),
+        const dim3 grid = make_row_major_grid(
+            static_cast<unsigned int>(std::max(
+                1,
+                (vector_columns + kThreadsPerBlock - 1) /
+                    kThreadsPerBlock)),
             seq_len * participant_count);
         publish_shared_expert_rank_bank_kernel<<<
             grid,
@@ -20078,9 +20451,10 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
-        const dim3 grid(
-            (d_model + kCanonicalMoEOutputTileColumns - 1) /
-                kCanonicalMoEOutputTileColumns,
+        const dim3 grid = make_row_major_grid(
+            static_cast<unsigned int>(
+                (d_model + kCanonicalMoEOutputTileColumns - 1) /
+                kCanonicalMoEOutputTileColumns),
             seq_len);
         finalize_canonical_moe_publication_kernel<<<
             grid,

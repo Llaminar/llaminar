@@ -14,8 +14,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
+import re
 
 from .qwen_release_geometry import QWEN_RELEASE_MODELS, qwen_release_geometries
+from .qwen_moe_gguf_patterns import (
+    QwenMoEPrefillMixture,
+    qwen_moe_prefill_mixtures,
+)
 from .shape_manifest import (
     NativeVNNIShape,
     NativeVNNIShapeManifest,
@@ -39,13 +45,52 @@ CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
     + CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
     + CPU_14B_PLUS_PREFILL_M_BUCKETS
 )))
-GPU_PREFILL_M_BUCKETS = (64, 256, 1024, 2048, 4096, 8192, 16384)
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_PREFILL_BUCKET_DEFINITION = (
+    _REPO_ROOT / "src/v2/utils/PrefillGraphBuckets.def"
+)
+_PREFILL_BUCKET_PATTERN = re.compile(
+    r"^LLAMINAR_PREFILL_GRAPH_BUCKET\(([1-9][0-9]*)\)$"
+)
+
+
+def _load_gpu_prefill_m_buckets() -> tuple[int, ...]:
+    """Read the exact physical graph buckets shared with the C++ runtime."""
+
+    buckets = tuple(
+        int(match.group(1))
+        for line in _PREFILL_BUCKET_DEFINITION.read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if (match := _PREFILL_BUCKET_PATTERN.fullmatch(line.strip()))
+    )
+    if not buckets:
+        raise ValueError(
+            f"{_PREFILL_BUCKET_DEFINITION}: no prefill graph buckets"
+        )
+    if tuple(sorted(set(buckets))) != buckets:
+        raise ValueError(
+            f"{_PREFILL_BUCKET_DEFINITION}: buckets must be unique and ordered"
+        )
+    return buckets
+
+
+# Long contexts replay these physical captures in chunks. Evidence for virtual
+# M=8192 or M=16384 would train launches that production can never select.
+GPU_PREFILL_M_BUCKETS = _load_gpu_prefill_m_buckets()
+
+# Versions 8 through 10 of the immutable CPU split used this older, virtual-M
+# GPU schedule. Keep its identity explicit for historical artifact readers;
+# changing the live graph buckets must never reinterpret a signed corpus.
+LEGACY_GPU_PREFILL_M_BUCKETS = (
+    64, 256, 1024, 2048, 4096, 8192, 16384
+)
 
 # Historical CPU certificates legitimately contain these older buckets.  They
 # remain readable as immutable evidence, but new CPU collection and generated
 # runtime bucketing use ``CPU_PREFILL_M_BUCKETS`` exclusively.
 HISTORICAL_CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
-    GPU_PREFILL_M_BUCKETS + (128, 512)
+    LEGACY_GPU_PREFILL_M_BUCKETS + (128, 512)
 )))
 SUPPORTED_CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
     CPU_PREFILL_M_BUCKETS + HISTORICAL_CPU_PREFILL_M_BUCKETS
@@ -147,6 +192,20 @@ class CPUPrefillMeasurement:
     @property
     def maximum_m(self) -> int:
         """Return the largest measured prefill row count."""
+
+        return self.m_values[-1]
+
+
+@dataclass(frozen=True)
+class MoEPrefillMixtureMeasurement:
+    """One concrete production MoE codebook mixture and measured M buckets."""
+
+    mixture: QwenMoEPrefillMixture
+    m_values: tuple[int, ...]
+
+    @property
+    def maximum_m(self) -> int:
+        """Return the largest measured grouped-prefill row count."""
 
         return self.m_values[-1]
 
@@ -263,6 +322,32 @@ def gpu_prefill_measurements() -> tuple[CPUPrefillMeasurement, ...]:
             raise ValueError(f"{name}: exceeds the supported runtime envelope")
         measurements.append(CPUPrefillMeasurement(shape, GPU_PREFILL_M_BUCKETS))
     return tuple(measurements)
+
+
+@lru_cache(maxsize=3)
+def moe_prefill_mixture_measurements(
+    backend: str,
+) -> tuple[MoEPrefillMixtureMeasurement, ...]:
+    """Return the all-format production MoE mixture matrix for one backend.
+
+    This matrix is additive to ordinary per-projection measurements. It times
+    the complete routed/shared role tuple so a locally optimal gate tile cannot
+    hide an expensive directory rebuild or interaction with the down/shared
+    path. CPU retains the reviewed large-model M=32 budget; CUDA and ROCm own
+    every canonical GPU prefill bucket.
+    """
+
+    normalized = backend.lower()
+    if normalized == "cpu":
+        m_values = CPU_14B_PLUS_PREFILL_M_BUCKETS
+    elif normalized in {"cuda", "rocm"}:
+        m_values = GPU_PREFILL_M_BUCKETS
+    else:
+        raise ValueError(f"unknown NativeVNNI backend {backend!r}")
+    return tuple(
+        MoEPrefillMixtureMeasurement(mixture, m_values)
+        for mixture in qwen_moe_prefill_mixtures()
+    )
 
 
 def main() -> int:

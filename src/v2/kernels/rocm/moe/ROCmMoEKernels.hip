@@ -13388,9 +13388,11 @@ __global__ void rocm_moe_swiglu_kernel(
 }
 
 // =========================================================================
-// Kernel 6b: Weighted Add — output += weight * input
+// Kernel 6b: Decode-equivalent weighted route accumulation
 //
-// Simple element-wise weighted accumulation for expert output aggregation.
+// The independently rounded multiply and add are shared with grouped route
+// publication. This prevents compiler contraction from making serial M=1 and
+// grouped verifier rows observe different FP32 expression trees.
 // =========================================================================
 
 __global__ void rocm_moe_weighted_add_kernel(
@@ -13402,7 +13404,10 @@ __global__ void rocm_moe_weighted_add_kernel(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    output[idx] += weight * input[idx];
+    const float weighted_route = rocm_native_vnni_weight_route_rn(
+        weight, input[idx]);
+    output[idx] = rocm_native_vnni_accumulate_rn(
+        output[idx], weighted_route);
 }
 
 // =========================================================================

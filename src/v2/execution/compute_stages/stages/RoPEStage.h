@@ -1,6 +1,11 @@
 /**
  * @file RoPEStage.h
- * @brief Rotary position encoding stage
+ * @brief Typed query/key rotary-position execution stage.
+ *
+ * Normal attention rotates Q and, unless RoPE-on-read is active, K. Shifted
+ * MTP cache publication has no query at all and may need to rotate only K.
+ * This interface represents those operands explicitly so graph builders never
+ * manufacture a dummy query or mutate a K tensor through a query-shaped API.
  */
 
 #pragma once
@@ -16,6 +21,15 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Semantic operand set consumed by one RoPE stage.
+     */
+    enum class RoPEOperandSet
+    {
+        QueryAndOptionalKey, ///< Q is required; K may be rotated alongside it.
+        KeyOnly,             ///< K is the sole operand for cache publication.
+    };
+
     // Forward declarations
     class ITensorRoPE;
     /**
@@ -31,6 +45,9 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+
+            /** Exact semantic operands represented by this stage. */
+            RoPEOperandSet operand_set = RoPEOperandSet::QueryAndOptionalKey;
 
             // Type-safe tensor pointers (required)
             ITensor *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
@@ -231,6 +248,9 @@ namespace llaminar2
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
+        bool isKeyOnly() const noexcept;
+        ITensor *primaryOperand() const noexcept;
+        int primaryHeadCount() const noexcept;
         ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
 
         Params params_;

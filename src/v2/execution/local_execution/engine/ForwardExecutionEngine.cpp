@@ -14,6 +14,7 @@
 
 #include "ForwardExecutionEngine.h"
 #include "PrefillBucketUtils.h"
+#include "../../compute_stages/ComputeStageFactory.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -257,7 +258,7 @@ namespace llaminar2
                 chunk_input.token_ids = plan.chunk.token_ids.data();
                 chunk_input.token_ids_device = nullptr;
                 break;
-            case PrefillChunkTokenAuthority::DeviceAdmissionBank:
+            case PrefillChunkTokenAuthority::DeviceResidentRows:
                 /*
                  * Request admission has already initialized every physical row
                  * through the selected bucket. Keeping the host pointer null is
@@ -279,8 +280,17 @@ namespace llaminar2
             }
             else
             {
-                chunk_input.position_ids = plan.chunk.position_ids.data();
-                chunk_input.position_ids_device = nullptr;
+                if (base_input.position_ids_device)
+                {
+                    chunk_input.position_ids = nullptr;
+                    chunk_input.position_ids_device =
+                        base_input.position_ids_device;
+                }
+                else
+                {
+                    chunk_input.position_ids = plan.chunk.position_ids.data();
+                    chunk_input.position_ids_device = nullptr;
+                }
             }
             chunk_input.seq_len = plan.chunk.bucket_seq_len;
             chunk_input.real_seq_len = plan.chunk.real_count;
@@ -611,14 +621,17 @@ namespace llaminar2
         const int token_offset = effectiveTokenOffset(input);
 
         plan.padding_required = !plan.selection.exact;
-        plan.position_policy = input.device.is_gpu()
-                                   ? ForwardPositionPolicy::ContiguousOffset
-                                   : ForwardPositionPolicy::ExplicitRows;
+        plan.position_policy =
+            input.position_ids_device
+                ? ForwardPositionPolicy::ExplicitRows
+                : input.device.is_gpu()
+                      ? ForwardPositionPolicy::ContiguousOffset
+                      : ForwardPositionPolicy::ExplicitRows;
         plan.chunk.token_offset = token_offset;
         plan.chunk.real_count = real_seq_len;
         plan.chunk.bucket_seq_len = plan.selection.bucket_seq_len;
         plan.chunk.token_authority = input.token_ids_device
-                                         ? PrefillChunkTokenAuthority::DeviceAdmissionBank
+                                         ? PrefillChunkTokenAuthority::DeviceResidentRows
                                          : PrefillChunkTokenAuthority::HostPaddedRows;
         if (plan.chunk.token_authority ==
             PrefillChunkTokenAuthority::HostPaddedRows)
@@ -629,7 +642,8 @@ namespace llaminar2
                 plan.selection.bucket_seq_len,
                 pad_token_id);
         }
-        if (plan.position_policy == ForwardPositionPolicy::ExplicitRows)
+        if (plan.position_policy == ForwardPositionPolicy::ExplicitRows &&
+            !input.position_ids_device)
         {
             plan.chunk.position_ids = buildPrefillChunkPositionIds(
                 real_seq_len,
@@ -642,6 +656,7 @@ namespace llaminar2
                  PrefillChunkTokenAuthority::HostPaddedRows &&
              plan.chunk.token_ids.empty()) ||
             (plan.position_policy == ForwardPositionPolicy::ExplicitRows &&
+             !input.position_ids_device &&
              plan.chunk.position_ids.empty()))
         {
             plan.error = "failed to prepare bucketed prefill chunk buffers";
@@ -669,9 +684,17 @@ namespace llaminar2
     {
         PrefillChunkRuntimeSchedule runtime_schedule;
 
-        if (!input.token_ids)
+        if ((!input.token_ids && !input.token_ids_device) ||
+            (input.token_ids && input.token_ids_device))
         {
-            runtime_schedule.error = "bucketed prefill schedule requires token_ids";
+            runtime_schedule.error =
+                "bucketed prefill schedule requires exactly one token authority";
+            return runtime_schedule;
+        }
+        if (input.token_ids_device && !input.device.is_gpu())
+        {
+            runtime_schedule.error =
+                "bucketed prefill device token input requires a GPU device";
             return runtime_schedule;
         }
         if (input.batch_size != 1)
@@ -684,6 +707,14 @@ namespace llaminar2
         if (!runtime_schedule.schedule)
         {
             runtime_schedule.error = runtime_schedule.schedule.error;
+            return runtime_schedule;
+        }
+        if (input.token_ids_device &&
+            runtime_schedule.schedule.chunks.size() > 1 &&
+            !input.device_prefill_chunk.has_value())
+        {
+            runtime_schedule.error =
+                "multi-chunk device prefill requires a captured device chunk materializer";
             return runtime_schedule;
         }
 
@@ -714,16 +745,26 @@ namespace llaminar2
 
             ForwardInput chunk_input = input;
             const int relative_offset = chunk.token_offset - input_start;
-            chunk_input.token_ids = input.token_ids + relative_offset;
+            chunk_input.token_ids =
+                input.token_ids ? input.token_ids + relative_offset : nullptr;
+            chunk_input.token_ids_device = input.token_ids_device;
             chunk_input.seq_len = chunk.real_count;
             chunk_input.real_seq_len = chunk.real_count;
             chunk_input.bucket_seq_len = 0;
             chunk_input.token_offset = chunk.token_offset;
             chunk_input.position_offset = chunk.token_offset;
 
+            /*
+             * The scheduler is the sole authority for physical graph width.
+             * Prepare against that one selected bucket instead of repeating
+             * selection across the policy's complete bucket set.  Repeating
+             * the policy decision here allowed a short final chunk to choose a
+             * smaller graph even when fixed_chunk_real_tokens deliberately
+             * established one immutable capture width for the transaction.
+             */
             auto runtime_plan = prepareSinglePrefillChunkRuntimePlan(
                 chunk_input,
-                policy.bucket_sizes,
+                std::vector<int>{chunk.bucket_seq_len},
                 pad_token_id,
                 allow_padded_execution);
             runtime_plan.chunk_index = chunk.chunk_index;
@@ -1395,6 +1436,10 @@ namespace llaminar2
                 .position_policy = effective_input.position_policy,
                 .uses_device_sequence_lengths =
                     input.sequence_lengths_device != nullptr,
+                .device_prefill_chunk_capture_identity =
+                    effective_input.device_prefill_chunk
+                        ? effective_input.device_prefill_chunk->capture_identity
+                        : uint64_t{0},
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
@@ -3052,8 +3097,8 @@ namespace llaminar2
             }
 
             if (cache.config().trace)
-                LOG_INFO("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
-                                                                                  << " replay_count=" << cache.replayCount(key));
+                LOG_TRACE("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
+                                                                                    << " replay_count=" << cache.replayCount(key));
             publishPrefillGraphObservation(
                 forward_cache,
                 input,
@@ -3496,6 +3541,68 @@ namespace llaminar2
 
         output = build_result.output();
         ComputeGraph graph = build_result.takeGraph();
+
+        if (effective_input.device_prefill_chunk)
+        {
+            const DevicePrefillChunkGraphBinding &binding =
+                *effective_input.device_prefill_chunk;
+            const bool binding_matches_forward_input =
+                binding.valid() && effective_input.device.is_gpu() &&
+                effective_input.batch_size == 1 &&
+                effective_input.seq_len == binding.bucket_seq_len &&
+                effective_input.token_ids == nullptr &&
+                effective_input.token_ids_device ==
+                    binding.chunk_token_ids_device &&
+                effective_input.position_ids == nullptr &&
+                effective_input.position_ids_device ==
+                    binding.chunk_position_ids_device &&
+                effective_input.position_policy ==
+                    ForwardPositionPolicy::ExplicitRows &&
+                effective_input.sequence_lengths_device ==
+                    binding.chunk_real_rows_device;
+            if (!binding_matches_forward_input)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Device prefill chunk binding does not exactly own the forward graph inputs");
+                return false;
+            }
+
+            const std::vector<std::string> model_roots = graph.getRootNodes();
+            if (model_roots.empty())
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Cannot prepend a device chunk materializer to an empty model graph");
+                return false;
+            }
+
+            constexpr const char *kChunkMaterializationNode =
+                "prefill_chunk_materialization";
+            graph.addNode(
+                kChunkMaterializationNode,
+                ComputeStageFactory::createPrefillChunkMaterialization({
+                    .device_id = effective_input.device,
+                    .backend = binding.backend,
+                    .request_token_ids_device =
+                        binding.request_token_ids_device,
+                    .request_position_ids_device =
+                        binding.request_position_ids_device,
+                    .request_total_rows_device =
+                        binding.request_total_rows_device,
+                    .cached_tokens_device = binding.cached_tokens_device,
+                    .chunk_token_ids_device = binding.chunk_token_ids_device,
+                    .chunk_position_ids_device =
+                        binding.chunk_position_ids_device,
+                    .chunk_real_rows_device = binding.chunk_real_rows_device,
+                    .chunk_row_stride_device =
+                        binding.chunk_row_stride_device,
+                    .request_row_capacity = binding.request_row_capacity,
+                    .bucket_seq_len = binding.bucket_seq_len,
+                    .pad_token_id = binding.pad_token_id,
+                    .capture_identity = binding.capture_identity,
+                    .stage_name = kChunkMaterializationNode,
+                }),
+                effective_input.device);
+            for (const std::string &root : model_roots)
+                graph.addDependency(root, kChunkMaterializationNode);
+        }
         auto collective_nodes = graph.collectiveNodeNames();
 
         if (signature.live_mtp_request_batch_condition &&

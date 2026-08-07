@@ -57,6 +57,24 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
+extern "C" bool cudaMoE_query_row_major_grid(
+    unsigned int column_blocks,
+    int logical_rows,
+    unsigned int *grid_x,
+    unsigned int *grid_y,
+    unsigned int *grid_z);
+
+extern "C" bool cudaMoE_grouped_prefill_query_production_config(
+    uint8_t gateup_codebook_id,
+    uint8_t down_codebook_id,
+    int m,
+    int hidden_size,
+    int expert_width,
+    int expert_count,
+    int top_k,
+    int *gateup_tile_n,
+    int *exact_overlay);
+
 extern "C" bool cudaMoE_count_per_expert(
     const int *routing_indices,
     int *expert_counts,
@@ -933,34 +951,6 @@ namespace
         std::string old_value_;
     };
 
-    class ScopedCudaMoEGemmConfig
-    {
-    public:
-        ScopedCudaMoEGemmConfig()
-            : old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
-              old_down_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kparts)
-        {
-        }
-
-        ~ScopedCudaMoEGemmConfig()
-        {
-            auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kparts = old_gateup_kparts_;
-            gemm.cuda_moe_down_kparts = old_down_kparts_;
-        }
-
-        void set(int gateup_kparts, int down_kparts)
-        {
-            auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kparts = gateup_kparts;
-            gemm.cuda_moe_down_kparts = down_kparts;
-        }
-
-    private:
-        int old_gateup_kparts_ = 16;
-        int old_down_kparts_ = 16;
-    };
-
     /**
      * @brief Temporarily select the production CUDA router-Q8 publication path.
      *
@@ -1121,7 +1111,9 @@ namespace
         const char *expected_gateup_route = nullptr,
         const char *expected_down_route = nullptr,
         const char *expected_down_accumulation = nullptr,
-        int expected_active_expert_slots = -1)
+        int expected_active_expert_slots = -1,
+        int expected_tile_n = 128,
+        const char *expected_policy_source = nullptr)
     {
         const auto records =
             llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
@@ -1144,11 +1136,8 @@ namespace
             std::to_string(splitk_tile_rows);
         const std::string expected_splitk_tile_count =
             std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
-        const std::string expected_tile_n =
-            std::to_string(
-                (active_slots > 0 && (seq_len <= 4 || expected_kpart_gateup))
-                    ? 64
-                    : 128);
+        const std::string expected_tile_n_text =
+            std::to_string(expected_tile_n);
         const auto match = std::find_if(
             records.begin(),
             records.end(),
@@ -1159,21 +1148,18 @@ namespace
                     const auto it = record.tags.find(key);
                     return it != record.tags.end() && it->second == value;
                 };
-                const auto tile_it = record.tags.find("tile_m");
-                const bool valid_runtime_tile =
-                    tile_it != record.tags.end() &&
-                    (tile_it->second == "2" || tile_it->second == "4" ||
-                     tile_it->second == "8" || tile_it->second == "16");
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals("swiglu_path", expected_path) &&
                        tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("activation_quant_rows", std::to_string(seq_len)) &&
                        tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       (expected_tile_m > 0
-                            ? tag_equals("tile_m", expected_tile)
-                            : valid_runtime_tile) &&
-                       tag_equals("tile_n", expected_tile_n) &&
+                       tag_equals("tile_m", expected_tile) &&
+                       tag_equals("tile_n", expected_tile_n_text) &&
+                       (!expected_policy_source ||
+                        tag_equals(
+                            "policy_source",
+                            std::string(expected_policy_source))) &&
                        (!expected_gateup_route ||
                         tag_equals("gateup_route", std::string(expected_gateup_route))) &&
                        (!expected_down_route ||
@@ -1187,9 +1173,7 @@ namespace
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
                                         << swiglu_path << " seq_len=" << seq_len
                                         << " tile_m="
-                                        << (expected_tile_m > 0
-                                                ? expected_tile
-                                                : std::string("runtime_policy"))
+                                        << expected_tile
                                         << "\n"
                                         << llaminar2::PerfStatsCollector::jsonString(
                                                {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
@@ -1935,6 +1919,175 @@ namespace
         llaminar2::CUDAMoEKernel *cuda_kernel_ = nullptr;
         llaminar2::IMoEKernel *cpu_kernel_ = nullptr;
     };
+}
+
+/**
+ * @brief Prove large-M MoE rows remain total across CUDA grid-Y overflow.
+ *
+ * CUDA limits grid Y to 65,535 blocks. Production prefill flattens `M * top_k`
+ * routed rows, so the first overflow happens at an ordinary 8192-token/top-8
+ * workload and the 16K/top-8 corpus point requires three Y/Z planes. This test
+ * queries the production geometry helper directly and proves every boundary is
+ * representable without a missing or duplicated logical row.
+ */
+TEST(Test__CUDAMoERowMajorGrid,
+     YZDecompositionIsTotalAtProductionPrefillBoundaries)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    struct ExpectedGeometry
+    {
+        int logical_rows;
+        unsigned int grid_y;
+        unsigned int grid_z;
+    };
+    constexpr std::array<ExpectedGeometry, 7> cases = {{
+        {1, 1u, 1u},
+        {65535, 65535u, 1u},
+        {65536, 65535u, 2u},
+        {131069, 65535u, 2u},
+        {131070, 65535u, 2u},
+        {131071, 65535u, 3u},
+        {131072, 65535u, 3u},
+    }};
+
+    for (const auto &expected : cases)
+    {
+        SCOPED_TRACE(expected.logical_rows);
+        unsigned int grid_x = 0;
+        unsigned int grid_y = 0;
+        unsigned int grid_z = 0;
+        ASSERT_TRUE(cudaMoE_query_row_major_grid(
+            /*column_blocks=*/7u,
+            expected.logical_rows,
+            &grid_x,
+            &grid_y,
+            &grid_z));
+        EXPECT_EQ(grid_x, 7u);
+        EXPECT_EQ(grid_y, expected.grid_y);
+        EXPECT_EQ(grid_z, expected.grid_z);
+
+        const uint64_t physical_row_capacity =
+            static_cast<uint64_t>(grid_y) * grid_z;
+        EXPECT_GE(
+            physical_row_capacity,
+            static_cast<uint64_t>(expected.logical_rows));
+        EXPECT_LT(
+            physical_row_capacity -
+                static_cast<uint64_t>(expected.logical_rows),
+            static_cast<uint64_t>(grid_y));
+
+        const uint64_t last_logical_row =
+            static_cast<uint64_t>(expected.logical_rows - 1);
+        const uint64_t last_plane = last_logical_row / grid_y;
+        const uint64_t last_row_in_plane = last_logical_row % grid_y;
+        EXPECT_LT(last_plane, static_cast<uint64_t>(grid_z));
+        EXPECT_EQ(
+            last_row_in_plane + last_plane * grid_y,
+            last_logical_row);
+    }
+
+    unsigned int ignored_x = 0;
+    unsigned int ignored_y = 0;
+    unsigned int ignored_z = 0;
+    EXPECT_FALSE(cudaMoE_query_row_major_grid(
+        0u, 1, &ignored_x, &ignored_y, &ignored_z));
+    EXPECT_FALSE(cudaMoE_query_row_major_grid(
+        1u, 0, &ignored_x, &ignored_y, &ignored_z));
+    EXPECT_FALSE(cudaMoE_query_row_major_grid(
+        1u, 1, nullptr, &ignored_y, &ignored_z));
+#endif
+}
+
+/**
+ * @brief Prove capture-time CUDA MoE prefill dispatch is total over positive M.
+ *
+ * Exact overlays deliberately cover only measured production keys. Every other
+ * positive row count must still select the stable generic launch geometry so a
+ * previously unseen prompt length can be captured without a policy hole. The
+ * largest case also proves the selector does not accidentally truncate its
+ * signed row-count domain while looking up the exact-overlay table.
+ */
+TEST(Test__CUDAMoEPrefillPolicy,
+     UnseenMIsTotalThroughTheGenericCapturePolicy)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    struct ScopedGenericPolicy
+    {
+        ScopedGenericPolicy()
+            : gemm(llaminar2::mutableDebugEnv().gemm),
+              old_tile_n(gemm.cuda_moe_gateup_ordered_kpart_tile_n),
+              old_override_active(
+                  gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active)
+        {
+            // Disable a process-level trainer override so this test observes
+            // the same exact-then-generic selector used by ordinary capture.
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n = 128;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active = false;
+        }
+
+        ~ScopedGenericPolicy()
+        {
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n = old_tile_n;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active =
+                old_override_active;
+        }
+
+        llaminar2::GemmConfig &gemm;
+        int old_tile_n;
+        bool old_override_active;
+    } policy_scope;
+
+    constexpr std::array<int, 13> unseen_m_values = {
+        1,
+        2,
+        4,
+        8,
+        16,
+        31,
+        63,
+        65,
+        128,
+        512,
+        32768,
+        262145,
+        std::numeric_limits<int>::max(),
+    };
+    for (const int m : unseen_m_values)
+    {
+        SCOPED_TRACE(m);
+        int gateup_tile_n = 0;
+        int exact_overlay = -1;
+        ASSERT_TRUE(cudaMoE_grouped_prefill_query_production_config(
+            /*gateup_codebook_id=*/13,
+            /*down_codebook_id=*/11,
+            m,
+            /*hidden_size=*/2048,
+            /*expert_width=*/512,
+            /*expert_count=*/256,
+            /*top_k=*/8,
+            &gateup_tile_n,
+            &exact_overlay));
+        EXPECT_EQ(gateup_tile_n, 128);
+        EXPECT_EQ(exact_overlay, 0);
+    }
+
+    int ignored_tile_n = 0;
+    int ignored_exact_overlay = 0;
+    EXPECT_FALSE(cudaMoE_grouped_prefill_query_production_config(
+        /*gateup_codebook_id=*/13,
+        /*down_codebook_id=*/11,
+        /*m=*/0,
+        /*hidden_size=*/2048,
+        /*expert_width=*/512,
+        /*expert_count=*/256,
+        /*top_k=*/8,
+        &ignored_tile_n,
+        &ignored_exact_overlay));
+#endif
 }
 
 /**
@@ -17061,11 +17214,9 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
     const auto device = llaminar2::DeviceId::cuda(0);
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedCudaMoEGemmConfig gemm_config;
     ScopedCudaMoERouterQ8Config router_q8_config(
         /*router_q8=*/true,
         /*reuse_router_q8_hidden=*/true);
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     const auto formats = cudaMoEGroupedNativeFormats();
@@ -18700,17 +18851,33 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     ASSERT_FALSE(grid_records.empty());
     EXPECT_EQ(grid_records.front().tags.at("active_expert_slots"), std::to_string(seq_len * top_k));
     EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
-    EXPECT_EQ(grid_records.front().tags.at("tile_m"), "2")
-        << "seq_len=4 verifier-style grouped prefill should use the tuned tiny-M tile by default";
-    EXPECT_EQ(grid_records.front().tags.at("tile_n"), "64")
-        << "compact verifier rows use the small-N expert tile while "
-           "max_tokens_per_expert <= 4";
-    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2);
+    EXPECT_EQ(grid_records.front().tags.at("tile_m"), "0")
+        << "ordered split-K owns the grouped arithmetic tree, so no full-K "
+           "row tile may be advertised";
+    EXPECT_EQ(grid_records.front().tags.at("tile_n"), "128")
+        << "an unseen verifier geometry must report the same total generic "
+           "width that the captured CUDA launch receives";
+    EXPECT_EQ(grid_records.front().tags.at("policy_source"), "generic");
+    EXPECT_EQ(grid_records.front().tags.at("gateup_codebook_mask"),
+              "0x00000001");
+    EXPECT_EQ(grid_records.front().tags.at("down_codebook_mask"),
+              "0x00000001");
+    expectPrefillSwiGLUPathRecord(
+        "fused",
+        seq_len,
+        top_k,
+        num_experts,
+        /*expected_tile_m=*/0,
+        /*expected_gateup_route=*/"kpart_prefill",
+        /*expected_down_route=*/"ordered_kpart_prefill",
+        /*expected_down_accumulation=*/"row_ordered_kpart");
     const auto path_records = llaminar2::PerfStatsCollector::snapshot(
         {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
     ASSERT_FALSE(path_records.empty());
     EXPECT_EQ(path_records.front().tags.at("down_publication"), "fused_direct");
-    EXPECT_EQ(path_records.front().tags.at("down_direct_warps"), "9");
+    EXPECT_EQ(path_records.front().tags.at("down_direct_warps"),
+              std::to_string(top_k))
+        << "direct publication assigns one non-dominated warp per route";
 
     llaminar2::PerfStatsCollector::reset();
 #endif
@@ -18921,9 +19088,6 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
 #else
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
-
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ASSERT_TRUE(llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
@@ -19089,8 +19253,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     using llaminar2::DeviceMoERuntimeTable;
@@ -19313,11 +19475,9 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
     const auto device1 = llaminar2::DeviceId::cuda(1);
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedCudaMoEGemmConfig gemm_config;
     ScopedCudaMoERouterQ8Config router_q8_config(
         /*router_q8=*/true,
         /*reuse_router_q8_hidden=*/true);
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     ScopedCudaDeviceStream stream1(1);
     ASSERT_EQ(stream1.status(), cudaSuccess);
@@ -19879,8 +20039,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     auto &gemm = llaminar2::mutableDebugEnv().gemm;
     const bool old_router_q8 = gemm.cuda_moe_router_q8;
     const bool old_reuse_router_q8_hidden = gemm.cuda_moe_reuse_router_q8_hidden;
@@ -20040,9 +20198,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
 #else
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
-
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     constexpr int num_experts = 2;
     constexpr int top_k = 1;
@@ -20246,8 +20401,6 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int top_k = 8;
@@ -20372,8 +20525,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         const std::string expected_active_slots = std::to_string(active_slots);
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
-        const std::string expected_tile_n =
-            std::to_string(active_slots > 0 ? 64 : 128);
+        const std::string expected_tile_n = "128";
         const int splitk_tile_rows = std::min(
             seq_len,
             llaminar2::MoEWorkspaceBuffers::kVerifierSplitKTileRows);
@@ -20391,17 +20543,10 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
                     const auto tag = record.tags.find(key);
                     return tag != record.tags.end() && tag->second == value;
                 };
-                const auto tile = record.tags.find("tile_m");
-                const bool valid_runtime_tile =
-                    tile != record.tags.end() &&
-                    (tile->second == "2" || tile->second == "4" ||
-                     tile->second == "8" || tile->second == "16");
                 return tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       (expected_tile_m > 0
-                            ? tag_equals("tile_m", expected_tile)
-                            : valid_runtime_tile) &&
+                       tag_equals("tile_m", expected_tile) &&
                        tag_equals("tile_n", expected_tile_n) &&
                        tag_equals("splitk_tile_rows", expected_splitk_tile_rows) &&
                        tag_equals("splitk_tile_count", expected_splitk_tile_count);
@@ -20681,8 +20826,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     auto &cuda_moe_config = llaminar2::mutableDebugEnv().gemm;
     cuda_moe_config.cuda_moe_router_q8 = true;
     cuda_moe_config.cuda_moe_reuse_router_q8_hidden = true;
@@ -21066,8 +21209,6 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int num_experts = 1;
@@ -21276,8 +21417,6 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     constexpr int num_experts = 1;
     constexpr int top_k = 1;
@@ -21464,7 +21603,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMatchRowDecode)
+TEST_F(Test__CUDAMoEKernel,
+       RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ3SDown_RuntimeMBoundariesMatchRowDecode)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -21473,12 +21613,11 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
         GTEST_SKIP() << "No CUDA device available";
 
     /*
-     * This is the routed-only companion to the combined shared-expert IQ3_S
-     * regression above.  Qwen3.6 MoE production MTP verifier rows often have no
-     * shared expert path, so the grouped routed expert pipeline itself must be
-     * decode-equivalent at every runtime-M tile and capacity boundary before
-     * the graph can publish verifier rows
-     * from it.
+     * This mixed IQ2_S gate/up and IQ3_S down layout is an authenticated Qwen
+     * production pair in the generated overlay corpus. Qwen3.6 MoE production
+     * MTP verifier rows often have no shared-expert path, so this test drives the
+     * routed pipeline itself through serial-row equivalence, captured bucket
+     * execution, and the exact capture-time launch-policy key at M=64.
      */
     constexpr int d_model = 2048;
     constexpr int intermediate = 512;
@@ -21487,30 +21626,41 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
     constexpr int routed_variants = 16;
     const auto device = llaminar2::DeviceId::cuda(0);
 
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
+    llaminar2::PerfStatsCollector::reset();
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
     std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
     owned_weights.reserve(static_cast<size_t>(routed_variants * 3));
     prepared_weights.reserve(static_cast<size_t>(routed_variants * 3));
 
-    auto add_prepared_iq3 = [&](int rows,
-                                int cols,
-                                int seed,
-                                const char *role) -> llaminar2::ITensorGemm *
+    auto add_prepared = [&](int rows,
+                            int cols,
+                            int seed,
+                            const char *role,
+                            bool gateup) -> llaminar2::ITensorGemm *
     {
-        auto weight = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
-            {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-            static_cast<unsigned>(seed));
+        std::unique_ptr<llaminar2::TensorBase> weight;
+        if (gateup)
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        else
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
         auto *weight_ptr = weight.get();
         owned_weights.push_back(std::move(weight));
         prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
             weight_ptr,
             device,
-            std::string("test.cuda_moe.qwen36_iq3_routed_verifier.") + role +
+            std::string("test.cuda_moe.qwen36_iq2s_iq3s_routed_verifier.") + role +
                 "." + std::to_string(seed),
             llaminar2::ModelContextId{910000 + static_cast<uint64_t>(seed)}));
 
@@ -21518,7 +21668,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
         auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(kernel);
         if (!tensor_kernel)
             throw std::runtime_error(
-                "prepared CUDA IQ3_S routed GEMM must expose an explicit stream contract");
+                "prepared CUDA mixed-format routed GEMM must expose an explicit stream contract");
         tensor_kernel->setGPUStream(stream_);
         return kernel;
     };
@@ -21534,11 +21684,17 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
     for (int variant = 0; variant < routed_variants; ++variant)
     {
         routed[static_cast<size_t>(variant)].gate =
-            add_prepared_iq3(intermediate, d_model, 911000 + variant, "routed_gate");
+            add_prepared(
+                intermediate, d_model, 911000 + variant, "routed_gate_iq2s",
+                /*gateup=*/true);
         routed[static_cast<size_t>(variant)].up =
-            add_prepared_iq3(intermediate, d_model, 912000 + variant, "routed_up");
+            add_prepared(
+                intermediate, d_model, 912000 + variant, "routed_up_iq2s",
+                /*gateup=*/true);
         routed[static_cast<size_t>(variant)].down =
-            add_prepared_iq3(d_model, intermediate, 913000 + variant, "routed_down");
+            add_prepared(
+                d_model, intermediate, 913000 + variant, "routed_down_iq3s",
+                /*gateup=*/false);
     }
 
     auto variant_for_expert = [&](int expert_id) -> size_t
@@ -21626,18 +21782,20 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
         int logical_rows = 0;
     };
     std::vector<RoutedPrefillCase> cases;
-    cases.reserve(kGroupedVerifierBoundaryRows.size() + 2);
+    cases.reserve(kGroupedVerifierBoundaryRows.size() + 3);
     for (const int rows : kGroupedVerifierBoundaryRows)
         cases.push_back({.capacity_rows = rows, .logical_rows = rows});
 
     /*
      * Production prefill captures bucket-sized graphs while only a prefix of
      * those rows is live. The 33-row case crosses the large-grouping launch
-     * boundary cheaply; the 768-row case is the first real Qwen3.6 bucket and
-     * reproduces the production launch geometry that a fully populated
-     * verifier-sized sweep cannot exercise.
+     * boundary cheaply. M=64 is the first measured exact-overlay key for this
+     * geometry and codebook pair. The 768-row case is the first real Qwen3.6
+     * bucket and reproduces the production launch geometry that a fully
+     * populated verifier-sized sweep cannot exercise.
      */
     cases.push_back({.capacity_rows = 33, .logical_rows = 9});
+    cases.push_back({.capacity_rows = 64, .logical_rows = 64});
     cases.push_back({.capacity_rows = 768, .logical_rows = 9});
 
     for (const RoutedPrefillCase test_case : cases)
@@ -21739,13 +21897,43 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
             grouped_output->data(),
             grouped_output->data() + grouped_output->numel());
         expectBitwiseFP32RowsEqual(
-            "CUDA IQ3_S routed verifier grouped prefill capacity_M=" +
+            "CUDA Qwen3.6 IQ2_S/IQ3_S routed verifier grouped prefill capacity_M=" +
                 std::to_string(seq_len) +
                 " logical_M=" + std::to_string(test_case.logical_rows),
             grouped_values.data(),
             row_by_row_expected.data(),
             grouped_values.size(),
             static_cast<size_t>(d_model));
+
+        if (seq_len == 64)
+        {
+            int selected_tile_n = 0;
+            int exact_overlay = 0;
+            ASSERT_TRUE(cudaMoE_grouped_prefill_query_production_config(
+                /*gateup_codebook_id=*/13,
+                /*down_codebook_id=*/11,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k,
+                &selected_tile_n,
+                &exact_overlay));
+            ASSERT_EQ(exact_overlay, 1)
+                << "the authenticated M=64 production key must use its exact overlay";
+            expectPrefillSwiGLUPathRecord(
+                "fused",
+                seq_len,
+                top_k,
+                num_experts,
+                /*expected_tile_m=*/0,
+                /*expected_gateup_route=*/"kpart_prefill",
+                /*expected_down_route=*/"ordered_kpart_prefill",
+                /*expected_down_accumulation=*/"row_ordered_kpart",
+                /*expected_active_expert_slots=*/num_experts,
+                selected_tile_n,
+                /*expected_policy_source=*/"exact_overlay");
+        }
     }
 
     /*
@@ -21883,7 +22071,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMat
     ASSERT_TRUE(execute_runtime_prefill(kFullChunkRows, nullptr));
     ASSERT_TRUE(execute_runtime_prefill(kTailRows, &tail_after_full_chunk));
     expectBitwiseFP32RowsEqual(
-        "CUDA IQ3_S runtime grouped prefill M=36 after M=512 persistent-workspace reuse",
+        "CUDA Qwen3.6 IQ2_S/IQ3_S runtime grouped prefill M=36 after M=512 persistent-workspace reuse",
         tail_after_full_chunk.data(),
         tail_before_full_chunk.data(),
         tail_after_full_chunk.size(),
@@ -21918,8 +22106,6 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
-    ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(/*gateup_kparts=*/4, /*down_kparts=*/4);
 
     const auto formats = cudaMoEGroupedNativeFormats();
     auto expect_unmasked_grouping_record = [&](int seq_len)
@@ -22681,7 +22867,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
         llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_active_expert_grid_calls"});
     EXPECT_FALSE(active_grid_records.empty())
         << "large prompt prefill should use the graph-capturable compact active-expert grid";
-    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                   "kpart_prefill",
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
@@ -22849,7 +23035,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
                   stream_),
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                   "kpart_prefill",
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
@@ -23038,7 +23224,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
                        /*max_row_relative_l2=*/0.008,
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                  16,
+                                  0,
                                   "kpart_prefill",
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
@@ -23276,7 +23462,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
                        /*max_row_relative_l2=*/0.008,
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                  16,
+                                  0,
                                   "kpart_prefill",
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");
@@ -23513,7 +23699,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
                        /*max_row_relative_l2=*/0.008,
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                  16,
+                                  0,
                                   "kpart_prefill",
                                   "ordered_kpart_prefill",
                                   "row_ordered_kpart");

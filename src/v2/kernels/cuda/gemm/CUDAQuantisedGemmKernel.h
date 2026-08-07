@@ -608,7 +608,7 @@ namespace llaminar2
              * @brief Rebind NativeVNNI prefill scratch to the per-stream slot used by concurrent fused prefill.
              *
              * validateWorkspace() binds the serial view of the workspace. Concurrent
-             * prefill projections need disjoint split-K/stream-K slices before their
+             * prefill projections need disjoint canonical partial slices before their
              * side-stream launch.
              */
             void bindConcurrentNativePrefillScratch(int m, int n, int k, int stream_idx) const;

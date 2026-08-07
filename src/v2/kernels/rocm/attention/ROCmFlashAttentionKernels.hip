@@ -532,7 +532,11 @@ namespace
      * Uses vectorized FP16 VALU operations for Q@K^T computation.
      * No WMMA/Matrix Cores - pure ALU implementation optimized for Vega.
      */
-    template <KVTypeTag KV_TYPE, int THREADS_PER_ROW>
+    template <KVTypeTag KV_TYPE,
+              int THREADS_PER_ROW,
+              int STATIC_HEAD_DIM = 0,
+              int STATIC_TILE_Q = 0,
+              int STATIC_TILE_KV = 0>
     __global__ __launch_bounds__(256, 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
@@ -555,6 +559,13 @@ namespace
         int head_start,
         int gqa_n_rep)
     {
+        const int kernel_head_dim =
+            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : head_dim;
+        const int kernel_tile_q =
+            STATIC_TILE_Q > 0 ? STATIC_TILE_Q : tile_q;
+        const int kernel_tile_kv =
+            STATIC_TILE_KV > 0 ? STATIC_TILE_KV : tile_kv;
+
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         int position_offset_runtime = position_offset;
@@ -587,30 +598,30 @@ namespace
             : head_idx / effective_gqa_ratio;
 
         // Q row range for this block
-        const int q_block_start = q_tile_idx * tile_q;
+        const int q_block_start = q_tile_idx * kernel_tile_q;
         if (q_block_start >= seq_len)
             return;
-        const int q_tile_rows = min(tile_q, seq_len - q_block_start);
+        const int q_tile_rows = min(kernel_tile_q, seq_len - q_block_start);
 
         // Compute LDS layout
         FA2LDSLayout lds_layout;
-        lds_layout.compute(head_dim, tile_q, tile_kv);
+        lds_layout.compute(kernel_head_dim, kernel_tile_q, kernel_tile_kv);
 
         // LDS allocation
         extern __shared__ char smem[];
 
         __half *Q_tile = reinterpret_cast<__half *>(smem);
-        __half *KV_buffers = Q_tile + tile_q * lds_layout.q_stride;
-        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * tile_kv * lds_layout.kv_stride);
+        __half *KV_buffers = Q_tile + kernel_tile_q * lds_layout.q_stride;
+        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kernel_tile_kv * lds_layout.kv_stride);
 
         // Helper lambdas for double-buffered K/V access
         auto get_K_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + stage * 2 * tile_kv * lds_layout.kv_stride;
+            return KV_buffers + stage * 2 * kernel_tile_kv * lds_layout.kv_stride;
         };
         auto get_V_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + (stage * 2 + 1) * tile_kv * lds_layout.kv_stride;
+            return KV_buffers + (stage * 2 + 1) * kernel_tile_kv * lds_layout.kv_stride;
         };
 
         // =====================================================================
@@ -626,35 +637,40 @@ namespace
         const int row_lane = tid % THREADS_PER_ROW;
         const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // Both launch variants cap ownership at 32 output dimensions per
-        // thread.  Four lanes cooperate through head_dim 128; eight lanes
-        // cooperate at head_dim 256.  Keeping this bound compile-time visible
-        // prevents the accumulator array from growing with the context length.
-        float O_acc[32];
+        // Keep the maximum supported head dimension distributed evenly across
+        // the compile-time row width. Four lanes cooperate through head_dim
+        // 128, while sixteen lanes cooperate above 128. The wider large-head
+        // row cuts live output ownership from 32 to sixteen values per thread,
+        // avoiding private scratch and scalar-register spills on gfx906.
+        /*
+         * Keep the slot count compile-time visible so LLVM can promote output
+         * accumulators to VGPRs instead of a per-thread private segment.  The
+         * runtime head-dimension predicate preserves every supported geometry.
+         */
+        constexpr int OUTPUTS_PER_THREAD =
+            (256 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+        float O_acc[OUTPUTS_PER_THREAD];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
 
-        if (thread_has_row)
+        #pragma unroll
+        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
         {
-            int d_local = 0;
-            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
-            {
-                O_acc[d_local++] = 0.0f;
-            }
+            O_acc[d_local] = 0.0f;
         }
 
         // Batch/head pointers
-        const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
+        const float *Q_batch = Q + batch_idx * seq_len * n_heads * kernel_head_dim;
         const size_t request_element_offset =
             static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_stride) *
-            static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+            static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kernel_head_dim);
 
         // =====================================================================
         // Load Q tile into LDS (done once per block)
         // =====================================================================
-        if ((head_dim & 1) == 0)
+        if ((kernel_head_dim & 1) == 0)
         {
-            const int head_dim_vec2 = head_dim / 2;
+            const int head_dim_vec2 = kernel_head_dim / 2;
             for (int i = tid; i < q_tile_rows * head_dim_vec2; i += threads_per_block)
             {
                 int local_row = i / head_dim_vec2;
@@ -663,39 +679,39 @@ namespace
                 int global_row = q_block_start + local_row;
 
                 const float2 qv = *reinterpret_cast<const float2 *>(
-                    Q_batch + global_row * n_heads * head_dim + head_idx * head_dim + d);
+                    Q_batch + global_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim + d);
                 reinterpret_cast<__half2 *>(Q_tile + local_row * lds_layout.q_stride + d)[0] = __float22half2_rn(qv);
             }
         }
         else
         {
-            for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block)
+            for (int i = tid; i < q_tile_rows * kernel_head_dim; i += threads_per_block)
             {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
+                int local_row = i / kernel_head_dim;
+                int d = i % kernel_head_dim;
                 int global_row = q_block_start + local_row;
-                float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+                float val = Q_batch[global_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim + d];
                 Q_tile[local_row * lds_layout.q_stride + d] = float_to_half(val);
             }
         }
         __syncthreads();
 
-        const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
+        const int num_kv_tiles = (kv_len_runtime + kernel_tile_kv - 1) / kernel_tile_kv;
 
         // =====================================================================
         // Prologue: Load first KV tile
         // =====================================================================
         {
             const int kv_start = 0;
-            const int kv_end = min(tile_kv, kv_len_runtime);
+            const int kv_end = min(kernel_tile_kv, kv_len_runtime);
             const int actual_len = kv_end - kv_start;
 
             __half *K_dst = get_K_tile(0);
             __half *V_dst = get_V_tile(0);
 
-            if ((head_dim & 1) == 0)
+            if ((kernel_head_dim & 1) == 0)
             {
-                const int head_dim_vec2 = head_dim / 2;
+                const int head_dim_vec2 = kernel_head_dim / 2;
                 for (int i = tid; i < actual_len * head_dim_vec2; i += threads_per_block)
                 {
                     int local_row = i / head_dim_vec2;
@@ -705,7 +721,7 @@ namespace
                     const size_t element =
                         request_element_offset +
                         (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                            static_cast<size_t>(head_dim) +
+                            static_cast<size_t>(kernel_head_dim) +
                         static_cast<size_t>(d);
 
                     reinterpret_cast<__half2 *>(
@@ -718,15 +734,15 @@ namespace
             }
             else
             {
-                for (int i = tid; i < actual_len * head_dim; i += threads_per_block)
+                for (int i = tid; i < actual_len * kernel_head_dim; i += threads_per_block)
                 {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
+                    int local_row = i / kernel_head_dim;
+                    int d = i % kernel_head_dim;
                     int global_row = kv_start + local_row;
                     const size_t element =
                         request_element_offset +
                         (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                            static_cast<size_t>(head_dim) +
+                            static_cast<size_t>(kernel_head_dim) +
                         static_cast<size_t>(d);
 
                     K_dst[local_row * lds_layout.kv_stride + d] =
@@ -746,12 +762,12 @@ namespace
             const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
-            const int kv_start = kv_tile_iter * tile_kv;
-            const int kv_end = min(kv_start + tile_kv, kv_len_runtime);
+            const int kv_start = kv_tile_iter * kernel_tile_kv;
+            const int kv_end = min(kv_start + kernel_tile_kv, kv_len_runtime);
             const int actual_kv_len = kv_end - kv_start;
 
             // Early exit for causal (all positions masked)
-            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset_runtime)
+            if (causal && kv_start > (q_block_start + kernel_tile_q - 1) + position_offset_runtime)
             {
                 continue;
             }
@@ -764,17 +780,17 @@ namespace
             // =================================================================
             if (kv_tile_iter + 1 < num_kv_tiles)
             {
-                const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end = min(next_kv_start + tile_kv, kv_len_runtime);
+                const int next_kv_start = (kv_tile_iter + 1) * kernel_tile_kv;
+                const int next_kv_end = min(next_kv_start + kernel_tile_kv, kv_len_runtime);
                 const int next_len = next_kv_end - next_kv_start;
 
                 __half *K_next = get_K_tile(next_stage);
                 __half *V_next = get_V_tile(next_stage);
 
                 // Cooperative load by all threads
-                if ((head_dim & 1) == 0)
+                if ((kernel_head_dim & 1) == 0)
                 {
-                    const int head_dim_vec2 = head_dim / 2;
+                    const int head_dim_vec2 = kernel_head_dim / 2;
                     for (int i = tid; i < next_len * head_dim_vec2; i += threads_per_block)
                     {
                         int local_row = i / head_dim_vec2;
@@ -784,7 +800,7 @@ namespace
                         const size_t element =
                             request_element_offset +
                             (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                                static_cast<size_t>(head_dim) +
+                                static_cast<size_t>(kernel_head_dim) +
                             static_cast<size_t>(d);
 
                         reinterpret_cast<__half2 *>(
@@ -797,15 +813,15 @@ namespace
                 }
                 else
                 {
-                    for (int i = tid; i < next_len * head_dim; i += threads_per_block)
+                    for (int i = tid; i < next_len * kernel_head_dim; i += threads_per_block)
                     {
-                        int local_row = i / head_dim;
-                        int d = i % head_dim;
+                        int local_row = i / kernel_head_dim;
+                        int d = i % kernel_head_dim;
                         int global_row = next_kv_start + local_row;
                         const size_t element =
                             request_element_offset +
                             (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                                static_cast<size_t>(head_dim) +
+                                static_cast<size_t>(kernel_head_dim) +
                             static_cast<size_t>(d);
 
                         K_next[local_row * lds_layout.kv_stride + d] =
@@ -840,9 +856,9 @@ namespace
                 // Each instruction: d.f32 = a.f16x2 · b.f16x2 + c.f32
                 // Replaces 4× fp16→fp32 convert + 2× FP32 FMA per half2 pair
                 // with a single hardware dot-product instruction.
-                if ((head_dim & 1) == 0)
+                if ((kernel_head_dim & 1) == 0)
                 {
-                    const int head_dim_vec2 = head_dim / 2;
+                    const int head_dim_vec2 = kernel_head_dim / 2;
                     const __half2 *Q_ptr2 = reinterpret_cast<const __half2 *>(Q_ptr);
                     const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(K_ptr);
 
@@ -868,7 +884,7 @@ namespace
                 }
                 else
                 {
-                    for (int d = 0; d < head_dim; d++)
+                    for (int d = 0; d < kernel_head_dim; d++)
                     {
                         score += half_to_float(Q_ptr[d]) * half_to_float(K_ptr[d]);
                     }
@@ -963,10 +979,12 @@ namespace
                 float scale_old = fast_expf(m_i - m_i_new);
 
                 // Rescale previous accumulators
-                int d_local = 0;
-                for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+                #pragma unroll
+                for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
                 {
-                    O_acc[d_local++] *= scale_old;
+                    const int d = row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                        O_acc[d_local] *= scale_old;
                 }
                 l_i *= scale_old;
 
@@ -981,10 +999,12 @@ namespace
                         l_ij += p;
 
                         const __half *V_row = V_tile + j * lds_layout.kv_stride;
-                        int d_local = 0;
-                        for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+                        #pragma unroll
+                        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
                         {
-                            O_acc[d_local++] += p * half_to_float(V_row[d]);
+                            const int d = row_lane + d_local * THREADS_PER_ROW;
+                            if (d < kernel_head_dim)
+                                O_acc[d_local] += p * half_to_float(V_row[d]);
                         }
                     }
                 }
@@ -999,18 +1019,20 @@ namespace
         // =====================================================================
         // Write final output
         // =====================================================================
-        float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
+        float *O_batch = O + batch_idx * seq_len * n_heads * kernel_head_dim;
 
         if (thread_has_row)
         {
             int global_q_row = q_block_start + local_q_row;
             float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
 
-            float *O_row = O_batch + global_q_row * n_heads * head_dim + head_idx * head_dim;
-            int d_local = 0;
-            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+            float *O_row = O_batch + global_q_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim;
+            #pragma unroll
+            for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
             {
-                O_row[d] = O_acc[d_local++] * inv_l;
+                const int d = row_lane + d_local * THREADS_PER_ROW;
+                if (d < kernel_head_dim)
+                    O_row[d] = O_acc[d_local] * inv_l;
             }
         }
     }
@@ -1934,7 +1956,7 @@ static int launch_device_resident_prefill(
     };
 
     constexpr int THREADS_PER_BLOCK = 256;
-    const int threads_per_row = head_dim <= 128 ? 4 : 8;
+    const int threads_per_row = head_dim <= 128 ? 4 : 16;
     const int max_tile_q = THREADS_PER_BLOCK / threads_per_row;
     int tile_q = -1;
     int tile_kv = -1;
@@ -1988,10 +2010,23 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep);
     }
+    else if (head_dim == 256 && tile_q == 16 && tile_kv == 16)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<KV_TYPE, 16, 256, 16, 16>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep);
+    }
     else
     {
         hipLaunchKernelGGL(
-            (flash_attention_2_mi50_kernel<KV_TYPE, 8>),
+            (flash_attention_2_mi50_kernel<KV_TYPE, 16>),
             grid, block, lds_layout.total_size, hip_stream,
             Q, K, V, O,
             batch_size, seq_len, kv_len,

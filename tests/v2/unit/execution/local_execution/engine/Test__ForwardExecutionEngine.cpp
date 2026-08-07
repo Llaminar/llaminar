@@ -710,7 +710,7 @@ TEST_F(Test__ForwardExecutionEngine,
     EXPECT_TRUE(plan.padding_required);
     EXPECT_EQ(
         plan.chunk.token_authority,
-        PrefillChunkTokenAuthority::DeviceAdmissionBank);
+        PrefillChunkTokenAuthority::DeviceResidentRows);
     EXPECT_TRUE(plan.chunk.token_ids.empty())
         << "Device-owned prefill must not manufacture a host token shadow.";
     EXPECT_EQ(plan.chunk.real_count, 5);
@@ -924,6 +924,42 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimeSchedule_PreparesExplici
     EXPECT_TRUE(second.padding_required);
     EXPECT_FALSE(second.rebalance_allowed_after);
     EXPECT_FALSE(second.rebalance_required_after);
+}
+
+TEST_F(Test__ForwardExecutionEngine,
+       PrefillChunkRuntimeSchedule_FixedIntervalKeepsOneBucketForShortTail)
+{
+    const std::vector<int> tokens = {40, 41, 42, 43, 44};
+    auto input = makeTestInput(
+        static_cast<int>(tokens.size()),
+        1,
+        DeviceId::cpu(),
+        tokens.data(),
+        nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {2, 4, 8};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.real_token_start = 0;
+    policy.real_token_count = static_cast<int>(tokens.size());
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/true);
+
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 2u);
+    EXPECT_EQ(schedule.chunks[0].chunk.real_count, 4);
+    EXPECT_EQ(schedule.chunks[0].chunk.bucket_seq_len, 4);
+    EXPECT_EQ(schedule.chunks[1].chunk.real_count, 1);
+    EXPECT_EQ(schedule.chunks[1].chunk.bucket_seq_len, 4)
+        << "A fixed-width captured transaction must not mode-shift its tail "
+           "to the smaller two-row graph.";
+    EXPECT_EQ(
+        schedule.chunks[1].chunk.token_ids,
+        (std::vector<int>{44, 0, 0, 0}));
 }
 
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimeSchedule_RejectsRangeOutsideInput)

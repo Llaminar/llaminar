@@ -1,6 +1,6 @@
 /**
  * @file Test__PrefillGraphBucketDefaults.cpp
- * @brief Host-only regressions for NativeVNNI row-regime and tile planning.
+ * @brief Host-only regressions for NativeVNNI row and MoE route planning.
  *
  * These tests intentionally perform no GPU work. They pin the shared planning
  * contract used before CUDA or ROCm workspace allocation so every positive M
@@ -10,6 +10,7 @@
  */
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "../../performance/kernels/native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
 #include "../../utils/NativeVNNIEquivalenceInventory.h"
 
 #include <gtest/gtest.h>
@@ -155,7 +156,7 @@ namespace llaminar2
         }
 
         /**
-         * @test Validate the finite GPU byte-equivalence witness construction.
+         * @test Validate the finite cross-backend byte-equivalence witnesses.
          */
         TEST(Test__PrefillGraphBucketDefaults,
              EquivalenceInventoryExhaustsTileRowsAndBucketBoundaries)
@@ -168,7 +169,7 @@ namespace llaminar2
             for (const auto &test_case : cases)
             {
                 EXPECT_GT(test_case.active_rows, previous_active_rows);
-                EXPECT_GT(test_case.bucket_rows, test_case.active_rows);
+                EXPECT_GE(test_case.bucket_rows, test_case.active_rows);
                 EXPECT_TRUE(std::binary_search(
                     kDefaultPrefillGraphBucketSizes.begin(),
                     kDefaultPrefillGraphBucketSizes.end(),
@@ -181,10 +182,6 @@ namespace llaminar2
                  m <= 256;
                  ++m)
             {
-                const bool is_exact_bucket = std::binary_search(
-                    kDefaultPrefillGraphBucketSizes.begin(),
-                    kDefaultPrefillGraphBucketSizes.end(),
-                    m);
                 const bool has_witness = std::any_of(
                     cases.begin(),
                     cases.end(),
@@ -192,7 +189,7 @@ namespace llaminar2
                     {
                         return test_case.active_rows == m;
                     });
-                EXPECT_EQ(has_witness, !is_exact_bucket)
+                EXPECT_TRUE(has_witness)
                     << "M=" << m;
             }
 
@@ -206,10 +203,8 @@ namespace llaminar2
                     kDefaultPrefillGraphBucketSizes[index];
                 if (upper <= 256)
                     continue;
-                for (int active_rows : {lower + 1, upper - 1})
+                for (int active_rows : {lower + 1, upper - 1, upper})
                 {
-                    if (active_rows == upper)
-                        continue;
                     EXPECT_TRUE(std::any_of(
                         cases.begin(),
                         cases.end(),
@@ -232,6 +227,81 @@ namespace llaminar2
             EXPECT_EQ(std::adjacent_find(rows.begin(), rows.end()), rows.end());
             EXPECT_EQ(rows.front(), 2);
             EXPECT_EQ(rows.back(), kDefaultPrefillGraphBucketSizes.back());
+        }
+
+        TEST(Test__PrefillGraphBucketDefaults,
+             MoERoutingProfilesRemainUniqueAndDistributionDistinct)
+        {
+            using test::native_vnni_dispatch::MoERoutingProfile;
+            using test::native_vnni_dispatch::makeMoERoutingIndices;
+            using test::native_vnni_dispatch::summarizeMoERoutingProfile;
+
+            constexpr int rows = 512;
+            constexpr int top_k = 8;
+            constexpr int experts = 256;
+            const auto uniform = makeMoERoutingIndices(
+                MoERoutingProfile::Uniform, rows, top_k, experts);
+            const auto hotset = makeMoERoutingIndices(
+                MoERoutingProfile::Hotset, rows, top_k, experts);
+            const auto power_law = makeMoERoutingIndices(
+                MoERoutingProfile::PowerLaw, rows, top_k, experts);
+
+            for (const auto *routes : {&uniform, &hotset, &power_law})
+            {
+                ASSERT_EQ(routes->size(), static_cast<size_t>(rows * top_k));
+                for (int row = 0; row < rows; ++row)
+                {
+                    std::array<int, top_k> row_routes{};
+                    for (int slot = 0; slot < top_k; ++slot)
+                    {
+                        row_routes[static_cast<size_t>(slot)] =
+                            static_cast<int>((*routes)[
+                                static_cast<size_t>(row * top_k + slot)]);
+                    }
+                    std::sort(row_routes.begin(), row_routes.end());
+                    EXPECT_EQ(
+                        std::adjacent_find(
+                            row_routes.begin(), row_routes.end()),
+                        row_routes.end())
+                        << "row=" << row;
+                }
+            }
+
+            const auto uniform_stats =
+                summarizeMoERoutingProfile(uniform, experts);
+            const auto hotset_stats =
+                summarizeMoERoutingProfile(hotset, experts);
+            const auto power_law_stats =
+                summarizeMoERoutingProfile(power_law, experts);
+            EXPECT_EQ(uniform_stats.active_experts, experts);
+            EXPECT_DOUBLE_EQ(uniform_stats.assignment_cv, 0.0);
+            EXPECT_EQ(hotset_stats.active_experts, 32);
+            EXPECT_GT(hotset_stats.assignment_cv, power_law_stats.assignment_cv);
+            EXPECT_GT(power_law_stats.assignment_cv, 0.0);
+        }
+
+        TEST(Test__PrefillGraphBucketDefaults,
+             MoERoutingProfileNamesRejectUnknownCorpusIdentity)
+        {
+            using test::native_vnni_dispatch::MoERoutingProfile;
+            using test::native_vnni_dispatch::moeRoutingProfileName;
+            using test::native_vnni_dispatch::parseMoERoutingProfile;
+
+            EXPECT_EQ(
+                parseMoERoutingProfile("uniform"),
+                MoERoutingProfile::Uniform);
+            EXPECT_EQ(
+                parseMoERoutingProfile("hotset"),
+                MoERoutingProfile::Hotset);
+            EXPECT_EQ(
+                parseMoERoutingProfile("power_law"),
+                MoERoutingProfile::PowerLaw);
+            EXPECT_EQ(
+                moeRoutingProfileName(MoERoutingProfile::PowerLaw),
+                "power_law");
+            EXPECT_THROW(
+                static_cast<void>(parseMoERoutingProfile("round_robin")),
+                std::invalid_argument);
         }
     } // namespace
 } // namespace llaminar2

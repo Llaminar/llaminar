@@ -97,9 +97,6 @@
 #include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
-// Parity should exercise the production CUDA prefill path unless a test opts in
-// to a deterministic-mode regression explicitly.
-extern "C" void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
 #endif
 #ifdef HAVE_ROCM
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
@@ -2178,9 +2175,6 @@ namespace llaminar2::test::parity
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
             auto parity_profile_scope = profileParityScope("set_up.total");
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(false);
-#endif
 
             // Start log file capture for this test run (rank 0 only)
             if (isRank0())

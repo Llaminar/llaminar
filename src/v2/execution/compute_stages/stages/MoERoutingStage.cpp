@@ -10,6 +10,7 @@
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Assertions.h"
@@ -246,6 +247,24 @@ namespace llaminar2
                           << " layer=" << params_.layer_idx
                           << " kind=" << static_cast<int>(launch_plan.kind)
                           << " rows=" << launch_plan.physical_rows);
+                return false;
+            }
+
+            /*
+             * Snapshot topology is finalized after launch preparation and
+             * before beginCapture(). Require the diagnostic descriptor to
+             * identify the same persistent route-logit buffer that the kernel
+             * just prepared. A missing view is an incomplete graph workspace,
+             * not permission to omit raw routing evidence.
+             */
+            if (!bindRouterLogitsDeviceView())
+            {
+                LOG_ERROR("[MoERoutingStage] Failed to bind canonical device "
+                          "router-logit diagnostics before graph capture"
+                          << " device=" << params_.device_id.toString()
+                          << " layer=" << params_.layer_idx
+                          << " rows=" << params_.seq_len
+                          << " experts=" << params_.num_experts);
                 return false;
             }
         }
@@ -1073,8 +1092,16 @@ namespace llaminar2
         if (params_.gate_weights)
             info.addWeight("gate_weights", params_.gate_weights);
 
-        // Routing outputs (stashed during execute for snapshots)
-        if (!router_logits_.empty())
+        /*
+         * CPU routing may retain host results. GPU routing instead exposes the
+         * canonical workspace through a pure-device tensor view so captured
+         * diagnostics copy the exact raw logits D2D on the producer stream.
+         */
+        if (router_logits_device_view_)
+            info.addOutput("router_logits", router_logits_device_view_.get(),
+                           static_cast<size_t>(params_.seq_len),
+                           static_cast<size_t>(params_.num_experts));
+        else if (!router_logits_.empty())
             info.addOutput("router_logits", router_logits_.data(),
                            static_cast<size_t>(params_.seq_len),
                            static_cast<size_t>(params_.num_experts));
@@ -1177,12 +1204,79 @@ namespace llaminar2
 
     void MoERoutingStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        /*
+         * The view must never outlive the workspace address it describes.
+         * Drop it before replacing either the workspace or the backend
+         * kernel's scratch binding.
+         */
+        router_logits_device_view_.reset();
         bound_workspace_ = workspace;
         if (moe_kernel_)
         {
             if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(moe_kernel_))
                 consumer->bindWorkspace(workspace);
         }
+
+        if (!bindRouterLogitsDeviceView() && workspace && params_.device_id.is_gpu())
+        {
+            LOG_ERROR("[MoERoutingStage] GPU workspace does not expose the "
+                      "complete canonical router-logit buffer"
+                      << " device=" << params_.device_id.toString()
+                      << " layer=" << params_.layer_idx
+                      << " rows=" << params_.seq_len
+                      << " experts=" << params_.num_experts);
+        }
+        invalidateDumpInfoCache();
+    }
+
+    bool MoERoutingStage::bindRouterLogitsDeviceView()
+    {
+        if (!params_.device_id.is_gpu() || !bound_workspace_)
+            return true;
+
+        if (params_.seq_len <= 0 || params_.num_experts <= 0 ||
+            bound_workspace_->device() != params_.device_id)
+        {
+            router_logits_device_view_.reset();
+            return false;
+        }
+
+        const size_t rows = static_cast<size_t>(params_.seq_len);
+        const size_t experts = static_cast<size_t>(params_.num_experts);
+        if (rows > std::numeric_limits<size_t>::max() / experts ||
+            rows * experts > std::numeric_limits<size_t>::max() / sizeof(float))
+        {
+            router_logits_device_view_.reset();
+            return false;
+        }
+
+        const size_t required_bytes = rows * experts * sizeof(float);
+        void *const route_logits =
+            bound_workspace_->getBuffer(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        const size_t available_bytes =
+            bound_workspace_->getBufferSize(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        if (!route_logits || available_bytes < required_bytes)
+        {
+            router_logits_device_view_.reset();
+            return false;
+        }
+
+        if (router_logits_device_view_ &&
+            router_logits_device_view_->gpu_data_ptr() == route_logits &&
+            router_logits_device_view_->shape() ==
+                std::vector<size_t>{rows, experts})
+        {
+            return true;
+        }
+
+        router_logits_device_view_ = std::make_unique<GpuTensorView>(
+            route_logits,
+            rows,
+            experts,
+            TensorType::FP32,
+            params_.device_id);
+        invalidateDumpInfoCache();
+        return true;
     }
 
     void MoERoutingStage::unbindWorkspace()

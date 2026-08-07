@@ -247,4 +247,26 @@ namespace llaminar2::test
         }
         throw std::invalid_argument("Unknown canonical verifier format: " + std::string(label));
     }
+
+    /**
+     * @brief Resolve a non-degenerate MoE fixture by its stable source label.
+     *
+     * Production-derived mixed-format sweeps must use the same strengthened
+     * IQ3_S/IQ4_XS fixtures as the homogeneous all-format verifier sweep. This
+     * helper prevents a caller from accidentally resolving the generic tensor
+     * creator and certifying an all-zero composed FFN witness.
+     *
+     * @throws std::invalid_argument when @p label is not a canonical format.
+     */
+    inline const QuantizedVerifierFormatCase &quantizedMoEVerifierFormat(
+        std::string_view label)
+    {
+        for (const auto &format : quantizedMoEVerifierFormats())
+        {
+            if (label == format.label)
+                return format;
+        }
+        throw std::invalid_argument(
+            "Unknown canonical MoE verifier format: " + std::string(label));
+    }
 } // namespace llaminar2::test

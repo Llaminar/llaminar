@@ -44,6 +44,7 @@
 #include "fort.hpp"
 
 #include "utils/QuantizedVerifierFormats.h"
+#include "utils/NativeVNNIEquivalenceInventory.h"
 #include "utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
@@ -131,6 +132,45 @@ namespace
         std::string name_;
         bool had_old_;
         std::string old_value_;
+    };
+
+    /**
+     * @brief Temporarily bind OpenMP execution to an exact positive thread count.
+     *
+     * The M-totality sweep executes thousands of independent production M=1
+     * oracle rows. One physical worker keeps that diagnostic oracle cheap while
+     * still exercising the same NativeVNNI entry points and arithmetic. Other
+     * integration tests in this file retain the machine's full thread topology
+     * to certify work-sharing and scaling behavior.
+     */
+    class ScopedOMPThreadCount final
+    {
+    public:
+        /** Set a fixed OpenMP team size until this scope exits. */
+        explicit ScopedOMPThreadCount(int threads)
+            : previous_threads_(omp_get_max_threads()),
+              previous_dynamic_(omp_get_dynamic())
+        {
+            if (threads <= 0)
+                throw std::invalid_argument(
+                    "ScopedOMPThreadCount requires a positive thread count");
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+
+        /** Restore the calling test process's OpenMP policy. */
+        ~ScopedOMPThreadCount()
+        {
+            omp_set_num_threads(previous_threads_);
+            omp_set_dynamic(previous_dynamic_);
+        }
+
+        ScopedOMPThreadCount(const ScopedOMPThreadCount &) = delete;
+        ScopedOMPThreadCount &operator=(const ScopedOMPThreadCount &) = delete;
+
+    private:
+        int previous_threads_ = 1;
+        int previous_dynamic_ = 0;
     };
 
     /**
@@ -1549,6 +1589,158 @@ namespace
     }
 
     /**
+     * @test Prove CPU production prefill is serial-row exact over canonical M.
+     *
+     * Grouped-verifier tests already exhaust M=2..16. This companion sweep uses
+     * the shared cross-backend ordinary-prefill inventory: every M through 256,
+     * then the lower edge, upper edge, and exact threshold of every larger graph
+     * bucket through 4096. Exact-M and padded-bucket launches both use production
+     * Auto dispatch. Every active FP32 word is compared with an independent M=1
+     * result, rather than sampling only the first or final row.
+     *
+     * A compact `N=17, K=256` surface is legal for every codebook, retains an N
+     * tail, and keeps this CPU integration gate economical. Larger N/K surfaces
+     * and every physical full-K/K-partition schedule are certified separately
+     * above; this test owns M totality and row-index correctness.
+     */
+    TEST_F(
+        CPUNativeVNNIGemvTest,
+        NativeVNNIPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets)
+    {
+        constexpr int N = 17;
+        constexpr int K = 256;
+        const auto row_cases = nativeVNNIPrefillBucketEquivalenceCases();
+        ASSERT_FALSE(row_cases.empty());
+        const int maximum_bucket_rows = std::max_element(
+            row_cases.begin(),
+            row_cases.end(),
+            [](const auto &lhs, const auto &rhs)
+            {
+                return lhs.bucket_rows < rhs.bucket_rows;
+            })->bucket_rows;
+        ASSERT_EQ(maximum_bucket_rows, 4096);
+
+        ScopedOMPThreadCount one_oracle_worker(1);
+        setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+        PerfStatsCollector::reset();
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(maximum_bucket_rows),
+             static_cast<size_t>(K)},
+            -0.75f,
+            0.75f,
+            0x4D54504Du);
+        ASSERT_NE(input, nullptr);
+
+        uint64_t expected_prefill_launches_per_format = 0;
+        for (const auto &test_case : row_cases)
+        {
+            expected_prefill_launches_per_format +=
+                test_case.active_rows == test_case.bucket_rows ? 1u : 2u;
+        }
+
+        for (const auto &format : ALL_FORMATS)
+        {
+            SCOPED_TRACE(format.name);
+            auto weights = createWeightsForFormat(format.name, N, K);
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+
+            std::vector<float> serial(
+                static_cast<size_t>(maximum_bucket_rows) * N,
+                0.0f);
+            for (int row = 0; row < maximum_bucket_rows; ++row)
+            {
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data() + static_cast<size_t>(row) * K,
+                    serial.data() + static_cast<size_t>(row) * N,
+                    1,
+                    N,
+                    K))
+                    << format.name << " serial M1 row=" << row;
+            }
+
+            std::vector<float> grouped(
+                static_cast<size_t>(maximum_bucket_rows) * N,
+                0.0f);
+            for (const auto &test_case : row_cases)
+            {
+                SCOPED_TRACE(
+                    std::string("active_m=") +
+                    std::to_string(test_case.active_rows) +
+                    " bucket_m=" +
+                    std::to_string(test_case.bucket_rows));
+                const size_t active_values =
+                    static_cast<size_t>(test_case.active_rows) * N;
+
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data(),
+                    grouped.data(),
+                    test_case.active_rows,
+                    N,
+                    K));
+                expectBitwiseEqualFloatRows(
+                    format.name + " exact-M production prefill M=" +
+                        std::to_string(test_case.active_rows),
+                    grouped.data(),
+                    serial.data(),
+                    active_values,
+                    static_cast<size_t>(N));
+
+                if (test_case.bucket_rows == test_case.active_rows)
+                    continue;
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data(),
+                    grouped.data(),
+                    test_case.bucket_rows,
+                    N,
+                    K));
+                expectBitwiseEqualFloatRows(
+                    format.name + " padded production prefill active M=" +
+                        std::to_string(test_case.active_rows) + " bucket M=" +
+                        std::to_string(test_case.bucket_rows),
+                    grouped.data(),
+                    serial.data(),
+                    active_values,
+                    static_cast<size_t>(N));
+            }
+        }
+
+        uint64_t observed_prefill_launches = 0;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_prefill_gemm_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_prefill_gemm_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            EXPECT_EQ(record.tags.at("n"), std::to_string(N));
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_GE(std::stoi(record.tags.at("m")), 17);
+            EXPECT_TRUE(
+                record.tags.at("route") == "row_chunk_grid" ||
+                record.tags.at("route") == "two_row_n_major" ||
+                record.tags.at("route") == "two_row_pair_grid" ||
+                record.tags.at("route") == "decode_equivalent_kpart_rows");
+            observed_prefill_launches += record.count;
+        }
+        EXPECT_EQ(
+            observed_prefill_launches,
+            ALL_FORMATS.size() * expected_prefill_launches_per_format)
+            << "Every CPU all-format M-totality cell must execute one real "
+               "production grouped prefill route";
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
+    /**
      * @test Prove partial 64-column chunks remain inside each logical output row.
      *
      * The economical full-K prefill kernel shares one packed-weight chunk
@@ -1766,6 +1958,15 @@ namespace
         constexpr int N = 1536;
         constexpr int K = 8960;
         constexpr std::array<int, 4> runtime_rows = {2, 5, 15, 64};
+        constexpr std::array<VerifierRowsPolicy, 7> full_k_policies = {{
+            VerifierRowsPolicy::FullKRowChunkGrid,
+            VerifierRowsPolicy::FullKTwoRowNbc1,
+            VerifierRowsPolicy::FullKTwoRowNbc2,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc1,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc2,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc4,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc8,
+        }};
 
         setenv(
             "LLAMINAR_PERF_STATS_JSON",
@@ -1824,6 +2025,23 @@ namespace
                 }
 
                 std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+                for (const VerifierRowsPolicy policy : full_k_policies)
+                {
+                    EXPECT_THROW(
+                        gemm_native_vnni_preq_decode_equivalent_rows(
+                            packed,
+                            quantized_rows.data(),
+                            grouped.data(),
+                            M,
+                            N,
+                            ISAPath::AUTO,
+                            policy),
+                        std::invalid_argument)
+                        << format.name << " M=" << M << " policy="
+                        << verifierRowsPolicyName(policy)
+                        << " must reject full-K arithmetic when serial M=1 "
+                           "owns multiple K partitions";
+                }
                 ASSERT_TRUE(multiplyViaTensor(
                     kernel,
                     input->data(),
@@ -1919,7 +2137,8 @@ namespace
      * tiles and 1/2/3-row tails for M=5 and above. This regression forces that
      * candidate through both the ordinary full-K launch and the K-part launch,
      * then compares every FP32 byte with independent production M=1 decode.
-     * PerfStats route checks make a normalized Pairwise execution visible.
+     * Unsupported AVX2 and M=2 requests must fail before launch rather than
+     * silently executing Pairwise under a different requested identity.
      */
     TEST_F(CPUNativeVNNIGemvTest,
            MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows)
@@ -1977,6 +2196,24 @@ namespace
                     std::vector<float> serial(
                         static_cast<size_t>(M) * N,
                         0.0f);
+                    const bool wide_rows_supported =
+                        activeISALevel() == ISALevel::AVX512 && M >= 3;
+                    if (!wide_rows_supported)
+                    {
+                        EXPECT_THROW(
+                            gemm_native_vnni_preq_decode_equivalent_rows(
+                                packed,
+                                quantized_rows.data(),
+                                grouped.data(),
+                                M,
+                                N,
+                                ISAPath::AUTO,
+                                VerifierRowsPolicy::WideRows),
+                            std::invalid_argument)
+                            << fmt.name << " M=" << M
+                            << " must reject an unsupported WideRows request";
+                        continue;
+                    }
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         packed,
                         quantized_rows.data(),
@@ -2005,7 +2242,6 @@ namespace
             }
 
             uint64_t observed_calls = 0;
-            uint64_t effective_wide_calls = 0;
             for (const auto &record : PerfStatsCollector::snapshot(
                      {"kernel.cpu_native_vnni_verifier_rows_launch"}))
             {
@@ -2019,25 +2255,17 @@ namespace
                 EXPECT_EQ(
                     record.tags.at("k_tiles"),
                     std::to_string(forced_k_tiles));
-                const int tagged_m = std::stoi(record.tags.at("m"));
-                const bool should_be_wide =
-                    activeISALevel() == ISALevel::AVX512 && tagged_m >= 3;
-                EXPECT_EQ(
-                    record.tags.at("effective_policy"),
-                    should_be_wide ? "WideRows" : "Pairwise");
+                EXPECT_GE(std::stoi(record.tags.at("m")), 3);
+                EXPECT_EQ(record.tags.at("effective_policy"), "WideRows");
                 observed_calls += record.count;
-                if (record.tags.at("effective_policy") == "WideRows")
-                    effective_wide_calls += record.count;
             }
+            const uint64_t supported_rows =
+                activeISALevel() == ISALevel::AVX512
+                    ? verifier_rows.size() - 1
+                    : 0;
             EXPECT_EQ(
                 observed_calls,
-                ALL_FORMATS.size() * verifier_rows.size());
-            if (activeISALevel() == ISALevel::AVX512)
-            {
-                EXPECT_EQ(
-                    effective_wide_calls,
-                    ALL_FORMATS.size() * (verifier_rows.size() - 1));
-            }
+                ALL_FORMATS.size() * supported_rows);
 
             PerfStatsCollector::reset();
             unsetenv("LLAMINAR_PERF_STATS_JSON");
@@ -2691,6 +2919,10 @@ namespace
 
         setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
         PerfStatsCollector::reset();
+        const VerifierRowsPolicy requested_policy =
+            activeISALevel() == ISALevel::AVX512
+                ? VerifierRowsPolicy::WideRows
+                : VerifierRowsPolicy::Pairwise;
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed,
             quantized.data(),
@@ -2698,7 +2930,7 @@ namespace
             M,
             N,
             ISAPath::AUTO,
-            VerifierRowsPolicy::WideRows);
+            requested_policy);
         for (int row = 0; row < M; ++row)
         {
             gemv_native_vnni_preq(
@@ -2728,7 +2960,7 @@ namespace
             EXPECT_EQ(record.tags.at("build_isa"),
                       compiledNativeVNNIBuildISAName());
             EXPECT_EQ(record.tags.at("isa"), expected_runtime_isa);
-            EXPECT_EQ(record.tags.at("requested_policy"), "WideRows");
+            EXPECT_EQ(record.tags.at("requested_policy"), expected_policy);
             EXPECT_EQ(record.tags.at("effective_policy"), expected_policy);
             EXPECT_EQ(record.tags.at("threads"),
                       std::to_string(omp_get_max_threads()));

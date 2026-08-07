@@ -126,6 +126,15 @@ namespace llaminar2
         const int32_t *active_verifier_row_count_device = nullptr;
         /** Prepared controller budget for the current verifier transaction. */
         const uint32_t *transaction_commit_budget_device = nullptr;
+        /**
+         * Controller-owned carry count for the transaction being summarized.
+         *
+         * A value of one means output row zero was already committed by the
+         * preceding transaction boundary.  This is deliberately distinct from
+         * the greedy penalty policy's history-membership bit: sampling history
+         * and response-ledger ownership advance at different lifecycle edges.
+         */
+        const int32_t *next_leading_committed_output_count_device = nullptr;
         const int32_t *stop_tokens_device = nullptr;
         const MTPGreedyPenaltyPolicy *penalty_policy_device = nullptr;
         int32_t *generated_token_counts_device = nullptr;
@@ -150,6 +159,7 @@ namespace llaminar2
             return verifier_input_tokens_device != nullptr &&
                    active_verifier_row_count_device != nullptr &&
                    transaction_commit_budget_device != nullptr &&
+                   next_leading_committed_output_count_device != nullptr &&
                    stop_tokens_device != nullptr &&
                    penalty_policy_device != nullptr &&
                    generated_token_counts_device != nullptr &&

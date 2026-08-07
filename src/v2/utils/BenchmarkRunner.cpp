@@ -379,6 +379,7 @@ namespace llaminar2
     static const std::vector<std::string> &benchmarkPerfStatFilters()
     {
         static const std::vector<std::string> filters{
+            "kernel",
             "memory",
             "moe_overlay",
             "moe_rebalance",
@@ -1954,6 +1955,7 @@ namespace llaminar2
                 {"forward_graph", "prefill_graph_lifecycle"},
                 {"forward_graph", "prefill_graph_phase"},
                 {"forward_graph", "decode_graph_phase"},
+                {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
             });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();

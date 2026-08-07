@@ -2726,8 +2726,7 @@ namespace llaminar2
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool beginDeviceResidentGeneration(
-            int request_count,
-            int max_new_tokens) override;
+            const DeviceGenerationAdmissionRequest &request) override;
 
         /**
          * @brief Select native-parent or hosted-transaction MTP execution.
@@ -5617,33 +5616,30 @@ namespace llaminar2
                                      int first_seq_idx = 0);
 
         /**
-         * @brief Populate shifted MTP KV from one completed main prefill.
+         * @brief Populate CPU shifted-MTP KV from one completed main prefill.
          *
-         * @param tokens Host token shadow used by CPU execution and diagnostics.
-         * @param tokens_device Optional device-owned INT32 request rows. GPU
-         *        execution requires this pointer and never reconstructs shifted
-         *        sidecar input from the host shadow.
+         * CPU execution is host-owned, so this helper consumes host token and
+         * position rows directly. GPU shifted prefill is a different production
+         * architecture: `bindShiftedMTPPrefillTransaction()` installs it inside
+         * the complete captured main graph and no GPU caller may enter this
+         * method.
+         *
+         * @param tokens Host-owned token rows for the completed CPU prefill.
          * @param seq_len Number of rows produced per request.
          * @param batch_size Number of logical requests represented by the
          *        hidden-state tensor.
          * @param position_offset Logical position of the first prefill row.
-         * @param producer Execution-scoped device/stream provenance from the
-         *        exact main forward whose hidden rows are being consumed.
          * @param request_lengths Optional real row count for each padded request.
-         * @param position_ids Optional flattened host position shadow.
-         * @param position_ids_device Optional flattened device-owned position
-         *        rows paired with @p tokens_device. Required on GPU.
+         * @param position_ids Optional flattened host position rows.
          * @return true after every shifted pair is published.
          */
-        bool populateMTPShiftedCacheFromPrefill(const int *tokens,
-                                                const void *tokens_device,
-                                                int seq_len,
-                                                int batch_size,
-                                                int position_offset,
-                                                const ForwardExecutionProvenance &producer,
-                                                const std::vector<int> *request_lengths = nullptr,
-                                                 const std::vector<int> *position_ids = nullptr,
-                                                 const void *position_ids_device = nullptr);
+        bool populateCPUMTPShiftedCacheFromPrefill(
+            const int *tokens,
+            int seq_len,
+            int batch_size,
+            int position_offset,
+            const std::vector<int> *request_lengths = nullptr,
+            const std::vector<int> *position_ids = nullptr);
 
         /**
          * @brief Bind shifted MTP prefill into a main GPU forward graph.
@@ -5669,10 +5665,12 @@ namespace llaminar2
          * Ordinarily a new main forward invalidates the compact terminal-hidden
          * cache, so a later MTP sidecar must explicitly select the latest row
          * from `HIDDEN_STATE`.  Single-request grouped prefill is the important
-         * exception: `populateMTPShiftedCacheFromPrefill()` archives the true
-         * terminal row after it has published every internal shifted pair.  That
-         * row must remain current because a following stable prefill segment
-         * consumes it to publish the cross-segment shifted pair.
+         * CPU grouped prefill is the important exception:
+         * `populateCPUMTPShiftedCacheFromPrefill()` archives the true terminal
+         * row after publishing every internal shifted pair. That row remains
+         * current because a following CPU prefill segment consumes it to publish
+         * the cross-segment shifted pair. GPU publication is part of the captured
+         * main graph and reports the same ownership through its typed binding.
          *
          * @param seq_len Number of rows produced per request.
          * @param batch_size Number of logical requests represented by the
@@ -7230,12 +7228,19 @@ namespace llaminar2
         void *mtp_sidecar_position_ids_dev_ = nullptr; ///< INT32 [mtp_sidecar_condition_token_slot_width_], stable positions for chained device sidecars.
         void *mtp_verifier_position_ids_dev_ = nullptr; ///< INT32 [stochastic_target_row_capacity_], absolute grouped verifier rows derived from live device KV counts.
         void *mtp_verifier_request_lengths_dev_ = nullptr; ///< INT32 [stochastic_batch_output_request_capacity_], valid grouped-verifier width per request.
-        void *request_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], immutable external request tokens after admission.
-        void *request_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], absolute positions paired with request_token_ids_dev_.
+        void *request_token_ids_dev_ = nullptr; ///< INT32 [batch * max_seq_len], complete immutable external request after admission.
+        void *request_position_ids_dev_ = nullptr; ///< INT32 [batch * max_seq_len], absolute positions paired with request_token_ids_dev_.
+        void *prefill_chunk_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], captured current request window.
+        void *prefill_chunk_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], captured absolute positions for the current window.
+        void *prefill_chunk_geometry_dev_ = nullptr; ///< INT32 [2], current real row count followed by physical row stride.
+        int32_t *prefill_chunk_real_rows_dev_ = nullptr; ///< First scalar in PREFILL_CHUNK_GEOMETRY.
+        int32_t *prefill_chunk_row_stride_dev_ = nullptr; ///< Second scalar in PREFILL_CHUNK_GEOMETRY.
         void *mtp_shifted_prefill_token_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], graph-produced shifted condition tokens.
         void *mtp_shifted_prefill_position_ids_dev_ = nullptr; ///< INT32 [batch * activation_seq_len], graph-produced shifted absolute positions.
         void *mtp_shifted_prefill_append_lengths_dev_ = nullptr; ///< INT32 [request capacity], graph-produced shifted KV append widths.
-        int request_input_row_capacity_ = 0; ///< Number of flattened token/position elements reserved in the arena.
+        int request_input_row_capacity_ = 0; ///< Complete admitted-request row capacity, independent of activation graph width.
+        int prefill_chunk_row_capacity_ = 0; ///< Stable captured chunk-view row capacity.
+        int mtp_shifted_prefill_row_capacity_ = 0; ///< Stable shifted-MTP preparation row capacity.
         /**
          * @brief Immutable host source for graph-bucket padding admitted to the GPU.
          *
@@ -7571,6 +7576,7 @@ namespace llaminar2
             std::shared_ptr<void> event;
             DeviceId device = DeviceId::invalid();
             bool valid = false;
+            uint64_t publication_sequence = 0;
             ForwardExecutionRole execution_role =
                 ForwardExecutionRole::MainInference;
             bool is_decode = false;
@@ -7580,6 +7586,35 @@ namespace llaminar2
             int graph_seq_len = 0;
             int graph_batch_size = 0;
         };
+
+        /**
+         * @brief Independent durable publications for semantic forward outputs.
+         *
+         * Main-model logits and grouped-verifier logits remain live at the same
+         * time during an MTP transaction. They therefore cannot share one event
+         * slot whose metadata is overwritten by whichever graph launched last.
+         * Each semantic surface owns one persistent event, while the monotonic
+         * sequence records which publication is newest for consumers that
+         * explicitly accept either kind.
+         */
+        struct ForwardGraphOutputReadySet
+        {
+            ForwardGraphOutputReadyState main_forward;
+            ForwardGraphOutputReadyState grouped_verifier;
+            uint64_t next_publication_sequence = 1;
+        };
+
+        /** Select the publication slot owned by one concrete producer role. */
+        ForwardGraphOutputReadyState *forwardGraphOutputPublicationFor(
+            ForwardExecutionRole role,
+            bool all_position_logits);
+
+        /** Select one typed publication, or the newest slot for `Any`. */
+        const ForwardGraphOutputReadyState *selectForwardGraphOutputPublication(
+            ForwardGraphOutputKind required_kind) const;
+
+        /** Invalidate semantic provenance while retaining persistent events. */
+        void clearForwardGraphOutputPublications() noexcept;
 
         /**
          * @brief One fixed profiler-event pair owned for the runner lifetime.
@@ -7631,7 +7666,7 @@ namespace llaminar2
             device_generation_state_ready_;
         PendingRequestInputReuseReadyState
             request_input_reuse_ready_;
-        ForwardGraphOutputReadyState forward_graph_output_ready_;
+        ForwardGraphOutputReadySet forward_graph_output_ready_;
         MainLogitsPublicationState current_main_logits_publication_;
         std::shared_ptr<void>
             device_resident_mtp_transaction_ready_event_;
@@ -8628,9 +8663,18 @@ namespace llaminar2
         /// Whether TP contexts have been initialized
         bool tp_contexts_initialized_ = false;
 
-        /// Session epoch counter — incremented on each clear_cache() call
-        /// Used to detect stale kernel state across inference sessions
-        uint64_t session_epoch_ = 0;
+        /**
+         * @brief Nonzero identity of the request-state session currently owned
+         * by this orchestrator.
+         *
+         * Epoch zero is reserved by device dispatch tickets as their invalid,
+         * unpublished value.  A newly constructed orchestrator already owns a
+         * valid first session, before any caller has a reason to clear request
+         * state, so its epoch starts at one.  Every request-state reset or
+         * execution-cache invalidation advances the epoch and thereby makes a
+         * ticket from an earlier session fail lifecycle authentication.
+         */
+        uint64_t session_epoch_ = 1;
         uint64_t live_replay_state_epoch_ = 1;
         uint64_t live_state_mutation_count_ = 0;
         uint64_t live_state_accepted_publications_ = 0;

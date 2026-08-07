@@ -2130,7 +2130,7 @@ namespace llaminar2::test
             << "Rank mmap reclamation must rely on completed load pipelines, not a rank-wide GPU drain.";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReleaseWaitsForMTPShiftedPrefill)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReleaseFollowsIntegratedMTPPrefillProducer)
     {
         const fs::path root = findRepoRoot();
         const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
@@ -2146,7 +2146,7 @@ namespace llaminar2::test
         ASSERT_NE(forward_end, std::string::npos);
         const std::string forward_body = dgo_contents.substr(forward_start, forward_end - forward_start);
 
-        const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(");
+        const size_t forward_mtp = forward_body.find("bindShiftedMTPPrefillTransaction(");
         const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(");
         const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(forward_mtp, std::string::npos);
@@ -2162,7 +2162,7 @@ namespace llaminar2::test
         ASSERT_NE(chunk_end, std::string::npos);
         const std::string chunk_body = dgo_contents.substr(chunk_start, chunk_end - chunk_start);
 
-        const size_t chunk_mtp = chunk_body.find("populateMTPShiftedCacheFromPrefill(");
+        const size_t chunk_mtp = chunk_body.find("bindShiftedMTPPrefillTransaction(");
         const size_t chunk_terminal =
             chunk_body.find("noteMainForwardHiddenProducedForMTP(");
         const size_t chunk_release = chunk_body.find("releaseHostResidentWeightData();");
@@ -5250,8 +5250,10 @@ namespace llaminar2::test
             {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
             {"negative descriptor index guard", "if (desc_idx < 0)"},
             {"blank descriptor guard", "!native_vnni_desc_shape_ok<FMT>(desc, N, K)"},
-            {"invalid k-partial zero fill", "gate_partials[partial_index] = 0.0f;"},
-            {"invalid up k-partial zero fill", "up_partials[partial_index] = 0.0f;"},
+            {"invalid route-row zero fill", "route_output[output_index] = 0.0f;"},
+            {"invalid runtime gate-row zero fill", "gate_outputs[slot][n] = 0.0f;"},
+            {"invalid runtime up-row zero fill", "up_outputs[slot][n] = 0.0f;"},
+            {"serial-order route fold", "moe_grouped_native_vnni_down_ordered_reduce_kernel"},
         };
         for (const auto &[label, token] : decode_required_tokens)
         {
@@ -7347,8 +7349,13 @@ namespace llaminar2::test
         const fs::path root = findRepoRoot();
         const fs::path cuda_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";
         const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        const fs::path rocm_gemv_path =
+            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip";
+        const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
+        ASSERT_TRUE(fs::exists(rocm_gemv_path)) << rocm_gemv_path;
+        ASSERT_TRUE(fs::exists(debug_env_path)) << debug_env_path;
 
         auto body_between =
             [](const std::string &contents,
@@ -7381,6 +7388,8 @@ namespace llaminar2::test
 
         const std::string cuda = readFile(cuda_path);
         const std::string rocm = readFile(rocm_path);
+        const std::string rocm_gemv = readFile(rocm_gemv_path);
+        const std::string debug_env = readFile(debug_env_path);
 
         const std::vector<std::pair<std::string, std::string>> cuda_bodies = {
             {"bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(",
@@ -7429,17 +7438,41 @@ namespace llaminar2::test
         for (const auto &[begin, end] : rocm_bodies)
             require_no_soft_retry(body_between(rocm, begin, end, begin.c_str()), begin.c_str());
 
-        EXPECT_NE(rocm.find("K-part gate/up decode was requested but scratch allocation failed"),
+        const std::string rocm_grouped_decode_surface =
+            rocm + rocm_gemv + debug_env;
+        const std::vector<std::string> forbidden_rocm_variants = {
+            "LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE",
+            "LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE",
+            "LLAMINAR_ROCM_MOE_GATEUP_KPARTS",
+            "LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED",
+            "rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart",
+            "rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart",
+            "rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart",
+            "rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart",
+            "rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel",
+            "rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel",
+            "moe_grouped_native_vnni_down_parallel_experts_kernel_t",
+            "moe_grouped_native_vnni_down_runtime_parallel_experts_kernel_t",
+            "const bool use_gateup_kpart = false",
+            "const bool use_parallel_down = false",
+        };
+        for (const std::string &forbidden : forbidden_rocm_variants)
+        {
+            EXPECT_EQ(rocm_grouped_decode_surface.find(forbidden), std::string::npos)
+                << "retired non-byte-equivalent ROCm grouped-decode variant returned: "
+                << forbidden;
+        }
+
+        EXPECT_NE(rocm_gemv.find(
+                      "moe_grouped_native_vnni_down_route_kernel_t"),
                   std::string::npos)
-            << "ROCm grouped decode must fail hard when explicit gate/up K-part scratch is unavailable";
-        EXPECT_NE(rocm.find("K-part gate/up runtime kernel failed"), std::string::npos)
-            << "ROCm grouped decode must fail hard when explicit K-part gate/up launch fails";
-        EXPECT_NE(rocm.find("parallel down decode was requested but codebook"),
+            << "ROCm grouped down must compute route rows in parallel";
+        EXPECT_NE(rocm_gemv.find(
+                      "moe_grouped_native_vnni_down_ordered_reduce_kernel"),
                   std::string::npos)
-            << "ROCm grouped decode must fail hard when explicit parallel down cannot support the codebook";
-        EXPECT_NE(rocm.find("K-part fused gate/up SwiGLU quant kernel failed"),
-                  std::string::npos)
-            << "ROCm fused grouped decode must fail hard when the explicit fused K-part path fails";
+            << "ROCm grouped down must fold route rows in fixed router order";
+        EXPECT_NE(rocm.find("ordered_route_parallel_down"), std::string::npos)
+            << "ROCm PerfStats must expose the canonical ordered route-parallel path";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,

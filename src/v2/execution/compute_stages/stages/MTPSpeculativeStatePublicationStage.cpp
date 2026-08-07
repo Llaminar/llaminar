@@ -462,7 +462,7 @@ namespace llaminar2
         contract.addInOut(
             BufferId::STOCHASTIC_BATCH_OUTPUT_META,
             "INT32");
-        contract.addPreallocatedInOut(
+        contract.addPreallocatedOutput(
             BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,
             "INT32");
         if (params_.generation_controller_owned)
@@ -473,10 +473,10 @@ namespace llaminar2
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_CONTROL,
                 "INT32");
-            contract.addPreallocatedInOut(
+            contract.addPreallocatedOutput(
                 BufferId::MTP_CONDITION_TOKEN,
                 "INT32");
-            contract.addPreallocatedInOut(
+            contract.addPreallocatedOutput(
                 BufferId::MTP_POSITION_IDS,
                 "INT32");
         }

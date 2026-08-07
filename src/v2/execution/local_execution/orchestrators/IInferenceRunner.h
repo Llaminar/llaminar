@@ -301,6 +301,34 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable request used to admit a device-owned generation ledger.
+     *
+     * The leading-row disposition is part of response correctness, not optional
+     * scheduling metadata. A controller reopened after a rejection must consume
+     * the already-emitted correction as verifier row zero without returning it
+     * twice. Keeping geometry, response budget, and row ownership in one value
+     * prevents rank and backend layers from dropping that state independently.
+     */
+    struct DeviceGenerationAdmissionRequest
+    {
+        int request_count = 0; ///< Number of independent device controller rows.
+        int max_new_tokens = 0; ///< New response-token capacity for each row.
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition =
+                sampling_math::DeviceGenerationLeadingRowDisposition::
+                    PendingResponse; ///< Uniform row-zero ownership at admission.
+
+        /** @return true when every field describes a legal controller admission. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return request_count > 0 && max_new_tokens > 0 &&
+                   sampling_math::
+                       valid_device_generation_leading_row_disposition(
+                           initial_leading_row_disposition);
+        }
+    };
+
+    /**
      * @brief Host-visible terminal record for one device-owned generation row.
      *
      * This record is created only after the request's final controller
@@ -313,6 +341,10 @@ namespace llaminar2
         std::vector<int32_t> tokens; ///< Exact response tokens emitted by the device ledger.
         int remaining_token_count = 0; ///< Unused response budget when a stop token ended generation.
         bool model_stopped = false; ///< True when generation ended on the request stop policy.
+        sampling_math::DeviceGenerationLeadingRowDisposition
+            next_leading_row_disposition =
+                sampling_math::DeviceGenerationLeadingRowDisposition::
+                    PendingResponse; ///< Ownership of the retained continuation row.
         int transaction_count = 0; ///< Number of committed speculative transactions.
         int accepted_speculative_token_count = 0; ///< Accepted draft-token total.
         int rejected_transaction_count = 0; ///< Transactions that emitted a rejection correction.
@@ -4109,17 +4141,14 @@ namespace llaminar2
          * CPU and runners without a resident stochastic path may retain the
          * default no-op implementation.
          *
-         * @param request_count Number of independently generated request rows.
-         * @param max_new_tokens Exact terminal response budget per request.
+         * @param request Typed immutable geometry, response capacity, and
+         *        leading-row response ownership for this admission.
          * @return true when generation may begin.
          */
         virtual bool beginDeviceResidentGeneration(
-            int request_count,
-            int max_new_tokens)
+            const DeviceGenerationAdmissionRequest &request)
         {
-            (void)request_count;
-            (void)max_new_tokens;
-            return true;
+            return request.valid();
         }
 
         /**

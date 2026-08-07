@@ -455,7 +455,9 @@ TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)
     EXPECT_EQ(schedule.chunks[2].chunk_index, 2);
     EXPECT_EQ(schedule.chunks[2].token_offset, 224);
     EXPECT_EQ(schedule.chunks[2].real_count, 58);
-    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 64);
+    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 128)
+        << "A fixed real-token interval must retain one physical graph bucket "
+           "for its short final tail.";
 }
 
 TEST(Test__PrefillGraphCache, ChunkSchedule_RebalanceIntervalsCountRealTokensOnly)

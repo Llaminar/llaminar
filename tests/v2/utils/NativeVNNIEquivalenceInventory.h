@@ -11,12 +11,12 @@
  * 1. Exhaust every ordinary-prefill M through two complete 128-row device
  *    tiles. This covers every row residue and all interior/border transitions
  *    used by the current CUDA and ROCm batch-invariant kernels.
- * 2. Witness both open ends of every larger canonical graph-bucket interval.
- *    This catches automatic-dispatch changes at larger work sizes without
- *    redundantly testing every M inside an interval whose kernel decomposition
- *    has already been exhausted.
+ * 2. Witness both open ends and the exact upper threshold of every larger
+ *    canonical graph-bucket interval. This catches automatic-dispatch changes
+ *    at larger work sizes without testing every interior M after the kernel's
+ *    row decomposition has already been exhausted.
  *
- * CUDA and ROCm integration tests consume this exact inventory for every
+ * CPU, CUDA, and ROCm integration tests consume this exact inventory for every
  * loader-supported quantized format. Host-only planner tests separately prove
  * that positive values above the largest graph bucket remain accepted and
  * overflow-safe.
@@ -89,10 +89,10 @@ namespace llaminar2::test
      * @brief Build the canonical, ordered, duplicate-free M-totality inventory.
      *
      * Grouped verifier rows own `M=2..16`; ordinary prefill therefore starts at
-     * 17. Exact bucket sizes do not need an exact-versus-bucket comparison
-     * because both launches would have identical M. Every non-bucket M through
-     * 256 is exhaustive. Larger intervals contribute the first and last active
-     * M so dispatch thresholds and partial final tiles are both exercised.
+     * 17. Every M through 256 is exhaustive, including exact bucket thresholds
+     * where dispatch geometry may change. Larger intervals contribute the
+     * first row, last row, and exact upper bucket so both open-interval behavior
+     * and threshold dispatch are exercised.
      */
     inline std::vector<NativeVNNIPrefillBucketEquivalenceCase>
     nativeVNNIPrefillBucketEquivalenceCases()
@@ -114,8 +114,7 @@ namespace llaminar2::test
                     "NativeVNNI equivalence witness exceeds the largest "
                     "canonical graph-prefill bucket");
             }
-            if (*bucket != active_rows)
-                cases.push_back({active_rows, *bucket});
+            cases.push_back({active_rows, *bucket});
         };
 
         for (int m = first_prefill_m; m <= exhaustive_m; ++m)
@@ -133,6 +132,7 @@ namespace llaminar2::test
                 continue;
             add_active_rows(lower + 1);
             add_active_rows(upper - 1);
+            add_active_rows(upper);
         }
 
         std::sort(

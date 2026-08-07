@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 using ROCmNativeVNNIGemmShardFn = bool (*)(
@@ -42,6 +43,66 @@ using ROCmNativeVNNIGridInitShardFn = bool (*)(
     const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid,
     const void *h_iq1s_grid);
+
+/**
+ * @brief Publish the concrete prefill template selected by one host launch.
+ *
+ * The dispatcher stores this capture-time diagnostic in thread-local host
+ * state. It never participates in graph replay or device execution; its sole
+ * purpose is to let trainer and PerfStats tooling turn an AUTO decision into a
+ * concrete, reproducible launch tuple without reconstructing policy logic.
+ */
+extern "C" void rocmNativeVNNIPrefill_recordLastLaunchSelection(
+    uint8_t codebook_id,
+    int n_tile,
+    int m_tile,
+    int min_blocks,
+    int unroll,
+    bool full_tiles,
+    const void *function,
+    int block_threads);
+
+/**
+ * @brief Query the last concrete NativeVNNI prefill launch on this host thread.
+ *
+ * @param codebook_id Receives the selected runtime codebook.
+ * @param n_tile Receives the output-column tile width.
+ * @param m_tile Receives the row tile height.
+ * @param min_blocks Receives the compile-time launch-bounds occupancy target.
+ * @param unroll Receives the compile-time K-group unroll factor.
+ * @return True after at least one launch was published on the calling thread.
+ */
+extern "C" bool rocmNativeVNNIPrefill_getLastLaunchSelection(
+    uint8_t *codebook_id,
+    int *n_tile,
+    int *m_tile,
+    int *min_blocks,
+    int *unroll,
+    bool *full_tiles);
+
+/**
+ * @brief Query immutable compiler resources for the last selected kernel.
+ *
+ * The launch publisher stores only the function identity and block geometry.
+ * Resource inspection occurs when trainer or diagnostic code asks for it, so
+ * ordinary graph construction does not pay a `hipFuncGetAttributes` or
+ * occupancy-query cost for every projection.
+ *
+ * @param registers_per_thread Receives allocated VGPR count.
+ * @param local_memory_bytes_per_thread Receives compiler scratch bytes; a
+ *        non-zero value makes a tuning candidate ineligible for promotion.
+ * @param static_shared_memory_bytes Receives static LDS bytes.
+ * @param max_threads_per_block Receives the compiler block-size ceiling.
+ * @param max_active_blocks_per_sm Receives theoretical active blocks for the
+ *        exact captured block geometry.
+ * @return True when launch identity exists and both HIP queries succeed.
+ */
+extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
+    int *registers_per_thread,
+    size_t *local_memory_bytes_per_thread,
+    size_t *static_shared_memory_bytes,
+    int *max_threads_per_block,
+    int *max_active_blocks_per_sm);
 
 #define LLAMINAR_DECLARE_ROCM_NVNNI_GEMM_SHARD(INDEX)                   \
     extern "C" bool rocmGemm_native_vnni_fp32_shard_##INDEX(           \

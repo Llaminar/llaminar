@@ -49,6 +49,7 @@
 #include "stages/MTPConcatStage.h"
 #include "stages/MTPVerifierPreparationStage.h"
 #include "stages/MTPVerifierOutcomeStage.h"
+#include "stages/PrefillChunkMaterializationStage.h"
 
 namespace llaminar2
 {
@@ -86,6 +87,20 @@ namespace llaminar2
             const FusedQKVGEMMStage::Params &params);
 
         /**
+         * @brief Create an explicit fused K/V-only projection stage.
+         *
+         * The factory owns the projection policy so graph builders cannot
+         * accidentally retain query weights or outputs while claiming to build
+         * a K/V cache-publication transaction.
+         *
+         * @param params K/V projection parameters with every Q field unset.
+         * @return Stage that quantizes the shared activation once and projects K/V.
+         * @throws std::invalid_argument when any query field is populated.
+         */
+        static std::unique_ptr<IComputeStage> createFusedKVGEMM(
+            FusedQKVGEMMStage::Params params);
+
+        /**
          * @brief Create a fused Gate/Up GEMM stage for FFN
          *
          * This stage quantizes input once and runs gate + up projections using a
@@ -115,6 +130,22 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createRoPE(
             const RoPEStage::Params &params);
+
+        /**
+         * @brief Create an in-place K-only RoPE cache-publication stage.
+         *
+         * This typed constructor rejects query and separate-output state. It is
+         * used only when the graph stores post-RoPE K; RoPE-on-read graphs omit
+         * the stage entirely.
+         *
+         * @param params K operand, positive KV-head count, geometry, positions,
+         *               and K buffer ownership.
+         * @return A stage whose sole tensor transaction is K in/out.
+         * @throws std::invalid_argument if query, output, skip, or ambiguous
+         *         head-count state is supplied.
+         */
+        static std::unique_ptr<IComputeStage> createKeyOnlyRoPE(
+            RoPEStage::Params params);
 
         // =====================================================================
         // FFN and Residual
@@ -321,6 +352,10 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMTPVerifierPreparation(
             const MTPVerifierPreparationStage::Params &params);
+
+        /** @brief Create the captured device-owned long-prefill chunk publisher. */
+        static std::unique_ptr<IComputeStage> createPrefillChunkMaterialization(
+            const PrefillChunkMaterializationStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

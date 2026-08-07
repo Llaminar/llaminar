@@ -96,9 +96,9 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
     // Qwen3.5 has the main layer buffers, compact LM-head verifier row
-    // scratch, and 20 MTP verifier sidecar buffers including the phase-split
+    // scratch, and 21 MTP verifier sidecar buffers including the phase-split
     // full-prefill KV handoff rows and conditional CPU GlobalTP gather arena.
-    EXPECT_EQ(reqs.buffers.size(), 41u) << "Expected 41 layer buffers";
+    EXPECT_EQ(reqs.buffers.size(), 42u) << "Expected 42 layer buffers";
 
     // ── Shared buffers ──
 
@@ -527,7 +527,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 41u);
+    EXPECT_EQ(reqs.buffers.size(), 42u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");

@@ -732,6 +732,31 @@ TEST(Test__StageBufferContract, PreallocatedInOutSkipsWritePreparationOnly)
     EXPECT_EQ(write_preps[0].id, BufferId::ATTN_OUTPUT);
 }
 
+TEST(Test__StageBufferContract, PreallocatedOutputIsWriteOnlyAndSkipsRebinding)
+{
+    auto contract = StageBufferContract::build()
+                        .addInput(BufferId::STOCHASTIC_BATCH_OUTPUT_META)
+                        .addPreallocatedOutput(
+                            BufferId::MTP_CONDITION_TOKEN,
+                            "INT32");
+
+    ASSERT_EQ(contract.outputs.size(), 1u);
+    EXPECT_EQ(contract.outputs[0].id, BufferId::MTP_CONDITION_TOKEN);
+    EXPECT_EQ(contract.outputs[0].access, BufferAccess::WRITE);
+    EXPECT_FALSE(contract.outputs[0].prepare_write_storage);
+
+    const auto reads = contract.allArenaReads();
+    ASSERT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads[0].id, BufferId::STOCHASTIC_BATCH_OUTPUT_META)
+        << "A persistent output mailbox must not become a graph-frontier read";
+
+    const auto writes = contract.allWrites();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].id, BufferId::MTP_CONDITION_TOKEN);
+    EXPECT_TRUE(contract.writesRequiringPrepare().empty())
+        << "Setup-owned mailbox storage must retain its capture-time address";
+}
+
 TEST(Test__StageBufferContract, WorkspaceBinding)
 {
     auto contract = StageBufferContract::build()

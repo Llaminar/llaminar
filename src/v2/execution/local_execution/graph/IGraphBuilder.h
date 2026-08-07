@@ -41,6 +41,7 @@ namespace llaminar2
     class ITPContext;
     class PreparedWeightStore;
     class IModelContext;
+    class IBackend;
     struct PrefixFingerprintMaterial;
     struct DeviceMoELayerRuntime;
 
@@ -110,6 +111,52 @@ namespace llaminar2
                        static_cast<size_t>(request_count) &&
                    shifted_cached_tokens_device.size() ==
                        static_cast<size_t>(request_count);
+        }
+    };
+
+    /**
+     * @brief Immutable-address contract for a captured long-prefill chunk view.
+     *
+     * Request admission owns one complete token/position bank. A bucketed GPU
+     * graph must not ask the host to slice that bank or upload a new row for
+     * every replay. Instead, the graph begins with one materialization stage
+     * that derives its relative source offset from the canonical device KV
+     * count, copies the current bucket into stable arena storage, pads its tail,
+     * and publishes the real row count plus physical stride.
+     *
+     * The cached-token count is deliberately the progression authority. There
+     * is no second chunk cursor that could diverge from KV state after prefix
+     * restore, graph replay, or an interrupted request. Every pointer and scalar
+     * below is immutable graph identity; values behind the pointers are live
+     * stream-ordered device state.
+     */
+    struct DevicePrefillChunkGraphBinding
+    {
+        IBackend *backend = nullptr; ///< Backend that owns the graph-capturable preparation primitive.
+        const int32_t *request_token_ids_device = nullptr; ///< Complete admitted request-token bank.
+        const int32_t *request_position_ids_device = nullptr; ///< Complete admitted absolute-position bank.
+        const int32_t *request_total_rows_device = nullptr; ///< Admitted logical request length.
+        const int32_t *cached_tokens_device = nullptr; ///< Canonical live main-KV progress counter.
+        int32_t *chunk_token_ids_device = nullptr; ///< Stable physical bucket consumed by embedding.
+        int32_t *chunk_position_ids_device = nullptr; ///< Stable physical bucket consumed by RoPE.
+        int32_t *chunk_real_rows_device = nullptr; ///< Current logical row count consumed by stateful stages.
+        int32_t *chunk_row_stride_device = nullptr; ///< Current immutable physical bucket stride.
+        int request_row_capacity = 0; ///< Flattened rows available in the admitted request bank.
+        int bucket_seq_len = 0; ///< Physical graph width materialized on every replay.
+        int pad_token_id = 0; ///< Deterministic token used for inactive bucket rows.
+        uint64_t capture_identity = 0; ///< Complete pointer/geometry identity used by graph caching.
+
+        /** @return true when every captured address and geometry field is complete. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return backend && request_token_ids_device &&
+                   request_position_ids_device && request_total_rows_device &&
+                   cached_tokens_device && chunk_token_ids_device &&
+                   chunk_position_ids_device && chunk_real_rows_device &&
+                   chunk_row_stride_device && request_row_capacity > 0 &&
+                   bucket_seq_len > 0 &&
+                   bucket_seq_len <= request_row_capacity &&
+                   capture_identity != 0;
         }
     };
 
@@ -298,10 +345,10 @@ namespace llaminar2
          * @brief Optional device-resident INT32 token IDs.
          *
          * GPU verifier and sidecar graphs can use this to keep token IDs in
-         * arena/workspace memory across graph capture/replay. When this pointer
-         * is set, embedding stages treat it as the execution source of truth;
-         * `token_ids` may still be populated as a stable host shadow for logs,
-         * cache bookkeeping, and CPU-only helpers.
+         * arena/workspace memory across graph capture/replay. GPU callers must
+         * leave `token_ids` null when this pointer is set: carrying two live
+         * representations would make token ownership ambiguous and permit a
+         * stale host shadow to re-enter graph construction.
          */
         const void *token_ids_device = nullptr;
         const int *position_ids = nullptr; ///< Host position IDs [batch_size * seq_len]
@@ -310,10 +357,10 @@ namespace llaminar2
          *
          * Phase 10 resident MTP continuation can publish the next logical
          * positions directly in device memory.  GPU RoPE stages should consume
-         * this pointer without recording a host-to-device copy.  The host
-         * `position_ids` pointer may still be set for CPU execution, logging,
-         * and graph-key bookkeeping, but device execution must treat this
-         * pointer as the source of truth when it is present.
+         * this pointer without recording a host-to-device copy. GPU callers
+         * must leave `position_ids` null when it is present; diagnostics may
+         * observe device state explicitly but may not retain a competing host
+         * owner in the production input contract.
          */
         const void *position_ids_device = nullptr;
         /**
@@ -428,6 +475,16 @@ namespace llaminar2
          * field empty.
          */
         std::optional<ShiftedMTPPrefillGraphBinding> shifted_mtp_prefill;
+
+        /**
+         * @brief Optional captured materialization of one admitted prefill chunk.
+         *
+         * When present, `token_ids_device`, `position_ids_device`, and
+         * `sequence_lengths_device` name the stable chunk outputs in this
+         * binding. The preparation stage is inserted by generic graph machinery
+         * ahead of every model root, keeping model graph definitions declarative.
+         */
+        std::optional<DevicePrefillChunkGraphBinding> device_prefill_chunk;
 
         /// Batched input (alternative to token_ids)
         struct Batch

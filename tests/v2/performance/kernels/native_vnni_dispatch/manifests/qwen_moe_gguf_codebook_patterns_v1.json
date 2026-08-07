@@ -1,0 +1,6602 @@
+{
+  "schema_version": "qwen-moe-gguf-codebook-patterns-v1",
+  "sources": [
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2"
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f"
+    }
+  ],
+  "variants": [
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "MXFP4_MOE",
+      "files": [
+        {
+          "path": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3"
+        },
+        {
+          "path": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00002-of-00003.gguf",
+          "size_bytes": 49639075904,
+          "sha256": "96826e65ea619e50311763d56332ecf13f274b4d383fa3981b2c842d5c7a41fd"
+        },
+        {
+          "path": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00003-of-00003.gguf",
+          "size_bytes": 25014389152,
+          "sha256": "e3d0c53a236f6628928918ff3db806ab410b2b337d5e041076f57d9296ce47f5"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "MXFP4",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "MXFP4"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "MXFP4",
+            "up": "MXFP4",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q3_K_M",
+      "files": [
+        {
+          "path": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "e70ec702564603c9b24b03d7b456fb6ed7b9b18fc32867e350a29961c45fd3ed"
+        },
+        {
+          "path": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00002-of-00003.gguf",
+          "size_bytes": 49587318592,
+          "sha256": "f8c42a060c826b8526dd72e363b87ac23e9753f622b641af2d4ae037e435fa8b"
+        },
+        {
+          "path": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00003-of-00003.gguf",
+          "size_bytes": 6822619808,
+          "sha256": "419e7efab336499ae3a6fc25924fdf65b3954ed301f3b227bae1f83f88049bbf"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q3_K_S",
+      "files": [
+        {
+          "path": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "6a03e7a53875ad49d03d893b55db4c2341077d3ca1ded2653ff219cac4a2ef86"
+        },
+        {
+          "path": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00002-of-00003.gguf",
+          "size_bytes": 49700928800,
+          "sha256": "829930ef628eb0e5704d7b140eb5b8e01d32936e1aa4096c6b99f038f00e4c9a"
+        },
+        {
+          "path": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00003-of-00003.gguf",
+          "size_bytes": 2783141024,
+          "sha256": "5b81241abeaa770cd7cc3f546dcd8efbb7dae5c6828fbd8f3e76977fce4ca9ac"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ3_XXS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ3_S"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q4_K_M",
+      "files": [
+        {
+          "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3"
+        },
+        {
+          "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+          "size_bytes": 49968146912,
+          "sha256": "90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7"
+        },
+        {
+          "path": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf",
+          "size_bytes": 26557874144,
+          "sha256": "e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q4_K_S",
+      "files": [
+        {
+          "path": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "7ce20cdf3b3becc14f5e3db79c3f9200c2e98c80cb7a5811a8f1caf90163e24d"
+        },
+        {
+          "path": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00002-of-00003.gguf",
+          "size_bytes": 49808112224,
+          "sha256": "d44186dad0237821aec4ef172f009abce34a67c7cfc7aeb340f46d580e6fa876"
+        },
+        {
+          "path": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00003-of-00003.gguf",
+          "size_bytes": 21886070624,
+          "sha256": "d8056a5b30681878dd7aa805290b67114d838660d14523bcb56f4bb1cc1aaab3"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q4_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q5_K_M",
+      "files": [
+        {
+          "path": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "aaddf5fad610b8d681b41547f3e9a30988ce4419438e44e089cafb83843dc6e8"
+        },
+        {
+          "path": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00002-of-00003.gguf",
+          "size_bytes": 49730924512,
+          "sha256": "fc8f3008ec634667f1f931b8537154e7b25b683e5e1a99987e5388612dc5117c"
+        },
+        {
+          "path": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00003-of-00003.gguf",
+          "size_bytes": 41777351136,
+          "sha256": "ec7e3d620d8c4e926c48f7c2d3690fe7361fd3d298e99c04d1aef02feeda8d85"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q5_K_S",
+      "files": [
+        {
+          "path": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "05d04b7960379f0e7fefe6322440170f5c642e374c50528618fed11b91508e59"
+        },
+        {
+          "path": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00002-of-00003.gguf",
+          "size_bytes": 49943378208,
+          "sha256": "ea48fef91f5688ffa2af298f65490939fe1b69c7f478a3dd9d982c0cf5bb75e7"
+        },
+        {
+          "path": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00003-of-00003.gguf",
+          "size_bytes": 36431069376,
+          "sha256": "71882fc100f60a7b184c2b16a6fb6ef701f87a6dc2d33202995eb72ae2005f49"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q6_K",
+      "files": [
+        {
+          "path": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00001-of-00004.gguf",
+          "size_bytes": 10943552,
+          "sha256": "72b6bd33099fc33de1bc0e1ca512ac438e76718ad454ff7162e522720d8001c8"
+        },
+        {
+          "path": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00002-of-00004.gguf",
+          "size_bytes": 49978880768,
+          "sha256": "5e71fbfa73f7c9ffc4d4346581e355c1c3d86674c3d19647d075b6749348be04"
+        },
+        {
+          "path": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00003-of-00004.gguf",
+          "size_bytes": 49688896768,
+          "sha256": "c8b2bb81a19e4642f194abc8c00b23491ae01e29bba879008f15380122c119fb"
+        },
+        {
+          "path": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00004-of-00004.gguf",
+          "size_bytes": 1331061344,
+          "sha256": "a8902ddcfee5a906ae0be7d55b2f58a2b306b2c6b62197f3edde8e3852f9b8ab"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "Q8_0",
+      "files": [
+        {
+          "path": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf",
+          "size_bytes": 10943552,
+          "sha256": "a6cc4bf06d44a96739a200841d2335fc437fa2d790d0975baba9da8af9e228e1"
+        },
+        {
+          "path": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00002-of-00004.gguf",
+          "size_bytes": 49783204544,
+          "sha256": "81d470090559e5d87459fce8943ccdc9723b7f1b0c643f8289b7d0541ac62a1c"
+        },
+        {
+          "path": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00003-of-00004.gguf",
+          "size_bytes": 49805778720,
+          "sha256": "824422fa8fe3208b6de2c04d96e1240661b07b74f71ee69f0df1dd48360f66b9"
+        },
+        {
+          "path": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00004-of-00004.gguf",
+          "size_bytes": 30272008288,
+          "sha256": "be1ed51c1248c7accc053dca8e7f24d1b831fe1e87747c0104da4006123d68ae"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ1_M",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-IQ1_M.gguf",
+          "size_bytes": 34221749440,
+          "sha256": "a04c88f1fd1024fbb99c69cb05ab939e3fcebde4d9146a9a445b1bc053a634d9"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_XXS",
+        "Q5_K",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ2_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ2_M",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-IQ2_M.gguf",
+          "size_bytes": 39148942528,
+          "sha256": "5466fa1ac7d2dc7c213db5f3030190af5a7107ca85e9ab28b39fe7cd9c97446e"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "Q5_K",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ2_XXS",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf",
+          "size_bytes": 36637668544,
+          "sha256": "3a67140a6be1e51716ef28d32f52e3190295557c3ed04c8444a3a38eb82b756c"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ2_XXS",
+        "Q5_K",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ2_S"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ3_S",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-IQ3_S.gguf",
+          "size_bytes": 46556959936,
+          "sha256": "5e810f890244ce3e3699f1e9a3611fa6567a8f50123523a9fcf9bf4175d89947"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_S",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ3_S"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ3_XXS",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf",
+          "size_bytes": 44745020608,
+          "sha256": "a40f83c53128a739814132f30a442b029d02ff3224e32d0f52946427d48efe3c"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_XXS",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ4_NL",
+      "files": [
+        {
+          "path": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "fc335f1c4e1ea2979f61c5258094e4d1c30908396b210c2680450f859bce4015"
+        },
+        {
+          "path": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00002-of-00003.gguf",
+          "size_bytes": 49809599168,
+          "sha256": "8f2a1eb4d6cc73187e94926be9fa9d39d74ac05159814be0395943a223e141dc"
+        },
+        {
+          "path": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00003-of-00003.gguf",
+          "size_bytes": 11616927488,
+          "sha256": "4f29b916cc5c31d1123fee0ed4ffa1afe7e3f98314cdaf75aa2d5d7fe14c0dd7"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_NL",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_NL"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-IQ4_XS",
+      "files": [
+        {
+          "path": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "1bd4c860d2300566087683d8b971830eaea466eec8f8c5ee69f9ddc2bcea3613"
+        },
+        {
+          "path": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00002-of-00003.gguf",
+          "size_bytes": 49719606080,
+          "sha256": "1f77e62d600cb255e327e76ffa058755d1de2b8a1872dd58c89eeb5f8c90e7e8"
+        },
+        {
+          "path": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00003-of-00003.gguf",
+          "size_bytes": 10498961024,
+          "sha256": "c644a84cedb93cb85aaedc9bf711d6a388d8205a59566638a9eb1f5c8afd04f2"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_XS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q2_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf",
+          "size_bytes": 41845347520,
+          "sha256": "be44a62acb10d79f501d75ef3faee0219b50b305352f3db4bad13f76591121bd"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ2_XS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "IQ2_XS",
+            "up": "IQ2_XS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q3_K_XL",
+      "files": [
+        {
+          "path": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "e70ec702564603c9b24b03d7b456fb6ed7b9b18fc32867e350a29961c45fd3ed"
+        },
+        {
+          "path": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00002-of-00003.gguf",
+          "size_bytes": 49772068672,
+          "sha256": "94e50d2d9e65e216dc3ced9cd8cae8a5036e9c27b651c8f63ad7eb785a421f01"
+        },
+        {
+          "path": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00003-of-00003.gguf",
+          "size_bytes": 7187524256,
+          "sha256": "fd42cf1f8bae5ce0b4d4d3f39cc066745c41dfd7311785c72745887700377b06"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "IQ4_XS",
+            "up": "IQ4_XS",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q4_K_XL",
+      "files": [
+        {
+          "path": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3"
+        },
+        {
+          "path": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00002-of-00003.gguf",
+          "size_bytes": 49640779424,
+          "sha256": "ecdbd42d43b0df9fa0ef9a584e09e95a43966ef03a122aba0b87a99d44d9ad98"
+        },
+        {
+          "path": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00003-of-00003.gguf",
+          "size_bytes": 27378273056,
+          "sha256": "13300e0f059e6fa21aa0fabde2a554f9deea366c0e54f268045769b214b28c97"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q5_K_XL",
+      "files": [
+        {
+          "path": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00001-of-00003.gguf",
+          "size_bytes": 10943552,
+          "sha256": "aaddf5fad610b8d681b41547f3e9a30988ce4419438e44e089cafb83843dc6e8"
+        },
+        {
+          "path": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00002-of-00003.gguf",
+          "size_bytes": 49730924512,
+          "sha256": "fc8f3008ec634667f1f931b8537154e7b25b683e5e1a99987e5388612dc5117c"
+        },
+        {
+          "path": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00003-of-00003.gguf",
+          "size_bytes": 42186295776,
+          "sha256": "d2d333a474b940936d58f81aafa64c48ae19b07abdf7294f5c98f51d6fa3d13d"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q6_K_XL",
+      "files": [
+        {
+          "path": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf",
+          "size_bytes": 10943552,
+          "sha256": "72b6bd33099fc33de1bc0e1ca512ac438e76718ad454ff7162e522720d8001c8"
+        },
+        {
+          "path": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00002-of-00004.gguf",
+          "size_bytes": 49987450912,
+          "sha256": "a77ad76dfbd31565e6bc6fe7b380ae0b1092fdd04410ea016acd2c4f7d006670"
+        },
+        {
+          "path": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00003-of-00004.gguf",
+          "size_bytes": 49825630496,
+          "sha256": "3b751ddbc1e662fab8dfea10d06d35e8aa4d480a294ee7c1db2115fbd1dfdaae"
+        },
+        {
+          "path": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00004-of-00004.gguf",
+          "size_bytes": 12577224960,
+          "sha256": "8583d095c8d0289a893265a53f953bce21682adbd9b0e9656cfcadd5776ca7a1"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            46
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "variant_id": "UD-Q8_K_XL",
+      "files": [
+        {
+          "path": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf",
+          "size_bytes": 10943552,
+          "sha256": "7912a946792c2fcdb5c63596c97aefe680fa0bb2eae6c0c60ffa76f7f41c2479"
+        },
+        {
+          "path": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00002-of-00005.gguf",
+          "size_bytes": 49716898944,
+          "sha256": "59ad6ec60382613e8c0bf692002cfe301057e9b4d938416943cd2ea28d1ec647"
+        },
+        {
+          "path": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00003-of-00005.gguf",
+          "size_bytes": 49184599296,
+          "sha256": "89c4c27ffa0a478a0de72199ce0a0611361ee24791e93a674678bd6372483b57"
+        },
+        {
+          "path": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00005.gguf",
+          "size_bytes": 49963962272,
+          "sha256": "b74d5bc0a2bad0f8b0cb7a027fc80922860770d3d78361592393d33972b312d3"
+        },
+        {
+          "path": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00005-of-00005.gguf",
+          "size_bytes": 21961757088,
+          "sha256": "a1dd0addf37701b3089f234d48e777ac92b8f4c6f3e14dd819b915888138c913"
+        }
+      ],
+      "block_count": 48,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 1024,
+      "shared_expert_width": 1024,
+      "observed_formats": [
+        "F16",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "F16"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "F16"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "F16"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "MXFP4_MOE",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-MXFP4_MOE.gguf",
+          "size_bytes": 21587638912,
+          "sha256": "0f135a59159030f4710477abc6f9922d2f13552c85bff736deaaef71023cd770"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "MXFP4",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "MXFP4"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "MXFP4",
+            "up": "MXFP4",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q3_K_M",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q3_K_M.gguf",
+          "size_bytes": 16356375168,
+          "sha256": "5607c8fcc8b04ada7d1a1152b9a5b6c1e67e6768232c16f6b03d9719d5ab1b2d"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q3_K_S",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q3_K_S.gguf",
+          "size_bytes": 15265856128,
+          "sha256": "315cce210c0406ae05c4e482ceba154c9225fa0bb4c9e779465209dec08e625d"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ3_XXS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ3_S"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q4_K_M",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+          "size_bytes": 22016023168,
+          "sha256": "3b46d1066bc91cc2d613e3bc22ce691dd77e6f0d33c9060690d24ce6de494375"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q4_K_S",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+          "size_bytes": 20673845888,
+          "sha256": "ee93ceffed5ce4df8b09bcbaf59a286d531025a1ebde9cf204c74e800c47d57e"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q5_K_M",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q5_K_M.gguf",
+          "size_bytes": 26249607808,
+          "sha256": "93198787ca7744a813f437317ff086b9abeb3f6fabbd5fa5702aa893fa315d89"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q5_K_S",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q5_K_S.gguf",
+          "size_bytes": 24823544448,
+          "sha256": "ac6ea71c0a694e6e90554f8cb0daacecb7873b93a08ad009d1d524c322a2d25c"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q6_K",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q6_K.gguf",
+          "size_bytes": 28852861568,
+          "sha256": "56ddab06cc049b66fee8cff294c0b0e5e848f3381ed0da1a3a16a7bd80e8280a"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "Q8_0",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q8_0.gguf",
+          "size_bytes": 36903139968,
+          "sha256": "3808866c016ab02b4adb26b873f7008a2cdd2c0704a39704050119ab0631db46"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ2_M",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ2_M.gguf",
+          "size_bytes": 11391613568,
+          "sha256": "187b5bbb81d7ec1dc228cb04120302cc0d486cb3c988501af87e5f02e15ace0e"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "Q5_K",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ2_XXS",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
+          "size_bytes": 10656955008,
+          "sha256": "2a809de317cfd49ac9130b95619ee6ac039a855e467015b3e996eb61af84718b"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ2_XXS",
+        "Q5_K",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ2_S"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ3_S",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ3_S.gguf",
+          "size_bytes": 13583383168,
+          "sha256": "ca6e9542e9f9e34f28d59e1e335b3629825daf30a4c0b5c1ec9d2f898c061fb6"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_S",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ3_S"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ3_XXS",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf",
+          "size_bytes": 13080066688,
+          "sha256": "9f7f59280fcac9373f9122de0ed7a19e014fc14120a68b343ea46ac5f5dd96cd"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_XXS",
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ4_NL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ4_NL.gguf",
+          "size_bytes": 17821719168,
+          "sha256": "6aec31ed654fbf12f9950c98bab0a09faea433ffdc4b3acfeb55a1f050e3e444"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_NL",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_NL"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-IQ4_XS",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-IQ4_XS.gguf",
+          "size_bytes": 17486174848,
+          "sha256": "745def087c9ec34d12a94eb9b31eb52dba958b36def510b7e8f6f2e6bf1be123"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_XS",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q2_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf",
+          "size_bytes": 12156754560,
+          "sha256": "855b8d11f4b52e7ea4b9eeea2fbe3555c4d96d5b7b74702b6144810db3e77270"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_XS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_XS",
+            "up": "IQ2_XS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q3_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf",
+          "size_bytes": 16601176704,
+          "sha256": "fef37f41877128b0c82195c5cd173ca0e02394f48c7667dbf96172fa300fc945"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q5_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "IQ4_XS",
+            "up": "IQ4_XS",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q4_K_L",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q4_K_L.gguf",
+          "size_bytes": 20205632160,
+          "sha256": "b65bba850b65e989ac8c37978970b2fe2ed3aa404fcb8408c9b3f2df13e6ab0b"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "BF16",
+        "Q4_K"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "BF16"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "BF16",
+            "up": "BF16",
+            "down": "BF16"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q4_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+          "size_bytes": 22241950336,
+          "sha256": "1b0ac637dfa092bbba2793977db9485a40c4f8b42df5fe342f0076d61b66ae83"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q5_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q5_K_XL.gguf",
+          "size_bytes": 26385922688,
+          "sha256": "fa35af22dd694b8146bfb990c1227d834ee8ab83a4b91772105a14a9e09fde3d"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q6_K_S",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q6_K_S.gguf",
+          "size_bytes": 28515105440,
+          "sha256": "9812147c6c561c5229d72f14717618f9e1fc62f26a98e720569981891830b5d8"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q6_K"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q6_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf",
+          "size_bytes": 32071842432,
+          "sha256": "c5cd54592ac3a1fc20340841e57769ce8d0b685bb39d7879ab657f301c17155d"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            10
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "variant_id": "UD-Q8_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf",
+          "size_bytes": 48688560768,
+          "sha256": "86aaf646491f623ce0a7d6983ea8788e36b09d59e5543a4799ccc57ee3af15a9"
+        }
+      ],
+      "block_count": 40,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "F16",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "F16"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "F16"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "F16"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "MXFP4_MOE",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
+          "size_bytes": 22182574368,
+          "sha256": "e1a4925d2ea132576daa9cb980b1102b970d919d896936b7b6e681ef5bc3d3f6"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "MXFP4",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "MXFP4"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "MXFP4",
+            "up": "MXFP4",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "MXFP4",
+            "up": "MXFP4",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "Q8_0",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-Q8_0.gguf",
+          "size_bytes": 37801097504,
+          "sha256": "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ1_M",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ1_M.gguf",
+          "size_bytes": 11366414624,
+          "sha256": "223db8b347ebe3d75f43a0fd998eb86148c9744635066c6782662208ddc14867"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ1_M",
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q2_K",
+        "Q3_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            4,
+            5,
+            6,
+            9,
+            12,
+            13,
+            16,
+            17,
+            18,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            28,
+            29,
+            30
+          ],
+          "routed": {
+            "gate": "IQ1_M",
+            "up": "IQ1_M",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            1,
+            2,
+            3,
+            7,
+            8,
+            10,
+            11,
+            14,
+            15,
+            19,
+            27,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q3_K"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ2_M",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ2_M.gguf",
+          "size_bytes": 11882969376,
+          "sha256": "b989da14b63b29bd469cb1fab5bd16b422ab921787569b4b2bb4fd61e26129b8"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q2_K",
+        "Q3_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q3_K"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ2_XXS",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+          "size_bytes": 11819399456,
+          "sha256": "627e2b05f83088448e27861ec392d56efc2b178783cae5adfa4ad2d988441203"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ2_XXS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q2_K",
+        "Q3_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_XXS",
+            "up": "IQ2_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q3_K"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ3_S",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+          "size_bytes": 15346432288,
+          "sha256": "ab639a7f330f96c47d3e6c2dd2d6445182e7b763e17e6048dc850a71bbc9f27f"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_S",
+        "IQ4_XS",
+        "Q2_K",
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ3_XXS",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
+          "size_bytes": 14069266720,
+          "sha256": "36f9ec0e4c775f6efd3a61c1ea76f0875128469c3d012e3d9e2495a90e7a7150"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_S",
+        "IQ3_S",
+        "IQ4_XS",
+        "Q2_K",
+        "Q3_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ3_S"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_S",
+            "up": "IQ2_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q3_K"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ4_NL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ4_NL.gguf",
+          "size_bytes": 18536192288,
+          "sha256": "d0ad78047bd0a583bfcb484e9defc63112c5f1f856e310dcf88dc48f2ebeae5b"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_NL",
+        "Q3_K",
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_NL"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ4_NL",
+            "up": "IQ4_NL",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q3_K",
+            "up": "Q3_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-IQ4_XS",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf",
+          "size_bytes": 18209036576,
+          "sha256": "df27a780435b7b45c2597536112ea3cb091f8544c3d0c3318d9f4258b31f7adf"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_S",
+        "IQ4_XS",
+        "Q3_K",
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ3_S",
+            "up": "IQ3_S",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ4_XS",
+            "up": "IQ4_XS",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q3_K",
+            "up": "Q3_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q2_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf",
+          "size_bytes": 12574128416,
+          "sha256": "ed7cda7e38985b4fcff76475865135039641d2bfbac3c169df15ca770f37fb0c"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ2_XS",
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q2_K",
+        "Q3_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ2_XS",
+            "up": "IQ2_XS",
+            "down": "IQ3_XXS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ2_XS",
+            "up": "IQ2_XS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q2_K",
+            "up": "Q2_K",
+            "down": "Q3_K"
+          },
+          "shared": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q3_K_M",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q3_K_M.gguf",
+          "size_bytes": 17104402720,
+          "sha256": "8966dd0cd8c543c4228490a2a8b0e0814fc4f1e6a8e199ceed4de6754ae7b8e1"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q3_K",
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ4_XS",
+            "up": "IQ4_XS",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q3_K",
+            "up": "Q3_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q3_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+          "size_bytes": 17227569440,
+          "sha256": "3fba9ab57290b34726837521335bf9268397174f3dd662880e2d0c5264d17b81"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "IQ3_XXS",
+        "IQ4_XS",
+        "Q3_K",
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "IQ4_XS"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "IQ3_XXS",
+            "up": "IQ3_XXS",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "IQ4_XS",
+            "up": "IQ4_XS",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            40
+          ],
+          "routed": {
+            "gate": "Q3_K",
+            "up": "Q3_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q4_K_M",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+          "size_bytes": 22663387424,
+          "sha256": "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q4_K_S",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
+          "size_bytes": 21388319008,
+          "sha256": "2bee952b218e4a481430c59d8d3bdc7bae20bed0eb501326340c5fca7ae95d42"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q4_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q4_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+          "size_bytes": 22853663008,
+          "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "Q4_K",
+            "up": "Q4_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q5_K_M",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q5_K_M.gguf",
+          "size_bytes": 27087812896,
+          "sha256": "8ca8224c5519b50f286b9739f9ab1c2bc0759e02cfb6cbf48a09f0759eb2d319"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q5_K_S",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q5_K_S.gguf",
+          "size_bytes": 25538017568,
+          "sha256": "b773526fab7e47cd2da8f51c20f986f7912f0aee56811265839650c4bfd1a098"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q5_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q5_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+          "size_bytes": 27159116064,
+          "sha256": "9de9a9420f61a0bb59bb2ca1ea170a6a57f6821fa1deec915bcaef523730a919"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q5_K",
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "Q5_K",
+            "up": "Q5_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q6_K",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q6_K.gguf",
+          "size_bytes": 30011242784,
+          "sha256": "49935b04ad883c2f3d4da61f65b609d447dad67d0b08453b90abb09a1bb35464"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q6_K"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38,
+            39
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q6_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+          "size_bytes": 32611711264,
+          "sha256": "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "Q6_K",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": true,
+      "unsupported_formats": [],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            40
+          ],
+          "routed": {
+            "gate": "Q6_K",
+            "up": "Q6_K",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        }
+      ]
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "b8efbbece76dc9103a6a45b7ed95b26c3932fc5f",
+      "variant_id": "UD-Q8_K_XL",
+      "files": [
+        {
+          "path": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+          "size_bytes": 39099447584,
+          "sha256": "6c6b816537abad90b250a0972b345466028d861ddfe316d5f0de31ca6440f781"
+        }
+      ],
+      "block_count": 41,
+      "expert_count": 256,
+      "experts_per_token": 8,
+      "expert_width": 512,
+      "shared_expert_width": 512,
+      "observed_formats": [
+        "BF16",
+        "Q8_0"
+      ],
+      "native_vnni_sweepable": false,
+      "unsupported_formats": [
+        "BF16"
+      ],
+      "layer_patterns": [
+        {
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            35,
+            36,
+            37,
+            40
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            34,
+            38
+          ],
+          "routed": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "BF16"
+          },
+          "shared": {
+            "gate": "Q8_0",
+            "up": "Q8_0",
+            "down": "Q8_0"
+          }
+        },
+        {
+          "layers": [
+            39
+          ],
+          "routed": {
+            "gate": "BF16",
+            "up": "BF16",
+            "down": "BF16"
+          },
+          "shared": {
+            "gate": "BF16",
+            "up": "BF16",
+            "down": "BF16"
+          }
+        }
+      ]
+    }
+  ]
+}

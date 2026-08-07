@@ -120,6 +120,15 @@ class ROCmNativeVNNIDecodeAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not support Verifier"):
             adapt_rocm_decode_row(row, self.context())
 
+    def test_atomic_publication_evidence_is_rejected(self) -> None:
+        """A retired completion-order reduction cannot enter a corpus."""
+
+        row = self.row()
+        row["observed_path"] = "atomic_reduce"
+
+        with self.assertRaisesRegex(ValueError, "unsupported publication path"):
+            adapt_rocm_decode_row(row, self.context())
+
     def test_fast_m1_candidate_may_be_numerically_correct_without_byte_identity(self) -> None:
         row = self.row(m=1, candidate="KB8/TW24")
         row.update({

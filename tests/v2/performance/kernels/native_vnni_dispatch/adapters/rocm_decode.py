@@ -576,7 +576,12 @@ def adapt_rocm_decode_row(
         raise ValueError("installable profile is missing raw timing samples")
 
     observed_path = _required("observed_path", raw["observed_path"])
-    used_atomics = observed_path == "atomic_reduce"
+    if observed_path not in {"direct", "split_reduce"}:
+        raise ValueError(
+            "ROCm decode evidence used an unsupported publication path: "
+            f"{observed_path!r}; production permits only direct ownership or "
+            "ordered K-partition reduction"
+        )
     projection_vector = (n,)
     observation = NativeVNNIObservation(
         schema_version=SCHEMA_VERSION,
@@ -624,8 +629,8 @@ def adapt_rocm_decode_row(
         serial_m1_policy_id=ROCM_DECODE_SERIAL_POLICY_ID,
         serial_m1_policy_hash=context.serial_m1_policy_hash,
         candidate_policy_hash=candidate.candidate_policy_hash(),
-        ordered_reduction=candidate.ordered_reduction and not used_atomics,
-        uses_atomic_reduction=candidate.uses_atomic_reduction or used_atomics,
+        ordered_reduction=candidate.ordered_reduction,
+        uses_atomic_reduction=candidate.uses_atomic_reduction,
         trial_set_hash=_trial_set_hash(raw),
         numerical_correctness=numerical_correctness,
         bitwise_equal=mismatch_count == 0,

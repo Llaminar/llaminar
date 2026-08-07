@@ -112,7 +112,7 @@ namespace llaminar2
     enum class PrefillChunkTokenAuthority
     {
         HostPaddedRows,
-        DeviceAdmissionBank,
+        DeviceResidentRows,
     };
 
     struct PrefillChunkExecutionInput
@@ -123,7 +123,7 @@ namespace llaminar2
         int token_offset = 0;            ///< Offset of this chunk in the original prompt.
         int real_count = 0;              ///< Real tokens in this chunk.
         int bucket_seq_len = 0;          ///< Fixed graph execution length for this chunk.
-        std::vector<int> token_ids;      ///< Host-owned padded rows; empty for a device admission bank.
+        std::vector<int> token_ids;      ///< Host-owned padded rows; empty for resident device rows.
         std::vector<int> position_ids;   ///< Owned absolute position IDs [batch_size * bucket_seq_len].
         std::string error;               ///< Human-readable failure reason when ok is false.
 

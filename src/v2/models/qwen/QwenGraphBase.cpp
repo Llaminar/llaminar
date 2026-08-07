@@ -3943,6 +3943,79 @@ namespace llaminar2
         return true;
     }
 
+    std::string QwenGraphBase::addKeyCachePublicationTransforms(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        int local_n_kv_heads,
+        int total_tokens,
+        const int *position_ids,
+        const void *position_ids_device,
+        DeviceId device,
+        const std::string &projection_dependency)
+    {
+        if (!buffers.K || local_n_kv_heads <= 0 || total_tokens <= 0 ||
+            projection_dependency.empty())
+        {
+            throw std::invalid_argument(
+                "K cache-publication transforms require K, positive geometry, and a producer node");
+        }
+
+        std::string key_terminal = projection_dependency;
+        if (layer.k_norm)
+        {
+            const std::string norm_node = prefix + "k_norm";
+            graph.addNode(norm_node,
+                          ComputeStageFactory::createQKNorm({
+                              .device_id = device,
+                              .input = buffers.K,
+                              .output = buffers.K,
+                              .gamma = layer.k_norm,
+                              .n_heads = local_n_kv_heads,
+                              .head_dim = config_.head_dim,
+                              .eps = config_.rms_norm_eps,
+                              .seq_len = total_tokens,
+                              .input_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                              .output_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          }),
+                          device);
+            graph.addDependency(norm_node, key_terminal);
+            key_terminal = norm_node;
+        }
+
+        if (!config_.rope_on_read)
+        {
+            const std::string rope_node = prefix + "k_rope";
+            const int pos_offset = position_ids ? position_ids[0] : 0;
+            const bool force_decode_equivalent_rope_verifier_prefill =
+                device.is_cpu() &&
+                config_.usesMTPGroupedDecodeEquivalentRows() &&
+                total_tokens > 1;
+            graph.addNode(rope_node,
+                          ComputeStageFactory::createKeyOnlyRoPE({
+                              .device_id = device,
+                              .K = buffers.K,
+                              .n_kv_heads = local_n_kv_heads,
+                              .head_dim = config_.head_dim,
+                              .pos_offset = pos_offset,
+                              .theta_base = config_.rope_theta,
+                              .seq_len = total_tokens,
+                              .partial_rotary_factor = config_.partial_rotary_factor,
+                              .position_ids = position_ids,
+                              .position_ids_device = position_ids_device,
+                              .force_decode_equivalent_verifier_prefill =
+                                  force_decode_equivalent_rope_verifier_prefill,
+                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          }),
+                          device);
+            graph.addDependency(rope_node, key_terminal);
+            key_terminal = rope_node;
+        }
+
+        return key_terminal;
+    }
+
     std::string QwenGraphBase::addRoPE(
         ComputeGraph &graph,
         const std::string &prefix,

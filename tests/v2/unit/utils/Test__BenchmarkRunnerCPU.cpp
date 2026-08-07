@@ -1884,6 +1884,15 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
         "decode",
         "cuda:0",
         {{"sync_scope", "explicit_stream"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
+        "rocm_moe_grouped_prefill_batch_invariant_calls",
+        1.0,
+        "moe",
+        "rocm:0",
+        {{"gateup_codebook_mask", "0x00000028"},
+         {"down_codebook_mask", "0x00000008"},
+         {"policy_source", "generic_mixed_codebooks"}});
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
     BenchmarkResult result;
@@ -2101,9 +2110,14 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
                         perf_stats.at("filters").end(),
                         "forward_graph"),
               perf_stats.at("filters").end());
+    EXPECT_NE(std::find(perf_stats.at("filters").begin(),
+                        perf_stats.at("filters").end(),
+                        "kernel"),
+              perf_stats.at("filters").end());
 
     bool saw_gpu_direct_transfer = false;
     bool saw_full_graph_replay = false;
+    bool saw_mixed_moe_kernel_route = false;
     bool saw_filtered_mtp = false;
     for (const auto &record : perf_stats.at("records"))
     {
@@ -2130,12 +2144,26 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
             EXPECT_DOUBLE_EQ(record.at("total_ms").get<double>(), 0.002);
             EXPECT_DOUBLE_EQ(record.at("avg_us").get<double>(), 2.0);
         }
+        if (domain == "kernel" &&
+            name == "rocm_moe_grouped_prefill_batch_invariant_calls")
+        {
+            saw_mixed_moe_kernel_route = true;
+            EXPECT_EQ(record.at("phase"), "moe");
+            EXPECT_EQ(record.at("device"), "rocm:0");
+            EXPECT_EQ(record.at("tags").at("gateup_codebook_mask"),
+                      "0x00000028");
+            EXPECT_EQ(record.at("tags").at("down_codebook_mask"),
+                      "0x00000008");
+            EXPECT_EQ(record.at("tags").at("policy_source"),
+                      "generic_mixed_codebooks");
+        }
         if (domain == "mtp")
             saw_filtered_mtp = true;
     }
 
     EXPECT_TRUE(saw_gpu_direct_transfer);
     EXPECT_TRUE(saw_full_graph_replay);
+    EXPECT_TRUE(saw_mixed_moe_kernel_route);
     EXPECT_FALSE(saw_filtered_mtp);
     PerfStatsCollector::reset();
 }
@@ -2189,6 +2217,22 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         "cuda:0",
         {{"stage", "layer_0_moe_canonical_routes_reduce_to_root"},
          {"operation", "reduce_sum"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
+        "rocm_moe_grouped_prefill_batch_invariant_calls",
+        1.0,
+        "moe",
+        "rocm:0",
+        {{"seq_len", "512"},
+         {"gateup_codebook_mask", "0x00000028"},
+         {"down_codebook_mask", "0x00000008"},
+         {"policy_source", "generic_mixed_codebooks"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
+        "unrelated_warmup_kernel",
+        1.0,
+        "warmup",
+        "rocm:0");
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
     auto runner = std::make_shared<MockCPUInferenceRunner>();
@@ -2221,6 +2265,11 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         << "Captured allreduce stage/payload evidence must survive the measured reset";
     EXPECT_TRUE(has_record("tp_rooted_collective_bom", "calls"))
         << "Captured rooted-collective stage/payload evidence must survive the measured reset";
+    EXPECT_TRUE(has_record(
+        "kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"))
+        << "A captured MoE graph must retain its exact launch-policy identity";
+    EXPECT_FALSE(has_record("kernel", "unrelated_warmup_kernel"))
+        << "Retaining one immutable kernel route must not retain the whole noisy domain";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))
         << "Non-preserved warmup counters should still be cleared before measurement";
     PerfStatsCollector::reset();

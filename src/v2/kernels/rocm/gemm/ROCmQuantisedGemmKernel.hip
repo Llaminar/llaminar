@@ -35,6 +35,7 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
+#include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 // ============================================================================
 // Apply Scales Kernel (for two-kernel approach)
@@ -433,8 +434,9 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
     local_max = __shfl(local_max, source_lane_in_wave);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     // Step 2: Write scale
     if (sub_tid == 0)
@@ -499,8 +501,9 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
     local_max = __shfl(local_max, source_lane_in_wave);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     int q = 0;
     if (sub_tid < block_len)
@@ -687,7 +690,9 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
 
     if (tid < block_len)
     {
-        int q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        const int q =
+            llaminar2::rocm::decode_equivalent::quantizeQ8(
+                val, inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 }
@@ -743,13 +748,15 @@ void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
     }
     local_max = __shfl(local_max, 0);
 
-    const float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
     const float inv_scale = 1.0f / scale;
 
     int q = 0;
     if (tid < block_len)
     {
-        q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 

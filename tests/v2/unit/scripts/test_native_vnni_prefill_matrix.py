@@ -220,10 +220,13 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
         self.assertEqual(matrix["32B_FFN_Up"], GPU_PREFILL_M_BUCKETS)
         self.assertEqual(matrix["32B_FFN_Dn"], GPU_PREFILL_M_BUCKETS)
 
-    def test_gpu_matrix_keeps_m16384_for_smaller_models(self) -> None:
+    def test_gpu_matrix_uses_every_physical_capture_for_smaller_models(self) -> None:
         matrix = {row.shape.name: row.m_values for row in gpu_prefill_measurements()}
 
         self.assertEqual(matrix["7B_FFN_Up"], GPU_PREFILL_M_BUCKETS)
+        self.assertEqual(GPU_PREFILL_M_BUCKETS[-1], 4096)
+        self.assertIn(600, GPU_PREFILL_M_BUCKETS)
+        self.assertNotIn(8192, GPU_PREFILL_M_BUCKETS)
         self.assertEqual(
             sum(len(row.m_values) for row in gpu_prefill_measurements()),
             len(gpu_prefill_measurements()) * len(GPU_PREFILL_M_BUCKETS),

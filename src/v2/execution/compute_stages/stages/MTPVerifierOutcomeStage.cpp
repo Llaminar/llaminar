@@ -95,26 +95,38 @@ namespace llaminar2
         const size_t cols =
             shape.size() >= 2 ? shape[1]
                               : (shape.empty() ? 0 : shape[0]);
-        if (!params_.logits->deviceValid() ||
-            !logits_device.has_value() ||
+        auto *logits = static_cast<const float *>(
+            params_.logits->gpu_data_ptr());
+
+        /*
+         * The LM-head node and this consumer execute inside one captured graph.
+         * Their dependency and the ALL_POSITION_LOGITS buffer contract are the
+         * temporal proof that the producer runs first. A host coherence flag
+         * cannot represent an in-graph write: consulting deviceValid() here
+         * observes capture-time host metadata and incorrectly rejects the
+         * freshly produced device row. Validate only immutable capture identity
+         * here: storage device, element type, geometry, and persistent pointer.
+         */
+        if (!logits_device.has_value() ||
             *logits_device != params_.device_id ||
+            params_.logits->native_type() != TensorType::FP32 ||
             rows < static_cast<size_t>(params_.verifier_row_count) ||
-            cols != static_cast<size_t>(params_.vocab_size))
+            cols != static_cast<size_t>(params_.vocab_size) ||
+            !logits)
         {
             LOG_ERROR("[MTPVerifierOutcomeStage] Participant-local verifier logits do not "
                       "match the captured full-vocabulary contract"
                       << " rows=" << rows
                       << " cols=" << cols
                       << " expected_rows=" << params_.verifier_row_count
-                      << " expected_cols=" << params_.vocab_size);
-            return false;
-        }
-        auto *logits = static_cast<const float *>(
-            params_.logits->gpu_data_ptr());
-        if (!logits)
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] Participant-local verifier logits have "
-                      "no prepared device storage");
+                      << " expected_cols=" << params_.vocab_size
+                      << " dtype=" << params_.logits->dtype_name()
+                      << " current_device="
+                      << (logits_device.has_value()
+                              ? logits_device->toString()
+                              : "none")
+                      << " expected_device=" << params_.device_id.toString()
+                      << " device_ptr=" << static_cast<const void *>(logits));
             return false;
         }
 
@@ -158,7 +170,7 @@ namespace llaminar2
                 params_.binding.output_tokens_device,
                 params_.binding.output_meta_device,
                 params_.binding.transaction_commit_budget_device,
-                params_.binding.penalty_policy_device))
+                params_.binding.next_leading_committed_output_count_device))
         {
             LOG_ERROR("[MTPVerifierOutcomeStage] Greedy compact outcome reduction failed");
             return false;

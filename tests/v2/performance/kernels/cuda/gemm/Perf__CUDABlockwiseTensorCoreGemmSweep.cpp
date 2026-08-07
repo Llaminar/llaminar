@@ -277,7 +277,7 @@ namespace
         std::vector<int> target_waves = {4, 8, 16};
         std::vector<int> mkg_values = {2, 4, 8};
         std::vector<int> max_kb_values = {0, 2, 4, 8};
-        std::vector<int> force_two_phase_values = {0, 1, 2};
+        std::vector<int> force_two_phase_values = {1};
         int max_cases = std::numeric_limits<int>::max();
         bool smoke = false;
         std::string csv_path = "/tmp/llaminar_cuda_tc_gemv_sweep.csv";
@@ -434,7 +434,7 @@ namespace
             cfg.target_waves = {8};
             cfg.mkg_values = {4};
             cfg.max_kb_values = {0, 4};
-            cfg.force_two_phase_values = {0, 1, 2};
+            cfg.force_two_phase_values = {1};
             cfg.max_cases = 3;
         }
 
@@ -488,7 +488,12 @@ namespace
 
         const auto force_phase = getEnvCsvInts("LLAMINAR_CUDA_TC_SWEEP_FORCE_PHASES");
         if (!force_phase.empty())
+        {
+            if (force_phase != std::vector<int>{1})
+                throw std::invalid_argument(
+                    "CUDA NativeVNNI KPAR supports only ordered publication (phase 1)");
             cfg.force_two_phase_values = force_phase;
+        }
 
         const std::string csv_path = getEnvString("LLAMINAR_CUDA_TC_SWEEP_CSV");
         if (!csv_path.empty())

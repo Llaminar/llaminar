@@ -9,17 +9,36 @@
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
+#include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
+#include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
+#include "kernels/cuda/moe/CUDAMoEKernel.h"
+#include "../native_vnni_dispatch/GPUTrainerVerification.h"
 
 #include <cuda_runtime.h>
+#include <dlfcn.h>
+
+extern "C" bool cudaMoE_grouped_prefill_query_kernel_resources(
+    uint8_t codebook_id,
+    int component,
+    int block_threads,
+    int *registers_per_thread,
+    size_t *local_memory_bytes_per_thread,
+    size_t *static_shared_memory_bytes,
+    int *max_threads_per_block,
+    int *max_active_blocks_per_sm);
 #endif
 
 #include <algorithm>
@@ -29,6 +48,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
@@ -37,6 +57,9 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -212,6 +235,65 @@ namespace
         if (end == value || parsed <= 0)
             return fallback;
         return static_cast<int>(parsed);
+    }
+
+    /** Parse a strictly positive finite environment scalar. */
+    double envPositiveDouble(const char *name, double fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return fallback;
+        char *end = nullptr;
+        const double parsed = std::strtod(value, &end);
+        if (end == value || *end != '\0' || !std::isfinite(parsed) ||
+            parsed <= 0.0)
+        {
+            throw std::runtime_error(
+                std::string(name) + " must be a positive finite scalar");
+        }
+        return parsed;
+    }
+
+    /** Parse a comma-separated positive integer inventory without duplicates. */
+    std::vector<int> envCsvPositiveInts(
+        const char *name,
+        std::initializer_list<int> fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return std::vector<int>(fallback);
+
+        std::vector<int> result;
+        std::string csv(value);
+        size_t start = 0;
+        while (start <= csv.size())
+        {
+            const size_t comma = csv.find(',', start);
+            const std::string token = csv.substr(
+                start,
+                comma == std::string::npos
+                    ? std::string::npos
+                    : comma - start);
+            char *end = nullptr;
+            const long parsed = std::strtol(token.c_str(), &end, 10);
+            if (token.empty() || end == token.c_str() || *end != '\0' ||
+                parsed <= 0 || parsed > std::numeric_limits<int>::max())
+            {
+                throw std::runtime_error(
+                    std::string(name) + " contains an invalid positive integer");
+            }
+            const int integer = static_cast<int>(parsed);
+            if (std::find(result.begin(), result.end(), integer) != result.end())
+            {
+                throw std::runtime_error(
+                    std::string(name) + " contains a duplicate value");
+            }
+            result.push_back(integer);
+            if (comma == std::string::npos)
+                break;
+            start = comma + 1;
+        }
+        return result;
     }
 
     bool envCsvContainsOrUnset(const char *name, const std::string &candidate)
@@ -888,10 +970,85 @@ namespace
 #ifdef HAVE_CUDA
 namespace
 {
+    /** Static compiler and occupancy evidence for one exact CUDA kernel. */
+    struct CudaMoEPrefillKernelResources
+    {
+        int registers_per_thread = 0;
+        size_t local_memory_bytes_per_thread = 0;
+        size_t static_shared_memory_bytes = 0;
+        int max_threads_per_block = 0;
+        int max_active_blocks_per_sm = 0;
+
+        /** @return true when ptxas emitted no local-memory scratch. */
+        [[nodiscard]] bool spillFree() const noexcept
+        {
+            return local_memory_bytes_per_thread == 0;
+        }
+    };
+
+    /**
+     * @brief Inspect one exact CUDA grouped-prefill production component.
+     *
+     * A failed query is fatal to the harness. Timing an uninspected kernel
+     * would violate the corpus contract because a spilling specialization
+     * could appear to win before profiler evidence later disqualified it.
+     */
+    CudaMoEPrefillKernelResources queryCudaMoEPrefillKernelResources(
+        uint8_t execution_codebook,
+        int component,
+        int block_threads)
+    {
+        CudaMoEPrefillKernelResources resources{};
+        if (!cudaMoE_grouped_prefill_query_kernel_resources(
+                execution_codebook,
+                component,
+                block_threads,
+                &resources.registers_per_thread,
+                &resources.local_memory_bytes_per_thread,
+                &resources.static_shared_memory_bytes,
+                &resources.max_threads_per_block,
+                &resources.max_active_blocks_per_sm))
+        {
+            throw std::runtime_error(
+                "failed to inspect compiled CUDA MoE grouped-prefill kernel");
+        }
+        return resources;
+    }
+
     bool hasCudaDevice()
     {
         int count = 0;
         return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+    }
+
+    /**
+     * @brief Invoke one CUDA driver profiler-control entry point by symbol.
+     *
+     * CUDA 13 exports `cuProfilerStart` and `cuProfilerStop` from the driver,
+     * while the minimal development image does not install the historical
+     * runtime profiler header. Resolving the stable driver ABI keeps profiler
+     * controls inside this performance-only harness and prevents production
+     * code from acquiring a dependency on Nsight tooling.
+     *
+     * @param symbol Exact CUDA driver symbol to invoke.
+     * @return true only when the symbol exists and reports success.
+     */
+    bool invokeCudaMoEProfilerControl(const char *symbol)
+    {
+        if (!symbol || *symbol == '\0')
+            return false;
+        using ControlFunction = int (*)();
+        static void *driver = []
+        {
+            return ::dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+        }();
+        if (!driver)
+            return false;
+        ::dlerror();
+        void *raw = ::dlsym(driver, symbol);
+        if (!raw || ::dlerror() != nullptr)
+            return false;
+        return reinterpret_cast<ControlFunction>(raw)() == 0;
     }
 
     class ScopedCudaMoEPrefillConfig
@@ -922,32 +1079,316 @@ namespace
         bool old_fuse_swiglu_ = true;
     };
 
-    class ScopedCudaMoEGemmConfig
+    /** Restore capture-time CUDA MoE launch geometry after one trainer cell. */
+    class ScopedCudaMoEGeometryConfig
     {
     public:
-        ScopedCudaMoEGemmConfig()
-            : old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
-              old_down_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kparts)
+        ScopedCudaMoEGeometryConfig()
+            : old_gateup_tile_n_(
+                  llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n),
+              old_gateup_override_active_(
+                  llaminar2::mutableDebugEnv().gemm
+                      .cuda_moe_gateup_ordered_kpart_tile_n_override_active),
+              old_down_tile_n_(
+                  llaminar2::mutableDebugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n)
         {
         }
 
-        ~ScopedCudaMoEGemmConfig()
+        ~ScopedCudaMoEGeometryConfig()
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kparts = old_gateup_kparts_;
-            gemm.cuda_moe_down_kparts = old_down_kparts_;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n = old_gateup_tile_n_;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active =
+                old_gateup_override_active_;
+            gemm.cuda_moe_down_ordered_kpart_tile_n = old_down_tile_n_;
         }
 
-        void set(int gateup_kparts, int down_kparts)
+        /**
+         * @brief Force one arithmetic-neutral gate/up block width.
+         *
+         * K-partitions and direct-down warps are fixed by
+         * `CUDAMoEBatchInvariantPolicy`; only this block geometry may enter a
+         * work-size-dependent dispatch overlay.
+         */
+        void setGateUpTileN(int gateup_tile_n)
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kparts = gateup_kparts;
-            gemm.cuda_moe_down_kparts = down_kparts;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n = gateup_tile_n;
+            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active = true;
         }
 
     private:
-        int old_gateup_kparts_ = 16;
-        int old_down_kparts_ = 16;
+        int old_gateup_tile_n_ = 128;
+        bool old_gateup_override_active_ = false;
+        int old_down_tile_n_ = 128;
+    };
+
+    /** One arithmetic-neutral CUDA production launch candidate. */
+    struct CudaMoEProductionCandidate
+    {
+        int gateup_tile_n = 128;
+
+        /** @brief Return a stable corpus identity for this launch policy. */
+        std::string id() const
+        {
+            return "g_tn" + std::to_string(gateup_tile_n) +
+                   "__d_fixed";
+        }
+    };
+
+    /** @brief Enumerate the complete non-dominated CUDA top-8 candidate space. */
+    std::vector<CudaMoEProductionCandidate> cudaMoEProductionCandidates()
+    {
+        constexpr std::array<int, 7> gateup_tile_n{
+            64, 96, 128, 160, 192, 224, 256,
+        };
+        std::vector<CudaMoEProductionCandidate> result;
+        result.reserve(gateup_tile_n.size());
+        for (const int gate_width : gateup_tile_n)
+        {
+            result.push_back(CudaMoEProductionCandidate{
+                .gateup_tile_n = gate_width,
+            });
+        }
+        return result;
+    }
+
+    /**
+     * @brief Resolve one exact CUDA candidate identity for isolated profiling.
+     *
+     * Profiler evidence is meaningful only when the requested corpus identity
+     * maps to exactly one launch geometry. Unknown or partial spellings are
+     * rejected instead of silently selecting the generic production geometry.
+     *
+     * @param candidate_id Stable candidate identity from the timing corpus.
+     * @return Exact candidate when the identity is in the launch registry.
+     */
+    std::optional<CudaMoEProductionCandidate> findCudaMoEProductionCandidate(
+        const std::string &candidate_id)
+    {
+        for (const auto &candidate : cudaMoEProductionCandidates())
+        {
+            if (candidate.id() == candidate_id)
+                return candidate;
+        }
+        return std::nullopt;
+    }
+
+    /** Stable two-stage timing policy for one CUDA production sweep cell. */
+    struct CudaMoEProductionSweepSettings
+    {
+        int screening_warmups = 1;
+        int screening_trials = 3;
+        int screening_replays = 2;
+        int robust_warmups = 2;
+        int robust_trials = 15;
+        int robust_replays = 4;
+        int minimum_finalists = 7;
+        int maximum_finalists = 7;
+        double finalist_margin = 0.05;
+        std::string profiler_request_id;
+        std::optional<CudaMoEProductionCandidate> profiler_candidate;
+
+        /** @return true when this process owns one isolated profiler launch. */
+        [[nodiscard]] bool profiling() const noexcept
+        {
+            return !profiler_request_id.empty();
+        }
+    };
+
+    /** Screening, resource, and correctness evidence for one CUDA geometry. */
+    struct CudaMoEProductionEvidence
+    {
+        CudaMoEProductionCandidate candidate;
+        CudaMoEPrefillKernelResources gateup_resources;
+        CudaMoEPrefillKernelResources down_resources;
+        std::vector<double> screening_samples_ms;
+        std::vector<double> robust_samples_ms;
+        int screening_replays_per_sample = 0;
+        int robust_replays_per_sample = 0;
+        uint64_t bit_mismatches = 0;
+        uint64_t first_bit_mismatch = std::numeric_limits<uint64_t>::max();
+        bool route_counter_ok = false;
+        bool finalist = false;
+        bool winner = false;
+
+        /** @return Robust samples when available, otherwise screening samples. */
+        const std::vector<double> &selectedSamplesMs() const
+        {
+            return robust_samples_ms.empty()
+                       ? screening_samples_ms
+                       : robust_samples_ms;
+        }
+
+        /** @return Replay cardinality associated with `selectedSamplesMs()`. */
+        int selectedReplaysPerSample() const
+        {
+            return robust_samples_ms.empty()
+                       ? screening_replays_per_sample
+                       : robust_replays_per_sample;
+        }
+
+        /** @return Selected median latency in microseconds. */
+        double medianUs() const
+        {
+            const auto &samples = selectedSamplesMs();
+            return samples.empty()
+                       ? std::numeric_limits<double>::infinity()
+                       : samples[samples.size() / 2] * 1000.0;
+        }
+    };
+
+    /** Own one non-default CUDA stream for a complete production sweep cell. */
+    class ScopedCudaMoEPrefillStream
+    {
+    public:
+        ScopedCudaMoEPrefillStream()
+        {
+            if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) !=
+                cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to create CUDA MoE production sweep stream");
+            }
+        }
+
+        ScopedCudaMoEPrefillStream(const ScopedCudaMoEPrefillStream &) = delete;
+        ScopedCudaMoEPrefillStream &operator=(
+            const ScopedCudaMoEPrefillStream &) = delete;
+
+        ~ScopedCudaMoEPrefillStream()
+        {
+            if (stream_)
+                (void)cudaStreamDestroy(stream_);
+        }
+
+        /** @return Exact non-default CUDA stream owned by this cell. */
+        cudaStream_t get() const noexcept
+        {
+            return stream_;
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+
+    /** Unbind graph workspace before its manager leaves scope. */
+    class ScopedCudaMoEWorkspaceBinding
+    {
+    public:
+        ScopedCudaMoEWorkspaceBinding(
+            llaminar2::IWorkspaceConsumer *consumer,
+            llaminar2::DeviceWorkspaceManager *workspace)
+            : consumer_(consumer)
+        {
+            if (!consumer_ || !workspace)
+            {
+                throw std::invalid_argument(
+                    "CUDA MoE production sweep requires a workspace binding");
+            }
+            consumer_->bindWorkspace(workspace);
+        }
+
+        ScopedCudaMoEWorkspaceBinding(
+            const ScopedCudaMoEWorkspaceBinding &) = delete;
+        ScopedCudaMoEWorkspaceBinding &operator=(
+            const ScopedCudaMoEWorkspaceBinding &) = delete;
+
+        ~ScopedCudaMoEWorkspaceBinding()
+        {
+            consumer_->unbindWorkspace();
+        }
+
+    private:
+        llaminar2::IWorkspaceConsumer *consumer_ = nullptr;
+    };
+
+    /** Close an optional C stream owned by a trainer test scope. */
+    struct CudaMoEFileCloser
+    {
+        void operator()(std::FILE *file) const noexcept
+        {
+            if (file)
+                (void)std::fclose(file);
+        }
+    };
+
+    /** Persistent CUDA counters for allocation-free byte certificates. */
+    class CudaMoEPrefillDeviceByteCertificate
+    {
+    public:
+        CudaMoEPrefillDeviceByteCertificate()
+        {
+            if (cudaMalloc(&mismatch_count_, sizeof(uint64_t)) != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to allocate persistent CUDA mismatch counter");
+            }
+            if (cudaMalloc(&first_mismatch_, sizeof(uint64_t)) != cudaSuccess)
+            {
+                (void)cudaFree(mismatch_count_);
+                mismatch_count_ = nullptr;
+                throw std::runtime_error(
+                    "failed to allocate persistent CUDA first-mismatch counter");
+            }
+        }
+
+        CudaMoEPrefillDeviceByteCertificate(
+            const CudaMoEPrefillDeviceByteCertificate &) = delete;
+        CudaMoEPrefillDeviceByteCertificate &operator=(
+            const CudaMoEPrefillDeviceByteCertificate &) = delete;
+
+        ~CudaMoEPrefillDeviceByteCertificate()
+        {
+            if (first_mismatch_)
+                (void)cudaFree(first_mismatch_);
+            if (mismatch_count_)
+                (void)cudaFree(mismatch_count_);
+        }
+
+        /** @brief Compare two device tensors and materialize two terminal words. */
+        std::pair<uint64_t, uint64_t> compare(
+            const float *actual,
+            const float *expected,
+            size_t count,
+            cudaStream_t stream)
+        {
+            if (!llaminar2::test::enqueueCudaFP32ByteComparison(
+                    actual,
+                    expected,
+                    count,
+                    mismatch_count_,
+                    first_mismatch_,
+                    stream))
+            {
+                throw std::runtime_error(
+                    "failed to enqueue CUDA MoE byte certificate");
+            }
+            uint64_t host_count = 0;
+            uint64_t host_first = std::numeric_limits<uint64_t>::max();
+            if (cudaMemcpyAsync(
+                    &host_count,
+                    mismatch_count_,
+                    sizeof(host_count),
+                    cudaMemcpyDeviceToHost,
+                    stream) != cudaSuccess ||
+                cudaMemcpyAsync(
+                    &host_first,
+                    first_mismatch_,
+                    sizeof(host_first),
+                    cudaMemcpyDeviceToHost,
+                    stream) != cudaSuccess ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to read CUDA MoE byte certificate");
+            }
+            return {host_count, host_first};
+        }
+
+    private:
+        uint64_t *mismatch_count_ = nullptr;
+        uint64_t *first_mismatch_ = nullptr;
     };
 
     /**
@@ -966,6 +1407,240 @@ namespace
                 std::string("CUDA MoE verifier benchmark body failed during ") +
                 (phase ? phase : "unknown phase"));
         }
+    }
+
+    /** Reusable CUDA event pair for allocation-free captured-graph timing. */
+    class CudaMoEPrefillEventTimer
+    {
+    public:
+        explicit CudaMoEPrefillEventTimer(cudaStream_t stream)
+            : stream_(stream)
+        {
+            if (!stream_)
+            {
+                throw std::invalid_argument(
+                    "CUDA MoE prefill timer requires a non-null stream");
+            }
+            if (cudaEventCreate(&start_) != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to create CUDA MoE prefill start event");
+            }
+            if (cudaEventCreate(&stop_) != cudaSuccess)
+            {
+                (void)cudaEventDestroy(start_);
+                start_ = nullptr;
+                throw std::runtime_error(
+                    "failed to create CUDA MoE prefill stop event");
+            }
+        }
+
+        CudaMoEPrefillEventTimer(const CudaMoEPrefillEventTimer &) = delete;
+        CudaMoEPrefillEventTimer &operator=(
+            const CudaMoEPrefillEventTimer &) = delete;
+
+        ~CudaMoEPrefillEventTimer()
+        {
+            if (stop_)
+                (void)cudaEventDestroy(stop_);
+            if (start_)
+                (void)cudaEventDestroy(start_);
+        }
+
+        /** @brief Time repeated graph replays and return milliseconds per replay. */
+        double sample(int replays, const std::function<bool()> &launch)
+        {
+            if (replays <= 0 || !launch)
+            {
+                throw std::invalid_argument(
+                    "CUDA MoE timer requires positive replay cardinality");
+            }
+            if (cudaEventRecord(start_, stream_) != cudaSuccess)
+                throw std::runtime_error("failed to record CUDA timer start");
+            for (int replay = 0; replay < replays; ++replay)
+                requireCudaBenchBody(launch(), "CUDA candidate timing replay");
+            if (cudaEventRecord(stop_, stream_) != cudaSuccess ||
+                cudaEventSynchronize(stop_) != cudaSuccess)
+            {
+                throw std::runtime_error("failed to complete CUDA timing sample");
+            }
+            float elapsed_ms = 0.0f;
+            if (cudaEventElapsedTime(&elapsed_ms, start_, stop_) != cudaSuccess)
+                throw std::runtime_error("failed to read CUDA timing sample");
+            return static_cast<double>(elapsed_ms) /
+                   static_cast<double>(replays);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+        cudaEvent_t start_ = nullptr;
+        cudaEvent_t stop_ = nullptr;
+    };
+
+    /** @brief Prove PerfStats observed one exact forced CUDA candidate. */
+    bool observedCudaMoEProductionCandidate(
+        int rows,
+        int top_k,
+        const CudaMoEProductionCandidate &candidate)
+    {
+        const auto records = llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        for (const auto &record : records)
+        {
+            if (record.name != "cuda_moe_grouped_prefill_swiglu_path_calls")
+                continue;
+            const auto tag = [&record](const char *name) -> std::string
+            {
+                const auto found = record.tags.find(name);
+                return found == record.tags.end()
+                           ? std::string{}
+                           : found->second;
+            };
+            if (record.count > 0 &&
+                tag("seq_len") == std::to_string(rows) &&
+                tag("gateup_k_partitions") ==
+                    std::to_string(
+                        llaminar2::CUDAMoEBatchInvariantPolicy::
+                            gate_up_k_partitions) &&
+                tag("gateup_ordered_tile_n") ==
+                    std::to_string(candidate.gateup_tile_n) &&
+                tag("down_k_partitions") ==
+                    std::to_string(
+                        llaminar2::CUDAMoEBatchInvariantPolicy::
+                            down_k_partitions) &&
+                tag("down_direct_warps") ==
+                    std::to_string(
+                        llaminar2::CUDAMoEBatchInvariantPolicy::
+                            directDownWarps(top_k)) &&
+                tag("down_publication") == "fused_direct")
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Emit one authenticated aggregate row for a CUDA production candidate. */
+    void writeCudaMoEProductionEvidence(
+        std::FILE *csv,
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        const llaminar2::test::native_vnni_dispatch::MoERoutingProfileStats &route_stats,
+        int rows,
+        const CudaMoEProductionEvidence &evidence)
+    {
+        if (!csv)
+            throw std::invalid_argument("CUDA production evidence requires a CSV");
+        const auto &samples = evidence.selectedSamplesMs();
+        const auto timing =
+            llaminar2::test::trainer::summarizeSortedTimingSamples(samples);
+        const auto &gate_format = llaminar2::test::quantizedMoEVerifierFormat(
+            routed_case.routed.gate);
+        const auto &up_format = llaminar2::test::quantizedMoEVerifierFormat(
+            routed_case.routed.up);
+        const auto &down_format = llaminar2::test::quantizedMoEVerifierFormat(
+            routed_case.routed.down);
+        const int fixed_down_threads =
+            llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(
+                routed_case.experts_per_token) * 32;
+
+        std::ostringstream row;
+        row << std::setprecision(17)
+            << "cuda,moe_production_prefill,"
+            << routed_case.evidenceId() << ','
+            << llaminar2::test::native_vnni_dispatch::moeRoutingProfileName(
+                   route_profile) << ','
+            << routed_case.routed.gate << ','
+            << routed_case.routed.up << ','
+            << routed_case.routed.down << ','
+            << static_cast<unsigned>(gate_format.device_execution_codebook_id) << ','
+            << static_cast<unsigned>(up_format.device_execution_codebook_id) << ','
+            << static_cast<unsigned>(down_format.device_execution_codebook_id) << ','
+            << routed_case.hidden_size << ','
+            << routed_case.routed_expert_width << ','
+            << routed_case.expert_count << ','
+            << routed_case.experts_per_token << ','
+            << route_stats.active_experts << ','
+            << route_stats.maximum_assignments << ','
+            << route_stats.assignment_cv << ','
+            << rows << ','
+            << evidence.candidate.id() << ','
+            << 0 << ','
+            << evidence.candidate.gateup_tile_n << ','
+            << 0 << ','
+            << fixed_down_threads << ','
+            << evidence.gateup_resources.local_memory_bytes_per_thread << ','
+            << evidence.down_resources.local_memory_bytes_per_thread << ','
+            << evidence.gateup_resources.registers_per_thread << ','
+            << evidence.down_resources.registers_per_thread << ','
+            << evidence.gateup_resources.static_shared_memory_bytes << ','
+            << evidence.down_resources.static_shared_memory_bytes << ','
+            << evidence.gateup_resources.max_active_blocks_per_sm << ','
+            << evidence.down_resources.max_active_blocks_per_sm << ','
+            << evidence.screening_samples_ms.size() << ','
+            << evidence.screening_replays_per_sample << ','
+            << evidence.robust_samples_ms.size() << ','
+            << evidence.robust_replays_per_sample << ','
+            << samples.size() << ','
+            << evidence.selectedReplaysPerSample() << ','
+            << timing.min * 1000.0 << ','
+            << timing.median * 1000.0 << ','
+            << timing.p95 * 1000.0 << ','
+            << timing.mad * 1000.0 << ','
+            << timing.cv << ','
+            << timing.digest << ','
+            << evidence.bit_mismatches << ','
+            << evidence.first_bit_mismatch << ','
+            << (evidence.route_counter_ok ? 1 : 0) << ','
+            << (evidence.finalist ? 1 : 0) << ','
+            << (evidence.winner ? 1 : 0);
+        const std::string serialized = row.str();
+        std::fprintf(csv, "%s\n", serialized.c_str());
+        std::fflush(csv);
+    }
+
+    /** Retain every native CUDA event sample for later corpus authentication. */
+    void writeCudaMoEProductionTimingEvidence(
+        std::FILE *timing_csv,
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        int rows,
+        const CudaMoEProductionEvidence &evidence)
+    {
+        if (!timing_csv)
+            return;
+        const auto write_phase = [&] (
+            const char *phase,
+            const std::vector<double> &samples_ms,
+            int replays_per_sample)
+        {
+            for (size_t index = 0; index < samples_ms.size(); ++index)
+            {
+                std::fprintf(
+                    timing_csv,
+                    "cuda,moe_production_prefill,%s,%s,%d,%s,%s,%zu,%d,%.9f,%a\n",
+                    routed_case.evidenceId().c_str(),
+                    std::string(
+                        llaminar2::test::native_vnni_dispatch::
+                            moeRoutingProfileName(route_profile)).c_str(),
+                    rows,
+                    evidence.candidate.id().c_str(),
+                    phase,
+                    index,
+                    replays_per_sample,
+                    samples_ms[index] * 1000.0,
+                    samples_ms[index]);
+            }
+        };
+        write_phase(
+            "screening",
+            evidence.screening_samples_ms,
+            evidence.screening_replays_per_sample);
+        write_phase(
+            "robust",
+            evidence.robust_samples_ms,
+            evidence.robust_replays_per_sample);
+        std::fflush(timing_csv);
     }
 
     double timeCudaEvents(cudaStream_t stream, int iterations, const std::function<bool()> &body)
@@ -999,6 +1674,7 @@ namespace
         int intermediate,
         int gateup_table,
         int down_table,
+        llaminar2::DeviceId device,
         double *avg_ms)
     {
         auto *workspace_consumer =
@@ -1017,7 +1693,6 @@ namespace
             workspace_consumer->bindWorkspace(workspace);
         }
 
-        const auto device = llaminar2::DeviceId::cuda(0);
         std::vector<float> decoded;
         decoded.reserve(static_cast<size_t>(rows) * d_model);
 
@@ -1082,6 +1757,521 @@ namespace
         *avg_ms = std::chrono::duration<double, std::milli>(stop - start).count() /
                   static_cast<double>(timing_iters);
         return decoded;
+    }
+
+    /**
+     * @brief Execute one real CUDA MoE production tournament cell.
+     *
+     * Every expert owns distinct prepared weights, grouping is published once,
+     * and each non-dominated geometry captures the same production grouped
+     * pipeline. Compiler resource evidence is queried before launch, every
+     * candidate is byte-compared on device against the fixed-arithmetic
+     * reference, and timing uses a persistent event pair outside graph capture.
+     * Every M and routing profile proves that reference against serial row
+     * decode before any timing evidence can be emitted.
+     *
+     * @param routed_case Pinned GGUF source formats and production geometry.
+     * @param rows Exact prefill bucket represented by this cell.
+     * @param route_profile Deterministic expert-load distribution under test.
+     * @param device_ordinal CUDA device assigned by the external scheduler.
+     * @param settings Screening, finalist, and serial-proof policy.
+     * @param csv Optional aggregate evidence destination.
+     * @param timing_csv Optional raw native-event sidecar destination.
+     */
+    void runCudaProductionMoERoutedCase(
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        int rows,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile,
+        int device_ordinal,
+        const CudaMoEProductionSweepSettings &settings,
+        std::FILE *csv,
+        std::FILE *timing_csv)
+    {
+        if (settings.profiling() != settings.profiler_candidate.has_value())
+        {
+            throw std::invalid_argument(
+                "CUDA profiler request and exact candidate must be supplied together");
+        }
+        const std::vector<CudaMoEProductionCandidate> candidates =
+            settings.profiling()
+                ? std::vector<CudaMoEProductionCandidate>{
+                      *settings.profiler_candidate}
+                : cudaMoEProductionCandidates();
+        const int candidate_count = static_cast<int>(candidates.size());
+        if (rows <= 8 || device_ordinal < 0)
+        {
+            throw std::invalid_argument(
+                "CUDA production tournament requires M>8 and a valid device");
+        }
+        if (routed_case.routed.gate != routed_case.routed.up)
+        {
+            throw std::runtime_error(
+                routed_case.evidenceId() +
+                " has distinct gate/up formats, but CUDA production fuses them");
+        }
+        if (settings.screening_warmups < 0 || settings.screening_trials <= 0 ||
+            settings.screening_replays <= 0 || settings.robust_warmups < 0 ||
+            settings.robust_trials <= 0 || settings.robust_replays <= 0 ||
+            settings.minimum_finalists <= 0 ||
+            settings.maximum_finalists < settings.minimum_finalists ||
+            (!settings.profiling() &&
+             settings.maximum_finalists > candidate_count) ||
+            settings.finalist_margin < 0.0)
+        {
+            throw std::invalid_argument("invalid CUDA production timing policy");
+        }
+        if (cudaSetDevice(device_ordinal) != cudaSuccess)
+            throw std::runtime_error("failed to select CUDA sweep device");
+
+        const auto device = llaminar2::DeviceId::cuda(device_ordinal);
+        ScopedCudaMoEPrefillStream owned_stream;
+        const cudaStream_t stream = owned_stream.get();
+        const auto requirements = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+            rows,
+            routed_case.hidden_size,
+            routed_case.routed_expert_width,
+            routed_case.expert_count,
+            routed_case.experts_per_token);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            requirements.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
+            throw std::runtime_error("failed to allocate CUDA MoE workspace");
+
+        llaminar2::CUDAMoEKernel moe(device_ordinal);
+        moe.setGPUStream(stream);
+        ScopedCudaMoEWorkspaceBinding workspace_binding(&moe, workspace.get());
+
+        const auto &gateup_format =
+            llaminar2::test::quantizedVerifierFormat(routed_case.routed.gate.c_str());
+        const auto &down_format =
+            llaminar2::test::quantizedVerifierFormat(routed_case.routed.down.c_str());
+        std::vector<int> materialized_experts(
+            static_cast<size_t>(routed_case.expert_count));
+        std::iota(materialized_experts.begin(), materialized_experts.end(), 0);
+        auto tables = prepareExpertTables(
+            &moe,
+            device,
+            routed_case.expert_count,
+            routed_case.hidden_size,
+            routed_case.routed_expert_width,
+            "cuda",
+            470000,
+            std::move(materialized_experts),
+            gateup_format,
+            down_format);
+        if (tables.gateup_table_id < 0 || tables.down_table_id < 0)
+            throw std::runtime_error("failed to publish CUDA expert tables");
+
+        const std::vector<float> hidden_values =
+            makeHiddenValues(rows, routed_case.hidden_size);
+        const std::vector<float> routing_indices =
+            llaminar2::test::native_vnni_dispatch::makeMoERoutingIndices(
+            route_profile,
+            rows,
+            routed_case.experts_per_token,
+            routed_case.expert_count);
+        const auto route_stats =
+            llaminar2::test::native_vnni_dispatch::summarizeMoERoutingProfile(
+                routing_indices,
+                routed_case.expert_count);
+        const std::vector<float> routing_weights = makeRoutingWeights(
+            rows,
+            routed_case.experts_per_token);
+        auto hidden = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)},
+            hidden_values);
+        auto route_indices_tensor = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.experts_per_token)},
+            routing_indices);
+        auto route_weights_tensor = makeTensor(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.experts_per_token)},
+            routing_weights);
+        auto reference_output = makeZeros(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)});
+        auto candidate_output = makeZeros(
+            {static_cast<size_t>(rows),
+             static_cast<size_t>(routed_case.hidden_size)});
+        for (const auto &tensor : {
+                 hidden,
+                 route_indices_tensor,
+                 route_weights_tensor,
+                 reference_output,
+                 candidate_output})
+        {
+            if (!tensor->ensureOnDevice(device, stream))
+                throw std::runtime_error("failed to publish CUDA sweep tensor");
+        }
+
+        const auto prepare_groups = [&]()
+        {
+            return moe.prepareExpertGroupsAsync(
+                route_indices_tensor.get(),
+                route_weights_tensor.get(),
+                rows,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+        };
+        const auto execute_pipeline = [&](llaminar2::ITensor *output)
+        {
+            return moe.executeGroupedPrefillPipeline(
+                hidden.get(),
+                output,
+                tables.gateup_table_id,
+                tables.down_table_id,
+                rows,
+                routed_case.hidden_size,
+                routed_case.routed_expert_width,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+        };
+        requireCudaBenchBody(prepare_groups(), "CUDA production grouping");
+        if (cudaStreamSynchronize(stream) != cudaSuccess)
+            throw std::runtime_error("failed to publish CUDA production groups");
+
+        ScopedCudaMoEGeometryConfig forced_config;
+        const CudaMoEProductionCandidate reference_candidate{
+            .gateup_tile_n = 128,
+        };
+        forced_config.setGateUpTileN(reference_candidate.gateup_tile_n);
+        llaminar2::PerfStatsCollector::reset();
+        {
+            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            llaminar2::ScopedBackendGraphCapture capture(
+                graph,
+                "CUDA production MoE reference capture");
+            if (!capture.begin())
+                throw std::runtime_error("failed to begin CUDA reference capture");
+            requireCudaBenchBody(
+                execute_pipeline(reference_output.get()),
+                "CUDA production reference capture");
+            capture.finish();
+            if (!graph.instantiate() || !graph.launch() ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "failed to instantiate or replay CUDA reference graph");
+            }
+        }
+        if (!observedCudaMoEProductionCandidate(
+                rows,
+                routed_case.experts_per_token,
+                reference_candidate))
+        {
+            throw std::runtime_error("PerfStats missed CUDA reference policy");
+        }
+
+        std::vector<float> reference_host(reference_output->numel());
+        if (cudaMemcpyAsync(
+                reference_host.data(),
+                reference_output->gpu_data_ptr(),
+                reference_host.size() * sizeof(float),
+                cudaMemcpyDeviceToHost,
+                stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess)
+        {
+            throw std::runtime_error("failed to materialize CUDA reference");
+        }
+        double serial_ms = 0.0;
+        const std::vector<float> serial = runCudaRowwiseDecode(
+            &moe,
+            workspace.get(),
+            stream,
+            hidden_values,
+            routing_indices,
+            routing_weights,
+            rows,
+            routed_case.experts_per_token,
+            routed_case.hidden_size,
+            routed_case.routed_expert_width,
+            tables.gateup_table_id,
+            tables.down_table_id,
+            device,
+            &serial_ms);
+        const CloseMetrics serial_metrics = compareVectors(
+            reference_host,
+            serial,
+            reference_host.size());
+        if (serial_metrics.bit_mismatch_count != 0 ||
+            serial_metrics.nonfinite_count != 0)
+        {
+            throw std::runtime_error(
+                "CUDA production reference is not serial-row byte-equivalent");
+        }
+        requireCudaBenchBody(
+            prepare_groups(),
+            "CUDA post-oracle production grouping");
+        if (cudaStreamSynchronize(stream) != cudaSuccess)
+            throw std::runtime_error("failed to restore CUDA production groups");
+
+        CudaMoEPrefillEventTimer timer(stream);
+        CudaMoEPrefillDeviceByteCertificate certificate;
+        const int fixed_down_threads =
+            llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(
+                routed_case.experts_per_token) * 32;
+        const auto measure_candidate = [&] (
+            const CudaMoEProductionCandidate &candidate,
+            int warmups,
+            int trials,
+            int replays,
+            bool isolated_profile)
+        {
+            CudaMoEProductionEvidence evidence{};
+            evidence.candidate = candidate;
+            evidence.gateup_resources = queryCudaMoEPrefillKernelResources(
+                gateup_format.device_execution_codebook_id,
+                /*component=*/0,
+                candidate.gateup_tile_n);
+            evidence.down_resources = queryCudaMoEPrefillKernelResources(
+                down_format.device_execution_codebook_id,
+                /*component=*/1,
+                fixed_down_threads);
+            if (!evidence.gateup_resources.spillFree() ||
+                !evidence.down_resources.spillFree())
+            {
+                throw std::runtime_error(
+                    "spilling CUDA candidate reached timing: " + candidate.id());
+            }
+
+            forced_config.setGateUpTileN(candidate.gateup_tile_n);
+            llaminar2::PerfStatsCollector::reset();
+            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            llaminar2::ScopedBackendGraphCapture capture(
+                graph,
+                "CUDA production MoE candidate capture");
+            if (!capture.begin())
+                throw std::runtime_error("failed to begin CUDA candidate capture");
+            requireCudaBenchBody(
+                execute_pipeline(candidate_output.get()),
+                "CUDA production candidate capture");
+            capture.finish();
+            if (!graph.instantiate())
+            {
+                throw std::runtime_error(
+                    "failed to instantiate CUDA candidate " + candidate.id());
+            }
+            evidence.route_counter_ok = observedCudaMoEProductionCandidate(
+                rows,
+                routed_case.experts_per_token,
+                candidate);
+            if (!evidence.route_counter_ok)
+            {
+                throw std::runtime_error(
+                    "PerfStats missed forced CUDA candidate " + candidate.id());
+            }
+            for (int warmup = 0; warmup < warmups; ++warmup)
+                requireCudaBenchBody(graph.launch(), "CUDA candidate warmup");
+            requireCudaBenchBody(
+                graph.launch(),
+                "CUDA candidate byte-certificate replay");
+            const auto mismatch = certificate.compare(
+                reinterpret_cast<const float *>(candidate_output->gpu_data_ptr()),
+                reinterpret_cast<const float *>(reference_output->gpu_data_ptr()),
+                candidate_output->numel(),
+                stream);
+            evidence.bit_mismatches = mismatch.first;
+            evidence.first_bit_mismatch = mismatch.second;
+            if (evidence.bit_mismatches != 0)
+            {
+                throw std::runtime_error(
+                    "CUDA candidate " + candidate.id() +
+                    " changed serial-proven output bytes");
+            }
+
+            if (isolated_profile)
+            {
+                /*
+                 * Nsight Compute is launched with collection disabled. All
+                 * allocations, transfers, route preparation, graph capture,
+                 * warmup, and the device byte certificate above are therefore
+                 * outside the report. The only collected transaction is this
+                 * one replay of the exact production graph. Its stable stream
+                 * ID and immutable request ID let the parser associate every
+                 * physical child kernel with this candidate without guessing
+                 * from kernel names or process-wide launch order.
+                 */
+                if (cudaStreamSynchronize(stream) != cudaSuccess)
+                {
+                    throw std::runtime_error(
+                        "failed to settle CUDA preconditioning before profiling");
+                }
+                unsigned long long stream_id = 0;
+                if (cudaStreamGetId(stream, &stream_id) != cudaSuccess)
+                {
+                    throw std::runtime_error(
+                        "failed to identify CUDA MoE profiler stream");
+                }
+                if (!invokeCudaMoEProfilerControl("cuProfilerStart"))
+                {
+                    throw std::runtime_error(
+                        "failed to start isolated CUDA MoE profiler collection");
+                }
+                const bool launch_ok = graph.launch();
+                const cudaError_t completion = cudaStreamSynchronize(stream);
+                const bool stop_ok =
+                    invokeCudaMoEProfilerControl("cuProfilerStop");
+                if (!launch_ok || completion != cudaSuccess || !stop_ok)
+                {
+                    throw std::runtime_error(
+                        "isolated CUDA MoE profiler replay failed");
+                }
+                std::fprintf(
+                    stderr,
+                    "[NativeVNNIProfiler][CUDA-MoE-Prefill] request=%s "
+                    "candidate=%s M=%d stream_id=%llu launches=1\n",
+                    settings.profiler_request_id.c_str(),
+                    candidate.id().c_str(),
+                    rows,
+                    stream_id);
+                return evidence;
+            }
+
+            evidence.screening_samples_ms.reserve(static_cast<size_t>(trials));
+            for (int trial = 0; trial < trials; ++trial)
+            {
+                evidence.screening_samples_ms.push_back(timer.sample(
+                    replays,
+                    [&]() { return graph.launch(); }));
+            }
+            std::sort(
+                evidence.screening_samples_ms.begin(),
+                evidence.screening_samples_ms.end());
+            evidence.screening_replays_per_sample = replays;
+            return evidence;
+        };
+
+        if (settings.profiling())
+        {
+            (void)measure_candidate(
+                candidates.front(),
+                /*warmups=*/2,
+                /*trials=*/1,
+                /*replays=*/1,
+                /*isolated_profile=*/true);
+            return;
+        }
+
+        std::vector<CudaMoEProductionEvidence> evidence_rows;
+        evidence_rows.reserve(static_cast<size_t>(candidate_count));
+        for (const auto &candidate : candidates)
+        {
+            evidence_rows.push_back(measure_candidate(
+                candidate,
+                settings.screening_warmups,
+                settings.screening_trials,
+                settings.screening_replays,
+                /*isolated_profile=*/false));
+        }
+
+        std::vector<size_t> order(evidence_rows.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(
+            order.begin(),
+            order.end(),
+            [&evidence_rows](size_t left, size_t right)
+            {
+                return evidence_rows[left].medianUs() <
+                       evidence_rows[right].medianUs();
+            });
+        const double finalist_limit_us =
+            evidence_rows[order.front()].medianUs() *
+            (1.0 + settings.finalist_margin);
+        int finalist_count = 0;
+        for (size_t rank = 0; rank < order.size(); ++rank)
+        {
+            const bool required_rank =
+                rank < static_cast<size_t>(settings.minimum_finalists);
+            const bool near_best =
+                evidence_rows[order[rank]].medianUs() <= finalist_limit_us;
+            if ((!required_rank && !near_best) ||
+                finalist_count >= settings.maximum_finalists)
+            {
+                continue;
+            }
+            evidence_rows[order[rank]].finalist = true;
+            ++finalist_count;
+        }
+
+        for (auto &evidence : evidence_rows)
+        {
+            if (!evidence.finalist)
+                continue;
+            CudaMoEProductionEvidence robust = measure_candidate(
+                evidence.candidate,
+                settings.robust_warmups,
+                settings.robust_trials,
+                settings.robust_replays,
+                /*isolated_profile=*/false);
+            evidence.robust_samples_ms =
+                std::move(robust.screening_samples_ms);
+            evidence.robust_replays_per_sample =
+                robust.screening_replays_per_sample;
+            evidence.bit_mismatches = robust.bit_mismatches;
+            evidence.first_bit_mismatch = robust.first_bit_mismatch;
+            evidence.route_counter_ok = robust.route_counter_ok;
+        }
+
+        const auto winner = std::min_element(
+            evidence_rows.begin(),
+            evidence_rows.end(),
+            [](const auto &left, const auto &right)
+            {
+                if (left.finalist != right.finalist)
+                    return left.finalist;
+                return left.medianUs() < right.medianUs();
+            });
+        if (winner == evidence_rows.end() || !winner->finalist)
+            throw std::runtime_error("CUDA production tournament found no winner");
+        winner->winner = true;
+
+        if (csv)
+        {
+            for (const auto &evidence : evidence_rows)
+            {
+                writeCudaMoEProductionEvidence(
+                    csv,
+                    routed_case,
+                    route_profile,
+                    route_stats,
+                    rows,
+                    evidence);
+                writeCudaMoEProductionTimingEvidence(
+                    timing_csv,
+                    routed_case,
+                    route_profile,
+                    rows,
+                    evidence);
+            }
+        }
+    }
+
+    /** Prove all CUDA launch geometries through the shared tournament path. */
+    void proveCudaProductionCandidateInvariance(
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
+        int rows,
+        int device_ordinal)
+    {
+        CudaMoEProductionSweepSettings settings{};
+        settings.screening_warmups = 0;
+        settings.screening_trials = 1;
+        settings.screening_replays = 1;
+        settings.robust_warmups = 0;
+        settings.robust_trials = 1;
+        settings.robust_replays = 1;
+        settings.minimum_finalists = 1;
+        settings.maximum_finalists = 1;
+        runCudaProductionMoERoutedCase(
+            routed_case,
+            rows,
+            llaminar2::test::native_vnni_dispatch::MoERoutingProfile::Uniform,
+            device_ordinal,
+            settings,
+            nullptr,
+            nullptr);
     }
 
     BenchResult runCudaCase(
@@ -1158,20 +2348,6 @@ namespace
          * tiles without editing source between runs.
          */
         prefill_config.set(/*tile_m=*/tile_m_override, /*fuse_swiglu=*/true);
-        ScopedCudaMoEGemmConfig gemm_config;
-        const int gateup_kparts =
-            envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_GATEUP_KPARTS",
-                   llaminar2::debugEnv().gemm.cuda_moe_gateup_kparts);
-        const int down_kparts =
-            envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_DOWN_KPARTS",
-                   llaminar2::debugEnv().gemm.cuda_moe_down_kparts);
-        /*
-         * Ordered K-part execution is mandatory in production. These optional
-         * harness overrides sweep only the partition count, preserving the
-         * decode-equivalent arithmetic contract in every measured variant.
-         */
-        gemm_config.set(gateup_kparts, down_kparts);
-
         const auto hidden_values = makeHiddenValues(rows, d_model);
         auto routing_indices = unique_routes
                                    ? makeUniqueRoutingIndices(rows, top_k, num_experts)
@@ -1283,7 +2459,7 @@ namespace
         std::vector<float> rowwise = runCudaRowwiseDecode(
             moe.get(), workspace.get(), stream, hidden_values, routing_indices, routing_weights,
             rows, top_k, d_model, intermediate,
-            tables.gateup_table_id, tables.down_table_id, &rowwise_ms);
+            tables.gateup_table_id, tables.down_table_id, device, &rowwise_ms);
         CloseMetrics metrics = compareVectors(grouped, rowwise, static_cast<size_t>(d_model));
 
         EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
@@ -1561,6 +2737,325 @@ namespace
     }
 }
 #endif
+
+TEST(Perf__MoEVerifierPrefill, CUDA_AllFormatProductionPrefillCandidatesAreSpillFree)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    std::set<uint8_t> execution_codebooks;
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+        execution_codebooks.insert(format.device_execution_codebook_id);
+
+    constexpr std::array<int, 7> ordered_block_widths{
+        64, 96, 128, 160, 192, 224, 256,
+    };
+    for (const uint8_t codebook : execution_codebooks)
+    {
+        SCOPED_TRACE(static_cast<unsigned>(codebook));
+        for (const int block_width : ordered_block_widths)
+        {
+            SCOPED_TRACE(block_width);
+            const auto gateup = queryCudaMoEPrefillKernelResources(
+                codebook,
+                /*component=*/0,
+                block_width);
+            EXPECT_TRUE(gateup.spillFree());
+            EXPECT_GT(gateup.registers_per_thread, 0);
+            EXPECT_GT(gateup.max_active_blocks_per_sm, 0);
+
+            const auto canonical_down = queryCudaMoEPrefillKernelResources(
+                codebook,
+                /*component=*/2,
+                block_width);
+            EXPECT_TRUE(canonical_down.spillFree());
+            EXPECT_GT(canonical_down.registers_per_thread, 0);
+            EXPECT_GT(canonical_down.max_active_blocks_per_sm, 0);
+        }
+
+        /*
+         * Every pinned Qwen MoE geometry routes top-8 experts. A direct-down
+         * block therefore needs exactly eight warps: larger blocks add only
+         * idle warps, consume more residency, and cannot perform less work.
+         * Keeping those dominated widths out of the candidate registry avoids
+         * spending corpus time proving a launch geometry that cannot win.
+         */
+        const auto direct_down = queryCudaMoEPrefillKernelResources(
+            codebook,
+            /*component=*/1,
+            /*block_threads=*/8 * 32);
+        EXPECT_TRUE(direct_down.spillFree());
+        EXPECT_GT(direct_down.registers_per_thread, 0);
+        EXPECT_GT(direct_down.max_active_blocks_per_sm, 0);
+    }
+
+    const auto gather = queryCudaMoEPrefillKernelResources(
+        /*execution_codebook=*/0,
+        /*component=*/3,
+        /*block_threads=*/256);
+    const auto gateup_reduce = queryCudaMoEPrefillKernelResources(
+        /*execution_codebook=*/0,
+        /*component=*/4,
+        /*block_threads=*/32);
+    const auto canonical_down_reduce = queryCudaMoEPrefillKernelResources(
+        /*execution_codebook=*/0,
+        /*component=*/5,
+        /*block_threads=*/64);
+    EXPECT_TRUE(gather.spillFree())
+        << "gather registers=" << gather.registers_per_thread
+        << " local_bytes=" << gather.local_memory_bytes_per_thread
+        << " active_blocks=" << gather.max_active_blocks_per_sm;
+    EXPECT_TRUE(gateup_reduce.spillFree())
+        << "gate/up reduce registers=" << gateup_reduce.registers_per_thread
+        << " local_bytes=" << gateup_reduce.local_memory_bytes_per_thread
+        << " active_blocks=" << gateup_reduce.max_active_blocks_per_sm;
+    EXPECT_TRUE(canonical_down_reduce.spillFree())
+        << "down reduce registers=" << canonical_down_reduce.registers_per_thread
+        << " local_bytes=" << canonical_down_reduce.local_memory_bytes_per_thread
+        << " active_blocks=" << canonical_down_reduce.max_active_blocks_per_sm;
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+    if (envInt("LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP", 0) == 0)
+    {
+        GTEST_SKIP()
+            << "Set LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP=1 to run the "
+               "GGUF-derived CUDA production tournament";
+    }
+
+    CudaMoEProductionSweepSettings settings{};
+    settings.screening_warmups = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_SCREEN_WARMUPS", 1);
+    settings.screening_trials = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_SCREEN_TRIALS", 3);
+    settings.screening_replays = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_SCREEN_REPLAYS", 2);
+    settings.robust_warmups = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_ROBUST_WARMUPS", 2);
+    settings.robust_trials = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_ROBUST_TRIALS", 15);
+    settings.robust_replays = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_ROBUST_REPLAYS", 4);
+    settings.minimum_finalists = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MIN_FINALISTS", 7);
+    settings.maximum_finalists = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 7);
+    settings.finalist_margin = envPositiveDouble(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_FINALIST_MARGIN", 0.05);
+    const std::vector<int> m_values = envCsvPositiveInts(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_M",
+        {64, 256, 1024, 2048, 4096, 8192, 16384});
+    const int maximum_cells = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_CELLS",
+        std::numeric_limits<int>::max());
+    const int device_ordinal = envInt(
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_DEVICE", 0);
+    const char *route_profile_environment =
+        std::getenv("LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_ROUTE_PROFILE");
+    if (!route_profile_environment || !*route_profile_environment)
+    {
+        throw std::runtime_error(
+            "CUDA production MoE sweep requires one explicit route profile");
+    }
+    const auto route_profile =
+        llaminar2::test::native_vnni_dispatch::parseMoERoutingProfile(
+            route_profile_environment);
+
+    settings.profiler_request_id =
+        llaminar2::test::native_vnni_dispatch::profilerRequestId();
+    const std::string profiler_candidate_id =
+        llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+            "LLAMINAR_CUDA_MOE_PRODUCTION_PROFILE_CANDIDATE");
+    if (settings.profiling() != !profiler_candidate_id.empty())
+    {
+        throw std::runtime_error(
+            "isolated CUDA MoE profiling requires both a profiler request ID "
+            "and LLAMINAR_CUDA_MOE_PRODUCTION_PROFILE_CANDIDATE");
+    }
+    if (settings.profiling())
+    {
+        settings.profiler_candidate =
+            findCudaMoEProductionCandidate(profiler_candidate_id);
+        if (!settings.profiler_candidate)
+        {
+            throw std::runtime_error(
+                "unknown CUDA MoE production profiler candidate " +
+                profiler_candidate_id);
+        }
+        const std::string selected_cases =
+            llaminar2::test::native_vnni_dispatch::profilerEnvironment(
+                "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CASES");
+        if (selected_cases.empty() ||
+            selected_cases.find(',') != std::string::npos ||
+            m_values.size() != 1 || maximum_cells != 1)
+        {
+            throw std::runtime_error(
+                "isolated CUDA MoE profiling requires one explicit case, one M, "
+                "and LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_CELLS=1");
+        }
+    }
+
+    ScopedEnvOverride rowwise_iterations(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
+
+    std::unique_ptr<std::FILE, CudaMoEFileCloser> owned_csv;
+    std::FILE *csv = settings.profiling() ? nullptr : stdout;
+    if (!settings.profiling())
+    {
+        if (const char *path =
+                std::getenv("LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CSV");
+            path && *path)
+        {
+            owned_csv.reset(std::fopen(path, "w"));
+            ASSERT_NE(owned_csv.get(), nullptr)
+                << "failed to open CUDA aggregate CSV " << path;
+            csv = owned_csv.get();
+        }
+        std::fprintf(
+            csv,
+            "backend,phase,case_id,route_profile,source_gate,source_up,source_down,"
+            "gate_execution_codebook,up_execution_codebook,"
+            "down_execution_codebook,hidden_size,expert_width,expert_count,"
+            "top_k,route_active_experts,route_max_assignments,route_assignment_cv,"
+            "m,candidate_id,gate_tile_m,gate_tile_n,down_tile_m,"
+            "down_tile_n,gate_local_bytes,down_local_bytes,gate_registers,"
+            "down_registers,gate_shared_bytes,down_shared_bytes,"
+            "gate_active_blocks_per_sm,down_active_blocks_per_sm,"
+            "screening_sample_count,screening_replays,robust_sample_count,"
+            "robust_replays,selected_sample_count,selected_replays,min_us,"
+            "median_us,p95_us,mad_us,cv,timing_sample_digest,bit_mismatches,"
+            "first_bit_mismatch,route_counter_ok,finalist,is_winner\n");
+    }
+
+    std::unique_ptr<std::FILE, CudaMoEFileCloser> timing_csv;
+    if (!settings.profiling())
+    {
+        if (const char *path =
+                std::getenv("LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_TIMING_CSV");
+            path && *path)
+        {
+            timing_csv.reset(std::fopen(path, "w"));
+            ASSERT_NE(timing_csv.get(), nullptr)
+                << "failed to open CUDA timing CSV " << path;
+            std::fprintf(
+                timing_csv.get(),
+                "backend,phase,case_id,route_profile,m,candidate_id,timing_phase,"
+                "sample_index,timed_replays,latency_us,latency_ms_hex\n");
+        }
+    }
+
+    int executed_cells = 0;
+    for (const auto &routed_case :
+         llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases())
+    {
+        if (!envCsvContainsOrUnset(
+                "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_CASES",
+                routed_case.evidenceId()) ||
+            !envCsvContainsOrUnset(
+                "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_GATE_FORMATS",
+                routed_case.routed.gate) ||
+            !envCsvContainsOrUnset(
+                "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_DOWN_FORMATS",
+                routed_case.routed.down))
+        {
+            continue;
+        }
+        for (const int rows : m_values)
+        {
+            if (executed_cells >= maximum_cells)
+                break;
+            SCOPED_TRACE(
+                routed_case.evidenceId() + "/route=" +
+                std::string(
+                    llaminar2::test::native_vnni_dispatch::
+                        moeRoutingProfileName(route_profile)) +
+                "/M" + std::to_string(rows));
+            std::fprintf(
+                stderr,
+                "[CUDA MoE production sweep] case=%s route=%s M=%d gate/up=%s "
+                "down=%s hidden=%d expert_width=%d experts=%d top_k=%d\n",
+                routed_case.evidenceId().c_str(),
+                std::string(
+                    llaminar2::test::native_vnni_dispatch::
+                        moeRoutingProfileName(route_profile)).c_str(),
+                rows,
+                routed_case.routed.gate.c_str(),
+                routed_case.routed.down.c_str(),
+                routed_case.hidden_size,
+                routed_case.routed_expert_width,
+                routed_case.expert_count,
+                routed_case.experts_per_token);
+            runCudaProductionMoERoutedCase(
+                routed_case,
+                rows,
+                route_profile,
+                device_ordinal,
+                settings,
+                csv,
+                timing_csv.get());
+            ++executed_cells;
+        }
+        if (executed_cells >= maximum_cells)
+            break;
+    }
+    EXPECT_GT(executed_cells, 0)
+        << "CUDA production filters selected no GGUF-derived cells";
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvariant)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+    if (envInt("LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE", 0) == 0)
+    {
+        GTEST_SKIP()
+            << "Set LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE=1 to run the "
+               "complete production launch-policy eligibility proof";
+    }
+
+    const auto &cases =
+        llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases();
+    const auto selected = std::find_if(
+        cases.begin(),
+        cases.end(),
+        [](const auto &candidate)
+        {
+            return candidate.hidden_size == 2048 &&
+                   candidate.routed_expert_width == 512 &&
+                   candidate.expert_count == 256 &&
+                   candidate.experts_per_token == 8 &&
+                   candidate.routed.gate == "IQ2_S" &&
+                   candidate.routed.up == "IQ2_S" &&
+                   candidate.routed.down == "IQ3_S";
+        });
+    ASSERT_NE(selected, cases.end())
+        << "pinned GGUF manifest lacks the Qwen3.6 IQ2_S/IQ3_S production case";
+
+    ScopedEnvOverride rowwise_iterations(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
+    proveCudaProductionCandidateInvariance(
+        *selected,
+        envInt("LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_M", 64),
+        envInt("LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_DEVICE", 0));
+#endif
+}
 
 TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedExpertFFNDecodeEquivalent)
 {

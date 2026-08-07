@@ -90,19 +90,24 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
-    void cudaNativeVNNIPrefill_setStreamKMode(int mode);
-    int cudaNativeVNNIPrefill_getStreamKMode();
     void cudaNativeVNNIPrefill_setBK256Mode(int mode);
     int cudaNativeVNNIPrefill_getBK256Mode();
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getDeterministicMode();
-    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
-    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+    void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id);
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
         int *tile_id,
-        int *split_k,
+        int *k_partitions,
         int *used_bk256,
-        int *used_streamk);
+        int *used_canonical_kpart);
+	    bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+	        uint8_t codebook_id,
+	        int n,
+	        int k,
+	        int sm_count,
+	        int *uses_ordered_reducer,
+	        int *k_partitions);
 	    bool cudaNativeVNNIInitIQGridTables_tuned();
 	    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
 	    int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
@@ -229,19 +234,20 @@ namespace
     {
     public:
         ScopedCudaPrefillModes()
-            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
+            : force_tile_(-1),
               bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
-              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+              canonical_kpart_(
+                  cudaNativeVNNIPrefill_getCanonicalKPartitionMode())
         {
-            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_);
         }
 
         ~ScopedCudaPrefillModes()
         {
-            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
-            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setForceTile(force_tile_);
             cudaNativeVNNIPrefill_setBK256Mode(bk256_);
-            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+                canonical_kpart_);
         }
 
         ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
@@ -249,10 +255,8 @@ namespace
 
     private:
         int force_tile_ = -1;
-        int force_split_k_ = 0;
-        int streamk_ = 0;
         int bk256_ = 0;
-        bool deterministic_ = false;
+        bool canonical_kpart_ = false;
     };
 
     class ScopedDeterministicDebugEnv
@@ -266,15 +270,12 @@ namespace
                 had_old_ = true;
                 old_value_ = old;
             }
-            old_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
             setenv("LLAMINAR_DETERMINISTIC", "1", 1);
             mutableDebugEnv().reload();
-            cudaNativeVNNIPrefill_setDeterministicMode(true);
         }
 
         ~ScopedDeterministicDebugEnv()
         {
-            cudaNativeVNNIPrefill_setDeterministicMode(old_prefill_deterministic_);
             if (had_old_)
                 setenv("LLAMINAR_DETERMINISTIC", old_value_.c_str(), 1);
             else
@@ -288,7 +289,6 @@ namespace
     private:
         std::string old_value_;
         bool had_old_ = false;
-        bool old_prefill_deterministic_ = false;
     };
 #endif
 
@@ -819,12 +819,12 @@ namespace
     }
 
     /**
-     * @brief Force decode-equivalent CUDA M=1 GEMV reductions for one test scope.
+     * @brief Select the public-M1 dispatch identity for a low-level test call.
      *
-     * The generated CUDA GEMV dispatch can deliberately choose atomic K-parallel
-     * reductions for speed.  MTP verifier publication needs the stricter serial
-     * decode oracle, so focused primitive tests enable the same thread-local mode
-     * used by CUDAQuantisedGemmKernel's canonical M=1 helper.
+     * All CUDA NativeVNNI K-parallel routes use persistent partials and ordered
+     * publication. This scope makes a direct low-level verifier test resolve
+     * the same generated M=1 family, tile, and exact K partition used by the
+     * production graph; it does not enable alternate arithmetic.
      */
     class ScopedCudaDecodeEquivalentM1Gemv final
     {
@@ -1652,7 +1652,6 @@ protected:
         }
         setenv("LLAMINAR_DETERMINISTIC", "0", 1);
         mutableDebugEnv().reload();
-        cudaNativeVNNIPrefill_setDeterministicMode(false);
         llaminar::v2::kernels::KernelFactory::clearCache();
 #endif
     }
@@ -1829,61 +1828,67 @@ protected:
     }
 
     /**
-     * @brief Set up a shared workspace for multiple CUDA GEMM kernels
+     * @brief Set up one shared workspace for several fused execution regimes.
      *
-     * Used for fused QKV operations where multiple kernels share workspace.
-     * Computes the maximum requirements across all kernels.
+     * A production graph family plans each participant independently before it
+     * unions their persistent requirements.  The parity fixture must express
+     * the same contract when one test executes grouped verifier rows and then
+     * the real fused M=1 decode route as its byte oracle.  Collapsing those
+     * regimes to only their largest numeric M is invalid because CUDA M=1 uses
+     * projection side streams while grouped verifier execution deliberately
+     * remains on its graph stream.
      *
-     * @param kernels Vector of kernels that need workspace
-     * @param M Maximum batch/sequence length
-     * @param Ns Output dimensions for each kernel
-     * @param K Input dimension (shared)
-     * @return true on success, false on allocation failure
+     * @param kernels Fused projection kernels that share one workspace.
+     * @param execution_rows Exact M values that this workspace must execute.
+     * @param Ns Output dimensions corresponding one-to-one with @p kernels.
+     * @param K Shared input dimension.
+     * @return true on success, false for an invalid contract or allocation failure.
      */
-    bool setupSharedWorkspace(
+    bool setupSharedWorkspaceForExecutionRows(
         const std::vector<ITensorGemm *> &kernels,
-        int M,
+        const std::vector<int> &execution_rows,
         const std::vector<int> &Ns,
         int K)
     {
-        // Merge requirements across all kernels by buffer name so fused paths
-        // keep pace with the evolving CUDA workspace contract.
-        WorkspaceRequirements shared_reqs;
-
-        for (size_t i = 0; i < kernels.size(); ++i)
+        if (kernels.empty() || kernels.size() != Ns.size() ||
+            execution_rows.empty())
         {
-            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernels[i]);
-            if (ws_consumer)
-            {
-                auto reqs = ws_consumer->getWorkspaceRequirements(M, Ns[i], K);
-                for (const auto &buf : reqs.buffers)
-                {
-                    auto it = std::find_if(
-                        shared_reqs.buffers.begin(),
-                        shared_reqs.buffers.end(),
-                        [&](const WorkspaceDescriptor &existing)
-                        {
-                            return existing.name == buf.name;
-                        });
-
-                    if (it == shared_reqs.buffers.end())
-                    {
-                        shared_reqs.buffers.push_back(buf);
-                        continue;
-                    }
-
-                    it->size_bytes = std::max(it->size_bytes, buf.size_bytes);
-                    it->alignment = std::max(it->alignment, buf.alignment);
-                    it->required = it->required || buf.required;
-                }
-            }
+            LOG_ERROR("Invalid fused CUDA workspace test contract: kernels="
+                      << kernels.size() << " Ns=" << Ns.size()
+                      << " execution_rows=" << execution_rows.size());
+            return false;
         }
 
-        addCudaConcurrentDecodeGemvSideStreamWorkspace(
-            shared_reqs,
-            gpu_device_,
-            M,
-            kernels.size());
+        WorkspaceRequirements shared_reqs;
+        for (const int rows : execution_rows)
+        {
+            if (rows <= 0)
+            {
+                LOG_ERROR("Invalid fused CUDA workspace row regime: M=" << rows);
+                return false;
+            }
+
+            WorkspaceRequirements regime_reqs;
+            for (size_t i = 0; i < kernels.size(); ++i)
+            {
+                auto *ws_consumer =
+                    dynamic_cast<IWorkspaceConsumer *>(kernels[i]);
+                if (ws_consumer)
+                {
+                    regime_reqs.merge(
+                        ws_consumer->getWorkspaceRequirements(rows, Ns[i], K));
+                }
+            }
+
+            // Projection fan-out is a property of this exact row regime.  In
+            // particular, only M=1 reserves disjoint concurrent-decode slots.
+            addCudaConcurrentDecodeGemvSideStreamWorkspace(
+                regime_reqs,
+                gpu_device_,
+                rows,
+                kernels.size());
+            shared_reqs.merge(regime_reqs);
+        }
 
         workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, workspaceBudgetFor(shared_reqs));
         if (!workspace_->allocate(shared_reqs))
@@ -1903,6 +1908,22 @@ protected:
         }
 
         return true;
+    }
+
+    /**
+     * @brief Set up a shared workspace for one fused CUDA GEMM row regime.
+     *
+     * This convenience overload keeps single-regime tests concise. Tests that
+     * invoke both grouped and serial production routes must call
+     * setupSharedWorkspaceForExecutionRows() and name both exact M values.
+     */
+    bool setupSharedWorkspace(
+        const std::vector<ITensorGemm *> &kernels,
+        int M,
+        const std::vector<int> &Ns,
+        int K)
+    {
+        return setupSharedWorkspaceForExecutionRows(kernels, {M}, Ns, K);
     }
 
     /**
@@ -2237,8 +2258,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
  * format accepted by the production preparation pipeline.
  *
  * M=32 lies immediately above the grouped-verifier regime and therefore enters
- * the ordinary prefill launcher. The test intentionally leaves tile, split-K,
- * BK256, and Stream-K controls in production Auto mode. Each source tensor is
+ * the ordinary prefill launcher. The test intentionally leaves output-tile and
+ * BK256 controls in production Auto mode. Each source tensor is
  * prepared through the real KernelFactory path, executed on CUDA, and compared
  * with the CPU implementation using the format's established quantized parity
  * threshold. This catches both a missing generated-prefill include dependency
@@ -2253,10 +2274,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
     constexpr int N = 384;
     constexpr int K = 512;
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     for (const auto &format : cudaSmallMNativeFormats())
     {
@@ -2315,12 +2334,10 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
  * 128-row tiles and both ends of every larger canonical graph-bucket interval.
  *
  * One explicit stream, prepared weight, workspace, and fixed device buffers
- * are reused per format. Every witness also launches its final active row
- * through the independent production M=1 route. This prevents exact-M and
- * bucket-M implementations from agreeing with each other while both drift
- * from serial decode. Only result bytes are downloaded after the launches,
- * keeping the regression focused on production kernel arithmetic instead of
- * measuring thousands of allocation and coherence setup transactions.
+ * are reused per format. Independent production M=1 launches construct every
+ * oracle row in one device-resident matrix, followed by one D2H. This prevents
+ * exact-M and bucket-M implementations from agreeing while both drift from
+ * serial decode, and proves interior rows rather than sampling only a boundary.
  */
 TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
 {
@@ -2330,29 +2347,25 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
     struct LaunchSelection
     {
         int tile_id = -1;
-        int split_k = -1;
+        int k_partitions = -1;
         int used_bk256 = -1;
-        int used_streamk = -1;
+        int used_canonical_kpart = -1;
     };
     const auto read_launch_selection = []
     {
         LaunchSelection selection;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
             &selection.tile_id,
-            &selection.split_k,
+            &selection.k_partitions,
             &selection.used_bk256,
-            &selection.used_streamk);
+            &selection.used_canonical_kpart);
         return selection;
     };
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
-    constexpr int canonical_prefix_rows =
-        kDefaultNativeVNNIVerifierRowCapacity + 1;
     std::array<bool, 6> tensor_core_tile_seen{};
     bool bk256_narrow_seen = false;
     bool bk256_wide_seen = false;
@@ -2392,11 +2405,35 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
             ASSERT_NE(cuda_kernel, nullptr)
                 << format.name << " CUDA prepared kernel";
             cuda_kernel->setGPUStream(stream);
+
+            int sm_count = 0;
+            ASSERT_EQ(
+                cudaDeviceGetAttribute(
+                    &sm_count,
+                    cudaDevAttrMultiProcessorCount,
+                    gpu_device_.cuda_ordinal()),
+                cudaSuccess);
+            int uses_ordered_reducer = 0;
+            int canonical_k_partitions = 0;
+            ASSERT_TRUE(
+                cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                    quantizedVerifierFormat(format.name)
+                        .device_execution_codebook_id,
+                    N,
+                    K,
+                    sm_count,
+                    &uses_ordered_reducer,
+                    &canonical_k_partitions));
+            const bool has_canonical_kpart_candidate =
+                uses_ordered_reducer != 0 && canonical_k_partitions > 1;
+            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(
+                has_canonical_kpart_candidate);
             ASSERT_TRUE(setupWorkspaceIfNeeded(
                 cuda_kernel,
                 maximum_bucket_rows,
                 N,
                 K));
+            cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
 
             auto input = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{
@@ -2414,33 +2451,71 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                 std::vector<size_t>{
                     static_cast<size_t>(maximum_bucket_rows),
                     static_cast<size_t>(N)});
+            auto canonical_kpart_output = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(maximum_bucket_rows),
+                    static_cast<size_t>(N)});
             auto serial_row_input = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{1, static_cast<size_t>(K)});
             auto serial_row_output = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{1, static_cast<size_t>(N)});
+            auto serial_rows = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(maximum_bucket_rows),
+                    static_cast<size_t>(N)});
             ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
             ASSERT_TRUE(exact_output->allocateOnDevice(gpu_device_, stream));
             ASSERT_TRUE(bucket_output->allocateOnDevice(gpu_device_, stream));
-            ASSERT_TRUE(serial_row_input->ensureOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(canonical_kpart_output->allocateOnDevice(
+                gpu_device_, stream));
+            ASSERT_TRUE(serial_row_input->allocateOnDevice(gpu_device_, stream));
             ASSERT_TRUE(serial_row_output->allocateOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(serial_rows->allocateOnDevice(gpu_device_, stream));
 
-            ASSERT_TRUE(cuda_kernel->multiply_tensor(
-                input.get(),
-                exact_output.get(),
-                canonical_prefix_rows,
-                N,
-                K,
-                /*transpose_B=*/true,
-                1.0f,
-                0.0f));
-            const size_t canonical_prefix_values =
-                static_cast<size_t>(canonical_prefix_rows) * N;
-            std::vector<float> canonical_prefix(canonical_prefix_values);
+            const size_t serial_row_input_bytes =
+                static_cast<size_t>(K) * sizeof(float);
+            const size_t serial_row_output_bytes =
+                static_cast<size_t>(N) * sizeof(float);
+            std::vector<float> serial_decode_rows(
+                static_cast<size_t>(maximum_bucket_rows) * N);
+            for (int row = 0; row < maximum_bucket_rows; ++row)
+            {
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        serial_row_input->gpu_data_ptr(),
+                        static_cast<const float *>(input->gpu_data_ptr()) +
+                            static_cast<size_t>(row) * K,
+                        serial_row_input_bytes,
+                        cudaMemcpyDeviceToDevice,
+                        stream),
+                    cudaSuccess);
+                TransferEngine::publishCurrentDeviceWrite(
+                    serial_row_input.get(), stream);
+                ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                    serial_row_input.get(),
+                    serial_row_output.get(),
+                    1,
+                    N,
+                    K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f))
+                    << "serial row=" << row;
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        static_cast<float *>(serial_rows->gpu_data_ptr()) +
+                            static_cast<size_t>(row) * N,
+                        serial_row_output->gpu_data_ptr(),
+                        serial_row_output_bytes,
+                        cudaMemcpyDeviceToDevice,
+                        stream),
+                    cudaSuccess);
+            }
             ASSERT_EQ(
                 cudaMemcpyAsync(
-                    canonical_prefix.data(),
-                    exact_output->gpu_data_ptr(),
-                    canonical_prefix_values * sizeof(float),
+                    serial_decode_rows.data(),
+                    serial_rows->gpu_data_ptr(),
+                    serial_decode_rows.size() * sizeof(float),
                     cudaMemcpyDeviceToHost,
                     stream),
                 cudaSuccess);
@@ -2475,6 +2550,28 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     0.0f));
                 const LaunchSelection bucket_selection = read_launch_selection();
 
+                if (has_canonical_kpart_candidate)
+                {
+                    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
+                    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                        input.get(),
+                        canonical_kpart_output.get(),
+                        test_case.active_rows,
+                        N,
+                        K,
+                        /*transpose_B=*/true,
+                        1.0f,
+                        0.0f));
+                    const LaunchSelection canonical_selection =
+                        read_launch_selection();
+                    EXPECT_EQ(canonical_selection.used_canonical_kpart, 1);
+                    EXPECT_EQ(
+                        canonical_selection.k_partitions,
+                        canonical_k_partitions);
+                    EXPECT_EQ(canonical_selection.used_bk256, 0);
+                    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+                }
+
                 /*
                  * Lock the measured BK256-to-BK64 crossover into the same
                  * regression that proves its arithmetic. M=33 is the first
@@ -2494,53 +2591,30 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     profiled_narrow_large_k_crossover_seen = true;
                 }
 
-                /*
-                 * Route the witness's final active row through production M=1.
-                 * The same stream orders the row upload, GEMV launch, and all
-                 * result downloads, so this oracle adds no device-wide fence
-                 * and cannot observe partially published data.
-                 */
-                const float *serial_row_source =
-                    input_values.data() +
-                    static_cast<size_t>(test_case.active_rows - 1) * K;
-                ASSERT_EQ(
-                    cudaMemcpyAsync(
-                        serial_row_input->gpu_data_ptr(),
-                        serial_row_source,
-                        static_cast<size_t>(K) * sizeof(float),
-                        cudaMemcpyHostToDevice,
-                        stream),
-                    cudaSuccess);
-                ASSERT_TRUE(cuda_kernel->multiply_tensor(
-                    serial_row_input.get(),
-                    serial_row_output.get(),
-                    1,
-                    N,
-                    K,
-                    /*transpose_B=*/true,
-                    1.0f,
-                    0.0f));
-
                 SCOPED_TRACE(
                     std::string("exact_selection={tile=") +
                     std::to_string(exact_selection.tile_id) +
-                    ",split_k=" + std::to_string(exact_selection.split_k) +
+                    ",k_partitions=" +
+                    std::to_string(exact_selection.k_partitions) +
                     ",bk256=" + std::to_string(exact_selection.used_bk256) +
-                    ",streamk=" + std::to_string(exact_selection.used_streamk) +
+                    ",canonical_kpart=" +
+                    std::to_string(exact_selection.used_canonical_kpart) +
                     "} bucket_selection={tile=" +
                     std::to_string(bucket_selection.tile_id) +
-                    ",split_k=" + std::to_string(bucket_selection.split_k) +
+                    ",k_partitions=" +
+                    std::to_string(bucket_selection.k_partitions) +
                     ",bk256=" + std::to_string(bucket_selection.used_bk256) +
-                    ",streamk=" + std::to_string(bucket_selection.used_streamk) +
+                    ",canonical_kpart=" +
+                    std::to_string(bucket_selection.used_canonical_kpart) +
                     "}");
 
                 for (const LaunchSelection &selection :
                      {exact_selection, bucket_selection})
                 {
-                    EXPECT_EQ(selection.split_k, 1)
-                        << "production AUTO prefill changed the canonical K tree";
-                    EXPECT_EQ(selection.used_streamk, 0)
-                        << "production AUTO prefill selected atomic Stream-K";
+                    EXPECT_EQ(selection.k_partitions, 1)
+                        << "AUTO should own the complete output tile";
+                    EXPECT_EQ(selection.used_canonical_kpart, 0)
+                        << "AUTO unexpectedly entered forced K-partition mode";
                     if (selection.tile_id >= 0 &&
                         selection.tile_id <
                             static_cast<int>(tensor_core_tile_seen.size()))
@@ -2556,7 +2630,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     static_cast<size_t>(test_case.active_rows) * N;
                 std::vector<float> exact_host(active_values);
                 std::vector<float> bucket_host(active_values);
-                std::vector<float> serial_row_host(static_cast<size_t>(N));
+                std::vector<float> canonical_kpart_host(
+                    has_canonical_kpart_candidate ? active_values : 0);
                 ASSERT_EQ(
                     cudaMemcpyAsync(
                         exact_host.data(),
@@ -2573,14 +2648,17 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                         cudaMemcpyDeviceToHost,
                         stream),
                     cudaSuccess);
-                ASSERT_EQ(
-                    cudaMemcpyAsync(
-                        serial_row_host.data(),
-                        serial_row_output->gpu_data_ptr(),
-                        static_cast<size_t>(N) * sizeof(float),
-                        cudaMemcpyDeviceToHost,
-                        stream),
-                    cudaSuccess);
+                if (has_canonical_kpart_candidate)
+                {
+                    ASSERT_EQ(
+                        cudaMemcpyAsync(
+                            canonical_kpart_host.data(),
+                            canonical_kpart_output->gpu_data_ptr(),
+                            active_values * sizeof(float),
+                            cudaMemcpyDeviceToHost,
+                            stream),
+                        cudaSuccess);
+                }
                 ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
                 const std::string label =
@@ -2593,25 +2671,37 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     bucket_host.data(),
                     exact_host.data(),
                     active_values);
-                const std::string prefix_label =
+                if (has_canonical_kpart_candidate)
+                {
+                    const std::string canonical_kpart_label =
+                        std::string(format.name) +
+                        " canonical K-partition vs serial-row-equivalent "
+                        "prefill at M=" +
+                        std::to_string(test_case.active_rows);
+                    expectBitwiseEqualFloatRow(
+                        canonical_kpart_label.c_str(),
+                        canonical_kpart_host.data(),
+                        exact_host.data(),
+                        active_values);
+                }
+                const std::string exact_serial_label =
                     std::string(format.name) +
-                    " canonical M=17 prefix at active M=" +
+                    " exact M vs production serial M=1 rows at active M=" +
                     std::to_string(test_case.active_rows);
                 expectBitwiseEqualFloatRow(
-                    prefix_label.c_str(),
+                    exact_serial_label.c_str(),
                     exact_host.data(),
-                    canonical_prefix.data(),
-                    canonical_prefix_values);
-                const std::string serial_label =
+                    serial_decode_rows.data(),
+                    active_values);
+                const std::string bucket_serial_label =
                     std::string(format.name) +
-                    " final active row vs production M=1 at active M=" +
+                    " bucket active rows vs production serial M=1 at active M=" +
                     std::to_string(test_case.active_rows);
                 expectBitwiseEqualFloatRow(
-                    serial_label.c_str(),
-                    exact_host.data() +
-                        static_cast<size_t>(test_case.active_rows - 1) * N,
-                    serial_row_host.data(),
-                    static_cast<size_t>(N));
+                    bucket_serial_label.c_str(),
+                    bucket_host.data(),
+                    serial_decode_rows.data(),
+                    active_values);
             }
 
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
@@ -2646,9 +2736,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
  * output bit. This regression therefore computes a conservative
  * `T64x128_w2x2` reference, restores production automatic dispatch, checks the
  * selected measured winner, and compares the complete output tensor byte for
- * byte. Stream-K, BK256, split-K, and deterministic test mode remain disabled
- * so this is the same single-partition route used by captured production
- * prefill graphs.
+ * byte. BK256 remains disabled so the comparison isolates output-tile policy;
+ * both candidates execute the same mandatory public-M=1 reduction schedule.
  */
 TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactTile)
 {
@@ -2672,9 +2761,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
     }};
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     const std::vector<float> input =
         randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -2706,7 +2793,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         std::vector<float> conservative_output(
             static_cast<size_t>(M) * static_cast<size_t>(N),
             0.0f);
-        cudaNativeVNNIPrefill_setForceTile(conservative_tile, 1);
+        cudaNativeVNNIPrefill_setForceTile(conservative_tile);
         ASSERT_TRUE(cudaMultiplyViaTensor(
             cuda_kernel,
             input.data(),
@@ -2717,23 +2804,23 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
             gpu_device_));
 
         int tile_id = -1;
-        int split_k = -1;
+        int k_partitions = -1;
         int used_bk256 = -1;
-        int used_streamk = -1;
+        int used_canonical_kpart = -1;
         cudaNativeVNNIPrefill_getLastLaunchSelection(
             &tile_id,
-            &split_k,
+            &k_partitions,
             &used_bk256,
-            &used_streamk);
+            &used_canonical_kpart);
         ASSERT_EQ(tile_id, conservative_tile);
-        ASSERT_EQ(split_k, 1);
+        ASSERT_EQ(k_partitions, 1);
         ASSERT_EQ(used_bk256, 0);
-        ASSERT_EQ(used_streamk, 0);
+        ASSERT_EQ(used_canonical_kpart, 0);
 
         std::vector<float> production_output(
             static_cast<size_t>(M) * static_cast<size_t>(N),
             0.0f);
-        cudaNativeVNNIPrefill_setForceTile(-1, 0);
+        cudaNativeVNNIPrefill_setForceTile(-1);
         ASSERT_TRUE(cudaMultiplyViaTensor(
             cuda_kernel,
             input.data(),
@@ -2745,14 +2832,14 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
 
         cudaNativeVNNIPrefill_getLastLaunchSelection(
             &tile_id,
-            &split_k,
+            &k_partitions,
             &used_bk256,
-            &used_streamk);
+            &used_canonical_kpart);
         EXPECT_EQ(tile_id, overlay.expected_tile)
             << overlay.format_name << " did not use its profiled production tile";
-        EXPECT_EQ(split_k, 1);
+        EXPECT_EQ(k_partitions, 1);
         EXPECT_EQ(used_bk256, 0);
-        EXPECT_EQ(used_streamk, 0);
+        EXPECT_EQ(used_canonical_kpart, 0);
 
         expectBitwiseEqualFloatRow(
             (std::string(overlay.format_name) +
@@ -2775,15 +2862,15 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
  * The production policy changes only asymmetric and dual-scale formats, but
  * the regression intentionally sweeps every loader-supported NativeVNNI
  * format. For each M=2..16 plus the M=31 depth sentinel, it compares production
- * AUTO dispatch against the measured `T64x64_w2x2`, split-K=1 candidate in
+ * AUTO dispatch against the measured `T64x64_w2x2` candidate in
  * native FP32 bytes. Affected formats must select that candidate without a
  * force control; unaffected formats prove that the candidate remains a valid
  * arithmetic oracle without changing their independently tuned AUTO policy.
  *
  * This exercises the public tensor GEMM entrypoint with ordinary production
- * optimizations enabled. Stream-K is disabled because it is not a legal
- * batch-invariant production candidate, while deterministic test mode remains
- * off so this test cannot certify a test-only execution regime.
+ * optimizations enabled. Every selectable tile now inherits the public M=1
+ * partition boundaries and fold order, so geometry selection cannot silently
+ * opt out of the serial-row arithmetic contract.
  */
 TEST_F(Test__CUDAGemmParity,
        AsymmetricQwen36MoEExpertProjectionUsesProfiledMTotalByteExactTile)
@@ -2817,9 +2904,7 @@ TEST_F(Test__CUDAGemmParity,
     };
 
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     size_t profiled_formats_seen = 0;
     for (const auto &format : cudaSmallMNativeFormats())
@@ -2850,7 +2935,7 @@ TEST_F(Test__CUDAGemmParity,
             std::vector<float> profiled_output(
                 static_cast<size_t>(M) * N,
                 0.0f);
-            cudaNativeVNNIPrefill_setForceTile(profiled_tile, 1);
+            cudaNativeVNNIPrefill_setForceTile(profiled_tile);
             ASSERT_TRUE(cudaMultiplyViaTensor(
                 cuda_kernel,
                 input.data(),
@@ -2861,23 +2946,23 @@ TEST_F(Test__CUDAGemmParity,
                 gpu_device_));
 
             int tile_id = -1;
-            int split_k = -1;
+            int k_partitions = -1;
             int used_bk256 = -1;
-            int used_streamk = -1;
+            int used_canonical_kpart = -1;
             cudaNativeVNNIPrefill_getLastLaunchSelection(
                 &tile_id,
-                &split_k,
+                &k_partitions,
                 &used_bk256,
-                &used_streamk);
+                &used_canonical_kpart);
             ASSERT_EQ(tile_id, profiled_tile);
-            ASSERT_EQ(split_k, 1);
+            ASSERT_EQ(k_partitions, 1);
             ASSERT_EQ(used_bk256, 0);
-            ASSERT_EQ(used_streamk, 0);
+            ASSERT_EQ(used_canonical_kpart, 0);
 
             std::vector<float> production_output(
                 static_cast<size_t>(M) * N,
                 0.0f);
-            cudaNativeVNNIPrefill_setForceTile(-1, 0);
+            cudaNativeVNNIPrefill_setForceTile(-1);
             ASSERT_TRUE(cudaMultiplyViaTensor(
                 cuda_kernel,
                 input.data(),
@@ -2889,17 +2974,17 @@ TEST_F(Test__CUDAGemmParity,
 
             cudaNativeVNNIPrefill_getLastLaunchSelection(
                 &tile_id,
-                &split_k,
+                &k_partitions,
                 &used_bk256,
-                &used_streamk);
+                &used_canonical_kpart);
             if (expects_profiled_tile)
             {
                 EXPECT_EQ(tile_id, profiled_tile)
                     << format.name
                     << " did not use the profiled verifier output geometry";
-                EXPECT_EQ(split_k, 1);
+                EXPECT_EQ(k_partitions, 1);
                 EXPECT_EQ(used_bk256, 0);
-                EXPECT_EQ(used_streamk, 0);
+                EXPECT_EQ(used_canonical_kpart, 0);
             }
 
             expectBitwiseEqualFloatRow(
@@ -3035,8 +3120,7 @@ DEFINE_QUANTIZED_PARITY_TEST(Q8_0_SmallMatrix, Q8_0Tensor, createQ8_0Random, 32,
 TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896PreservesOrderedKReduction)
 {
     ScopedCudaPrefillModes modes;
-    cudaNativeVNNIPrefill_setForceTile(-1, 0);
-    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setForceTile(-1);
 
     const int M = 35;
     const int N = 896;
@@ -3061,31 +3145,30 @@ TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896PreservesOrderedKReduction)
     {
         std::vector<float> C_cuda(M * N, 0.0f);
         ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_))
-            << "production split-K prefill repetition " << repetition;
+            << "production decode-equivalent prefill repetition " << repetition;
 
         int tile_id = -99;
-        int split_k = -1;
+        int k_partitions = -1;
         int used_bk256 = 0;
-        int used_streamk = 0;
-        cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
+        int used_canonical_kpart = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &tile_id,
+            &k_partitions,
+            &used_bk256,
+            &used_canonical_kpart);
         /*
-         * Production prefill deliberately keeps one increasing-K walk for
-         * every output row. Split-K used to improve occupancy here, but its
-         * reduction combines rounded partition sums and therefore cannot be
-         * byte-equivalent to the canonical serial reduction. The current
-         * launch policy recovers occupancy through output-tile geometry while
-         * retaining split_k=1 for batch invariance.
+         * The ordinary tile records one physical output owner. Its kernel still
+         * reproduces the public M=1 partition boundaries and ascending fold
+         * internally whenever decode uses an ordered reducer.
          */
-        EXPECT_EQ(split_k, 1)
-            << "Production prefill must preserve the ordered K reduction";
-        EXPECT_EQ(used_streamk, 0)
-            << "This shape should use split-K rather than Stream-K";
+        EXPECT_EQ(k_partitions, 1);
+        EXPECT_EQ(used_canonical_kpart, 0);
 
         auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.999, 0.05);
         result.print("Q8_0 Prefill 35x896x896"
                      " repetition=" + std::to_string(repetition) +
                      " tile=" + std::to_string(tile_id) +
-                     " split_k=" + std::to_string(split_k));
+                     " k_partitions=" + std::to_string(k_partitions));
 
         EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";
         EXPECT_GE(result.cosine_similarity, 0.999)
@@ -3219,17 +3302,38 @@ TEST_F(Test__CUDAGemmParity, Q4_0_SmallPrefillM4_UsesNativeSmallMRoute)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
-TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
+TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamicReset)
 {
-    const int M = 512;
-    const int N = 896;
-    const int K = 896;
+    const int M = 128;
+    const int N = 512;
+    const int K = 2048;
 
     ScopedCudaPrefillModes prefill_modes;
     cudaNativeVNNIPrefill_setBK256Mode(-1);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
-    cudaNativeVNNIPrefill_setForceTile(1, 1); // T64x128_w2x2, single split-K.
-    cudaNativeVNNIPrefill_setStreamKMode(2);  // Force two-pass Stream-K fixup buffer path.
+    cudaNativeVNNIPrefill_setForceTile(1); // T64x128_w2x2.
+
+    int sm_count = 0;
+    ASSERT_EQ(
+        cudaDeviceGetAttribute(
+            &sm_count,
+            cudaDevAttrMultiProcessorCount,
+            gpu_device_.cuda_ordinal()),
+        cudaSuccess);
+    int uses_ordered_reducer = 0;
+    int canonical_k_partitions = 0;
+    ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+        quantizedVerifierFormat("Q4_0").device_execution_codebook_id,
+        N,
+        K,
+        sm_count,
+        &uses_ordered_reducer,
+        &canonical_k_partitions));
+    ASSERT_EQ(uses_ordered_reducer, 1);
+    ASSERT_GT(canonical_k_partitions, 1);
+
+    // Workspace identity must include the public-M=1 partition schedule before
+    // graph capture. Captured replay then owns the same persistent partials.
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
 
     auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)}, 232);
     auto A_data = randomFP32(static_cast<size_t>(M) * K);
@@ -3241,6 +3345,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
     ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
 
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
@@ -3258,18 +3363,45 @@ TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     cuda_kernel->setGPUStream(stream);
+
+    // The direct output owner and the explicit K-partition owner are separate
+    // economical schedules for exactly the same public-M=1 arithmetic tree.
+    // Capture must preserve byte equality, not merely numerical proximity.
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
+        gpu_device_.ordinal, workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> C_direct(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  C_direct.data(),
+                  C_tensor.gpu_data_ptr(),
+                  C_direct.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(true);
     ASSERT_TRUE(cuda_kernel->multiply_tensor(
         &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
         gpu_device_.ordinal, workspace_.get()));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     int tile_id = -1;
-    int split_k = 0;
+    int k_partitions = 0;
     int used_bk256 = 0;
-    int used_streamk = 0;
-    cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
-    ASSERT_EQ(used_bk256, 0) << "Regression must exercise BK64 Stream-K, not BK256";
-    ASSERT_EQ(used_streamk, 2) << "Regression must exercise two-pass Stream-K context scratch";
+    int used_canonical_kpart = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &tile_id,
+        &k_partitions,
+        &used_bk256,
+        &used_canonical_kpart);
+    ASSERT_EQ(used_bk256, 0);
+    ASSERT_EQ(used_canonical_kpart, 1)
+        << "Regression must exercise persistent canonical K-partition scratch";
+    ASSERT_EQ(k_partitions, canonical_k_partitions);
 
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -3304,8 +3436,14 @@ TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
+    expectBitwiseEqualFloatRow(
+        "Q4_0 canonical K-partition graph replay vs direct output-owner schedule",
+        C_cuda.data(),
+        C_direct.data(),
+        C_cuda.size());
+
     auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
-    result.print("Q4_0 prefill graph replay after CUDA GEMM dynamic reset");
+    result.print("Q4_0 canonical K-partition graph replay after CUDA GEMM dynamic reset");
     EXPECT_FALSE(result.has_nan_inf);
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "Cosine similarity too low after graph replay: " << result.cosine_similarity;
@@ -5728,9 +5866,9 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
         ASSERT_NE(cuda_kernel0, nullptr) << fmt.name << " CUDA projection 0 kernel";
         ASSERT_NE(cuda_kernel1, nullptr) << fmt.name << " CUDA projection 1 kernel";
 
-        ASSERT_TRUE(setupSharedWorkspace(
+        ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(
             {cuda_kernel0, cuda_kernel1},
-            kGroupedVerifierRuntimeRows.back(),
+            {1, kGroupedVerifierRuntimeRows.back()},
             {N0, N1},
             K))
             << fmt.name << " shared workspace";
@@ -7306,6 +7444,182 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
 }
 
 /**
+ * @brief Prove the generated WIDE/DIRECT verifier family for every codebook.
+ *
+ * The compact all-format sweep above is exhaustive over verifier M, but its
+ * `N=384, K=512` geometry selects KPAR. Qwen LM heads are extremely wide and
+ * select the single-partition WIDE or DIRECT serial-M1 families instead. The
+ * grouped launcher must preserve that one-accumulator expression tree while
+ * reusing each packed-weight traversal across sixteen verifier rows. The
+ * grouped policy may choose its separately certified tensor-core kernel when
+ * that kernel is byte-gated against the same serial-M1 contract.
+ *
+ * `N=248320, K=1024` is a production Qwen vocabulary projection and is an
+ * exact generated-policy overlay for every supported codebook. This test keeps
+ * M-totality in the compact suite and crosses it with the physical M=16 policy
+ * bucket here. PerfStats proves that the real grouped entry point inherited the
+ * generated WIDE/DIRECT route; byte comparison against independent public-M1
+ * launches proves the route did not replace serial arithmetic with a merely
+ * close approximation.
+ */
+TEST_F(Test__CUDAGemmParity,
+       NativeVNNILMHeadM16_AllNativeFormatsMatchSerialGEMVs)
+{
+    constexpr int M = 16;
+    constexpr int N = 248320;
+    constexpr int K = 1024;
+    constexpr int wide_shape_id = 0;
+    constexpr int direct_shape_id = 2;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    size_t inherited_wide_direct_routes = 0;
+    size_t tensor_core_routes = 0;
+
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr)
+            << "Failed to create " << format.name
+            << " Qwen LM-head WIDE/DIRECT weights";
+
+        auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K))
+            << format.name << " WIDE/DIRECT verifier workspace";
+
+        DeviceNativeVNNIMatrixDesc desc;
+        ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
+            << format.name << " must export a native-VNNI descriptor";
+
+        int shape_id = -1;
+        int tile_n = 0;
+        int cpt = 0;
+        int exact_kb = -1;
+        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+            desc.codebook_id,
+            /*graph_captured=*/1,
+            /*m=*/1,
+            N,
+            K,
+            &shape_id,
+            &tile_n,
+            &cpt,
+            &exact_kb))
+            << format.name << " generated serial-M1 LM-head policy";
+        ASSERT_TRUE(shape_id == wide_shape_id || shape_id == direct_shape_id)
+            << format.name << " expected WIDE/DIRECT route, shape_id="
+            << shape_id << " tile_n=" << tile_n << " cpt=" << cpt;
+        ASSERT_EQ(exact_kb, 0)
+            << format.name
+            << " single-partition WIDE/DIRECT policy must not encode KPAR";
+
+        const auto input = randomFP32(static_cast<size_t>(M) * K);
+        std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+            kernel,
+            input.data(),
+            grouped.data(),
+            M,
+            N,
+            K,
+            gpu_device_,
+            workspace_.get()))
+            << format.name << " grouped WIDE/DIRECT verifier projection";
+
+        bool observed_grouped_route = false;
+        for (const auto &record :
+             PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_gemv_dispatch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cuda_native_vnni_gemv_dispatch")
+            {
+                continue;
+            }
+
+            const auto tag = [&record](const char *name) -> std::string
+            {
+                const auto it = record.tags.find(name);
+                return it == record.tags.end() ? std::string{} : it->second;
+            };
+            if (tag("codebook") != std::to_string(desc.codebook_id) ||
+                tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K))
+            {
+                continue;
+            }
+
+            observed_grouped_route = true;
+            EXPECT_EQ(tag("semantic_contract"), "verifier_serial_m1_bitwise")
+                << format.name;
+            EXPECT_EQ(tag("effective_kb"), "1") << format.name;
+            EXPECT_EQ(tag("rowmajor_available"), "false") << format.name;
+
+            const std::string route = tag("route");
+            if (route == "wide" || route == "direct")
+            {
+                ++inherited_wide_direct_routes;
+                EXPECT_EQ(tag("force_two_phase"), "0") << format.name;
+            }
+            else if (route == "tensor_core")
+            {
+                ++tensor_core_routes;
+                EXPECT_EQ(tag("force_two_phase"), "1") << format.name;
+            }
+            else
+            {
+                ADD_FAILURE()
+                    << format.name << " unexpected grouped LM-head route="
+                    << route;
+            }
+        }
+        ASSERT_TRUE(observed_grouped_route)
+            << format.name
+            << " did not publish grouped WIDE/DIRECT production dispatch evidence\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_native_vnni_gemv_dispatch"}, 20);
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                kernel,
+                input.data() + static_cast<size_t>(row) * K,
+                serial.data(),
+                /*M=*/1,
+                N,
+                K,
+                gpu_device_))
+                << format.name << " serial LM-head decode row=" << row;
+
+            expectBitwiseEqualFloatRow(
+                (std::string(format.name) +
+                 " WIDE/DIRECT grouped LM-head M=16 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                grouped.data() + static_cast<size_t>(row) * N,
+                serial.data(),
+                serial.size());
+        }
+
+        cleanupWorkspaceIfNeeded(kernel);
+        EXPECT_FALSE(kernel->hasDynamicStateActive())
+            << format.name
+            << " WIDE/DIRECT sweep leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+
+    EXPECT_GT(inherited_wide_direct_routes, 0u)
+        << "all-format LM-head coverage must execute the inherited "
+           "WIDE/DIRECT grouped implementation";
+    EXPECT_GT(tensor_core_routes, 0u)
+        << "all-format LM-head coverage must execute the byte-gated "
+           "tensor-core grouped implementation";
+}
+
+/**
  * @brief Prove every native codebook on the production large-K KPAR shape class.
  *
  * The compact all-format sweep above uses `K=512`, while Qwen3.6 LocalTP GDN
@@ -8438,13 +8752,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDecodeRoute)
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecodeRoute)
 {
     const int N = 17408;
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
-    ScopedDeterministicDebugEnv deterministic;
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ4_KRandom(
@@ -8508,15 +8821,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         {
             return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
         }))
-        << "Q4_K deterministic M=1 canonical gate/up projection failed";
+        << "Q4_K production M=1 canonical gate/up projection failed";
 
     expectBitwiseEqualFloatRow(
-        "deterministic Q4_K gate M=2 row0 vs M=1 canonical decode",
+        "production Q4_K gate M=2 row0 vs M=1 canonical decode",
         gate_m2->data(),
         gate_m1->data(),
         static_cast<size_t>(N));
     expectBitwiseEqualFloatRow(
-        "deterministic Q4_K up M=2 row0 vs M=1 canonical decode",
+        "production Q4_K up M=2 row0 vs M=1 canonical decode",
         up_m2->data(),
         up_m1->data(),
         static_cast<size_t>(N));
@@ -8537,7 +8850,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         }
     }
     EXPECT_EQ(canonical_m1, 2u)
-        << "Deterministic M=1 gate/up must route through canonical decode GEMV";
+        << "Production M=1 gate/up must route through canonical decode GEMV";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();
@@ -8550,13 +8863,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDecodeRoute)
+TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecodeRoute)
 {
     const int N = 17408;
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
-    ScopedDeterministicDebugEnv deterministic;
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ5_KRandom(
@@ -8620,15 +8932,15 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         {
             return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
         }))
-        << "Q5_K deterministic M=1 canonical gate/up projection failed";
+        << "Q5_K production M=1 canonical gate/up projection failed";
 
     expectBitwiseEqualFloatRow(
-        "deterministic Q5_K gate M=2 row0 vs M=1 canonical decode",
+        "production Q5_K gate M=2 row0 vs M=1 canonical decode",
         gate_m2->data(),
         gate_m1->data(),
         static_cast<size_t>(N));
     expectBitwiseEqualFloatRow(
-        "deterministic Q5_K up M=2 row0 vs M=1 canonical decode",
+        "production Q5_K up M=2 row0 vs M=1 canonical decode",
         up_m2->data(),
         up_m1->data(),
         static_cast<size_t>(N));
@@ -8649,7 +8961,7 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         }
     }
     EXPECT_EQ(canonical_m1, 2u)
-        << "Deterministic M=1 Q5_K gate/up must route through canonical decode GEMV";
+        << "Production M=1 Q5_K gate/up must route through canonical decode GEMV";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();

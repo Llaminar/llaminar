@@ -68,9 +68,6 @@ namespace llaminar2
         // These functions are implemented in CUDAQuantisedGemmKernel_CUTLASS.cu
         extern "C"
         {
-            void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-            bool cudaNativeVNNIPrefill_getDeterministicMode();
-
             // Quantize FP32 activations to INT8 with per-block-of-32 scales
             bool cudaQuantGemm_quantizeActivationsBlockwise(
                 const float *d_A_fp32,       // [M x K]
@@ -207,10 +204,8 @@ namespace llaminar2
 
             void cudaPrefillContext_bindWorkspace(
                 CUDAPrefillContext *ctx,
-                float *splitk_partials,
-                size_t splitk_partials_bytes,
-                float *streamk_fixup,
-                size_t streamk_fixup_bytes);
+                float *canonical_kpart_partials,
+                size_t canonical_kpart_partials_bytes);
 
             bool cudaNativeVNNIPrefill_getWorkspacePlan(
                 uint8_t codebook_id,
@@ -218,20 +213,18 @@ namespace llaminar2
                 int N,
                 int K,
                 int cuda_device_id,
-                size_t *splitk_partials_bytes,
-                size_t *streamk_fixup_bytes,
-                int *planned_split_k,
-                int *planned_streamk);
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions);
 
             void cudaNativeVNNIPrefill_getLastLaunchSelection(
                 int *tile_id,
-                int *split_k,
+                int *k_partitions,
                 int *used_bk256,
-                int *used_streamk);
+                int *used_canonical_kpart);
 
-            int cudaNativeVNNIPrefill_getStreamKMode();
             int cudaNativeVNNIPrefill_getBK256Mode();
-            void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+            bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+            void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
 
         }
 
@@ -334,14 +327,12 @@ namespace llaminar2
         }
 
         /**
-         * @brief Temporarily force decode-equivalent M=1 GEMV reductions.
+         * @brief Resolve grouped verifier work through public-M1 dispatch.
          *
-         * The generated CUDA GEMV table may choose atomic K-parallel reductions
-         * for speed.  Atomic accumulation is not a valid oracle for MTP verifier
-         * publication because first-call and later-call rows can differ by one
-         * ULP.  The low-level switch is thread-local, so this scope affects only
-         * the current LocalTP worker while preserving normal fast policy on
-         * sibling host threads.
+         * CUDA NativeVNNI has one ordered K-partition arithmetic contract. The
+         * thread-local scope selects the public-M1 family, tile, and exact K
+         * partition for a grouped launch; it does not enable a slower or
+         * alternate reduction implementation.
          */
         class ScopedNativeVNNIGemvDecodeEquivalentM1Config final
         {
@@ -483,11 +474,6 @@ namespace llaminar2
 
         namespace
         {
-            int ceilDivPositive(int value, int divisor)
-            {
-                return (value + divisor - 1) / divisor;
-            }
-
             size_t paddedNativePrefillM(int m)
             {
                 return (m > 1) ? static_cast<size_t>((m + 127) & ~127) : static_cast<size_t>(m);
@@ -500,104 +486,25 @@ namespace llaminar2
                            : 1ULL;
             }
 
-            size_t paddedSplitKPartialBytes(int m, int n, int split_k)
+            size_t paddedCanonicalKpartBytes(
+                int m,
+                int n,
+                int k_partitions)
             {
-                if (m <= 0 || n <= 0 || split_k <= 1)
+                if (m <= 0 || n <= 0 || k_partitions <= 1)
                     return 0;
-                return static_cast<size_t>(split_k) *
+                return static_cast<size_t>(k_partitions) *
                        paddedNativePrefillM(m) *
                        static_cast<size_t>(n) *
                        sizeof(float);
             }
 
-            int workspacePlanningSmCount(int cuda_device_id)
-            {
-                int sm_count = 0;
-                if (cudaDeviceGetAttribute(
-                        &sm_count,
-                        cudaDevAttrMultiProcessorCount,
-                        cuda_device_id) == cudaSuccess &&
-                    sm_count > 0)
-                {
-                    return sm_count;
-                }
-
-                // Requirement planning must be safe in no-hardware unit tests and
-                // before CUDA context setup. Use a high-SM fallback so underfilled
-                // prompt/expert sub-batches reserve enough split-K scratch.
-                return 132;
-            }
-
-            int conservativeNativePrefillSplitK(uint8_t codebook_id, int rows, int n, int k, int cuda_device_id)
-            {
-                if (rows <= 1 || n <= 0 || k <= 0)
-                    return 1;
-
-                // Codebook-specific tile selection happens in the device
-                // launcher. Workspace sizing needs only a conservative split-K
-                // upper bound and deliberately has no generated prefill table.
-                (void)codebook_id;
-
-                const int sm_count = workspacePlanningSmCount(cuda_device_id);
-                const int ki = std::max(1, k / 128);
-                const int t64 = ceilDivPositive(rows, 64) * ceilDivPositive(n, 64);
-                const int t64x128 = ceilDivPositive(rows, 64) * ceilDivPositive(n, 128);
-                const int t128 = ceilDivPositive(rows, 128) * ceilDivPositive(n, 128);
-
-                if (t128 >= sm_count && rows >= 128)
-                    return 1;
-
-                if (t64x128 >= sm_count)
-                {
-                    return (t64x128 < ((3 * sm_count) / 2) && ki >= 28) ? 2 : 1;
-                }
-
-                if (t64 >= sm_count)
-                {
-                    if (ki < 14 || t64x128 < 28)
-                        return 1;
-
-                    const int target = (3 * sm_count) / 2;
-                    int split_k = 1;
-                    for (int candidate = 1; candidate <= 4; candidate *= 2)
-                    {
-                        if (ki < candidate * 7)
-                            break;
-                        split_k = candidate;
-                        if (t64x128 * candidate >= target)
-                            break;
-                    }
-                    return split_k;
-                }
-
-                int base_tiles = t64;
-                if (t128 >= 16 && ki >= 40 && rows >= 128)
-                    base_tiles = t128;
-                else if (t64x128 >= 8 && ki >= 8)
-                    base_tiles = t64x128;
-
-                const int target = (3 * sm_count) / 2;
-                int split_k = 1;
-                for (int candidate = 1; candidate <= 8; candidate *= 2)
-                {
-                    if (base_tiles >= 8 && ki < candidate)
-                        break;
-                    split_k = candidate;
-                    if (base_tiles * candidate >= target)
-                        break;
-                }
-                return split_k;
-            }
-
             struct NativePrefillWorkspaceBounds
             {
                 bool valid = false;
-                size_t splitk_partials_bytes = 0;
-                size_t streamk_fixup_bytes = 0;
-                int splitk_rows = 0;
-                int streamk_rows = 0;
-                int planned_split_k = 1;
-                int planned_streamk = 0;
+                size_t canonical_kpart_partials_bytes = 0;
+                int canonical_kpart_rows = 0;
+                int planned_k_partitions = 1;
             };
 
             struct NativePrefillWorkspaceCacheKey
@@ -607,11 +514,9 @@ namespace llaminar2
                 int n = 0;
                 int k = 0;
                 int cuda_device_id = 0;
-                int deterministic = 0;
-                int streamk_mode = 0;
                 int bk256_mode = 0;
+                int canonical_kpart_mode = 0;
                 int force_tile = -1;
-                int force_split_k = 0;
 
                 bool operator==(const NativePrefillWorkspaceCacheKey &other) const
                 {
@@ -620,11 +525,9 @@ namespace llaminar2
                            n == other.n &&
                            k == other.k &&
                            cuda_device_id == other.cuda_device_id &&
-                           deterministic == other.deterministic &&
-                           streamk_mode == other.streamk_mode &&
                            bk256_mode == other.bk256_mode &&
-                           force_tile == other.force_tile &&
-                           force_split_k == other.force_split_k;
+                           canonical_kpart_mode == other.canonical_kpart_mode &&
+                           force_tile == other.force_tile;
                 }
             };
 
@@ -642,11 +545,9 @@ namespace llaminar2
                     mix(static_cast<size_t>(key.n));
                     mix(static_cast<size_t>(key.k));
                     mix(static_cast<size_t>(key.cuda_device_id));
-                    mix(static_cast<size_t>(key.deterministic));
-                    mix(static_cast<size_t>(key.streamk_mode));
                     mix(static_cast<size_t>(key.bk256_mode));
+                    mix(static_cast<size_t>(key.canonical_kpart_mode));
                     mix(static_cast<size_t>(key.force_tile + 2));
-                    mix(static_cast<size_t>(key.force_split_k));
                     return h;
                 }
             };
@@ -680,80 +581,30 @@ namespace llaminar2
                 if (rows <= 1)
                     return bounds;
 
-                size_t splitk_partials_bytes = 0;
-                size_t streamk_fixup_bytes = 0;
-                int planned_split_k = 1;
-                int planned_streamk = 0;
+                size_t canonical_kpart_partials_bytes = 0;
+                int planned_k_partitions = 1;
                 if (!cudaNativeVNNIPrefill_getWorkspacePlan(
                         codebook_id,
                         rows,
                         n,
                         k,
                         cuda_device_id,
-                        &splitk_partials_bytes,
-                        &streamk_fixup_bytes,
-                        &planned_split_k,
-                        &planned_streamk))
+                        &canonical_kpart_partials_bytes,
+                        &planned_k_partitions))
                 {
                     return bounds;
                 }
 
-                if (!cudaNativeVNNIPrefill_getDeterministicMode())
-                {
-                    planned_split_k = std::max(
-                        planned_split_k,
-                        conservativeNativePrefillSplitK(
-                            codebook_id,
-                            rows,
-                            n,
-                            k,
-                            cuda_device_id));
-                }
-
                 bounds.valid = true;
-                bounds.splitk_partials_bytes =
-                    std::max(splitk_partials_bytes,
-                             paddedSplitKPartialBytes(rows, n, planned_split_k));
-                bounds.streamk_fixup_bytes = streamk_fixup_bytes;
-                bounds.splitk_rows = rows;
-                bounds.streamk_rows = rows;
-                bounds.planned_split_k = planned_split_k;
-                bounds.planned_streamk = planned_streamk;
+                bounds.canonical_kpart_partials_bytes = std::max(
+                    canonical_kpart_partials_bytes,
+                    paddedCanonicalKpartBytes(
+                        rows,
+                        n,
+                        planned_k_partitions));
+                bounds.canonical_kpart_rows = rows;
+                bounds.planned_k_partitions = planned_k_partitions;
                 return bounds;
-            }
-
-            std::vector<int> nativePrefillWorkspaceRowCandidates(int max_m)
-            {
-                std::vector<int> rows;
-                auto add = [&rows, max_m](int row)
-                {
-                    if (row > 1 && row <= max_m)
-                        rows.push_back(row);
-                };
-
-                add(max_m);
-
-                // Cover the heuristic's row boundaries, plus enough dense
-                // small-row coverage for MoE expert groups that can land between
-                // boundaries with larger split-K than the full prompt.
-                const int dense_limit = std::min(max_m, 1024);
-                for (int row = 2; row <= dense_limit; ++row)
-                    add(row);
-
-                static constexpr int kPrefillPlanningBreakpoints[] = {
-                    2, 3, 4, 64, 128, 256, 384, 512, 544, 576, 600, 608,
-                    640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560,
-                    3072, 4096,
-                };
-                for (int row : kPrefillPlanningBreakpoints)
-                    add(row);
-
-                for (int row = 1152; row <= max_m; row += 128)
-                    add(row);
-
-                std::sort(rows.begin(), rows.end());
-                rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-                return rows;
             }
 
             NativePrefillWorkspaceBounds maxNativePrefillWorkspaceForRowsUpTo(
@@ -764,8 +615,7 @@ namespace llaminar2
                 int cuda_device_id)
             {
                 int force_tile = -1;
-                int force_split_k = 0;
-                cudaNativeVNNIPrefill_getForceTile(&force_tile, &force_split_k);
+                cudaNativeVNNIPrefill_getForceTile(&force_tile);
 
                 const NativePrefillWorkspaceCacheKey key{
                     codebook_id,
@@ -773,11 +623,9 @@ namespace llaminar2
                     n,
                     k,
                     cuda_device_id,
-                    cudaNativeVNNIPrefill_getDeterministicMode() ? 1 : 0,
-                    cudaNativeVNNIPrefill_getStreamKMode(),
                     cudaNativeVNNIPrefill_getBK256Mode(),
+                    cudaNativeVNNIPrefill_getCanonicalKPartitionMode() ? 1 : 0,
                     force_tile,
-                    force_split_k,
                 };
 
                 {
@@ -788,28 +636,20 @@ namespace llaminar2
                         return it->second;
                 }
 
-                NativePrefillWorkspaceBounds best;
-                for (int rows : nativePrefillWorkspaceRowCandidates(max_m))
-                {
-                    const NativePrefillWorkspaceBounds current =
-                        nativePrefillWorkspaceForRows(codebook_id, rows, n, k, cuda_device_id);
-                    if (!current.valid)
-                        continue;
-
-                    best.valid = true;
-                    if (current.splitk_partials_bytes > best.splitk_partials_bytes)
-                    {
-                        best.splitk_partials_bytes = current.splitk_partials_bytes;
-                        best.splitk_rows = rows;
-                        best.planned_split_k = current.planned_split_k;
-                    }
-                    if (current.streamk_fixup_bytes > best.streamk_fixup_bytes)
-                    {
-                        best.streamk_fixup_bytes = current.streamk_fixup_bytes;
-                        best.streamk_rows = rows;
-                        best.planned_streamk = current.planned_streamk;
-                    }
-                }
+                /*
+                 * Public-M1 partition count depends only on codebook/N/K and
+                 * workspace bytes are monotonic in M. Planning the largest
+                 * graph bucket therefore proves every smaller row count; an
+                 * exhaustive host-side scan of all intermediate M values adds
+                 * no information and needlessly lengthens graph construction.
+                 */
+                NativePrefillWorkspaceBounds best =
+                    nativePrefillWorkspaceForRows(
+                        codebook_id,
+                        max_m,
+                        n,
+                        k,
+                        cuda_device_id);
 
                 std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
                 nativePrefillWorkspaceCache().emplace(key, best);
@@ -1067,7 +907,7 @@ namespace llaminar2
                     std::call_once(native_vnni_prefill_once, [&]()
                                    { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
 
-                    // Lazy-create per-device prefill context (stream-K fixup buffer + SM count)
+                    // Lazy-create the per-device prefill context and SM-count cache.
                     if (!impl->prefill_ctx)
                         impl->prefill_ctx = cudaPrefillContext_create(cuda_device_id);
 
@@ -1093,18 +933,21 @@ namespace llaminar2
                     }
 
                     int tile_id = -99;
-                    int split_k = -1;
+                    int k_partitions = -1;
                     int used_bk256 = 0;
-                    int used_streamk = 0;
+                    int used_canonical_kpart = 0;
                     cudaNativeVNNIPrefill_getLastLaunchSelection(
-                        &tile_id, &split_k, &used_bk256, &used_streamk);
+                        &tile_id,
+                        &k_partitions,
+                        &used_bk256,
+                        &used_canonical_kpart);
                     LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
                               << static_cast<int>(impl->native_codebook_id)
                               << " M=" << m << " N=" << n << " K=" << k
                               << " tile_id=" << tile_id
-                              << " split_k=" << split_k
+                              << " k_partitions=" << k_partitions
                               << " bk256=" << used_bk256
-                              << " streamk=" << used_streamk
+                              << " canonical_kpart=" << used_canonical_kpart
                               << " (no fallback available — TC/CUTLASS paths have been removed)");
                 }
 
@@ -1718,32 +1561,22 @@ namespace llaminar2
             }
             if (impl_->prefill_ctx)
             {
-                float *splitk_partials = nullptr;
-                size_t splitk_partials_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS))
+                float *canonical_kpart_partials = nullptr;
+                size_t canonical_kpart_partials_bytes = 0;
+                if (workspace_->hasBuffer(
+                        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS))
                 {
-                    splitk_partials = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS));
-                    splitk_partials_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                }
-
-                float *streamk_fixup = nullptr;
-                size_t streamk_fixup_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP))
-                {
-                    streamk_fixup = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP));
-                    streamk_fixup_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
+                    canonical_kpart_partials = static_cast<float *>(
+                        workspace_->getBuffer(
+                            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS));
+                    canonical_kpart_partials_bytes = workspace_->getBufferSize(
+                        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
                 }
 
                 cudaPrefillContext_bindWorkspace(
                     impl_->prefill_ctx,
-                    splitk_partials,
-                    splitk_partials_bytes,
-                    streamk_fixup,
-                    streamk_fixup_bytes);
+                    canonical_kpart_partials,
+                    canonical_kpart_partials_bytes);
             }
         }
 
@@ -1756,26 +1589,24 @@ namespace llaminar2
             if (!impl_ || !impl_->prefill_ctx || !workspace_ || m <= 1)
                 return;
 
-            size_t splitk_bytes = 0;
-            size_t streamk_bytes = 0;
-            int planned_split_k = 1;
-            int planned_streamk = 0;
+            size_t canonical_kpart_bytes = 0;
+            int planned_k_partitions = 1;
             if (!cudaNativeVNNIPrefill_getWorkspacePlan(
                     impl_->native_codebook_id,
                     m,
                     n,
                     k,
                     cuda_device_id_,
-                    &splitk_bytes,
-                    &streamk_bytes,
-                    &planned_split_k,
-                    &planned_streamk))
+                    &canonical_kpart_bytes,
+                    &planned_k_partitions))
             {
                 return;
             }
 
-            splitk_bytes = std::max(splitk_bytes, paddedSplitKPartialBytes(m, n, planned_split_k));
-            if (splitk_bytes == 0 && streamk_bytes == 0)
+            canonical_kpart_bytes = std::max(
+                canonical_kpart_bytes,
+                paddedCanonicalKpartBytes(m, n, planned_k_partitions));
+            if (canonical_kpart_bytes == 0)
                 return;
 
             if (stream_idx < 0 || stream_idx >= kCudaConcurrentPrefillWorkspaceSlots)
@@ -1785,80 +1616,43 @@ namespace llaminar2
                     std::to_string(stream_idx) + " is outside the declared workspace slot range");
             }
 
-            float *splitk_ptr = nullptr;
-            size_t splitk_slot_bytes = 0;
-            if (splitk_bytes > 0)
+            void *buffer = workspace_->getBuffer(
+                GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+            const size_t total_bytes = workspace_->getBufferSize(
+                GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+            const size_t slot_bytes =
+                total_bytes /
+                static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+            const size_t required_total =
+                canonical_kpart_bytes *
+                static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+            if (!buffer || total_bytes < required_total ||
+                slot_bytes < canonical_kpart_bytes)
             {
-                void *buffer = workspace_->getBuffer(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                const size_t total_bytes = workspace_->getBufferSize(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                splitk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                const size_t required_total =
-                    splitk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                if (!buffer || total_bytes < required_total || splitk_slot_bytes < splitk_bytes)
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentPrefill] " +
-                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS) +
-                        " workspace is missing or undersized for concurrent split-K projection: need total " +
-                        std::to_string(required_total) + " bytes (" +
-                        std::to_string(splitk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes) +
-                        " [M=" + std::to_string(m) +
-                        ", N=" + std::to_string(n) +
-                        ", K=" + std::to_string(k) +
-                        ", codebook=" + std::to_string(static_cast<int>(impl_->native_codebook_id)) +
-                        ", split_k=" + std::to_string(planned_split_k) +
-                        ", streamk=" + std::to_string(planned_streamk) +
-                        ", stream_idx=" + std::to_string(stream_idx) +
-                        ", slots=" + std::to_string(kCudaConcurrentPrefillWorkspaceSlots) + "]");
-                }
-                auto *base = static_cast<unsigned char *>(buffer);
-                splitk_ptr = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx) * splitk_slot_bytes);
+                throw std::runtime_error(
+                    "[ConcurrentPrefill] canonical public-M1 K-partition "
+                    "workspace is missing or undersized: need total " +
+                    std::to_string(required_total) + " bytes (" +
+                    std::to_string(canonical_kpart_bytes) +
+                    " per slot), have " + std::to_string(total_bytes) +
+                    " [M=" + std::to_string(m) +
+                    ", N=" + std::to_string(n) +
+                    ", K=" + std::to_string(k) +
+                    ", codebook=" + std::to_string(static_cast<int>(
+                        impl_->native_codebook_id)) +
+                    ", k_partitions=" + std::to_string(planned_k_partitions) +
+                    ", stream_idx=" + std::to_string(stream_idx) +
+                    ", slots=" + std::to_string(
+                        kCudaConcurrentPrefillWorkspaceSlots) + "]");
             }
-
-            float *streamk_ptr = nullptr;
-            size_t streamk_slot_bytes = 0;
-            if (streamk_bytes > 0)
-            {
-                void *buffer = workspace_->getBuffer(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
-                const size_t total_bytes = workspace_->getBufferSize(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
-                streamk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                const size_t required_total =
-                    streamk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                if (!buffer || total_bytes < required_total || streamk_slot_bytes < streamk_bytes)
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentPrefill] " +
-                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP) +
-                        " workspace is missing or undersized for concurrent stream-K projection: need total " +
-                        std::to_string(required_total) + " bytes (" +
-                        std::to_string(streamk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes) +
-                        " [M=" + std::to_string(m) +
-                        ", N=" + std::to_string(n) +
-                        ", K=" + std::to_string(k) +
-                        ", codebook=" + std::to_string(static_cast<int>(impl_->native_codebook_id)) +
-                        ", split_k=" + std::to_string(planned_split_k) +
-                        ", streamk=" + std::to_string(planned_streamk) +
-                        ", stream_idx=" + std::to_string(stream_idx) +
-                        ", slots=" + std::to_string(kCudaConcurrentPrefillWorkspaceSlots) + "]");
-                }
-                auto *base = static_cast<unsigned char *>(buffer);
-                streamk_ptr = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx) * streamk_slot_bytes);
-            }
+            auto *base = static_cast<unsigned char *>(buffer);
+            auto *canonical_kpart_ptr = reinterpret_cast<float *>(
+                base + static_cast<size_t>(stream_idx) * slot_bytes);
 
             cudaPrefillContext_bindWorkspace(
                 impl_->prefill_ctx,
-                splitk_ptr,
-                splitk_slot_bytes,
-                streamk_ptr,
-                streamk_slot_bytes);
+                canonical_kpart_ptr,
+                slot_bytes);
         }
 
         void CUDAQuantisedGemmKernel::bindConcurrentNativeDecodeScratch(
@@ -2595,24 +2389,13 @@ namespace llaminar2
                 }
             }
 
-            // Step 4: Try concurrent multi-stream dispatch for prefill
-            // Deterministic parity mode intentionally disables this path. We
-            // also avoid it for very small prefill M, which is the regime where
-            // the multi-stream fused path still proved unstable in local-PP
-            // parity runs. Keep the fast path for larger prompt lengths where
-            // concurrent projection dispatch is most useful.
-            const bool deterministic_prefill = cudaNativeVNNIPrefill_getDeterministicMode() ||
-                                               debugEnv().gemm.deterministic;
-            const bool small_m_stage_stream = (execution_stream != nullptr) && (m <= 16);
-
-            // Prefill concurrency: larger prompt M, multi-stream fused projections.
-            // The small-M regime (m <= 16) is intentionally excluded here because the
-            // multi-stream fused path proved unstable in local-PP parity runs.
+            // Prefill concurrency is an output-schedule choice and therefore
+            // cannot change any projection's canonical K reduction. Small M is
+            // excluded only because separate stream launches are uneconomical
+            // there; it is not a correctness or determinism fallback.
             const bool prefill_concurrent_eligible = use_blockwise && m > 16 &&
                                                      projections.size() >= 2 &&
-                                                     debugEnv().gemm.cuda_concurrent_prefill &&
-                                                     !deterministic_prefill &&
-                                                     !small_m_stage_stream;
+                                                     debugEnv().gemm.cuda_concurrent_prefill;
 
             // Decode concurrency: m == 1 GEMV projections (e.g. the GDN q/k/v/z and the
             // tiny alpha/beta gates) dispatched on separate streams so the small,
@@ -2623,28 +2406,24 @@ namespace llaminar2
             // partial arenas declared by the fused stage that knows projection fan-out.
             const bool decode_concurrent_eligible = use_blockwise && m == 1 &&
                                                     projections.size() >= 2 &&
-                                                    debugEnv().gemm.cuda_concurrent_decode &&
-                                                    !deterministic_prefill &&
-                                                    !useCanonicalM1Decode();
+                                                    debugEnv().gemm.cuda_concurrent_decode;
 
             const bool concurrent_eligible = prefill_concurrent_eligible || decode_concurrent_eligible;
             const bool concurrent_decode = decode_concurrent_eligible;
 
             // CUDA stream/event creation (pool.init) is illegal while a graph capture is
-            // active. The pool is initialized during the eager warmup step (step 0) that
-            // precedes capture, so by the time the captured decode runs it is already
-            // initialized. Guard defensively: if capture is active and the pool has not
-            // yet been initialized, fall back to the sequential path rather than issue an
-            // illegal allocation inside the capture.
+            // active. The eager preparation phase must therefore initialize the pool
+            // before capture begins. Reaching capture without that lifecycle edge is a
+            // malformed graph, not permission to silently change its launch topology.
             bool concurrent_safe = concurrent_eligible;
             if (concurrent_eligible && isGraphCaptureActive())
             {
                 auto &pool_check = getSharedCUDAPrefillPool(cuda_device_id_);
                 if (!pool_check.initialized)
                 {
-                    LOG_DEBUG("[ConcurrentGemm] Graph capture active but stream pool not "
-                              "initialized; using sequential fallback");
-                    concurrent_safe = false;
+                    throw std::runtime_error(
+                        "[ConcurrentGemm] Capture began before the CUDA projection "
+                        "stream/event pool was initialized");
                 }
             }
 
@@ -3612,10 +3391,9 @@ namespace llaminar2
 
             /*
              * The grouped verifier entry point batches rows, but each row must
-             * still obey the same deterministic K-reduction contract as public
-             * M=1 decode.  This scoped flag is thread-local inside the CUDA GEMV
-             * dispatcher, so normal prefill and non-publication small-M tuning
-             * retain their faster generated policy.
+             * inherit the family, tile, and fixed K-partition contract of public
+             * M=1 decode. The scope changes dispatch identity only; both paths
+             * use the same ordered publication implementation.
              */
             bool ok = false;
             if (explicitSmallMVerifierScopeActive())
@@ -4097,7 +3875,7 @@ namespace llaminar2
             // INT8 path needs quantization + accumulator buffers
             size_t quant_a_bytes = static_cast<size_t>(workspace_m) * k * sizeof(int8_t);
             size_t scales_a_bytes = static_cast<size_t>(workspace_m) * sizeof(float);
-            // NativeVNNI doesn't use INT32 accumulator split-K, so 1 chunk is sufficient.
+            // NativeVNNI owns its ordered FP32 reduction and needs one INT32 chunk.
             constexpr size_t partial_chunk_blocks = 1;
             size_t acc_int32_bytes = static_cast<size_t>(workspace_m) * n * partial_chunk_blocks * sizeof(int32_t);
             size_t concurrent_prefill_acc_bytes =
@@ -4172,18 +3950,10 @@ namespace llaminar2
                 {
                     const size_t prefill_scratch_slots = concurrentPrefillScratchSlotsForM(m);
 
-                    if (prefill_bounds.splitk_partials_bytes > 0)
+                    if (prefill_bounds.canonical_kpart_partials_bytes > 0)
                     {
-                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
-                                                prefill_bounds.splitk_partials_bytes * prefill_scratch_slots,
-                                                256,
-                                                true,
-                                                WorkspaceExecutionRegime::PrefillOnly});
-                    }
-                    if (prefill_bounds.streamk_fixup_bytes > 0)
-                    {
-                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
-                                                prefill_bounds.streamk_fixup_bytes * prefill_scratch_slots,
+                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS,
+                                                prefill_bounds.canonical_kpart_partials_bytes * prefill_scratch_slots,
                                                 256,
                                                 true,
                                                 WorkspaceExecutionRegime::PrefillOnly});
@@ -4191,12 +3961,13 @@ namespace llaminar2
                     LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                               << static_cast<int>(native_codebook_id)
                               << " max_rows=" << m
-                              << " splitk_rows=" << prefill_bounds.splitk_rows
-                              << " split_k=" << prefill_bounds.planned_split_k
-                              << " streamk_rows=" << prefill_bounds.streamk_rows
-                              << " streamk=" << prefill_bounds.planned_streamk
-                              << " splitk_partials=" << (prefill_bounds.splitk_partials_bytes / 1024) << "KB"
-                              << " streamk_fixup=" << (prefill_bounds.streamk_fixup_bytes / 1024) << "KB");
+                              << " canonical_kpart_rows="
+                              << prefill_bounds.canonical_kpart_rows
+                              << " k_partitions="
+                              << prefill_bounds.planned_k_partitions
+                              << " canonical_kpart_partials="
+                              << (prefill_bounds.canonical_kpart_partials_bytes / 1024)
+                              << "KB");
                 }
             }
 

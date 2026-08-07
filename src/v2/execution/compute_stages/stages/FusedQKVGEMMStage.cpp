@@ -1,6 +1,11 @@
 /**
  * @file FusedQKVGEMMStage.cpp
- * @brief Implementation of FusedQKVGEMMStage
+ * @brief Implements shared-activation Q/K/V and K/V projection transactions.
+ *
+ * Projection descriptors are resolved and allocated before graph execution.
+ * The K/V-only policy deliberately omits every Q weight, output, prepared
+ * binding, and ownership edge while retaining the backend's one-quantization
+ * fused projection route.
  */
 
 #include "FusedQKVGEMMStage.h"
@@ -27,6 +32,49 @@ namespace llaminar2
     FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool FusedQKVGEMMStage::includesQuery() const noexcept
+    {
+        return params_.projection_set ==
+               AttentionProjectionSet::QueryKeyValue;
+    }
+
+    size_t FusedQKVGEMMStage::projectionCount() const noexcept
+    {
+        return includesQuery() ? 3U : 2U;
+    }
+
+    ITensorGemm *FusedQKVGEMMStage::anchorKernel() const noexcept
+    {
+        return includesQuery() ? cached_gemm_q_ : cached_gemm_k_;
+    }
+
+    void FusedQKVGEMMStage::rebuildProjectionDescriptors()
+    {
+        cached_projections_.clear();
+        cached_projections_.reserve(projectionCount());
+        if (includesQuery())
+        {
+            cached_projections_.emplace_back(
+                cached_gemm_q_,
+                dynamic_cast<TensorBase *>(params_.output_q),
+                params_.n_q,
+                params_.bias_q,
+                "Q");
+        }
+        cached_projections_.emplace_back(
+            cached_gemm_k_,
+            dynamic_cast<TensorBase *>(params_.output_k),
+            params_.n_k,
+            params_.bias_k,
+            "K");
+        cached_projections_.emplace_back(
+            cached_gemm_v_,
+            dynamic_cast<TensorBase *>(params_.output_v),
+            params_.n_v,
+            params_.bias_v,
+            "V");
     }
 
     void FusedQKVGEMMStage::clearCachedGemmStreams()
@@ -58,17 +106,25 @@ namespace llaminar2
 
     bool FusedQKVGEMMStage::validatePreparedWeights(std::string *error) const
     {
-        if (!params_.wq && !params_.wk && !params_.wv)
+        if ((!includesQuery() || !params_.wq) &&
+            !params_.wk && !params_.wv)
             return true;
         if (!params_.prepared_store ||
-            !params_.prepared_ref_q.has_value() ||
+            (includesQuery() && !params_.prepared_ref_q.has_value()) ||
             !params_.prepared_ref_k.has_value() ||
             !params_.prepared_ref_v.has_value())
         {
-            if (error) *error = "FusedQKVGEMMStage requires PreparedWeightStore and Q/K/V PreparedWeightRefs";
+            if (error)
+            {
+                *error = includesQuery()
+                             ? "FusedQKVGEMMStage requires PreparedWeightStore and Q/K/V PreparedWeightRefs"
+                             : "FusedQKVGEMMStage K/V-only mode requires PreparedWeightStore and K/V PreparedWeightRefs";
+            }
             return false;
         }
-        const bool has_q = params_.prepared_store->contains(params_.prepared_ref_q.value());
+        const bool has_q = !includesQuery() ||
+                           params_.prepared_store->contains(
+                               params_.prepared_ref_q.value());
         const bool has_k = params_.prepared_store->contains(params_.prepared_ref_k.value());
         const bool has_v = params_.prepared_store->contains(params_.prepared_ref_v.value());
         if (!has_q || !has_k || !has_v)
@@ -76,7 +132,9 @@ namespace llaminar2
             if (error)
             {
                 *error = "FusedQKVGEMMStage has a PreparedWeightRef missing from PreparedWeightStore"
-                         " q=" + std::to_string(params_.prepared_ref_q->binding_id) + ":" + (has_q ? "1" : "0") +
+                         " q=" + (includesQuery()
+                                      ? std::to_string(params_.prepared_ref_q->binding_id) + ":" + (has_q ? "1" : "0")
+                                      : std::string("not-requested")) +
                          " k=" + std::to_string(params_.prepared_ref_k->binding_id) + ":" + (has_k ? "1" : "0") +
                          " v=" + std::to_string(params_.prepared_ref_v->binding_id) + ":" + (has_v ? "1" : "0");
             }
@@ -88,22 +146,29 @@ namespace llaminar2
     bool FusedQKVGEMMStage::resolveIndividualKernels(const char *caller)
     {
         if (cache_resolved_individual_)
-            return cached_gemm_q_ && cached_gemm_k_ && cached_gemm_v_;
+            return (!includesQuery() || cached_gemm_q_) &&
+                   cached_gemm_k_ && cached_gemm_v_;
 
         if (!params_.prepared_store ||
-            !params_.prepared_ref_q.has_value() ||
+            (includesQuery() && !params_.prepared_ref_q.has_value()) ||
             !params_.prepared_ref_k.has_value() ||
             !params_.prepared_ref_v.has_value())
         {
-            LOG_ERROR("[" << caller << "] PreparedWeightStore and Q/K/V PreparedWeightRefs are required");
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and "
+                      << (includesQuery() ? "Q/K/V" : "K/V")
+                      << " PreparedWeightRefs are required");
             return false;
         }
 
-        cached_gemm_q_ = params_.prepared_store->gemmKernel(params_.prepared_ref_q.value());
+        cached_gemm_q_ = includesQuery()
+                             ? params_.prepared_store->gemmKernel(
+                                   params_.prepared_ref_q.value())
+                             : nullptr;
         cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
         cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
 
-        if (!cached_gemm_q_ || !cached_gemm_k_ || !cached_gemm_v_)
+        if ((includesQuery() && !cached_gemm_q_) ||
+            !cached_gemm_k_ || !cached_gemm_v_)
         {
             LOG_ERROR("[" << caller << "] PreparedWeightRefs were provided but one or more Q/K/V GEMM kernels were missing from PreparedWeightStore"
                       << " q=" << static_cast<const void *>(cached_gemm_q_)
@@ -112,6 +177,7 @@ namespace llaminar2
             return false;
         }
 
+        rebuildProjectionDescriptors();
         cache_resolved_individual_ = true;
         return true;
     }
@@ -122,6 +188,7 @@ namespace llaminar2
 
         LOG_TRACE("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                     << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v
+                                                    << " projections=" << (includesQuery() ? "Q/K/V" : "K/V")
                                                     << " device=" << params_.device_id.to_string());
 
         // Log bias tensor pointers for multi-GPU debugging
@@ -147,134 +214,95 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.wq || !params_.wk || !params_.wv)
+        if ((includesQuery() && !params_.wq) || !params_.wk || !params_.wv)
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Null weight tensor(s)");
+            LOG_ERROR("[FusedQKVGEMMStage] Null "
+                      << (includesQuery() ? "Q/K/V" : "K/V")
+                      << " weight tensor(s)");
             return false;
         }
-        if (!params_.output_q || !params_.output_k || !params_.output_v)
+        if ((includesQuery() && !params_.output_q) ||
+            !params_.output_k || !params_.output_v)
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Null output buffer(s)");
+            LOG_ERROR("[FusedQKVGEMMStage] Null "
+                      << (includesQuery() ? "Q/K/V" : "K/V")
+                      << " output buffer(s)");
             return false;
         }
-        if (params_.m <= 0 || params_.k <= 0)
+        if (params_.projection_set == AttentionProjectionSet::KeyValueOnly &&
+            (params_.wq || params_.output_q || params_.bias_q ||
+             params_.n_q != 0 || params_.prepared_ref_q.has_value() ||
+             params_.output_q_buffer_id.has_value()))
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
+            LOG_ERROR("[FusedQKVGEMMStage] K/V-only policy must not carry query weights, output, dimensions, bias, prepared refs, or buffer ownership");
+            return false;
+        }
+        if (params_.m <= 0 || params_.k <= 0 ||
+            params_.n_k <= 0 || params_.n_v <= 0 ||
+            (includesQuery() && params_.n_q <= 0))
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Invalid dimensions: m=" << params_.m
+                      << " k=" << params_.k
+                      << " n_q=" << params_.n_q
+                      << " n_k=" << params_.n_k
+                      << " n_v=" << params_.n_v);
             return false;
         }
 
         if (!resolveIndividualKernels("FusedQKVGEMMStage"))
             return false;
-        auto *gemm_q = cached_gemm_q_;
-        auto *gemm_k = cached_gemm_k_;
-        auto *gemm_v = cached_gemm_v_;
+        if (cached_gemm_q_)
+            bindStageStream(cached_gemm_q_);
+        bindStageStream(cached_gemm_k_);
+        bindStageStream(cached_gemm_v_);
+
         const bool gpu_execution = params_.device_id.is_gpu();
-        if (gemm_q)
-            bindStageStream(gemm_q);
-        if (gemm_k)
-            bindStageStream(gemm_k);
-        if (gemm_v)
-            bindStageStream(gemm_v);
         LOG_TRACE("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
-        bool success = false;
 
-        if (gpu_execution)
+        auto *input_base =
+            dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
+        auto *output_q_base = includesQuery()
+                                  ? dynamic_cast<TensorBase *>(params_.output_q)
+                                  : nullptr;
+        auto *output_k_base = dynamic_cast<TensorBase *>(params_.output_k);
+        auto *output_v_base = dynamic_cast<TensorBase *>(params_.output_v);
+        if (!input_base || (includesQuery() && !output_q_base) ||
+            !output_k_base || !output_v_base)
         {
-            // GPU path: Use tensor-aware API - kernel handles device placement
-            LOG_TRACE("[FusedQKVGEMMStage] Using tensor-aware GPU path");
+            LOG_ERROR("[FusedQKVGEMMStage] Projection transaction requires TensorBase-derived input and outputs");
+            return false;
+        }
 
-            // Cast ITensor* to TensorBase* for tensor-aware API
-            auto *input_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
-            auto *output_q_base = dynamic_cast<TensorBase *>(params_.output_q);
-            auto *output_k_base = dynamic_cast<TensorBase *>(params_.output_k);
-            auto *output_v_base = dynamic_cast<TensorBase *>(params_.output_v);
-
-            if (!input_base || !output_q_base || !output_k_base || !output_v_base)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] GPU path requires TensorBase-derived types");
-                return false;
-            }
-
-            if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
-            {
-                success = executeDecodeEquivalentVerifierPrefill(
-                    input_base, output_q_base, output_k_base, output_v_base,
-                    gemm_q, gemm_k, gemm_v);
-            }
-            else
-            {
-                // Build tensor projection descriptors
-                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                    {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
-                    {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
-                    {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
-
-                // Use tensor-aware fused API - handles all device sync internally
-                success = gemm_q->multiply_fused_tensor(
-                    input_base,
-                    projections,
-                    params_.m,
-                    params_.k,
-                    nullptr,
-                    bound_workspace_);
-            }
-
-            if (success)
-            {
-                LOG_TRACE("[FusedQKVGEMMStage] GPU execution complete");
-            }
+        bool success = false;
+        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+        {
+            success = executeDecodeEquivalentVerifierPrefill(input_base);
         }
         else
         {
-            // CPU path: Use tensor-aware API (same as GPU path)
-            auto *input_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
-            auto *output_q_base = dynamic_cast<TensorBase *>(params_.output_q);
-            auto *output_k_base = dynamic_cast<TensorBase *>(params_.output_k);
-            auto *output_v_base = dynamic_cast<TensorBase *>(params_.output_v);
+            success = anchorKernel()->multiply_fused_tensor(
+                input_base,
+                cached_projections_,
+                params_.m,
+                params_.k,
+                nullptr,
+                bound_workspace_);
+        }
 
-            if (!input_base || !output_q_base || !output_k_base || !output_v_base)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] CPU path requires TensorBase-derived types");
-                return false;
-            }
-
-            LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
-                                                        << " output_type=" << params_.output_q->dtype_name());
-
-            if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
-            {
-                success = executeDecodeEquivalentVerifierPrefill(
-                    input_base, output_q_base, output_k_base, output_v_base,
-                    gemm_q, gemm_k, gemm_v);
-            }
-            else
-            {
-                // Build tensor projection descriptors
-                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                    {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
-                    {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
-                    {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
-
-                success = gemm_q->multiply_fused_tensor(
-                    input_base,
-                    projections,
-                    params_.m,
-                    params_.k,
-                    nullptr,
-                    bound_workspace_);
-            }
-
-            if (success && Logger::getInstance().shouldLog(LogLevel::TRACE))
-            {
-                const float *q_data = output_q_base->data();
-                LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
-                                                               << q_data[0] << "," << q_data[1] << ","
-                                                               << q_data[2] << "," << q_data[3] << ","
-                                                               << q_data[4] << "," << q_data[5] << ","
-                                                               << q_data[6] << "," << q_data[7]
-                                                               << " n_q=" << params_.n_q);
-            }
+        if (success && !gpu_execution &&
+            Logger::getInstance().shouldLog(LogLevel::TRACE))
+        {
+            TensorBase *diagnostic_output =
+                includesQuery() ? output_q_base : output_k_base;
+            const float *data = diagnostic_output->data();
+            LOG_TRACE("[FusedQKVGEMMStage] "
+                      << (includesQuery() ? "Q" : "K")
+                      << " output[0:8]=" << std::setprecision(10)
+                      << data[0] << "," << data[1] << ","
+                      << data[2] << "," << data[3] << ","
+                      << data[4] << "," << data[5] << ","
+                      << data[6] << "," << data[7]);
         }
 
         if (!success)
@@ -288,19 +316,13 @@ namespace llaminar2
     }
 
     bool FusedQKVGEMMStage::executeDecodeEquivalentVerifierPrefill(
-        TensorBase *input_base,
-        TensorBase *output_q_base,
-        TensorBase *output_k_base,
-        TensorBase *output_v_base,
-        ITensorGemm *gemm_q,
-        ITensorGemm *gemm_k,
-        ITensorGemm *gemm_v)
+        TensorBase *input_base)
     {
         const bool is_gpu = params_.device_id.is_gpu();
         void *stream = gpuStream();
         if (is_gpu && !stream)
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Grouped verifier GPU QKV requires an explicit stream");
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped verifier GPU projection requires an explicit stream");
             return false;
         }
 
@@ -309,13 +331,9 @@ namespace llaminar2
          * kernel layer. Unsupported grouped implementations fail closed here;
          * production stage execution must never replay verifier rows one at a time.
          */
-        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-            {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
-            {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
-            {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
-        const bool success = gemm_q->multiply_fused_verifier_rows_decode_equivalent(
+        const bool success = anchorKernel()->multiply_fused_verifier_rows_decode_equivalent(
             input_base,
-            projections,
+            cached_projections_,
             params_.m,
             params_.k,
             nullptr,
@@ -326,22 +344,25 @@ namespace llaminar2
             if (is_gpu)
             {
                 const StageGPUExecution gpu = gpuExecution();
-                gpu.publish(output_q_base);
-                gpu.publish(output_k_base);
-                gpu.publish(output_v_base);
+                for (const auto &projection : cached_projections_)
+                    gpu.publish(projection.output);
             }
             PerfStatsCollector::addCounter(
                 "mtp",
-                "qkv_decode_equivalent_verifier_prefill_rows",
+                includesQuery()
+                    ? "qkv_decode_equivalent_verifier_prefill_rows"
+                    : "kv_decode_equivalent_prefill_rows",
                 static_cast<double>(params_.m),
                 {},
                 params_.device_id.to_string(),
-                {{"stage", "FusedQKVGEMM"},
+                {{"stage", includesQuery() ? "FusedQKVGEMM" : "FusedKVGEMM"},
                  {"route", "grouped"}});
         }
         else
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Grouped decode-equivalent verifier QKV is unsupported or failed"
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped decode-equivalent "
+                      << (includesQuery() ? "Q/K/V" : "K/V")
+                      << " projection is unsupported or failed"
                       << " device=" << params_.device_id.to_string()
                       << " m=" << params_.m
                       << " k=" << params_.k);
@@ -352,8 +373,10 @@ namespace llaminar2
 
     size_t FusedQKVGEMMStage::estimatedFlops() const
     {
-        // Three GEMMs: 2 * M * N * K each
-        size_t flops_q = static_cast<size_t>(2) * params_.m * params_.n_q * params_.k;
+        const size_t flops_q = includesQuery()
+                                   ? static_cast<size_t>(2) * params_.m *
+                                         params_.n_q * params_.k
+                                   : 0U;
         size_t flops_k = static_cast<size_t>(2) * params_.m * params_.n_k * params_.k;
         size_t flops_v = static_cast<size_t>(2) * params_.m * params_.n_v * params_.k;
         return flops_q + flops_k + flops_v;
@@ -364,12 +387,15 @@ namespace llaminar2
         // Input: m * k reads (shared)
         size_t input_bytes = static_cast<size_t>(params_.m) * params_.k * sizeof(float);
 
-        // Outputs: Q, K, V writes
-        size_t output_bytes = static_cast<size_t>(params_.m) * (params_.n_q + params_.n_k + params_.n_v) * sizeof(float);
+        const int projected_columns =
+            (includesQuery() ? params_.n_q : 0) + params_.n_k + params_.n_v;
+        size_t output_bytes = static_cast<size_t>(params_.m) *
+                              projected_columns * sizeof(float);
 
         // Weight reads (approximate - actual depends on quantization format)
         // Quantized weights are ~4-8 bits/element, but we estimate conservatively
-        size_t weight_bytes = static_cast<size_t>(params_.k) * (params_.n_q + params_.n_k + params_.n_v) * sizeof(float) / 4;
+        size_t weight_bytes = static_cast<size_t>(params_.k) *
+                              projected_columns * sizeof(float) / 4;
 
         return input_bytes + output_bytes + weight_bytes;
     }
@@ -398,12 +424,13 @@ namespace llaminar2
         info.addInput("input", params_.input, params_.m, params_.k);
 
         // Weight tensors
-        info.addWeight("wq", params_.wq);
+        if (includesQuery())
+            info.addWeight("wq", params_.wq);
         info.addWeight("wk", params_.wk);
         info.addWeight("wv", params_.wv);
 
         // Bias tensors (optional but needed for coherence)
-        if (params_.bias_q)
+        if (includesQuery() && params_.bias_q)
         {
             info.addWeight("bias_q", params_.bias_q);
         }
@@ -417,14 +444,16 @@ namespace llaminar2
         }
 
         // Outputs
-        info.addOutput("output_q", params_.output_q, params_.m, params_.n_q);
+        if (includesQuery())
+            info.addOutput("output_q", params_.output_q, params_.m, params_.n_q);
         info.addOutput("output_k", params_.output_k, params_.m, params_.n_k);
         info.addOutput("output_v", params_.output_v, params_.m, params_.n_v);
 
         // Scalar params
         info.addScalarInt("m", params_.m);
         info.addScalarInt("k", params_.k);
-        info.addScalarInt("n_q", params_.n_q);
+        if (includesQuery())
+            info.addScalarInt("n_q", params_.n_q);
         info.addScalarInt("n_k", params_.n_k);
         info.addScalarInt("n_v", params_.n_v);
 
@@ -435,14 +464,19 @@ namespace llaminar2
     {
         StageBufferRequirements reqs;
 
-        if (!params_.input || !params_.wq || !params_.wk || !params_.wv)
+        if (!params_.input || (includesQuery() && !params_.wq) ||
+            !params_.wk || !params_.wv ||
+            (includesQuery() && !params_.output_q) ||
+            !params_.output_k || !params_.output_v)
             return reqs; // Empty if tensors not set
 
         // Convert tensor types
         BufferTensorType input_type = params_.input
                                           ? toBufferTensorType(params_.input->native_type())
                                           : BufferTensorType::FP32;
-        BufferTensorType wq_type = toBufferTensorType(params_.wq->native_type());
+        BufferTensorType wq_type = includesQuery()
+                                       ? toBufferTensorType(params_.wq->native_type())
+                                       : BufferTensorType::FP32;
         BufferTensorType wk_type = toBufferTensorType(params_.wk->native_type());
         BufferTensorType wv_type = toBufferTensorType(params_.wv->native_type());
 
@@ -450,20 +484,34 @@ namespace llaminar2
         reqs.addInput("input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, input_type);
 
         // WEIGHT buffers
-        reqs.addWeight("wq", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_q)}, wq_type);
+        if (includesQuery())
+        {
+            reqs.addWeight(
+                "wq",
+                {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_q)},
+                wq_type);
+        }
         reqs.addWeight("wk", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_k)}, wk_type);
         reqs.addWeight("wv", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_v)}, wv_type);
 
         // OUTPUT buffers
-        BufferTensorType out_type = params_.output_q
-                                        ? toBufferTensorType(params_.output_q->native_type())
+        const ITensor *representative_output =
+            includesQuery() ? params_.output_q : params_.output_k;
+        BufferTensorType out_type = representative_output
+                                        ? toBufferTensorType(representative_output->native_type())
                                         : BufferTensorType::FP32;
-        reqs.addOutput("output_q", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_q)}, out_type);
-        reqs.addOutput("output_k", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_k)}, out_type);
-        reqs.addOutput("output_v", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_v)}, out_type);
+        if (includesQuery())
+        {
+            reqs.addOutput(
+                "output_q",
+                {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_q)},
+                out_type);
+        }
+        reqs.addOutput("output_k", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_k)}, toBufferTensorType(params_.output_k->native_type()));
+        reqs.addOutput("output_v", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_v)}, toBufferTensorType(params_.output_v->native_type()));
 
         // Optional biases
-        if (params_.bias_q)
+        if (includesQuery() && params_.bias_q)
         {
             reqs.addWeight("bias_q", {static_cast<size_t>(params_.n_q)}, BufferTensorType::FP32);
         }
@@ -485,28 +533,30 @@ namespace llaminar2
 
     IWorkspaceConsumer *FusedQKVGEMMStage::getKernelAsWorkspaceConsumer()
     {
-        if (!params_.wq)
+        const ITensor *anchor_weight = includesQuery() ? params_.wq : params_.wk;
+        if (!anchor_weight)
         {
-            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor not set");
+            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Transaction anchor weight tensor not set");
             return nullptr;
         }
 
-        auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
-        if (!wq_base)
+        auto *anchor_weight_base =
+            dynamic_cast<TensorBase *>(const_cast<ITensor *>(anchor_weight));
+        if (!anchor_weight_base)
         {
-            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor is not TensorBase");
+            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Transaction anchor weight is not TensorBase");
             return nullptr;
         }
 
         if (!resolveIndividualKernels("FusedQKVGEMMStage::getKernelAsWorkspaceConsumer"))
             return nullptr;
 
-        return dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_);
+        return dynamic_cast<IWorkspaceConsumer *>(anchorKernel());
     }
 
     WorkspaceRequirements FusedQKVGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
     {
-        // Ensure all three kernels are resolved so each projection contributes
+        // Resolve every active kernel so each projection contributes
         // its actual N/K shape before workspace requirements are merged.
         auto *self = const_cast<FusedQKVGEMMStage *>(this);
         if (!self->resolveIndividualKernels("FusedQKVGEMMStage::getWorkspaceRequirements"))
@@ -516,11 +566,17 @@ namespace llaminar2
         const int workspace_k = (k > 0) ? k : params_.k;
 
         WorkspaceRequirements combined;
-        if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
-            combined.merge(consumer_q->getWorkspaceRequirements(
-                workspace_m,
-                params_.n_q > 0 ? params_.n_q : n,
-                workspace_k));
+        if (includesQuery())
+        {
+            if (auto *consumer_q =
+                    dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
+            {
+                combined.merge(consumer_q->getWorkspaceRequirements(
+                    workspace_m,
+                    params_.n_q > 0 ? params_.n_q : n,
+                    workspace_k));
+            }
+        }
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
             combined.merge(consumer_k->getWorkspaceRequirements(
                 workspace_m,
@@ -532,22 +588,28 @@ namespace llaminar2
                 params_.n_v > 0 ? params_.n_v : n,
                 workspace_k));
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
-            combined, params_.device_id, workspace_m, /*projection_count=*/3);
+            combined,
+            params_.device_id,
+            workspace_m,
+            static_cast<int>(projectionCount()));
         return combined;
     }
 
     void FusedQKVGEMMStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        // Bind workspace to ALL THREE kernels (Q, K, V)
-        // Each kernel needs workspace for GPU execution
+        // Every active projection kernel shares the same persistent workspace.
         if (!resolveIndividualKernels("FusedQKVGEMMStage::bindWorkspace"))
             return;
 
         // Bind workspace using cached kernels
-        if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
+        if (includesQuery())
         {
-            consumer_q->bindWorkspace(workspace);
-            LOG_TRACE("[FusedQKVGEMMStage] Bound workspace to Q kernel");
+            if (auto *consumer_q =
+                    dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
+            {
+                consumer_q->bindWorkspace(workspace);
+                LOG_TRACE("[FusedQKVGEMMStage] Bound workspace to Q kernel");
+            }
         }
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
         {
@@ -567,8 +629,12 @@ namespace llaminar2
     void FusedQKVGEMMStage::unbindWorkspace()
     {
         // Unbind workspace from cached kernels
-        if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
-            consumer_q->unbindWorkspace();
+        if (includesQuery())
+        {
+            if (auto *consumer_q =
+                    dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
+                consumer_q->unbindWorkspace();
+        }
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
             consumer_k->unbindWorkspace();
         if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
@@ -579,17 +645,19 @@ namespace llaminar2
 
     StageBufferContract FusedQKVGEMMStage::bufferContract() const
     {
-        if (!params_.input_buffer_id || !params_.output_q_buffer_id ||
+        if (!params_.input_buffer_id ||
+            (includesQuery() && !params_.output_q_buffer_id) ||
             !params_.output_k_buffer_id || !params_.output_v_buffer_id)
             return {};
 
         auto contract = StageBufferContract::build()
-                            .addInput(*params_.input_buffer_id)
-                            .addOutput(*params_.output_q_buffer_id)
-                            .addOutput(*params_.output_k_buffer_id)
-                            .addOutput(*params_.output_v_buffer_id);
+                            .addInput(*params_.input_buffer_id);
+        if (includesQuery())
+            contract.addOutput(*params_.output_q_buffer_id);
+        contract.addOutput(*params_.output_k_buffer_id)
+            .addOutput(*params_.output_v_buffer_id);
         // Q/K/V kernels consume store-owned prepared representations.
-        if (params_.wq)
+        if (includesQuery() && params_.wq)
             contract.addPreparedWeight(
                 const_cast<ITensor *>(params_.wq),
                 params_.prepared_store,
@@ -604,7 +672,7 @@ namespace llaminar2
                 const_cast<ITensor *>(params_.wv),
                 params_.prepared_store,
                 params_.prepared_ref_v.value_or(PreparedWeightRef{}));
-        if (params_.bias_q)
+        if (includesQuery() && params_.bias_q)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_q)));
         if (params_.bias_k)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_k)));

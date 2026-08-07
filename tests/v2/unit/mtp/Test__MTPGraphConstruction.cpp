@@ -12,6 +12,7 @@
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -1872,6 +1873,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
 TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
 {
     DenseMTPGraphFixture fixture;
+    fixture.config.rope_on_read = true;
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
     graph_builder.setWeights(fixture.modelWeights());
 
@@ -1886,6 +1888,9 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     output.gate = nullptr;
     output.up = nullptr;
     output.ffn_output = nullptr;
+    output.q = nullptr;
+    output.q_raw = nullptr;
+    output.q_gate = nullptr;
 
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
@@ -1897,14 +1902,18 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     ASSERT_NE(graph.getNode("mtp0_norm_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_concat"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
-    ASSERT_NE(graph.getNode("MTP0_qkv_proj"), nullptr);
-    ASSERT_NE(graph.getNode("MTP0_q_gate_split"), nullptr);
-    ASSERT_NE(graph.getNode("MTP0_rope"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_kv_proj"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_k_norm"), nullptr);
     ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
 
     EXPECT_EQ(graph.getNode("MTP0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
-    EXPECT_EQ(graph.getNode("MTP0_qkv_proj")->stage->type(), ComputeStageType::GEMM_FUSED_QKV);
+    EXPECT_EQ(graph.getNode("MTP0_kv_proj")->stage->type(), ComputeStageType::GEMM_FUSED_KV);
 
+    EXPECT_EQ(graph.getNode("MTP0_qkv_proj"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_q_gate_split"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_q_norm"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_rope"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_k_rope"), nullptr);
     EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
     EXPECT_EQ(graph.getNode("layer64_ffn_residual"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_final_norm"), nullptr);
@@ -1912,8 +1921,66 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
 
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_attn_norm", "mtp0_fc"));
-    EXPECT_TRUE(hasDependency(graph, "MTP0_qkv_proj", "MTP0_attn_norm"));
-    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_rope"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_proj", "MTP0_attn_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_k_norm", "MTP0_kv_proj"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_k_norm"));
+
+    const auto kv_contract = graph.getNode("MTP0_kv_proj")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(kv_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_TRUE(contractWrites(kv_contract, BufferId::MTP_K_PROJ));
+    EXPECT_TRUE(contractWrites(kv_contract, BufferId::MTP_V_PROJ));
+    EXPECT_FALSE(contractWrites(kv_contract, BufferId::MTP_Q_PROJ));
+    EXPECT_FALSE(contractWrites(kv_contract, BufferId::MTP_FA_Q_RAW));
+}
+
+TEST(Test__MTPGraphConstruction, KVOnlyQwen35SidecarRotatesOnlyKForPostRoPECache)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.rope_on_read = false;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.kv_cache_only = true;
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.q = nullptr;
+    output.q_raw = nullptr;
+    output.q_gate = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    ASSERT_NE(graph.getNode("MTP0_kv_proj"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_k_norm"), nullptr);
+    const auto *rope_node = graph.getNode("MTP0_k_rope");
+    ASSERT_NE(rope_node, nullptr);
+    const auto *rope = dynamic_cast<const RoPEStage *>(rope_node->stage.get());
+    ASSERT_NE(rope, nullptr);
+    EXPECT_EQ(rope->getParams().operand_set, RoPEOperandSet::KeyOnly);
+    EXPECT_EQ(rope->getParams().Q, nullptr);
+    EXPECT_EQ(rope->getParams().K, output.k);
+    EXPECT_EQ(rope->getParams().n_heads, 0);
+    EXPECT_EQ(rope->getParams().n_kv_heads, fixture.config.n_kv_heads);
+
+    EXPECT_EQ(graph.getNode("MTP0_qkv_proj"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_q_gate_split"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_q_norm"), nullptr);
+    EXPECT_TRUE(hasDependency(graph, "MTP0_k_rope", "MTP0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_k_rope"));
+
+    const auto rope_contract = rope_node->stage->bufferContract();
+    EXPECT_TRUE(contractReads(rope_contract, BufferId::MTP_K_PROJ));
+    EXPECT_TRUE(contractWrites(rope_contract, BufferId::MTP_K_PROJ));
+    EXPECT_FALSE(contractReads(rope_contract, BufferId::MTP_Q_PROJ));
+    EXPECT_FALSE(contractWrites(rope_contract, BufferId::MTP_Q_PROJ));
 }
 
 TEST(Test__MTPGraphConstruction, PhaseSplitKVOnlySidecarUsesMTPFullPrefillBuffers)
@@ -2017,7 +2084,7 @@ TEST(Test__MTPGraphConstruction, PhaseSplitKVOnlySidecarUsesMTPFullPrefillBuffer
     EXPECT_TRUE(contractReads(kv_append_contract, BufferId::MTP_V_FULL_PREFILL));
     EXPECT_FALSE(contractReads(kv_append_contract, BufferId::K_FULL_PREFILL));
     EXPECT_FALSE(contractReads(kv_append_contract, BufferId::V_FULL_PREFILL));
-    EXPECT_TRUE(hasDependency(graph, "MTP0_tp_kv_state_allgather", "MTP0_rope"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_tp_kv_state_allgather", "MTP0_k_rope"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_tp_kv_state_allgather"));
 }
 

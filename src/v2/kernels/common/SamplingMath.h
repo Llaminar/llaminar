@@ -358,6 +358,43 @@ namespace llaminar2::sampling_math
     };
 
     /**
+     * @brief Publish the canonical byte-stable invalid compact outcome.
+     *
+     * A fused verifier may discover a fatal device-controller violation before
+     * it can enter the ordinary serial-equivalent reducer.  The controller owns
+     * the precise error code, while this compact ABI communicates only whether
+     * an outcome is consumable.  Clearing every metadata word and poisoning
+     * every token slot therefore gives all CUDA, ROCm, and CPU callers the same
+     * deterministic invalid value instead of exposing bytes left by a previous
+     * activation that happened to share the arena allocation.
+     *
+     * The helper tolerates either destination being null so validation paths can
+     * initialize every destination that is structurally available before they
+     * return.  A non-positive token capacity simply means there are no token
+     * slots whose bytes can be made authoritative.
+     *
+     * @param out_tokens Compact token destination, or nullptr when unavailable.
+     * @param out_token_capacity Number of writable token slots.
+     * @param out_meta Fixed-width compact metadata destination, or nullptr.
+     */
+    LLAMINAR_SAMPLING_HD void initialize_invalid_speculative_batch_outcome(
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta)
+    {
+        if (out_tokens && out_token_capacity > 0)
+        {
+            for (int i = 0; i < out_token_capacity; ++i)
+                out_tokens[i] = -1;
+        }
+        if (out_meta)
+        {
+            for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
+                out_meta[i] = 0;
+        }
+    }
+
+    /**
      * @brief Device-side MTP depth policy mode admitted before generation.
      */
     enum class DeviceGenerationDepthPolicyMode : int
@@ -507,6 +544,48 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 43,
         kDeviceGenerationControlCount = 44,
     };
+
+    /**
+     * @brief Response ownership of verifier row zero at controller admission.
+     *
+     * Every grouped verifier transaction begins with one condition row. At an
+     * ordinary prefill or accepted-token boundary that row has not crossed the
+     * current response boundary and must be appended if it becomes visible. A
+     * rejection boundary is different: its correction token was emitted by the
+     * preceding controller, but the state produced by consuming that token has
+     * not yet been committed. The following verifier therefore consumes the
+     * correction as row zero while excluding it from its new response ledger.
+     *
+     * This enum is shared by host admission, CUDA, ROCm, and the device control
+     * transition helper so the distinction cannot be inferred from token values
+     * or reconstructed independently by a backend.
+     */
+    enum class DeviceGenerationLeadingRowDisposition : int32_t
+    {
+        /** Row zero has not yet been returned to the caller. */
+        PendingResponse = 0,
+        /** Row zero was returned by the immediately preceding controller. */
+        AlreadyEmitted = 1,
+    };
+
+    /** @return true when @p disposition is one legal admission value. */
+    LLAMINAR_SAMPLING_HD bool valid_device_generation_leading_row_disposition(
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return disposition ==
+                   DeviceGenerationLeadingRowDisposition::PendingResponse ||
+               disposition ==
+                   DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+    }
+
+    /** @return Stable control-word value for @p disposition, or `-1` if invalid. */
+    LLAMINAR_SAMPLING_HD int device_generation_leading_committed_output_count(
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return valid_device_generation_leading_row_disposition(disposition)
+                   ? static_cast<int>(disposition)
+                   : -1;
+    }
 
     /**
      * @brief Fatal validation failures reported by the generation controller.
@@ -739,13 +818,19 @@ namespace llaminar2::sampling_math
      *        row.  It must cover the complete request budget.
      * @param depth_policy Immutable fixed/dynamic policy admitted for this request.
      * @param control Writable row with @ref kDeviceGenerationControlCount words.
+     * @param initial_leading_row_disposition Whether verifier row zero is a new
+     *        response token or an already-emitted correction carried from the
+     *        preceding controller.
      * @return true when the initialized controller is valid.
      */
     LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
         int max_new_tokens,
         int response_capacity,
         const DeviceGenerationDepthPolicy &depth_policy,
-        int *control)
+        int *control,
+        DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition =
+                DeviceGenerationLeadingRowDisposition::PendingResponse)
     {
         if (!control)
             return false;
@@ -767,9 +852,20 @@ namespace llaminar2::sampling_math
                 static_cast<int>(DeviceGenerationError::InvalidDepthPolicy);
             return false;
         }
+        const int initial_leading_committed_output_count =
+            device_generation_leading_committed_output_count(
+                initial_leading_row_disposition);
+        if (initial_leading_committed_output_count < 0)
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidInitialization);
+            return false;
+        }
 
         control[kDeviceGenerationControlOk] = 1;
         control[kDeviceGenerationControlRemainingTokenCount] = max_new_tokens;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
+            initial_leading_committed_output_count;
         control[kDeviceGenerationControlCurrentDraftDepth] =
             depth_policy.initial_depth;
         control[kDeviceGenerationControlActiveVerifierRowCount] =
@@ -1833,21 +1929,18 @@ namespace llaminar2::sampling_math
         int *out_meta,
         const int *greedy_draft_tokens = nullptr)
     {
+        initialize_invalid_speculative_batch_outcome(
+            out_tokens,
+            out_token_capacity,
+            out_meta);
         if (!out_tokens || !out_meta ||
             row_count < 0 ||
             out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens)
         {
-            if (out_meta)
-                out_meta[kSpecBatchMetaOk] = 0;
             return;
         }
-
-        for (int i = 0; i < out_token_capacity; ++i)
-            out_tokens[i] = -1;
-        for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
-            out_meta[i] = 0;
 
         if (first_token < 0)
         {
@@ -1986,16 +2079,10 @@ namespace llaminar2::sampling_math
             leading_committed_output_count < 0 ||
             leading_committed_output_count > 1)
         {
-            if (out_tokens && out_token_capacity > 0)
-            {
-                for (int i = 0; i < out_token_capacity; ++i)
-                    out_tokens[i] = -1;
-            }
-            if (out_meta)
-            {
-                for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
-                    out_meta[i] = 0;
-            }
+            initialize_invalid_speculative_batch_outcome(
+                out_tokens,
+                out_token_capacity,
+                out_meta);
             return;
         }
 

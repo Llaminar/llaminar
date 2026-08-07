@@ -1,14 +1,12 @@
 /**
  * @file CUDARowSelectKernels.h
- * @brief CUDA host wrappers for graph-capturable hidden-state row selection.
+ * @brief CUDA launch contracts for graph-capturable row and prefill selection.
  *
- * Provides the tiny CUDA runtime surface used by HiddenStateRowSelectStage:
- * pinned host/device scalar allocation, scalar upload, and one fixed-grid row
- * copy kernel. The captured graph records the scalar upload and kernel launch;
- * later replays read the current value from the same pinned host address.
- *
- * Lifecycle: allocation/free are owned by the stage. Kernel launches run on the
- * stream supplied by the graph executor or on the default stream when null.
+ * Hidden-state helpers retain their explicitly bounded pre-capture parameter
+ * storage, while long-context prefill consumes only device-owned request banks,
+ * device geometry, and canonical KV progress. Allocation belongs to stage or
+ * arena setup. Every launch and transfer requires the exact non-null stream
+ * supplied by its producer; null never aliases CUDA's default stream.
  */
 
 #pragma once
@@ -18,6 +16,27 @@
 
 namespace llaminar2::cuda
 {
+
+    /**
+     * @brief Materialize one graph-stable prefill chunk from a resident request bank.
+     *
+     * The kernel reads canonical KV progress and admitted request geometry on
+     * device. It performs no allocation, transfer, callback, or synchronization.
+     * See IBackend::enqueuePreparePrefillChunkView() for the full contract.
+     */
+    bool launchPreparePrefillChunkView(
+        const int32_t *request_token_ids,
+        const int32_t *request_position_ids,
+        const int32_t *request_total_rows,
+        const int32_t *cached_tokens,
+        int request_row_capacity,
+        int bucket_seq_len,
+        int32_t pad_token_id,
+        int32_t *out_token_ids,
+        int32_t *out_position_ids,
+        int32_t *out_real_rows,
+        int32_t *out_row_stride,
+        void *stream);
 
     /**
      * @brief Allocate pinned host scalar storage for selected row.

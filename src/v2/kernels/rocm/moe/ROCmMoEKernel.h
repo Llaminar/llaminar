@@ -840,9 +840,19 @@ namespace llaminar2
 
         void syncBlasStream();
         bool ensureStagingCapacity(int count);
-        bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
+        /**
+         * @brief Bind persistent scratch for one ordered grouped-decode transaction.
+         *
+         * The down projection computes every route independently and then folds
+         * route rows in router order.  Supplying both projection dimensions here
+         * makes the route-contribution arena part of the capture-time workspace
+         * contract instead of a dynamic launch-time allocation.
+         */
+        bool ensureGroupedDecodeCapacity(
+            int num_active,
+            int intermediate,
+            int d_model);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
-        bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
         bool ensureGroupedGateUpDecodeMetadata(const int *expert_ids, int num_active);
         bool ensureGroupedDownDecodeMetadata(const int *expert_ids, const float *expert_weights, int num_active);
         bool isDecodeGraphCaptureActive() const;
@@ -1132,8 +1142,11 @@ namespace llaminar2
         DeviceNativeVNNIMatrixDesc *d_grouped_down_descs_ = nullptr;
         int8_t *d_grouped_swiglu_int8_ = nullptr;
         float *d_grouped_swiglu_scales_ = nullptr;
+        /** `[KB][route][N]` ordered split-K scratch; KB plane zero is reusable route output. */
+        float *d_grouped_down_partials_ = nullptr;
         int grouped_decode_active_cap_ = 0;
         int grouped_decode_intermediate_cap_ = 0;
+        int grouped_decode_d_model_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<int> grouped_down_cached_expert_ids_;
         std::vector<float> grouped_down_cached_weights_;
@@ -1144,13 +1157,12 @@ namespace llaminar2
         int *d_grouped_gateup_expert_ids_ = nullptr;
         int8_t *d_grouped_hidden_int8_ = nullptr;
         float *d_grouped_hidden_scales_ = nullptr;
+        /** `[KB][route][N]` gate partials using the serial-M1 partition topology. */
         float *d_grouped_gateup_gate_partials_ = nullptr;
+        /** `[KB][route][N]` up partials using the serial-M1 partition topology. */
         float *d_grouped_gateup_up_partials_ = nullptr;
         int grouped_gateup_active_cap_ = 0;
         int grouped_gateup_d_model_cap_ = 0;
-        int grouped_gateup_kpart_active_cap_ = 0;
-        int grouped_gateup_kpart_partitions_cap_ = 0;
-        int grouped_gateup_kpart_intermediate_cap_ = 0;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
         std::vector<float *> host_grouped_gate_output_ptrs_;
         std::vector<float *> host_grouped_up_output_ptrs_;
@@ -1207,6 +1219,7 @@ namespace llaminar2
         float *d_prefill_swiglu_scales_ = nullptr; ///< [prefill_slots_cap_, intermediate / 32]
         float *d_prefill_gate_ = nullptr;          ///< [prefill_slots_cap_, max(d_model,intermediate)]
         float *d_prefill_up_ = nullptr;            ///< [prefill_slots_cap_, intermediate]
+        uint32_t *d_prefill_work_directory_ = nullptr; ///< Device-authored adaptive TM12/TM16 spans.
         int prefill_slots_cap_ = 0;           ///< Current capacity (total_slots)
         int prefill_d_model_cap_ = 0;         ///< Current d_model capacity
         int prefill_intermediate_cap_ = 0;    ///< Current intermediate capacity
@@ -1215,6 +1228,16 @@ namespace llaminar2
         uint64_t bound_workspace_id_ = 0;
 
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
+        /**
+         * @brief Bind and validate the persistent adaptive prefill directory.
+         * @param total_slots Number of routed rows that bound directory work.
+         * @param num_experts Number of live descriptor/count-table entries.
+         * @return true when the dedicated workspace region satisfies the full
+         *         device-authored TM12/TM16 span contract.
+         */
+        bool ensureGroupedPrefillWorkDirectoryCapacity(
+            int total_slots,
+            int num_experts);
     };
 
 } // namespace llaminar2

@@ -301,7 +301,13 @@ void rocm_gdn_recurrent_step_kernel(
         const float decay = wave_sums[0];
         const float beta_h = wave_sums[1];
 
-        // Pass 1 retains scalar decode's ascending key-row accumulation.
+        /*
+         * Pass 1 installs the rounded decay into resident state and then uses
+         * that exact value for K^T S. CPU recurrence and CUDA long prefill
+         * already define this canonical five-step GDN arithmetic. Keeping the
+         * rounded value avoids a second state*decay operation in pass two while
+         * making M=1, grouped verification, and long prefill share one contract.
+         */
         float partial_kv = 0.0f;
         if (vi < d_v)
         {
@@ -311,8 +317,8 @@ void rocm_gdn_recurrent_step_kernel(
                  ++local_row)
             {
                 const int state_row = row_begin + local_row;
-                const float s_decayed = state_rows[local_row] * decay;
-                partial_kv += s_decayed * k_local[state_row];
+                state_rows[local_row] *= decay;
+                partial_kv += state_rows[local_row] * k_local[state_row];
             }
 #pragma clang loop unroll(disable)
             for (int tail_row = 0;
@@ -321,9 +327,10 @@ void rocm_gdn_recurrent_step_kernel(
             {
                 const int state_row =
                     row_begin + kRegisterRowsPerSplit + tail_row;
-                const float s_decayed =
-                    state_tail[tail_row * kGdnRecurrentThreads + tid] *
-                    decay;
+                const int lds_index =
+                    tail_row * kGdnRecurrentThreads + tid;
+                const float s_decayed = state_tail[lds_index] * decay;
+                state_tail[lds_index] = s_decayed;
                 partial_kv += s_decayed * k_local[state_row];
             }
         }
@@ -362,7 +369,7 @@ void rocm_gdn_recurrent_step_kernel(
             {
                 const int state_row = row_begin + local_row;
                 const float s_new =
-                    state_rows[local_row] * decay +
+                    state_rows[local_row] +
                     k_local[state_row] * delta;
                 state_rows[local_row] = s_new;
                 if (snapshot)
@@ -379,7 +386,7 @@ void rocm_gdn_recurrent_step_kernel(
                 const int lds_index =
                     tail_row * kGdnRecurrentThreads + tid;
                 const float s_new =
-                    state_tail[lds_index] * decay +
+                    state_tail[lds_index] +
                     k_local[state_row] * delta;
                 state_tail[lds_index] = s_new;
                 if (snapshot)
@@ -520,20 +527,24 @@ bool launch_rocm_gdn_recurrent_step(
 // =========================================================================
 // Prefill Recurrence Kernel (seq_len>1, register-cached state)
 //
-// V4 optimizations:
-//   1. State cached in registers: each thread keeps its 32 state values
-//      in VGPRs across all 595 timesteps. State is loaded from global
-//      ONCE at kernel start and written back ONCE at end.
+// Long-prefill optimizations:
+//   1. D_K is specialized before graph capture. Each thread retains exactly
+//      D_K/4 state values across every timestep: 16 for D_K=64 and 32 for
+//      D_K=128. State is loaded from global once and written back once.
 //   2. Single-pass per timestep: kv dot product → delta → state update →
 //      output accumulation in ONE loop over the 32 cached rows.
-//   3. 2D grid: dim3(n_heads, col_blocks) with ROW_SPLIT=4 for parity.
-//   4. Eliminates ~1190 global memory state R/W passes per thread.
+//   3. The four-way row split is identical to grouped/scalar decode.
+//   4. The Qwen D_K=128 specialization places its final five rows in explicit
+//      LDS, avoiding compiler-owned private scratch at the two-wave VGPR limit.
 //
-// Register budget: 32 state floats + ~20 other = 52 VGPRs per thread.
-// gfx906 has 256 VGPRs → max occupancy = 4 waves/SIMD = 16 waves/CU.
-// (Currently only 4 waves/CU from 1 block, so this is occupancy-neutral.)
+// Release ISA metadata is a gate: every specialization must report zero
+// private segment and zero VGPR/SGPR spills before it may remain dispatchable.
 // =========================================================================
 
+template <int STATIC_N_HEADS = 0,
+          int STATIC_D_K = 0,
+          int STATIC_D_V = 0,
+          int STATIC_BLOCK_SIZE = 0>
 __global__ __launch_bounds__(256, 2)
 void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ Q,
@@ -551,48 +562,62 @@ void rocm_gdn_chunk_forward_kernel(
     int snapshot_stride_floats,
     int max_snapshot_rows,
     int request_count, int request_seq_len,
-    int n_heads, int d_k, int d_v,
+    int n_heads, int d_v,
     bool use_qk_l2norm)
 {
+    static_assert(
+        STATIC_D_K == 64 || STATIC_D_K == 128,
+        "ROCm long-prefill GDN requires a capture-time D_K specialization");
+    const int kernel_n_heads =
+        STATIC_N_HEADS > 0 ? STATIC_N_HEADS : n_heads;
+    constexpr int kernel_d_k = STATIC_D_K;
+    const int kernel_d_v = STATIC_D_V > 0 ? STATIC_D_V : d_v;
+    const int kernel_block_size =
+        STATIC_BLOCK_SIZE > 0 ? STATIC_BLOCK_SIZE : blockDim.x;
+
     const int request = blockIdx.z;
     const int h = blockIdx.x;
-    if (request >= request_count || h >= n_heads) return;
+    if (request >= request_count || h >= kernel_n_heads) return;
 
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
 
     constexpr int ROW_SPLIT = 4;
-    const int cols_per_block = block_size / ROW_SPLIT;
-    const int split_id = tid / cols_per_block;   // 0..ROW_SPLIT-1
-    const int col_in_block = tid % cols_per_block;
-    const int vi = blockIdx.y * cols_per_block + col_in_block;
+    const int cols_per_block = kernel_block_size / ROW_SPLIT;
+    const int vi =
+        blockIdx.y * cols_per_block + tid % cols_per_block;
 
-    const int qk_stride = n_heads * d_k;
-    const int v_stride = n_heads * d_v;
-    const float scale = rsqrtf((float)d_k);
-
+    const int qk_stride = kernel_n_heads * kernel_d_k;
+    const int v_stride = kernel_n_heads * kernel_d_v;
+    const float scale = rsqrtf(static_cast<float>(kernel_d_k));
     const int request_row_base = request * request_seq_len;
     const size_t request_state_stride =
-        static_cast<size_t>(n_heads) * d_k * d_v;
+        static_cast<size_t>(kernel_n_heads) * kernel_d_k * kernel_d_v;
     const float *S_initial =
         initial_state +
         static_cast<size_t>(request) * request_state_stride +
-        static_cast<size_t>(h) * d_k * d_v;
+        static_cast<size_t>(h) * kernel_d_k * kernel_d_v;
     float *S_updated =
         updated_state +
         static_cast<size_t>(request) * request_state_stride +
-        static_cast<size_t>(h) * d_k * d_v;
+        static_cast<size_t>(h) * kernel_d_k * kernel_d_v;
 
     extern __shared__ float smem[];
     float *q_local = smem;
-    float *k_local = smem + d_k;
-    float *warp_sums = smem + 2 * d_k; // [16] for warp reduction
-    float *reduce_kv = smem + 2 * d_k + 16;            // [block_size]
-    float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
+    float *k_local = smem + kernel_d_k;
+    float *warp_sums = smem + 2 * kernel_d_k; // [16] for warp reduction
+    float *reduce_kv = smem + 2 * kernel_d_k + 16; // [kernel_block_size]
+    float *reduce_out =
+        smem + 2 * kernel_d_k + 16 + kernel_block_size; // [kernel_block_size]
+    constexpr int kExplicitLdsStateTailRows =
+        STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256 ? 5 : 0;
+    constexpr bool kUsesExplicitLdsStateTail =
+        kExplicitLdsStateTailRows > 0;
+    float *state_tail = reduce_out + kernel_block_size;
+    float *gate_decay = state_tail +
+        kExplicitLdsStateTailRows * kernel_block_size;
+    float *gate_beta = gate_decay + request_seq_len;
 
-    int warp_id = tid / 64;
-    int lane_id = tid % 64;
-    int num_warps = (block_size + 63) / 64;
+    int num_warps = (kernel_block_size + 63) / 64;
 
     // Pre-load A_log and dt_bias (constant across timesteps)
     __shared__ float A_log_h;
@@ -615,13 +640,35 @@ void rocm_gdn_chunk_forward_kernel(
                                        : raw_effective);
     }
 
+    /*
+     * Gate evaluation has no recurrent dependency. The former implementation
+     * evaluated softplus, decay, and sigmoid on lane zero inside every token
+     * iteration, making 255 peers wait for one long transcendental chain. Each
+     * workgroup now evaluates its complete token range cooperatively once and
+     * retains the exact FP32 results in LDS. The recurrent loop below consumes
+     * the same per-token values without changing state arithmetic or ordering.
+     */
+    for (int t = tid; t < effective_seq_len; t += kernel_block_size)
+    {
+        const int row = request_row_base + t;
+        const float x =
+            alpha[row * kernel_n_heads + h] + dt_bias_h;
+        const float softplus =
+            x > 20.0f ? x : log1pf(expf(x));
+        gate_decay[t] = expf(A_log_h * softplus);
+        gate_beta[t] =
+            1.0f /
+            (1.0f + expf(-beta_raw[row * kernel_n_heads + h]));
+    }
+    __syncthreads();
+
     // =====================================================================
     // REGISTER-CACHED STATE: Load state into registers ONCE
     // Each thread owns rows_per_split (=d_k/ROW_SPLIT) state values for
     // its column vi. With d_k=128, ROW_SPLIT=4: 32 floats per thread.
     // =====================================================================
-    const int rows_per_split = d_k / ROW_SPLIT;
-    const int j_start = split_id * rows_per_split;
+    constexpr int rows_per_split = kernel_d_k / ROW_SPLIT;
+    const int j_start = (tid / cols_per_block) * rows_per_split;
 
     // Use individual variables in groups of 8 to help the compiler
     // keep them in VGPRs (AMD compiler more likely to register-allocate
@@ -631,171 +678,269 @@ void rocm_gdn_chunk_forward_kernel(
     float sc16, sc17, sc18, sc19, sc20, sc21, sc22, sc23;
     float sc24, sc25, sc26, sc27, sc28, sc29, sc30, sc31;
 
-    if (vi < d_v) {
-        sc0  = S_initial[(j_start +  0) * d_v + vi];
-        sc1  = S_initial[(j_start +  1) * d_v + vi];
-        sc2  = S_initial[(j_start +  2) * d_v + vi];
-        sc3  = S_initial[(j_start +  3) * d_v + vi];
-        sc4  = S_initial[(j_start +  4) * d_v + vi];
-        sc5  = S_initial[(j_start +  5) * d_v + vi];
-        sc6  = S_initial[(j_start +  6) * d_v + vi];
-        sc7  = S_initial[(j_start +  7) * d_v + vi];
-        sc8  = S_initial[(j_start +  8) * d_v + vi];
-        sc9  = S_initial[(j_start +  9) * d_v + vi];
-        sc10 = S_initial[(j_start + 10) * d_v + vi];
-        sc11 = S_initial[(j_start + 11) * d_v + vi];
-        sc12 = S_initial[(j_start + 12) * d_v + vi];
-        sc13 = S_initial[(j_start + 13) * d_v + vi];
-        sc14 = S_initial[(j_start + 14) * d_v + vi];
-        sc15 = S_initial[(j_start + 15) * d_v + vi];
-        sc16 = S_initial[(j_start + 16) * d_v + vi];
-        sc17 = S_initial[(j_start + 17) * d_v + vi];
-        sc18 = S_initial[(j_start + 18) * d_v + vi];
-        sc19 = S_initial[(j_start + 19) * d_v + vi];
-        sc20 = S_initial[(j_start + 20) * d_v + vi];
-        sc21 = S_initial[(j_start + 21) * d_v + vi];
-        sc22 = S_initial[(j_start + 22) * d_v + vi];
-        sc23 = S_initial[(j_start + 23) * d_v + vi];
-        sc24 = S_initial[(j_start + 24) * d_v + vi];
-        sc25 = S_initial[(j_start + 25) * d_v + vi];
-        sc26 = S_initial[(j_start + 26) * d_v + vi];
-        sc27 = S_initial[(j_start + 27) * d_v + vi];
-        sc28 = S_initial[(j_start + 28) * d_v + vi];
-        sc29 = S_initial[(j_start + 29) * d_v + vi];
-        sc30 = S_initial[(j_start + 30) * d_v + vi];
-        sc31 = S_initial[(j_start + 31) * d_v + vi];
+    if (vi < kernel_d_v) {
+        sc0  = S_initial[(j_start +  0) * kernel_d_v + vi];
+        sc1  = S_initial[(j_start +  1) * kernel_d_v + vi];
+        sc2  = S_initial[(j_start +  2) * kernel_d_v + vi];
+        sc3  = S_initial[(j_start +  3) * kernel_d_v + vi];
+        sc4  = S_initial[(j_start +  4) * kernel_d_v + vi];
+        sc5  = S_initial[(j_start +  5) * kernel_d_v + vi];
+        sc6  = S_initial[(j_start +  6) * kernel_d_v + vi];
+        sc7  = S_initial[(j_start +  7) * kernel_d_v + vi];
+        sc8  = S_initial[(j_start +  8) * kernel_d_v + vi];
+        sc9  = S_initial[(j_start +  9) * kernel_d_v + vi];
+        sc10 = S_initial[(j_start + 10) * kernel_d_v + vi];
+        sc11 = S_initial[(j_start + 11) * kernel_d_v + vi];
+        sc12 = S_initial[(j_start + 12) * kernel_d_v + vi];
+        sc13 = S_initial[(j_start + 13) * kernel_d_v + vi];
+        sc14 = S_initial[(j_start + 14) * kernel_d_v + vi];
+        sc15 = S_initial[(j_start + 15) * kernel_d_v + vi];
+        if constexpr (STATIC_D_K == 128)
+        {
+            sc16 = S_initial[(j_start + 16) * kernel_d_v + vi];
+            sc17 = S_initial[(j_start + 17) * kernel_d_v + vi];
+            sc18 = S_initial[(j_start + 18) * kernel_d_v + vi];
+            sc19 = S_initial[(j_start + 19) * kernel_d_v + vi];
+            sc20 = S_initial[(j_start + 20) * kernel_d_v + vi];
+            sc21 = S_initial[(j_start + 21) * kernel_d_v + vi];
+            sc22 = S_initial[(j_start + 22) * kernel_d_v + vi];
+            sc23 = S_initial[(j_start + 23) * kernel_d_v + vi];
+            sc24 = S_initial[(j_start + 24) * kernel_d_v + vi];
+            sc25 = S_initial[(j_start + 25) * kernel_d_v + vi];
+            sc26 = S_initial[(j_start + 26) * kernel_d_v + vi];
+            if constexpr (kUsesExplicitLdsStateTail)
+            {
+                state_tail[0 * kernel_block_size + tid] =
+                    S_initial[(j_start + 27) * kernel_d_v + vi];
+                state_tail[1 * kernel_block_size + tid] =
+                    S_initial[(j_start + 28) * kernel_d_v + vi];
+                state_tail[2 * kernel_block_size + tid] =
+                    S_initial[(j_start + 29) * kernel_d_v + vi];
+                state_tail[3 * kernel_block_size + tid] =
+                    S_initial[(j_start + 30) * kernel_d_v + vi];
+                state_tail[4 * kernel_block_size + tid] =
+                    S_initial[(j_start + 31) * kernel_d_v + vi];
+            }
+            else
+            {
+                sc27 = S_initial[(j_start + 27) * kernel_d_v + vi];
+                sc28 = S_initial[(j_start + 28) * kernel_d_v + vi];
+                sc29 = S_initial[(j_start + 29) * kernel_d_v + vi];
+                sc30 = S_initial[(j_start + 30) * kernel_d_v + vi];
+                sc31 = S_initial[(j_start + 31) * kernel_d_v + vi];
+            }
+        }
     } else {
         sc0=sc1=sc2=sc3=sc4=sc5=sc6=sc7=0.0f;
         sc8=sc9=sc10=sc11=sc12=sc13=sc14=sc15=0.0f;
-        sc16=sc17=sc18=sc19=sc20=sc21=sc22=sc23=0.0f;
-        sc24=sc25=sc26=sc27=sc28=sc29=sc30=sc31=0.0f;
+        if constexpr (STATIC_D_K == 128)
+        {
+            sc16=sc17=sc18=sc19=sc20=sc21=sc22=sc23=0.0f;
+            sc24=sc25=sc26=0.0f;
+            if constexpr (kUsesExplicitLdsStateTail)
+            {
+                state_tail[0 * kernel_block_size + tid] = 0.0f;
+                state_tail[1 * kernel_block_size + tid] = 0.0f;
+                state_tail[2 * kernel_block_size + tid] = 0.0f;
+                state_tail[3 * kernel_block_size + tid] = 0.0f;
+                state_tail[4 * kernel_block_size + tid] = 0.0f;
+            }
+            else
+            {
+                sc27=sc28=sc29=sc30=sc31=0.0f;
+            }
+        }
     }
 
     for (int t = 0; t < request_seq_len; t++) {
         const int row = request_row_base + t;
-        const float *q_src = Q + row * qk_stride + h * d_k;
-        const float *k_src = K + row * qk_stride + h * d_k;
-        const float *v_src = V + row * v_stride + h * d_v;
-        float *o_dst = output + row * v_stride + h * d_v;
+        const float *q_src = Q + row * qk_stride + h * kernel_d_k;
+        const float *k_src = K + row * qk_stride + h * kernel_d_k;
+        const float *v_src = V + row * v_stride + h * kernel_d_v;
+        float *o_dst = output + row * v_stride + h * kernel_d_v;
 
         if (t >= effective_seq_len) {
-            if (vi < d_v && split_id == 0)
+            if (vi < kernel_d_v && tid < cols_per_block)
                 o_dst[vi] = 0.0f;
             continue;
         }
 
-        // Load Q and K into shared memory (all threads cooperate)
-        for (int i = tid; i < d_k; i += block_size) {
+        // Load Q and K into shared memory (all threads cooperate).
+        for (int i = tid; i < kernel_d_k; i += kernel_block_size) {
             q_local[i] = q_src[i];
             k_local[i] = k_src[i];
         }
         __syncthreads();
 
         if (use_qk_l2norm) {
-            // Q norm
+            /*
+             * Q and K normalization are independent, but both reductions use
+             * the same fixed wavefront and warp ordering.  Keep separate
+             * accumulators and shared-memory lanes so each result remains
+             * byte-identical to the former serial Q-then-K implementation,
+             * while publishing both reductions through one barrier sequence.
+             */
             float q_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
+            float k_sum = 0.0f;
+            for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+            {
                 q_sum += q_local[i] * q_local[i];
+                k_sum += k_local[i] * k_local[i];
+            }
             for (int offset = 32; offset > 0; offset >>= 1)
+            {
                 q_sum += __shfl_xor(q_sum, offset);
-            if (lane_id == 0) warp_sums[warp_id] = q_sum;
-            __syncthreads();
-            if (tid == 0) {
-                float total = 0.0f;
-                for (int w = 0; w < num_warps; w++) total += warp_sums[w];
-                warp_sums[0] = total;
+                k_sum += __shfl_xor(k_sum, offset);
+            }
+            if (tid % 64 == 0)
+            {
+                warp_sums[tid / 64] = q_sum;
+                warp_sums[8 + tid / 64] = k_sum;
             }
             __syncthreads();
-            float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-            for (int i = tid; i < d_k; i += block_size)
-                q_local[i] *= q_inv;
+            if (tid == 0)
+            {
+                float q_total = 0.0f;
+                float k_total = 0.0f;
+                for (int w = 0; w < num_warps; ++w)
+                {
+                    q_total += warp_sums[w];
+                    k_total += warp_sums[8 + w];
+                }
+                warp_sums[0] = q_total;
+                warp_sums[8] = k_total;
+            }
             __syncthreads();
 
-            // K norm
-            float k_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
-                k_sum += k_local[i] * k_local[i];
-            for (int offset = 32; offset > 0; offset >>= 1)
-                k_sum += __shfl_xor(k_sum, offset);
-            if (lane_id == 0) warp_sums[warp_id] = k_sum;
-            __syncthreads();
-            if (tid == 0) {
-                float total = 0.0f;
-                for (int w = 0; w < num_warps; w++) total += warp_sums[w];
-                warp_sums[0] = total;
+            const float q_inv =
+                scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            const float k_inv =
+                1.0f / fmaxf(sqrtf(warp_sums[8]), 1e-6f);
+            for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+            {
+                q_local[i] *= q_inv;
+                k_local[i] *= k_inv;
             }
             __syncthreads();
-            float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-            for (int i = tid; i < d_k; i += block_size)
-                k_local[i] *= k_inv;
-            __syncthreads();
         } else {
-            for (int i = tid; i < d_k; i += block_size)
+            for (int i = tid; i < kernel_d_k; i += kernel_block_size)
                 q_local[i] *= scale;
             __syncthreads();
         }
 
-        // Gate and beta
-        float decay, beta_h;
-        if (tid == 0) {
-            float x = alpha[row * n_heads + h] + dt_bias_h;
-            float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            warp_sums[0] = expf(A_log_h * sp);
-            warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[row * n_heads + h]));
-        }
-        __syncthreads();
-        decay = warp_sums[0];
-        beta_h = warp_sums[1];
+        const float decay = gate_decay[t];
+        const float beta_h = gate_beta[t];
 
         // =================================================================
-        // SINGLE-PASS register-cached state processing
-        // Pass 1: decay state + accumulate kv dot product (from registers)
+        // DECODE-EQUIVALENT register-cached state processing
+        // Pass 1: round decay once into the resident state, then observe it.
+        //
+        // The canonical recurrence is `S = S * decay`, `kv = S^T k`, then
+        // `S = S + k outer delta`. ROCm M=1/grouped decode, CUDA, and CPU use
+        // this same rounded intermediate. Reusing it removes one dependency-
+        // chained multiply per state cell without changing the GDN equation.
         // =================================================================
         float partial_kv = 0.0f;
-        if (vi < d_v) {
-            // Apply decay to cached state and compute kv dot product
-            sc0 *= decay; partial_kv += sc0 * k_local[j_start + 0];
-            sc1 *= decay; partial_kv += sc1 * k_local[j_start + 1];
-            sc2 *= decay; partial_kv += sc2 * k_local[j_start + 2];
-            sc3 *= decay; partial_kv += sc3 * k_local[j_start + 3];
-            sc4 *= decay; partial_kv += sc4 * k_local[j_start + 4];
-            sc5 *= decay; partial_kv += sc5 * k_local[j_start + 5];
-            sc6 *= decay; partial_kv += sc6 * k_local[j_start + 6];
-            sc7 *= decay; partial_kv += sc7 * k_local[j_start + 7];
-            sc8 *= decay; partial_kv += sc8 * k_local[j_start + 8];
-            sc9 *= decay; partial_kv += sc9 * k_local[j_start + 9];
-            sc10 *= decay; partial_kv += sc10 * k_local[j_start + 10];
-            sc11 *= decay; partial_kv += sc11 * k_local[j_start + 11];
-            sc12 *= decay; partial_kv += sc12 * k_local[j_start + 12];
-            sc13 *= decay; partial_kv += sc13 * k_local[j_start + 13];
-            sc14 *= decay; partial_kv += sc14 * k_local[j_start + 14];
-            sc15 *= decay; partial_kv += sc15 * k_local[j_start + 15];
-            sc16 *= decay; partial_kv += sc16 * k_local[j_start + 16];
-            sc17 *= decay; partial_kv += sc17 * k_local[j_start + 17];
-            sc18 *= decay; partial_kv += sc18 * k_local[j_start + 18];
-            sc19 *= decay; partial_kv += sc19 * k_local[j_start + 19];
-            sc20 *= decay; partial_kv += sc20 * k_local[j_start + 20];
-            sc21 *= decay; partial_kv += sc21 * k_local[j_start + 21];
-            sc22 *= decay; partial_kv += sc22 * k_local[j_start + 22];
-            sc23 *= decay; partial_kv += sc23 * k_local[j_start + 23];
-            sc24 *= decay; partial_kv += sc24 * k_local[j_start + 24];
-            sc25 *= decay; partial_kv += sc25 * k_local[j_start + 25];
-            sc26 *= decay; partial_kv += sc26 * k_local[j_start + 26];
-            sc27 *= decay; partial_kv += sc27 * k_local[j_start + 27];
-            sc28 *= decay; partial_kv += sc28 * k_local[j_start + 28];
-            sc29 *= decay; partial_kv += sc29 * k_local[j_start + 29];
-            sc30 *= decay; partial_kv += sc30 * k_local[j_start + 30];
-            sc31 *= decay; partial_kv += sc31 * k_local[j_start + 31];
+        if (vi < kernel_d_v) {
+#define LLAMINAR_ROCM_GDN_DECAY_OBSERVE(OFFSET, MEMBER)                       \
+            MEMBER *= decay;                                                  \
+            partial_kv += MEMBER * k_local[j_start + OFFSET]
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(0, sc0);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(1, sc1);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(2, sc2);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(3, sc3);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(4, sc4);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(5, sc5);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(6, sc6);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(7, sc7);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(8, sc8);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(9, sc9);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(10, sc10);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(11, sc11);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(12, sc12);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(13, sc13);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(14, sc14);
+            LLAMINAR_ROCM_GDN_DECAY_OBSERVE(15, sc15);
+            if constexpr (STATIC_D_K == 128)
+            {
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(16, sc16);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(17, sc17);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(18, sc18);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(19, sc19);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(20, sc20);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(21, sc21);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(22, sc22);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(23, sc23);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(24, sc24);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(25, sc25);
+                LLAMINAR_ROCM_GDN_DECAY_OBSERVE(26, sc26);
+                if constexpr (kUsesExplicitLdsStateTail)
+                {
+                    float tail_state =
+                        state_tail[0 * kernel_block_size + tid] * decay;
+                    state_tail[0 * kernel_block_size + tid] = tail_state;
+                    partial_kv += tail_state * k_local[j_start + 27];
+
+                    tail_state =
+                        state_tail[1 * kernel_block_size + tid] * decay;
+                    state_tail[1 * kernel_block_size + tid] = tail_state;
+                    partial_kv += tail_state * k_local[j_start + 28];
+
+                    tail_state =
+                        state_tail[2 * kernel_block_size + tid] * decay;
+                    state_tail[2 * kernel_block_size + tid] = tail_state;
+                    partial_kv += tail_state * k_local[j_start + 29];
+
+                    tail_state =
+                        state_tail[3 * kernel_block_size + tid] * decay;
+                    state_tail[3 * kernel_block_size + tid] = tail_state;
+                    partial_kv += tail_state * k_local[j_start + 30];
+
+                    tail_state =
+                        state_tail[4 * kernel_block_size + tid] * decay;
+                    state_tail[4 * kernel_block_size + tid] = tail_state;
+                    partial_kv += tail_state * k_local[j_start + 31];
+                }
+                else
+                {
+                    sc27 *= decay; partial_kv += sc27 * k_local[j_start + 27];
+                    sc28 *= decay; partial_kv += sc28 * k_local[j_start + 28];
+                    sc29 *= decay; partial_kv += sc29 * k_local[j_start + 29];
+                    sc30 *= decay; partial_kv += sc30 * k_local[j_start + 30];
+                    sc31 *= decay; partial_kv += sc31 * k_local[j_start + 31];
+                }
+            }
+#undef LLAMINAR_ROCM_GDN_DECAY_OBSERVE
         }
         reduce_kv[tid] = partial_kv;
         __syncthreads();
 
         // Reduce kv across splits and compute delta
         float delta = 0.0f;
-        if (vi < d_v) {
+        if (vi < kernel_d_v) {
+            int reduction_col = 0;
+            if constexpr (STATIC_BLOCK_SIZE == 256)
+            {
+                /*
+                 * Keep this invariant address out of the 425-row live range.
+                 * Clang otherwise hoists `tid % 64` before the loop, exhausts
+                 * the 128-VGPR two-wave budget, and spills the address through
+                 * private memory. The volatile instruction creates the same
+                 * integer column locally and lets it die after this reduction.
+                 */
+                asm volatile(
+                    "v_and_b32_e32 %0, 63, %1"
+                    : "=v"(reduction_col)
+                    : "v"(tid));
+            }
+            else
+            {
+                reduction_col = tid % cols_per_block;
+            }
             float kv = 0.0f;
             for (int s = 0; s < ROW_SPLIT; s++)
-                kv += reduce_kv[col_in_block + s * cols_per_block];
+                kv += reduce_kv[
+                    reduction_col + s * cols_per_block];
             delta = (v_src[vi] - kv) * beta_h;
         }
 
@@ -803,127 +948,219 @@ void rocm_gdn_chunk_forward_kernel(
         // Pass 2: Update state + accumulate output (all in registers)
         // =================================================================
         float partial_out = 0.0f;
-        if (vi < d_v) {
-            sc0 += k_local[j_start + 0] * delta; partial_out += sc0 * q_local[j_start + 0];
-            sc1 += k_local[j_start + 1] * delta; partial_out += sc1 * q_local[j_start + 1];
-            sc2 += k_local[j_start + 2] * delta; partial_out += sc2 * q_local[j_start + 2];
-            sc3 += k_local[j_start + 3] * delta; partial_out += sc3 * q_local[j_start + 3];
-            sc4 += k_local[j_start + 4] * delta; partial_out += sc4 * q_local[j_start + 4];
-            sc5 += k_local[j_start + 5] * delta; partial_out += sc5 * q_local[j_start + 5];
-            sc6 += k_local[j_start + 6] * delta; partial_out += sc6 * q_local[j_start + 6];
-            sc7 += k_local[j_start + 7] * delta; partial_out += sc7 * q_local[j_start + 7];
-            sc8 += k_local[j_start + 8] * delta; partial_out += sc8 * q_local[j_start + 8];
-            sc9 += k_local[j_start + 9] * delta; partial_out += sc9 * q_local[j_start + 9];
-            sc10 += k_local[j_start + 10] * delta; partial_out += sc10 * q_local[j_start + 10];
-            sc11 += k_local[j_start + 11] * delta; partial_out += sc11 * q_local[j_start + 11];
-            sc12 += k_local[j_start + 12] * delta; partial_out += sc12 * q_local[j_start + 12];
-            sc13 += k_local[j_start + 13] * delta; partial_out += sc13 * q_local[j_start + 13];
-            sc14 += k_local[j_start + 14] * delta; partial_out += sc14 * q_local[j_start + 14];
-            sc15 += k_local[j_start + 15] * delta; partial_out += sc15 * q_local[j_start + 15];
-            sc16 += k_local[j_start + 16] * delta; partial_out += sc16 * q_local[j_start + 16];
-            sc17 += k_local[j_start + 17] * delta; partial_out += sc17 * q_local[j_start + 17];
-            sc18 += k_local[j_start + 18] * delta; partial_out += sc18 * q_local[j_start + 18];
-            sc19 += k_local[j_start + 19] * delta; partial_out += sc19 * q_local[j_start + 19];
-            sc20 += k_local[j_start + 20] * delta; partial_out += sc20 * q_local[j_start + 20];
-            sc21 += k_local[j_start + 21] * delta; partial_out += sc21 * q_local[j_start + 21];
-            sc22 += k_local[j_start + 22] * delta; partial_out += sc22 * q_local[j_start + 22];
-            sc23 += k_local[j_start + 23] * delta; partial_out += sc23 * q_local[j_start + 23];
-            sc24 += k_local[j_start + 24] * delta; partial_out += sc24 * q_local[j_start + 24];
-            sc25 += k_local[j_start + 25] * delta; partial_out += sc25 * q_local[j_start + 25];
-            sc26 += k_local[j_start + 26] * delta; partial_out += sc26 * q_local[j_start + 26];
-            sc27 += k_local[j_start + 27] * delta; partial_out += sc27 * q_local[j_start + 27];
-            sc28 += k_local[j_start + 28] * delta; partial_out += sc28 * q_local[j_start + 28];
-            sc29 += k_local[j_start + 29] * delta; partial_out += sc29 * q_local[j_start + 29];
-            sc30 += k_local[j_start + 30] * delta; partial_out += sc30 * q_local[j_start + 30];
-            sc31 += k_local[j_start + 31] * delta; partial_out += sc31 * q_local[j_start + 31];
+        if (vi < kernel_d_v) {
+#define LLAMINAR_ROCM_GDN_UPDATE_PROJECT(OFFSET, MEMBER)                      \
+            MEMBER += k_local[j_start + OFFSET] * delta;                      \
+            partial_out += MEMBER * q_local[j_start + OFFSET]
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(0, sc0);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(1, sc1);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(2, sc2);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(3, sc3);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(4, sc4);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(5, sc5);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(6, sc6);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(7, sc7);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(8, sc8);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(9, sc9);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(10, sc10);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(11, sc11);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(12, sc12);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(13, sc13);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(14, sc14);
+            LLAMINAR_ROCM_GDN_UPDATE_PROJECT(15, sc15);
+            if constexpr (STATIC_D_K == 128)
+            {
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(16, sc16);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(17, sc17);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(18, sc18);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(19, sc19);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(20, sc20);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(21, sc21);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(22, sc22);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(23, sc23);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(24, sc24);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(25, sc25);
+                LLAMINAR_ROCM_GDN_UPDATE_PROJECT(26, sc26);
+                if constexpr (kUsesExplicitLdsStateTail)
+                {
+                    float tail_state =
+                        state_tail[0 * kernel_block_size + tid] +
+                        k_local[j_start + 27] * delta;
+                    state_tail[0 * kernel_block_size + tid] = tail_state;
+                    partial_out += tail_state * q_local[j_start + 27];
+
+                    tail_state =
+                        state_tail[1 * kernel_block_size + tid] +
+                        k_local[j_start + 28] * delta;
+                    state_tail[1 * kernel_block_size + tid] = tail_state;
+                    partial_out += tail_state * q_local[j_start + 28];
+
+                    tail_state =
+                        state_tail[2 * kernel_block_size + tid] +
+                        k_local[j_start + 29] * delta;
+                    state_tail[2 * kernel_block_size + tid] = tail_state;
+                    partial_out += tail_state * q_local[j_start + 29];
+
+                    tail_state =
+                        state_tail[3 * kernel_block_size + tid] +
+                        k_local[j_start + 30] * delta;
+                    state_tail[3 * kernel_block_size + tid] = tail_state;
+                    partial_out += tail_state * q_local[j_start + 30];
+
+                    tail_state =
+                        state_tail[4 * kernel_block_size + tid] +
+                        k_local[j_start + 31] * delta;
+                    state_tail[4 * kernel_block_size + tid] = tail_state;
+                    partial_out += tail_state * q_local[j_start + 31];
+                }
+                else
+                {
+                    sc27 += k_local[j_start + 27] * delta; partial_out += sc27 * q_local[j_start + 27];
+                    sc28 += k_local[j_start + 28] * delta; partial_out += sc28 * q_local[j_start + 28];
+                    sc29 += k_local[j_start + 29] * delta; partial_out += sc29 * q_local[j_start + 29];
+                    sc30 += k_local[j_start + 30] * delta; partial_out += sc30 * q_local[j_start + 30];
+                    sc31 += k_local[j_start + 31] * delta; partial_out += sc31 * q_local[j_start + 31];
+                }
+            }
+#undef LLAMINAR_ROCM_GDN_UPDATE_PROJECT
         }
         reduce_out[tid] = partial_out;
         __syncthreads();
 
         // Reduce output and write (only split_id=0 writes)
-        if (vi < d_v && split_id == 0) {
+        if (vi < kernel_d_v && tid < cols_per_block) {
+            int reduction_col = 0;
+            if constexpr (STATIC_BLOCK_SIZE == 256)
+            {
+                asm volatile(
+                    "v_and_b32_e32 %0, 63, %1"
+                    : "=v"(reduction_col)
+                    : "v"(tid));
+            }
+            else
+            {
+                reduction_col = tid % cols_per_block;
+            }
             float out_vi = 0.0f;
             for (int s = 0; s < ROW_SPLIT; s++)
-                out_vi += reduce_out[col_in_block + s * cols_per_block];
+                out_vi += reduce_out[
+                    reduction_col + s * cols_per_block];
             o_dst[vi] = out_vi;
         }
-        if (state_snapshots && row < max_snapshot_rows && vi < d_v) {
+        if (state_snapshots && row < max_snapshot_rows && vi < kernel_d_v) {
             float *snapshot =
                 state_snapshots +
                 (size_t)row * snapshot_stride_floats +
-                (size_t)h * d_k * d_v;
-            snapshot[(j_start +  0) * d_v + vi] = sc0;
-            snapshot[(j_start +  1) * d_v + vi] = sc1;
-            snapshot[(j_start +  2) * d_v + vi] = sc2;
-            snapshot[(j_start +  3) * d_v + vi] = sc3;
-            snapshot[(j_start +  4) * d_v + vi] = sc4;
-            snapshot[(j_start +  5) * d_v + vi] = sc5;
-            snapshot[(j_start +  6) * d_v + vi] = sc6;
-            snapshot[(j_start +  7) * d_v + vi] = sc7;
-            snapshot[(j_start +  8) * d_v + vi] = sc8;
-            snapshot[(j_start +  9) * d_v + vi] = sc9;
-            snapshot[(j_start + 10) * d_v + vi] = sc10;
-            snapshot[(j_start + 11) * d_v + vi] = sc11;
-            snapshot[(j_start + 12) * d_v + vi] = sc12;
-            snapshot[(j_start + 13) * d_v + vi] = sc13;
-            snapshot[(j_start + 14) * d_v + vi] = sc14;
-            snapshot[(j_start + 15) * d_v + vi] = sc15;
-            snapshot[(j_start + 16) * d_v + vi] = sc16;
-            snapshot[(j_start + 17) * d_v + vi] = sc17;
-            snapshot[(j_start + 18) * d_v + vi] = sc18;
-            snapshot[(j_start + 19) * d_v + vi] = sc19;
-            snapshot[(j_start + 20) * d_v + vi] = sc20;
-            snapshot[(j_start + 21) * d_v + vi] = sc21;
-            snapshot[(j_start + 22) * d_v + vi] = sc22;
-            snapshot[(j_start + 23) * d_v + vi] = sc23;
-            snapshot[(j_start + 24) * d_v + vi] = sc24;
-            snapshot[(j_start + 25) * d_v + vi] = sc25;
-            snapshot[(j_start + 26) * d_v + vi] = sc26;
-            snapshot[(j_start + 27) * d_v + vi] = sc27;
-            snapshot[(j_start + 28) * d_v + vi] = sc28;
-            snapshot[(j_start + 29) * d_v + vi] = sc29;
-            snapshot[(j_start + 30) * d_v + vi] = sc30;
-            snapshot[(j_start + 31) * d_v + vi] = sc31;
+                (size_t)h * kernel_d_k * kernel_d_v;
+            snapshot[(j_start +  0) * kernel_d_v + vi] = sc0;
+            snapshot[(j_start +  1) * kernel_d_v + vi] = sc1;
+            snapshot[(j_start +  2) * kernel_d_v + vi] = sc2;
+            snapshot[(j_start +  3) * kernel_d_v + vi] = sc3;
+            snapshot[(j_start +  4) * kernel_d_v + vi] = sc4;
+            snapshot[(j_start +  5) * kernel_d_v + vi] = sc5;
+            snapshot[(j_start +  6) * kernel_d_v + vi] = sc6;
+            snapshot[(j_start +  7) * kernel_d_v + vi] = sc7;
+            snapshot[(j_start +  8) * kernel_d_v + vi] = sc8;
+            snapshot[(j_start +  9) * kernel_d_v + vi] = sc9;
+            snapshot[(j_start + 10) * kernel_d_v + vi] = sc10;
+            snapshot[(j_start + 11) * kernel_d_v + vi] = sc11;
+            snapshot[(j_start + 12) * kernel_d_v + vi] = sc12;
+            snapshot[(j_start + 13) * kernel_d_v + vi] = sc13;
+            snapshot[(j_start + 14) * kernel_d_v + vi] = sc14;
+            snapshot[(j_start + 15) * kernel_d_v + vi] = sc15;
+            if constexpr (STATIC_D_K == 128)
+            {
+                snapshot[(j_start + 16) * kernel_d_v + vi] = sc16;
+                snapshot[(j_start + 17) * kernel_d_v + vi] = sc17;
+                snapshot[(j_start + 18) * kernel_d_v + vi] = sc18;
+                snapshot[(j_start + 19) * kernel_d_v + vi] = sc19;
+                snapshot[(j_start + 20) * kernel_d_v + vi] = sc20;
+                snapshot[(j_start + 21) * kernel_d_v + vi] = sc21;
+                snapshot[(j_start + 22) * kernel_d_v + vi] = sc22;
+                snapshot[(j_start + 23) * kernel_d_v + vi] = sc23;
+                snapshot[(j_start + 24) * kernel_d_v + vi] = sc24;
+                snapshot[(j_start + 25) * kernel_d_v + vi] = sc25;
+                snapshot[(j_start + 26) * kernel_d_v + vi] = sc26;
+                if constexpr (kUsesExplicitLdsStateTail)
+                {
+                    snapshot[(j_start + 27) * kernel_d_v + vi] =
+                        state_tail[0 * kernel_block_size + tid];
+                    snapshot[(j_start + 28) * kernel_d_v + vi] =
+                        state_tail[1 * kernel_block_size + tid];
+                    snapshot[(j_start + 29) * kernel_d_v + vi] =
+                        state_tail[2 * kernel_block_size + tid];
+                    snapshot[(j_start + 30) * kernel_d_v + vi] =
+                        state_tail[3 * kernel_block_size + tid];
+                    snapshot[(j_start + 31) * kernel_d_v + vi] =
+                        state_tail[4 * kernel_block_size + tid];
+                }
+                else
+                {
+                    snapshot[(j_start + 27) * kernel_d_v + vi] = sc27;
+                    snapshot[(j_start + 28) * kernel_d_v + vi] = sc28;
+                    snapshot[(j_start + 29) * kernel_d_v + vi] = sc29;
+                    snapshot[(j_start + 30) * kernel_d_v + vi] = sc30;
+                    snapshot[(j_start + 31) * kernel_d_v + vi] = sc31;
+                }
+            }
         }
-        __syncthreads();
     }
 
     // =====================================================================
     // Write state back to global memory ONCE at the end
     // =====================================================================
-    if (vi < d_v) {
-        S_updated[(j_start +  0) * d_v + vi] = sc0;
-        S_updated[(j_start +  1) * d_v + vi] = sc1;
-        S_updated[(j_start +  2) * d_v + vi] = sc2;
-        S_updated[(j_start +  3) * d_v + vi] = sc3;
-        S_updated[(j_start +  4) * d_v + vi] = sc4;
-        S_updated[(j_start +  5) * d_v + vi] = sc5;
-        S_updated[(j_start +  6) * d_v + vi] = sc6;
-        S_updated[(j_start +  7) * d_v + vi] = sc7;
-        S_updated[(j_start +  8) * d_v + vi] = sc8;
-        S_updated[(j_start +  9) * d_v + vi] = sc9;
-        S_updated[(j_start + 10) * d_v + vi] = sc10;
-        S_updated[(j_start + 11) * d_v + vi] = sc11;
-        S_updated[(j_start + 12) * d_v + vi] = sc12;
-        S_updated[(j_start + 13) * d_v + vi] = sc13;
-        S_updated[(j_start + 14) * d_v + vi] = sc14;
-        S_updated[(j_start + 15) * d_v + vi] = sc15;
-        S_updated[(j_start + 16) * d_v + vi] = sc16;
-        S_updated[(j_start + 17) * d_v + vi] = sc17;
-        S_updated[(j_start + 18) * d_v + vi] = sc18;
-        S_updated[(j_start + 19) * d_v + vi] = sc19;
-        S_updated[(j_start + 20) * d_v + vi] = sc20;
-        S_updated[(j_start + 21) * d_v + vi] = sc21;
-        S_updated[(j_start + 22) * d_v + vi] = sc22;
-        S_updated[(j_start + 23) * d_v + vi] = sc23;
-        S_updated[(j_start + 24) * d_v + vi] = sc24;
-        S_updated[(j_start + 25) * d_v + vi] = sc25;
-        S_updated[(j_start + 26) * d_v + vi] = sc26;
-        S_updated[(j_start + 27) * d_v + vi] = sc27;
-        S_updated[(j_start + 28) * d_v + vi] = sc28;
-        S_updated[(j_start + 29) * d_v + vi] = sc29;
-        S_updated[(j_start + 30) * d_v + vi] = sc30;
-        S_updated[(j_start + 31) * d_v + vi] = sc31;
+    if (vi < kernel_d_v) {
+        S_updated[(j_start +  0) * kernel_d_v + vi] = sc0;
+        S_updated[(j_start +  1) * kernel_d_v + vi] = sc1;
+        S_updated[(j_start +  2) * kernel_d_v + vi] = sc2;
+        S_updated[(j_start +  3) * kernel_d_v + vi] = sc3;
+        S_updated[(j_start +  4) * kernel_d_v + vi] = sc4;
+        S_updated[(j_start +  5) * kernel_d_v + vi] = sc5;
+        S_updated[(j_start +  6) * kernel_d_v + vi] = sc6;
+        S_updated[(j_start +  7) * kernel_d_v + vi] = sc7;
+        S_updated[(j_start +  8) * kernel_d_v + vi] = sc8;
+        S_updated[(j_start +  9) * kernel_d_v + vi] = sc9;
+        S_updated[(j_start + 10) * kernel_d_v + vi] = sc10;
+        S_updated[(j_start + 11) * kernel_d_v + vi] = sc11;
+        S_updated[(j_start + 12) * kernel_d_v + vi] = sc12;
+        S_updated[(j_start + 13) * kernel_d_v + vi] = sc13;
+        S_updated[(j_start + 14) * kernel_d_v + vi] = sc14;
+        S_updated[(j_start + 15) * kernel_d_v + vi] = sc15;
+        if constexpr (STATIC_D_K == 128)
+        {
+            S_updated[(j_start + 16) * kernel_d_v + vi] = sc16;
+            S_updated[(j_start + 17) * kernel_d_v + vi] = sc17;
+            S_updated[(j_start + 18) * kernel_d_v + vi] = sc18;
+            S_updated[(j_start + 19) * kernel_d_v + vi] = sc19;
+            S_updated[(j_start + 20) * kernel_d_v + vi] = sc20;
+            S_updated[(j_start + 21) * kernel_d_v + vi] = sc21;
+            S_updated[(j_start + 22) * kernel_d_v + vi] = sc22;
+            S_updated[(j_start + 23) * kernel_d_v + vi] = sc23;
+            S_updated[(j_start + 24) * kernel_d_v + vi] = sc24;
+            S_updated[(j_start + 25) * kernel_d_v + vi] = sc25;
+            S_updated[(j_start + 26) * kernel_d_v + vi] = sc26;
+            if constexpr (kUsesExplicitLdsStateTail)
+            {
+                S_updated[(j_start + 27) * kernel_d_v + vi] =
+                    state_tail[0 * kernel_block_size + tid];
+                S_updated[(j_start + 28) * kernel_d_v + vi] =
+                    state_tail[1 * kernel_block_size + tid];
+                S_updated[(j_start + 29) * kernel_d_v + vi] =
+                    state_tail[2 * kernel_block_size + tid];
+                S_updated[(j_start + 30) * kernel_d_v + vi] =
+                    state_tail[3 * kernel_block_size + tid];
+                S_updated[(j_start + 31) * kernel_d_v + vi] =
+                    state_tail[4 * kernel_block_size + tid];
+            }
+            else
+            {
+                S_updated[(j_start + 27) * kernel_d_v + vi] = sc27;
+                S_updated[(j_start + 28) * kernel_d_v + vi] = sc28;
+                S_updated[(j_start + 29) * kernel_d_v + vi] = sc29;
+                S_updated[(j_start + 30) * kernel_d_v + vi] = sc30;
+                S_updated[(j_start + 31) * kernel_d_v + vi] = sc31;
+            }
+        }
     }
 }
 
@@ -2353,7 +2590,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         !output || !initial_state || !updated_state || !stream ||
         seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
         seq_len != request_count * request_seq_len ||
-        n_heads <= 0 || d_k <= 0 || d_v <= 0)
+        n_heads <= 0 || (d_k != 64 && d_k != 128) || d_v <= 0)
     {
         return false;
     }
@@ -2432,8 +2669,8 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
     }
 
     // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
-    // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
-    // reduction error that compounds through the GDN recurrence.
+    // 4 wavefronts/block matches CUDA's ROW_SPLIT=4 and preserves the fixed
+    // reduction order that compounds through the recurrent state.
     int col_threads = 256;
     int cols_per_block = col_threads / 4; // 64 columns per block
     if (d_v <= 64)
@@ -2442,19 +2679,69 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         cols_per_block = col_threads / 4; // 32 columns per block
     }
     int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
-    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+    const bool uses_qwen36_moe_static_kernel =
+        n_heads == 32 && d_k == 128 && d_v == 128 && col_threads == 256;
+    const int lds_state_tail_rows =
+        uses_qwen36_moe_static_kernel ? 5 : 0;
+    // q[d_k] + k[d_k] + warp sums[16] + two reduction arrays + state tail
+    // + one decay and beta scalar for every row in this captured bucket.
+    int smem_size =
+        (2 * d_k + 16 +
+         (2 + lds_state_tail_rows) * col_threads +
+         2 * request_seq_len) * sizeof(float);
 
-    hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
-        dim3(n_heads, num_col_blocks, request_count), dim3(col_threads), smem_size, (hipStream_t)stream,
-        Q, K, V, alpha, beta_raw, A_log, dt_bias,
-        output, initial_state, updated_state,
-        device_effective_seq_len,
-        state_snapshots,
-        snapshot_stride_floats,
-        max_snapshot_rows,
-        request_count, request_seq_len,
-        n_heads, d_k, d_v, use_qk_l2norm);
+    if (uses_qwen36_moe_static_kernel)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                rocm_gdn_chunk_forward_kernel<32, 128, 128, 256>),
+            dim3(n_heads, num_col_blocks, request_count),
+            dim3(col_threads),
+            smem_size,
+            (hipStream_t)stream,
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm);
+    }
+    else if (d_k == 64)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<0, 64>),
+            dim3(n_heads, num_col_blocks, request_count),
+            dim3(col_threads),
+            smem_size,
+            (hipStream_t)stream,
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<0, 128>),
+            dim3(n_heads, num_col_blocks, request_count),
+            dim3(col_threads),
+            smem_size,
+            (hipStream_t)stream,
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {

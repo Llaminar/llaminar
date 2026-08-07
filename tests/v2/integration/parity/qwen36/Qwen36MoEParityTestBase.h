@@ -23,11 +23,14 @@
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
+#include "execution/mtp/MTPVerifierPolicy.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "models/IGraphConfigBuilder.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -54,15 +57,8 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
-
-#ifdef HAVE_CUDA
-extern "C"
-{
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getDeterministicMode();
-}
-#endif
 
 namespace llaminar2::test::parity::qwen36
 {
@@ -400,17 +396,12 @@ namespace llaminar2::test::parity::qwen36
                 old_deterministic_env_ = old_value;
             }
 
-#ifdef HAVE_CUDA
-            old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
-#endif
-
             /*
              * Default parity remains a production-path canary, so deterministic
              * dispatch is forced off even when the surrounding shell enables it.
              * LLAMINAR_PARITY_DIAGNOSTIC_DETERMINISTIC is an explicit debugging
-             * override used to prove whether a tiny prefix-invariance delta is
-             * caused by non-deterministic CUDA prefill kernels; it is never set
-             * by the test cases themselves.
+             * override for isolating a broader backend-ordering defect; it does
+             * not substitute a second NativeVNNI arithmetic regime.
              */
             const char *diagnostic_deterministic =
                 std::getenv("LLAMINAR_PARITY_DIAGNOSTIC_DETERMINISTIC");
@@ -423,9 +414,6 @@ namespace llaminar2::test::parity::qwen36
 
             setenv("LLAMINAR_DETERMINISTIC", force_diagnostic_determinism ? "1" : "0", 1);
             mutableDebugEnv().reload();
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(force_diagnostic_determinism);
-#endif
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -436,9 +424,6 @@ namespace llaminar2::test::parity::qwen36
                 return;
             }
 
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(old_cuda_prefill_deterministic_);
-#endif
             if (had_old_deterministic_env_)
             {
                 setenv("LLAMINAR_DETERMINISTIC", old_deterministic_env_.c_str(), 1);
@@ -460,9 +445,6 @@ namespace llaminar2::test::parity::qwen36
         std::unique_ptr<ScopedEnvironmentValues> production_environment_;
         bool had_old_deterministic_env_ = false;
         std::string old_deterministic_env_;
-#ifdef HAVE_CUDA
-        bool old_cuda_prefill_deterministic_ = false;
-#endif
     };
 
     class ScopedMoEPrefixCaseEnvironment
@@ -1296,6 +1278,23 @@ namespace llaminar2::test::parity::qwen36
         if (!require_mtp_sidecar_snapshots)
         {
             return true;
+        }
+
+        /*
+         * Schema 2 changed MOE_ROUTER_OUTPUT from Transformers' misleadingly
+         * named post-softmax probability tensor to the actual pre-softmax
+         * linear projection used by Llaminar's router-logit contract.  Merely
+         * checking that the NPY exists would accept stale fixtures and make a
+         * healthy router look catastrophically wrong.
+         */
+        constexpr int kMTPSidecarSnapshotSchema = 2;
+        std::ifstream schema_file(
+            dir / "mtp_sidecar_snapshot_schema.txt");
+        int observed_schema = 0;
+        if (!(schema_file >> observed_schema) ||
+            observed_schema != kMTPSidecarSnapshotSchema)
+        {
+            return false;
         }
 
         const std::vector<std::string> required_mtp_sidecar_files = {
@@ -2460,11 +2459,26 @@ namespace llaminar2::test::parity::qwen36
         }
         if (moEPrefixCaseUsesROCm(test_case))
         {
-            expectPerfCounterPositive(
+            /*
+             * A fused projection group quantizes one activation row once and
+             * dispatches every projection from that shared device buffer.  It
+             * supersedes the older per-projection NativeVNNI counter while
+             * remaining the economical small-M production route this gate is
+             * meant to certify.
+             */
+            const double native_vnni_calls = perfCounterSum(
                 records,
                 "kernel",
-                "rocm_native_vnni_small_m_calls",
-                context);
+                "rocm_native_vnni_small_m_calls");
+            const double fused_shared_quant_calls = perfCounterSum(
+                records,
+                "kernel",
+                "rocm_fused_small_m_shared_quant_calls");
+            EXPECT_GT(native_vnni_calls + fused_shared_quant_calls, 0.0)
+                << context
+                << " should publish an economical ROCm small-M NativeVNNI or "
+                   "fused shared-quant projection route.\n"
+                << PerfStatsCollector::summaryString({"kernel"});
         }
     }
 
@@ -2677,6 +2691,12 @@ namespace llaminar2::test::parity::qwen36
             hasMTPPerfCounter(
                 records,
                 "graph_owned_greedy_outcome_stage_enqueues");
+        const bool used_graph_owned_outcome =
+            hasMTPPerfRecordTag(
+                records,
+                "all_position_greedy_device_resident_outcomes",
+                "implementation",
+                "graph_owned_outcome");
         const bool armed_graph_owned_outcome =
             hasMTPPerfCounter(
                 records,
@@ -2737,9 +2757,11 @@ namespace llaminar2::test::parity::qwen36
                    "publication outside the proven lane.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
 
-            EXPECT_TRUE(used_graph_owned_outcome_stage)
-                << context << " must execute the greedy outcome reducer inside "
-                   "the captured verifier graph.\n"
+            EXPECT_TRUE(used_graph_owned_outcome)
+                << context << " must consume a greedy outcome produced inside "
+                   "the captured verifier graph. The stage-enqueue counter is "
+                   "capture-time evidence and may precede a request-local "
+                   "PerfStats reset.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_TRUE(armed_graph_owned_outcome)
                 << context << " must arm graph-owned outcome controls before "
@@ -3797,6 +3819,18 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_EQ(
                 priming.tokens.size(),
                 static_cast<size_t>(test_case.decode_steps));
+
+            /*
+             * The priming generation is a complete synthetic request, not a
+             * prefix of the request under test. Cross the same public request
+             * boundary used by serving before replaying the retained graph.
+             * This resets main KV/GDN state and shifted-MTP KV together on the
+             * orchestrator-owned reset stream while deliberately preserving
+             * replay-safe captures. Omitting this boundary leaves the priming
+             * rows live and correctly trips the shifted-prefill device invariant
+             * when the next independent prompt tries to start at position zero.
+             */
+            mtp->clearCache();
         }
 
         PerfStatsCollector::reset();
@@ -5702,15 +5736,145 @@ namespace llaminar2::test::parity::qwen36
         return keys;
     }
 
+    inline constexpr std::string_view kMTPDecodeSidecarSnapshotContextPrefix =
+        "MTP_DECODE_SIDECAR_";
+
+    inline constexpr std::string_view kInitialProductionMTPDecodeSidecarSnapshotPrefix =
+        "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_";
+
+    inline constexpr std::string_view kResidentProductionMTPDecodeSidecarSnapshotPrefix =
+        "MTP_DECODE_SIDECAR_RESIDENT_LOGICAL_STATE_";
+
+    /**
+     * @brief Return the complete materialized operation surface of one Qwen3.6
+     *        MoE depth-zero decode sidecar.
+     *
+     * The relative names deliberately include the terminal-hidden selector and
+     * every tensor boundary exposed by the unfused diagnostic graph.  A fused
+     * production graph may lawfully omit an intermediate only when both input
+     * policies omit it; the resident/direct comparison below still requires all
+     * common materialized boundaries to be byte-identical and separately
+     * requires the semantically essential stage set.
+     *
+     * Keeping this inventory beside the context-name helpers prevents a new
+     * sidecar input policy from silently receiving weaker accuracy coverage.
+     */
+    inline const std::vector<std::string_view> &qwen36MoEMTPSidecarRelativeSnapshotKeys()
+    {
+        static const std::vector<std::string_view> keys = {
+            "MTP_TERMINAL_HIDDEN_ROW_SELECT",
+            "MTP0_EMBEDDING",
+            "MTP0_NORM_HIDDEN",
+            "MTP0_NORM_EMBEDDING",
+            "MTP0_CONCAT",
+            "MTP0_FC",
+            "MTP0_ATTENTION_NORM",
+            "MTP0_Q_PROJECTION",
+            "MTP0_Q_NORM",
+            "MTP0_K_PROJECTION",
+            "MTP0_K_NORM",
+            "MTP0_V_PROJECTION",
+            "MTP0_ATTENTION_CONTEXT",
+            "MTP0_ATTENTION_CONTEXT_GATED",
+            "MTP0_ATTENTION_OUTPUT",
+            "MTP0_FFN_NORM",
+            "MTP0_MOE_ROUTER_OUTPUT",
+            "MTP0_MOE_ROUTING_INDICES",
+            "MTP0_MOE_ROUTING_WEIGHTS",
+            "MTP0_MOE_EXPERT_OUTPUT",
+            "MTP0_MOE_SHARED_EXPERT_OUTPUT",
+            "MTP0_MOE_SHARED_GATE_OUTPUT",
+            "MTP0_MOE_COMBINED_OUTPUT",
+            "MTP0_FFN_RESIDUAL",
+            "MTP0_FINAL_NORM",
+            "MTP0_LM_HEAD",
+        };
+        return keys;
+    }
+
+    /**
+     * @brief Build the stage-local filter for sidecar snapshot graph capture.
+     *
+     * `DeviceGraphExecutor` selects stage outputs before `SnapshotCapture`
+     * decorates their keys with the runtime sidecar context.  The filter must
+     * therefore contain relative stage keys; supplying final context-qualified
+     * names selects no graph nodes and yields an empty oracle.  The capture
+     * callback still publishes both qualified and unqualified snapshots, so
+     * callers can compare two input-policy contexts without weakening stage
+     * selection.
+     *
+     * @return Relative semantic keys accepted by the executor stage filter.
+     */
+    inline std::vector<std::string> qwen36MoEMTPSidecarSnapshotFilterKeys()
+    {
+        std::vector<std::string> keys;
+        keys.reserve(qwen36MoEMTPSidecarRelativeSnapshotKeys().size());
+        for (const std::string_view relative :
+             qwen36MoEMTPSidecarRelativeSnapshotKeys())
+        {
+            keys.emplace_back(relative);
+        }
+        return keys;
+    }
+
+    /**
+     * @brief Identify a snapshot owned by one context-qualified production
+     *        MTP decode-sidecar graph.
+     *
+     * The first transaction consumes the sampled target token and live KV
+     * position directly.  Later transactions consume the resident logical
+     * sequence-state mailbox.  Both are production sidecars, and future
+     * device-owned input policies may add further context names.  The graph
+     * context is therefore deliberately treated as an opaque qualifier; the
+     * `_MTP<n>_` marker is the stable boundary between that qualifier and the
+     * model-stage name understood by the PyTorch oracle.
+     */
+    inline bool isProductionMTPDecodeSidecarSnapshotKey(
+        std::string_view key)
+    {
+        return key.starts_with(kMTPDecodeSidecarSnapshotContextPrefix) &&
+               key.find("_MTP") != std::string_view::npos;
+    }
+
     inline std::string pytorchReferenceKeyForMoEDiagnosticKey(const std::string &key)
     {
-        static constexpr const char *kDecodeSidecarPrefix = "MTP_DECODE_SIDECAR_";
-        const std::string prefix(kDecodeSidecarPrefix);
-        if (key.rfind(prefix, 0) == 0)
+        if (isProductionMTPDecodeSidecarSnapshotKey(key))
         {
-            return key.substr(prefix.size());
+            const size_t stage_marker = key.find("_MTP");
+            if (stage_marker == std::string::npos)
+            {
+                throw std::logic_error(
+                    "Context-qualified MTP sidecar snapshot lacks a stage marker: " +
+                    key);
+            }
+            return key.substr(stage_marker + 1);
+        }
+
+        static constexpr std::string_view kGenericDecodeSidecarPrefix =
+            "MTP_DECODE_SIDECAR_";
+        for (const std::string_view prefix : {kGenericDecodeSidecarPrefix})
+        {
+            if (key.rfind(prefix, 0) == 0)
+                return key.substr(prefix.size());
         }
         return key;
+    }
+
+    /**
+     * @brief Name one stage from the production device-owned decode sidecar.
+     *
+     * The MTP runner can retain several captured sidecar variants at once.
+     * Accuracy diagnostics must inspect the variant that consumes the sampled
+     * target token and live device KV position, rather than accepting an
+     * identically named stage from a priming, prefill, or chained graph.
+     */
+    inline std::string productionMTPDecodeSidecarSnapshotKey(
+        std::string_view stage_suffix)
+    {
+        return std::string(
+                   kInitialProductionMTPDecodeSidecarSnapshotPrefix) +
+               "MTP0_" +
+               std::string(stage_suffix);
     }
 
     inline MoESnapshotCompareRow compareMoESnapshotVectors(
@@ -7125,6 +7289,41 @@ namespace llaminar2::test::parity::qwen36
         return grouped_key;
     }
 
+    /**
+     * @brief Return true for a serial-only routed-expert intermediate that an
+     *        economical fused grouped MoE operation does not materialize.
+     *
+     * The serial graph writes routed expert accumulation to
+     * `MOE_EXPERT_OUTPUT`, then combines it with the shared expert.  The grouped
+     * verifier's fused owner writes the mathematically equivalent combined row
+     * directly.  Requiring a routed-only scratch tensor would add production
+     * traffic solely for diagnostics.  The sweep instead proves the complete
+     * semantic boundary through router logits, exact indices/weights, shared
+     * expert output, `MOE_COMBINED_OUTPUT`, and the residual output.
+     */
+    inline bool isSerialOnlyFusedMoERoutedIntermediate(
+        const std::string &key,
+        const std::map<std::string, std::vector<float>> &all_position_snapshots,
+        const std::map<std::string, std::vector<float>> &serial_snapshots)
+    {
+        static constexpr std::string_view kRoutedSuffix =
+            "_MOE_EXPERT_OUTPUT";
+        if (!std::string_view(key).ends_with(kRoutedSuffix) ||
+            all_position_snapshots.find(key) != all_position_snapshots.end() ||
+            serial_snapshots.find(key) == serial_snapshots.end())
+        {
+            return false;
+        }
+
+        const std::string layer_prefix =
+            key.substr(0, key.size() - kRoutedSuffix.size());
+        const std::string combined_key =
+            layer_prefix + "_MOE_COMBINED_OUTPUT";
+        return all_position_snapshots.find(combined_key) !=
+                   all_position_snapshots.end() &&
+               serial_snapshots.find(combined_key) != serial_snapshots.end();
+    }
+
     inline void appendMoEAllPositionVerifierRows(
         const std::map<std::string, std::vector<float>> &all_position_snapshots,
         const std::map<std::string, std::vector<float>> &serial_snapshots,
@@ -7139,6 +7338,13 @@ namespace llaminar2::test::parity::qwen36
         auto append_key_if_captured =
             [&](const std::string &key)
         {
+            if (isSerialOnlyFusedMoERoutedIntermediate(
+                    key,
+                    all_position_snapshots,
+                    serial_snapshots))
+            {
+                return;
+            }
             if (seen_keys.find(key) != seen_keys.end())
             {
                 return;
@@ -7168,6 +7374,13 @@ namespace llaminar2::test::parity::qwen36
         }
         for (const auto &entry : serial_snapshots)
         {
+            if (isSerialOnlyFusedMoERoutedIntermediate(
+                    entry.first,
+                    all_position_snapshots,
+                    serial_snapshots))
+            {
+                continue;
+            }
             append_key_if_captured(entry.first);
         }
 
@@ -7433,7 +7646,9 @@ namespace llaminar2::test::parity::qwen36
              * snapshot makes the M=1..4 numeric checks isolate target-model
              * logits/KV/GDN equivalence rather than shifted-cache coherence.
             */
-            const int production_sidecar_position = runner->get_position();
+            const int production_sidecar_position =
+                static_cast<int>(prompt_tokens.size()) +
+                serial_setup_token_count;
             for (int i = 0; i < serial_setup_token_count; ++i)
             {
                 ASSERT_TRUE(commit_shifted_row(
@@ -7447,14 +7662,22 @@ namespace llaminar2::test::parity::qwen36
             }
         }
 
+        const int verifier_base_cached_tokens =
+            static_cast<int>(prompt_tokens.size()) +
+            serial_setup_token_count;
+        ASSERT_GE(verifier_base_cached_tokens, 0);
+
         const PrefixRuntimeStateSnapshot verifier_base_cursor_probe =
             runner->prefixStateProbe();
-        ASSERT_FALSE(verifier_base_cursor_probe.sequence_lengths.empty())
-            << "publication equivalence requires an observable canonical "
-               "sequence cursor";
-        const int verifier_base_cached_tokens =
-            verifier_base_cursor_probe.sequence_lengths.front();
-        ASSERT_GE(verifier_base_cached_tokens, 0);
+        if (!device.is_gpu())
+        {
+            ASSERT_FALSE(verifier_base_cursor_probe.sequence_lengths.empty())
+                << "CPU publication equivalence requires its host-owned "
+                   "canonical sequence cursor";
+            EXPECT_EQ(
+                verifier_base_cursor_probe.sequence_lengths.front(),
+                verifier_base_cached_tokens);
+        }
 
         /*
          * Exercise the production rollback contract.  GPU MTP checkpoints keep
@@ -7462,7 +7685,9 @@ namespace llaminar2::test::parity::qwen36
          * recurrent sidecars required to restore the logical boundary.  The
          * diagnostic payload exporter performs a host-visible KV round trip and
          * therefore cannot prove the ordering or ownership contract used by
-         * stochastic inference.
+         * stochastic inference.  The focused fixture already owns the exact
+         * prompt/setup geometry, so a GPU test names that logical boundary
+         * directly rather than reviving a host mirror of the device cursor.
          */
         const PrefixStateSnapshot verifier_base =
             runner->captureLivePrefixCheckpoint(
@@ -7634,11 +7859,73 @@ namespace llaminar2::test::parity::qwen36
                 << "resident publication proof exceeds compact outcome capacity";
             if (runner->supportsGreedyAllPositionBatchOutcomeOnDevice())
             {
+                constexpr int kVerifierTargetSampleSlot = 0;
+                constexpr int kFirstVerifierDraftSampleSlot = 0;
+                const int verifier_draft_token_count =
+                    static_cast<int>(verifier_tokens.size() - 1);
+
+                /*
+                 * The graph-owned outcome reducer is part of the production
+                 * device-generation transaction, not a standalone argmax
+                 * utility. Admit the same persistent response/controller
+                 * ledger that production opens immediately after prefill. The
+                 * captured verifier-preparation graph consumes the admission
+                 * event and derives its transaction commit budget from this
+                 * device-owned state; seeding only the verifier tokens would
+                 * leave those control words at their arena-reset value and
+                 * exercise an impossible half-admitted transaction.
+                 *
+                 * This fixture starts from the first response boundary, so
+                 * verifier row zero has not yet crossed the caller boundary.
+                 * Later rejection-carry tests must admit `AlreadyEmitted`
+                 * explicitly rather than inferring ownership from token data.
+                 */
+                const int resident_response_budget =
+                    config.max_seq_len - verifier_base_cached_tokens;
+                ASSERT_GE(
+                    resident_response_budget,
+                    static_cast<int>(verifier_tokens.size()))
+                    << "publication regression needs enough admitted response "
+                       "capacity for its complete verifier transaction";
+                ASSERT_TRUE(runner->beginDeviceResidentGeneration(
+                    DeviceGenerationAdmissionRequest{
+                        .request_count = 1,
+                        .max_new_tokens = resident_response_budget,
+                        .initial_leading_row_disposition =
+                            sampling_math::
+                                DeviceGenerationLeadingRowDisposition::
+                                    PendingResponse,
+                    }))
+                    << "publication regression must enter the production "
+                       "device-generation admission lifecycle";
+
+                /*
+                 * Fixture tokens are known on the host, but the production
+                 * verifier transaction is not allowed to consume a host row.
+                 * Publish the condition token and drafts into their typed
+                 * runner-owned sample slots, complete with exact producer
+                 * events, then let the verifier stream compose its resident
+                 * row. This exercises the same producer/consumer ownership
+                 * contract as stochastic inference without weakening the GPU
+                 * no-host-input invariant for a diagnostic convenience path.
+                 */
+                ASSERT_TRUE(runner->stageStochasticTargetTokenForDeviceSampling(
+                    verifier_tokens.front(),
+                    kVerifierTargetSampleSlot))
+                    << "publication regression must seed a device-owned target "
+                       "sample slot";
+                ASSERT_TRUE(runner->stageStochasticDraftTokensForDeviceVerification(
+                    verifier_tokens.data() + 1,
+                    verifier_draft_token_count,
+                    kFirstVerifierDraftSampleSlot))
+                    << "publication regression must seed device-owned draft "
+                       "sample slots";
                 verifier_tokens_device =
-                    runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                        verifier_tokens.data(),
-                        static_cast<int>(verifier_tokens.size()),
-                        static_cast<int>(verifier_tokens.size() - 1));
+                    runner->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                        kVerifierTargetSampleSlot,
+                        kFirstVerifierDraftSampleSlot,
+                        verifier_draft_token_count,
+                        static_cast<int>(verifier_tokens.size()));
                 ASSERT_NE(nullptr, verifier_tokens_device)
                     << "compact greedy verifier regression requires a materialized "
                        "device verifier-token row";
@@ -8942,9 +9229,13 @@ namespace llaminar2::test::parity::qwen36
      * runs the verifier tokens as one compact all-position graph forward, reads
      * row-indexed logits for every semantic verifier row, and compares them
      * against serial decode prefixes with strict sampled-token and distribution
-     * metrics.  The helper intentionally does not publish live state from the
-     * grouped forward; direct accepted-state publication remains a separate
-     * continuation-equivalence gate.
+     * metrics.  Its optional publication mode additionally drives the compact
+     * outcome, accepted-state publication, resident sidecar, and next grouped
+     * verifier exactly as serving does.  When
+     * @p verify_resident_sidecar_input_equivalence is true, that mode also
+     * archives the accepted device checkpoint and proves that the mailbox-input
+     * sidecar is byte-identical to the direct device-target sidecar from the
+     * same checkpoint.
      */
     inline void runMoEMainVerifierGroupedRowsMatchSerialDecode(
         const MoEPrefixRestoreParityCase &test_case,
@@ -8960,7 +9251,8 @@ namespace llaminar2::test::parity::qwen36
         std::optional<SamplingParams> stochastic_summary_params = std::nullopt,
         int expected_stochastic_rejection_token = -1,
         bool stochastic_first_token_is_pending = false,
-        int expected_stochastic_accepted_prefix = -1)
+        int expected_stochastic_accepted_prefix = -1,
+        bool verify_resident_sidecar_input_equivalence = false)
     {
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
@@ -8995,14 +9287,53 @@ namespace llaminar2::test::parity::qwen36
                 << "a partial grouped publication needs at least one rejected "
                    "draft row after its accepted prefix";
         }
-        const std::vector<int32_t> &token_path =
-            serial_token_path.empty() ? expected_tokens : serial_token_path;
+        if (verify_resident_sidecar_input_equivalence)
+        {
+            ASSERT_GT(accepted_grouped_rows_before_verifier, 0)
+                << "resident-sidecar equivalence requires accepted-state publication";
+            ASSERT_TRUE(stochastic_summary_params.has_value())
+                << "resident-sidecar equivalence requires the production stochastic outcome";
+            ASSERT_TRUE(exercise_shifted_row_maintenance)
+                << "resident-sidecar equivalence requires the production shifted-cache lifecycle";
+        }
+        const bool uses_reference_seed_token_path =
+            serial_token_path.empty();
+        std::vector<int32_t> token_path =
+            uses_reference_seed_token_path
+                ? expected_tokens
+                : serial_token_path;
+        const size_t required_token_path_size = static_cast<size_t>(
+            serial_setup_token_count +
+            accepted_grouped_rows_before_verifier +
+            verifier_row_count + 1);
+        if (uses_reference_seed_token_path &&
+            token_path.size() < required_token_path_size)
+        {
+            /*
+             * The checked-in PyTorch fixture intentionally keeps only the
+             * short token-exact decode window. Row-equivalence itself is a
+             * teacher-forced operation proof: after that authenticated seed,
+             * any valid token sequence is a legitimate adversarial input as
+             * long as grouped and serial executions consume identical bytes.
+             * Extend from prompt token IDs deterministically instead of
+             * weakening M coverage or requiring another expensive reference
+             * generation pass whenever the grouped sweep grows.
+             */
+            ASSERT_FALSE(prompt_tokens.empty())
+                << "cannot extend grouped verifier token path without prompt tokens";
+            size_t extension_index = 0;
+            while (token_path.size() < required_token_path_size)
+            {
+                const size_t prompt_index =
+                    (extension_index * 17 + prompt_tokens.size() / 2) %
+                    prompt_tokens.size();
+                token_path.push_back(prompt_tokens[prompt_index]);
+                ++extension_index;
+            }
+        }
         ASSERT_GE(
             token_path.size(),
-            static_cast<size_t>(
-                serial_setup_token_count +
-                accepted_grouped_rows_before_verifier +
-                verifier_row_count + 1))
+            required_token_path_size)
             << "grouped verifier row proof requires one explicit condition "
                "token for every setup/verification forward plus the expected "
                "continuation token";
@@ -9058,6 +9389,17 @@ namespace llaminar2::test::parity::qwen36
             configured_draft_tokens >= 0
                 ? configured_draft_tokens
                 : verifier_row_count;
+        if (verify_resident_sidecar_input_equivalence)
+        {
+            const int active_draft_depth = verifier_row_count - 1;
+            ASSERT_GE(config.mtp.draft_tokens, active_draft_depth)
+                << "resident-sidecar equivalence requires graph capacity for "
+                   "the selected dynamic transaction depth";
+            config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+            config.mtp.depth_policy.min_depth = 1;
+            config.mtp.depth_policy.max_depth = config.mtp.draft_tokens;
+            config.mtp.depth_policy.initial_depth = active_draft_depth;
+        }
         config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
         const RoutedExpertPrefillRuntimeConfig resolved_routed_prefill =
@@ -9358,11 +9700,11 @@ namespace llaminar2::test::parity::qwen36
             [&](const std::vector<int32_t> &tokens,
                 bool producers_already_device_owned) -> const void *
         {
-            if (tokens.size() < 2)
+            if (tokens.empty())
             {
                 ADD_FAILURE()
                     << "grouped verifier device composition requires a "
-                       "condition and at least one draft row";
+                       "condition row";
                 return nullptr;
             }
 
@@ -9380,10 +9722,11 @@ namespace llaminar2::test::parity::qwen36
                  */
                 if (!runner->stageStochasticTargetTokenForDeviceSampling(
                         tokens.front(), kConditionTargetSlot) ||
-                    !runner->stageStochasticDraftTokensForDeviceVerification(
-                        tokens.data() + 1,
-                        draft_count,
-                        kFirstDraftSlot))
+                    (draft_count > 0 &&
+                     !runner->stageStochasticDraftTokensForDeviceVerification(
+                         tokens.data() + 1,
+                         draft_count,
+                         kFirstDraftSlot)))
                 {
                     ADD_FAILURE()
                         << "failed to admit focused verifier fixture tokens "
@@ -9534,7 +9877,7 @@ namespace llaminar2::test::parity::qwen36
             << "prefill forward failed";
         const int32_t prefill_sample = sample_current("prefill");
         ASSERT_GE(prefill_sample, 0);
-        if (serial_token_path.empty())
+        if (uses_reference_seed_token_path)
         {
             EXPECT_EQ(prefill_sample, token_path[0]);
         }
@@ -9602,6 +9945,42 @@ namespace llaminar2::test::parity::qwen36
                         serial_setup_token_count +
                         accepted_grouped_rows_before_verifier + row)]);
             }
+
+            /*
+             * Accepted-state publication is meaningful only inside the same
+             * device-generation transaction that serving opens after prefill.
+             * The verifier-preparation graph consumes this admission event and
+             * derives its response/commit budget from the persistent controller
+             * ledger.  Staging target and draft rows without admission leaves a
+             * half-constructed transaction that the production reducer must
+             * reject.  The explicit leading-row policy also gives the previously
+             * inert `stochastic_first_token_is_pending` argument one precise
+             * ownership meaning.
+             */
+            const int publication_base_cached_tokens =
+                static_cast<int>(prompt_tokens.size()) +
+                serial_setup_token_count;
+            const int publication_response_budget =
+                config.max_seq_len - publication_base_cached_tokens;
+            ASSERT_GE(
+                publication_response_budget,
+                static_cast<int>(publication_tokens.size()))
+                << "accepted publication needs enough admitted response capacity";
+            ASSERT_TRUE(runner->beginDeviceResidentGeneration(
+                DeviceGenerationAdmissionRequest{
+                    .request_count = 1,
+                    .max_new_tokens = publication_response_budget,
+                    .initial_leading_row_disposition =
+                        stochastic_first_token_is_pending
+                            ? sampling_math::
+                                  DeviceGenerationLeadingRowDisposition::
+                                      PendingResponse
+                            : sampling_math::
+                                  DeviceGenerationLeadingRowDisposition::
+                                      AlreadyEmitted,
+                }))
+                << "accepted grouped publication must enter the production "
+                   "device-generation admission lifecycle";
 
             auto bind_grouped_verifier =
                 [&](const std::vector<int32_t> &tokens,
@@ -9758,6 +10137,37 @@ namespace llaminar2::test::parity::qwen36
                     << "accepted-prefix grouped verifier did not publish a resident outcome";
             }
             ASSERT_TRUE(resident_outcome.valid());
+            if (verify_resident_sidecar_input_equivalence &&
+                stochastic_publication)
+            {
+                /*
+                 * Establish the compact reducer as a known-good producer before
+                 * any shifted-cache, accepted-state, checkpoint, or sidecar
+                 * consumer can touch persistent GPU state.  The delayed probe
+                 * below then turns any later corruption into a precise mailbox-
+                 * lifetime regression instead of ambiguously blaming reduction
+                 * math.  This extra D2H exists only in the focused diagnostic
+                 * oracle; production retains its single terminal response bridge.
+                 */
+                DeviceSpeculativeVerifyBatchOutcome initial_outcome_probe;
+                ASSERT_TRUE(
+                    runner->copyDeviceSpeculativeOutcomesToHostForDiagnostics(
+                        resident_outcome,
+                        &initial_outcome_probe))
+                    << "resident sidecar oracle could not authenticate the "
+                       "compact reducer output before downstream consumers";
+                ASSERT_TRUE(initial_outcome_probe.ok);
+                EXPECT_EQ(
+                    initial_outcome_probe.target_verifier_state_commit_count,
+                    accepted_grouped_rows_before_verifier);
+                EXPECT_EQ(
+                    initial_outcome_probe.accepted_speculative_prefix,
+                    accepted_grouped_rows_before_verifier - 1);
+                ASSERT_FALSE(chained_verifier_tokens.empty());
+                EXPECT_EQ(
+                    initial_outcome_probe.rejected_verified_token,
+                    chained_verifier_tokens.front());
+            }
             ASSERT_TRUE(clear_grouped_verifier());
 
             if (exercise_shifted_row_maintenance &&
@@ -9800,6 +10210,40 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_TRUE(logical_state.valid())
                 << "accepted grouped publication did not leave a resident logical-state mailbox";
 
+            PrefixStateSnapshot resident_sidecar_base;
+            std::map<std::string, std::vector<float>> resident_sidecar_snapshots;
+            std::optional<PrefixRuntimeStateSnapshot> resident_sidecar_state;
+            std::vector<std::string> sidecar_snapshot_filter;
+            ScopedMoEVerifierSnapshotCapture resident_sidecar_snapshot_capture;
+            if (verify_resident_sidecar_input_equivalence)
+            {
+                ASSERT_TRUE(device.is_gpu())
+                    << "resident/direct sidecar equivalence is a GPU ownership proof";
+                const int accepted_cached_tokens =
+                    static_cast<int>(prompt_tokens.size()) +
+                    serial_setup_token_count +
+                    accepted_grouped_rows_before_verifier;
+                resident_sidecar_base = runner->captureLivePrefixCheckpoint(
+                    PrefixCheckpointCaptureRequest{
+                        .sequence_index = 0,
+                        .logical_cached_tokens = accepted_cached_tokens,
+                    });
+                ASSERT_TRUE(resident_sidecar_base.valid)
+                    << "resident sidecar oracle could not archive its accepted-state base";
+                ASSERT_TRUE(resident_sidecar_base.logical_checkpoint)
+                    << "GPU resident sidecar oracle must use the device logical-checkpoint path";
+                ASSERT_EQ(
+                    resident_sidecar_base.cached_tokens,
+                    accepted_cached_tokens);
+
+                sidecar_snapshot_filter =
+                    qwen36MoEMTPSidecarSnapshotFilterKeys();
+                resident_sidecar_snapshot_capture.enable(
+                    *runner,
+                    sidecar_snapshot_filter);
+                resident_sidecar_snapshot_capture.clear();
+            }
+
             /*
              * This is the production ordering boundary that the older oracles
              * omitted.  Maintenance publishes on its explicit stream, and the
@@ -9814,6 +10258,16 @@ namespace llaminar2::test::parity::qwen36
                     logical_state,
                     /*request_index=*/0))
                 << "resident sidecar prelaunch after accepted publication failed";
+            if (verify_resident_sidecar_input_equivalence)
+            {
+                resident_sidecar_snapshots =
+                    captureMoERunnerSnapshots(*runner);
+                ASSERT_FALSE(resident_sidecar_snapshots.empty())
+                    << "resident sidecar snapshot filter selected no production "
+                       "operation boundaries";
+                resident_sidecar_state = runner->prefixStateProbe();
+                resident_sidecar_snapshot_capture.disable();
+            }
 
             if (stochastic_publication)
             {
@@ -10101,6 +10555,104 @@ namespace llaminar2::test::parity::qwen36
             if (exercise_device_rebalance_maintenance)
             {
                 runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            }
+
+            if (verify_resident_sidecar_input_equivalence)
+            {
+                ASSERT_TRUE(resident_sidecar_base.valid);
+                ASSERT_TRUE(resident_sidecar_state.has_value());
+                ASSERT_TRUE(runner->restoreLivePrefixState(resident_sidecar_base))
+                    << "resident sidecar oracle could not restore its exact accepted-state base";
+
+                ScopedMoEVerifierSnapshotCapture direct_sidecar_snapshot_capture;
+                direct_sidecar_snapshot_capture.enable(
+                    *runner,
+                    sidecar_snapshot_filter);
+                direct_sidecar_snapshot_capture.clear();
+
+                constexpr int kDirectOracleTargetSlot = 0;
+                ASSERT_TRUE(runner->stageStochasticTargetTokenForDeviceSampling(
+                    chained_verifier_tokens.front(),
+                    kDirectOracleTargetSlot))
+                    << "direct sidecar oracle could not publish the same condition token";
+                ASSERT_TRUE(
+                    runner->forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+                        kDirectOracleTargetSlot))
+                    << "direct sidecar oracle failed from the restored accepted-state base";
+
+                const auto direct_sidecar_snapshots =
+                    captureMoERunnerSnapshots(*runner);
+                ASSERT_FALSE(direct_sidecar_snapshots.empty())
+                    << "direct device-target sidecar snapshot filter selected no "
+                       "production operation boundaries";
+                const PrefixRuntimeStateSnapshot direct_sidecar_state =
+                    runner->prefixStateProbe();
+                direct_sidecar_snapshot_capture.disable();
+
+                size_t compared_stage_count = 0;
+                for (const std::string_view relative_key :
+                     qwen36MoEMTPSidecarRelativeSnapshotKeys())
+                {
+                    const std::string resident_key =
+                        std::string(
+                            kResidentProductionMTPDecodeSidecarSnapshotPrefix) +
+                        std::string(relative_key);
+                    const std::string direct_key =
+                        std::string(
+                            kInitialProductionMTPDecodeSidecarSnapshotPrefix) +
+                        std::string(relative_key);
+                    const auto resident_it =
+                        resident_sidecar_snapshots.find(resident_key);
+                    const auto direct_it =
+                        direct_sidecar_snapshots.find(direct_key);
+
+                    ASSERT_EQ(
+                        resident_it != resident_sidecar_snapshots.end(),
+                        direct_it != direct_sidecar_snapshots.end())
+                        << "sidecar input policies materialized different operation surfaces"
+                        << "\nrelative_stage=" << relative_key
+                        << "\nresident_key=" << resident_key
+                        << "\ndirect_key=" << direct_key;
+                    if (resident_it == resident_sidecar_snapshots.end())
+                    {
+                        continue;
+                    }
+
+                    ++compared_stage_count;
+                    const MoESnapshotCompareRow comparison =
+                        compareMoESnapshotVectors(
+                            resident_it->second,
+                            direct_it->second.data(),
+                            direct_it->second.size(),
+                            /*sync_idx=*/0,
+                            /*output_tokens=*/0,
+                            resident_key,
+                            direct_key,
+                            "resident_sidecar_vs_direct_device_target",
+                            "resident_mailbox",
+                            "direct_device_target");
+                    EXPECT_TRUE(comparison.byte_identical)
+                        << "Sidecar input policy changed grouped predictor math at "
+                        << relative_key << ": "
+                        << describeMoEDiagnosticRow(comparison);
+                }
+                EXPECT_GE(compared_stage_count, 19u)
+                    << "resident/direct sidecar proof did not observe the complete "
+                       "semantically essential operation surface";
+
+                MTPRuntimeSnapshotComparisonOptions state_options;
+                state_options.compare_main_kv_payload_hashes = true;
+                state_options.compare_shifted_mtp_kv = true;
+                state_options.compare_gdn_hashes = true;
+                const MTPStateValidationResult state_match =
+                    compareMTPRuntimeStateSnapshots(
+                        *resident_sidecar_state,
+                        direct_sidecar_state,
+                        state_options);
+                EXPECT_TRUE(state_match)
+                    << "Resident and direct device-target sidecars must publish "
+                       "identical shifted KV/recurrent state. reason="
+                    << state_match.reason;
             }
             return;
         }
@@ -10797,8 +11349,20 @@ namespace llaminar2::test::parity::qwen36
         while (static_cast<int>(mtp_tokens.size()) < decode_token_budget)
         {
             const int remaining = decode_token_budget - static_cast<int>(mtp_tokens.size());
+            const int transaction_first_decode_step =
+                static_cast<int>(mtp_tokens.size());
             mtp->clearSnapshots();
-            mtp->setDecodeStepTokenBudget(remaining);
+            /*
+             * Keep one diagnostic observation bounded to one speculative
+             * transaction.  A larger response budget allows the resident
+             * generation loop to execute several transactions before the sole
+             * terminal observation; every captured snapshot slot would then
+             * contain whichever transaction last wrote that stage.  Two
+             * response tokens are sufficient to exercise one draft and its
+             * target verification while preserving an unambiguous mapping to
+             * the PyTorch decode-step namespace.
+             */
+            mtp->setDecodeStepTokenBudget(std::min(remaining, 2));
             GenerationResult mtp_step = mtp->decodeStep();
             mtp->setDecodeStepTokenBudget(0);
             ASSERT_TRUE(mtp_step.error.empty()) << mtp_step.error;
@@ -10824,14 +11388,14 @@ namespace llaminar2::test::parity::qwen36
             {
                 baseline_keys.push_back(entry.first);
             }
-            const int pytorch_decode_step =
+            const int latest_completed_main_decode_step =
                 std::max(0, static_cast<int>(mtp_tokens.size()) - 2);
             auto keys = unionSnapshotKeys(baseline_keys, mtp->getSnapshotKeys());
             keys = unionSnapshotKeys(
                 keys,
                 listMoEPyTorchSnapshotKeysForDecodeStep(
                     pytorch_snapshot_dir,
-                    pytorch_decode_step));
+                    latest_completed_main_decode_step));
             for (const auto &key : keys)
             {
                 auto row = compareMoESnapshotKey(
@@ -10843,6 +11407,24 @@ namespace llaminar2::test::parity::qwen36
                 all_snapshot_rows.push_back(row);
                 writeMoESnapshotCsvRow(snapshot_csv, row);
 
+                /*
+                 * MTP0 predicts output token N from the terminal main hidden
+                 * preceding the latest emitted token and that latest token's
+                 * embedding.  Before the first transaction the prompt is the
+                 * predecessor, so both indices are zero; after N tokens have
+                 * been emitted the matching teacher-forced PyTorch sidecar
+                 * row is N-1.  Using N here compared a valid post-rollback
+                 * transaction with the following reference token and made the
+                 * embedding boundary appear catastrophically stale.
+                 */
+                const int pytorch_mtp_sidecar_step =
+                    transaction_first_decode_step == 0
+                        ? 0
+                        : transaction_first_decode_step - 1;
+                const int pytorch_decode_step =
+                    isProductionMTPDecodeSidecarSnapshotKey(key)
+                        ? pytorch_mtp_sidecar_step
+                        : latest_completed_main_decode_step;
                 if (pytorch_decode_step < test_case.decode_steps)
                 {
                     const std::string pytorch_reference_key =
@@ -10893,6 +11475,36 @@ namespace llaminar2::test::parity::qwen36
                         "mtp");
                     all_snapshot_rows.push_back(mtp_pt_row);
                     writeMoESnapshotCsvRow(snapshot_csv, mtp_pt_row);
+
+                    if (key ==
+                            productionMTPDecodeSidecarSnapshotKey("LM_HEAD") &&
+                        pytorch_data.size() ==
+                            static_cast<size_t>(mtp->vocabSize()) &&
+                        mtp_data && mtp_size == pytorch_data.size())
+                    {
+                        const int pytorch_draft = argmaxToken(
+                            pytorch_data.data(),
+                            static_cast<int>(pytorch_data.size()));
+                        const int production_draft = argmaxToken(
+                            mtp_data,
+                            static_cast<int>(mtp_size));
+                        EXPECT_EQ(production_draft, pytorch_draft)
+                            << "Production MTP sidecar selected a different "
+                               "greedy draft token from the PyTorch MTP head at "
+                               "decode step "
+                            << pytorch_decode_step
+                            << "\nproduction top-5: "
+                            << topKSummary(
+                                   mtp_data,
+                                   static_cast<int>(mtp_size))
+                            << "\nPyTorch top-5: "
+                            << topKSummary(
+                                   pytorch_data.data(),
+                                   static_cast<int>(pytorch_data.size()))
+                            << "\ndiagnostic CSVs:\n"
+                            << token_csv_path << '\n'
+                            << snapshot_csv_path;
+                    }
                 }
             }
 
@@ -10902,25 +11514,6 @@ namespace llaminar2::test::parity::qwen36
         const auto mtp_state = mtp->prefixStateProbe();
         mtp->disableSnapshotCapture();
         mtp->shutdown();
-
-        auto find_mtp_sidecar_row = [&](const std::string &key) -> const MoESnapshotCompareRow *
-        {
-            for (const auto &row : all_snapshot_rows)
-            {
-                if (row.comparison == "pytorch_vs_mtp" &&
-                    row.key == key &&
-                    row.sync_idx == 0)
-                {
-                    return &row;
-                }
-            }
-            return nullptr;
-        };
-
-        const MoESnapshotCompareRow *sidecar_ffn_residual_row =
-            find_mtp_sidecar_row("MTP_DECODE_SIDECAR_MTP0_FFN_RESIDUAL");
-        const MoESnapshotCompareRow *sidecar_lm_head_row =
-            find_mtp_sidecar_row("MTP_DECODE_SIDECAR_MTP0_LM_HEAD");
 
         ASSERT_EQ(baseline_tokens.size(), mtp_tokens.size())
             << "diagnostic CSVs:\n"
@@ -10938,72 +11531,179 @@ namespace llaminar2::test::parity::qwen36
             << " mtp current_position=" << mtp_state.current_position;
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
-        ASSERT_NE(sidecar_ffn_residual_row, nullptr)
-            << "MTP sidecar diagnostic did not compare decode_step0_MTP0_FFN_RESIDUAL"
-            << "\ndiagnostic CSVs:\n"
-            << token_csv_path << '\n'
-            << snapshot_csv_path;
-        EXPECT_TRUE(isComparableMoEDiagnosticRow(*sidecar_ffn_residual_row))
-            << describeMoEDiagnosticRow(*sidecar_ffn_residual_row);
-        EXPECT_GE(sidecar_ffn_residual_row->cosine, 0.98)
-            << "MTP sidecar block-output PyTorch reference mismatch: "
-            << describeMoEDiagnosticRow(*sidecar_ffn_residual_row)
-            << "\ndiagnostic CSVs:\n"
-            << token_csv_path << '\n'
-            << snapshot_csv_path;
-        ASSERT_NE(sidecar_lm_head_row, nullptr)
-            << "MTP sidecar diagnostic did not compare decode_step0_MTP0_LM_HEAD"
-            << "\ndiagnostic CSVs:\n"
-            << token_csv_path << '\n'
-            << snapshot_csv_path;
-        EXPECT_TRUE(isComparableMoEDiagnosticRow(*sidecar_lm_head_row))
-            << describeMoEDiagnosticRow(*sidecar_lm_head_row);
-        EXPECT_GE(sidecar_lm_head_row->cosine, 0.98)
-            << "MTP sidecar PyTorch reference mismatch: "
-            << describeMoEDiagnosticRow(*sidecar_lm_head_row)
-            << "\ndiagnostic CSVs:\n"
-            << token_csv_path << '\n'
-            << snapshot_csv_path;
+        ASSERT_GE(sync_idx, 2)
+            << "The sidecar regression must cross the first-transaction to "
+               "resident-logical-state handoff";
 
-        const std::vector<std::string> required_sidecar_keys = {
-            "MTP_DECODE_SIDECAR_MTP0_EMBEDDING",
-            "MTP_DECODE_SIDECAR_MTP0_NORM_HIDDEN",
-            "MTP_DECODE_SIDECAR_MTP0_CONCAT",
-            "MTP_DECODE_SIDECAR_MTP0_FC",
-            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_NORM",
-            "MTP_DECODE_SIDECAR_MTP0_Q_PROJECTION",
-            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_CONTEXT",
-            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_FFN_NORM",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTER_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTING_INDICES",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTING_WEIGHTS",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_EXPERT_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_SHARED_EXPERT_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_SHARED_GATE_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_MOE_COMBINED_OUTPUT",
-            "MTP_DECODE_SIDECAR_MTP0_FFN_RESIDUAL",
-            "MTP_DECODE_SIDECAR_MTP0_FINAL_NORM",
-            "MTP_DECODE_SIDECAR_MTP0_LM_HEAD",
+        const std::vector<std::string_view> required_sidecar_stage_suffixes = {
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "MOE_ROUTER_OUTPUT",
+            "MOE_ROUTING_INDICES",
+            "MOE_ROUTING_WEIGHTS",
+            "MOE_EXPERT_OUTPUT",
+            "MOE_SHARED_EXPERT_OUTPUT",
+            "MOE_SHARED_GATE_OUTPUT",
+            "MOE_COMBINED_OUTPUT",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
         };
-        std::vector<std::string> missing_sidecar_keys;
-        for (const auto &key : required_sidecar_keys)
+
+        auto find_active_mtp_sidecar_row =
+            [&](int transaction_index,
+                std::string_view stage_suffix) -> const MoESnapshotCompareRow *
         {
-            if (observed_mtp_sidecar_keys.count(key) == 0)
+            const std::string stage_tail =
+                "_MTP0_" + std::string(stage_suffix);
+            const MoESnapshotCompareRow *match = nullptr;
+            for (const auto &row : all_snapshot_rows)
             {
-                missing_sidecar_keys.push_back(key);
+                if (row.comparison != "pytorch_vs_mtp" ||
+                    row.sync_idx != transaction_index ||
+                    !row.present_in_mtp ||
+                    !isProductionMTPDecodeSidecarSnapshotKey(row.key) ||
+                    !std::string_view(row.key).ends_with(stage_tail))
+                {
+                    continue;
+                }
+                if (match)
+                {
+                    ADD_FAILURE()
+                        << "Transaction " << transaction_index
+                        << " exposed more than one active production sidecar "
+                           "for stage "
+                        << stage_suffix << ": " << match->key
+                        << " and " << row.key;
+                    return match;
+                }
+                match = &row;
             }
+            return match;
+        };
+
+        /*
+         * Validate every observed transaction, not just transaction zero.  A
+         * rejected draft changes the next transaction from direct target-token
+         * input to the resident logical-state mailbox; checking only the first
+         * graph left precisely that ownership handoff unproved.  Context names
+         * remain opaque policy labels, but exactly one context must be live and
+         * it must expose the complete production stage surface.
+         */
+        for (int transaction_index = 0;
+             transaction_index < sync_idx;
+             ++transaction_index)
+        {
+            SCOPED_TRACE(
+                "MTP sidecar transaction " +
+                std::to_string(transaction_index));
+
+            std::string active_context;
+            for (const std::string_view suffix : required_sidecar_stage_suffixes)
+            {
+                const MoESnapshotCompareRow *row =
+                    find_active_mtp_sidecar_row(transaction_index, suffix);
+                ASSERT_NE(row, nullptr)
+                    << "Missing active production MTP sidecar stage " << suffix
+                    << "\nobserved MTP keys: "
+                    << joinStringsMoEDiagnostic(std::vector<std::string>(
+                           observed_mtp_sidecar_keys.begin(),
+                           observed_mtp_sidecar_keys.end()))
+                    << "\ndiagnostic CSVs:\n"
+                    << token_csv_path << '\n'
+                    << snapshot_csv_path;
+                EXPECT_TRUE(isComparableMoEDiagnosticRow(*row))
+                    << describeMoEDiagnosticRow(*row);
+
+                const size_t stage_marker = row->key.find("_MTP0_");
+                ASSERT_NE(stage_marker, std::string::npos)
+                    << row->key;
+                const std::string row_context =
+                    row->key.substr(0, stage_marker);
+                if (active_context.empty())
+                {
+                    active_context = row_context;
+                }
+                else
+                {
+                    EXPECT_EQ(row_context, active_context)
+                        << "One transaction mixed snapshots from distinct "
+                           "sidecar graph contexts";
+                }
+            }
+
+            const MoESnapshotCompareRow *embedding_row =
+                find_active_mtp_sidecar_row(transaction_index, "EMBEDDING");
+            ASSERT_NE(embedding_row, nullptr);
+            EXPECT_GE(embedding_row->cosine, 0.99)
+                << "MTP sidecar consumed the wrong condition token: "
+                << describeMoEDiagnosticRow(*embedding_row);
+            EXPECT_LE(embedding_row->rel_l2, 0.05)
+                << describeMoEDiagnosticRow(*embedding_row);
+
+            const MoESnapshotCompareRow *ffn_residual_row =
+                find_active_mtp_sidecar_row(transaction_index, "FFN_RESIDUAL");
+            ASSERT_NE(ffn_residual_row, nullptr);
+            EXPECT_GE(ffn_residual_row->cosine, 0.98)
+                << "MTP sidecar block-output PyTorch reference mismatch: "
+                << describeMoEDiagnosticRow(*ffn_residual_row);
+
+            /*
+             * Schema 2 snapshots the true pre-softmax router projection.  The
+             * complete routing boundary is checked so a semantically stale
+             * fixture, changed top-k set, or materially different weight cannot
+             * hide behind a matching final token.
+             */
+            const MoESnapshotCompareRow *router_logits_row =
+                find_active_mtp_sidecar_row(
+                    transaction_index,
+                    "MOE_ROUTER_OUTPUT");
+            ASSERT_NE(router_logits_row, nullptr);
+            EXPECT_GE(router_logits_row->cosine, 0.99)
+                << "MTP sidecar raw router-logit direction mismatch: "
+                << describeMoEDiagnosticRow(*router_logits_row);
+            EXPECT_LE(router_logits_row->rel_l2, 0.05)
+                << "MTP sidecar raw router-logit magnitude mismatch: "
+                << describeMoEDiagnosticRow(*router_logits_row);
+
+            const MoESnapshotCompareRow *routing_indices_row =
+                find_active_mtp_sidecar_row(
+                    transaction_index,
+                    "MOE_ROUTING_INDICES");
+            ASSERT_NE(routing_indices_row, nullptr);
+            EXPECT_TRUE(routing_indices_row->byte_identical)
+                << "MTP sidecar selected a different top-k expert set/order: "
+                << describeMoEDiagnosticRow(*routing_indices_row);
+
+            const MoESnapshotCompareRow *routing_weights_row =
+                find_active_mtp_sidecar_row(
+                    transaction_index,
+                    "MOE_ROUTING_WEIGHTS");
+            ASSERT_NE(routing_weights_row, nullptr);
+            EXPECT_GE(routing_weights_row->cosine, 0.99)
+                << "MTP sidecar routing-weight direction mismatch: "
+                << describeMoEDiagnosticRow(*routing_weights_row);
+            EXPECT_LE(routing_weights_row->rel_l2, 0.05)
+                << "MTP sidecar routing-weight magnitude mismatch: "
+                << describeMoEDiagnosticRow(*routing_weights_row);
+
+            const MoESnapshotCompareRow *lm_head_row =
+                find_active_mtp_sidecar_row(transaction_index, "LM_HEAD");
+            ASSERT_NE(lm_head_row, nullptr);
+            EXPECT_GE(lm_head_row->cosine, 0.98)
+                << "MTP sidecar PyTorch reference mismatch: "
+                << describeMoEDiagnosticRow(*lm_head_row)
+                << "\ndiagnostic CSVs:\n"
+                << token_csv_path << '\n'
+                << snapshot_csv_path;
         }
-        EXPECT_TRUE(missing_sidecar_keys.empty())
-            << "MTP sidecar diagnostic snapshots are missing required keys: "
-            << joinStringsMoEDiagnostic(missing_sidecar_keys)
-            << "\nobserved MTP keys: "
-            << joinStringsMoEDiagnostic(std::vector<std::string>(
-                   observed_mtp_sidecar_keys.begin(),
-                   observed_mtp_sidecar_keys.end()))
-            << "\ndiagnostic CSVs:\n"
-            << token_csv_path << '\n'
-            << snapshot_csv_path;
     }
 
     inline void runMoEMTPBenchmarkStyleSkipGatherParity(
@@ -11395,7 +12095,8 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
     }
 
-    inline void expectCudaMoEMTPVerifierFusedPrefillPath(int expected_seq_len = 2)
+    inline void expectCudaMoEMTPVerifierFusedPrefillPath(
+        int expected_logical_seq_len = 2)
     {
         const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
         auto tag_equals = [](const PerfStatRecord &record,
@@ -11407,13 +12108,39 @@ namespace llaminar2::test::parity::qwen36
         };
         const int expected_routed_top_k = 8;
         const int expected_routed_experts = 256;
-        const int expected_total_slots = expected_seq_len * expected_routed_top_k;
-        const int expected_tile_m = expected_seq_len <= 4 ? 2 : 4;
-        const std::string seq_len_tag = std::to_string(expected_seq_len);
+        /*
+         * This focused runner provisions one more physical row than its
+         * configured draft count and then captures the canonical power-of-two
+         * bucket.  In particular, logical M=3 executes a physical M=4 graph.
+         * PerfStats describes launch geometry, while the byte comparisons above
+         * consume only logical rows, so derive the former through the production
+         * policy instead of conflating the two cardinalities.
+         */
+        const int expected_physical_seq_len = mtpVerifierPhysicalRowBucket(
+            expected_logical_seq_len,
+            expected_logical_seq_len + 1);
+        ASSERT_GT(expected_physical_seq_len, 0);
+        const int expected_total_slots =
+            expected_physical_seq_len * expected_routed_top_k;
+        const int expected_splitk_tile_rows = std::min(
+            expected_physical_seq_len,
+            MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const int expected_splitk_tile_count =
+            (expected_physical_seq_len + expected_splitk_tile_rows - 1) /
+            expected_splitk_tile_rows;
+        const std::string seq_len_tag =
+            std::to_string(expected_physical_seq_len);
         const std::string total_slots_tag = std::to_string(expected_total_slots);
-        const std::string tile_m_tag = std::to_string(expected_tile_m);
+        const std::string splitk_tile_rows_tag =
+            std::to_string(expected_splitk_tile_rows);
+        const std::string splitk_tile_count_tag =
+            std::to_string(expected_splitk_tile_count);
+        const std::string k_partitions_tag = std::to_string(
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
+        const std::string down_k_partitions_tag = std::to_string(
+            CUDAMoEBatchInvariantPolicy::down_k_partitions);
 
-        if (expected_seq_len == 1)
+        if (expected_logical_seq_len == 1)
         {
             auto has_decode_equivalent_stage = [&](const char *stage) -> bool
             {
@@ -11542,10 +12269,22 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "swiglu_path", "fused") &&
                        tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
                        tag_equals(record, "total_slots", total_slots_tag.c_str()) &&
+                       tag_equals(record, "activation_quant_rows", seq_len_tag.c_str()) &&
                        tag_equals(record, "top_k", "8") &&
                        tag_equals(record, "num_experts", "256") &&
-                       tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
-                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "tile_m", "0") &&
+                       tag_equals(record, "tile_n", "128") &&
+                       tag_equals(record, "policy_source", "generic") &&
+                       tag_equals(record, "gateup_geometry_contract", "ordered_split_k") &&
+                       tag_equals(record, "row_tile_source", "splitk_tile_rows") &&
+                       tag_equals(record, "splitk_tile_rows", splitk_tile_rows_tag.c_str()) &&
+                       tag_equals(record, "splitk_tile_count", splitk_tile_count_tag.c_str()) &&
+                       tag_equals(record, "gateup_k_partitions", k_partitions_tag.c_str()) &&
+                       tag_equals(record, "gateup_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_k_partitions", down_k_partitions_tag.c_str()) &&
+                       tag_equals(record, "down_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_publication", "fused_direct") &&
+                       tag_equals(record, "down_direct_warps", "8") &&
                        /*
                         * Active experts are the unique experts selected across
                         * the verifier rows.  Real router outputs can repeat an
@@ -11561,8 +12300,8 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_NE(match, records.end())
             << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
-            << "routed grouped prefill SwiGLU/down kernels with the "
-            << "verifier-sized tile. This is the accepted production contract "
+            << "routed grouped prefill SwiGLU/down kernels with the fixed-order "
+            << "split-K verifier geometry. This is the accepted production contract "
             << "for the routed branch while shared-expert work is owned by the "
             << "safe composite decode-equivalent verifier stage.\n"
             << "candidate cuda_moe_grouped_prefill_swiglu_path_calls:"
@@ -11760,8 +12499,20 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "seq_len", "1") &&
                        tag_equals(record, "total_slots", "8") &&
                        tag_equals(record, "active_expert_slots", "8") &&
-                       tag_equals(record, "tile_m", "2") &&
-                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "num_experts", "256") &&
+                       tag_equals(record, "tile_m", "0") &&
+                       tag_equals(record, "tile_n", "128") &&
+                       tag_equals(record, "policy_source", "generic") &&
+                       tag_equals(record, "gateup_geometry_contract", "ordered_split_k") &&
+                       tag_equals(record, "row_tile_source", "splitk_tile_rows") &&
+                       tag_equals(record, "splitk_tile_rows", "1") &&
+                       tag_equals(record, "splitk_tile_count", "1") &&
+                       tag_equals(record, "gateup_k_partitions", "16") &&
+                       tag_equals(record, "gateup_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_k_partitions", "16") &&
+                       tag_equals(record, "down_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_publication", "fused_direct") &&
+                       tag_equals(record, "down_direct_warps", "8") &&
                        tag_equals(record, "gateup_route", "kpart_prefill") &&
                        tag_equals(record, "down_route", "ordered_kpart_prefill") &&
                        tag_equals(record, "down_accumulation", "row_ordered_kpart");
@@ -11787,8 +12538,19 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "total_slots", "1") &&
                        tag_equals(record, "active_expert_slots", "1") &&
                        tag_equals(record, "num_experts", "1") &&
-                       tag_equals(record, "tile_m", "2") &&
-                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "tile_m", "0") &&
+                       tag_equals(record, "tile_n", "128") &&
+                       tag_equals(record, "policy_source", "generic") &&
+                       tag_equals(record, "gateup_geometry_contract", "ordered_split_k") &&
+                       tag_equals(record, "row_tile_source", "splitk_tile_rows") &&
+                       tag_equals(record, "splitk_tile_rows", "1") &&
+                       tag_equals(record, "splitk_tile_count", "1") &&
+                       tag_equals(record, "gateup_k_partitions", "16") &&
+                       tag_equals(record, "gateup_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_k_partitions", "16") &&
+                       tag_equals(record, "down_ordered_tile_n", "128") &&
+                       tag_equals(record, "down_publication", "fused_direct") &&
+                       tag_equals(record, "down_direct_warps", "1") &&
                        tag_equals(record, "gateup_route", "kpart_prefill") &&
                        tag_equals(record, "down_route", "ordered_kpart_prefill") &&
                        tag_equals(record, "down_accumulation", "row_ordered_kpart");

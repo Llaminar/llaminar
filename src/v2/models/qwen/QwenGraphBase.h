@@ -834,6 +834,38 @@ namespace llaminar2
             const std::string &k_dependency);
 
         /**
+         * @brief Make a projected K tensor ready for exact KV-cache publication.
+         *
+         * The helper owns the graph-wide K publication policy: it applies the
+         * model's optional per-head K norm and applies K-only RoPE only when the
+         * cache stores post-RoPE keys. With RoPE-on-read, projected normalized K
+         * remains pre-RoPE and no rotary node is emitted.
+         *
+         * @param graph Graph receiving the cache-publication transforms.
+         * @param prefix Stable node-name prefix.
+         * @param buffers Activation buffers containing K and its binding map.
+         * @param layer Layer weights containing the optional K norm.
+         * @param local_n_kv_heads Number of K heads represented by @p buffers.
+         * @param total_tokens Number of physical K rows.
+         * @param position_ids Optional host position row for CPU execution.
+         * @param position_ids_device Optional device-owned GPU position row.
+         * @param device Stage device.
+         * @param projection_dependency Node that produces K.
+         * @return The final node whose completion makes K cache-ready.
+         */
+        std::string addKeyCachePublicationTransforms(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            int local_n_kv_heads,
+            int total_tokens,
+            const int *position_ids,
+            const void *position_ids_device,
+            DeviceId device,
+            const std::string &projection_dependency);
+
+        /**
          * @brief Add the declarative RoPE stage for Q and, when configured, K.
          *
          * The graph-wide @c rope_on_read policy is the sole owner of whether K

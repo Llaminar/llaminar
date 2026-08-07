@@ -68,11 +68,14 @@ scripts/train_native_vnni_dispatch.sh --backend all --install \
   --minimum-passing-domain-percent 0
 ```
 
-The production transaction installs learned dispatch only for serial M=1 and
-grouped verifier rows. Ordinary prefill is heuristic-only on CPU, CUDA, and
-ROCm and must compile and execute without a generated prefill include. The
-explicit `--backend cpu-prefill` transaction remains available for offline
-kernel research and corpus analysis, but `--install` is intentionally rejected.
+The production tree transaction installs learned dispatch only for serial M=1
+and grouped verifier rows. Ordinary dense prefill remains heuristic-only on
+CPU, CUDA, and ROCm and must compile and execute without a generated prefill
+include. Routed CUDA/ROCm MoE prefill has a separate authenticated exact-overlay
+transaction described below; its measured overlays are additive to a total
+generic capture policy. The explicit `--backend cpu-prefill` transaction remains
+available for offline kernel research and corpus analysis, but `--install` is
+intentionally rejected.
 
 Pass hardware/tool/lane controls after `--`. Do not pass `--shapes` or
 `--shape-partition`; add production overlays to the shared inventory. The
@@ -746,6 +749,14 @@ observed route/counters. Unsupported combinations need explicit typed records,
 not missing rows. Do not serialize a combinatorially projected formula corpus;
 retain measured cells and evaluate formulas during fitting.
 
+Before timing any CUDA or ROCm candidate, query the exact compiled template
+specialization's static resources through the backend runtime. A non-zero CUDA
+local-memory allocation or ROCm private/scratch allocation disqualifies that
+specialization before graph capture and timing; register spilling is an
+eligibility failure, not a learner feature. Keep an all-format/role/candidate
+resource-inventory regression, and require isolated `ncu`/`rocprof` evidence to
+confirm zero dynamic spill traffic for every promoted production candidate.
+
 ## Measurement Surfaces
 
 - **Fast M=1 decode/GEMV:** bandwidth-sensitive serial decode. Optimize the
@@ -761,6 +772,49 @@ retain measured cells and evaluate formulas during fitting.
 CUDA and ROCm use M={64,256,1024,2048,4096,8192,16384}. Exact overlays come
 only from these exact cells; generic rules provide total dispatch for every
 unseen positive M and N/K geometry.
+
+An installable GPU prefill row must compare the complete `M*N` output against
+its certified oracle on the exact producer stream. Use
+`GPUTrainerVerification.h`: retain the oracle in device memory, enqueue the
+backend comparison after canonical timing, and materialize only mismatch count
+and first-byte offset. Sampled rows, cosine alone, or a host-side full-output
+download are diagnostic evidence and cannot authorize an overlay. Keep
+`V2_Integration_CUDATrainerFullBufferByteCertificate` and
+`V2_Integration_ROCmTrainerFullBufferByteCertificate` green; they prove signed
+zero and NaN-payload sensitivity, full-span mismatch detection, and null-stream
+intolerance.
+
+For routed production MoE prefill, use the same backend-neutral resumable
+transaction for CUDA and ROCm. One worker owns each physical device; every cell
+measures the complete arithmetic-eligible candidate inventory and is promoted
+atomically only after aggregate/raw-timing authentication. `combine` and the
+overlay generator require the entire planned matrix, so an interrupted or
+partial corpus cannot be installed:
+
+```bash
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_moe_prefill_sweep run \
+    --backend <cuda|rocm> --output-dir <work-dir> \
+    --binary <v2_perf_moe_verifier_prefill> --devices <ordinals>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.production_moe_prefill_sweep combine \
+    --backend <cuda|rocm> --output-dir <work-dir>
+
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.moe_production_overlay \
+    --backend <cuda|rocm> --work-dir <work-dir> \
+    --output <backend-generated-include> --summary-csv <summary.csv>
+```
+
+The generated key contains only execution codebooks, hidden/expert geometry,
+expert count, top-k, and exact M. Source GGUF labels remain evidence metadata.
+CUDA overlays may change only arithmetic-neutral gate/up block width; fixed
+partition counts and reduction trees are correctness policy, not candidates.
+ROCm overlays select only the explicitly registered byte-equivalent geometry
+axes. After installation, prove exact precedence with PerfStats and byte-compare
+the real production path against serial rows; separately prove unseen positive
+M reaches the generic policy.
 
 For canonical multi-GPU timing, CUDA assigns disjoint format shards. ROCm
 assigns disjoint shape shards and runs the complete format matrix on each

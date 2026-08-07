@@ -2,6 +2,7 @@
 
 #include "../local_execution/device/WorkspaceDescriptor.h"
 #include "../../tensors/TensorKernels.h"
+#include "../../kernels/common/NativeVNNIGroupedDecodePolicy.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -75,6 +76,8 @@ namespace llaminar2
         constexpr const char *ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE = "rocm_moe_runtime_prefill_gate_desc_table";
         constexpr const char *ROCM_RUNTIME_PREFILL_UP_DESC_TABLE = "rocm_moe_runtime_prefill_up_desc_table";
         constexpr const char *ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE = "rocm_moe_runtime_prefill_down_desc_table";
+        constexpr const char *ROCM_PREFILL_WORK_DIRECTORY =
+            "rocm_moe_prefill_work_directory";
 
         /**
          * @brief Maximum number of MoE transformer layers resident on one device.
@@ -130,6 +133,34 @@ namespace llaminar2
         inline int ceilDiv(int value, int divisor)
         {
             return (value + divisor - 1) / divisor;
+        }
+
+        /**
+         * @brief Return persistent words for the adaptive ROCm prefill planner.
+         *
+         * The directory owns two device-published count words followed by
+         * independent conservative TM12 and TM16 spans. Each populated expert
+         * contributes at most one partially filled tile, which bounds a span by
+         * `active_experts + ceil(total_slots / tile_rows)`. Clamping each span
+         * to total route slots keeps the contract valid for very small models
+         * without reserving a dense expert-by-row rectangle.
+         */
+        inline std::size_t rocmAdaptivePrefillDirectoryWords(
+            std::size_t total_slots,
+            std::size_t num_experts)
+        {
+            total_slots = std::max<std::size_t>(1, total_slots);
+            num_experts = std::max<std::size_t>(1, num_experts);
+            const std::size_t active_experts =
+                std::min(total_slots, num_experts);
+            const auto capacity = [=](std::size_t tile_rows)
+            {
+                return std::min(
+                    total_slots,
+                    active_experts +
+                        (total_slots + tile_rows - 1) / tile_rows);
+            };
+            return 2u + capacity(12u) + capacity(16u);
         }
 
         inline void add(WorkspaceRequirements &reqs, const char *name, std::size_t bytes)
@@ -235,8 +266,10 @@ namespace llaminar2
             add(reqs, PREFILL_GATE, total_slots * static_cast<std::size_t>(max_dim) * sizeof(float));
             add(reqs, PREFILL_UP, total_slots * static_cast<std::size_t>(intermediate) * sizeof(float));
 
-            constexpr int kMaxGateUpPartitions = 32;
-            constexpr int kMaxDownPartitions = 16;
+            constexpr int kMaxGateUpPartitions =
+                NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+            constexpr int kMaxDownPartitions =
+                NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
             const std::size_t verifier_splitk_slots =
                 static_cast<std::size_t>(std::min(max_seq_len, kVerifierSplitKTileRows)) *
@@ -360,12 +393,20 @@ namespace llaminar2
             WorkspaceRequirements reqs = rocmRouting(max_seq_len, d_model, num_experts);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
             max_seq_len = std::max(1, max_seq_len);
+            num_experts = std::max(1, num_experts);
             top_k = std::max(1, top_k);
 
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
+            const std::size_t prefill_slots =
+                static_cast<std::size_t>(max_seq_len) *
+                static_cast<std::size_t>(top_k);
 
             add(reqs, ROCM_SHARED_GATE, static_cast<std::size_t>(max_seq_len) * sizeof(float));
             add(reqs, ROCM_GROUP_MAX_TOKENS, sizeof(int));
+            add(reqs, ROCM_PREFILL_WORK_DIRECTORY,
+                rocmAdaptivePrefillDirectoryWords(
+                    prefill_slots,
+                    static_cast<std::size_t>(num_experts)) * sizeof(uint32_t));
             /*
              * Grouped decode pointer arrays are captured by value as device
              * addresses. A full decode graph contains many MoE stages, so ROCm

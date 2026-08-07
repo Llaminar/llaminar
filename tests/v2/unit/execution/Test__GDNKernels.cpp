@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -60,6 +61,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
+#include "utils/OpenMPUtils.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../utils/VerifierRowTestInventory.h"
 #include "../../utils/TestTensorFactory.h"
@@ -108,6 +110,95 @@ namespace
 
     private:
         hipStream_t stream_ = nullptr;
+    };
+
+    /**
+     * @brief Own persistent device state for one direct ROCm stateful-kernel test.
+     *
+     * Production GDN and short-convolution state is allocated by the hybrid
+     * cache before graph construction and bound to the kernel exactly once.
+     * Direct integration tests must reproduce that ownership boundary rather
+     * than relying on the retired kernel-owned allocation behavior.  The
+     * request-zero state aliases the primary bank, matching the single-geometry
+     * production binding, and initialization is ordered on the same explicit
+     * stream that will launch the kernel.
+     */
+    class ScopedROCmKernelState
+    {
+    public:
+        /**
+         * @brief Allocate, initialize, and bind one immutable state address.
+         *
+         * @tparam Kernel Stateful ROCm kernel exposing bindDeviceState().
+         * @param kernel Kernel that receives the non-owning binding.
+         * @param state_floats Number of FP32 values in its scalar live state.
+         * @param stream Exact producer/consumer stream used by the test.
+         */
+        template <typename Kernel>
+        ScopedROCmKernelState(
+            Kernel &kernel,
+            size_t state_floats,
+            hipStream_t stream)
+        {
+            if (state_floats == 0 ||
+                state_floats > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                !stream)
+            {
+                throw std::invalid_argument(
+                    "ScopedROCmKernelState requires a positive INT-sized state and non-null stream");
+            }
+
+            const size_t bytes = state_floats * sizeof(float);
+            hipError_t status = hipMalloc(
+                reinterpret_cast<void **>(&state_), bytes);
+            if (status != hipSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("hipMalloc(state) failed: ") +
+                    hipGetErrorString(status));
+            }
+
+            status = hipMemsetAsync(state_, 0, bytes, stream);
+            if (status != hipSuccess)
+            {
+                (void)hipFree(state_);
+                state_ = nullptr;
+                throw std::runtime_error(
+                    std::string("hipMemsetAsync(state) failed: ") +
+                    hipGetErrorString(status));
+            }
+
+            const int state_count = static_cast<int>(state_floats);
+            const GDNDeviceStateBinding binding{
+                .primary_state = state_,
+                .primary_state_floats = state_count,
+                .secondary_state = nullptr,
+                .secondary_state_floats = 0,
+                .request_state_bank = state_,
+                .request_state_bank_floats = state_floats,
+                .request_capacity = 1,
+            };
+            if (!kernel.bindDeviceState(binding))
+            {
+                (void)hipFree(state_);
+                state_ = nullptr;
+                throw std::runtime_error(
+                    "ROCm stateful kernel rejected explicit test-owned state");
+            }
+        }
+
+        ~ScopedROCmKernelState()
+        {
+            if (state_)
+                (void)hipFree(state_);
+        }
+
+        ScopedROCmKernelState(const ScopedROCmKernelState &) = delete;
+        ScopedROCmKernelState &operator=(
+            const ScopedROCmKernelState &) = delete;
+
+    private:
+        float *state_ = nullptr; ///< Persistent request-zero/primary state bank.
     };
 #endif
 
@@ -639,37 +730,6 @@ TEST(GDNROCmConfig, MoEReuseRouterQ8HiddenDefaultsOnAndParsesEnv)
 
     flag.set("1");
     EXPECT_TRUE(debugEnv().rocm.moe_reuse_router_q8_hidden);
-}
-
-TEST(GDNROCmConfig, MoEGateUpKPartsDefaultsToFourAndParsesSupportedValues)
-{
-    ScopedEnvVar kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS");
-
-    kparts.clear();
-    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 4);
-
-    kparts.set("8");
-    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 8);
-
-    kparts.set("16");
-    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 16);
-
-    kparts.set("32");
-    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 4);
-}
-
-TEST(GDNROCmConfig, MoEGateUpSwiGLUQuantFusedDefaultsOnAndParsesEnv)
-{
-    ScopedEnvVar flag("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED");
-
-    flag.clear();
-    EXPECT_TRUE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
-
-    flag.set("0");
-    EXPECT_FALSE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
-
-    flag.set("1");
-    EXPECT_TRUE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
 }
 
 TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
@@ -1946,6 +2006,137 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
             serial_state.size(),
             "CPU grouped GDN published state rows=" + std::to_string(rows));
     }
+}
+
+/**
+ * @brief Proves CPU long prefill is byte-identical to ordered serial decode.
+ *
+ * The compact geometry makes it cheap to sweep capture boundaries through a
+ * live 512-row bucket, while the Qwen 3.6 geometry exercises the production
+ * 32-head, 128-wide recurrence. Both query-normalization modes are covered.
+ * This regression specifically forbids approximate prefill-only gate math:
+ * preprocessing may be parallelized, but every row must execute the same
+ * decay, sigmoid, state update, and projection arithmetic as `recurrent_step`.
+ */
+TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeByteExact)
+{
+    llaminar::v2::ThreadCountGuard worker_count(4);
+
+    auto verify_geometry = [](
+                               int n_heads,
+                               int d_k,
+                               int d_v,
+                               std::initializer_list<int> row_counts)
+    {
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        const int state_floats = n_heads * d_k * d_v;
+
+        for (const int rows : row_counts)
+        {
+            std::vector<float> q(static_cast<size_t>(rows) * qk_stride);
+            std::vector<float> k(q.size());
+            std::vector<float> v(static_cast<size_t>(rows) * v_stride);
+            std::vector<float> alpha(static_cast<size_t>(rows) * n_heads);
+            std::vector<float> beta(alpha.size());
+            std::vector<float> a_log(static_cast<size_t>(n_heads));
+            std::vector<float> dt_bias(static_cast<size_t>(n_heads));
+            std::vector<float> initial_state(
+                static_cast<size_t>(state_floats));
+
+            for (size_t i = 0; i < q.size(); ++i)
+            {
+                q[i] = 0.0021f * static_cast<float>(
+                    static_cast<int>(i % 29) - 14);
+                k[i] = -0.0017f * static_cast<float>(
+                    static_cast<int>(i % 31) - 15);
+            }
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                v[i] = 0.0029f * static_cast<float>(
+                    static_cast<int>(i % 23) - 11);
+            }
+            for (size_t i = 0; i < alpha.size(); ++i)
+            {
+                alpha[i] = -0.17f + 0.0031f * static_cast<float>(i % 37);
+                beta[i] = 0.11f - 0.0023f * static_cast<float>(i % 41);
+            }
+            for (int h = 0; h < n_heads; ++h)
+            {
+                a_log[static_cast<size_t>(h)] =
+                    -0.35f - 0.002f * static_cast<float>(h);
+                dt_bias[static_cast<size_t>(h)] =
+                    0.01f * static_cast<float>((h % 7) - 3);
+            }
+            for (int i = 0; i < state_floats; ++i)
+            {
+                initial_state[static_cast<size_t>(i)] =
+                    0.0001f * static_cast<float>((i % 43) - 21);
+            }
+
+            for (const bool use_qk_l2norm : {false, true})
+            {
+                CPUGatedDeltaNet prefill_kernel;
+                CPUGatedDeltaNet serial_kernel;
+                std::vector<float> prefill_state = initial_state;
+                std::vector<float> serial_state = initial_state;
+                std::vector<float> prefill_output(
+                    static_cast<size_t>(rows) * v_stride, 0.0f);
+                std::vector<float> serial_output(prefill_output.size(), 0.0f);
+
+                ASSERT_TRUE(prefill_kernel.chunk_forward(
+                    q.data(), k.data(), v.data(),
+                    alpha.data(), beta.data(), a_log.data(), dt_bias.data(),
+                    prefill_output.data(), prefill_state.data(),
+                    rows, n_heads, d_k, d_v,
+                    /*chunk_size=*/64, use_qk_l2norm));
+
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(serial_kernel.recurrent_step(
+                        q.data() + static_cast<size_t>(row) * qk_stride,
+                        k.data() + static_cast<size_t>(row) * qk_stride,
+                        v.data() + static_cast<size_t>(row) * v_stride,
+                        alpha.data() + static_cast<size_t>(row) * n_heads,
+                        beta.data() + static_cast<size_t>(row) * n_heads,
+                        a_log.data(),
+                        dt_bias.data(),
+                        serial_output.data() +
+                            static_cast<size_t>(row) * v_stride,
+                        serial_state.data(),
+                        n_heads, d_k, d_v, use_qk_l2norm));
+                }
+
+                const std::string context =
+                    "CPU GDN heads=" + std::to_string(n_heads) +
+                    " d_k=" + std::to_string(d_k) +
+                    " d_v=" + std::to_string(d_v) +
+                    " M=" + std::to_string(rows) +
+                    " l2=" + (use_qk_l2norm ? "true" : "false");
+                expectByteExactFP32(
+                    prefill_output.data(),
+                    serial_output.data(),
+                    serial_output.size(),
+                    context + " output");
+                expectByteExactFP32(
+                    prefill_state.data(),
+                    serial_state.data(),
+                    serial_state.size(),
+                    context + " terminal state");
+            }
+        }
+    };
+
+    verify_geometry(
+        /*n_heads=*/8,
+        /*d_k=*/64,
+        /*d_v=*/64,
+        {1, 2, 4, 8, 9, 16, 31, 32, 63, 64, 127, 128, 425, 512});
+    verify_geometry(
+        /*n_heads=*/32,
+        /*d_k=*/128,
+        /*d_v=*/128,
+        {1, 2, 4, 8, 9, 16});
 }
 
 TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
@@ -3828,7 +4019,7 @@ TEST(Test__GDNKernels, ROCmMergedQKVDeinterleaveUsesModularQKTiling)
     ASSERT_EQ(d_k_out, d_scratch + q_dst_dim);
     ASSERT_EQ(d_v_out, d_scratch + q_dst_dim + k_dst_dim);
 
-    TransferEngine::publishGraphOwnedDeviceWrite(scratch, device);
+    TransferEngine::publishDeviceWrite(scratch, device, stream);
     ASSERT_TRUE(scratch->ensureOnHost(stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -3936,6 +4127,7 @@ TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
 
     ROCmGatedDeltaNet kernel(0);
     kernel.setGPUStream(stream);
+    ScopedROCmKernelState kernel_state(kernel, state_elems, stream);
     for (int t = 0; t < seq_len; ++t)
     {
         ASSERT_TRUE(kernel.recurrent_step(
@@ -3952,7 +4144,7 @@ TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
             /*use_qk_l2norm=*/true));
     }
 
-    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
+    TransferEngine::publishDeviceWrite(output, device, stream);
     ASSERT_TRUE(output->ensureOnHost(stream));
     std::vector<float> device_state(state_elems, 0.0f);
     ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
@@ -4043,6 +4235,7 @@ TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
 
     ROCmGatedDeltaNet kernel(0);
     kernel.setGPUStream(stream);
+    ScopedROCmKernelState kernel_state(kernel, state_elems, stream);
     ASSERT_TRUE(kernel.chunk_forward(
         d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
         d_output, nullptr,
@@ -4064,7 +4257,7 @@ TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
             /*use_qk_l2norm=*/true));
     }
 
-    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
+    TransferEngine::publishDeviceWrite(output, device, stream);
     ASSERT_TRUE(output->ensureOnHost(stream));
     std::vector<float> device_state(state_elems, 0.0f);
     ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
@@ -4096,6 +4289,8 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
     const size_t v_elems = static_cast<size_t>(total_len) * n_heads * d_v;
     const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
     const size_t output_elems = static_cast<size_t>(total_len) * n_heads * d_v;
+    const size_t state_elems =
+        static_cast<size_t>(n_heads) * d_k * d_v;
 
     // Use production head dimensions with deterministic small-magnitude inputs
     // so the ROCm prefill recurrence can be compared against decode exactly.
@@ -4154,6 +4349,8 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
     // state that production decode consumes after prefill.
     ROCmGatedDeltaNet prefill_kernel(0);
     prefill_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState prefill_state(
+        prefill_kernel, state_elems, stream.get());
     ASSERT_TRUE(prefill_kernel.chunk_forward(
         d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
         d_prefill, nullptr, prefill_len, n_heads, d_k, d_v,
@@ -4178,6 +4375,8 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
     // token if prefill state writeback has the same semantics as recurrent_step().
     ROCmGatedDeltaNet decode_kernel(0);
     decode_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState decode_state(
+        decode_kernel, state_elems, stream.get());
     for (int t = 0; t < total_len; ++t)
     {
         ASSERT_TRUE(decode_kernel.recurrent_step(
@@ -4194,8 +4393,8 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
             /*use_qk_l2norm=*/true));
     }
 
-    TransferEngine::publishGraphOwnedDeviceWrite(prefill_out, device);
-    TransferEngine::publishGraphOwnedDeviceWrite(decode_out, device);
+    TransferEngine::publishDeviceWrite(prefill_out, device, stream.get());
+    TransferEngine::publishDeviceWrite(decode_out, device, stream.get());
     ASSERT_TRUE(prefill_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(decode_out->ensureOnHost(stream.get()));
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4243,6 +4442,8 @@ TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQw
     const size_t qk_elems = static_cast<size_t>(total_len) * qk_stride;
     const size_t v_elems = static_cast<size_t>(total_len) * v_stride;
     const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+    const size_t state_elems =
+        static_cast<size_t>(n_heads) * d_k * d_v;
 
     auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.03f, 1301);
     auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.03f, 1302);
@@ -4300,6 +4501,8 @@ TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQw
 
     ROCmGatedDeltaNet chunk_kernel(0);
     chunk_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState chunk_state(
+        chunk_kernel, state_elems, stream.get());
     ASSERT_TRUE(chunk_kernel.chunk_forward(
         d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
         d_prompt, nullptr, prompt_len, n_heads, d_k, d_v,
@@ -4327,6 +4530,8 @@ TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQw
 
     ROCmGatedDeltaNet ref_kernel(0);
     ref_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState ref_state(
+        ref_kernel, state_elems, stream.get());
     for (int t = 0; t < total_len; ++t)
     {
         ASSERT_TRUE(ref_kernel.recurrent_step(
@@ -4342,9 +4547,9 @@ TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQw
             /*use_qk_l2norm=*/true));
     }
 
-    TransferEngine::publishGraphOwnedDeviceWrite(suffix_out, device);
-    TransferEngine::publishGraphOwnedDeviceWrite(next_out, device);
-    TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
+    TransferEngine::publishDeviceWrite(suffix_out, device, stream.get());
+    TransferEngine::publishDeviceWrite(next_out, device, stream.get());
+    TransferEngine::publishDeviceWrite(ref_out, device, stream.get());
     ASSERT_TRUE(suffix_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(next_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
@@ -4402,6 +4607,8 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
     const size_t v_elems = static_cast<size_t>(total_len) * v_stride;
     const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
     const size_t output_elems = static_cast<size_t>(total_len) * v_stride;
+    const size_t state_elems =
+        static_cast<size_t>(n_heads) * d_k * d_v;
 
     auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2101);
     auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2102);
@@ -4450,6 +4657,8 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
 
         ROCmGatedDeltaNet padded_kernel(0);
         padded_kernel.setGPUStream(stream.get());
+        ScopedROCmKernelState padded_state(
+            padded_kernel, state_elems, stream.get());
         ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
             d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
             d_padded, nullptr, bucket_len, n_heads, d_k, d_v,
@@ -4470,6 +4679,8 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
 
         ROCmGatedDeltaNet ref_kernel(0);
         ref_kernel.setGPUStream(stream.get());
+        ScopedROCmKernelState ref_state(
+            ref_kernel, state_elems, stream.get());
         ASSERT_TRUE(ref_kernel.chunk_forward(
             d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
             d_ref, nullptr, real_len, n_heads, d_k, d_v,
@@ -4487,8 +4698,8 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
             n_heads, d_k, d_v,
             /*use_qk_l2norm=*/true));
 
-        TransferEngine::publishGraphOwnedDeviceWrite(padded_out, device);
-        TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
+        TransferEngine::publishDeviceWrite(padded_out, device, stream.get());
+        TransferEngine::publishDeviceWrite(ref_out, device, stream.get());
         ASSERT_TRUE(padded_out->ensureOnHost(stream.get()));
         ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
         ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4529,6 +4740,8 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
     const int bucket_len = 17;
     const int decode_row = bucket_len;
     const int total_len = bucket_len + 1;
+    const size_t state_elems =
+        static_cast<size_t>(channels) * (kernel_size - 1);
     auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.04f, 2201);
     auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.03f, 2202);
     auto bias = makeFP32Random({static_cast<size_t>(channels)}, 0.0f, 0.01f, 2203);
@@ -4556,6 +4769,8 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
 
         ROCmShortConvolution padded_kernel(0);
         padded_kernel.setGPUStream(stream.get());
+        ScopedROCmKernelState padded_state(
+            padded_kernel, state_elems, stream.get());
         ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
             d_input, d_weight, d_bias,
             d_padded, nullptr,
@@ -4573,6 +4788,8 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
 
         ROCmShortConvolution ref_kernel(0);
         ref_kernel.setGPUStream(stream.get());
+        ScopedROCmKernelState ref_state(
+            ref_kernel, state_elems, stream.get());
         ASSERT_TRUE(ref_kernel.forward(
             d_input, d_weight, d_bias,
             d_ref, nullptr,
@@ -4587,8 +4804,8 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
             1, channels, kernel_size,
             /*apply_silu=*/true));
 
-        TransferEngine::publishGraphOwnedDeviceWrite(padded_out, device);
-        TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
+        TransferEngine::publishDeviceWrite(padded_out, device, stream.get());
+        TransferEngine::publishDeviceWrite(ref_out, device, stream.get());
         ASSERT_TRUE(padded_out->ensureOnHost(stream.get()));
         ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
         ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4622,6 +4839,8 @@ TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentia
     const int suffix_len = 2;
     const int next_len = 1;
     const int total_len = prompt_len + suffix_len + next_len;
+    const size_t state_elems =
+        static_cast<size_t>(channels) * (kernel_size - 1);
 
     auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.08f, 2401);
     auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.05f, 2402);
@@ -4656,6 +4875,8 @@ TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentia
 
     ROCmShortConvolution chunk_kernel(0);
     chunk_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState chunk_state(
+        chunk_kernel, state_elems, stream.get());
     ASSERT_TRUE(chunk_kernel.forward(
         d_input, d_weight, d_bias,
         d_prompt, nullptr,
@@ -4677,6 +4898,8 @@ TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentia
 
     ROCmShortConvolution ref_kernel(0);
     ref_kernel.setGPUStream(stream.get());
+    ScopedROCmKernelState ref_state(
+        ref_kernel, state_elems, stream.get());
     for (int t = 0; t < total_len; ++t)
     {
         ASSERT_TRUE(ref_kernel.forward(
@@ -4688,9 +4911,9 @@ TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentia
             /*apply_silu=*/true));
     }
 
-    TransferEngine::publishGraphOwnedDeviceWrite(suffix_out, device);
-    TransferEngine::publishGraphOwnedDeviceWrite(next_out, device);
-    TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
+    TransferEngine::publishDeviceWrite(suffix_out, device, stream.get());
+    TransferEngine::publishDeviceWrite(next_out, device, stream.get());
+    TransferEngine::publishDeviceWrite(ref_out, device, stream.get());
     ASSERT_TRUE(suffix_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(next_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
@@ -4796,12 +5019,10 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
         ASSERT_TRUE(bundles[0]->kernel->multiply_fused_tensor(
             input.get(), projections, M, K, nullptr, &workspace))
             << fmt.name << ": fused GDN projection failed";
-        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
-
-        TransferEngine::publishGraphOwnedDeviceWrite(out_qkv, device);
-        TransferEngine::publishGraphOwnedDeviceWrite(out_z, device);
-        TransferEngine::publishGraphOwnedDeviceWrite(out_a, device);
-        TransferEngine::publishGraphOwnedDeviceWrite(out_b, device);
+        TransferEngine::publishDeviceWrite(out_qkv, device, stream.get());
+        TransferEngine::publishDeviceWrite(out_z, device, stream.get());
+        TransferEngine::publishDeviceWrite(out_a, device, stream.get());
+        TransferEngine::publishDeviceWrite(out_b, device, stream.get());
 
         const float *input_host = input->data();
         std::vector<float> expected;

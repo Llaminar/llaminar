@@ -2250,6 +2250,51 @@ set_tests_properties(V2_Unit_NativeVNNIQwenReleaseGeometry PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_NativeVNNIHFGGUFMoeInventory
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_hf_gguf_moe_inventory.py
+)
+set_tests_properties(V2_Unit_NativeVNNIHFGGUFMoeInventory PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIQwenMoEPrefillPatterns
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_qwen_moe_prefill_patterns.py
+)
+set_tests_properties(V2_Unit_NativeVNNIQwenMoEPrefillPatterns PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Matrix;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIProductionMoEPrefillSweep
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_moe_prefill_sweep.py
+)
+set_tests_properties(V2_Unit_NativeVNNIProductionMoEPrefillSweep PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Resume;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIProductionDensePrefillSweep
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_dense_prefill_sweep.py
+)
+set_tests_properties(V2_Unit_NativeVNNIProductionDensePrefillSweep PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dense;Prefill;AllFormat;Trainer;Resume;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIGPUPrefillTrainerPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_gpu_prefill_trainer_policy.py
+)
+set_tests_properties(V2_Unit_NativeVNNIGPUPrefillTrainerPolicy PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Prefill;Trainer;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_ROCmMoEGroupedPrefillTrainer
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_moe_grouped_prefill_trainer.py
@@ -2541,17 +2586,6 @@ add_test(NAME V2_Unit_MoELLEPTraceCorpusEvaluatorScript
 )
 set_tests_properties(V2_Unit_MoELLEPTraceCorpusEvaluatorScript PROPERTIES
     LABELS "V2;Unit;MoE;Benchmark;Policy;LLEP;Regression"
-    TIMEOUT 30
-)
-
-add_test(NAME V2_Unit_CUDAPrefillDispatchGeneratorAliases
-    COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_prefill_dispatch_generator.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_prefill_dispatch_alias_smoke.csv
-)
-set_tests_properties(V2_Unit_CUDAPrefillDispatchGeneratorAliases PROPERTIES
-    LABELS "V2;Unit;CUDA;GEMM;Prefill;NativeVNNI;Codebook;Dispatch;Regression"
     TIMEOUT 30
 )
 
@@ -5533,19 +5567,48 @@ add_v2_test(V2_Perf_PrefixCacheMTP
 # Times CUDA/ROCm verifier rows plus ROCm production M=8/32/256 routing and
 # routed-expert publication. Native-bit parity and graph-vs-serial economy are
 # mandatory before the harness reports a successful CSV row.
+set(LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
+set(LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen_moe_gguf_codebook_patterns_v1.json")
 add_executable(v2_perf_moe_verifier_prefill
     performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__CUDAMoERouterSoftmaxTopK.cpp
     performance/kernels/moe/Perf__ROCmMoERouterSoftmaxTopK.cpp
 )
+if(HAVE_ROCM)
+    set_source_files_properties(
+        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    target_sources(v2_perf_moe_verifier_prefill PRIVATE
+        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+    )
+endif()
+if(HAVE_CUDA)
+    target_sources(v2_perf_moe_verifier_prefill PRIVATE
+        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+    )
+endif()
 target_link_libraries(v2_perf_moe_verifier_prefill
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
+target_include_directories(v2_perf_moe_verifier_prefill PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+)
+target_compile_definitions(v2_perf_moe_verifier_prefill PRIVATE
+    LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST}"
+    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"
+)
 if(HAVE_CUDA)
     target_link_libraries(v2_perf_moe_verifier_prefill CUDA::cudart)
+endif()
+if(HAVE_ROCM)
+    target_link_libraries(v2_perf_moe_verifier_prefill
+        ${ROCM_PATH}/lib/librocprofiler-sdk-roctx.so)
 endif()
 add_v2_test(V2_Perf_MoEVerifierPrefill
     COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
@@ -5556,6 +5619,59 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
     # parallel without running two GPU timing tests on the same accelerator.
     RESOURCE_LOCK RealModel_Perf
 )
+
+# The GPU tuning corpus may promote a candidate only after comparing every
+# output bit on the producer stream. Keep that small certificate primitive in
+# focused backend integration binaries so sampled-row regressions, IEEE-value
+# normalization, and accidental default-stream use fail independently of a
+# multi-hour corpus run.
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_trainer_verification
+        integration/native_vnni_dispatch/Test__CUDATrainerVerification.cpp
+        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+    )
+    target_link_libraries(v2_integration_cuda_trainer_verification PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    add_v2_test(V2_Integration_CUDATrainerFullBufferByteCertificate
+        COMMAND $<TARGET_FILE:v2_integration_cuda_trainer_verification>
+        LABELS "V2;Integration;CUDA;NativeVNNI;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
+        MPI_PROCS 1
+    )
+    if(TEST V2_Integration_CUDATrainerFullBufferByteCertificate)
+        set_tests_properties(
+            V2_Integration_CUDATrainerFullBufferByteCertificate PROPERTIES
+            RESOURCE_LOCK cuda_gpu_0
+            TIMEOUT 30
+        )
+    endif()
+endif()
+
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_trainer_verification
+        integration/native_vnni_dispatch/Test__ROCmTrainerVerification.cpp
+        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+    )
+    target_link_libraries(v2_integration_rocm_trainer_verification PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        hip::host
+    )
+    add_v2_test(V2_Integration_ROCmTrainerFullBufferByteCertificate
+        COMMAND $<TARGET_FILE:v2_integration_rocm_trainer_verification>
+        LABELS "V2;Integration;ROCm;NativeVNNI;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
+        MPI_PROCS 1
+    )
+    if(TEST V2_Integration_ROCmTrainerFullBufferByteCertificate)
+        set_tests_properties(
+            V2_Integration_ROCmTrainerFullBufferByteCertificate PROPERTIES
+            RESOURCE_LOCK rocm_gpu_0
+            TIMEOUT 30
+        )
+    endif()
+endif()
 
 # The Qwen 3.6 routed-plus-shared verifier table has 257 descriptors. Keep its
 # capacity proof in the canonical grouped-verifier namespace so CUDA/ROCm table
@@ -5711,7 +5827,7 @@ add_v2_test(V2_Integration_CUDAGemmParity
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
+            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.NativeVNNILMHeadM16_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;FP32;FP16;BF16;Regression"
     MPI_PROCS 1
@@ -5741,11 +5857,11 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RealQwen36MoEGDNQKV
 # Test: CUDA GEMM Non-Determinism (self-consistency across repeated calls)
 # Exercises multiply_fused_tensor() N times with same input and checks output stability.
 # Reproduces split-K atomicAdd non-determinism seen in PP parity tests.
-add_executable(v2_integration_cuda_gemm_nondet integration/kernels/cuda/Test__CUDAGemmNonDeterminism.cpp)
-target_link_libraries(v2_integration_cuda_gemm_nondet llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Integration_CUDAGemmNonDeterminism
-    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_nondet>
-    LABELS "V2;Integration;CUDA;GEMM;NonDeterminism;Quantized;SplitK"
+add_executable(v2_integration_cuda_gemm_batch_invariance integration/kernels/cuda/Test__CUDAGemmBatchInvariance.cpp)
+target_link_libraries(v2_integration_cuda_gemm_batch_invariance llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAGemmBatchInvariance
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+    LABELS "V2;Integration;CUDA;GEMM;BatchInvariance;ByteExact;Quantized;CanonicalKpart;Concurrency"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
@@ -5770,8 +5886,8 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_Qwen36AsymmetricTileOverlay
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristicQwen36
-    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_nondet>
-            --gtest_filter=Test__CUDAGemmNonDeterminism.NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;NativeVNNI;Qwen36;PerfStats;Regression"
     MPI_PROCS 1
@@ -5783,6 +5899,13 @@ target_link_libraries(v2_integration_cuda_moe_kernel llaminar2_core GTest::gtest
 add_v2_test(V2_Integration_CUDAMoEKernel
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDA_MoERowGridMTotality
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoERowMajorGrid.YZDecompositionIsTotalAtProductionPrefillBoundaries
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;Prefill;LongContext;MTotality;LaunchGeometry;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_CUDA_MoEActiveExpertCompaction
@@ -5808,7 +5931,7 @@ if(TEST V2_Integration_CUDA_MoETransferStateMachine)
 endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
+            --gtest_filter=Test__CUDAMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__CUDAMoEPrefillPolicy.UnseenMIsTotalThroughTheGenericCapturePolicy:Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ3SDown_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
     MPI_PROCS 1
@@ -6036,6 +6159,13 @@ add_v2_test(V2_Integration_CUDAGDNPaddedRealLength
     LABELS "V2;Integration;CUDA;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GDNPrefillDecodeEquivalence_CUDA
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.RecurrenceLongPrefillQwen36MoEChunkMTotalityMatchesSerialDecodeByteExact:Test__CUDAGDNPaddedRealLength.RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;MTotality;FP32;Regression"
+    MPI_PROCS 1
+)
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
             --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedVerifierAndDecodeRecurrencePublicationRuntimeM
@@ -6129,8 +6259,6 @@ add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
 # must never grow private model/shape lists.
 set(LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST
     "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json")
-set(LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG
-    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
 
 add_executable(v2_perf_cuda_native_vnni_decode_trainer
     performance/kernels/cuda/gemm/Perf__CUDANativeVNNIDecodeTrainer.cpp)
@@ -6167,6 +6295,11 @@ if(HAVE_CUDA)
 endif()
 
 add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf__CUDANativeVNNIGemm.cpp)
+if(HAVE_CUDA)
+    target_sources(v2_perf_cuda_native_vnni_gemm PRIVATE
+        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+    )
+endif()
 target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_perf_cuda_native_vnni_gemm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
@@ -10362,6 +10495,13 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillBucketMInvariantAllFormats
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
+    MPI_PROCS 1
+)
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode
@@ -11570,14 +11710,13 @@ if(HAVE_ROCM)
     # Outputs codebook-tagged candidate rows and best variant per shape for dispatch heuristic tuning.
     add_executable(v2_perf_native_vnni_sweep
         performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp
-        performance/kernels/rocm/GpuVerification.hip
+        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
     )
     target_link_libraries(v2_perf_native_vnni_sweep
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
-        roc::hipblas
     )
     target_include_directories(v2_perf_native_vnni_sweep PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
@@ -11959,6 +12098,13 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmGDNPaddedRealLength
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
         LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GDNPrefillDecodeEquivalence_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.RecurrenceLongPrefillQwen36MoEStaticChunkMTotalityMatchesSerialDecodeByteExact:Test__ROCmGDNPaddedRealLength.RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;MTotality;FP32;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRecurrence
@@ -13466,6 +13612,14 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;Execution;GraphCapture;PrefillGraphCache;Buckets;ROCm"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_ROCm
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
+                --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;Prefill;GraphCapture;PrefillGraphCache;LongContext;256K;MTotality;KVCache;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRequestBatch
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
                 --gtest_filter=Test__ROCmGDNPaddedRealLength.RequestBatchedUnequalLengthsPreserveByteExactContinuation
@@ -13500,11 +13654,21 @@ if(HAVE_CUDA)
         LABELS "V2;Integration;Execution;GraphCapture;PrefillGraphCache;Buckets;CUDA"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_CUDA
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
+                --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;Prefill;GraphCapture;PrefillGraphCache;LongContext;256K;MTotality;KVCache;DeviceResident;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
 endif()
 
 foreach(_prefill_graph_cache_test
         V2_Integration_PrefillGraphCacheExecution_ROCm
-        V2_Integration_PrefillGraphCacheExecution_CUDA)
+        V2_Integration_PrefillGraphCacheLongContextMTotality_ROCm
+        V2_Integration_PrefillGraphCacheExecution_CUDA
+        V2_Integration_PrefillGraphCacheLongContextMTotality_CUDA)
     if(TEST ${_prefill_graph_cache_test})
         set_tests_properties(${_prefill_graph_cache_test} PROPERTIES
             ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
@@ -13512,6 +13676,25 @@ foreach(_prefill_graph_cache_test
     endif()
 endforeach()
 message(STATUS "V2 Tests: Added PrefillGraphCacheExecution integration tests")
+
+# CPU counterpart to the GPU 256K graph-replay stress. It uses one Qwen2.5-0.5B
+# KV layer in native Q8_1 storage so the full logical-address and padded-tail
+# contract is exercised without turning the integration gate into a model-scale
+# prefill benchmark.
+add_executable(v2_test_cpu_prefill_long_context_m_totality
+    integration/execution/Test__CPUPrefillLongContextMTotality.cpp
+)
+target_link_libraries(v2_test_cpu_prefill_long_context_m_totality PRIVATE
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_PrefillLongContextMTotality_CPU
+    COMMAND $<TARGET_FILE:v2_test_cpu_prefill_long_context_m_totality>
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;Prefill;LongContext;256K;MTotality;KVCache;Q8_1;Qwen25_05B;Regression"
+    MPI_PROCS 1
+)
 
 # Tests: CachedGraphReplayExecution - explicit CUDA and ROCm graph-replay suites.
 # A combined binary used to probe whichever factory happened to be registered
@@ -14028,6 +14211,13 @@ add_v2_test(V2_Unit_GDNKernels
     COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
             --gtest_filter=-*ROCm*:*CUDA*
     LABELS "V2;Unit;GDNKernels;GDN;PhaseC"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Unit_GDNPrefillDecodeEquivalence_CPU
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeByteExact
+            --gtest_brief=1
+    LABELS "V2;Unit;CPU;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;MTotality;FP32;Regression"
     MPI_PROCS 1
 )
 if(HAVE_ROCM)

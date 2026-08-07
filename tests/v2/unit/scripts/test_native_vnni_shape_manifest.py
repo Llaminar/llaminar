@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -726,23 +727,50 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
             cmake.count("qwen35_qwen36_release_models_v1.json"),
             1,
         )
-        # CUDA and ROCm each have decode and prefill trainers; CPU uses one
-        # executable for both surfaces.  All five must receive the same two
-        # centralized paths instead of naming a backend-private inventory.
-        expected_trainer_targets = 5
-        self.assertEqual(
-            cmake.count(
-                'LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="'
-                '${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"'
-            ),
-            expected_trainer_targets,
+        definition_blocks = {
+            match.group("target"): match.group("body")
+            for match in re.finditer(
+                r"target_compile_definitions\(\s*(?P<target>\S+)\s+"
+                r"(?P<body>.*?)\)",
+                cmake,
+                re.DOTALL,
+            )
+        }
+        expected_shared_targets = {
+            "v2_perf_cpu_native_vnni_gemv",
+            "v2_perf_cuda_native_vnni_decode_trainer",
+            "v2_perf_cuda_native_vnni_gemm",
+            "v2_perf_native_vnni_sweep",
+            "v2_perf_native_vnni_throughput",
+        }
+        shared_targets = {
+            target
+            for target, body in definition_blocks.items()
+            if "LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH" in body
+        }
+        self.assertSetEqual(shared_targets, expected_shared_targets)
+        for target in expected_shared_targets:
+            self.assertIn(
+                "LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH",
+                definition_blocks[target],
+                target,
+            )
+
+        # The production MoE prefill harness consumes the same release-model
+        # catalog plus its centralized real-GGUF codebook-pattern manifest. It
+        # is intentionally not a generic shape-manifest trainer.
+        catalog_only_targets = {
+            target
+            for target, body in definition_blocks.items()
+            if "LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH" in body
+        } - shared_targets
+        self.assertSetEqual(
+            catalog_only_targets,
+            {"v2_perf_moe_verifier_prefill"},
         )
-        self.assertEqual(
-            cmake.count(
-                'LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="'
-                '${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"'
-            ),
-            expected_trainer_targets,
+        self.assertIn(
+            "LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH",
+            definition_blocks["v2_perf_moe_verifier_prefill"],
         )
 
 

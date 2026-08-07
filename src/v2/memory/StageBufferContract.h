@@ -120,6 +120,25 @@ namespace llaminar2
             return *this;
         }
 
+        /**
+         * @brief Declare a write-only buffer whose stable storage is already bound.
+         *
+         * Captured publication stages often overwrite a persistent arena
+         * mailbox through a pointer fixed during setup.  Such a destination is
+         * not an input merely because its storage predates the stage, and
+         * treating it as READWRITE would manufacture a stale-coherence
+         * dependency at the graph frontier.  This binding still participates
+         * in post-execute device-write publication, but it neither requests
+         * input coherence nor permits the executor to rebind its storage.
+         */
+        StageBufferContract &addPreallocatedOutput(
+            BufferId id,
+            const char *dtype = nullptr)
+        {
+            outputs.push_back({id, BufferAccess::WRITE, dtype, false});
+            return *this;
+        }
+
         StageBufferContract &addWeight(ITensor *tensor)
         {
             if (tensor)
@@ -199,7 +218,11 @@ namespace llaminar2
         {
             std::vector<BufferBinding> result;
             result.reserve(outputs.size() + inouts.size());
-            result.insert(result.end(), outputs.begin(), outputs.end());
+            for (const auto &binding : outputs)
+            {
+                if (binding.prepare_write_storage)
+                    result.push_back(binding);
+            }
             for (const auto &binding : inouts)
             {
                 if (binding.prepare_write_storage)

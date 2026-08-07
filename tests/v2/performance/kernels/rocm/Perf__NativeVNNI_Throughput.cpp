@@ -2145,8 +2145,8 @@ namespace
         result.route_counter_ok = observed && observed_count > 0 &&
                                   result.observed_kb == expected_kb &&
                                   inherited_waves_match &&
-                                  !(M >= 2 &&
-                                    result.observed_path == "atomic_reduce");
+                                  (result.observed_path == "direct" ||
+                                   result.observed_path == "split_reduce");
 
         if (!profiler_request_id.empty())
         {

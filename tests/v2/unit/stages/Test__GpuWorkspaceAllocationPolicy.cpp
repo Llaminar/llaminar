@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/rocm/gemm/ROCmMoEProductionPrefillOverlayGenerated.inc"
 #include "kernels/GDNDeviceStateBinding.h"
 
 #include <algorithm>
@@ -849,6 +850,119 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExp
         << "fixture must cover the small-token, many-expert regression";
 }
 
+/**
+ * @brief Keep adaptive ROCm prefill planning in dedicated persistent storage.
+ *
+ * The captured planner publishes two live span lengths followed by independent
+ * TM12 and TM16 work directories.  Reusing active-expert or routing metadata
+ * for this mutable projection plan creates an ownership race between stages;
+ * under-allocation instead permits a long-prefill replay to overwrite its
+ * neighboring arena allocation.  Exercise tiny, representative, and large M
+ * values so the sizing contract remains total rather than fitted to M=512.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ROCmAdaptivePrefillDirectoryHasDedicatedMTotalCapacity)
+{
+    using namespace llaminar2::MoEWorkspaceBuffers;
+    constexpr int kModel = 2048;
+    constexpr int kIntermediate = 512;
+    constexpr int kExperts = 256;
+    constexpr int kTopK = 8;
+
+    for (const int rows : {1, 2, 15, 16, 17, 512, 4096, 16384})
+    {
+        const std::size_t slots =
+            static_cast<std::size_t>(rows) * kTopK;
+        const std::size_t active = std::min<std::size_t>(slots, kExperts);
+        const auto span_capacity = [=](std::size_t tile_rows)
+        {
+            return std::min(
+                slots,
+                active + (slots + tile_rows - 1) / tile_rows);
+        };
+        const std::size_t expected_words =
+            2u + span_capacity(12u) + span_capacity(16u);
+
+        EXPECT_EQ(
+            rocmAdaptivePrefillDirectoryWords(slots, kExperts),
+            expected_words)
+            << "rows=" << rows;
+
+        const auto requirements = rocmMoE(
+            rows, kModel, kIntermediate, kExperts, kTopK);
+        const auto *directory = requirements.find(
+            ROCM_PREFILL_WORK_DIRECTORY);
+        ASSERT_NE(directory, nullptr) << "rows=" << rows;
+        EXPECT_EQ(
+            directory->size_bytes,
+            expected_words * sizeof(uint32_t))
+            << "rows=" << rows;
+        EXPECT_STRNE(
+            ROCM_PREFILL_WORK_DIRECTORY,
+            GROUP_ACTIVE_EXPERT_IDS);
+    }
+}
+
+/**
+ * @brief Lock the installed Qwen 3.6 35B route-robust exact overlay.
+ *
+ * The generated table is intentionally model-name independent: prepared
+ * codebooks, geometry, expert topology, and M form the complete capture-time
+ * key.  This regression ensures the authenticated adaptive policy is selected
+ * for that exact key while adjacent unswept M values continue to the total
+ * generic policy instead of accidentally inheriting an exact winner.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ROCmQwen36_35B_M512SelectsEveryCertifiedProductionPrefillOverlay)
+{
+    using llaminar2::rocm::generated::ROCmMoEProductionPrefillOverlayConfig;
+    using llaminar2::rocm::generated::selectROCmMoEProductionPrefillOverlay;
+
+    struct ExpectedPolicy
+    {
+        uint8_t gateup_codebook;
+        uint8_t down_codebook;
+        uint8_t gateup_tile_m;
+        uint16_t gateup_tile_n;
+        uint8_t down_tile_m;
+        uint16_t down_tile_n;
+    };
+    constexpr std::array expected{
+        ExpectedPolicy{11, 8, 16, 128, 16, 256},
+        ExpectedPolicy{13, 4, 20, 128, 16, 128},
+        ExpectedPolicy{13, 8, 20, 128, 20, 128},
+        ExpectedPolicy{13, 11, 20, 128, 20, 128},
+    };
+
+    for (const auto &policy : expected)
+    {
+        ROCmMoEProductionPrefillOverlayConfig config{};
+        ASSERT_TRUE(selectROCmMoEProductionPrefillOverlay(
+            policy.gateup_codebook,
+            policy.down_codebook,
+            /*hidden_size=*/2048,
+            /*expert_width=*/512,
+            /*expert_count=*/256,
+            /*top_k=*/8,
+            /*m=*/512,
+            config));
+        EXPECT_EQ(config.gateup_tile_m, policy.gateup_tile_m);
+        EXPECT_EQ(config.gateup_tile_n, policy.gateup_tile_n);
+        EXPECT_EQ(config.down_tile_m, policy.down_tile_m);
+        EXPECT_EQ(config.down_tile_n, policy.down_tile_n);
+    }
+
+    ROCmMoEProductionPrefillOverlayConfig config{};
+    EXPECT_FALSE(selectROCmMoEProductionPrefillOverlay(
+        13, 11, 2048, 512, 256, 8,
+        /*m=*/511,
+        config));
+    EXPECT_FALSE(selectROCmMoEProductionPrefillOverlay(
+        13, 11, 2048, 512, 256, 8,
+        /*m=*/513,
+        config));
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataCapacityCoversEveryLayerAndGraphOwner)
 {
     using namespace llaminar2::MoEWorkspaceBuffers;
@@ -1380,7 +1494,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
            "requirements.";
     EXPECT_NE(
         compact_forward_impl.find(
-            "elseif(main_prefill&&!populateMTPShiftedCacheFromPrefill("),
+            "elseif(main_prefill&&!populateCPUMTPShiftedCacheFromPrefill("),
         std::string::npos)
         << "Only a real main-inference prefill may populate shifted MTP state; "
            "a grouped verifier can share its shape and all-position output policy.";
@@ -1870,7 +1984,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarGraphCaptureInstallsLocalTPBo
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto collective_scan = sliceBetween(
         sidecar_body,
         "sidecar_cache.collective_nodes.clear();",
@@ -1946,7 +2060,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPFirstUseCaptureAndParentPublicationA
     const auto sidecar = sliceBetween(
         orchestrator_source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     EXPECT_EQ(
         sidecar.find("try_gpu_graph_capture && !rebuilt_graph"),
         std::string::npos)
@@ -2178,7 +2292,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     EXPECT_NE(sidecar_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos)
         << "A new MTP sidecar run must wait before reading/appending shifted MTP KV.";
     EXPECT_NE(sidecar_body.find("recordShiftedMTPKVReady"), std::string::npos)
@@ -2604,10 +2718,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
         readFile(repoRoot() / "src/v2/execution/local_execution/engine/ForwardExecutionEngine.h");
     const auto graph_builder_header =
         readFile(repoRoot() / "src/v2/execution/local_execution/graph/IGraphBuilder.h");
+    const auto qwen_graph_source =
+        readFile(repoRoot() / "src/v2/models/qwen/QwenGraphBase.cpp");
 
     const auto archive_body = sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(",
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(",
         "const float *DeviceGraphOrchestrator::logits() const");
     const auto main_forward_body = sliceBetween(
         source,
@@ -2652,7 +2768,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto row_selectors_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRows(",
@@ -2685,6 +2801,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
         source,
         "bool DeviceGraphOrchestrator::recordShiftedMTPKVReady(",
         "bool DeviceGraphOrchestrator::waitForPendingShiftedMTPKVReady(");
+    const auto integrated_shifted_prefill_body = sliceBetween(
+        qwen_graph_source,
+        "std::string QwenGraphBase::maybeAddShiftedMTPPrefillTransaction(",
+        "ComputeGraph QwenGraphBase::buildFullForwardGraph(");
 
     const auto compact_header =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
@@ -2737,6 +2857,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
     const auto compact_shifted_event_record =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(
             shifted_event_record_body));
+    const auto compact_integrated_shifted_prefill =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(
+            integrated_shifted_prefill_body));
 
     EXPECT_NE(
         compact_header.find(
@@ -2767,26 +2890,34 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDev
             "publishForwardGraphOutputReady(output)"),
         std::string::npos)
         << "Every successful forward must publish its invocation-scoped stream before it can be invalidated.";
-    EXPECT_NE(
-        compact_archive.find(
-            "hidden_selection_stream=producer.stream;"),
-        std::string::npos)
-        << "Shifted prefill must consume the stream carried by its exact ForwardOutput.";
+    EXPECT_NE(compact_archive.find("if(!state_.device_id.is_cpu())"),
+              std::string::npos)
+        << "The host-owned helper must structurally reject GPU shifted prefill.";
+    EXPECT_EQ(compact_archive.find("producer.stream"), std::string::npos)
+        << "The CPU helper must not retain obsolete GPU producer provenance.";
     EXPECT_EQ(
         compact_archive.find("lastMainForwardHiddenProducerStream("),
         std::string::npos)
         << "Immediate shifted-prefill handoff must not rediscover its producer through mutable engine-global state.";
     EXPECT_NE(
         compact_main_forward.find(
-            "input.position_offset,output.execution,"),
+            "bindShiftedMTPPrefillTransaction(input,batch_size)"),
         std::string::npos)
-        << "Main forward must pass invocation-scoped provenance directly into shifted-prefill publication.";
+        << "Main GPU prefill must install its shifted transaction before graph construction.";
     EXPECT_NE(
-        compact_archive.find(
-            "selectMTPTerminalHiddenRow("
-            "seq_len-1,seq_len,hidden_selection_stream)"),
+        compact_integrated_shifted_prefill.find(
+            "graph.addDependency(prepare_node,dependency_node)"),
         std::string::npos)
-        << "GPU terminal-row archival must remain on the main-forward producer stream.";
+        << "Shifted preparation and terminal archival must be downstream of the exact main-forward producer node.";
+    EXPECT_NE(
+        compact_integrated_shifted_prefill.find(
+            "graph.merge(std::move(mtp_kv_graph),prepare_node)"),
+        std::string::npos)
+        << "The KV-only MTP graph must remain in the same captured dependency chain.";
+    EXPECT_EQ(
+        compact_integrated_shifted_prefill.find("synchronizeStream("),
+        std::string::npos)
+        << "The integrated graph dependency must not become a host wait.";
     EXPECT_EQ(
         compact_archive.find("synchronizeOwnedGPUHelperStream("),
         std::string::npos)
@@ -3151,23 +3282,43 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenGpuPublicationHasTyped
     const auto shifted_prefill_population = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
-            "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(",
+            "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(",
             "const float *DeviceGraphOrchestrator::logits() const")));
+    const auto shifted_prefill_binding = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::bindShiftedMTPPrefillTransaction(",
+            "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(")));
     EXPECT_NE(
-        shifted_prefill_population.find(
-            "state_.device_id.is_gpu()?selectMTPTerminalHiddenRowsFromShiftedPrefillProgress("),
+        shifted_prefill_binding.find(
+            "MTPShiftedPrefillHiddenPublicationPolicy::GraphIntegratedKVTransaction"),
         std::string::npos)
-        << "GPU shifted-prefill rows, including the terminal archive, must be selected from live device KV progress.";
+        << "GPU shifted prefill must require the declarative graph-integrated transaction policy.";
     EXPECT_NE(
-        shifted_prefill_population.find(
-            "state_.device_id.is_gpu()?selectMTPTerminalHiddenRowsFromShiftedPrefillProgress("),
+        shifted_prefill_binding.find(
+            "deviceSequenceCachedTokenCountPtr(request)"),
         std::string::npos)
-        << "The terminal archive must choose device progress before its CPU-only host-indexed arm.";
+        << "The captured transaction must derive progress from canonical device KV counters.";
+    EXPECT_NE(
+        shifted_prefill_binding.find(
+            "input.shifted_mtp_prefill=std::move(binding)"),
+        std::string::npos)
+        << "GPU shifted prefill must publish one typed binding into main graph construction.";
+    EXPECT_NE(
+        shifted_prefill_population.find("if(!state_.device_id.is_cpu())"),
+        std::string::npos)
+        << "The remaining host-owned shifted-prefill helper must reject GPU execution.";
+    EXPECT_EQ(shifted_prefill_population.find(".is_gpu()"), std::string::npos);
+    EXPECT_EQ(shifted_prefill_population.find("tokens_device"), std::string::npos);
+    EXPECT_EQ(
+        source.find("populateMTPShiftedCacheFromPrefill"),
+        std::string::npos)
+        << "The retired mixed CPU/GPU sidecar entrypoint must not return.";
     EXPECT_EQ(
         shifted_prefill_population.find(
-            "if(!selectMTPTerminalHiddenRow(seq_len-1,seq_len,hidden_selection_stream))"),
+            "selectMTPTerminalHiddenRowsFromShiftedPrefillProgress("),
         std::string::npos)
-        << "An unconditional prompt-width host cursor must never return to terminal archiving.";
+        << "CPU publication must not retain a dead GPU progress-selection arm.";
 
     const auto manifest = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
@@ -3546,7 +3697,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsRequireDeviceOwnedConditi
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto executable_sidecar_body =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
     const auto compact_source = removeAsciiWhitespace(source);
@@ -4714,7 +4865,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto prepare_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(",
@@ -6068,6 +6219,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
     const auto graph_outcome_stage = readFile(
         repoRoot() /
         "src/v2/execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp");
+    const auto outcome_binding_body = sliceBetween(
+        dgo_source,
+        "MTPVerifierOutcomeGraphBinding outcome_binding;",
+        "if (!outcome_binding.validForGreedy()");
     const auto verifier_metadata_body = sliceBetween(
         dgo_source,
         "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
@@ -6084,11 +6239,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
     const auto cuda_greedy_summary_kernel = sliceBetween(
         cuda_sampling,
         "cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(",
-        "__global__ void cuda_derive_speculative_publication_metadata_kernel(");
+        "__global__ void cuda_advance_speculative_commit_boundary_kernel(");
     const auto rocm_greedy_summary_kernel = sliceBetween(
         rocm_sampling,
         "rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(",
-        "__global__ void rocm_derive_speculative_publication_metadata_kernel(");
+        "__global__ void rocm_advance_speculative_commit_boundary_kernel(");
 
     const size_t first_token_device_sample =
         first_token_body.find("sampleGreedyFromMainLogitsToDeviceTargetSlot(");
@@ -6123,6 +6278,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         stripCommentsAndStringLiterals(greedy_consumer_body));
     const auto compact_graph_outcome_stage = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(graph_outcome_stage));
+    const auto compact_outcome_binding = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(outcome_binding_body));
     const auto compact_verifier_metadata = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(verifier_metadata_body));
     const auto compact_device_token_input = removeAsciiWhitespace(
@@ -6165,6 +6322,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         compact_graph_outcome_stage.find(
             "enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls("),
         std::string::npos);
+    EXPECT_NE(
+        compact_graph_outcome_stage.find(
+            "params_.binding.next_leading_committed_output_count_device"),
+        std::string::npos)
+        << "The reducer must consume the device controller's exact response-ledger carry.";
+    EXPECT_NE(
+        compact_outcome_binding.find(
+            "outcome_binding.next_leading_committed_output_count_device="
+            "device_generation_storage_.control_device+sampling_math::"
+            "kDeviceGenerationControlNextLeadingCommittedOutputCount"),
+        std::string::npos)
+        << "The captured outcome graph must bind carry state directly to the authoritative controller field.";
     EXPECT_NE(
         compact_graph_outcome_stage.find(
             "MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal"),
@@ -6286,6 +6455,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         rocm_greedy_summary_kernel.find(
             "sampling_math::kSpeculativeBatchMaxStopTokens"),
         std::string::npos);
+    ASSERT_NE(
+        cuda_greedy_summary_kernel.find(
+            "next_leading_committed_output_count"),
+        std::string::npos);
+    ASSERT_NE(
+        rocm_greedy_summary_kernel.find(
+            "next_leading_committed_output_count"),
+        std::string::npos);
+    EXPECT_EQ(
+        cuda_greedy_summary_kernel.find("first_token_already_in_history"),
+        std::string::npos)
+        << "Penalty history cannot stand in for response-ledger carry state.";
+    EXPECT_EQ(
+        rocm_greedy_summary_kernel.find("first_token_already_in_history"),
+        std::string::npos)
+        << "Penalty history cannot stand in for response-ledger carry state.";
 }
 
 /**
@@ -7459,7 +7644,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto resident_sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(",
@@ -11553,7 +11738,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGraphWaitsOnSidecarStreamWit
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
-        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     const auto flush_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::flushPendingMTPWork()",
@@ -12234,8 +12419,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         source.find("llaminar2::ScopedBackendGraphCapture transaction_"),
         std::string::npos);
-    EXPECT_EQ(countOccurrences(source, "ScopedHipPerfGraph graph("), 4u)
-        << "Every ROCm verifier perf capture family must share one typed owner.";
+    const size_t capture_owner_count =
+        countOccurrences(source, "ScopedHipPerfGraph graph(");
+    const size_t capture_close_count =
+        countOccurrences(source, "graph.finishAndInstantiate()");
+    EXPECT_GT(capture_owner_count, 0u)
+        << "The ROCm verifier perf harness must exercise captured execution.";
+    EXPECT_EQ(capture_owner_count, capture_close_count)
+        << "Every ROCm verifier perf capture closure must belong to one typed "
+           "ScopedHipPerfGraph owner.";
 
     for (const auto &forbidden : {
              "hipStreamBeginCapture(",
@@ -14581,6 +14773,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "std::optional<DeviceGenerationSamplingMode>sampling_mode"),
         std::string::npos)
         << "Greedy and stochastic parent bodies must never share cache identity.";
+    EXPECT_NE(
+        compact_header.find("uint64_tsession_epoch_=1;"),
+        std::string::npos)
+        << "A fresh runner is already a live request session. Epoch zero is "
+           "the invalid dispatch-ticket sentinel and must never require an "
+           "unrelated cache reset before first-request MTP admission.";
     EXPECT_NE(composer.find("request_count!=1"), std::string::npos);
     EXPECT_NE(
         composer.find("verifier_rows_per_request=draft_depth+1"),

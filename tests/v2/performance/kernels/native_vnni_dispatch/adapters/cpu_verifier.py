@@ -1,9 +1,9 @@
 """CPU NativeVNNI grouped-verifier trainer adapter.
 
 CPU candidates are explicit production policies, not inferred labels.  The
-adapter keeps normalized/unsupported launches in the corpus, verifies every
-raw steady-clock sample, and admits a candidate only when its effective route,
-repeat bytes, and complete FP32 output match serial M=1 decode.
+adapter rejects normalized or unsupported launches outright, verifies every
+raw steady-clock sample, and admits a candidate only when its exact effective
+route, repeat bytes, and complete FP32 output match serial M=1 decode.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from ..schema import (
 )
 
 
-CPU_VERIFIER_TRIAL_SET_VERSION = "cpu-verifier-deterministic-q8-rows-v3"
+CPU_VERIFIER_TRIAL_SET_VERSION = "cpu-verifier-deterministic-q8-rows-v4"
 CPU_SERIAL_POLICY_ID = "cpu.nvnni.production.serial-m1-v2"
 
 REQUIRED_RAW_COLUMNS = frozenset({
@@ -523,6 +523,11 @@ def adapt_cpu_verifier_row(
     forced_route_ok = route_counter_ok and (
         observed_id == candidate.effective_candidate_id
     )
+    if not forced_route_ok:
+        raise ValueError(
+            "CPU grouped verifier candidate did not execute its exact "
+            "requested production route"
+        )
 
     mismatch_count = int(raw["bit_mismatches"])
     repeat_mismatches = int(raw["repeat_byte_mismatches"])
@@ -552,7 +557,7 @@ def adapt_cpu_verifier_row(
     context.validate_promotion_timing(
         warmups,
         samples,
-        forced_route_ok=forced_route_ok,
+        forced_route_ok=True,
     )
     if timing_samples is not None:
         if len(timing_samples) != samples:
@@ -585,15 +590,14 @@ def adapt_cpu_verifier_row(
     n_block_chunks = int(raw["n_block_chunks"])
     if k_tiles < 0 or n_block_chunks <= 0:
         raise ValueError("CPU verifier launch geometry is invalid")
-    if forced_route_ok and candidate.config_json["policy"] == "WideRows" and (
+    if candidate.config_json["policy"] == "WideRows" and (
         effective_runtime_isa == "AVX2" or m == 2
     ):
         raise ValueError(
             "CPU telemetry claimed an impossible effective WideRows route"
         )
     if (
-        forced_route_ok
-        and candidate.config_json.get("k_tile_policy") == "full_k"
+        candidate.config_json.get("k_tile_policy") == "full_k"
         and k_tiles > 1
     ):
         raise ValueError(
@@ -601,8 +605,7 @@ def adapt_cpu_verifier_row(
         )
     expected_n_block_chunks = candidate.config_json.get("n_block_chunks")
     if (
-        forced_route_ok
-        and expected_n_block_chunks is not None
+        expected_n_block_chunks is not None
         and n_block_chunks != int(expected_n_block_chunks)
     ):
         raise ValueError(
