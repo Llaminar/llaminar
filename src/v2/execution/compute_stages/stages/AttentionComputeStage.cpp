@@ -36,6 +36,11 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#if defined(HAVE_ROCM)
+#include "../../../kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#include "../../../kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
+#endif
+
 namespace llaminar2
 {
 
@@ -556,6 +561,136 @@ namespace llaminar2
                 << prefill_plan.max_context_partitions
                 << " partial_output_bytes="
                 << prefill_plan.partial_output_bytes);
+        }
+#endif
+
+#if defined(HAVE_ROCM)
+        if (params_.device_id.is_rocm())
+        {
+            const int device_index =
+                params_.device_id.toKernelDeviceIndex();
+            const rocm::fa2_policy::ROCmFA2PhysicalDeviceProperties
+                properties =
+                    rocm::queryROCmFlashAttentionDeviceProperties(
+                        device_index);
+
+            const int kv_capacity =
+                params_.kv_cache
+                    ? params_.kv_cache->max_seq_len()
+                    : std::max(params_.kv_len, params_.seq_len);
+            const rocm::fa2_policy::ROCmFA2PrefillParallelPlan prefill_plan =
+                rocm::fa2_policy::selectROCmFA2PrefillParallelPlan({
+                    .batch_size = params_.batch_size,
+                    .query_rows = params_.seq_len,
+                    .local_query_heads = params_.n_heads,
+                    .head_dim = params_.head_dim,
+                    .kv_capacity = kv_capacity,
+                    .compute_unit_count = properties.compute_unit_count,
+                    .lds_capacity_bytes = properties.lds_capacity_bytes,
+                    .requested_axis =
+                        params_.execution_policy.prefill_parallel_axis,
+                });
+            if (!prefill_plan.valid)
+            {
+                throw std::runtime_error(
+                    "AttentionComputeStage received an invalid ROCm FA2 "
+                    "capture plan for " + params_.device_id.toString());
+            }
+
+            const auto require_capacity = [&reqs](
+                                              const char *name,
+                                              std::size_t bytes)
+            {
+                for (auto &buffer : reqs.buffers)
+                {
+                    if (buffer.name == name)
+                    {
+                        buffer.size_bytes =
+                            std::max(buffer.size_bytes, bytes);
+                        return;
+                    }
+                }
+                reqs.buffers.push_back({name, bytes, 256, true});
+            };
+
+            if (prefill_plan.usesContextParallelism())
+            {
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    prefill_plan.partial_output_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_M,
+                    prefill_plan.partial_m_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_L,
+                    prefill_plan.partial_l_bytes);
+            }
+
+            /*
+             * Geometry selection is non-monotonic in M on MI50. Medium query
+             * grids use context summaries, but large prefill grids return to
+             * direct query parallelism and report zero partial bytes. Reserve
+             * the policy-computed maximum over the complete admitted M range
+             * now, before any graph captures the shared arena address. This is
+             * a family capacity declaration only; runtime graph selection
+             * remains tied to the exact captured bucket above.
+             */
+            const rocm::fa2_policy::ROCmFA2PrefillParallelPlan
+                family_workspace_plan =
+                    rocm::fa2_policy::
+                        selectROCmFA2GeometrySelectedWorkspaceEnvelope({
+                            .batch_size = params_.batch_size,
+                            .query_rows = kv_capacity,
+                            .local_query_heads = params_.n_heads,
+                            .head_dim = params_.head_dim,
+                            .kv_capacity = kv_capacity,
+                            .compute_unit_count =
+                                properties.compute_unit_count,
+                            .lds_capacity_bytes =
+                                properties.lds_capacity_bytes,
+                            .requested_axis = params_.execution_policy
+                                                  .prefill_parallel_axis,
+                        });
+            if (family_workspace_plan.valid &&
+                family_workspace_plan.usesContextParallelism())
+            {
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    family_workspace_plan.partial_output_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_M,
+                    family_workspace_plan.partial_m_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_L,
+                    family_workspace_plan.partial_l_bytes);
+            }
+
+            LOG_TRACE(
+                "[AttentionComputeStage] ROCm prefill capture plan"
+                << " device=" << params_.device_id.toString()
+                << " requested="
+                << attention::attentionPrefillParallelAxisName(
+                       params_.execution_policy.prefill_parallel_axis)
+                << " selected="
+                << rocm::fa2_policy::rocmFA2PrefillPhysicalModeName(
+                       prefill_plan.mode)
+                << " query_blocks=" << prefill_plan.query_grid_blocks
+                << " context_partitions="
+                << prefill_plan.max_context_partitions
+                << " context_slots="
+                << prefill_plan.context_partition_slots
+                << " context_phase_block_slots="
+                << prefill_plan.context_phase_block_slots
+                << " device_direct_partition_limit="
+                << prefill_plan.device_direct_partition_limit
+                << " reducer_wavefronts="
+                << prefill_plan.reducer_dimension_wavefronts
+                << " reducer_block_slots="
+                << prefill_plan.reducer_block_slots
+                << " partial_output_bytes="
+                << prefill_plan.partial_output_bytes
+                << " family_partial_output_bytes="
+                << family_workspace_plan.partial_output_bytes);
         }
 #endif
 

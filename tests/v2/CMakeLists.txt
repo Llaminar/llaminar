@@ -5442,6 +5442,20 @@ add_v2_test(V2_Unit_CUDAFlashAttentionLaunchPolicy
     MPI_PROCS 1
 )
 
+# Device-free ROCm FA2 capture-policy coverage over every released Qwen
+# attention geometry, TP1/2/4/8, and short-to-256K K/V capacity envelopes.
+add_executable(v2_unit_rocm_flash_attention_launch_policy
+    unit/kernels/rocm/Test__ROCmFlashAttentionLaunchPolicy.cpp)
+target_link_libraries(v2_unit_rocm_flash_attention_launch_policy
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main)
+add_v2_test(V2_Unit_ROCmFlashAttentionLaunchPolicy
+    COMMAND $<TARGET_FILE:v2_unit_rocm_flash_attention_launch_policy>
+    LABELS "V2;Unit;ROCm;Attention;FlashAttention;GraphCapture;LaunchPolicy;Totality;Qwen"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Quantized GEMM workspace declarations
 # Host-only structural regressions for workspace-owned CUDA GEMM scratch.
 add_executable(v2_unit_cuda_quantised_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
@@ -6172,6 +6186,13 @@ add_v2_test(V2_Integration_CUDAFlashAttentionParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+add_v2_test(V2_Integration_CUDAFlashAttentionContextParallelByteExact
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+            --gtest_filter=Test__CUDAFlashAttentionParity.FA2FixedContextSequenceAndParallelCapturedTransactionsAreByteExact:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;FlashAttention;ContextParallel;GraphCapture;BatchInvariant;ByteExact;AllNativeFormats;FP16;FP32;256K;Regression"
+    MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Attention
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
@@ -11658,12 +11679,12 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm stable graph flash-decode benchmarks")
 
-    # Performance Test: ROCm Flash Attention Prefill — tile_q, KV type, and TP scaling sweep
-    # Measures prefill attention latency across tile_q={16,32,64}, KV types (FP32/FP16/Q8_1),
-    # and TP head count configurations. Unlike decode, prefill has no split-K; occupancy
-    # comes from n_heads × num_q_tiles.
+    # Performance Test: ROCm Flash Attention Prefill and captured context policy.
+    # Covers direct-query and persistent K/V-context schedules, every native KV
+    # representation, all released Qwen/TP geometries, and 256K context replay.
     add_executable(v2_perf_rocm_flash_attention_prefill
         performance/kernels/rocm/Perf__ROCmFlashAttentionPrefill.cpp
+        performance/kernels/rocm/Perf__ROCmFlashAttentionContextParallel.cpp
     )
     target_link_libraries(v2_perf_rocm_flash_attention_prefill
         llaminar2_core
@@ -11672,10 +11693,10 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Perf_ROCmFlashAttentionPrefill
         COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
-        LABELS "V2;Performance;ROCm;Attention;FlashAttention;Prefill;TP;Scaling;Benchmark"
+        LABELS "V2;Performance;ROCm;Attention;FlashAttention;Prefill;TP;Scaling;ContextParallel;AllFormats;GraphCapture;Benchmark"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added ROCm Flash Attention prefill TP scaling benchmarks")
+    message(STATUS "V2 Tests: Added ROCm Flash Attention prefill/context policy benchmarks")
 
     # Performance Test: ROCm GEMV KB Scaling — KB (K-parallel split) sweep for decode GEMV
     # Measures INT8 VNNI GEMV latency across forced KB values and TP-derived N sizes.
@@ -12444,6 +12465,13 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmFlashAttentionParity
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
         LABELS "V2;Integration;ROCm;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCmFlashAttentionContextParallelByteExact
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=Test__ROCmFlashAttentionParity.FA2ContextParallelCapturedTransactionAllNativeFormatsIsDirectByteExact:Test__ROCmFlashAttentionParity.ComputeTensorGeometrySelectedContextGraphAllNativeFormatsIsQueryByteExact
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;Attention;FlashAttention;ContextParallel;GraphCapture;DeviceResident;BatchInvariant;ByteExact;AllFormats;FP32;FP16;BF16;Q8_1;GQA;TP;256K;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Attention

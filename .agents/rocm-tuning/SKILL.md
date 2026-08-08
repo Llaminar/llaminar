@@ -177,6 +177,31 @@ for the tested rocprof v1 dispatch-range/counter commands, metric
 interpretation, wave64 vectorization checks, and ROCm 7 `.hip_fatbin`
 extraction workflow.
 
+For ROCm FlashAttention2, build
+`v2_perf_rocm_flash_attention_prefill` and use its exact-candidate test so one
+profiler invocation contains one captured transaction and no unrelated model
+work. Select the production geometry explicitly: `qwen7_tp1` exercises the
+packed device-direct branch, `qwen27_tp4` exercises long-context partition
+publication/reduction, and `qwen35_tp8` exercises replicated GQA. For example:
+
+```bash
+LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY=qwen7_tp1 \
+LLAMINAR_ROCM_FA2_PROFILE_M=128 \
+LLAMINAR_ROCM_FA2_PROFILE_KV=8192 \
+LLAMINAR_ROCM_FA2_PROFILE_CAPACITY=131072 \
+LLAMINAR_ROCM_FA2_PROFILE_FORMAT=FP16 \
+LLAMINAR_ROCM_FA2_PROFILE_MODE=context \
+rocprofv3 --kernel-trace --stats --output-directory /tmp/rocm-fa2-qwen7 \
+  -- ./build_v2_release/tests/v2/v2_perf_rocm_flash_attention_prefill \
+  --gtest_filter=ROCmFlashAttentionContextParallelPerf.ExactCandidateProfilerLaunch
+```
+
+Use `LLAMINAR_ROCM_FA2_PROFILE_PHASE_BLOCKS`,
+`LLAMINAR_ROCM_FA2_PROFILE_SLOTS`,
+`LLAMINAR_ROCM_FA2_PROFILE_REDUCER_WAVEFRONTS`, and
+`LLAMINAR_ROCM_FA2_PROFILE_REDUCER_BLOCKS` only to isolate a measured tournament
+candidate. Leave them unset to profile the installed capture-time policy.
+
 ---
 
 ## Step 3: ISA deep-dive (occupancy + scheduling)

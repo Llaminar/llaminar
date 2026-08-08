@@ -30,12 +30,14 @@
 #include <hip/hip_bfloat16.h>
 #include <cstdint>
 #include "../../attention/AttentionDeviceParams.h"
+#include "ROCmFlashAttentionLaunchPolicy.h"
 #include "../../../tensors/BlockStructures.h"
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
@@ -216,6 +218,195 @@ namespace
             kv_stride > post_append_kv_len ? kv_stride : post_append_kv_len;
         out[flat_row].position_offset = base_position + query_row;
         out[flat_row].mask_stride = post_append_kv_len;
+    }
+
+    // Hardware exponential helper is defined beside the decode implementation
+    // and forward-declared here for the context reducer above prefill utilities.
+    __device__ __forceinline__ float fast_expf(float x);
+
+    /**
+     * @brief Merge two scaled online-softmax terms with one fixed instruction order.
+     *
+     * gfx906 LLVM can otherwise choose a fused multiply-add in one kernel
+     * specialization and two rounded operations in another. Calling this same
+     * explicit primitive from direct FA2 and the context reducer makes physical
+     * scheduling irrelevant to both output and denominator bytes.
+     */
+    __device__ __forceinline__ float merge_fa2_scaled_terms(
+        float previous,
+        float previous_scale,
+        float partition,
+        float partition_scale)
+    {
+        const float scaled_previous = previous * previous_scale;
+        return fmaf(partition, partition_scale, scaled_previous);
+    }
+
+    /**
+     * @brief Merge canonical ROCm FA2 context summaries in ascending K/V order.
+     *
+     * Phase one publishes an unnormalized `(m, l, O)` tuple for every logical
+     * 256-key interval. Each lane below owns disjoint output dimensions and
+     * traverses every live interval in the same ascending order. Dimension
+     * striping changes occupancy only: there are no atomics, cross-workgroup
+     * reductions, allocations, transfers, or stream synchronizations.
+     *
+     * The graph grid is fixed by the captured query geometry. Live partition
+     * count comes directly from the device-owned attention parameter record,
+     * so stale summary bytes above a shorter replay can never participate.
+     *
+     * @tparam DIMENSION_WAVEFRONTS Number of independent 64-dimension stripes
+     *         assigned to one query-row/head reduction.
+     */
+    template <int DIMENSION_WAVEFRONTS>
+    __global__ __launch_bounds__(256, 2)
+    void flash_attention_2_context_reduce_mi50_kernel(
+        const float *__restrict__ O_partial,
+        const float *__restrict__ m_partial,
+        const float *__restrict__ l_partial,
+        float *__restrict__ O,
+        int batch_size,
+        int seq_len,
+        int n_heads,
+        int head_dim,
+        int max_context_partitions,
+        int device_direct_partition_limit,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__
+            device_params)
+    {
+        constexpr int wavefronts_per_block =
+            256 / WAVEFRONT_SIZE;
+        static_assert(
+            DIMENSION_WAVEFRONTS == 1 ||
+                DIMENSION_WAVEFRONTS == 2 ||
+                DIMENSION_WAVEFRONTS == 4,
+            "MI50 FA2 reducer supports one, two, or four dimension wavefronts");
+        static_assert(
+            wavefronts_per_block % DIMENSION_WAVEFRONTS == 0,
+            "Reducer dimension stripes must divide the physical workgroup");
+        constexpr int rows_per_block =
+            wavefronts_per_block / DIMENSION_WAVEFRONTS;
+
+        const int live_kv_len = device_params->kv_len;
+        const int live_partitions = min(
+            max_context_partitions,
+            max(
+                1,
+                (live_kv_len +
+                 llaminar2::rocm::fa2_policy::
+                     kROCmFA2CanonicalContextPartitionKeys -
+                 1) /
+                    llaminar2::rocm::fa2_policy::
+                        kROCmFA2CanonicalContextPartitionKeys));
+        if (live_partitions <= device_direct_partition_limit)
+            return;
+
+        const int wavefront = threadIdx.x / WAVEFRONT_SIZE;
+        const int lane = threadIdx.x % WAVEFRONT_SIZE;
+        const int row_in_block = wavefront / DIMENSION_WAVEFRONTS;
+        const int dimension_wavefront =
+            wavefront % DIMENSION_WAVEFRONTS;
+        const int logical_row_blocks =
+            (seq_len + rows_per_block - 1) / rows_per_block;
+        const int blocks_per_batch = n_heads * logical_row_blocks;
+        const int logical_blocks = batch_size * blocks_per_batch;
+
+        /*
+         * Grid width is an economy choice embedded at capture time. Each
+         * physical workgroup strides disjoint logical row/head tasks, making
+         * the grid persistent without introducing an atomic work queue. The
+         * arithmetic performed for one output element is therefore identical
+         * for every physical block count.
+         */
+        for (int logical_block = static_cast<int>(blockIdx.x);
+             logical_block < logical_blocks;
+             logical_block += static_cast<int>(gridDim.x))
+        {
+            const int batch = logical_block / blocks_per_batch;
+            const int batch_block = logical_block % blocks_per_batch;
+            const int head = batch_block / logical_row_blocks;
+            const int row_block = batch_block % logical_row_blocks;
+            const int query_row =
+                row_block * rows_per_block + row_in_block;
+            if (query_row >= seq_len)
+                continue;
+
+            const size_t scalar_base =
+                ((static_cast<size_t>(batch) * seq_len + query_row) *
+                     n_heads +
+                 head) *
+                max_context_partitions;
+            float *O_row =
+                O +
+                ((static_cast<size_t>(batch) * seq_len + query_row) *
+                     n_heads +
+                 head) *
+                    static_cast<size_t>(head_dim);
+
+            for (int dimension =
+                     dimension_wavefront * WAVEFRONT_SIZE + lane;
+                 dimension < head_dim;
+                 dimension += DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE)
+            {
+                float merged_m = -FLT_MAX;
+                float merged_l = 0.0f;
+                float merged_output = 0.0f;
+
+                for (int partition = 0;
+                     partition < live_partitions;
+                     ++partition)
+                {
+                    const size_t summary_index =
+                        scalar_base + static_cast<size_t>(partition);
+                    const float partition_l = l_partial[summary_index];
+                    if (!(partition_l > 0.0f))
+                        continue;
+
+                    const float partition_m = m_partial[summary_index];
+                    const float partition_output =
+                        O_partial[
+                            summary_index * static_cast<size_t>(head_dim) +
+                            dimension];
+                    if (!(merged_l > 0.0f))
+                    {
+                        merged_m = partition_m;
+                        merged_l = partition_l;
+                        merged_output = partition_output;
+                        continue;
+                    }
+
+                    const float next_m = fmaxf(merged_m, partition_m);
+                    const float previous_scale =
+                        fast_expf(merged_m - next_m);
+                    const float partition_scale =
+                        fast_expf(partition_m - next_m);
+                    merged_output = merge_fa2_scaled_terms(
+                        merged_output,
+                        previous_scale,
+                        partition_output,
+                        partition_scale);
+                    merged_l = merge_fa2_scaled_terms(
+                        merged_l,
+                        previous_scale,
+                        partition_l,
+                        partition_scale);
+                    merged_m = next_m;
+                }
+
+                /*
+                 * Preserve the direct schedule's exact normalization
+                 * expression. A source-level division can select a different
+                 * gfx906 rounding sequence from `reciprocal then multiply`,
+                 * even though both are numerically close.
+                 */
+                const float inverse_l =
+                    merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+                O_row[dimension] =
+                    merged_l > 0.0f
+                        ? merged_output * inverse_l
+                        : 0.0f;
+            }
+        }
     }
 
     // =========================================================================
@@ -536,7 +727,8 @@ namespace
               int THREADS_PER_ROW,
               int STATIC_HEAD_DIM = 0,
               int STATIC_TILE_Q = 0,
-              int STATIC_TILE_KV = 0>
+              int STATIC_TILE_KV = 0,
+              bool WRITE_CONTEXT_PARTIAL = false>
     __global__ __launch_bounds__(256, 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
@@ -557,7 +749,14 @@ namespace
         int tile_q,
         int tile_kv,
         int head_start,
-        int gqa_n_rep)
+        int gqa_n_rep,
+        float *__restrict__ O_partial = nullptr,
+        float *__restrict__ m_partial = nullptr,
+        float *__restrict__ l_partial = nullptr,
+        int context_partition_size = 0,
+        int max_context_partitions = 0,
+        int context_partition_slots = 0,
+        int device_direct_partition_limit = 0)
     {
         const int kernel_head_dim =
             STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : head_dim;
@@ -579,14 +778,83 @@ namespace
             mask_stride = device_params->mask_stride;
         }
 
-        // Block/thread indexing
-        const int batch_idx = blockIdx.z;
-        const int head_idx = blockIdx.x;
-        const int q_tile_idx = blockIdx.y;
+        const int logical_query_tiles =
+            (seq_len + kernel_tile_q - 1) / kernel_tile_q;
+        const int phase_blocks_per_slot =
+            batch_size * logical_query_tiles * n_heads;
+        int graph_live_context_partitions = 1;
+        int active_context_partition_slots = 1;
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            graph_live_context_partitions = min(
+                max_context_partitions,
+                max(
+                    1,
+                    (kv_len_runtime + context_partition_size - 1) /
+                        context_partition_size));
+            if (graph_live_context_partitions <=
+                device_direct_partition_limit)
+            {
+                return;
+            }
+            active_context_partition_slots = min(
+                context_partition_slots,
+                graph_live_context_partitions);
+        }
+        else if (device_direct_partition_limit > 0)
+        {
+            const int live_context_partitions = max(
+                1,
+                (kv_len_runtime +
+                 llaminar2::rocm::fa2_policy::
+                     kROCmFA2CanonicalContextPartitionKeys -
+                 1) /
+                    llaminar2::rocm::fa2_policy::
+                        kROCmFA2CanonicalContextPartitionKeys);
+            if (live_context_partitions > device_direct_partition_limit)
+                return;
+        }
+        const int logical_phase_blocks = WRITE_CONTEXT_PARTIAL
+                                             ? phase_blocks_per_slot *
+                                                   active_context_partition_slots
+                                             : 1;
+        const int first_logical_block = WRITE_CONTEXT_PARTIAL
+                                            ? static_cast<int>(blockIdx.x)
+                                            : 0;
+        const int logical_block_stride = WRITE_CONTEXT_PARTIAL
+                                             ? static_cast<int>(gridDim.x)
+                                             : 1;
         const int tid = threadIdx.x;
         const int threads_per_block = blockDim.x;
         const int wavefront_id = tid / WAVEFRONT_SIZE;
         const int lane_id = tid % WAVEFRONT_SIZE;
+
+        /*
+         * Context graphs expose a CU-sized physical grid. Every workgroup
+         * deterministically strides the larger logical space of partition
+         * slots, batches, query tiles, and heads. All threads in a workgroup
+         * execute the same task sequence, so the barriers in the tiled
+         * attention body remain valid and no atomic work queue is required.
+         */
+        for (int logical_block = first_logical_block;
+             logical_block < logical_phase_blocks;
+             logical_block += logical_block_stride)
+        {
+            int batch_idx = static_cast<int>(blockIdx.z);
+            int q_tile_idx = static_cast<int>(blockIdx.y);
+            int head_idx = static_cast<int>(blockIdx.x);
+            int context_partition_slot = 0;
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+            {
+                context_partition_slot =
+                    logical_block / phase_blocks_per_slot;
+                int participant_block =
+                    logical_block % phase_blocks_per_slot;
+                head_idx = participant_block % n_heads;
+                participant_block /= n_heads;
+                q_tile_idx = participant_block % logical_query_tiles;
+                batch_idx = participant_block / logical_query_tiles;
+            }
 
         // GQA mapping: multiple Q heads can share one KV head
         // When gqa_n_rep > 0, KV heads are REPLICATED (each device has all KV heads),
@@ -600,8 +868,35 @@ namespace
         // Q row range for this block
         const int q_block_start = q_tile_idx * kernel_tile_q;
         if (q_block_start >= seq_len)
-            return;
+        {
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+                continue;
+            else
+                return;
+        }
         const int q_tile_rows = min(kernel_tile_q, seq_len - q_block_start);
+
+        /*
+         * Context execution launches a bounded persistent partition grid. Each
+         * physical slot strides over logical partitions, while summary storage
+         * is indexed by the logical partition number. The reducer can therefore
+         * traverse one fixed ascending arithmetic order regardless of the
+         * physical slot count selected by the capture-time policy.
+         */
+        int first_context_partition = 0;
+        int context_partition_stride = 1;
+        int live_context_partitions = 1;
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            live_context_partitions = graph_live_context_partitions;
+            first_context_partition = context_partition_slot;
+            context_partition_stride = context_partition_slots;
+            if (first_context_partition >= live_context_partitions ||
+                context_partition_stride <= 0)
+            {
+                continue;
+            }
+        }
 
         // Compute LDS layout
         FA2LDSLayout lds_layout;
@@ -637,21 +932,24 @@ namespace
         const int row_lane = tid % THREADS_PER_ROW;
         const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // Keep the maximum supported head dimension distributed evenly across
-        // the compile-time row width. Four lanes cooperate through head_dim
-        // 128, while sixteen lanes cooperate above 128. The wider large-head
-        // row cuts live output ownership from 32 to sixteen values per thread,
-        // avoiding private scratch and scalar-register spills on gfx906.
         /*
-         * Keep the slot count compile-time visible so LLVM can promote output
-         * accumulators to VGPRs instead of a per-thread private segment.  The
-         * runtime head-dimension predicate preserves every supported geometry.
+         * Size static Qwen instantiations from their exact head dimension so
+         * LLVM never reserves a 256-wide accumulator for HD64/HD128. Generic
+         * uncommon dimensions retain the maximum bound and runtime predicate.
+         * Four lanes cooperate through HD128 and sixteen lanes above it; each
+         * thread therefore owns only the output values that can be live for its
+         * compiled geometry, keeping the array in VGPRs instead of scratch.
          */
+        constexpr int COMPILED_HEAD_DIM =
+            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : 256;
         constexpr int OUTPUTS_PER_THREAD =
-            (256 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            (COMPILED_HEAD_DIM + THREADS_PER_ROW - 1) /
+            THREADS_PER_ROW;
         float O_acc[OUTPUTS_PER_THREAD];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
+        float merged_m = -FLT_MAX;
+        float merged_l = 0.0f;
 
         #pragma unroll
         for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
@@ -696,14 +994,52 @@ namespace
         }
         __syncthreads();
 
-        const int num_kv_tiles = (kv_len_runtime + kernel_tile_kv - 1) / kernel_tile_kv;
-
-        // =====================================================================
-        // Prologue: Load first KV tile
-        // =====================================================================
+        for (int context_partition = first_context_partition;
+             context_partition < live_context_partitions;
+             context_partition += context_partition_stride)
         {
-            const int kv_start = 0;
-            const int kv_end = min(kernel_tile_kv, kv_len_runtime);
+            /*
+             * A persistent physical slot may own several logical partitions.
+             * Reset only its private online-softmax tuple between them; Q stays
+             * resident in LDS and the graph launches no additional work.
+             */
+            if (thread_has_row)
+            {
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    O_acc[d_local] = 0.0f;
+                }
+                m_i = -FLT_MAX;
+                l_i = 0.0f;
+            }
+
+            const int kv_partition_begin = WRITE_CONTEXT_PARTIAL
+                                               ? context_partition *
+                                                     context_partition_size
+                                               : 0;
+            const int kv_partition_end = WRITE_CONTEXT_PARTIAL
+                                             ? min(
+                                                   kv_partition_begin +
+                                                       context_partition_size,
+                                                   kv_len_runtime)
+                                             : kv_len_runtime;
+            const int partition_kv_len =
+                max(0, kv_partition_end - kv_partition_begin);
+            const int num_kv_tiles =
+                (partition_kv_len + kernel_tile_kv - 1) /
+                kernel_tile_kv;
+
+            // =================================================================
+            // Prologue: Load the first K/V tile in this arithmetic partition.
+            // =================================================================
+            {
+            const int kv_start = kv_partition_begin;
+            const int kv_end = min(
+                kv_start + kernel_tile_kv,
+                kv_partition_end);
             const int actual_len = kv_end - kv_start;
 
             __half *K_dst = get_K_tile(0);
@@ -762,14 +1098,17 @@ namespace
             const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
-            const int kv_start = kv_tile_iter * kernel_tile_kv;
-            const int kv_end = min(kv_start + kernel_tile_kv, kv_len_runtime);
+            const int kv_start =
+                kv_partition_begin + kv_tile_iter * kernel_tile_kv;
+            const int kv_end = min(
+                kv_start + kernel_tile_kv,
+                kv_partition_end);
             const int actual_kv_len = kv_end - kv_start;
 
-            // Early exit for causal (all positions masked)
+            // Every later tile is also masked for the complete query block.
             if (causal && kv_start > (q_block_start + kernel_tile_q - 1) + position_offset_runtime)
             {
-                continue;
+                break;
             }
 
             __half *K_tile = get_K_tile(current_stage);
@@ -780,8 +1119,12 @@ namespace
             // =================================================================
             if (kv_tile_iter + 1 < num_kv_tiles)
             {
-                const int next_kv_start = (kv_tile_iter + 1) * kernel_tile_kv;
-                const int next_kv_end = min(next_kv_start + kernel_tile_kv, kv_len_runtime);
+                const int next_kv_start =
+                    kv_partition_begin +
+                    (kv_tile_iter + 1) * kernel_tile_kv;
+                const int next_kv_end = min(
+                    next_kv_start + kernel_tile_kv,
+                    kv_partition_end);
                 const int next_len = next_kv_end - next_kv_start;
 
                 __half *K_next = get_K_tile(next_stage);
@@ -1013,27 +1356,177 @@ namespace
                 m_i = m_i_new;
             }
 
+            constexpr int canonical_partition_keys =
+                llaminar2::rocm::fa2_policy::
+                    kROCmFA2CanonicalContextPartitionKeys;
+            const int maximum_visible_key =
+                q_block_start + kernel_tile_q - 1 +
+                position_offset_runtime;
+            const bool next_tile_is_causally_empty =
+                causal && kv_end > maximum_visible_key;
+
+            if constexpr (!WRITE_CONTEXT_PARTIAL)
+            {
+                const bool closes_canonical_partition =
+                    kv_end % canonical_partition_keys == 0;
+                const bool closes_scan =
+                    kv_tile_iter + 1 == num_kv_tiles ||
+                    next_tile_is_causally_empty;
+                if ((closes_canonical_partition || closes_scan) &&
+                    thread_has_row)
+                {
+                    const int global_q_row =
+                        q_block_start + local_q_row;
+                    float *O_row =
+                        O +
+                        ((static_cast<size_t>(batch_idx) * seq_len +
+                          global_q_row) *
+                             n_heads +
+                         head_idx) *
+                            static_cast<size_t>(kernel_head_dim);
+
+                    if (l_i > 0.0f)
+                    {
+                        if (!(merged_l > 0.0f))
+                        {
+                            merged_m = m_i;
+                            merged_l = l_i;
+                            #pragma unroll
+                            for (int d_local = 0;
+                                 d_local < OUTPUTS_PER_THREAD;
+                                 ++d_local)
+                            {
+                                const int d =
+                                    row_lane +
+                                    d_local * THREADS_PER_ROW;
+                                if (d < kernel_head_dim)
+                                    O_row[d] = O_acc[d_local];
+                            }
+                        }
+                        else
+                        {
+                            const float next_m =
+                                fmaxf(merged_m, m_i);
+                            const float previous_scale =
+                                fast_expf(merged_m - next_m);
+                            const float partition_scale =
+                                fast_expf(m_i - next_m);
+                            #pragma unroll
+                            for (int d_local = 0;
+                                 d_local < OUTPUTS_PER_THREAD;
+                                 ++d_local)
+                            {
+                                const int d =
+                                    row_lane +
+                                    d_local * THREADS_PER_ROW;
+                                if (d < kernel_head_dim)
+                                {
+                                    O_row[d] = merge_fa2_scaled_terms(
+                                        O_row[d],
+                                        previous_scale,
+                                        O_acc[d_local],
+                                        partition_scale);
+                                }
+                            }
+                            merged_l = merge_fa2_scaled_terms(
+                                merged_l,
+                                previous_scale,
+                                l_i,
+                                partition_scale);
+                            merged_m = next_m;
+                        }
+                    }
+
+                    if (!closes_scan)
+                    {
+                        #pragma unroll
+                        for (int d_local = 0;
+                             d_local < OUTPUTS_PER_THREAD;
+                             ++d_local)
+                        {
+                            O_acc[d_local] = 0.0f;
+                        }
+                        m_i = -FLT_MAX;
+                        l_i = 0.0f;
+                    }
+                }
+            }
+
             __syncthreads();
+            if (next_tile_is_causally_empty)
+                break;
         }
 
         // =====================================================================
-        // Write final output
+        // Publish one canonical summary or the final normalized output.
         // =====================================================================
-        float *O_batch = O + batch_idx * seq_len * n_heads * kernel_head_dim;
-
         if (thread_has_row)
         {
-            int global_q_row = q_block_start + local_q_row;
-            float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+            const int global_q_row = q_block_start + local_q_row;
+            float *O_row =
+                O +
+                ((static_cast<size_t>(batch_idx) * seq_len +
+                  global_q_row) *
+                     n_heads +
+                 head_idx) *
+                    static_cast<size_t>(kernel_head_dim);
 
-            float *O_row = O_batch + global_q_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim;
-            #pragma unroll
-            for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+            if constexpr (WRITE_CONTEXT_PARTIAL)
             {
-                const int d = row_lane + d_local * THREADS_PER_ROW;
-                if (d < kernel_head_dim)
-                    O_row[d] = O_acc[d_local] * inv_l;
+                const size_t summary_index =
+                    ((static_cast<size_t>(batch_idx) * seq_len +
+                      global_q_row) *
+                         n_heads +
+                     head_idx) *
+                        max_context_partitions +
+                    context_partition;
+                float *O_summary =
+                    O_partial +
+                    summary_index * static_cast<size_t>(kernel_head_dim);
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    const int d =
+                        row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                        O_summary[d] = O_acc[d_local];
+                }
+                if (row_lane == 0)
+                {
+                    m_partial[summary_index] = m_i;
+                    l_partial[summary_index] = l_i;
+                }
             }
+            else
+            {
+                const float inverse_l =
+                    merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    const int d =
+                        row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                    {
+                        O_row[d] = merged_l > 0.0f
+                                       ? O_row[d] * inverse_l
+                                       : 0.0f;
+                    }
+                }
+            }
+        }
+
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            // Every thread must finish consuming LDS before this persistent
+            // slot advances and reuses it for the next logical partition.
+            __syncthreads();
+        }
+        }
         }
     }
 
@@ -1892,7 +2385,7 @@ namespace
  * @return Zero after a valid launch, or -1 when geometry is unsupported or
  *         HIP reports a launch error.
  */
-template <KVTypeTag KV_TYPE>
+template <KVTypeTag KV_TYPE, bool WRITE_CONTEXT_PARTIAL = false>
 static int launch_device_resident_prefill(
     const float *Q,
     const void *K,
@@ -1911,18 +2404,35 @@ static int launch_device_resident_prefill(
     const float *mask,
     hipStream_t hip_stream,
     int head_start,
-    int gqa_n_rep)
+    int gqa_n_rep,
+    float *O_partial = nullptr,
+    float *m_partial = nullptr,
+    float *l_partial = nullptr,
+    int context_partition_size = 0,
+    int max_context_partitions = 0,
+    int context_partition_slots = 0,
+    int context_phase_block_slots = 0,
+    int device_direct_partition_limit = 0,
+    int reducer_dimension_wavefronts = 0,
+    int reducer_block_slots = 0)
 {
-    if (!Q || !K || !V || !O || batch_size <= 0 || seq_len <= 0 ||
+    if (!Q || !K || !V || !O || !hip_stream ||
+        batch_size <= 0 || seq_len <= 0 ||
         kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
         head_dim <= 0 || head_dim > 256)
     {
         printf("[launch_device_resident_prefill] Invalid pointers or geometry\n");
         return -1;
     }
-    if (n_heads % n_kv_heads != 0)
+    const bool valid_head_mapping =
+        gqa_n_rep > 0
+            ? head_start >= 0 &&
+                  static_cast<long long>(head_start) + n_heads <=
+                      static_cast<long long>(n_kv_heads) * gqa_n_rep
+            : n_heads % n_kv_heads == 0;
+    if (!valid_head_mapping)
     {
-        printf("[launch_device_resident_prefill] n_heads must be divisible by n_kv_heads\n");
+        printf("[launch_device_resident_prefill] Invalid local or replicated GQA head mapping\n");
         return -1;
     }
     if constexpr (KV_TYPE == KVTypeTag::Q8_1)
@@ -1934,73 +2444,134 @@ static int launch_device_resident_prefill(
         }
     }
 
-    struct TileCandidate
+    if constexpr (WRITE_CONTEXT_PARTIAL)
     {
-        int q;
-        int kv;
-    };
-
-    // Larger tile area wins; ties prefer more query rows so a K/V tile is
-    // reused by more work.  The 32x16 and 16x16 candidates keep head_dim 256
-    // comfortably below MI50's 64 KiB LDS limit.
-    constexpr TileCandidate candidates[] = {
-        {64, 64},
-        {64, 32},
-        {32, 64},
-        {32, 32},
-        {32, 16},
-        {16, 32},
-        {16, 16},
-        {8, 16},
-        {8, 8},
-    };
-
-    constexpr int THREADS_PER_BLOCK = 256;
-    const int threads_per_row = head_dim <= 128 ? 4 : 16;
-    const int max_tile_q = THREADS_PER_BLOCK / threads_per_row;
-    int tile_q = -1;
-    int tile_kv = -1;
-    int best_area = -1;
-    FA2LDSLayout lds_layout{};
-
-    for (const auto &candidate : candidates)
-    {
-        if (candidate.q > max_tile_q)
-            continue;
-
-        FA2LDSLayout candidate_layout;
-        candidate_layout.compute(head_dim, candidate.q, candidate.kv);
-        if (candidate_layout.total_size > LDS_SIZE_BYTES)
-            continue;
-
-        const int area = candidate.q * candidate.kv;
-        if (area > best_area || (area == best_area && candidate.q > tile_q))
+        const int expected_partitions =
+            (kv_len +
+             llaminar2::rocm::fa2_policy::
+                 kROCmFA2CanonicalContextPartitionKeys -
+             1) /
+            llaminar2::rocm::fa2_policy::
+                kROCmFA2CanonicalContextPartitionKeys;
+        if (!O_partial || !m_partial || !l_partial || !device_params ||
+            context_partition_size !=
+                llaminar2::rocm::fa2_policy::
+                    kROCmFA2CanonicalContextPartitionKeys ||
+            max_context_partitions != expected_partitions ||
+            context_partition_slots <= 0 ||
+            context_partition_slots > max_context_partitions ||
+            context_phase_block_slots <= 0 ||
+            device_direct_partition_limit <= 0 ||
+            device_direct_partition_limit > max_context_partitions ||
+            (reducer_dimension_wavefronts != 1 &&
+             reducer_dimension_wavefronts != 2 &&
+             reducer_dimension_wavefronts != 4))
         {
-            tile_q = candidate.q;
-            tile_kv = candidate.kv;
-            best_area = area;
-            lds_layout = candidate_layout;
+            printf("[launch_device_resident_prefill] Invalid context transaction geometry\n");
+            return -1;
+        }
+        constexpr int wavefronts_per_block =
+            llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock /
+            llaminar2::rocm::fa2_policy::kROCmFA2WavefrontSize;
+        const int rows_per_block =
+            wavefronts_per_block / reducer_dimension_wavefronts;
+        const long long logical_reducer_blocks =
+            static_cast<long long>(batch_size) * n_heads *
+            ((static_cast<long long>(seq_len) + rows_per_block - 1) /
+             rows_per_block);
+        if (logical_reducer_blocks <= 0 ||
+            logical_reducer_blocks > std::numeric_limits<int>::max() ||
+            reducer_block_slots <= 0 ||
+            reducer_block_slots > logical_reducer_blocks)
+        {
+            printf("[launch_device_resident_prefill] Invalid persistent reducer grid\n");
+            return -1;
         }
     }
 
-    if (best_area < 0)
+    const auto tile_plan =
+        llaminar2::rocm::fa2_policy::selectROCmFA2Tile(
+            head_dim,
+            LDS_SIZE_BYTES);
+    if (!tile_plan.valid)
     {
         printf("[launch_device_resident_prefill] No LDS tile fits head_dim=%d\n", head_dim);
+        return -1;
+    }
+    const int tile_q = tile_plan.query_rows;
+    const int tile_kv = tile_plan.kv_rows;
+    const int threads_per_row = tile_plan.threads_per_row;
+    FA2LDSLayout lds_layout{};
+    lds_layout.compute(head_dim, tile_q, tile_kv);
+    if (static_cast<size_t>(lds_layout.total_size) != tile_plan.lds_bytes)
+    {
+        printf("[launch_device_resident_prefill] Policy/kernel LDS layout mismatch\n");
         return -1;
     }
 
     const float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
-    const dim3 grid(n_heads, num_q_tiles, batch_size);
-    const dim3 block(THREADS_PER_BLOCK);
+    if constexpr (WRITE_CONTEXT_PARTIAL)
+    {
+        /*
+         * Capture the exact direct schedule before the partition transaction.
+         * Its kernel reads the same device-owned live length and returns before
+         * touching output when that length exceeds the immutable direct span.
+         * The following phase and reducer apply the opposite predicate. This
+         * three-node transaction gives HIP conditional execution without host
+         * dispatch, graph recapture, atomics, or a merged high-register kernel.
+         */
+        const int direct_status =
+            launch_device_resident_prefill<KV_TYPE, false>(
+                Q, K, V, O,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                causal, window_size, position_offset,
+                device_params, mask,
+                hip_stream,
+                head_start, gqa_n_rep,
+                nullptr, nullptr, nullptr,
+                0,
+                max_context_partitions,
+                0,
+                0,
+                device_direct_partition_limit,
+                0,
+                0);
+        if (direct_status != 0)
+        {
+            printf("[launch_device_resident_prefill] Guarded direct launch failed\n");
+            return -1;
+        }
+
+        const long long logical_phase_blocks =
+            static_cast<long long>(batch_size) * n_heads * num_q_tiles *
+            context_partition_slots;
+        if (logical_phase_blocks <= 0 ||
+            logical_phase_blocks > std::numeric_limits<int>::max() ||
+            context_phase_block_slots > logical_phase_blocks)
+        {
+            printf("[launch_device_resident_prefill] Invalid persistent context phase grid\n");
+            return -1;
+        }
+    }
+    const dim3 grid(
+        WRITE_CONTEXT_PARTIAL
+            ? context_phase_block_slots
+            : n_heads,
+        WRITE_CONTEXT_PARTIAL ? 1 : num_q_tiles,
+        WRITE_CONTEXT_PARTIAL ? 1 : batch_size);
+    const dim3 block(
+        llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock);
 
     // Discard an error left by an earlier asynchronous operation before the
     // launch, then report only the status produced by this kernel.
     (void)hipGetLastError();
-    if (threads_per_row == 4)
+    if (head_dim == 64 && tile_q == 64 && tile_kv == 64)
     {
         hipLaunchKernelGGL(
-            (flash_attention_2_mi50_kernel<KV_TYPE, 4>),
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 64, 64, 64, WRITE_CONTEXT_PARTIAL>),
             grid, block, lds_layout.total_size, hip_stream,
             Q, K, V, O,
             batch_size, seq_len, kv_len,
@@ -2008,12 +2579,56 @@ static int launch_device_resident_prefill(
             softmax_scale, causal, window_size, position_offset,
             device_params, mask,
             tile_q, tile_kv,
-            head_start, gqa_n_rep);
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else if (head_dim == 128 && tile_q == 64 && tile_kv == 32)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 128, 64, 32, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else if (threads_per_row == 4)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 0, 0, 0, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
     }
     else if (head_dim == 256 && tile_q == 16 && tile_kv == 16)
     {
         hipLaunchKernelGGL(
-            (flash_attention_2_mi50_kernel<KV_TYPE, 16, 256, 16, 16>),
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 16, 256, 16, 16, WRITE_CONTEXT_PARTIAL>),
             grid, block, lds_layout.total_size, hip_stream,
             Q, K, V, O,
             batch_size, seq_len, kv_len,
@@ -2021,12 +2636,18 @@ static int launch_device_resident_prefill(
             softmax_scale, causal, window_size, position_offset,
             device_params, mask,
             tile_q, tile_kv,
-            head_start, gqa_n_rep);
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
     }
     else
     {
         hipLaunchKernelGGL(
-            (flash_attention_2_mi50_kernel<KV_TYPE, 16>),
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 16, 0, 0, 0, WRITE_CONTEXT_PARTIAL>),
             grid, block, lds_layout.total_size, hip_stream,
             Q, K, V, O,
             batch_size, seq_len, kv_len,
@@ -2034,15 +2655,65 @@ static int launch_device_resident_prefill(
             softmax_scale, causal, window_size, position_offset,
             device_params, mask,
             tile_q, tile_kv,
-            head_start, gqa_n_rep);
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
     }
 
-    const hipError_t error = hipGetLastError();
+    hipError_t error = hipGetLastError();
     if (error != hipSuccess)
     {
         printf("[launch_device_resident_prefill] Kernel launch failed: %s\n",
                hipGetErrorString(error));
         return -1;
+    }
+
+    if constexpr (WRITE_CONTEXT_PARTIAL)
+    {
+        const dim3 reducer_grid(reducer_block_slots);
+        if (reducer_dimension_wavefronts == 1)
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<1>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        else if (reducer_dimension_wavefronts == 2)
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<2>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<4>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        error = hipGetLastError();
+        if (error != hipSuccess)
+        {
+            printf("[launch_device_resident_prefill] Context reducer launch failed: %s\n",
+                   hipGetErrorString(error));
+            return -1;
+        }
     }
     return 0;
 }
@@ -2439,6 +3110,168 @@ extern "C"
             device_params, mask,
             static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch captured context-parallel FA2 over an FP32 K/V cache.
+     *
+     * The guarded direct kernel, guarded phase, and guarded reducer are
+     * submitted to the same explicit stream and therefore captured as one
+     * ordered, device-owned transaction.
+     */
+    int hipFlashAttn_prefill_fa2_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::FP32,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native FP16 K/V. */
+    int hipFlashAttn_prefill_fa2_fp16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::FP16,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native BF16 K/V. */
+    int hipFlashAttn_prefill_fa2_bf16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::BF16,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native Q8_1 K/V. */
+    int hipFlashAttn_prefill_fa2_q8_1_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::Q8_1,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
     }
 
     /**

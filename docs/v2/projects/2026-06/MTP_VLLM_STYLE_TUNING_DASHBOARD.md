@@ -502,6 +502,40 @@ verifier operation-equivalence matrix remains green on both CUDA and ROCm for
 M=1..4, the first production transaction/publication, and the M=6
 resident-sidecar device target.
 
+The 2026-08-08 ROCm FA2 policy slice installs the same explicit
+query-sequence/K/V-context capture-time choice used by CUDA. Its complete
+2,040-domain Qwen catalog covers every released dense/MoE attention geometry,
+legal TP=1/2/4/8 split, tuned context horizons through 128K, and the production
+head-dimension envelope. Mean regret is `0.371%`, maximum regret is `2.663%`,
+and no catalog domain exceeds 5%. The independent phase-grid tournament
+selected 60 resident phase blocks and retained a `3.387%` maximum regret.
+`rocprof`/ISA evidence for
+the installed kernels reports zero scratch: HD128 direct and phase use 68
+VGPRs, HD256 phase uses 80 VGPRs, and the ordered reducer uses 32 VGPRs.
+
+Timing exploration remains capped at 128K, but correctness and capacity do
+not. Device-free CUDA/ROCm policy regressions exhaust every positive capacity
+through one million and prove extremal dispatch totality through `INT_MAX`.
+Real captured 256K transactions then prove CUDA direct/context byte equality
+for both compiled native K/V types (FP16 and FP32), and ROCm direct/context
+equality for FP32, FP16, BF16, and Q8_1 K/V storage. This exposed a
+non-monotonic arena-sizing defect:
+the largest M selected direct query execution and declared no partial
+workspace, while an intermediate M selected context execution and needed the
+family maximum. The ROCm launch policy now computes the complete family
+workspace envelope before capture; runtime rebinding or allocation is not used.
+
+The linked Release Qwen3.6-35B ROCm1 server cell subsequently passed `19/19`
+again at fixed MTP depth 3 and the full long-context tier, producing `3,842`
+PerfStats records with clean shutdown and complete VRAM release. Every FA2
+capture requested `geometry_selected`: M=256 selected the actual context graph
+with 60 phase blocks and 1,024 reducer blocks, while M=1,536/2,048/4,096 selected
+query-sequence execution. The server gate now rejects a legacy query-only ROCm
+request policy or malformed/missing per-backend FA2 capture evidence.
+The complete Integration target set rebuilt cleanly, and the final device-free
+unit/source-policy checkpoint passed `593/593` after synchronizing the stale
+CUDA MoE router boundary regression with its installed measured overlay.
+
 The llama.cpp CLI command below intentionally receives the unwrapped source
 file because `--conversation` applies the GGUF chat template itself. Its
 effective 434-token prompt is byte-equivalent to Llaminar's checked-in

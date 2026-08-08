@@ -48,6 +48,27 @@ namespace llaminar2
 
     namespace rocm
     {
+        namespace fa2_policy
+        {
+            struct ROCmFA2PhysicalDeviceProperties;
+        }
+
+        /**
+         * @brief Query immutable ROCm properties used by FA2 graph planning.
+         *
+         * This backend boundary deliberately returns a runtime-neutral policy
+         * type. Callers that also compile CUDA support therefore never need to
+         * include HIP headers in the same translation unit as CUDA headers.
+         * Invalid device ordinals and failed property queries are fatal because
+         * capture must never guess a launch geometry.
+         *
+         * @param device_idx Participant-local HIP device ordinal.
+         * @return Valid compute-unit and per-workgroup LDS capacities.
+         * @throws std::runtime_error when HIP cannot provide exact properties.
+         */
+        [[nodiscard]] fa2_policy::ROCmFA2PhysicalDeviceProperties
+        queryROCmFlashAttentionDeviceProperties(int device_idx);
+
         // =============================================================================
         // Attention Workspace Buffer Names
         // =============================================================================

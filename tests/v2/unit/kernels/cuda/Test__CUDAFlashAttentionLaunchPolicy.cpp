@@ -14,6 +14,8 @@
 #include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
 
 #include <array>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -530,6 +532,109 @@ namespace
                          .kv_capacity = 0,
                          .sm_count = 82,
                      }).valid);
+    }
+
+    /**
+     * @brief Prove context-capacity totality beyond the measured 128K corpus.
+     *
+     * CUDA timing tournaments deliberately stop at 128K. Capture planning and
+     * arena arithmetic remain generic: the test exhausts every capacity through
+     * one million and then checks the final positive `int` boundaries. The 256K
+     * cell checks exact summary bytes so a truncated workspace cannot pass on
+     * policy labels alone.
+     */
+    TEST(
+        CUDAFlashAttentionLaunchPolicy,
+        PositiveContextCapacityTotalityIncludesExact256KWorkspace)
+    {
+        for (int capacity = 1; capacity <= 1048576; ++capacity)
+        {
+            const auto plan = selectFA2PrefillParallelPlan({
+                .batch_size = 1,
+                .query_rows = 64,
+                .local_query_heads = 2,
+                .head_dim = 64,
+                .kv_capacity = capacity,
+                .sm_count = 82,
+                .requested_axis =
+                    AttentionPrefillParallelAxis::GeometrySelected,
+            });
+            const bool context_is_total =
+                capacity <= 256
+                    ? !plan.usesContextParallelism()
+                    : plan.usesContextParallelism() &&
+                          plan.partial_output_bytes > 0 &&
+                          plan.partial_m_bytes > 0 &&
+                          plan.partial_l_bytes > 0;
+            if (!plan.valid || plan.query_grid_blocks <= 0 ||
+                !context_is_total)
+            {
+                ADD_FAILURE()
+                    << "CUDA FA2 policy has a positive-capacity hole at "
+                    << capacity;
+                break;
+            }
+        }
+
+        constexpr std::array capacities{
+            std::numeric_limits<int>::max() - 255,
+            std::numeric_limits<int>::max(),
+        };
+
+        for (const int capacity : capacities)
+        {
+            SCOPED_TRACE("capacity=" + std::to_string(capacity));
+            const auto plan = selectFA2PrefillParallelPlan({
+                .batch_size = 1,
+                .query_rows = 64,
+                .local_query_heads = 2,
+                .head_dim = 64,
+                .kv_capacity = capacity,
+                .sm_count = 82,
+                .requested_axis =
+                    AttentionPrefillParallelAxis::GeometrySelected,
+            });
+            ASSERT_TRUE(plan.valid);
+            EXPECT_GT(plan.query_grid_blocks, 0);
+            if (capacity <= 256)
+            {
+                EXPECT_FALSE(plan.usesContextParallelism());
+                continue;
+            }
+
+            ASSERT_TRUE(plan.usesContextParallelism());
+            EXPECT_EQ(
+                plan.max_context_partitions,
+                static_cast<int>(
+                    (static_cast<std::int64_t>(capacity) + 255) / 256));
+            EXPECT_GT(plan.partial_output_bytes, 0U);
+            EXPECT_GT(plan.partial_m_bytes, 0U);
+            EXPECT_EQ(plan.partial_m_bytes, plan.partial_l_bytes);
+        }
+
+        constexpr std::size_t kRows = 64;
+        constexpr std::size_t kHeads = 2;
+        constexpr std::size_t kPartitions = 1024;
+        constexpr std::size_t kHeadDim = 64;
+        const auto context_256k = selectFA2PrefillParallelPlan({
+            .batch_size = 1,
+            .query_rows = static_cast<int>(kRows),
+            .local_query_heads = static_cast<int>(kHeads),
+            .head_dim = static_cast<int>(kHeadDim),
+            .kv_capacity = 262144,
+            .sm_count = 82,
+            .requested_axis =
+                AttentionPrefillParallelAxis::GeometrySelected,
+        });
+        ASSERT_TRUE(context_256k.valid);
+        ASSERT_TRUE(context_256k.usesContextParallelism());
+        EXPECT_EQ(context_256k.max_context_partitions, 1024);
+        EXPECT_EQ(
+            context_256k.partial_output_bytes,
+            kRows * kHeads * kPartitions * kHeadDim * sizeof(float));
+        EXPECT_EQ(
+            context_256k.partial_m_bytes,
+            kRows * kHeads * kPartitions * sizeof(float));
     }
 
     TEST(CUDAFlashAttentionLaunchPolicy, ReducerDimensionPolicyIsTotalAndFailClosed)

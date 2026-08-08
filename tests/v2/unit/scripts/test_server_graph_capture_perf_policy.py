@@ -22,6 +22,9 @@ from graph_capture_perf_policy import (  # noqa: E402
     device_kinds_for_cell,
     validate_graph_capture_policy,
 )
+from flash_attention_perf_policy import (  # noqa: E402
+    validate_flash_attention_plan_policy,
+)
 from gpu_host_transfer_perf_policy import (  # noqa: E402
     validate_gpu_host_transfer_policy,
 )
@@ -90,6 +93,117 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 self.fail(
                     f"embedded Python heredoc {index} is invalid: {error}"
                 )
+
+    def test_flash_attention_policy_accepts_rocm_query_and_context_plans(
+        self,
+    ) -> None:
+        """ROCm capture inventory authenticates both three-node plan shapes."""
+
+        common_tags = {
+            "requested_axis": "geometry_selected",
+            "batch_size": "1",
+            "query_rows": "64",
+            "local_query_heads": "16",
+            "head_dim": "128",
+            "kv_capacity": "8192",
+            "query_grid_blocks": "64",
+            "tile_q": "16",
+            "tile_kv": "32",
+            "kv_storage": "FP16",
+        }
+        query = counter(
+            "rocm_fa2_parallel_plan_selections",
+            domain="gpu_graph_inventory",
+            device="rocm:0",
+            tags=common_tags
+            | {
+                "selected_axis": "query_sequence",
+                "context_partitions": "0",
+                "context_partition_slots": "0",
+                "context_phase_block_slots": "0",
+                "device_direct_partition_limit": "0",
+                "reducer_dimension_wavefronts": "0",
+                "reducer_block_slots": "0",
+            },
+        ) | {"phase": "capture_setup"}
+        context = counter(
+            "rocm_fa2_parallel_plan_selections",
+            domain="gpu_graph_inventory",
+            device="rocm:0",
+            tags=common_tags
+            | {
+                "selected_axis": "key_value_context",
+                "context_partitions": "32",
+                "context_partition_slots": "32",
+                "context_phase_block_slots": "60",
+                "device_direct_partition_limit": "1",
+                "reducer_dimension_wavefronts": "4",
+                "reducer_block_slots": "896",
+            },
+        ) | {"phase": "capture_setup"}
+
+        result = validate_flash_attention_plan_policy(
+            [query, context],
+            "rocm:0",
+            "",
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.expected_backends, frozenset({"rocm"}))
+        self.assertEqual(result.observed_backends, frozenset({"rocm"}))
+        self.assertEqual(result.plan_count, 2)
+        self.assertEqual(
+            result.selected_modes,
+            frozenset({"query_sequence", "key_value_context"}),
+        )
+
+    def test_flash_attention_policy_rejects_legacy_query_only_request(
+        self,
+    ) -> None:
+        """A graph that pins the retired backend policy fails closed."""
+
+        record = counter(
+            "rocm_fa2_parallel_plan_selections",
+            domain="gpu_graph_inventory",
+            device="rocm:0",
+            tags={
+                "requested_axis": "query_sequence",
+                "selected_axis": "query_sequence",
+                "batch_size": "1",
+                "query_rows": "256",
+                "local_query_heads": "16",
+                "head_dim": "256",
+                "kv_capacity": "4096",
+                "query_grid_blocks": "256",
+                "context_partitions": "0",
+                "context_partition_slots": "0",
+                "context_phase_block_slots": "0",
+                "device_direct_partition_limit": "0",
+                "reducer_dimension_wavefronts": "0",
+                "reducer_block_slots": "0",
+                "tile_q": "16",
+                "tile_kv": "16",
+                "kv_storage": "FP16",
+            },
+        ) | {"phase": "capture_setup"}
+
+        result = validate_flash_attention_plan_policy(
+            [record],
+            "rocm:0",
+            "",
+        )
+        self.assertIn("geometry-selected", result.error or "")
+
+    def test_flash_attention_policy_requires_every_declared_gpu_backend(
+        self,
+    ) -> None:
+        """A mixed CUDA/ROCm graph cannot omit one backend's FA2 evidence."""
+
+        result = validate_flash_attention_plan_policy(
+            [],
+            "pp",
+            "--define-domain mixed=cuda:0,rocm:0",
+        )
+        self.assertIn("cuda, rocm", result.error or "")
 
     def test_gpu_host_transfer_policy_accepts_only_response_materialization(
         self,

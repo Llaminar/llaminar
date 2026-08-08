@@ -159,6 +159,37 @@ extern "C"
         int head_start,
         int gqa_n_rep);
 
+    /** @brief Launch fixed K/V partitions over native FP32 cache storage. */
+    int cudaFlashAttn_prefill_fa2_context_parallel(
+        const float *Q,
+        const float *K,
+        const float *V,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int batch_size,
+        int seq_len,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
+
     /** @brief Launch fixed K/V partitions as one context-parallel grid. */
     int cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(
         const float *Q,
@@ -2819,11 +2850,14 @@ TEST_F(Test__CUDAFlashAttentionParity, FA2QueryPartitions_AllHeadDimsAndTPMappin
  * kernel specialization and one shared ascending reducer.  This matrix uses
  * nonzero randomized tensors across HD64/128/256, sharded and replicated GQA,
  * partition tails, causal boundaries, sliding windows, and an additive mask.
- * All three complete captured outputs must match byte-for-byte.  The direct
- * transaction performs the same fixed-partition arithmetic locally, while the
- * sequence and context schedules externalize those summaries before the same
- * ordered merge.  Requiring byte identity here prevents capture-time scheduling
- * policy from changing model math.
+ * Compact cases require all three complete captured outputs to match
+ * byte-for-byte. The direct transaction performs the same fixed-partition
+ * arithmetic locally, while the sequence and context schedules externalize
+ * those summaries before the same ordered merge. Dedicated 256K cases compare
+ * the real direct and context-grid transactions for both compiled native CUDA
+ * K/V types, FP16 and FP32, without constructing a 1,025-node diagnostic
+ * sequence graph. Requiring byte identity prevents capture-time scheduling
+ * policy from changing model math at or beyond the measured 128K horizon.
  */
 TEST_F(
     Test__CUDAFlashAttentionParity,
@@ -2844,9 +2878,12 @@ TEST_F(
         int context_partition_size;
         int window_size;
         bool use_additive_mask;
+        bool sweep_physical_candidates = true;
+        bool capture_partitioned_sequence = true;
+        bool use_fp32_kv = false;
     };
 
-    constexpr std::array<ContextCase, 4> cases{{
+    constexpr std::array<ContextCase, 6> cases{{
         {"HD64 sharded partition tail", 17, 257, 14, 2, 64,
          0, 0, 256, -1, false},
         {"HD128 replicated TP4 window", 33, 513, 3, 2, 128,
@@ -2855,6 +2892,20 @@ TEST_F(
          0, 0, 256, -1, true},
         {"HD256 replicated TP8 rank7", 16, 1025, 2, 2, 256,
          14, 8, 256, -1, false},
+        // Keep the tuning corpus bounded at 128K while proving that the real
+        // captured direct and context-parallel transactions remain byte-exact
+        // at the 256K production capacity boundary.  The compact cases above
+        // exhaustively cross physical slot/reducer candidates; repeating that
+        // Cartesian sweep here would add no new arithmetic coverage.
+        {"HD64 256K FP16 capacity totality", 17, 262144, 1, 1, 64,
+         0, 0, 256, -1, false,
+         /*sweep_physical_candidates=*/false,
+         /*capture_partitioned_sequence=*/false},
+        {"HD64 256K FP32 capacity totality", 17, 262144, 1, 1, 64,
+         0, 0, 256, -1, false,
+         /*sweep_physical_candidates=*/false,
+         /*capture_partitioned_sequence=*/false,
+         /*use_fp32_kv=*/true},
     }};
 
     if (!attention_stream_)
@@ -2872,6 +2923,11 @@ TEST_F(
     for (const ContextCase &test_case : cases)
     {
         SCOPED_TRACE(test_case.label);
+        ASSERT_FALSE(
+            test_case.use_fp32_kv &&
+            test_case.capture_partitioned_sequence)
+            << "CUDA has no FP32 diagnostic sequence-node entrypoint; native "
+               "FP32 must use the production context-grid transaction";
         const int context_partitions =
             (test_case.kv_len + test_case.context_partition_size - 1) /
             test_case.context_partition_size;
@@ -2935,8 +2991,11 @@ TEST_F(
         ScopedCUDAAllocation d_partial_l;
         ScopedCUDAAllocation d_mask;
         ASSERT_TRUE(d_q.allocate(output_elements * sizeof(float)));
-        ASSERT_TRUE(d_k.allocate(kv_elements * sizeof(uint16_t)));
-        ASSERT_TRUE(d_v.allocate(kv_elements * sizeof(uint16_t)));
+        const size_t kv_element_bytes = test_case.use_fp32_kv
+                                            ? sizeof(float)
+                                            : sizeof(uint16_t);
+        ASSERT_TRUE(d_k.allocate(kv_elements * kv_element_bytes));
+        ASSERT_TRUE(d_v.allocate(kv_elements * kv_element_bytes));
         ASSERT_TRUE(d_direct_output.allocate(output_elements * sizeof(float)));
         ASSERT_TRUE(d_sequence_output.allocate(output_elements * sizeof(float)));
         ASSERT_TRUE(d_context_output.allocate(output_elements * sizeof(float)));
@@ -2956,14 +3015,20 @@ TEST_F(
             cudaSuccess);
         ASSERT_EQ(
             cudaMemcpyAsync(
-                d_k.get(), k_fp16.data(),
-                kv_elements * sizeof(uint16_t),
+                d_k.get(),
+                test_case.use_fp32_kv
+                    ? static_cast<const void *>(k_source.data())
+                    : static_cast<const void *>(k_fp16.data()),
+                kv_elements * kv_element_bytes,
                 cudaMemcpyHostToDevice, attention_stream_),
             cudaSuccess);
         ASSERT_EQ(
             cudaMemcpyAsync(
-                d_v.get(), v_fp16.data(),
-                kv_elements * sizeof(uint16_t),
+                d_v.get(),
+                test_case.use_fp32_kv
+                    ? static_cast<const void *>(v_source.data())
+                    : static_cast<const void *>(v_fp16.data()),
+                kv_elements * kv_element_bytes,
                 cudaMemcpyHostToDevice, attention_stream_),
             cudaSuccess);
         if (test_case.use_additive_mask)
@@ -2984,6 +3049,45 @@ TEST_F(
                 int reducer_dimension_warps = 0,
                 int context_partition_slots = 0) -> int
         {
+            const int selected_partition_slots =
+                context_partition_slots > 0
+                    ? context_partition_slots
+                    : context_partitions;
+            if (test_case.use_fp32_kv)
+            {
+                if (!context_parallel)
+                    return -1;
+                return cudaFlashAttn_prefill_fa2_context_parallel(
+                    d_q.as<float>(),
+                    d_k.as<float>(),
+                    d_v.as<float>(),
+                    d_context_output.as<float>(),
+                    d_partial_output.as<float>(),
+                    d_partial_m.as<float>(),
+                    d_partial_l.as<float>(),
+                    /*batch_size=*/1,
+                    test_case.seq_len,
+                    test_case.kv_len,
+                    test_case.n_heads,
+                    test_case.n_kv_heads,
+                    test_case.head_dim,
+                    /*causal=*/true,
+                    test_case.window_size,
+                    test_case.kv_len - test_case.seq_len,
+                    /*device_params=*/nullptr,
+                    mask,
+                    test_case.context_partition_size,
+                    context_partitions,
+                    selected_partition_slots,
+                    /*device_direct_partition_limit=*/0,
+                    reducer_dimension_warps,
+                    /*capture_conditional=*/nullptr,
+                    static_cast<void *>(attention_stream_),
+                    cuda_ordinal_,
+                    test_case.head_start,
+                    test_case.replicated_gqa_n_rep);
+            }
+
             auto launcher = context_parallel
                                 ? cudaFlashAttn_prefill_fa2_fp16kv_context_parallel
                                 : cudaFlashAttn_prefill_fa2_fp16kv_partitioned_sequence;
@@ -3010,9 +3114,7 @@ TEST_F(
                 mask,
                 test_case.context_partition_size,
                 context_partitions,
-                context_partition_slots > 0
-                    ? context_partition_slots
-                    : context_partitions,
+                selected_partition_slots,
                 /*device_direct_partition_limit=*/0,
                 reducer_dimension_warps,
                 /*capture_conditional=*/nullptr,
@@ -3024,9 +3126,35 @@ TEST_F(
 
         // Prime every specialization and retain the ordinary direct result as
         // an independent semantic comparison outside the canonical byte gate.
-        ASSERT_EQ(
-            cudaFlashAttn_prefill_fa2_fp16kv(
-                d_q.as<float>(), d_k.get(), d_v.get(),
+        const auto launch_direct = [&]() -> int
+        {
+            if (test_case.use_fp32_kv)
+            {
+                return cudaFlashAttn_prefill_fa2(
+                    d_q.as<float>(),
+                    d_k.as<float>(),
+                    d_v.as<float>(),
+                    d_direct_output.as<float>(),
+                    /*batch_size=*/1,
+                    test_case.seq_len,
+                    test_case.kv_len,
+                    test_case.n_heads,
+                    test_case.n_kv_heads,
+                    test_case.head_dim,
+                    /*causal=*/true,
+                    test_case.window_size,
+                    test_case.kv_len - test_case.seq_len,
+                    /*device_params=*/nullptr,
+                    mask,
+                    static_cast<void *>(attention_stream_),
+                    cuda_ordinal_,
+                    test_case.head_start,
+                    test_case.replicated_gqa_n_rep);
+            }
+            return cudaFlashAttn_prefill_fa2_fp16kv(
+                d_q.as<float>(),
+                d_k.get(),
+                d_v.get(),
                 d_direct_output.as<float>(),
                 /*batch_size=*/1,
                 test_case.seq_len,
@@ -3042,9 +3170,13 @@ TEST_F(
                 static_cast<void *>(attention_stream_),
                 cuda_ordinal_,
                 test_case.head_start,
-                test_case.replicated_gqa_n_rep),
-            0);
-        ASSERT_EQ(launch_canonical(/*context_parallel=*/false), 0);
+                test_case.replicated_gqa_n_rep);
+        };
+        ASSERT_EQ(launch_direct(), 0);
+        if (test_case.capture_partitioned_sequence)
+        {
+            ASSERT_EQ(launch_canonical(/*context_parallel=*/false), 0);
+        }
         ASSERT_EQ(launch_canonical(/*context_parallel=*/true), 0);
         ASSERT_EQ(cudaStreamSynchronize(attention_stream_), cudaSuccess);
 
@@ -3092,13 +3224,16 @@ TEST_F(
                     : static_cast<size_t>(context_partitions + 1));
         };
 
-        capture_transaction(
-            /*context_parallel=*/false,
-            /*reducer_dimension_warps=*/0,
-            /*context_partition_slots=*/context_partitions,
-            &sequence_graph,
-            &sequence_exec);
-        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        if (test_case.capture_partitioned_sequence)
+        {
+            capture_transaction(
+                /*context_parallel=*/false,
+                /*reducer_dimension_warps=*/0,
+                /*context_partition_slots=*/context_partitions,
+                &sequence_graph,
+                &sequence_exec);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        }
         capture_transaction(
             /*context_parallel=*/true,
             /*reducer_dimension_warps=*/0,
@@ -3107,7 +3242,10 @@ TEST_F(
             &context_exec);
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
 
-        ASSERT_EQ(cudaGraphLaunch(sequence_exec, attention_stream_), cudaSuccess);
+        if (test_case.capture_partitioned_sequence)
+        {
+            ASSERT_EQ(cudaGraphLaunch(sequence_exec, attention_stream_), cudaSuccess);
+        }
         ASSERT_EQ(cudaGraphLaunch(context_exec, attention_stream_), cudaSuccess);
 
         std::vector<float> direct_output(output_elements);
@@ -3119,12 +3257,15 @@ TEST_F(
                 output_elements * sizeof(float),
                 cudaMemcpyDeviceToHost, attention_stream_),
             cudaSuccess);
-        ASSERT_EQ(
-            cudaMemcpyAsync(
-                sequence_output.data(), d_sequence_output.get(),
-                output_elements * sizeof(float),
-                cudaMemcpyDeviceToHost, attention_stream_),
-            cudaSuccess);
+        if (test_case.capture_partitioned_sequence)
+        {
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    sequence_output.data(), d_sequence_output.get(),
+                    output_elements * sizeof(float),
+                    cudaMemcpyDeviceToHost, attention_stream_),
+                cudaSuccess);
+        }
         ASSERT_EQ(
             cudaMemcpyAsync(
                 context_output.data(), d_context_output.get(),
@@ -3133,11 +3274,14 @@ TEST_F(
             cudaSuccess);
         ASSERT_EQ(cudaStreamSynchronize(attention_stream_), cudaSuccess);
 
-        EXPECT_TRUE(expectBitwiseEqualFP32Rows(
-            context_output.data(),
-            sequence_output.data(),
-            output_elements,
-            test_case.label));
+        if (test_case.capture_partitioned_sequence)
+        {
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                context_output.data(),
+                sequence_output.data(),
+                output_elements,
+                test_case.label));
+        }
         EXPECT_TRUE(expectBitwiseEqualFP32Rows(
             context_output.data(),
             direct_output.data(),
@@ -3149,6 +3293,18 @@ TEST_F(
         // element. Crossing the complete small-capacity slot range with every
         // reducer candidate proves that a CTA may process several strided
         // partitions without changing bytes or leaving stale summaries live.
+        if (!test_case.sweep_physical_candidates)
+        {
+            ASSERT_EQ(cudaGraphExecDestroy(context_exec), cudaSuccess);
+            ASSERT_EQ(cudaGraphDestroy(context_graph), cudaSuccess);
+            if (test_case.capture_partitioned_sequence)
+            {
+                ASSERT_EQ(cudaGraphExecDestroy(sequence_exec), cudaSuccess);
+                ASSERT_EQ(cudaGraphDestroy(sequence_graph), cudaSuccess);
+            }
+            continue;
+        }
+
         const int maximum_reducer_warps =
             llaminar2::cuda::fa2_policy::
                 maximumFA2ReducerDimensionWarps(test_case.head_dim);
@@ -3208,8 +3364,11 @@ TEST_F(
 
         ASSERT_EQ(cudaGraphExecDestroy(context_exec), cudaSuccess);
         ASSERT_EQ(cudaGraphDestroy(context_graph), cudaSuccess);
-        ASSERT_EQ(cudaGraphExecDestroy(sequence_exec), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(sequence_graph), cudaSuccess);
+        if (test_case.capture_partitioned_sequence)
+        {
+            ASSERT_EQ(cudaGraphExecDestroy(sequence_exec), cudaSuccess);
+            ASSERT_EQ(cudaGraphDestroy(sequence_graph), cudaSuccess);
+        }
     }
 }
 

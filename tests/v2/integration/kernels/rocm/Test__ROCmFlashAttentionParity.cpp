@@ -44,11 +44,15 @@
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "kernels/attention/AttentionDeviceParams.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #endif
@@ -62,11 +66,117 @@
 #include <iomanip>
 #include <limits>
 #include <cstring>
+#include <cstdlib>
 
 using namespace llaminar2;
 
+#ifdef HAVE_ROCM
+extern "C"
+{
+    /** @brief Launch the direct MI50 FA2 schedule over FP32 K/V. */
+    int hipFlashAttn_prefill_fa2(
+        const float *Q, const float *K, const float *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask, void *stream, int head_start, int gqa_n_rep);
+
+    /** @brief Launch the direct MI50 FA2 schedule over FP16 K/V. */
+    int hipFlashAttn_prefill_fa2_fp16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask, void *stream, int head_start, int gqa_n_rep);
+
+    /** @brief Launch the direct MI50 FA2 schedule over BF16 K/V. */
+    int hipFlashAttn_prefill_fa2_bf16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask, void *stream, int head_start, int gqa_n_rep);
+
+    /** @brief Launch the direct MI50 FA2 schedule over Q8_1 K/V. */
+    int hipFlashAttn_prefill_fa2_q8_1(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask, void *stream, int head_start, int gqa_n_rep);
+
+#define DECLARE_ROCM_FA2_CONTEXT_WRAPPER(name)                              \
+    int name(                                                              \
+        const float *Q, const void *K, const void *V, float *O,             \
+        float *O_partial, float *m_partial, float *l_partial,               \
+        int batch_size, int seq_len, int kv_capacity,                       \
+        int n_heads, int n_kv_heads, int head_dim,                          \
+        bool causal, int window_size, int position_offset,                  \
+        const llaminar2::attention::AttentionDeviceParams *device_params,   \
+        const float *mask, int context_partition_size,                      \
+        int max_context_partitions, int context_partition_slots,            \
+        int context_phase_block_slots,                                      \
+        int device_direct_partition_limit,                                  \
+        int reducer_dimension_wavefronts, int reducer_block_slots,          \
+        void *stream,                                                       \
+        int head_start, int gqa_n_rep)
+
+    /** @brief Launch the two-node context transaction over FP32 K/V. */
+    DECLARE_ROCM_FA2_CONTEXT_WRAPPER(
+        hipFlashAttn_prefill_fa2_context_parallel);
+    /** @brief Launch the two-node context transaction over FP16 K/V. */
+    DECLARE_ROCM_FA2_CONTEXT_WRAPPER(
+        hipFlashAttn_prefill_fa2_fp16_context_parallel);
+    /** @brief Launch the two-node context transaction over BF16 K/V. */
+    DECLARE_ROCM_FA2_CONTEXT_WRAPPER(
+        hipFlashAttn_prefill_fa2_bf16_context_parallel);
+    /** @brief Launch the two-node context transaction over Q8_1 K/V. */
+    DECLARE_ROCM_FA2_CONTEXT_WRAPPER(
+        hipFlashAttn_prefill_fa2_q8_1_context_parallel);
+
+#undef DECLARE_ROCM_FA2_CONTEXT_WRAPPER
+}
+#endif
+
 namespace
 {
+    /** @brief Restore one temporary process environment value at scope exit. */
+    class ScopedEnvironmentVariable final
+    {
+    public:
+        ScopedEnvironmentVariable(const char *name, const char *value)
+            : name_(name ? name : ""),
+              had_original_(!name_.empty() && std::getenv(name_.c_str())),
+              original_(had_original_ ? std::getenv(name_.c_str()) : "")
+        {
+            if (!name_.empty())
+                ::setenv(name_.c_str(), value ? value : "", 1);
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+            if (name_.empty())
+                return;
+            if (had_original_)
+                ::setenv(name_.c_str(), original_.c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+        }
+
+        ScopedEnvironmentVariable(const ScopedEnvironmentVariable &) = delete;
+        ScopedEnvironmentVariable &operator=(
+            const ScopedEnvironmentVariable &) = delete;
+
+    private:
+        std::string name_;
+        bool had_original_ = false;
+        std::string original_;
+    };
+
     const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     // ============================================================================
@@ -301,6 +411,155 @@ namespace
         memcpy(&result, &bits, sizeof(float));
         return result;
     }
+
+#ifdef HAVE_ROCM
+    /** Native K/V representations accepted by the production ROCm FA2 path. */
+    enum class ROCmFA2KVFormat : uint8_t
+    {
+        FP32,
+        FP16,
+        BF16,
+        Q8_1,
+    };
+
+    /** @return Stable format spelling for scoped assertion diagnostics. */
+    const char *rocmFA2KVFormatName(ROCmFA2KVFormat format)
+    {
+        switch (format)
+        {
+        case ROCmFA2KVFormat::FP32:
+            return "FP32";
+        case ROCmFA2KVFormat::FP16:
+            return "FP16";
+        case ROCmFA2KVFormat::BF16:
+            return "BF16";
+        case ROCmFA2KVFormat::Q8_1:
+            return "Q8_1";
+        }
+        return "invalid";
+    }
+
+    /**
+     * @brief Encode dense FP32 K/V rows in one native cache format.
+     *
+     * Q8_1 scale metadata is rounded to its actual FP16 representation before
+     * quantization so every generated block is finite and internally valid.
+     * The test compares schedules over identical bytes; it does not rely on a
+     * malformed random byte stream accidentally decoding to useful values.
+     */
+    std::vector<uint8_t> encodeROCmFA2KV(
+        const std::vector<float> &source,
+        ROCmFA2KVFormat format,
+        int head_dim)
+    {
+        if (format == ROCmFA2KVFormat::FP32)
+        {
+            std::vector<uint8_t> bytes(source.size() * sizeof(float));
+            std::memcpy(bytes.data(), source.data(), bytes.size());
+            return bytes;
+        }
+
+        if (format == ROCmFA2KVFormat::FP16 ||
+            format == ROCmFA2KVFormat::BF16)
+        {
+            std::vector<uint16_t> encoded(source.size());
+            for (size_t element = 0; element < source.size(); ++element)
+            {
+                if (format == ROCmFA2KVFormat::FP16)
+                {
+                    encoded[element] = floatToFP16(source[element]);
+                }
+                else
+                {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &source[element], sizeof(bits));
+                    encoded[element] = static_cast<uint16_t>(bits >> 16);
+                }
+            }
+            std::vector<uint8_t> bytes(encoded.size() * sizeof(uint16_t));
+            std::memcpy(bytes.data(), encoded.data(), bytes.size());
+            return bytes;
+        }
+
+        if (head_dim <= 0 || head_dim % static_cast<int>(Q8_1Block::BLOCK_SIZE) != 0 ||
+            source.size() % static_cast<size_t>(head_dim) != 0)
+        {
+            return {};
+        }
+
+        const size_t block_count =
+            source.size() / Q8_1Block::BLOCK_SIZE;
+        std::vector<Q8_1Block> blocks(block_count);
+        for (size_t block_index = 0; block_index < block_count; ++block_index)
+        {
+            const float *values =
+                source.data() + block_index * Q8_1Block::BLOCK_SIZE;
+            float maximum = 0.0f;
+            for (size_t element = 0;
+                 element < Q8_1Block::BLOCK_SIZE;
+                 ++element)
+            {
+                maximum = std::max(maximum, std::abs(values[element]));
+            }
+            const float requested_scale =
+                maximum > 0.0f ? maximum / 127.0f : 1.0f / 127.0f;
+            Q8_1Block &block = blocks[block_index];
+            block.d = floatToFP16(requested_scale);
+            const float scale = fp16ToFloat(block.d);
+            int sum = 0;
+            for (size_t element = 0;
+                 element < Q8_1Block::BLOCK_SIZE;
+                 ++element)
+            {
+                const int quantized = std::clamp(
+                    static_cast<int>(std::nearbyint(values[element] / scale)),
+                    -127,
+                    127);
+                block.qs[element] = static_cast<int8_t>(quantized);
+                sum += quantized;
+            }
+            block.sum_qs = static_cast<int16_t>(sum);
+        }
+
+        std::vector<uint8_t> bytes(blocks.size() * sizeof(Q8_1Block));
+        std::memcpy(bytes.data(), blocks.data(), bytes.size());
+        return bytes;
+    }
+
+    /** @brief RAII owner for setup-time HIP allocations in integration tests. */
+    class ScopedHIPAllocation
+    {
+    public:
+        ScopedHIPAllocation() = default;
+        ~ScopedHIPAllocation()
+        {
+            if (pointer_)
+                (void)hipFree(pointer_);
+        }
+
+        ScopedHIPAllocation(const ScopedHIPAllocation &) = delete;
+        ScopedHIPAllocation &operator=(const ScopedHIPAllocation &) = delete;
+
+        /** Allocate one non-empty device buffer. */
+        bool allocate(size_t bytes)
+        {
+            return bytes > 0 && hipMalloc(&pointer_, bytes) == hipSuccess;
+        }
+
+        /** @return Untyped device address owned by this scope. */
+        void *get() const noexcept { return pointer_; }
+
+        /** @return Device address interpreted as `T`. */
+        template <typename T>
+        T *as() const noexcept
+        {
+            return static_cast<T *>(pointer_);
+        }
+
+    private:
+        void *pointer_ = nullptr;
+    };
+#endif
 
     void quantizeToFP16(const float *src, uint16_t *dst, size_t count)
     {
@@ -1047,6 +1306,1045 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 
     LOG_INFO("[FlashAttn2_FP32_LargeHeadDim_GQA] PASSED");
+}
+
+/**
+ * @brief Prove the captured ROCm context schedule preserves direct FA2 bytes.
+ *
+ * The direct and context schedules share one canonical 256-key arithmetic
+ * partition. The context schedule changes only physical ownership: persistent
+ * workgroups publish unnormalized summaries and one deterministic reducer
+ * consumes them in ascending partition order. This matrix crosses every native
+ * K/V format, every compiled head dimension, sharded and replicated GQA,
+ * causal tails, a sliding window, an additive mask, and live lengths on both
+ * sides of both the one-partition and medium-context device-only mode shifts.
+ *
+ * One context transaction must capture as exactly three kernel nodes. HIP has
+ * no conditional graph node here: an exact direct kernel, context phase, and
+ * reducer apply complementary predicates to the same device-live partition
+ * count. Replaying one graph on both sides of a span proves that host dispatch
+ * and recapture are absent from the runtime contract.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    FA2ContextParallelCapturedTransactionAllNativeFormatsIsDirectByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    struct ContextCase
+    {
+        const char *label;
+        int seq_len;
+        int kv_capacity;
+        int n_heads;
+        int n_kv_heads;
+        int head_dim;
+        int head_start;
+        int replicated_gqa_n_rep;
+        int window_size;
+        bool use_additive_mask;
+        bool sweep_physical_candidates = true;
+    };
+
+    constexpr std::array<ContextCase, 11> cases{{
+        {"M1 grouped verifier", 1, 513, 2, 2, 256,
+         0, 8, -1, false},
+        {"M2 grouped verifier", 2, 513, 2, 2, 256,
+         0, 8, -1, false},
+        {"M4 grouped verifier", 4, 513, 2, 2, 256,
+         0, 8, -1, false},
+        {"M8 grouped verifier", 8, 513, 2, 2, 256,
+         0, 8, -1, false},
+        {"M16 grouped verifier", 16, 513, 2, 2, 256,
+         0, 8, -1, false},
+        {"HD64 sharded partition tails", 17, 769, 14, 2, 64,
+         0, 0, -1, false},
+        {"HD128 replicated TP4 window", 33, 769, 3, 2, 128,
+         9, 6, 191, false},
+        {"HD256 sharded additive mask", 17, 1025, 16, 2, 256,
+         0, 0, -1, true},
+        {"HD256 replicated TP8 rank7", 17, 1025, 2, 2, 256,
+         14, 8, -1, false},
+        {"packed single-wave device-direct boundary", 1, 8449, 56, 1, 128,
+         0, 0, -1, false, false},
+        {"HD64 256K capacity totality", 1, 262144, 1, 1, 64,
+         0, 0, -1, false, false},
+    }};
+    constexpr std::array<ROCmFA2KVFormat, 4> formats{{
+        ROCmFA2KVFormat::FP32,
+        ROCmFA2KVFormat::FP16,
+        ROCmFA2KVFormat::BF16,
+        ROCmFA2KVFormat::Q8_1,
+    }};
+
+    const auto physical =
+        llaminar2::rocm::queryROCmFlashAttentionDeviceProperties(0);
+
+    for (const ContextCase &test_case : cases)
+    {
+        for (ROCmFA2KVFormat format : formats)
+        {
+            SCOPED_TRACE(
+                std::string(test_case.label) + " format=" +
+                rocmFA2KVFormatName(format));
+
+            const auto plan =
+                llaminar2::rocm::fa2_policy::
+                    selectROCmFA2PrefillParallelPlan(
+                        {
+                            .batch_size = 1,
+                            .query_rows = test_case.seq_len,
+                            .local_query_heads = test_case.n_heads,
+                            .head_dim = test_case.head_dim,
+                            .kv_capacity = test_case.kv_capacity,
+                            .compute_unit_count =
+                                physical.compute_unit_count,
+                            .lds_capacity_bytes =
+                                physical.lds_capacity_bytes,
+                            .requested_axis =
+                                attention::AttentionPrefillParallelAxis::
+                                    KeyValueContext,
+                        });
+            ASSERT_TRUE(plan.valid);
+            ASSERT_TRUE(plan.usesContextParallelism());
+            ASSERT_EQ(
+                plan.max_context_partitions,
+                (test_case.kv_capacity +
+                 llaminar2::rocm::fa2_policy::
+                     kROCmFA2CanonicalContextPartitionKeys -
+                 1) /
+                    llaminar2::rocm::fa2_policy::
+                        kROCmFA2CanonicalContextPartitionKeys);
+
+            const size_t output_elements =
+                static_cast<size_t>(test_case.seq_len) *
+                test_case.n_heads * test_case.head_dim;
+            const size_t kv_elements =
+                static_cast<size_t>(test_case.kv_capacity) *
+                test_case.n_kv_heads * test_case.head_dim;
+            const std::vector<float> q_host =
+                randomFP32Scaled(output_elements, 0.25f);
+            const std::vector<float> k_source =
+                randomFP32Scaled(kv_elements, 0.25f);
+            const std::vector<float> v_source =
+                randomFP32Scaled(kv_elements, 0.25f);
+            const std::vector<uint8_t> k_native =
+                encodeROCmFA2KV(k_source, format, test_case.head_dim);
+            const std::vector<uint8_t> v_native =
+                encodeROCmFA2KV(v_source, format, test_case.head_dim);
+            ASSERT_FALSE(k_native.empty());
+            ASSERT_EQ(k_native.size(), v_native.size());
+
+            std::vector<float> mask_host;
+            if (test_case.use_additive_mask)
+            {
+                mask_host.assign(
+                    static_cast<size_t>(test_case.seq_len) *
+                        test_case.kv_capacity,
+                    0.0f);
+                for (int query = 0; query < test_case.seq_len; ++query)
+                {
+                    for (int key = 240; key < 256; ++key)
+                    {
+                        mask_host[
+                            static_cast<size_t>(query) *
+                                test_case.kv_capacity +
+                            key] = -1.0e30f;
+                    }
+                    for (int key = 7;
+                         key < test_case.kv_capacity;
+                         key += 97)
+                    {
+                        mask_host[
+                            static_cast<size_t>(query) *
+                                test_case.kv_capacity +
+                            key] = -0.125f;
+                    }
+                }
+            }
+
+            ScopedHIPAllocation d_q;
+            ScopedHIPAllocation d_k;
+            ScopedHIPAllocation d_v;
+            ScopedHIPAllocation d_direct_output;
+            ScopedHIPAllocation d_context_output;
+            ScopedHIPAllocation d_partial_output;
+            ScopedHIPAllocation d_partial_m;
+            ScopedHIPAllocation d_partial_l;
+            ScopedHIPAllocation d_params;
+            ScopedHIPAllocation d_mask;
+            ASSERT_TRUE(d_q.allocate(output_elements * sizeof(float)));
+            ASSERT_TRUE(d_k.allocate(k_native.size()));
+            ASSERT_TRUE(d_v.allocate(v_native.size()));
+            ASSERT_TRUE(
+                d_direct_output.allocate(output_elements * sizeof(float)));
+            ASSERT_TRUE(
+                d_context_output.allocate(output_elements * sizeof(float)));
+            ASSERT_TRUE(d_partial_output.allocate(plan.partial_output_bytes));
+            ASSERT_TRUE(d_partial_m.allocate(plan.partial_m_bytes));
+            ASSERT_TRUE(d_partial_l.allocate(plan.partial_l_bytes));
+            ASSERT_TRUE(d_params.allocate(
+                sizeof(attention::AttentionDeviceParams)));
+            if (test_case.use_additive_mask)
+            {
+                ASSERT_TRUE(
+                    d_mask.allocate(mask_host.size() * sizeof(float)));
+            }
+
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    d_q.get(), q_host.data(),
+                    output_elements * sizeof(float),
+                    hipMemcpyHostToDevice, test_stream_),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    d_k.get(), k_native.data(), k_native.size(),
+                    hipMemcpyHostToDevice, test_stream_),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    d_v.get(), v_native.data(), v_native.size(),
+                    hipMemcpyHostToDevice, test_stream_),
+                hipSuccess);
+            if (test_case.use_additive_mask)
+            {
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        d_mask.get(), mask_host.data(),
+                        mask_host.size() * sizeof(float),
+                        hipMemcpyHostToDevice, test_stream_),
+                    hipSuccess);
+            }
+
+            const auto *device_params =
+                d_params.as<attention::AttentionDeviceParams>();
+            const float *device_mask =
+                test_case.use_additive_mask
+                    ? d_mask.as<float>()
+                    : nullptr;
+
+            const auto launch_direct = [&]() -> int
+            {
+                switch (format)
+                {
+                case ROCmFA2KVFormat::FP32:
+                    return hipFlashAttn_prefill_fa2(
+                        d_q.as<float>(), d_k.as<float>(), d_v.as<float>(),
+                        d_direct_output.as<float>(),
+                        1, test_case.seq_len, test_case.kv_capacity,
+                        test_case.n_heads, test_case.n_kv_heads,
+                        test_case.head_dim, true, test_case.window_size,
+                        0, device_params, device_mask,
+                        static_cast<void *>(test_stream_),
+                        test_case.head_start,
+                        test_case.replicated_gqa_n_rep);
+                case ROCmFA2KVFormat::FP16:
+                    return hipFlashAttn_prefill_fa2_fp16(
+                        d_q.as<float>(), d_k.get(), d_v.get(),
+                        d_direct_output.as<float>(),
+                        1, test_case.seq_len, test_case.kv_capacity,
+                        test_case.n_heads, test_case.n_kv_heads,
+                        test_case.head_dim, true, test_case.window_size,
+                        0, device_params, device_mask,
+                        static_cast<void *>(test_stream_),
+                        test_case.head_start,
+                        test_case.replicated_gqa_n_rep);
+                case ROCmFA2KVFormat::BF16:
+                    return hipFlashAttn_prefill_fa2_bf16(
+                        d_q.as<float>(), d_k.get(), d_v.get(),
+                        d_direct_output.as<float>(),
+                        1, test_case.seq_len, test_case.kv_capacity,
+                        test_case.n_heads, test_case.n_kv_heads,
+                        test_case.head_dim, true, test_case.window_size,
+                        0, device_params, device_mask,
+                        static_cast<void *>(test_stream_),
+                        test_case.head_start,
+                        test_case.replicated_gqa_n_rep);
+                case ROCmFA2KVFormat::Q8_1:
+                    return hipFlashAttn_prefill_fa2_q8_1(
+                        d_q.as<float>(), d_k.get(), d_v.get(),
+                        d_direct_output.as<float>(),
+                        1, test_case.seq_len, test_case.kv_capacity,
+                        test_case.n_heads, test_case.n_kv_heads,
+                        test_case.head_dim, true, test_case.window_size,
+                        0, device_params, device_mask,
+                        static_cast<void *>(test_stream_),
+                        test_case.head_start,
+                        test_case.replicated_gqa_n_rep);
+                }
+                return -1;
+            };
+
+            const auto launch_context =
+                [&](int partition_slots,
+                    int reducer_wavefronts,
+                    int reducer_block_slots,
+                    int phase_block_slots) -> int
+            {
+                const auto invoke = [&](auto launcher) -> int
+                {
+                    return launcher(
+                        d_q.as<float>(), d_k.get(), d_v.get(),
+                        d_context_output.as<float>(),
+                        d_partial_output.as<float>(),
+                        d_partial_m.as<float>(),
+                        d_partial_l.as<float>(),
+                        1, test_case.seq_len, test_case.kv_capacity,
+                        test_case.n_heads, test_case.n_kv_heads,
+                        test_case.head_dim, true, test_case.window_size,
+                        0, device_params, device_mask,
+                        llaminar2::rocm::fa2_policy::
+                            kROCmFA2CanonicalContextPartitionKeys,
+                        plan.max_context_partitions,
+                        partition_slots,
+                        phase_block_slots,
+                        plan.device_direct_partition_limit,
+                        reducer_wavefronts,
+                        reducer_block_slots,
+                        static_cast<void *>(test_stream_),
+                        test_case.head_start,
+                        test_case.replicated_gqa_n_rep);
+                };
+
+                switch (format)
+                {
+                case ROCmFA2KVFormat::FP32:
+                    return invoke(
+                        hipFlashAttn_prefill_fa2_context_parallel);
+                case ROCmFA2KVFormat::FP16:
+                    return invoke(
+                        hipFlashAttn_prefill_fa2_fp16_context_parallel);
+                case ROCmFA2KVFormat::BF16:
+                    return invoke(
+                        hipFlashAttn_prefill_fa2_bf16_context_parallel);
+                case ROCmFA2KVFormat::Q8_1:
+                    return invoke(
+                        hipFlashAttn_prefill_fa2_q8_1_context_parallel);
+                }
+                return -1;
+            };
+
+            attention::AttentionDeviceParams initial_params{
+                .kv_len = test_case.seq_len,
+                .kv_stride = test_case.kv_capacity,
+                .position_offset = 0,
+                .mask_stride = test_case.kv_capacity,
+            };
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    d_params.get(), &initial_params,
+                    sizeof(initial_params), hipMemcpyHostToDevice,
+                    test_stream_),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t graph_exec = nullptr;
+            bool context_launch_recorded = false;
+            hipError_t end_capture_status = hipSuccess;
+            {
+                GraphCaptureGuard capture_guard;
+                ASSERT_EQ(
+                    hipStreamBeginCapture(
+                        test_stream_, hipStreamCaptureModeGlobal),
+                    hipSuccess);
+                context_launch_recorded =
+                    launch_context(
+                        plan.context_partition_slots,
+                        plan.reducer_dimension_wavefronts,
+                        plan.reducer_block_slots,
+                        plan.context_phase_block_slots) == 0;
+                end_capture_status =
+                    hipStreamEndCapture(test_stream_, &graph);
+            }
+            ASSERT_TRUE(context_launch_recorded);
+            ASSERT_EQ(end_capture_status, hipSuccess);
+            ASSERT_NE(graph, nullptr);
+            size_t graph_node_count = 0;
+            ASSERT_EQ(
+                hipGraphGetNodes(graph, nullptr, &graph_node_count),
+                hipSuccess);
+            ASSERT_EQ(graph_node_count, 3u)
+                << "ROCm context FA2 must remain one guarded direct kernel, "
+                   "one guarded phase, and one guarded reducer";
+            ASSERT_EQ(
+                hipGraphInstantiate(
+                    &graph_exec, graph, nullptr, nullptr, 0),
+                hipSuccess);
+
+            const std::array<int, 8> live_lengths{{
+                test_case.seq_len,
+                255,
+                256,
+                257,
+                513,
+                8192,
+                8193,
+                test_case.kv_capacity,
+            }};
+            std::vector<float> direct_output(output_elements);
+            std::vector<float> context_output(output_elements);
+            for (int live_kv_len : live_lengths)
+            {
+                if (live_kv_len > test_case.kv_capacity ||
+                    live_kv_len < test_case.seq_len)
+                {
+                    continue;
+                }
+                SCOPED_TRACE(
+                    "live_kv_len=" + std::to_string(live_kv_len));
+                const attention::AttentionDeviceParams params{
+                    .kv_len = live_kv_len,
+                    .kv_stride = test_case.kv_capacity,
+                    .position_offset = live_kv_len - test_case.seq_len,
+                    .mask_stride = test_case.kv_capacity,
+                };
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        d_params.get(), &params, sizeof(params),
+                        hipMemcpyHostToDevice, test_stream_),
+                    hipSuccess);
+                ASSERT_EQ(launch_direct(), 0);
+                ASSERT_EQ(
+                    hipGraphLaunch(graph_exec, test_stream_),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        direct_output.data(), d_direct_output.get(),
+                        output_elements * sizeof(float),
+                        hipMemcpyDeviceToHost, test_stream_),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        context_output.data(), d_context_output.get(),
+                        output_elements * sizeof(float),
+                        hipMemcpyDeviceToHost, test_stream_),
+                    hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                ASSERT_FALSE(
+                    hasNaNOrInf(direct_output.data(), output_elements));
+                ASSERT_FALSE(
+                    hasNaNOrInf(context_output.data(), output_elements));
+                EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                    context_output.data(), direct_output.data(),
+                    output_elements,
+                    std::string(test_case.label) + " " +
+                        rocmFA2KVFormatName(format) +
+                        " captured context/direct"));
+            }
+
+            /*
+             * The long boundary case exists solely to cross the device-live
+             * direct/context predicate in one captured graph. Physical slot,
+             * reducer, and phase-grid totality are already crossed by every
+             * native format in the compact cases below; repeating their full
+             * Cartesian sweep at 8K would add no distinct correctness claim.
+             */
+            if (!test_case.sweep_physical_candidates)
+            {
+                ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+                ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+                continue;
+            }
+
+            /*
+             * Physical slots and output-dimension stripes are economy knobs,
+             * never arithmetic knobs. Cross their complete useful range at
+             * maximum live length so the forthcoming tournament cannot install
+             * a faster candidate that changes a single output byte.
+             */
+            const attention::AttentionDeviceParams maximum_params{
+                .kv_len = test_case.kv_capacity,
+                .kv_stride = test_case.kv_capacity,
+                .position_offset =
+                    test_case.kv_capacity - test_case.seq_len,
+                .mask_stride = test_case.kv_capacity,
+            };
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    d_params.get(), &maximum_params,
+                    sizeof(maximum_params), hipMemcpyHostToDevice,
+                    test_stream_),
+                hipSuccess);
+            ASSERT_EQ(launch_direct(), 0);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    direct_output.data(), d_direct_output.get(),
+                    output_elements * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_),
+                hipSuccess);
+
+            const int maximum_reducer_wavefronts =
+                llaminar2::rocm::fa2_policy::
+                    maximumROCmFA2ReducerWavefronts(
+                        test_case.head_dim);
+            for (int slots = 1;
+                 slots <= plan.max_context_partitions;
+                 ++slots)
+            {
+                for (int wavefronts = 1;
+                     wavefronts <= maximum_reducer_wavefronts;
+                     wavefronts *= 2)
+                {
+                    const int logical_blocks = static_cast<int>(
+                        llaminar2::rocm::fa2_policy::
+                            rocmFA2ReducerLogicalBlocks(
+                                {
+                                    .batch_size = 1,
+                                    .query_rows = test_case.seq_len,
+                                    .local_query_heads = test_case.n_heads,
+                                    .head_dim = test_case.head_dim,
+                                    .kv_capacity = test_case.kv_capacity,
+                                    .compute_unit_count =
+                                        physical.compute_unit_count,
+                                },
+                                wavefronts));
+                    ASSERT_GT(logical_blocks, 0);
+
+                    std::vector<int> reducer_block_candidates;
+                    const auto add_reducer_blocks =
+                        [&](int candidate)
+                    {
+                        if (candidate > 0 &&
+                            candidate <= logical_blocks &&
+                            std::find(
+                                reducer_block_candidates.begin(),
+                                reducer_block_candidates.end(),
+                                candidate) ==
+                                reducer_block_candidates.end())
+                        {
+                            reducer_block_candidates.push_back(candidate);
+                        }
+                    };
+                    for (int candidate = 1;
+                         candidate > 0 && candidate <= logical_blocks;
+                         candidate *= 2)
+                    {
+                        add_reducer_blocks(candidate);
+                        if (candidate > logical_blocks / 2)
+                            break;
+                    }
+                    add_reducer_blocks(
+                        (physical.compute_unit_count + 1) / 2);
+                    add_reducer_blocks(physical.compute_unit_count);
+                    add_reducer_blocks(2 * physical.compute_unit_count);
+                    add_reducer_blocks(logical_blocks);
+
+                    for (const int reducer_blocks :
+                         reducer_block_candidates)
+                    {
+                        SCOPED_TRACE(
+                            "slots=" + std::to_string(slots) +
+                            " reducer_wavefronts=" +
+                            std::to_string(wavefronts) +
+                            " reducer_blocks=" +
+                            std::to_string(reducer_blocks));
+                        ASSERT_EQ(
+                            launch_context(
+                                slots,
+                                wavefronts,
+                                reducer_blocks,
+                                llaminar2::rocm::fa2_policy::
+                                    selectROCmFA2ContextPhaseBlockSlots(
+                                        {
+                                            .batch_size = 1,
+                                            .query_rows = test_case.seq_len,
+                                            .local_query_heads =
+                                                test_case.n_heads,
+                                            .head_dim = test_case.head_dim,
+                                            .kv_capacity =
+                                                test_case.kv_capacity,
+                                            .compute_unit_count =
+                                                physical.compute_unit_count,
+                                            .lds_capacity_bytes =
+                                                physical.lds_capacity_bytes,
+                                        },
+                                        plan.tile,
+                                        slots)),
+                            0);
+                        ASSERT_EQ(
+                            hipMemcpyAsync(
+                                context_output.data(),
+                                d_context_output.get(),
+                                output_elements * sizeof(float),
+                                hipMemcpyDeviceToHost, test_stream_),
+                            hipSuccess);
+                        ASSERT_EQ(
+                            hipStreamSynchronize(test_stream_),
+                            hipSuccess);
+                        EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                            context_output.data(), direct_output.data(),
+                            output_elements,
+                            std::string(test_case.label) + " " +
+                                rocmFA2KVFormatName(format) +
+                                " candidate geometry"));
+                    }
+                }
+            }
+
+            /*
+             * Physical phase residency is independent of partition ownership
+             * and reducer geometry. Sweep it separately to avoid an expensive
+             * Cartesian product while still proving that persistent task
+             * striding cannot alter any summary or final output byte.
+             */
+            const int logical_phase_blocks = static_cast<int>(
+                llaminar2::rocm::fa2_policy::
+                    rocmFA2ContextPhaseLogicalBlocks(
+                        {
+                            .batch_size = 1,
+                            .query_rows = test_case.seq_len,
+                            .local_query_heads = test_case.n_heads,
+                            .head_dim = test_case.head_dim,
+                            .kv_capacity = test_case.kv_capacity,
+                            .compute_unit_count =
+                                physical.compute_unit_count,
+                            .lds_capacity_bytes =
+                                physical.lds_capacity_bytes,
+                        },
+                        plan.tile,
+                        plan.context_partition_slots));
+            ASSERT_GT(logical_phase_blocks, 0);
+            std::vector<int> phase_block_candidates;
+            const auto add_phase_blocks = [&](int candidate)
+            {
+                if (candidate > 0 &&
+                    candidate <= logical_phase_blocks &&
+                    std::find(
+                        phase_block_candidates.begin(),
+                        phase_block_candidates.end(),
+                        candidate) == phase_block_candidates.end())
+                {
+                    phase_block_candidates.push_back(candidate);
+                }
+            };
+            for (const int candidate : {1, 2, 4, 8, 16})
+                add_phase_blocks(candidate);
+            add_phase_blocks((physical.compute_unit_count + 1) / 2);
+            add_phase_blocks(physical.compute_unit_count);
+            add_phase_blocks(2 * physical.compute_unit_count);
+            add_phase_blocks(plan.context_phase_block_slots);
+
+            for (const int phase_blocks : phase_block_candidates)
+            {
+                SCOPED_TRACE(
+                    "persistent_phase_blocks=" +
+                    std::to_string(phase_blocks));
+                ASSERT_EQ(
+                    launch_context(
+                        plan.context_partition_slots,
+                        plan.reducer_dimension_wavefronts,
+                        plan.reducer_block_slots,
+                        phase_blocks),
+                    0);
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        context_output.data(),
+                        d_context_output.get(),
+                        output_elements * sizeof(float),
+                        hipMemcpyDeviceToHost, test_stream_),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipStreamSynchronize(test_stream_),
+                    hipSuccess);
+                EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                    context_output.data(), direct_output.data(),
+                    output_elements,
+                    std::string(test_case.label) + " " +
+                        rocmFA2KVFormatName(format) +
+                        " persistent phase grid"));
+            }
+
+            ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+            ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        }
+    }
+}
+
+/**
+ * @brief Certify production ROCm FA2 policy dispatch and graph replay.
+ *
+ * This test enters through `ROCmFlashAttentionKernelT::compute_tensor()` rather
+ * than a raw wrapper. Geometry-selected policy must resolve to the native
+ * context transaction, consume an arena sized from that plan, and capture one
+ * device K/V-length producer followed by the guarded direct, phase, and reducer
+ * nodes.
+ * The same graph then crosses one through five live context partitions and
+ * returns to a shorter prefix without host-side physical dispatch or recapture.
+ *
+ * Every native cache format is compared byte-for-byte with the production
+ * query-sequence policy. PerfStats must independently report both selected
+ * axes, preventing a future implementation from making the numerical check
+ * green by silently substituting the direct route.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    ComputeTensorGeometrySelectedContextGraphAllNativeFormatsIsQueryByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+    ASSERT_FALSE(debugEnv().rocm.fa_disable_native_kv)
+        << "Production native-K/V dispatch must remain enabled for this gate";
+
+    ScopedEnvironmentVariable perf_stats(
+        "LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr int batch_size = 1;
+    constexpr int seq_len = 17;
+    constexpr int kv_capacity = 1025;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int q_width = n_heads * head_dim;
+    constexpr int kv_width = n_kv_heads * head_dim;
+    constexpr std::array<int, 6> live_lengths{{
+        seq_len, 256, 257, 513, kv_capacity, 256,
+    }};
+    constexpr std::array<ROCmFA2KVFormat, 4> formats{{
+        ROCmFA2KVFormat::FP32,
+        ROCmFA2KVFormat::FP16,
+        ROCmFA2KVFormat::BF16,
+        ROCmFA2KVFormat::Q8_1,
+    }};
+
+    const size_t q_elements =
+        static_cast<size_t>(seq_len) * q_width;
+    const size_t kv_elements =
+        static_cast<size_t>(kv_capacity) * kv_width;
+    const std::vector<float> q_host =
+        randomFP32Scaled(q_elements, 0.25f);
+    const std::vector<float> k_host =
+        randomFP32Scaled(kv_elements, 0.25f);
+    const std::vector<float> v_host =
+        randomFP32Scaled(kv_elements, 0.25f);
+    const DeviceId device = DeviceId::rocm(0);
+
+    const attention::AttentionExecutionPolicy query_policy{
+        .prefill_parallel_axis =
+            attention::AttentionPrefillParallelAxis::QuerySequence,
+    };
+    const attention::AttentionExecutionPolicy geometry_policy{
+        .prefill_parallel_axis =
+            attention::AttentionPrefillParallelAxis::GeometrySelected,
+    };
+    const attention::AttentionPrefillCaptureGeometry capture_geometry{
+        .batch_size = batch_size,
+        .query_rows = seq_len,
+        .local_query_heads = n_heads,
+        .head_dim = head_dim,
+        .kv_capacity = kv_capacity,
+        .execution_policy = geometry_policy,
+    };
+    const auto physical =
+        llaminar2::rocm::queryROCmFlashAttentionDeviceProperties(0);
+    const auto geometry_plan =
+        llaminar2::rocm::fa2_policy::selectROCmFA2PrefillParallelPlan({
+            .batch_size = batch_size,
+            .query_rows = seq_len,
+            .local_query_heads = n_heads,
+            .head_dim = head_dim,
+            .kv_capacity = kv_capacity,
+            .compute_unit_count = physical.compute_unit_count,
+            .lds_capacity_bytes = physical.lds_capacity_bytes,
+            .requested_axis = geometry_policy.prefill_parallel_axis,
+        });
+    ASSERT_TRUE(geometry_plan.valid);
+    ASSERT_TRUE(geometry_plan.usesContextParallelism());
+    ASSERT_EQ(geometry_plan.device_direct_partition_limit, 1);
+    ASSERT_EQ(geometry_plan.max_context_partitions, 5);
+
+    const auto make_native_kv = [](
+                                    const std::vector<float> &values,
+                                    ROCmFA2KVFormat format)
+        -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{
+            static_cast<size_t>(kv_capacity),
+            static_cast<size_t>(kv_width),
+        };
+        switch (format)
+        {
+        case ROCmFA2KVFormat::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(
+                values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ROCmFA2KVFormat::FP16:
+        {
+            std::vector<uint16_t> native(values.size());
+            quantizeToFP16(values.data(), native.data(), native.size());
+            return std::make_shared<FP16Tensor>(shape, std::move(native));
+        }
+        case ROCmFA2KVFormat::BF16:
+        {
+            auto tensor = std::make_shared<BF16Tensor>(shape);
+            tensor->from_fp32(values.data(), values.size());
+            return tensor;
+        }
+        case ROCmFA2KVFormat::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        }
+        return nullptr;
+    };
+
+    const auto enlarge_context_workspace =
+        [&geometry_plan](WorkspaceRequirements *requirements)
+    {
+        ASSERT_NE(requirements, nullptr);
+        const auto require_capacity =
+            [requirements](const char *name, size_t bytes)
+        {
+            for (auto &buffer : requirements->buffers)
+            {
+                if (buffer.name == name)
+                {
+                    buffer.size_bytes =
+                        std::max(buffer.size_bytes, bytes);
+                    return;
+                }
+            }
+            requirements->buffers.push_back(
+                {name, bytes, 256, true});
+        };
+        require_capacity(
+            llaminar2::rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+            geometry_plan.partial_output_bytes);
+        require_capacity(
+            llaminar2::rocm::AttentionWorkspaceBuffers::PARTIAL_M,
+            geometry_plan.partial_m_bytes);
+        require_capacity(
+            llaminar2::rocm::AttentionWorkspaceBuffers::PARTIAL_L,
+            geometry_plan.partial_l_bytes);
+    };
+
+    for (ROCmFA2KVFormat format : formats)
+    {
+        SCOPED_TRACE(rocmFA2KVFormatName(format));
+
+        FP32Tensor q_tensor({
+            static_cast<size_t>(seq_len),
+            static_cast<size_t>(q_width),
+        });
+        FP32Tensor query_output({
+            static_cast<size_t>(seq_len),
+            static_cast<size_t>(q_width),
+        });
+        FP32Tensor context_output({
+            static_cast<size_t>(seq_len),
+            static_cast<size_t>(q_width),
+        });
+        std::copy(q_host.begin(), q_host.end(), q_tensor.mutable_data());
+        std::shared_ptr<TensorBase> k_tensor =
+            make_native_kv(k_host, format);
+        std::shared_ptr<TensorBase> v_tensor =
+            make_native_kv(v_host, format);
+        ASSERT_NE(k_tensor, nullptr);
+        ASSERT_NE(v_tensor, nullptr);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        ScopedHIPAllocation device_live_length;
+        ASSERT_TRUE(device_live_length.allocate(sizeof(int)));
+
+        auto &transfer = TransferEngine::instance();
+        ASSERT_TRUE(transfer.uploadFull(&q_tensor, device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(k_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(v_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&query_output, device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&context_output, device, stream).success);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        llaminar2::rocm::ROCmFlashAttentionKernelT<
+            ActivationPrecision::FP32>
+            query_kernel(0);
+        llaminar2::rocm::ROCmFlashAttentionKernelT<
+            ActivationPrecision::FP32>
+            context_kernel(0);
+        query_kernel.setGPUStream(stream);
+        context_kernel.setGPUStream(stream);
+
+        WorkspaceRequirements requirements =
+            context_kernel.getWorkspaceRequirements(
+                /*m=*/1, n_heads, head_dim);
+        enlarge_context_workspace(&requirements);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        query_kernel.bindWorkspace(&workspace);
+        context_kernel.bindWorkspace(&workspace);
+
+        const auto compute_with_policy =
+            [&](llaminar2::rocm::ROCmFlashAttentionKernelT<
+                    ActivationPrecision::FP32> &kernel,
+                FP32Tensor *output,
+                int live_length,
+                const attention::AttentionExecutionPolicy &policy)
+        {
+            return kernel.compute_tensor(
+                &q_tensor, k_tensor.get(), v_tensor.get(), output,
+                batch_size, seq_len, live_length,
+                n_heads, n_kv_heads, head_dim,
+                /*causal=*/true,
+                /*window_size=*/-1,
+                /*workspace_scores=*/nullptr,
+                /*workspace_mask=*/nullptr,
+                &mpi_ctx_,
+                /*device_idx=*/0,
+                /*head_start=*/0,
+                n_heads,
+                n_kv_heads,
+                /*gqa_n_rep=*/0,
+                policy);
+        };
+
+        const int capture_live_length = live_lengths.front();
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_live_length.get(), &capture_live_length,
+                sizeof(capture_live_length), hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_TRUE(context_kernel.prepareDynamicAttnParams(
+            capture_live_length,
+            capture_live_length - seq_len,
+            /*query_rows=*/1,
+            stream,
+            kv_capacity));
+        ASSERT_TRUE(compute_with_policy(
+            context_kernel,
+            &context_output,
+            capture_live_length,
+            geometry_policy));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        {
+            GraphCaptureGuard capture_guard;
+            ASSERT_EQ(
+                hipStreamBeginCapture(
+                    stream, hipStreamCaptureModeGlobal),
+                hipSuccess);
+            ASSERT_TRUE(
+                context_kernel.
+                    prepareDynamicAttnParamsFromDeviceSequenceState(
+                        device_live_length.as<int>(),
+                        seq_len,
+                        /*query_rows=*/1,
+                        stream,
+                        kv_capacity,
+                        /*active_query_rows_device=*/nullptr,
+                        capture_geometry));
+            ASSERT_TRUE(compute_with_policy(
+                context_kernel,
+                &context_output,
+                capture_live_length,
+                geometry_policy));
+            ASSERT_EQ(
+                hipStreamEndCapture(stream, &graph),
+                hipSuccess);
+        }
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(
+                &graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        size_t graph_node_count = 0;
+        ASSERT_EQ(
+            hipGraphGetNodes(graph, nullptr, &graph_node_count),
+            hipSuccess);
+        ASSERT_EQ(graph_node_count, 4u)
+            << "Production ROCm prefill must capture one device-state "
+               "producer, one guarded direct kernel, one context phase, and "
+               "one reducer";
+
+        std::vector<float> query_host(q_elements);
+        std::vector<float> context_host(q_elements);
+        for (int live_length : live_lengths)
+        {
+            SCOPED_TRACE(
+                "live_length=" + std::to_string(live_length));
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    device_live_length.get(), &live_length,
+                    sizeof(live_length), hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+            ASSERT_TRUE(query_kernel.prepareDynamicAttnParams(
+                live_length,
+                live_length - seq_len,
+                /*query_rows=*/1,
+                stream,
+                kv_capacity));
+            ASSERT_TRUE(compute_with_policy(
+                query_kernel,
+                &query_output,
+                live_length,
+                query_policy));
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    context_host.data(), context_output.gpu_data_ptr(),
+                    q_elements * sizeof(float),
+                    hipMemcpyDeviceToHost, stream),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    query_host.data(), query_output.gpu_data_ptr(),
+                    q_elements * sizeof(float),
+                    hipMemcpyDeviceToHost, stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                context_host.data(), query_host.data(), q_elements,
+                std::string(rocmFA2KVFormatName(format)) +
+                    " production context/query"));
+        }
+
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    }
+
+    const std::vector<PerfStatRecord> records =
+        PerfStatsCollector::snapshot({"gpu_graph_inventory"});
+    const auto recorded =
+        [&records](const char *selected_axis, const char *storage)
+    {
+        return std::any_of(
+            records.begin(), records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                const auto selected =
+                    record.tags.find("selected_axis");
+                const auto kv_storage =
+                    record.tags.find("kv_storage");
+                return record.name ==
+                           "rocm_fa2_parallel_plan_selections" &&
+                       selected != record.tags.end() &&
+                       selected->second == selected_axis &&
+                       kv_storage != record.tags.end() &&
+                       kv_storage->second == storage;
+            });
+    };
+    for (const char *storage : {"fp32", "FP16", "BF16", "Q8_1"})
+    {
+        EXPECT_TRUE(recorded("query_sequence", storage));
+        EXPECT_TRUE(recorded("key_value_context", storage));
+    }
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, DeviceResidentPrefillHonorsExternalMask)

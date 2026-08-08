@@ -2101,6 +2101,7 @@ path, backend, extra_flags, long_context_run, suite_options, policy_module_dir =
 sys.path.insert(0, policy_module_dir)
 
 from graph_capture_perf_policy import validate_graph_capture_policy
+from flash_attention_perf_policy import validate_flash_attention_plan_policy
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
 from mtp_device_generation_perf_policy import (
@@ -2154,6 +2155,15 @@ if is_gpu:
     )
     if graph_capture_validation.error:
         print(f"FAIL: {graph_capture_validation.error}")
+        sys.exit(0)
+
+    flash_attention_validation = validate_flash_attention_plan_policy(
+        records,
+        backend,
+        extra_flags,
+    )
+    if flash_attention_validation.error:
+        print(f"FAIL: {flash_attention_validation.error}")
         sys.exit(0)
 
     request_input_validation = validate_request_input_lifetime_policy(records)

@@ -11,6 +11,7 @@
  */
 
 #include "ROCmFlashAttentionKernelT.h"
+#include "ROCmFlashAttentionLaunchPolicy.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
@@ -18,6 +19,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -70,6 +72,82 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    /** @brief Captured two-node context FA2 transaction over FP32 K/V. */
+    int hipFlashAttn_prefill_fa2_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    /** @brief Captured two-node context FA2 transaction over FP16 K/V. */
+    int hipFlashAttn_prefill_fa2_fp16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    /** @brief Captured two-node context FA2 transaction over BF16 K/V. */
+    int hipFlashAttn_prefill_fa2_bf16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    /** @brief Captured two-node context FA2 transaction over Q8_1 K/V. */
+    int hipFlashAttn_prefill_fa2_q8_1_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
         void *stream,
         int head_start, int gqa_n_rep);
 
@@ -254,6 +332,126 @@ namespace llaminar2
          */
         constexpr int MAX_SMALL_DECODE_ROWS =
             attention::kMaxGroupedVerifierAttentionRows;
+
+        fa2_policy::ROCmFA2PhysicalDeviceProperties
+        queryROCmFlashAttentionDeviceProperties(int device_idx)
+        {
+            hipDeviceProp_t properties{};
+            const hipError_t status =
+                hipGetDeviceProperties(&properties, device_idx);
+            if (status != hipSuccess)
+            {
+                throw std::runtime_error(
+                    "ROCm FA2 could not query immutable device properties for "
+                    "device " +
+                    std::to_string(device_idx) + ": " +
+                    hipGetErrorString(status));
+            }
+            if (properties.multiProcessorCount <= 0 ||
+                properties.sharedMemPerBlock == 0)
+            {
+                throw std::runtime_error(
+                    "ROCm FA2 received invalid immutable device properties for "
+                    "device " +
+                    std::to_string(device_idx));
+            }
+
+            return {
+                .compute_unit_count = properties.multiProcessorCount,
+                .lds_capacity_bytes = properties.sharedMemPerBlock,
+            };
+        }
+
+        /**
+         * @brief Resolve a ROCm prefill graph from immutable capture geometry.
+         *
+         * Device properties are setup-time facts. Live K/V length is not read
+         * here and remains exclusively in the device-owned parameter record
+         * consumed by the captured guarded-direct, phase, and reducer kernels.
+         */
+        static fa2_policy::ROCmFA2PrefillParallelPlan
+        resolvePrefillPlanForDevice(
+            int batch_size,
+            int query_rows,
+            int local_query_heads,
+            int head_dim,
+            int kv_capacity,
+            int device_idx,
+            const attention::AttentionExecutionPolicy &execution_policy)
+        {
+            const fa2_policy::ROCmFA2PhysicalDeviceProperties properties =
+                queryROCmFlashAttentionDeviceProperties(device_idx);
+
+            return fa2_policy::selectROCmFA2PrefillParallelPlan({
+                .batch_size = batch_size,
+                .query_rows = query_rows,
+                .local_query_heads = local_query_heads,
+                .head_dim = head_dim,
+                .kv_capacity = kv_capacity,
+                .compute_unit_count = properties.compute_unit_count,
+                .lds_capacity_bytes = properties.lds_capacity_bytes,
+                .requested_axis =
+                    execution_policy.prefill_parallel_axis,
+            });
+        }
+
+        /**
+         * @brief Publish one successfully submitted ROCm FA2 capture plan.
+         *
+         * This inventory update runs only while a graph is constructed. Replay
+         * never returns through this host method, so PerfStats introduces no
+         * token-path synchronization or host-owned execution state.
+         */
+        static void recordFA2ParallelPlanSelection(
+            const fa2_policy::ROCmFA2PrefillParallelPlan &plan,
+            const attention::AttentionExecutionPolicy &execution_policy,
+            int batch_size,
+            int query_rows,
+            int local_query_heads,
+            int head_dim,
+            int kv_capacity,
+            int device_idx,
+            const char *kv_storage)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            PerfStatsCollector::addCounter(
+                "gpu_graph_inventory",
+                "rocm_fa2_parallel_plan_selections",
+                1.0,
+                "capture_setup",
+                "rocm:" + std::to_string(device_idx),
+                {
+                    {"requested_axis",
+                     attention::attentionPrefillParallelAxisName(
+                         execution_policy.prefill_parallel_axis)},
+                    {"selected_axis",
+                     fa2_policy::rocmFA2PrefillPhysicalModeName(plan.mode)},
+                    {"batch_size", std::to_string(batch_size)},
+                    {"query_rows", std::to_string(query_rows)},
+                    {"local_query_heads", std::to_string(local_query_heads)},
+                    {"head_dim", std::to_string(head_dim)},
+                    {"kv_capacity", std::to_string(kv_capacity)},
+                    {"tile_q", std::to_string(plan.tile.query_rows)},
+                    {"tile_kv", std::to_string(plan.tile.kv_rows)},
+                    {"query_grid_blocks",
+                     std::to_string(plan.query_grid_blocks)},
+                    {"context_partitions",
+                     std::to_string(plan.max_context_partitions)},
+                    {"context_partition_slots",
+                     std::to_string(plan.context_partition_slots)},
+                    {"context_phase_block_slots",
+                     std::to_string(plan.context_phase_block_slots)},
+                    {"device_direct_partition_limit",
+                     std::to_string(plan.device_direct_partition_limit)},
+                    {"reducer_dimension_wavefronts",
+                     std::to_string(plan.reducer_dimension_wavefronts)},
+                    {"reducer_block_slots",
+                     std::to_string(plan.reducer_block_slots)},
+                    {"kv_storage", kv_storage ? kv_storage : "unknown"},
+                });
+        }
 
         /**
          * @brief Select a graph-stable physical split envelope.
@@ -929,7 +1127,6 @@ namespace llaminar2
             const int *active_query_rows_device,
             const attention::AttentionPrefillCaptureGeometry &prefill_capture)
         {
-            (void)prefill_capture;
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
@@ -946,6 +1143,42 @@ namespace llaminar2
                 dynamic_attn_device_valid_ = false;
                 dynamic_attn_device_derived_ = false;
                 return false;
+            }
+            if (!prefill_capture.empty() && !prefill_capture.valid())
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Partially specified prefill capture geometry cannot publish device attention params");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+            if (prefill_capture.valid())
+            {
+                if (prefill_capture.kv_capacity != kv_stride)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Prefill capture capacity disagrees with attention-param stride"
+                              << " capture_capacity="
+                              << prefill_capture.kv_capacity
+                              << " kv_stride=" << kv_stride);
+                    dynamic_attn_device_valid_ = false;
+                    dynamic_attn_device_derived_ = false;
+                    return false;
+                }
+
+                const auto capture_plan = resolvePrefillPlanForDevice(
+                    prefill_capture.batch_size,
+                    prefill_capture.query_rows,
+                    prefill_capture.local_query_heads,
+                    prefill_capture.head_dim,
+                    prefill_capture.kv_capacity,
+                    device_idx_,
+                    prefill_capture.execution_policy);
+                if (!capture_plan.valid)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Invalid ROCm FA2 prefill plan before device attention-param publication");
+                    dynamic_attn_device_valid_ = false;
+                    dynamic_attn_device_derived_ = false;
+                    return false;
+                }
             }
 
             void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
@@ -1026,15 +1259,6 @@ namespace llaminar2
             (void)mpi_ctx;
             (void)local_n_heads;
             (void)local_n_kv_heads;
-
-            if (execution_policy.prefill_parallel_axis !=
-                attention::AttentionPrefillParallelAxis::QuerySequence)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Unsupported declared prefill parallel axis: "
-                          << attention::attentionPrefillParallelAxisName(
-                                 execution_policy.prefill_parallel_axis));
-                return false;
-            }
 
             if (!Q || !K || !V || !output)
             {
@@ -1144,6 +1368,33 @@ namespace llaminar2
             }
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const int launch_kv_capacity =
+                dynamic_attn_kv_stride_ > 0
+                    ? dynamic_attn_kv_stride_
+                    : kv_len;
+            const fa2_policy::ROCmFA2PrefillParallelPlan prefill_plan =
+                resolvePrefillPlanForDevice(
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    execution_policy);
+            if (!prefill_plan.valid)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Invalid declared ROCm prefill capture plan"
+                          << " requested="
+                          << attention::attentionPrefillParallelAxisName(
+                                 execution_policy.prefill_parallel_axis)
+                          << " batch=" << batch_size
+                          << " rows=" << seq_len
+                          << " heads=" << n_heads
+                          << " head_dim=" << head_dim
+                          << " kv_capacity=" << launch_kv_capacity
+                          << " device=" << dev);
+                return false;
+            }
 
             LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
                                                                                  << " seq_len=" << seq_len << " kv_len=" << kv_len
@@ -1248,6 +1499,49 @@ namespace llaminar2
                 mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
             }
 
+            float *context_O_partial = nullptr;
+            float *context_m_partial = nullptr;
+            float *context_l_partial = nullptr;
+            if (prefill_plan.usesContextParallelism())
+            {
+                if (!stream_ || !workspace_ || !d_attn_params)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Context-parallel prefill requires an exact HIP stream, bound arena, and device-owned attention params");
+                    return false;
+                }
+
+                context_O_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+                context_m_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_M));
+                context_l_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_L));
+                const bool capacity_valid =
+                    context_O_partial && context_m_partial &&
+                    context_l_partial &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_OUTPUT) >=
+                        prefill_plan.partial_output_bytes &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_M) >=
+                        prefill_plan.partial_m_bytes &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_L) >=
+                        prefill_plan.partial_l_bytes;
+                if (!capacity_valid)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Context-parallel workspace does not match the captured plan"
+                              << " required_output="
+                              << prefill_plan.partial_output_bytes
+                              << " required_scalar="
+                              << prefill_plan.partial_m_bytes);
+                    return false;
+                }
+            }
+
             // Native KV dispatch: call typed kernel directly, skip FP32 conversion
             if (use_native_kv)
             {
@@ -1262,6 +1556,7 @@ namespace llaminar2
                 }
 
                 int result;
+                bool submitted_prefill = false;
                 if (small_decode_rows_ > 1)
                 {
                     /*
@@ -1349,13 +1644,117 @@ namespace llaminar2
                 }
                 else
                 {
-                    // Prefill with native KV. With
-                    // LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL=1, this path is also
-                    // an explicit diagnostic/reference path for single-token
-                    // decode.
+                    submitted_prefill = true;
+                    // Prefill with native K/V. Query and context transactions
+                    // share the same format-specialized arithmetic kernel.
                     ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_PREFILL,
                                                      static_cast<hipStream_t>(stream_));
-                    if (kv_native_type == TensorType::FP16)
+                    if (prefill_plan.usesContextParallelism())
+                    {
+                        if (kv_native_type == TensorType::FP16)
+                        {
+                            result =
+                                hipFlashAttn_prefill_fa2_fp16_context_parallel(
+                                    Q_ptr,
+                                    K->gpu_data_ptr(),
+                                    V->gpu_data_ptr(),
+                                    O_ptr,
+                                    context_O_partial,
+                                    context_m_partial,
+                                    context_l_partial,
+                                    batch_size,
+                                    seq_len,
+                                    launch_kv_capacity,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    causal,
+                                    window_size,
+                                    /*position_offset=*/0,
+                                    d_attn_params,
+                                    mask_ptr,
+                                    fa2_policy::
+                                        kROCmFA2CanonicalContextPartitionKeys,
+                                    prefill_plan.max_context_partitions,
+                                    prefill_plan.context_partition_slots,
+                                    prefill_plan.context_phase_block_slots,
+                                    prefill_plan.device_direct_partition_limit,
+                                    prefill_plan.reducer_dimension_wavefronts,
+                                    prefill_plan.reducer_block_slots,
+                                    stream_,
+                                    head_start,
+                                    gqa_n_rep);
+                        }
+                        else if (kv_native_type == TensorType::BF16)
+                        {
+                            result =
+                                hipFlashAttn_prefill_fa2_bf16_context_parallel(
+                                    Q_ptr,
+                                    K->gpu_data_ptr(),
+                                    V->gpu_data_ptr(),
+                                    O_ptr,
+                                    context_O_partial,
+                                    context_m_partial,
+                                    context_l_partial,
+                                    batch_size,
+                                    seq_len,
+                                    launch_kv_capacity,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    causal,
+                                    window_size,
+                                    /*position_offset=*/0,
+                                    d_attn_params,
+                                    mask_ptr,
+                                    fa2_policy::
+                                        kROCmFA2CanonicalContextPartitionKeys,
+                                    prefill_plan.max_context_partitions,
+                                    prefill_plan.context_partition_slots,
+                                    prefill_plan.context_phase_block_slots,
+                                    prefill_plan.device_direct_partition_limit,
+                                    prefill_plan.reducer_dimension_wavefronts,
+                                    prefill_plan.reducer_block_slots,
+                                    stream_,
+                                    head_start,
+                                    gqa_n_rep);
+                        }
+                        else
+                        {
+                            result =
+                                hipFlashAttn_prefill_fa2_q8_1_context_parallel(
+                                    Q_ptr,
+                                    K->gpu_data_ptr(),
+                                    V->gpu_data_ptr(),
+                                    O_ptr,
+                                    context_O_partial,
+                                    context_m_partial,
+                                    context_l_partial,
+                                    batch_size,
+                                    seq_len,
+                                    launch_kv_capacity,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    causal,
+                                    window_size,
+                                    /*position_offset=*/0,
+                                    d_attn_params,
+                                    mask_ptr,
+                                    fa2_policy::
+                                        kROCmFA2CanonicalContextPartitionKeys,
+                                    prefill_plan.max_context_partitions,
+                                    prefill_plan.context_partition_slots,
+                                    prefill_plan.context_phase_block_slots,
+                                    prefill_plan.device_direct_partition_limit,
+                                    prefill_plan.reducer_dimension_wavefronts,
+                                    prefill_plan.reducer_block_slots,
+                                    stream_,
+                                    head_start,
+                                    gqa_n_rep);
+                        }
+                    }
+                    else if (kv_native_type == TensorType::FP16)
                     {
                         result = hipFlashAttn_prefill_fa2_fp16(
                             Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
@@ -1392,15 +1791,100 @@ namespace llaminar2
                               << K->dtype_name() << " KV kernel failed: " << result);
                     return false;
                 }
+                if (submitted_prefill)
+                {
+                    recordFA2ParallelPlanSelection(
+                        prefill_plan,
+                        execution_policy,
+                        batch_size,
+                        seq_len,
+                        n_heads,
+                        head_dim,
+                        launch_kv_capacity,
+                        dev,
+                        K->dtype_name());
+                }
                 return true;
             }
 
-            return apply_typed(Q_ptr, K_ptr, V_ptr, O_ptr,
-                               batch_size, seq_len, kv_len,
-                               n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev,
-                               d_attn_params, mask_ptr,
-                               head_start, gqa_n_rep);
+            if (prefill_plan.usesContextParallelism())
+            {
+                int result = -1;
+                {
+                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                        ROCmKernelType::FLASH_ATTN_PREFILL,
+                        static_cast<hipStream_t>(stream_));
+                    result = hipFlashAttn_prefill_fa2_context_parallel(
+                        Q_ptr,
+                        K_ptr,
+                        V_ptr,
+                        O_ptr,
+                        context_O_partial,
+                        context_m_partial,
+                        context_l_partial,
+                        batch_size,
+                        seq_len,
+                        launch_kv_capacity,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        /*position_offset=*/0,
+                        d_attn_params,
+                        mask_ptr,
+                        fa2_policy::
+                            kROCmFA2CanonicalContextPartitionKeys,
+                        prefill_plan.max_context_partitions,
+                        prefill_plan.context_partition_slots,
+                        prefill_plan.context_phase_block_slots,
+                        prefill_plan.device_direct_partition_limit,
+                        prefill_plan.reducer_dimension_wavefronts,
+                        prefill_plan.reducer_block_slots,
+                        stream_,
+                        head_start,
+                        gqa_n_rep);
+                }
+                if (result != 0)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] FP32 context-parallel FA2 transaction failed: "
+                              << result);
+                    return false;
+                }
+                recordFA2ParallelPlanSelection(
+                    prefill_plan,
+                    execution_policy,
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    "fp32");
+                return true;
+            }
+
+            const bool direct_success = apply_typed(
+                Q_ptr, K_ptr, V_ptr, O_ptr,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                causal, window_size, 0, dev,
+                d_attn_params, mask_ptr,
+                head_start, gqa_n_rep);
+            if (direct_success && seq_len > MAX_SMALL_DECODE_ROWS)
+            {
+                recordFA2ParallelPlanSelection(
+                    prefill_plan,
+                    execution_policy,
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    "fp32");
+            }
+            return direct_success;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_verifier_rows_decode_equivalent(
