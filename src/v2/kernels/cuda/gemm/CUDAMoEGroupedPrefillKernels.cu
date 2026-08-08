@@ -34,23 +34,66 @@ namespace
     constexpr uint32_t kUnusedDirectoryEntry = UINT32_MAX;
     constexpr int kRows = llaminar2::cuda::moe::kGroupedImmaTileRows;
     constexpr int kColumnsPerWarp = 8;
-    constexpr int kWarpsPerBlock = 4;
-    constexpr int kColumnsPerBlock = kColumnsPerWarp * kWarpsPerBlock;
-    constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;
-    constexpr int kMinimumBlocksPerSm = 1024 / kThreadsPerBlock;
-    constexpr int kGateUpWarpsPerBlock = 2 * kWarpsPerBlock;
-    constexpr int kGateUpThreadsPerBlock = kGateUpWarpsPerBlock * 32;
-    constexpr int kGateUpMinimumBlocksPerSm = 4;
     constexpr int kQuantBlock = 32;
-    constexpr int kGateUpOperandBytes =
-        kRows * kQuantBlock +
-        kGateUpWarpsPerBlock * kColumnsPerWarp * kQuantBlock;
-    constexpr int kGateUpProjectionBytes =
-        2 * kRows * kColumnsPerBlock * static_cast<int>(sizeof(float));
-    constexpr int kGateUpSharedBytes =
-        kGateUpProjectionBytes > kGateUpOperandBytes
-            ? kGateUpProjectionBytes
-            : kGateUpOperandBytes;
+
+    /** Compile-time resources derived from one arithmetic-neutral CTA width. */
+    template <int ColumnsPerBlock>
+    struct GroupedImmaGeometry final
+    {
+        static_assert(ColumnsPerBlock >= 32);
+        static_assert((ColumnsPerBlock % kColumnsPerWarp) == 0);
+        static_assert((ColumnsPerBlock % kQuantBlock) == 0);
+
+        static constexpr int projection_warps =
+            ColumnsPerBlock / kColumnsPerWarp;
+        static constexpr int projection_threads = projection_warps * 32;
+        static constexpr int projection_minimum_blocks_per_sm =
+            1024 / projection_threads > 0
+                ? 1024 / projection_threads
+                : 1;
+    };
+
+    /** Resources for the disjoint gate/up warp-bank schedule. */
+    template <int ColumnsPerBlock>
+    struct ParallelGateUpGeometry final
+    {
+        using Projection = GroupedImmaGeometry<ColumnsPerBlock>;
+        static constexpr int gate_up_warps = 2 * Projection::projection_warps;
+        static constexpr int gate_up_threads = gate_up_warps * 32;
+        static constexpr int gate_up_minimum_blocks_per_sm =
+            1024 / gate_up_threads > 0
+                ? 1024 / gate_up_threads
+                : 1;
+        static constexpr int gate_up_operand_bytes =
+            kRows * kQuantBlock +
+            gate_up_warps * kColumnsPerWarp * kQuantBlock;
+        static constexpr int gate_up_projection_bytes =
+            2 * kRows * ColumnsPerBlock * static_cast<int>(sizeof(float));
+        static constexpr int gate_up_shared_bytes =
+            gate_up_projection_bytes > gate_up_operand_bytes
+                ? gate_up_projection_bytes
+                : gate_up_operand_bytes;
+    };
+
+    /** Resources for the register-resident paired-projection schedule. */
+    template <int ColumnsPerBlock>
+    struct PairedGateUpGeometry final
+    {
+        using Projection = GroupedImmaGeometry<ColumnsPerBlock>;
+        static constexpr int gate_up_warps = Projection::projection_warps;
+        static constexpr int gate_up_threads = Projection::projection_threads;
+        static constexpr int gate_up_minimum_blocks_per_sm =
+            Projection::projection_minimum_blocks_per_sm;
+        static constexpr int gate_up_operand_bytes =
+            kRows * kQuantBlock +
+            2 * gate_up_warps * kColumnsPerWarp * kQuantBlock;
+        static constexpr int gate_up_value_bytes =
+            kRows * ColumnsPerBlock * static_cast<int>(sizeof(float));
+        static constexpr int gate_up_shared_bytes =
+            gate_up_value_bytes > gate_up_operand_bytes
+                ? gate_up_value_bytes
+                : gate_up_operand_bytes;
+    };
     constexpr uint32_t kSupportedCodebookMask =
         (uint32_t{1} << 0) |
         (uint32_t{1} << 4) |
@@ -463,8 +506,10 @@ namespace
      * partition in one CTA; no global partial buffer or cross-CTA reduction is
      * required, and the final FP32 tree is exactly the public serial-M1 tree.
      */
-    template <uint8_t CodebookId>
-    __global__ __launch_bounds__(kThreadsPerBlock, kMinimumBlocksPerSm)
+    template <uint8_t CodebookId, int ColumnsPerBlock>
+    __global__ __launch_bounds__(
+        GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
+        GroupedImmaGeometry<ColumnsPerBlock>::projection_minimum_blocks_per_sm)
     void groupedImmaProjectionKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
@@ -481,6 +526,7 @@ namespace
         int K,
         int k_partitions)
     {
+        using Geometry = GroupedImmaGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
         if (directory_index >= directory_entries)
             return;
@@ -522,12 +568,13 @@ namespace
         const int warp = static_cast<int>(threadIdx.x) >> 5;
         const int lane = static_cast<int>(threadIdx.x) & 31;
         const int column_base =
-            (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp) *
+            (static_cast<int>(blockIdx.x) * Geometry::projection_warps + warp) *
             kColumnsPerWarp;
 
         __shared__ __align__(16) int8_t shared_a[kRows * kQuantBlock];
         __shared__ __align__(16)
-            int8_t shared_b[kWarpsPerBlock][kColumnsPerWarp * kQuantBlock];
+            int8_t shared_b[Geometry::projection_warps]
+                            [kColumnsPerWarp * kQuantBlock];
 
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
@@ -693,10 +740,10 @@ namespace
      * serial-decode rounding boundary: gate and up retain independent integer
      * MMA and FP32 partition trees before the canonical nonlinear epilogue.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
-        kGateUpThreadsPerBlock,
-        kGateUpMinimumBlocksPerSm)
+        ParallelGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+        ParallelGateUpGeometry<ColumnsPerBlock>::gate_up_minimum_blocks_per_sm)
     void groupedImmaGateUpSwiGluKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
@@ -714,6 +761,7 @@ namespace
         int K,
         int k_partitions)
     {
+        using Geometry = ParallelGateUpGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
         if (directory_index >= directory_entries)
             return;
@@ -750,8 +798,13 @@ namespace
 
         const int warp = static_cast<int>(threadIdx.x) >> 5;
         const int lane = static_cast<int>(threadIdx.x) & 31;
-        const bool is_up_projection = warp >= kWarpsPerBlock;
-        const int projection_warp = warp & (kWarpsPerBlock - 1);
+        const bool is_up_projection =
+            warp >= Geometry::Projection::projection_warps;
+        const int projection_warp = is_up_projection
+                                        ? warp -
+                                              Geometry::Projection::
+                                                  projection_warps
+                                        : warp;
         const auto descriptor = is_up_projection
                                     ? up_descriptors[expert]
                                     : gate_descriptors[expert];
@@ -765,13 +818,15 @@ namespace
         const int active_rows = min(kRows, count - local_first_row);
         const int grouped_row_base = group_offset + local_first_row;
         const int column_base =
-            (static_cast<int>(blockIdx.x) * kWarpsPerBlock +
+            (static_cast<int>(blockIdx.x) *
+                 Geometry::Projection::projection_warps +
              projection_warp) *
             kColumnsPerWarp;
 
-        static_assert((kGateUpSharedBytes % sizeof(uint32_t)) == 0);
+        static_assert(
+            (Geometry::gate_up_shared_bytes % sizeof(uint32_t)) == 0);
         __shared__ __align__(16) uint32_t shared_storage[
-            kGateUpSharedBytes / sizeof(uint32_t)];
+            Geometry::gate_up_shared_bytes / sizeof(uint32_t)];
         auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
         int8_t *shared_a = shared_bytes;
         int8_t *shared_b =
@@ -913,32 +968,38 @@ namespace
                 projection_warp * kColumnsPerWarp +
                 mmaFragmentColumn(lane, element);
             const int column =
-                static_cast<int>(blockIdx.x) * kColumnsPerBlock + local_column;
+                static_cast<int>(blockIdx.x) * ColumnsPerBlock + local_column;
             if (local_row < active_rows && column < N)
             {
                 shared_projections[
-                    (projection * kRows + local_row) * kColumnsPerBlock +
+                    (projection * kRows + local_row) * ColumnsPerBlock +
                     local_column] = total[element];
             }
         }
         __syncthreads();
 
-        const int quant_column =
-            static_cast<int>(blockIdx.x) * kColumnsPerBlock + lane;
-        const bool quant_column_active = quant_column < N;
+        constexpr int kQuantBlocksPerCta = ColumnsPerBlock / kQuantBlock;
         const int output_blocks_per_row =
-            (N + kColumnsPerBlock - 1) / kColumnsPerBlock;
-        for (int local_row = warp; local_row < active_rows;
-             local_row += kGateUpWarpsPerBlock)
+            (N + kQuantBlock - 1) / kQuantBlock;
+        const int quantization_tasks = active_rows * kQuantBlocksPerCta;
+        for (int task = warp; task < quantization_tasks;
+             task += Geometry::gate_up_warps)
         {
+            const int local_row = task / kQuantBlocksPerCta;
+            const int local_quant_block = task % kQuantBlocksPerCta;
+            const int quant_column =
+                static_cast<int>(blockIdx.x) * ColumnsPerBlock +
+                local_quant_block * kQuantBlock + lane;
+            const bool quant_column_active = quant_column < N;
             const int fragment_index =
-                local_row * kColumnsPerBlock + lane;
+                local_row * ColumnsPerBlock +
+                local_quant_block * kQuantBlock + lane;
             const float gate = quant_column_active
                                    ? shared_projections[fragment_index]
                                    : 0.0f;
             const float up = quant_column_active
                                  ? shared_projections[
-                                       kRows * kColumnsPerBlock + fragment_index]
+                                       kRows * ColumnsPerBlock + fragment_index]
                                  : 0.0f;
             const float value = quant_column_active
                                     ? groupedPrefillSilu(gate) * up
@@ -963,7 +1024,331 @@ namespace
                     swiglu_scales[
                         static_cast<size_t>(grouped_row) *
                             output_blocks_per_row +
-                        static_cast<int>(blockIdx.x)] = scale;
+                        static_cast<int>(blockIdx.x) * kQuantBlocksPerCta +
+                        local_quant_block] = scale;
+                }
+                const float quantized = value / scale;
+                swiglu_int8[
+                    static_cast<size_t>(grouped_row) * N + quant_column] =
+                    static_cast<int8_t>(rintf(fminf(
+                        127.0f,
+                        fmaxf(-127.0f, quantized))));
+            }
+        }
+    }
+
+    /**
+     * @brief Compute gate and up in one warp and retain the pair in registers.
+     *
+     * A warp owns the same eight output columns for both projections. It
+     * decodes both B fragments into disjoint shared ranges, loads the common A
+     * fragment once, and evaluates the two canonical partition trees without
+     * an intervening publication. Only the exact SwiGLU result is written to
+     * shared memory for the unchanged 32-column blockwise quantizer. This
+     * schedule removes the duplicate A `ldmatrix` and the gate/up FP32 shared
+     * round trip while preserving every serial-row rounding boundary.
+     */
+    template <uint8_t CodebookId, int ColumnsPerBlock>
+    __global__ __launch_bounds__(
+        PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+        PairedGateUpGeometry<ColumnsPerBlock>::gate_up_minimum_blocks_per_sm)
+    void groupedImmaPairedGateUpSwiGluKernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ gate_descriptors,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ up_descriptors,
+        const int *__restrict__ group_counts,
+        const int *__restrict__ group_offsets,
+        const uint32_t *__restrict__ directory,
+        int8_t *__restrict__ swiglu_int8,
+        float *__restrict__ swiglu_scales,
+        int directory_entries,
+        int num_experts,
+        int total_slots,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        using Geometry = PairedGateUpGeometry<ColumnsPerBlock>;
+        const int directory_index = directoryIndexFromGrid();
+        if (directory_index >= directory_entries)
+            return;
+
+        const uint32_t packed_tile = directory[directory_index];
+        if (packed_tile == kUnusedDirectoryEntry)
+            return;
+
+        const int expert = static_cast<int>(packed_tile & kExpertMask);
+        const int local_first_row =
+            static_cast<int>(packed_tile >> kExpertBits);
+        if (expert < 0 || expert >= num_experts)
+        {
+            failFastInvalidGroupedImmaState();
+            return;
+        }
+
+        const int count = group_counts[expert];
+        const int group_offset = group_offsets[expert];
+        if (count <= 0 || local_first_row < 0 || local_first_row >= count ||
+            group_offset < 0 || group_offset + count > total_slots)
+        {
+            failFastInvalidGroupedImmaState();
+            return;
+        }
+        if (gate_descriptors[expert].codebook_id != CodebookId)
+            return;
+
+        const auto gate_descriptor = gate_descriptors[expert];
+        const auto up_descriptor = up_descriptors[expert];
+        if (!descriptorMatches<CodebookId>(gate_descriptor, N, K) ||
+            !descriptorMatches<CodebookId>(up_descriptor, N, K) ||
+            k_partitions <= 0)
+        {
+            failFastInvalidGroupedImmaState();
+            return;
+        }
+
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        const int active_rows = min(kRows, count - local_first_row);
+        const int grouped_row_base = group_offset + local_first_row;
+        const int column_base =
+            (static_cast<int>(blockIdx.x) * Geometry::gate_up_warps + warp) *
+            kColumnsPerWarp;
+
+        static_assert(
+            (Geometry::gate_up_shared_bytes % sizeof(uint32_t)) == 0);
+        __shared__ __align__(16) uint32_t shared_storage[
+            Geometry::gate_up_shared_bytes / sizeof(uint32_t)];
+        auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
+        int8_t *shared_a = shared_bytes;
+        constexpr int kWarpWeightBytes = kColumnsPerWarp * kQuantBlock;
+        int8_t *shared_gate_b =
+            shared_bytes + kRows * kQuantBlock + warp * kWarpWeightBytes;
+        int8_t *shared_up_b =
+            shared_bytes + kRows * kQuantBlock +
+            Geometry::gate_up_warps * kWarpWeightBytes +
+            warp * kWarpWeightBytes;
+
+        constexpr int kPayloadBytes =
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
+                payload_bytes;
+        const auto *gate_scales =
+            static_cast<const uint16_t *>(gate_descriptor.scales);
+        const auto *gate_mins =
+            static_cast<const uint16_t *>(gate_descriptor.mins);
+        const auto *gate_emins =
+            static_cast<const uint32_t *>(gate_descriptor.emins);
+        const auto *up_scales =
+            static_cast<const uint16_t *>(up_descriptor.scales);
+        const auto *up_mins =
+            static_cast<const uint16_t *>(up_descriptor.mins);
+        const auto *up_emins =
+            static_cast<const uint32_t *>(up_descriptor.emins);
+        const int blocks_per_row = K / kQuantBlock;
+        const int blocks_per_partition =
+            (blocks_per_row + k_partitions - 1) / k_partitions;
+        float gate_total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float up_total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int partition = 0; partition < k_partitions; ++partition)
+        {
+            float gate_partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float up_partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int block_begin = partition * blocks_per_partition;
+            const int block_end = min(
+                blocks_per_row,
+                block_begin + blocks_per_partition);
+
+            for (int block = block_begin; block < block_end; ++block)
+            {
+                if (threadIdx.x < 32)
+                {
+                    const int local_row = static_cast<int>(threadIdx.x) >> 1;
+                    const int half = static_cast<int>(threadIdx.x) & 1;
+                    int4 activation = make_int4(0, 0, 0, 0);
+                    if (local_row < active_rows)
+                    {
+                        const int grouped_row = grouped_row_base + local_row;
+                        activation = *reinterpret_cast<const int4 *>(
+                            A_int8 + static_cast<size_t>(grouped_row) * K +
+                            block * kQuantBlock + half * sizeof(int4));
+                    }
+                    *reinterpret_cast<int4 *>(
+                        shared_a + local_row * kQuantBlock +
+                        half * sizeof(int4)) = activation;
+                }
+
+                decodeMmaWeightFragment<CodebookId>(
+                    gate_descriptor,
+                    shared_gate_b,
+                    block,
+                    N,
+                    column_base,
+                    lane);
+                decodeMmaWeightFragment<CodebookId>(
+                    up_descriptor,
+                    shared_up_b,
+                    block,
+                    N,
+                    column_base,
+                    lane);
+                __syncthreads();
+
+                uint32_t a_fragment[4];
+                uint32_t gate_b_fragment[2];
+                uint32_t up_b_fragment[2];
+                loadMmaA(
+                    a_fragment,
+                    reinterpret_cast<const int *>(shared_a),
+                    lane);
+                loadMmaB(
+                    gate_b_fragment,
+                    reinterpret_cast<const int *>(shared_gate_b),
+                    lane);
+                loadMmaB(
+                    up_b_fragment,
+                    reinterpret_cast<const int *>(shared_up_b),
+                    lane);
+
+                int32_t gate_dot_lo[4] = {0, 0, 0, 0};
+                int32_t gate_dot_hi[4] = {0, 0, 0, 0};
+                int32_t up_dot_lo[4] = {0, 0, 0, 0};
+                int32_t up_dot_hi[4] = {0, 0, 0, 0};
+                if constexpr (llaminar2::cuda_native_vnni::
+                                  CodebookTraits<CodebookId>::is_dual_scale)
+                {
+                    const uint32_t gate_b_lo[2] = {
+                        gate_b_fragment[0], 0u};
+                    const uint32_t gate_b_hi[2] = {
+                        0u, gate_b_fragment[1]};
+                    const uint32_t up_b_lo[2] = {up_b_fragment[0], 0u};
+                    const uint32_t up_b_hi[2] = {0u, up_b_fragment[1]};
+                    mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_lo);
+                    mmaM16N8K32(gate_dot_hi, a_fragment, gate_b_hi);
+                    mmaM16N8K32(up_dot_lo, a_fragment, up_b_lo);
+                    mmaM16N8K32(up_dot_hi, a_fragment, up_b_hi);
+                }
+                else
+                {
+                    mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_fragment);
+                    mmaM16N8K32(up_dot_lo, a_fragment, up_b_fragment);
+                }
+
+#pragma unroll
+                for (int element = 0; element < 4; ++element)
+                {
+                    const int local_row = mmaFragmentRow(lane, element);
+                    const int column =
+                        column_base + mmaFragmentColumn(lane, element);
+                    if (local_row >= active_rows || column >= N)
+                        continue;
+
+                    const int grouped_row = grouped_row_base + local_row;
+                    const size_t linear =
+                        static_cast<size_t>(block) * N + column;
+                    const float activation_scale = scales_A[
+                        static_cast<size_t>(grouped_row) * blocks_per_row +
+                        block];
+                    gate_partial[element] = __fadd_rn(
+                        gate_partial[element],
+                        contributionFromMma<CodebookId>(
+                            shared_a + local_row * kQuantBlock,
+                            gate_dot_lo[element],
+                            gate_dot_hi[element],
+                            gate_descriptor.payload + linear * kPayloadBytes,
+                            gate_scales,
+                            gate_mins,
+                            gate_emins,
+                            linear,
+                            activation_scale));
+                    up_partial[element] = __fadd_rn(
+                        up_partial[element],
+                        contributionFromMma<CodebookId>(
+                            shared_a + local_row * kQuantBlock,
+                            up_dot_lo[element],
+                            up_dot_hi[element],
+                            up_descriptor.payload + linear * kPayloadBytes,
+                            up_scales,
+                            up_mins,
+                            up_emins,
+                            linear,
+                            activation_scale));
+                }
+                __syncthreads();
+            }
+
+#pragma unroll
+            for (int element = 0; element < 4; ++element)
+            {
+                gate_total[element] = __fadd_rn(
+                    gate_total[element],
+                    gate_partial[element]);
+                up_total[element] = __fadd_rn(
+                    up_total[element],
+                    up_partial[element]);
+            }
+        }
+
+        float *shared_values = reinterpret_cast<float *>(shared_storage);
+#pragma unroll
+        for (int element = 0; element < 4; ++element)
+        {
+            const int local_row = mmaFragmentRow(lane, element);
+            const int local_column =
+                warp * kColumnsPerWarp +
+                mmaFragmentColumn(lane, element);
+            const int column =
+                static_cast<int>(blockIdx.x) * ColumnsPerBlock + local_column;
+            if (local_row < active_rows && column < N)
+            {
+                shared_values[local_row * ColumnsPerBlock + local_column] =
+                    groupedPrefillSilu(gate_total[element]) *
+                    up_total[element];
+            }
+        }
+        __syncthreads();
+
+        constexpr int kQuantBlocksPerCta = ColumnsPerBlock / kQuantBlock;
+        const int output_blocks_per_row =
+            (N + kQuantBlock - 1) / kQuantBlock;
+        const int quantization_tasks = active_rows * kQuantBlocksPerCta;
+        for (int task = warp; task < quantization_tasks;
+             task += Geometry::gate_up_warps)
+        {
+            const int local_row = task / kQuantBlocksPerCta;
+            const int local_quant_block = task % kQuantBlocksPerCta;
+            const int quant_column =
+                static_cast<int>(blockIdx.x) * ColumnsPerBlock +
+                local_quant_block * kQuantBlock + lane;
+            const bool quant_column_active = quant_column < N;
+            const int fragment_index =
+                local_row * ColumnsPerBlock +
+                local_quant_block * kQuantBlock + lane;
+            const float value = quant_column_active
+                                    ? shared_values[fragment_index]
+                                    : 0.0f;
+            float abs_value = fabsf(value);
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+            {
+                abs_value = fmaxf(
+                    abs_value,
+                    __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            }
+
+            const float scale =
+                abs_value > 0.0f ? abs_value / 127.0f : 1.0f;
+            if (quant_column_active)
+            {
+                const int grouped_row = grouped_row_base + local_row;
+                if (lane == 0)
+                {
+                    swiglu_scales[
+                        static_cast<size_t>(grouped_row) *
+                            output_blocks_per_row +
+                        static_cast<int>(blockIdx.x) * kQuantBlocksPerCta +
+                        local_quant_block] = scale;
                 }
                 const float quantized = value / scale;
                 swiglu_int8[
@@ -979,10 +1364,11 @@ namespace
     bool makeProjectionGrid(
         int N,
         int directory_entries,
+        int columns_per_block,
         dim3 &grid)
     {
         constexpr unsigned int kGridDimensionLimit = 65535u;
-        if (N <= 0 || directory_entries <= 0)
+        if (N <= 0 || directory_entries <= 0 || columns_per_block <= 0)
             return false;
         const unsigned int rows =
             static_cast<unsigned int>(directory_entries);
@@ -991,15 +1377,15 @@ namespace
         if (rows_z == 0 || rows_z > kGridDimensionLimit)
             return false;
         grid = dim3(
-            static_cast<unsigned int>((N + kColumnsPerBlock - 1) /
-                                      kColumnsPerBlock),
+            static_cast<unsigned int>((N + columns_per_block - 1) /
+                                      columns_per_block),
             rows_y,
             rows_z);
         return grid.x > 0;
     }
 
     /** Launch one codebook specialization when its table mask bit is present. */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     bool launchCodebookProjection(
         uint32_t codebook_mask,
         const dim3 &grid,
@@ -1022,9 +1408,9 @@ namespace
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
             return true;
-        groupedImmaProjectionKernel<CodebookId><<<
+        groupedImmaProjectionKernel<CodebookId, ColumnsPerBlock><<<
             grid,
-            kThreadsPerBlock,
+            GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
             0,
             stream>>>(
             A_int8,
@@ -1046,7 +1432,7 @@ namespace
     }
 
     /** Launch one fused gate/up/SwiGLU specialization when its mask bit exists. */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     bool launchCodebookGateUpSwiGlu(
         uint32_t codebook_mask,
         const dim3 &grid,
@@ -1070,9 +1456,9 @@ namespace
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
             return true;
-        groupedImmaGateUpSwiGluKernel<CodebookId><<<
+        groupedImmaGateUpSwiGluKernel<CodebookId, ColumnsPerBlock><<<
             grid,
-            kGateUpThreadsPerBlock,
+            ParallelGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
             0,
             stream>>>(
             A_int8,
@@ -1092,6 +1478,236 @@ namespace
             k_partitions);
         launched = true;
         return cudaGetLastError() == cudaSuccess;
+    }
+
+    /** Launch one paired gate/up specialization when its mask bit exists. */
+    template <uint8_t CodebookId, int ColumnsPerBlock>
+    bool launchCodebookPairedGateUpSwiGlu(
+        uint32_t codebook_mask,
+        const dim3 &grid,
+        cudaStream_t stream,
+        const int8_t *A_int8,
+        const float *scales_A,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const int *group_counts,
+        const int *group_offsets,
+        const uint32_t *directory,
+        int8_t *swiglu_int8,
+        float *swiglu_scales,
+        int directory_entries,
+        int num_experts,
+        int total_slots,
+        int N,
+        int K,
+        int k_partitions,
+        bool &launched)
+    {
+        if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
+            return true;
+        groupedImmaPairedGateUpSwiGluKernel<
+            CodebookId,
+            ColumnsPerBlock><<<
+            grid,
+            PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+            0,
+            stream>>>(
+            A_int8,
+            scales_A,
+            gate_descriptors,
+            up_descriptors,
+            group_counts,
+            group_offsets,
+            directory,
+            swiglu_int8,
+            swiglu_scales,
+            directory_entries,
+            num_experts,
+            total_slots,
+            N,
+            K,
+            k_partitions);
+        launched = true;
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    /** Dispatch every codebook in a mixed descriptor table at one CTA width. */
+    template <int ColumnsPerBlock>
+    bool launchGroupedImmaProjectionTable(
+        uint32_t codebook_mask,
+        cudaStream_t stream,
+        const int8_t *A_int8,
+        const float *scales_A,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *descriptors,
+        const int *group_counts,
+        const int *group_offsets,
+        const uint32_t *directory,
+        const float *partition_weights,
+        float *output,
+        int directory_entries,
+        int num_experts,
+        int total_slots,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        dim3 grid;
+        if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
+            return false;
+
+        bool launched = false;
+#define LAUNCH_CODEBOOK(CB)                                                     \
+    do                                                                           \
+    {                                                                            \
+        if (!launchCodebookProjection<CB, ColumnsPerBlock>(                      \
+                codebook_mask, grid, stream, A_int8, scales_A, descriptors,     \
+                group_counts, group_offsets, directory, partition_weights,      \
+                output, directory_entries, num_experts, total_slots, N, K,      \
+                k_partitions, launched))                                         \
+        {                                                                        \
+            return false;                                                        \
+        }                                                                        \
+    } while (0)
+
+        LAUNCH_CODEBOOK(0);
+        LAUNCH_CODEBOOK(4);
+        LAUNCH_CODEBOOK(5);
+        LAUNCH_CODEBOOK(6);
+        LAUNCH_CODEBOOK(7);
+        LAUNCH_CODEBOOK(8);
+        LAUNCH_CODEBOOK(9);
+        LAUNCH_CODEBOOK(10);
+        LAUNCH_CODEBOOK(11);
+        LAUNCH_CODEBOOK(12);
+        LAUNCH_CODEBOOK(13);
+        LAUNCH_CODEBOOK(14);
+        LAUNCH_CODEBOOK(15);
+        LAUNCH_CODEBOOK(16);
+        LAUNCH_CODEBOOK(17);
+        LAUNCH_CODEBOOK(19);
+
+#undef LAUNCH_CODEBOOK
+        return launched;
+    }
+
+    /** Dispatch every fused gate/up codebook at one capture-time CTA width. */
+    template <int ColumnsPerBlock>
+    bool launchGroupedImmaGateUpTable(
+        uint32_t codebook_mask,
+        cudaStream_t stream,
+        const int8_t *A_int8,
+        const float *scales_A,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const int *group_counts,
+        const int *group_offsets,
+        const uint32_t *directory,
+        int8_t *swiglu_int8,
+        float *swiglu_scales,
+        int directory_entries,
+        int num_experts,
+        int total_slots,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        dim3 grid;
+        if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
+            return false;
+
+        bool launched = false;
+#define LAUNCH_GATE_UP_CODEBOOK(CB)                                             \
+    do                                                                           \
+    {                                                                            \
+        if (!launchCodebookGateUpSwiGlu<CB, ColumnsPerBlock>(                    \
+                codebook_mask, grid, stream, A_int8, scales_A,                  \
+                gate_descriptors, up_descriptors, group_counts, group_offsets,  \
+                directory, swiglu_int8, swiglu_scales, directory_entries,       \
+                num_experts, total_slots, N, K, k_partitions, launched))         \
+        {                                                                        \
+            return false;                                                        \
+        }                                                                        \
+    } while (0)
+
+        LAUNCH_GATE_UP_CODEBOOK(0);
+        LAUNCH_GATE_UP_CODEBOOK(4);
+        LAUNCH_GATE_UP_CODEBOOK(5);
+        LAUNCH_GATE_UP_CODEBOOK(6);
+        LAUNCH_GATE_UP_CODEBOOK(7);
+        LAUNCH_GATE_UP_CODEBOOK(8);
+        LAUNCH_GATE_UP_CODEBOOK(9);
+        LAUNCH_GATE_UP_CODEBOOK(10);
+        LAUNCH_GATE_UP_CODEBOOK(11);
+        LAUNCH_GATE_UP_CODEBOOK(12);
+        LAUNCH_GATE_UP_CODEBOOK(13);
+        LAUNCH_GATE_UP_CODEBOOK(14);
+        LAUNCH_GATE_UP_CODEBOOK(15);
+        LAUNCH_GATE_UP_CODEBOOK(16);
+        LAUNCH_GATE_UP_CODEBOOK(17);
+        LAUNCH_GATE_UP_CODEBOOK(19);
+
+#undef LAUNCH_GATE_UP_CODEBOOK
+        return launched;
+    }
+
+    /** Dispatch every paired gate/up codebook at one capture-time CTA width. */
+    template <int ColumnsPerBlock>
+    bool launchGroupedImmaPairedGateUpTable(
+        uint32_t codebook_mask,
+        cudaStream_t stream,
+        const int8_t *A_int8,
+        const float *scales_A,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
+        const int *group_counts,
+        const int *group_offsets,
+        const uint32_t *directory,
+        int8_t *swiglu_int8,
+        float *swiglu_scales,
+        int directory_entries,
+        int num_experts,
+        int total_slots,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        dim3 grid;
+        if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
+            return false;
+
+        bool launched = false;
+#define LAUNCH_PAIRED_GATE_UP_CODEBOOK(CB)                                      \
+    do                                                                           \
+    {                                                                            \
+        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(              \
+                codebook_mask, grid, stream, A_int8, scales_A,                  \
+                gate_descriptors, up_descriptors, group_counts, group_offsets,  \
+                directory, swiglu_int8, swiglu_scales, directory_entries,       \
+                num_experts, total_slots, N, K, k_partitions, launched))         \
+        {                                                                        \
+            return false;                                                        \
+        }                                                                        \
+    } while (0)
+
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(0);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(4);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(5);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(6);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(7);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(8);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(9);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(10);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(11);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(12);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(13);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(14);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(15);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(16);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(17);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(19);
+
+#undef LAUNCH_PAIRED_GATE_UP_CODEBOOK
+        return launched;
     }
 } // namespace
 
@@ -1147,6 +1763,7 @@ extern "C" bool cudaMoEGroupedImma_project(
     int K,
     uint32_t codebook_mask,
     int k_partitions,
+    llaminar2::cuda::moe::GroupedImmaColumns columns,
     int device_idx,
     void *stream)
 {
@@ -1156,51 +1773,44 @@ extern "C" bool cudaMoEGroupedImma_project(
         num_experts > llaminar2::cuda::moe::kGroupedImmaMaximumExperts ||
         total_slots <= 0 || N <= 0 || K <= 0 || (K % kQuantBlock) != 0 ||
         codebook_mask == 0 || (codebook_mask & ~kSupportedCodebookMask) != 0 ||
-        k_partitions <= 0)
+        k_partitions <= 0 ||
+        !llaminar2::cuda::moe::validGroupedImmaDownColumns(columns))
     {
         return false;
     }
     if (cudaSetDevice(device_idx) != cudaSuccess)
         return false;
 
-    dim3 grid;
-    if (!makeProjectionGrid(N, directory_entries, grid))
-        return false;
-
     const auto cuda_stream = static_cast<cudaStream_t>(stream);
-    bool launched = false;
-#define LAUNCH_CODEBOOK(CB)                                                   \
-    do                                                                         \
-    {                                                                          \
-        if (!launchCodebookProjection<CB>(                                    \
-                codebook_mask, grid, cuda_stream, d_A_int8, d_scales_A,       \
-                d_desc_table, d_group_counts, d_group_offsets, d_directory,   \
-                d_partition_weights, d_output, directory_entries,             \
-                num_experts, total_slots, N, K, k_partitions, launched))      \
-        {                                                                      \
-            return false;                                                      \
-        }                                                                      \
-    } while (0)
-
-    LAUNCH_CODEBOOK(0);
-    LAUNCH_CODEBOOK(4);
-    LAUNCH_CODEBOOK(5);
-    LAUNCH_CODEBOOK(6);
-    LAUNCH_CODEBOOK(7);
-    LAUNCH_CODEBOOK(8);
-    LAUNCH_CODEBOOK(9);
-    LAUNCH_CODEBOOK(10);
-    LAUNCH_CODEBOOK(11);
-    LAUNCH_CODEBOOK(12);
-    LAUNCH_CODEBOOK(13);
-    LAUNCH_CODEBOOK(14);
-    LAUNCH_CODEBOOK(15);
-    LAUNCH_CODEBOOK(16);
-    LAUNCH_CODEBOOK(17);
-    LAUNCH_CODEBOOK(19);
-
-#undef LAUNCH_CODEBOOK
-    return launched;
+    using llaminar2::cuda::moe::GroupedImmaColumns;
+    switch (columns)
+    {
+    case GroupedImmaColumns::Columns32:
+        return launchGroupedImmaProjectionTable<32>(
+            codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
+            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_output, directory_entries, num_experts, total_slots, N, K,
+            k_partitions);
+    case GroupedImmaColumns::Columns64:
+        return launchGroupedImmaProjectionTable<64>(
+            codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
+            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_output, directory_entries, num_experts, total_slots, N, K,
+            k_partitions);
+    case GroupedImmaColumns::Columns128:
+        return launchGroupedImmaProjectionTable<128>(
+            codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
+            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_output, directory_entries, num_experts, total_slots, N, K,
+            k_partitions);
+    case GroupedImmaColumns::Columns256:
+        return launchGroupedImmaProjectionTable<256>(
+            codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
+            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_output, directory_entries, num_experts, total_slots, N, K,
+            k_partitions);
+    }
+    return false;
 }
 
 extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
@@ -1220,6 +1830,8 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     int K,
     uint32_t codebook_mask,
     int k_partitions,
+    llaminar2::cuda::moe::GroupedImmaColumns columns,
+    llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
     int device_idx,
     void *stream)
 {
@@ -1229,61 +1841,77 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
         directory_entries <= 0 || num_experts <= 0 ||
         num_experts > llaminar2::cuda::moe::kGroupedImmaMaximumExperts ||
         total_slots <= 0 || N <= 0 || K <= 0 ||
-        (N % kColumnsPerBlock) != 0 || (K % kQuantBlock) != 0 ||
+        (N % kQuantBlock) != 0 || (K % kQuantBlock) != 0 ||
         codebook_mask == 0 ||
         (codebook_mask & ~kSupportedCodebookMask) != 0 ||
-        k_partitions <= 0)
+        k_partitions <= 0 ||
+        !llaminar2::cuda::moe::validGroupedImmaGateUpColumns(columns) ||
+        !llaminar2::cuda::moe::validGroupedImmaGateUpSchedule(schedule))
     {
         return false;
     }
     if (cudaSetDevice(device_idx) != cudaSuccess)
         return false;
 
-    dim3 grid;
-    if (!makeProjectionGrid(N, directory_entries, grid))
-        return false;
-
     const auto cuda_stream = static_cast<cudaStream_t>(stream);
-    bool launched = false;
-#define LAUNCH_GATE_UP_CODEBOOK(CB)                                            \
-    do                                                                          \
-    {                                                                           \
-        if (!launchCodebookGateUpSwiGlu<CB>(                                   \
-                codebook_mask, grid, cuda_stream, d_A_int8, d_scales_A,        \
-                d_gate_desc_table, d_up_desc_table, d_group_counts,            \
-                d_group_offsets, d_directory, d_swiglu_int8,                   \
-                d_swiglu_scales, directory_entries, num_experts, total_slots,  \
-                N, K, k_partitions, launched))                                 \
-        {                                                                       \
-            return false;                                                       \
-        }                                                                       \
-    } while (0)
-
-    LAUNCH_GATE_UP_CODEBOOK(0);
-    LAUNCH_GATE_UP_CODEBOOK(4);
-    LAUNCH_GATE_UP_CODEBOOK(5);
-    LAUNCH_GATE_UP_CODEBOOK(6);
-    LAUNCH_GATE_UP_CODEBOOK(7);
-    LAUNCH_GATE_UP_CODEBOOK(8);
-    LAUNCH_GATE_UP_CODEBOOK(9);
-    LAUNCH_GATE_UP_CODEBOOK(10);
-    LAUNCH_GATE_UP_CODEBOOK(11);
-    LAUNCH_GATE_UP_CODEBOOK(12);
-    LAUNCH_GATE_UP_CODEBOOK(13);
-    LAUNCH_GATE_UP_CODEBOOK(14);
-    LAUNCH_GATE_UP_CODEBOOK(15);
-    LAUNCH_GATE_UP_CODEBOOK(16);
-    LAUNCH_GATE_UP_CODEBOOK(17);
-    LAUNCH_GATE_UP_CODEBOOK(19);
-
-#undef LAUNCH_GATE_UP_CODEBOOK
-    return launched;
+    using llaminar2::cuda::moe::GroupedImmaColumns;
+    using llaminar2::cuda::moe::GroupedImmaGateUpSchedule;
+    const bool paired =
+        schedule == GroupedImmaGateUpSchedule::PairedProjections;
+    switch (columns)
+    {
+    case GroupedImmaColumns::Columns32:
+        return paired
+                   ? launchGroupedImmaPairedGateUpTable<32>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions)
+                   : launchGroupedImmaGateUpTable<32>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions);
+    case GroupedImmaColumns::Columns64:
+        return paired
+                   ? launchGroupedImmaPairedGateUpTable<64>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions)
+                   : launchGroupedImmaGateUpTable<64>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions);
+    case GroupedImmaColumns::Columns128:
+        return paired
+                   ? launchGroupedImmaPairedGateUpTable<128>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions)
+                   : launchGroupedImmaGateUpTable<128>(
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         d_gate_desc_table, d_up_desc_table, d_group_counts,
+                         d_group_offsets, d_directory, d_swiglu_int8,
+                         d_swiglu_scales, directory_entries, num_experts,
+                         total_slots, N, K, k_partitions);
+    case GroupedImmaColumns::Columns256:
+        return false;
+    }
+    return false;
 }
 
 namespace
 {
     /** Query compiler resources for one exact IMMA specialization. */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     bool queryGroupedImmaKernelResources(
         int *registers_per_thread,
         std::size_t *local_memory_bytes_per_thread,
@@ -1294,7 +1922,8 @@ namespace
         cudaFuncAttributes attributes{};
         if (cudaFuncGetAttributes(
                 &attributes,
-                groupedImmaProjectionKernel<CodebookId>) != cudaSuccess)
+                groupedImmaProjectionKernel<CodebookId, ColumnsPerBlock>) !=
+            cudaSuccess)
         {
             (void)cudaGetLastError();
             return false;
@@ -1303,8 +1932,8 @@ namespace
         int active_blocks = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &active_blocks,
-                groupedImmaProjectionKernel<CodebookId>,
-                kThreadsPerBlock,
+                groupedImmaProjectionKernel<CodebookId, ColumnsPerBlock>,
+                GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
                 0) != cudaSuccess)
         {
             (void)cudaGetLastError();
@@ -1320,7 +1949,7 @@ namespace
     }
 
     /** Query compiler resources for one fused gate/up/SwiGLU specialization. */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     bool queryGroupedImmaGateUpKernelResources(
         int *registers_per_thread,
         std::size_t *local_memory_bytes_per_thread,
@@ -1331,7 +1960,8 @@ namespace
         cudaFuncAttributes attributes{};
         if (cudaFuncGetAttributes(
                 &attributes,
-                groupedImmaGateUpSwiGluKernel<CodebookId>) != cudaSuccess)
+                groupedImmaGateUpSwiGluKernel<CodebookId, ColumnsPerBlock>) !=
+            cudaSuccess)
         {
             (void)cudaGetLastError();
             return false;
@@ -1340,8 +1970,8 @@ namespace
         int active_blocks = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &active_blocks,
-                groupedImmaGateUpSwiGluKernel<CodebookId>,
-                kGateUpThreadsPerBlock,
+                groupedImmaGateUpSwiGluKernel<CodebookId, ColumnsPerBlock>,
+                ParallelGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
                 0) != cudaSuccess)
         {
             (void)cudaGetLastError();
@@ -1355,10 +1985,143 @@ namespace
         *max_active_blocks_per_sm = active_blocks;
         return active_blocks > 0;
     }
+
+    /** Query compiler resources for one paired gate/up specialization. */
+    template <uint8_t CodebookId, int ColumnsPerBlock>
+    bool queryGroupedImmaPairedGateUpKernelResources(
+        int *registers_per_thread,
+        std::size_t *local_memory_bytes_per_thread,
+        std::size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm)
+    {
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(
+                &attributes,
+                groupedImmaPairedGateUpSwiGluKernel<
+                    CodebookId,
+                    ColumnsPerBlock>) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        int active_blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                groupedImmaPairedGateUpSwiGluKernel<
+                    CodebookId,
+                    ColumnsPerBlock>,
+                PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+                0) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        *registers_per_thread = attributes.numRegs;
+        *local_memory_bytes_per_thread = attributes.localSizeBytes;
+        *static_shared_memory_bytes = attributes.sharedSizeBytes;
+        *max_threads_per_block = attributes.maxThreadsPerBlock;
+        *max_active_blocks_per_sm = active_blocks;
+        return active_blocks > 0;
+    }
+
+    /** Resolve one down-projection codebook at a compile-time geometry. */
+    template <int ColumnsPerBlock>
+    bool queryGroupedImmaCodebookResources(
+        uint8_t codebook_id,
+        int *registers_per_thread,
+        std::size_t *local_memory_bytes_per_thread,
+        std::size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm)
+    {
+#define QUERY_CODEBOOK(CB)                                                      \
+    case CB:                                                                    \
+        return queryGroupedImmaKernelResources<CB, ColumnsPerBlock>(            \
+            registers_per_thread, local_memory_bytes_per_thread,                \
+            static_shared_memory_bytes, max_threads_per_block,                  \
+            max_active_blocks_per_sm)
+
+        switch (codebook_id)
+        {
+            QUERY_CODEBOOK(0);
+            QUERY_CODEBOOK(4);
+            QUERY_CODEBOOK(5);
+            QUERY_CODEBOOK(6);
+            QUERY_CODEBOOK(7);
+            QUERY_CODEBOOK(8);
+            QUERY_CODEBOOK(9);
+            QUERY_CODEBOOK(10);
+            QUERY_CODEBOOK(11);
+            QUERY_CODEBOOK(12);
+            QUERY_CODEBOOK(13);
+            QUERY_CODEBOOK(14);
+            QUERY_CODEBOOK(15);
+            QUERY_CODEBOOK(16);
+            QUERY_CODEBOOK(17);
+            QUERY_CODEBOOK(19);
+        default:
+            return false;
+        }
+
+#undef QUERY_CODEBOOK
+    }
+
+    /** Resolve one fused gate/up codebook at a compile-time geometry. */
+    template <int ColumnsPerBlock, bool Paired>
+    bool queryGroupedImmaGateUpCodebookResources(
+        uint8_t codebook_id,
+        int *registers_per_thread,
+        std::size_t *local_memory_bytes_per_thread,
+        std::size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm)
+    {
+#define QUERY_GATE_UP_CODEBOOK(CB)                                               \
+    case CB:                                                                     \
+        if constexpr (Paired)                                                    \
+            return queryGroupedImmaPairedGateUpKernelResources<                  \
+                CB, ColumnsPerBlock>(                                            \
+                registers_per_thread, local_memory_bytes_per_thread,             \
+                static_shared_memory_bytes, max_threads_per_block,               \
+                max_active_blocks_per_sm);                                       \
+        else                                                                     \
+            return queryGroupedImmaGateUpKernelResources<CB, ColumnsPerBlock>(   \
+                registers_per_thread, local_memory_bytes_per_thread,             \
+                static_shared_memory_bytes, max_threads_per_block,               \
+                max_active_blocks_per_sm)
+
+        switch (codebook_id)
+        {
+            QUERY_GATE_UP_CODEBOOK(0);
+            QUERY_GATE_UP_CODEBOOK(4);
+            QUERY_GATE_UP_CODEBOOK(5);
+            QUERY_GATE_UP_CODEBOOK(6);
+            QUERY_GATE_UP_CODEBOOK(7);
+            QUERY_GATE_UP_CODEBOOK(8);
+            QUERY_GATE_UP_CODEBOOK(9);
+            QUERY_GATE_UP_CODEBOOK(10);
+            QUERY_GATE_UP_CODEBOOK(11);
+            QUERY_GATE_UP_CODEBOOK(12);
+            QUERY_GATE_UP_CODEBOOK(13);
+            QUERY_GATE_UP_CODEBOOK(14);
+            QUERY_GATE_UP_CODEBOOK(15);
+            QUERY_GATE_UP_CODEBOOK(16);
+            QUERY_GATE_UP_CODEBOOK(17);
+            QUERY_GATE_UP_CODEBOOK(19);
+        default:
+            return false;
+        }
+
+#undef QUERY_GATE_UP_CODEBOOK
+    }
 }
 
 extern "C" bool cudaMoEGroupedImma_queryKernelResources(
     uint8_t codebook_id,
+    llaminar2::cuda::moe::GroupedImmaColumns columns,
     int *registers_per_thread,
     std::size_t *local_memory_bytes_per_thread,
     std::size_t *static_shared_memory_bytes,
@@ -1372,42 +2135,37 @@ extern "C" bool cudaMoEGroupedImma_queryKernelResources(
         return false;
     }
 
-#define QUERY_CODEBOOK(CB)                                                    \
-    case CB:                                                                  \
-        return queryGroupedImmaKernelResources<CB>(                           \
-            registers_per_thread,                                             \
-            local_memory_bytes_per_thread,                                    \
-            static_shared_memory_bytes,                                       \
-            max_threads_per_block,                                            \
-            max_active_blocks_per_sm)
-
-    switch (codebook_id)
+    using llaminar2::cuda::moe::GroupedImmaColumns;
+    switch (columns)
     {
-        QUERY_CODEBOOK(0);
-        QUERY_CODEBOOK(4);
-        QUERY_CODEBOOK(5);
-        QUERY_CODEBOOK(6);
-        QUERY_CODEBOOK(7);
-        QUERY_CODEBOOK(8);
-        QUERY_CODEBOOK(9);
-        QUERY_CODEBOOK(10);
-        QUERY_CODEBOOK(11);
-        QUERY_CODEBOOK(12);
-        QUERY_CODEBOOK(13);
-        QUERY_CODEBOOK(14);
-        QUERY_CODEBOOK(15);
-        QUERY_CODEBOOK(16);
-        QUERY_CODEBOOK(17);
-        QUERY_CODEBOOK(19);
-    default:
-        return false;
+    case GroupedImmaColumns::Columns32:
+        return queryGroupedImmaCodebookResources<32>(
+            codebook_id, registers_per_thread, local_memory_bytes_per_thread,
+            static_shared_memory_bytes, max_threads_per_block,
+            max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns64:
+        return queryGroupedImmaCodebookResources<64>(
+            codebook_id, registers_per_thread, local_memory_bytes_per_thread,
+            static_shared_memory_bytes, max_threads_per_block,
+            max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns128:
+        return queryGroupedImmaCodebookResources<128>(
+            codebook_id, registers_per_thread, local_memory_bytes_per_thread,
+            static_shared_memory_bytes, max_threads_per_block,
+            max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns256:
+        return queryGroupedImmaCodebookResources<256>(
+            codebook_id, registers_per_thread, local_memory_bytes_per_thread,
+            static_shared_memory_bytes, max_threads_per_block,
+            max_active_blocks_per_sm);
     }
-
-#undef QUERY_CODEBOOK
+    return false;
 }
 
 extern "C" bool cudaMoEGroupedImma_queryGateUpKernelResources(
     uint8_t codebook_id,
+    llaminar2::cuda::moe::GroupedImmaColumns columns,
+    llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
     int *registers_per_thread,
     std::size_t *local_memory_bytes_per_thread,
     std::size_t *static_shared_memory_bytes,
@@ -1416,41 +2174,56 @@ extern "C" bool cudaMoEGroupedImma_queryGateUpKernelResources(
 {
     if (!registers_per_thread || !local_memory_bytes_per_thread ||
         !static_shared_memory_bytes || !max_threads_per_block ||
-        !max_active_blocks_per_sm)
+        !max_active_blocks_per_sm ||
+        !llaminar2::cuda::moe::validGroupedImmaGateUpSchedule(schedule))
     {
         return false;
     }
 
-#define QUERY_GATE_UP_CODEBOOK(CB)                                            \
-    case CB:                                                                  \
-        return queryGroupedImmaGateUpKernelResources<CB>(                     \
-            registers_per_thread,                                             \
-            local_memory_bytes_per_thread,                                    \
-            static_shared_memory_bytes,                                       \
-            max_threads_per_block,                                            \
-            max_active_blocks_per_sm)
-
-    switch (codebook_id)
+    using llaminar2::cuda::moe::GroupedImmaColumns;
+    using llaminar2::cuda::moe::GroupedImmaGateUpSchedule;
+    const bool paired =
+        schedule == GroupedImmaGateUpSchedule::PairedProjections;
+    switch (columns)
     {
-        QUERY_GATE_UP_CODEBOOK(0);
-        QUERY_GATE_UP_CODEBOOK(4);
-        QUERY_GATE_UP_CODEBOOK(5);
-        QUERY_GATE_UP_CODEBOOK(6);
-        QUERY_GATE_UP_CODEBOOK(7);
-        QUERY_GATE_UP_CODEBOOK(8);
-        QUERY_GATE_UP_CODEBOOK(9);
-        QUERY_GATE_UP_CODEBOOK(10);
-        QUERY_GATE_UP_CODEBOOK(11);
-        QUERY_GATE_UP_CODEBOOK(12);
-        QUERY_GATE_UP_CODEBOOK(13);
-        QUERY_GATE_UP_CODEBOOK(14);
-        QUERY_GATE_UP_CODEBOOK(15);
-        QUERY_GATE_UP_CODEBOOK(16);
-        QUERY_GATE_UP_CODEBOOK(17);
-        QUERY_GATE_UP_CODEBOOK(19);
-    default:
+    case GroupedImmaColumns::Columns32:
+        return paired
+                   ? queryGroupedImmaGateUpCodebookResources<32, true>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm)
+                   : queryGroupedImmaGateUpCodebookResources<32, false>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns64:
+        return paired
+                   ? queryGroupedImmaGateUpCodebookResources<64, true>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm)
+                   : queryGroupedImmaGateUpCodebookResources<64, false>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns128:
+        return paired
+                   ? queryGroupedImmaGateUpCodebookResources<128, true>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm)
+                   : queryGroupedImmaGateUpCodebookResources<128, false>(
+                         codebook_id, registers_per_thread,
+                         local_memory_bytes_per_thread,
+                         static_shared_memory_bytes, max_threads_per_block,
+                         max_active_blocks_per_sm);
+    case GroupedImmaColumns::Columns256:
         return false;
     }
-
-#undef QUERY_GATE_UP_CODEBOOK
+    return false;
 }

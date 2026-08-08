@@ -256,6 +256,88 @@ Matched llama.cpp master comparison, tok/s:
 | ROCm dense 27B | `20.08/25.15` | `39.28/22.66` |
 | ROCm MoE 35B | `46.33/73.93` | `74.94/95.84` |
 
+### Reproducible CUDA1 SingleDevice Reference
+
+The active CUDA1 control uses the Release binary, a 434-token production-valid
+Qwen chat prompt, stochastic fixed-depth-3 verification, one capture/warmup,
+and three measured replays. MTP prefill population is inside the measured
+prefill transaction; model load, graph construction, and warmup are outside it.
+
+```bash
+env \
+  LLAMINAR_BENCHMARK_ITERATIONS=3 \
+  LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+  LLAMINAR_PREFILL_GRAPH_REQUIRED=1 \
+  LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1 \
+  LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0 \
+  /workspaces/llaminar/build_v2_release/llaminar2 benchmark \
+  -m /opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  -d cuda:0 --context-length 4096 -n 256 \
+  --benchmark-json-output /tmp/llaminar-cuda1-qwen36-35b-mtp-d3.json \
+  --prompt-file /workspaces/llaminar/benchmarks/prompts/qwen36_mtp_fixed_chat.txt \
+  --seed 123 --temperature 0.8 --top-k 40 --top-p 0.9 \
+  --mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed \
+  --mtp-verify-mode speculative-sampling \
+  --moe-residency-maintenance off
+```
+
+The 2026-08-07 pre-router-tuning baseline was `2271.66 tok/s` prefill
+(`191.05 ms`) and `189.60 tok/s` decode. A captured, byte-exact tournament over
+every production bucket from M=64 through M=4096 replaced the underfilled
+Qwen-35B `64x64` FP32 router tile with a typed bucket policy. At the canonical
+M=512 bucket, `32x32` reduced isolated replay from approximately `426 us` to
+`267 us`; all candidate outputs matched the installed arithmetic byte for byte.
+Two post-install Release runs measured `2336.31/2335.26 tok/s` prefill
+(`185.76/185.85 ms`) and `189.52/189.68 tok/s` decode. Both retained exactly
+`450/672` stochastic accepts (`66.96%`), zero transaction-validation failures,
+and one complete 1611-node captured graph.
+
+Nsight Compute confirms the physical improvement. The former `64x64` node used
+40 registers, zero spills, 32 blocks, 16.67% achieved occupancy, and `466.53 us`.
+The installed `32x32` node uses 39 registers, zero spills, 4.10 KiB shared
+memory, 128 blocks, 25.24% achieved occupancy, and `280.29 us`; measured SM and
+memory throughput both reach 42.25%. The next dominant target is grouped IMMA:
+gate/up/SwiGLU plus down projection account for approximately `78.45 ms` of the
+complete prefill replay, versus roughly `11.2 ms` for the tuned router.
+
+The follow-on all-format grouped-IMMA tournament covered the three concrete
+Qwen3.6 35B MoE gate/up and down codebook tuples over every production bucket:
+63 cells, 24 physical candidates per cell, and 1,512 authenticated records.
+Every candidate matched the serial arithmetic byte for byte. The installed
+policy uses paired gate/up projection with 32-column tiles through the smaller
+buckets, 64-column tiles where they win at larger M, and 32-column down tiles.
+Nsight Compute reports 64 registers, zero spills, and `64.19%/65.42%` achieved
+occupancy for the representative M=512/M=1024 winners. The resulting Release
+control measures `2445.92 tok/s` prefill (`177.44 ms`) and `189.69 tok/s`
+decode with unchanged `450/672` stochastic acceptance (`66.96%`), zero
+transaction-validation failures, and one complete captured verifier graph.
+
+The first full-context HTTP gate then exposed a separate graph-family workspace
+defect at Q8 `M=256,N=512,K=2048`: exact dispatch is non-monotonic in M, but
+planning had assumed the largest bucket represented every smaller bucket. The
+M=4096 direct winner therefore declared zero canonical-reducer scratch even
+though M=64/128/256 use the 16-partition public-M1 tree. Planning now computes
+a typed envelope over every installed cell through the graph family's maximum,
+caches it with the complete mutable policy identity, and fails during planning
+if the envelope cannot be proven. A focused CUDA integration regression covers
+all 16 execution codebooks and every captured prefill bucket; the Q8 case proves
+the 32 MiB four-slot allocation and the exact-overlay cache-key transition.
+
+The corrected Release live-server cell passed `19/19`: repeated prefill replay,
+three-position and strict-JSON needle recall, 1,024-token stochastic generation,
+cache reset, `3827/4096` near-boundary context, oversized rejection, clean exit,
+and complete VRAM release. PerfStats captured 2,702 records with zero segmented
+execution, 240 paired-IMMA exact-overlay calls, all 40 grouped-verifier layers,
+436 depth-three verifier transactions over 1,744 rows, and eight real executions
+of the formerly failing Q8 canonical bucket. The only D2H publications were the
+14 terminal request results. Peak process VRAM was 21,710 MiB on the 24 GiB
+RTX 3090.
+
+The final linked Release binary repeated the same `19/19` full-tier result and
+2,702-record PerfStats contract after the fail-fast planner change. The complete
+Integration tree rebuilt successfully (`792/792` targets), and the device-free
+unit gate passed `591/591` in 139.32 seconds.
+
 ### Reproducible ROCm1 SingleDevice Reference
 
 The active ROCm SingleDevice tuning control uses the Qwen3.6-35B-A3B MoE

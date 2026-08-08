@@ -64,6 +64,23 @@ extern "C"
     bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
     void cudaNativeVNNIPrefill_setExactOverlayEnabled(bool enabled);
     bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
+    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+        uint8_t codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions);
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        uint8_t codebook_id,
+        int max_M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions,
+        int *planned_rows);
     void cudaNativeVNNIPrefill_setForceTile(int tile_id);
     void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
@@ -990,16 +1007,14 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_GroupedSmallMProductionSchedule
 }
 
 /**
- * @test Prove ordinary CUDA NativeVNNI prefill is total without a generated
- * prefill dispatch include.
+ * @test Prove ordinary CUDA NativeVNNI prefill remains total below overlays.
  *
- * The production M=1 and grouped-verifier surfaces consume certified learned
- * dispatch, but prompt prefill intentionally remains on the legacy
- * format/geometry heuristic. Exercise representative Qwen3.6 dense projection
- * geometries in Q4_K and Q5_1, require a legal physical tile and reduction schedule,
- * and verify the launcher publishes the exact heuristic selection through
- * PerfStats. A missing learned prefill corpus must therefore neither fail the
- * operation nor silently suppress route telemetry.
+ * Exact cells are additive and must never substitute for a total generic
+ * format/geometry policy. This test explicitly bypasses installed cells, then
+ * exercises representative Qwen3.6 dense Q4_K and Q5_1 projections, requires
+ * a legal physical tile and reduction schedule, and verifies that PerfStats
+ * publishes the generic selection. An unseen shape must therefore neither fail
+ * dispatch nor silently suppress route telemetry.
  */
 TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic)
 {
@@ -1013,6 +1028,7 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36DensePromptPrefillUsesTot
 
     cudaNativeVNNIPrefill_setForceTile(-1);
     cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
 
     struct Shape
     {
@@ -1450,6 +1466,129 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWork
     }
 
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+/**
+ * @test Prove graph-family workspace covers every installed prefill bucket.
+ *
+ * The Qwen3.6 35B MoE Q8 gate/up geometry is deliberately non-monotonic:
+ * M=64,128,256 use the byte-exact public-M1 K-partition tree, while larger
+ * buckets use direct full-K tiles. Planning only M=4096 previously declared
+ * zero reducer scratch and made the first M=256 captured replay fail fatally.
+ *
+ * This regression asks every supported codebook for every production bucket's
+ * exact requirement, then proves the family envelope covers their maximum. It
+ * additionally checks the real Q8 workspace consumer reserves all four
+ * concurrent projection slots and that toggling exact overlays changes a
+ * cached request rather than returning stale policy state.
+ */
+TEST_F(Test__CUDAGemmBatchInvariance,
+       NativeVNNIPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride concurrent_env(
+        "LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    cudaNativeVNNIPrefill_setForceTile(-1);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+    cudaNativeVNNIPrefill_setExactOverlayEnabled(true);
+
+    constexpr std::array<uint8_t, 16> codebooks = {
+        0, 4, 5, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16, 17, 19};
+    constexpr int kMaxM = 4096;
+    constexpr int kN = 512;
+    constexpr int kK = 2048;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    for (const uint8_t codebook : codebooks)
+    {
+        SCOPED_TRACE(
+            "codebook=" + std::to_string(static_cast<int>(codebook)));
+        size_t observed_max_bytes = 0;
+        for (const int bucket : kDefaultPrefillGraphBucketSizes)
+        {
+            if (bucket > kMaxM)
+                break;
+            size_t bucket_bytes = 0;
+            int bucket_partitions = 1;
+            ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspacePlan(
+                codebook,
+                bucket,
+                kN,
+                kK,
+                gpu_device_.ordinal,
+                &bucket_bytes,
+                &bucket_partitions));
+            observed_max_bytes = std::max(observed_max_bytes, bucket_bytes);
+        }
+
+        size_t envelope_bytes = 0;
+        int envelope_partitions = 1;
+        int envelope_rows = 0;
+        ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+            codebook,
+            kMaxM,
+            kN,
+            kK,
+            gpu_device_.ordinal,
+            &envelope_bytes,
+            &envelope_partitions,
+            &envelope_rows));
+        EXPECT_EQ(envelope_bytes, observed_max_bytes);
+        EXPECT_EQ(envelope_bytes == 0, envelope_rows == 0);
+        EXPECT_EQ(envelope_bytes == 0, envelope_partitions == 1);
+    }
+
+    size_t q8_envelope_bytes = 0;
+    int q8_partitions = 1;
+    int q8_rows = 0;
+    ASSERT_TRUE(cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        /*Q8_0=*/19,
+        kMaxM,
+        kN,
+        kK,
+        gpu_device_.ordinal,
+        &q8_envelope_bytes,
+        &q8_partitions,
+        &q8_rows));
+    EXPECT_EQ(q8_rows, 256)
+        << "The installed Q8 overlay's last canonical bucket is M=256";
+    ASSERT_GT(q8_partitions, 1);
+    EXPECT_EQ(
+        q8_envelope_bytes,
+        static_cast<size_t>(q8_partitions) * q8_rows * kN * sizeof(float));
+
+    auto weight = TestTensorFactory::createQ8_0Random(
+        {static_cast<size_t>(kN), static_cast<size_t>(kK)},
+        /*seed=*/46256);
+    auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+    ASSERT_NE(workspace_consumer, nullptr);
+
+    const WorkspaceRequirements exact_requirements =
+        workspace_consumer->getWorkspaceRequirements(kMaxM, kN, kK);
+    const auto *exact_partials = exact_requirements.find(
+        GemmWorkspaceBuffers::
+            CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+    ASSERT_NE(exact_partials, nullptr);
+    EXPECT_EQ(exact_partials->size_bytes, q8_envelope_bytes * 4u)
+        << "Concurrent QKV-style replay owns four disjoint reducer slots";
+
+    cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
+    const WorkspaceRequirements generic_requirements =
+        workspace_consumer->getWorkspaceRequirements(kMaxM, kN, kK);
+    EXPECT_EQ(
+        generic_requirements.find(
+            GemmWorkspaceBuffers::
+                CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+        nullptr)
+        << "The workspace cache key must include exact-overlay policy state";
 #endif
 }
 

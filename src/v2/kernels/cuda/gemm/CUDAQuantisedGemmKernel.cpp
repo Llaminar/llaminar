@@ -216,6 +216,16 @@ namespace llaminar2
                 size_t *canonical_kpart_partials_bytes,
                 int *planned_k_partitions);
 
+            bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+                uint8_t codebook_id,
+                int max_M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions,
+                int *planned_rows);
+
             void cudaNativeVNNIPrefill_getLastLaunchSelection(
                 int *tile_id,
                 int *k_partitions,
@@ -223,6 +233,7 @@ namespace llaminar2
                 int *used_canonical_kpart);
 
             int cudaNativeVNNIPrefill_getBK256Mode();
+            bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
             bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
             void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
 
@@ -501,7 +512,6 @@ namespace llaminar2
 
             struct NativePrefillWorkspaceBounds
             {
-                bool valid = false;
                 size_t canonical_kpart_partials_bytes = 0;
                 int canonical_kpart_rows = 0;
                 int planned_k_partitions = 1;
@@ -516,6 +526,7 @@ namespace llaminar2
                 int cuda_device_id = 0;
                 int bk256_mode = 0;
                 int canonical_kpart_mode = 0;
+                int exact_overlay_enabled = 1;
                 int force_tile = -1;
 
                 bool operator==(const NativePrefillWorkspaceCacheKey &other) const
@@ -527,6 +538,7 @@ namespace llaminar2
                            cuda_device_id == other.cuda_device_id &&
                            bk256_mode == other.bk256_mode &&
                            canonical_kpart_mode == other.canonical_kpart_mode &&
+                           exact_overlay_enabled == other.exact_overlay_enabled &&
                            force_tile == other.force_tile;
                 }
             };
@@ -547,6 +559,7 @@ namespace llaminar2
                     mix(static_cast<size_t>(key.cuda_device_id));
                     mix(static_cast<size_t>(key.bk256_mode));
                     mix(static_cast<size_t>(key.canonical_kpart_mode));
+                    mix(static_cast<size_t>(key.exact_overlay_enabled));
                     mix(static_cast<size_t>(key.force_tile + 2));
                     return h;
                 }
@@ -570,43 +583,6 @@ namespace llaminar2
                 return cache;
             }
 
-            NativePrefillWorkspaceBounds nativePrefillWorkspaceForRows(
-                uint8_t codebook_id,
-                int rows,
-                int n,
-                int k,
-                int cuda_device_id)
-            {
-                NativePrefillWorkspaceBounds bounds;
-                if (rows <= 1)
-                    return bounds;
-
-                size_t canonical_kpart_partials_bytes = 0;
-                int planned_k_partitions = 1;
-                if (!cudaNativeVNNIPrefill_getWorkspacePlan(
-                        codebook_id,
-                        rows,
-                        n,
-                        k,
-                        cuda_device_id,
-                        &canonical_kpart_partials_bytes,
-                        &planned_k_partitions))
-                {
-                    return bounds;
-                }
-
-                bounds.valid = true;
-                bounds.canonical_kpart_partials_bytes = std::max(
-                    canonical_kpart_partials_bytes,
-                    paddedCanonicalKpartBytes(
-                        rows,
-                        n,
-                        planned_k_partitions));
-                bounds.canonical_kpart_rows = rows;
-                bounds.planned_k_partitions = planned_k_partitions;
-                return bounds;
-            }
-
             NativePrefillWorkspaceBounds maxNativePrefillWorkspaceForRowsUpTo(
                 uint8_t codebook_id,
                 int max_m,
@@ -618,14 +594,17 @@ namespace llaminar2
                 cudaNativeVNNIPrefill_getForceTile(&force_tile);
 
                 const NativePrefillWorkspaceCacheKey key{
-                    codebook_id,
-                    max_m,
-                    n,
-                    k,
-                    cuda_device_id,
-                    cudaNativeVNNIPrefill_getBK256Mode(),
-                    cudaNativeVNNIPrefill_getCanonicalKPartitionMode() ? 1 : 0,
-                    force_tile,
+                    .codebook_id = codebook_id,
+                    .max_m = max_m,
+                    .n = n,
+                    .k = k,
+                    .cuda_device_id = cuda_device_id,
+                    .bk256_mode = cudaNativeVNNIPrefill_getBK256Mode(),
+                    .canonical_kpart_mode =
+                        cudaNativeVNNIPrefill_getCanonicalKPartitionMode() ? 1 : 0,
+                    .exact_overlay_enabled =
+                        cudaNativeVNNIPrefill_getExactOverlayEnabled() ? 1 : 0,
+                    .force_tile = force_tile,
                 };
 
                 {
@@ -636,20 +615,44 @@ namespace llaminar2
                         return it->second;
                 }
 
-                /*
-                 * Public-M1 partition count depends only on codebook/N/K and
-                 * workspace bytes are monotonic in M. Planning the largest
-                 * graph bucket therefore proves every smaller row count; an
-                 * exhaustive host-side scan of all intermediate M values adds
-                 * no information and needlessly lengthens graph construction.
-                 */
-                NativePrefillWorkspaceBounds best =
-                    nativePrefillWorkspaceForRows(
+                NativePrefillWorkspaceBounds best;
+                size_t canonical_kpart_partials_bytes = 0;
+                int planned_k_partitions = 1;
+                int planned_rows = 0;
+                if (!cudaNativeVNNIPrefill_getWorkspaceEnvelope(
                         codebook_id,
                         max_m,
                         n,
                         k,
-                        cuda_device_id);
+                        cuda_device_id,
+                        &canonical_kpart_partials_bytes,
+                        &planned_k_partitions,
+                        &planned_rows))
+                {
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] NativeVNNI prefill "
+                        "workspace-envelope planning failed [codebook=" +
+                        std::to_string(static_cast<int>(codebook_id)) +
+                        ", max_M=" + std::to_string(max_m) +
+                        ", N=" + std::to_string(n) +
+                        ", K=" + std::to_string(k) +
+                        ", cuda_device=" + std::to_string(cuda_device_id) +
+                        ", exact_overlay=" +
+                        std::to_string(key.exact_overlay_enabled) +
+                        ", force_tile=" + std::to_string(key.force_tile) +
+                        ", force_canonical_kpart=" +
+                        std::to_string(key.canonical_kpart_mode) +
+                        ", bk256_mode=" + std::to_string(key.bk256_mode) +
+                        "]");
+                }
+                best.canonical_kpart_partials_bytes = std::max(
+                    canonical_kpart_partials_bytes,
+                    paddedCanonicalKpartBytes(
+                        planned_rows,
+                        n,
+                        planned_k_partitions));
+                best.canonical_kpart_rows = planned_rows;
+                best.planned_k_partitions = planned_k_partitions;
 
                 std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
                 nativePrefillWorkspaceCache().emplace(key, best);
@@ -3946,29 +3949,27 @@ namespace llaminar2
                         n,
                         k,
                         cuda_device_id_);
-                if (prefill_bounds.valid)
-                {
-                    const size_t prefill_scratch_slots = concurrentPrefillScratchSlotsForM(m);
+                const size_t prefill_scratch_slots =
+                    concurrentPrefillScratchSlotsForM(m);
 
-                    if (prefill_bounds.canonical_kpart_partials_bytes > 0)
-                    {
-                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS,
-                                                prefill_bounds.canonical_kpart_partials_bytes * prefill_scratch_slots,
-                                                256,
-                                                true,
-                                                WorkspaceExecutionRegime::PrefillOnly});
-                    }
-                    LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
-                              << static_cast<int>(native_codebook_id)
-                              << " max_rows=" << m
-                              << " canonical_kpart_rows="
-                              << prefill_bounds.canonical_kpart_rows
-                              << " k_partitions="
-                              << prefill_bounds.planned_k_partitions
-                              << " canonical_kpart_partials="
-                              << (prefill_bounds.canonical_kpart_partials_bytes / 1024)
-                              << "KB");
+                if (prefill_bounds.canonical_kpart_partials_bytes > 0)
+                {
+                    reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS,
+                                            prefill_bounds.canonical_kpart_partials_bytes * prefill_scratch_slots,
+                                            256,
+                                            true,
+                                            WorkspaceExecutionRegime::PrefillOnly});
                 }
+                LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
+                          << static_cast<int>(native_codebook_id)
+                          << " max_rows=" << m
+                          << " canonical_kpart_rows="
+                          << prefill_bounds.canonical_kpart_rows
+                          << " k_partitions="
+                          << prefill_bounds.planned_k_partitions
+                          << " canonical_kpart_partials="
+                          << (prefill_bounds.canonical_kpart_partials_bytes / 1024)
+                          << "KB");
             }
 
             /*

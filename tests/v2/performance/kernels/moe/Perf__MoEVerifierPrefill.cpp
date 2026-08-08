@@ -1018,11 +1018,13 @@ namespace
 
     /** Inspect one exact persistent grouped-IMMA specialization. */
     CudaMoEPrefillKernelResources queryCudaMoEGroupedImmaKernelResources(
-        uint8_t execution_codebook)
+        uint8_t execution_codebook,
+        llaminar2::cuda::moe::GroupedImmaColumns columns)
     {
         CudaMoEPrefillKernelResources resources{};
         if (!cudaMoEGroupedImma_queryKernelResources(
                 execution_codebook,
+                columns,
                 &resources.registers_per_thread,
                 &resources.local_memory_bytes_per_thread,
                 &resources.static_shared_memory_bytes,
@@ -1037,11 +1039,15 @@ namespace
 
     /** Inspect one fused grouped-IMMA gate/up/SwiGLU specialization. */
     CudaMoEPrefillKernelResources queryCudaMoEGroupedImmaGateUpKernelResources(
-        uint8_t execution_codebook)
+        uint8_t execution_codebook,
+        llaminar2::cuda::moe::GroupedImmaColumns columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule)
     {
         CudaMoEPrefillKernelResources resources{};
         if (!cudaMoEGroupedImma_queryGateUpKernelResources(
                 execution_codebook,
+                columns,
+                schedule,
                 &resources.registers_per_thread,
                 &resources.local_memory_bytes_per_thread,
                 &resources.static_shared_memory_bytes,
@@ -1123,71 +1129,104 @@ namespace
     {
     public:
         ScopedCudaMoEGeometryConfig()
-            : old_gateup_tile_n_(
-                  llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_ordered_kpart_tile_n),
-              old_gateup_override_active_(
+            : old_imma_gateup_columns_(
+                  llaminar2::mutableDebugEnv().gemm.cuda_moe_imma_gateup_columns),
+              old_imma_down_columns_(
+                  llaminar2::mutableDebugEnv().gemm.cuda_moe_imma_down_columns),
+              old_imma_gateup_schedule_(
                   llaminar2::mutableDebugEnv().gemm
-                      .cuda_moe_gateup_ordered_kpart_tile_n_override_active),
-              old_down_tile_n_(
-                  llaminar2::mutableDebugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n)
+                      .cuda_moe_imma_gateup_schedule),
+              old_imma_override_active_(
+                  llaminar2::mutableDebugEnv().gemm
+                      .cuda_moe_imma_geometry_override_active)
         {
         }
 
         ~ScopedCudaMoEGeometryConfig()
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_ordered_kpart_tile_n = old_gateup_tile_n_;
-            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active =
-                old_gateup_override_active_;
-            gemm.cuda_moe_down_ordered_kpart_tile_n = old_down_tile_n_;
+            gemm.cuda_moe_imma_gateup_columns = old_imma_gateup_columns_;
+            gemm.cuda_moe_imma_down_columns = old_imma_down_columns_;
+            gemm.cuda_moe_imma_gateup_schedule =
+                old_imma_gateup_schedule_;
+            gemm.cuda_moe_imma_geometry_override_active =
+                old_imma_override_active_;
         }
 
-        /**
-         * @brief Force one arithmetic-neutral gate/up block width.
-         *
-         * K-partitions and direct-down warps are fixed by
-         * `CUDAMoEBatchInvariantPolicy`; only this block geometry may enter a
-         * work-size-dependent dispatch overlay.
-         */
-        void setGateUpTileN(int gateup_tile_n)
+        /** Force one pair of compiled grouped-IMMA CTA widths before capture. */
+        void setGroupedImmaGeometry(
+            int gateup_columns,
+            int down_columns,
+            llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule)
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_ordered_kpart_tile_n = gateup_tile_n;
-            gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active = true;
+            gemm.cuda_moe_imma_gateup_columns = gateup_columns;
+            gemm.cuda_moe_imma_down_columns = down_columns;
+            gemm.cuda_moe_imma_gateup_schedule =
+                static_cast<int>(schedule);
+            gemm.cuda_moe_imma_geometry_override_active = true;
         }
 
     private:
-        int old_gateup_tile_n_ = 128;
-        bool old_gateup_override_active_ = false;
-        int old_down_tile_n_ = 128;
+        int old_imma_gateup_columns_ = 32;
+        int old_imma_down_columns_ = 32;
+        int old_imma_gateup_schedule_ = 0;
+        bool old_imma_override_active_ = false;
     };
 
     /** One arithmetic-neutral CUDA production launch candidate. */
     struct CudaMoEProductionCandidate
     {
-        int gateup_tile_n = 128;
+        int gateup_columns = 32;
+        int down_columns = 32;
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule =
+            llaminar2::cuda::moe::GroupedImmaGateUpSchedule::
+                ParallelProjections;
 
         /** @brief Return a stable corpus identity for this launch policy. */
         std::string id() const
         {
-            return "g_tn" + std::to_string(gateup_tile_n) +
-                   "__d_fixed";
+            const char *schedule_name =
+                schedule == llaminar2::cuda::moe::
+                                GroupedImmaGateUpSchedule::PairedProjections
+                    ? "paired"
+                    : "parallel";
+            return std::string("imma_") + schedule_name + "_g" +
+                   std::to_string(gateup_columns) +
+                   "__d" + std::to_string(down_columns);
         }
     };
 
     /** @brief Enumerate the complete non-dominated CUDA top-8 candidate space. */
     std::vector<CudaMoEProductionCandidate> cudaMoEProductionCandidates()
     {
-        constexpr std::array<int, 7> gateup_tile_n{
-            64, 96, 128, 160, 192, 224, 256,
-        };
+        constexpr std::array<int, 3> gateup_columns{32, 64, 128};
+        constexpr std::array<int, 4> down_columns{32, 64, 128, 256};
+        constexpr std::array<
+            llaminar2::cuda::moe::GroupedImmaGateUpSchedule,
+            2>
+            schedules{
+                llaminar2::cuda::moe::GroupedImmaGateUpSchedule::
+                    ParallelProjections,
+                llaminar2::cuda::moe::GroupedImmaGateUpSchedule::
+                    PairedProjections,
+            };
         std::vector<CudaMoEProductionCandidate> result;
-        result.reserve(gateup_tile_n.size());
-        for (const int gate_width : gateup_tile_n)
+        result.reserve(
+            schedules.size() * gateup_columns.size() * down_columns.size());
+        for (const auto schedule : schedules)
         {
-            result.push_back(CudaMoEProductionCandidate{
-                .gateup_tile_n = gate_width,
-            });
+            for (const int gate_width : gateup_columns)
+            {
+                for (const int down_width : down_columns)
+                {
+                    result.push_back(CudaMoEProductionCandidate{
+                        .gateup_columns = gate_width,
+                        .down_columns = down_width,
+                        .schedule = schedule,
+                    });
+                }
+            }
         }
         return result;
     }
@@ -1222,8 +1261,8 @@ namespace
         int robust_warmups = 2;
         int robust_trials = 15;
         int robust_replays = 4;
-        int minimum_finalists = 7;
-        int maximum_finalists = 7;
+        int minimum_finalists = 4;
+        int maximum_finalists = 8;
         double finalist_margin = 0.05;
         std::string profiler_request_id;
         std::optional<CudaMoEProductionCandidate> profiler_candidate;
@@ -1519,9 +1558,14 @@ namespace
     /** @brief Prove PerfStats observed one exact forced CUDA candidate. */
     bool observedCudaMoEProductionCandidate(
         int rows,
-        int top_k,
         const CudaMoEProductionCandidate &candidate)
     {
+        const char *expected_schedule =
+            candidate.schedule == llaminar2::cuda::moe::
+                                      GroupedImmaGateUpSchedule::
+                                          PairedProjections
+                ? "paired_projections"
+                : "parallel_projections";
         const auto records = llaminar2::PerfStatsCollector::snapshot(
             {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
         for (const auto &record : records)
@@ -1537,21 +1581,13 @@ namespace
             };
             if (record.count > 0 &&
                 tag("seq_len") == std::to_string(rows) &&
-                tag("gateup_k_partitions") ==
-                    std::to_string(
-                        llaminar2::CUDAMoEBatchInvariantPolicy::
-                            gate_up_k_partitions) &&
-                tag("gateup_ordered_tile_n") ==
-                    std::to_string(candidate.gateup_tile_n) &&
-                tag("down_k_partitions") ==
-                    std::to_string(
-                        llaminar2::CUDAMoEBatchInvariantPolicy::
-                            down_k_partitions) &&
-                tag("down_direct_warps") ==
-                    std::to_string(
-                        llaminar2::CUDAMoEBatchInvariantPolicy::
-                            directDownWarps(top_k)) &&
-                tag("down_publication") == "fused_direct")
+                tag("gateup_geometry_contract") == "tensor_core_imma" &&
+                tag("imma_gateup_columns") ==
+                    std::to_string(candidate.gateup_columns) &&
+                tag("imma_down_columns") ==
+                    std::to_string(candidate.down_columns) &&
+                tag("imma_gateup_schedule") == expected_schedule &&
+                tag("down_publication") == "ordered_direct")
             {
                 return true;
             }
@@ -1579,10 +1615,6 @@ namespace
             routed_case.routed.up);
         const auto &down_format = llaminar2::test::quantizedMoEVerifierFormat(
             routed_case.routed.down);
-        const int fixed_down_threads =
-            llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(
-                routed_case.experts_per_token) * 32;
-
         std::ostringstream row;
         row << std::setprecision(17)
             << "cuda,moe_production_prefill,"
@@ -1604,10 +1636,10 @@ namespace
             << route_stats.assignment_cv << ','
             << rows << ','
             << evidence.candidate.id() << ','
-            << 0 << ','
-            << evidence.candidate.gateup_tile_n << ','
-            << 0 << ','
-            << fixed_down_threads << ','
+            << llaminar2::cuda::moe::kGroupedImmaTileRows << ','
+            << evidence.candidate.gateup_columns << ','
+            << llaminar2::cuda::moe::kGroupedImmaTileRows << ','
+            << evidence.candidate.down_columns << ','
             << evidence.gateup_resources.local_memory_bytes_per_thread << ','
             << evidence.down_resources.local_memory_bytes_per_thread << ','
             << evidence.gateup_resources.registers_per_thread << ','
@@ -1974,9 +2006,15 @@ namespace
 
         ScopedCudaMoEGeometryConfig forced_config;
         const CudaMoEProductionCandidate reference_candidate{
-            .gateup_tile_n = 128,
+            .gateup_columns = 32,
+            .down_columns = 32,
+            .schedule = llaminar2::cuda::moe::
+                GroupedImmaGateUpSchedule::ParallelProjections,
         };
-        forced_config.setGateUpTileN(reference_candidate.gateup_tile_n);
+        forced_config.setGroupedImmaGeometry(
+            reference_candidate.gateup_columns,
+            reference_candidate.down_columns,
+            reference_candidate.schedule);
         llaminar2::PerfStatsCollector::reset();
         {
             llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
@@ -1998,7 +2036,6 @@ namespace
         }
         if (!observedCudaMoEProductionCandidate(
                 rows,
-                routed_case.experts_per_token,
                 reference_candidate))
         {
             throw std::runtime_error("PerfStats missed CUDA reference policy");
@@ -2049,9 +2086,6 @@ namespace
 
         CudaMoEPrefillEventTimer timer(stream);
         CudaMoEPrefillDeviceByteCertificate certificate;
-        const int fixed_down_threads =
-            llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(
-                routed_case.experts_per_token) * 32;
         const auto measure_candidate = [&] (
             const CudaMoEProductionCandidate &candidate,
             int warmups,
@@ -2061,14 +2095,16 @@ namespace
         {
             CudaMoEProductionEvidence evidence{};
             evidence.candidate = candidate;
-            evidence.gateup_resources = queryCudaMoEPrefillKernelResources(
+            evidence.gateup_resources =
+                queryCudaMoEGroupedImmaGateUpKernelResources(
                 gateup_format.device_execution_codebook_id,
-                /*component=*/0,
-                candidate.gateup_tile_n);
-            evidence.down_resources = queryCudaMoEPrefillKernelResources(
+                static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                    candidate.gateup_columns),
+                candidate.schedule);
+            evidence.down_resources = queryCudaMoEGroupedImmaKernelResources(
                 down_format.device_execution_codebook_id,
-                /*component=*/1,
-                fixed_down_threads);
+                static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                    candidate.down_columns));
             if (!evidence.gateup_resources.spillFree() ||
                 !evidence.down_resources.spillFree())
             {
@@ -2076,7 +2112,10 @@ namespace
                     "spilling CUDA candidate reached timing: " + candidate.id());
             }
 
-            forced_config.setGateUpTileN(candidate.gateup_tile_n);
+            forced_config.setGroupedImmaGeometry(
+                candidate.gateup_columns,
+                candidate.down_columns,
+                candidate.schedule);
             llaminar2::PerfStatsCollector::reset();
             llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
             llaminar2::ScopedBackendGraphCapture capture(
@@ -2095,7 +2134,6 @@ namespace
             }
             evidence.route_counter_ok = observedCudaMoEProductionCandidate(
                 rows,
-                routed_case.experts_per_token,
                 candidate);
             if (!evidence.route_counter_ok)
             {
@@ -2793,53 +2831,86 @@ TEST(Perf__MoEVerifierPrefill, CUDA_AllFormatProductionPrefillCandidatesAreSpill
     constexpr std::array<int, 7> ordered_block_widths{
         64, 96, 128, 160, 192, 224, 256,
     };
+    constexpr std::array<llaminar2::cuda::moe::GroupedImmaColumns, 4>
+        down_imma_widths{
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32,
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns64,
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns128,
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns256,
+        };
+    constexpr std::array<llaminar2::cuda::moe::GroupedImmaColumns, 3>
+        gateup_imma_widths{
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32,
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns64,
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns128,
+        };
+    constexpr std::array<
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule,
+        2>
+        gateup_schedules{
+            llaminar2::cuda::moe::GroupedImmaGateUpSchedule::
+                ParallelProjections,
+            llaminar2::cuda::moe::GroupedImmaGateUpSchedule::
+                PairedProjections,
+        };
     for (const uint8_t codebook : execution_codebooks)
     {
         SCOPED_TRACE(static_cast<unsigned>(codebook));
 
-        const auto grouped_imma =
-            queryCudaMoEGroupedImmaKernelResources(codebook);
-        EXPECT_TRUE(grouped_imma.spillFree())
-            << "grouped IMMA registers="
-            << grouped_imma.registers_per_thread
-            << " local_bytes="
-            << grouped_imma.local_memory_bytes_per_thread
-            << " active_blocks="
-            << grouped_imma.max_active_blocks_per_sm;
-        EXPECT_GT(grouped_imma.registers_per_thread, 0);
-        EXPECT_GT(grouped_imma.max_active_blocks_per_sm, 0);
-
-        /*
-         * IQ4_NL and IQ2_S dominate the pinned Qwen 3.6 35B MoE expert
-         * mixture. Their production decoder distributes each output column's
-         * four independent payload groups across adjacent lanes. Besides
-         * removing idle decode lanes, that mapping keeps the compiled kernel
-         * at 48 registers/thread on sm_86 and admits ten 128-thread CTAs per
-         * SM. Guard the resulting occupancy directly: the former whole-column
-         * mapping used 56--62 registers/thread and only eight resident CTAs,
-         * which cost roughly 28--32% across the real grouped-IMMA launch
-         * family. Timing remains a benchmark concern, while this deterministic
-         * compiler-resource invariant catches the architectural regression.
-         */
-        if (codebook == 4 || codebook == 13)
+        for (const auto columns : down_imma_widths)
         {
-            EXPECT_LE(grouped_imma.registers_per_thread, 48)
-                << "dominant codebook lost its cooperative decode occupancy";
-            EXPECT_GE(grouped_imma.max_active_blocks_per_sm, 10)
-                << "dominant codebook admits too few resident CTAs";
+            SCOPED_TRACE(llaminar2::cuda::moe::groupedImmaColumns(columns));
+            const auto grouped_imma =
+                queryCudaMoEGroupedImmaKernelResources(codebook, columns);
+            EXPECT_TRUE(grouped_imma.spillFree())
+                << "grouped IMMA registers="
+                << grouped_imma.registers_per_thread
+                << " local_bytes="
+                << grouped_imma.local_memory_bytes_per_thread
+                << " active_blocks="
+                << grouped_imma.max_active_blocks_per_sm;
+            EXPECT_GT(grouped_imma.registers_per_thread, 0);
+            EXPECT_GT(grouped_imma.max_active_blocks_per_sm, 0);
+
+            /* The original 32-column geometry retains its stronger baseline. */
+            if (columns == llaminar2::cuda::moe::GroupedImmaColumns::Columns32 &&
+                (codebook == 4 || codebook == 13))
+            {
+                EXPECT_LE(grouped_imma.registers_per_thread, 48)
+                    << "dominant codebook lost cooperative decode occupancy";
+                EXPECT_GE(grouped_imma.max_active_blocks_per_sm, 10)
+                    << "dominant codebook admits too few resident CTAs";
+            }
         }
 
-        const auto grouped_imma_gateup =
-            queryCudaMoEGroupedImmaGateUpKernelResources(codebook);
-        EXPECT_TRUE(grouped_imma_gateup.spillFree())
-            << "fused gate/up IMMA registers="
-            << grouped_imma_gateup.registers_per_thread
-            << " local_bytes="
-            << grouped_imma_gateup.local_memory_bytes_per_thread
-            << " active_blocks="
-            << grouped_imma_gateup.max_active_blocks_per_sm;
-        EXPECT_GT(grouped_imma_gateup.registers_per_thread, 0);
-        EXPECT_GT(grouped_imma_gateup.max_active_blocks_per_sm, 0);
+        for (const auto columns : gateup_imma_widths)
+        {
+            for (const auto schedule : gateup_schedules)
+            {
+                SCOPED_TRACE(
+                    llaminar2::cuda::moe::groupedImmaColumns(columns));
+                SCOPED_TRACE(
+                    schedule == llaminar2::cuda::moe::
+                                    GroupedImmaGateUpSchedule::
+                                        PairedProjections
+                        ? "paired_projections"
+                        : "parallel_projections");
+                const auto grouped_imma_gateup =
+                    queryCudaMoEGroupedImmaGateUpKernelResources(
+                        codebook,
+                        columns,
+                        schedule);
+                EXPECT_TRUE(grouped_imma_gateup.spillFree())
+                    << "fused gate/up IMMA registers="
+                    << grouped_imma_gateup.registers_per_thread
+                    << " local_bytes="
+                    << grouped_imma_gateup.local_memory_bytes_per_thread
+                    << " active_blocks="
+                    << grouped_imma_gateup.max_active_blocks_per_sm;
+                EXPECT_GT(grouped_imma_gateup.registers_per_thread, 0);
+                EXPECT_GT(grouped_imma_gateup.max_active_blocks_per_sm, 0);
+            }
+        }
 
         for (const int block_width : ordered_block_widths)
         {
@@ -2932,9 +3003,9 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
     settings.robust_replays = envInt(
         "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_ROBUST_REPLAYS", 4);
     settings.minimum_finalists = envInt(
-        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MIN_FINALISTS", 7);
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MIN_FINALISTS", 4);
     settings.maximum_finalists = envInt(
-        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 7);
+        "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 8);
     settings.finalist_margin = envPositiveDouble(
         "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_FINALIST_MARGIN", 0.05);
     const std::vector<int> m_values = envCsvPositiveInts(
@@ -3099,6 +3170,16 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
 #endif
 }
 
+/**
+ * @brief Prove every exact-overlay CUDA geometry against serial row decode.
+ *
+ * The two M values exercise both compiled gate/up widths. Each format tuple is
+ * sourced from the pinned GGUF inventory and every one of the 24 candidate
+ * schedules runs through the production captured pipeline. The tournament
+ * performs a full-buffer device byte comparison before emitting any timing,
+ * so adding a tuple to the runtime exact-overlay table without extending this
+ * certificate leaves an immediately visible test gap.
+ */
 TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvariant)
 {
 #ifndef HAVE_CUDA
@@ -3113,31 +3194,55 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvarian
                "complete production launch-policy eligibility proof";
     }
 
+    struct ExactOverlayFormatTuple
+    {
+        const char *gate_up = nullptr;
+        const char *down = nullptr;
+    };
+    constexpr std::array<ExactOverlayFormatTuple, 4> exact_overlay_formats{{
+        {"IQ2_S", "IQ4_XS"},
+        {"IQ2_S", "Q6_K"},
+        {"IQ3_S", "Q6_K"},
+        {"IQ2_S", "IQ3_S"},
+    }};
+    const std::vector<int> rows_to_prove = envCsvPositiveInts(
+        "LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_M", {64, 1024});
+    const int device_ordinal = envInt(
+        "LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_DEVICE", 0);
     const auto &cases =
         llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases();
-    const auto selected = std::find_if(
-        cases.begin(),
-        cases.end(),
-        [](const auto &candidate)
-        {
-            return candidate.hidden_size == 2048 &&
-                   candidate.routed_expert_width == 512 &&
-                   candidate.expert_count == 256 &&
-                   candidate.experts_per_token == 8 &&
-                   candidate.routed.gate == "IQ2_S" &&
-                   candidate.routed.up == "IQ2_S" &&
-                   candidate.routed.down == "IQ3_S";
-        });
-    ASSERT_NE(selected, cases.end())
-        << "pinned GGUF manifest lacks the Qwen3.6 IQ2_S/IQ3_S production case";
 
     ScopedEnvOverride rowwise_iterations(
         "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
     ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
-    proveCudaProductionCandidateInvariance(
-        *selected,
-        envInt("LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_M", 64),
-        envInt("LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_DEVICE", 0));
+    for (const auto &format : exact_overlay_formats)
+    {
+        const auto selected = std::find_if(
+            cases.begin(),
+            cases.end(),
+            [&](const auto &candidate)
+            {
+                return candidate.hidden_size == 2048 &&
+                       candidate.routed_expert_width == 512 &&
+                       candidate.expert_count == 256 &&
+                       candidate.experts_per_token == 8 &&
+                       candidate.routed.gate == format.gate_up &&
+                       candidate.routed.up == format.gate_up &&
+                       candidate.routed.down == format.down;
+            });
+        ASSERT_NE(selected, cases.end())
+            << "pinned GGUF manifest lacks exact-overlay tuple gate/up="
+            << format.gate_up << " down=" << format.down;
+        for (const int rows : rows_to_prove)
+        {
+            SCOPED_TRACE(
+                std::string("gate/up=") + format.gate_up +
+                "/down=" + format.down + "/M=" +
+                std::to_string(rows));
+            proveCudaProductionCandidateInvariance(
+                *selected, rows, device_ordinal);
+        }
+    }
 #endif
 }
 

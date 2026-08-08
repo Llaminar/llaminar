@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <vector>
@@ -2173,6 +2174,59 @@ namespace
     };
 
     /**
+     * @brief Return whether an identifier has a compiled NativeVNNI prefill path.
+     *
+     * Workspace planning and launch dispatch must accept exactly the same
+     * codebook set. Centralizing the inventory prevents a newly implemented
+     * format from becoming launchable without also receiving a valid persistent
+     * workspace contract.
+     */
+    constexpr bool isSupportedNativeVNNIPrefillCodebook(uint8_t codebook)
+    {
+        switch (codebook)
+        {
+        case 0:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        case 9:
+        case 10:
+        case 11:
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 16:
+        case 17:
+        case 19:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * @brief Validate one generated overlay tuple before it controls execution.
+     *
+     * BK256 launch identifiers exist only for Q4_0 and cannot preserve the
+     * canonical public-M1 partition tree. Ordinary BK64 tiles cover every
+     * supported codebook and may select either direct or canonical arithmetic.
+     */
+    constexpr bool isValidDensePrefillOverlayConfig(
+        uint8_t codebook,
+        const llaminar2::cuda::generated::CUDADensePrefillOverlayConfig &config)
+    {
+        const bool ordinary_tile = config.tile_id >= 0 && config.tile_id <= 5;
+        const bool valid_bk256 =
+            codebook == 0 && config.bk256 && !config.canonical_kpart &&
+            (config.tile_id == -3 || config.tile_id == -2);
+        const bool valid_bk64 = !config.bk256 && ordinary_tile;
+        return valid_bk256 || valid_bk64;
+    }
+
+    /**
      * @brief Resolve one authenticated dense-prefill launch before capture.
      *
      * Exact overlays are keyed only by the runtime-visible codebook and matrix
@@ -2209,14 +2263,65 @@ namespace
             return DensePrefillOverlayStatus::NotSelected;
         }
 
-        const bool ordinary_tile = config.tile_id >= 0 && config.tile_id <= 5;
-        const bool valid_bk256 =
-            config.bk256 && !config.canonical_kpart &&
-            (config.tile_id == -3 || config.tile_id == -2);
-        const bool valid_bk64 = !config.bk256 && ordinary_tile;
-        return (valid_bk256 || valid_bk64)
+        return isValidDensePrefillOverlayConfig(codebook, config)
                    ? DensePrefillOverlayStatus::Selected
                    : DensePrefillOverlayStatus::Invalid;
+    }
+
+    /**
+     * @brief Query bytes for one row count using the public M=1 reduction tree.
+     *
+     * The partition boundaries are owned by the serial-decode policy. Prefill
+     * may reuse that arithmetic only after this query proves an ordered reducer
+     * with more than one partition on the selected device.
+     */
+    bool queryCanonicalPrefillWorkspaceForRows(
+        uint8_t codebook_id,
+        int rows,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions)
+    {
+        CUDAPrefillContext_ temp_ctx;
+        temp_ctx.device_id = cuda_device_id;
+
+        int uses_ordered_reducer = 0;
+        int k_partitions = 0;
+        if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                codebook_id,
+                N,
+                K,
+                querySmCount(&temp_ctx),
+                &uses_ordered_reducer,
+                &k_partitions) ||
+            uses_ordered_reducer == 0 || k_partitions <= 1)
+        {
+            return false;
+        }
+
+        const size_t partitions = static_cast<size_t>(k_partitions);
+        const size_t row_count = static_cast<size_t>(rows);
+        const size_t columns = static_cast<size_t>(N);
+        constexpr size_t element_bytes = sizeof(float);
+        if (row_count > std::numeric_limits<size_t>::max() / partitions ||
+            row_count * partitions >
+                std::numeric_limits<size_t>::max() / columns ||
+            row_count * partitions * columns >
+                std::numeric_limits<size_t>::max() / element_bytes)
+        {
+            return false;
+        }
+
+        if (canonical_kpart_partials_bytes)
+        {
+            *canonical_kpart_partials_bytes =
+                partitions * row_count * columns * element_bytes;
+        }
+        if (planned_k_partitions)
+            *planned_k_partitions = k_partitions;
+        return true;
     }
 
     // ─── Format complexity classification ─────────────────────────────
@@ -3611,32 +3716,8 @@ extern "C"
             *planned_k_partitions = 1;
         if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
             return false;
-
-        CUDAPrefillContext_ temp_ctx;
-        temp_ctx.device_id = cuda_device_id;
-
-        switch (codebook_id)
-        {
-        case 0:
-        case 4:
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
-        case 12:
-        case 13:
-        case 14:
-        case 15:
-        case 16:
-        case 17:
-        case 19:
-            break;
-        default:
+        if (!isSupportedNativeVNNIPrefillCodebook(codebook_id))
             return false;
-        }
 
         llaminar2::cuda::generated::CUDADensePrefillOverlayConfig
             exact_overlay{};
@@ -3651,28 +3732,92 @@ extern "C"
              exact_overlay.canonical_kpart);
         if (!needs_canonical_kpart)
             return true;
+        return queryCanonicalPrefillWorkspaceForRows(
+            codebook_id,
+            M,
+            N,
+            K,
+            cuda_device_id,
+            canonical_kpart_partials_bytes,
+            planned_k_partitions);
+    }
 
-        int uses_ordered_reducer = 0;
-        int k_partitions = 0;
-        if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        uint8_t codebook_id,
+        int max_M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions,
+        int *planned_rows)
+    {
+        if (canonical_kpart_partials_bytes)
+            *canonical_kpart_partials_bytes = 0;
+        if (planned_k_partitions)
+            *planned_k_partitions = 1;
+        if (planned_rows)
+            *planned_rows = 0;
+        if (max_M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+        if (!isSupportedNativeVNNIPrefillCodebook(codebook_id))
+            return false;
+
+        int canonical_rows = 0;
+        if (g_force_canonical_kpart)
+        {
+            canonical_rows = max_M;
+        }
+        else
+        {
+            const bool exact_overlay_controls_launch =
+                g_dense_prefill_exact_overlay_enabled &&
+                g_force_tile_id < 0 &&
+                g_bk256_force_mode == 0;
+            if (exact_overlay_controls_launch)
+            {
+                /*
+                 * Generated cells are sparse in geometry and non-monotonic in
+                 * launch family. Scan the complete installed policy rather
+                 * than assuming the largest M represents every smaller replay.
+                 * This occurs during graph/workspace planning and is cached by
+                 * the C++ adapter; no scan occurs in captured execution.
+                 */
+                for (const auto &entry :
+                     llaminar2::cuda::generated::kCUDADensePrefillOverlayEntries)
+                {
+                    if (entry.codebook != codebook_id ||
+                        entry.n != N || entry.k != K ||
+                        entry.m <= 1 || entry.m > max_M)
+                    {
+                        continue;
+                    }
+                    if (!isValidDensePrefillOverlayConfig(
+                            codebook_id, entry.config))
+                    {
+                        return false;
+                    }
+                    if (entry.config.canonical_kpart)
+                        canonical_rows = std::max(canonical_rows, entry.m);
+                }
+            }
+        }
+
+        if (canonical_rows == 0)
+            return true;
+        if (!queryCanonicalPrefillWorkspaceForRows(
                 codebook_id,
+                canonical_rows,
                 N,
                 K,
-                querySmCount(&temp_ctx),
-                &uses_ordered_reducer,
-                &k_partitions) ||
-            uses_ordered_reducer == 0 || k_partitions <= 1)
+                cuda_device_id,
+                canonical_kpart_partials_bytes,
+                planned_k_partitions))
         {
             return false;
         }
-
-        if (canonical_kpart_partials_bytes)
-        {
-            *canonical_kpart_partials_bytes =
-                static_cast<size_t>(k_partitions) * M * N * sizeof(float);
-        }
-        if (planned_k_partitions)
-            *planned_k_partitions = k_partitions;
+        if (planned_rows)
+            *planned_rows = canonical_rows;
         return true;
     }
 } // extern "C"

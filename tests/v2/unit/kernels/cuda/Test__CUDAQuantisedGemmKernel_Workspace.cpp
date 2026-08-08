@@ -419,14 +419,16 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillDirectScheduleDeclaresNoKpartScratch)
+       NativeVNNIPrefillGenericDirectScheduleDeclaresNoKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
     constexpr int kM = 596;
-    constexpr int kN = 5120;
+    // Deliberately unswept geometry: this case isolates the total generic
+    // direct policy without consulting a device-specific exact overlay.
+    constexpr int kN = 5119;
     constexpr int kK = 17408;
     auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
 
@@ -439,14 +441,16 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillConcurrentDirectScheduleDoesNotInventKpartScratch)
+       NativeVNNIPrefillConcurrentGenericDirectScheduleDoesNotInventKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
     constexpr int kM = 596;
-    constexpr int kN = 5120;
+    // Deliberately unswept geometry keeps this host-only unit test independent
+    // of the device-specific exact-overlay workspace envelope.
+    constexpr int kN = 5119;
     constexpr int kK = 17408;
     const auto serial_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
     EXPECT_EQ(
@@ -465,14 +469,15 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillDirectPromptAndExpertSchedulesNeedNoKpartScratch)
+       NativeVNNIPrefillGenericDirectPromptAndExpertSchedulesNeedNoKpartScratch)
 {
     auto weights = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/1011);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
     constexpr int kPromptM = 595;
     constexpr int kExpertRows = 312;
-    constexpr int kN = 512;
+    // N=513 is intentionally absent from the installed production overlay.
+    constexpr int kN = 513;
     constexpr int kK = 2048;
     auto prompt_reqs = kernel.getWorkspaceRequirements(kPromptM, kN, kK);
     auto expert_reqs = kernel.getWorkspaceRequirements(kExpertRows, kN, kK);

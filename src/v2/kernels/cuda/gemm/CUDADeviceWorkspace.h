@@ -91,6 +91,44 @@ extern "C"
         size_t *canonical_kpart_partials_bytes,
         int *planned_k_partitions);
 
+    /**
+     * @brief Compute the persistent scratch envelope for a prefill graph family.
+     *
+     * A captured prefill family can replay any installed exact-overlay bucket
+     * through `max_M`. Exact dispatch is not monotonic in row count: a smaller
+     * bucket may use the canonical public-M1 K-partition schedule while the
+     * largest bucket uses a direct full-K tile. This query examines the complete
+     * active launch-policy range and returns the largest canonical requirement
+     * that any replay in the family can publish.
+     *
+     * The function performs policy planning only. It launches no kernels,
+     * allocates no device memory, and leaves 128-row arena padding to the owning
+     * workspace planner.
+     *
+     * @param codebook_id Canonical NativeVNNI codebook identifier.
+     * @param max_M Inclusive maximum row count represented by the graph family.
+     * @param N Projection output width.
+     * @param K Projection reduction width; must be divisible by 32.
+     * @param cuda_device_id CUDA device whose public-M1 schedule is authoritative.
+     * @param canonical_kpart_partials_bytes Receives the unpadded maximum bytes.
+     * @param planned_k_partitions Receives the public-M1 partition count, or one
+     *        when no member of the family uses canonical K partitioning.
+     * @param planned_rows Receives the row count responsible for the envelope,
+     *        or zero when no member requires canonical reduction scratch.
+     * @return `true` for a complete valid policy envelope; `false` for invalid
+     *         geometry, unsupported codebook, malformed overlay, or unavailable
+     *         canonical schedule.
+     */
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        uint8_t codebook_id,
+        int max_M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions,
+        int *planned_rows);
+
     // -----------------------------------------------------------------
     // cuBLAS context lifetime
     // -----------------------------------------------------------------

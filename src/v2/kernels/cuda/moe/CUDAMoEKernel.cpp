@@ -442,6 +442,13 @@ namespace
     struct CUDAMoEProductionPrefillPolicy
     {
         int gateup_tile_n = 0;
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns =
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32;
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns =
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32;
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule = llaminar2::cuda::moe::
+                GroupedImmaGateUpSchedule::ParallelProjections;
         const char *source = "missing";
     };
 
@@ -506,8 +513,6 @@ namespace
         int top_k,
         bool use_gateup_kpart)
     {
-        if (!use_gateup_kpart)
-            return {kCUDAMoEGenericGateUpOrderedTileN, "direct"};
         if (gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
             seq_len <= 0 || hidden_size <= 0 || expert_width <= 0 ||
             expert_count <= 0 || top_k <= 0 || top_k > expert_count)
@@ -515,9 +520,59 @@ namespace
             return {};
         }
 
+        if (!use_gateup_kpart)
+        {
+            const auto grouped_imma =
+                llaminar2::cuda::moe::selectGroupedImmaLaunchPolicy(
+                    singleCUDAMoECodebook(gateup_codebook_mask),
+                    singleCUDAMoECodebook(down_codebook_mask),
+                    seq_len,
+                    hidden_size,
+                    expert_width,
+                    expert_count,
+                    top_k);
+            CUDAMoEProductionPrefillPolicy policy{
+                .gateup_tile_n = llaminar2::cuda::moe::groupedImmaColumns(
+                    grouped_imma.gate_up_columns),
+                .imma_gateup_columns = grouped_imma.gate_up_columns,
+                .imma_down_columns = grouped_imma.down_columns,
+                .imma_gateup_schedule = grouped_imma.gate_up_schedule,
+                .source = grouped_imma.exact_overlay
+                              ? "tensor_core_imma_exact_overlay"
+                              : "tensor_core_imma_generic",
+            };
+            const auto &gemm = llaminar2::debugEnv().gemm;
+            if (gemm.cuda_moe_imma_geometry_override_active)
+            {
+                policy.imma_gateup_columns =
+                    static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                        gemm.cuda_moe_imma_gateup_columns);
+                policy.imma_down_columns =
+                    static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                        gemm.cuda_moe_imma_down_columns);
+                policy.imma_gateup_schedule = static_cast<
+                    llaminar2::cuda::moe::GroupedImmaGateUpSchedule>(
+                    gemm.cuda_moe_imma_gateup_schedule);
+                policy.gateup_tile_n =
+                    gemm.cuda_moe_imma_gateup_columns;
+                policy.source = "tensor_core_imma_explicit_override";
+            }
+            if (!llaminar2::cuda::moe::validGroupedImmaGateUpColumns(
+                    policy.imma_gateup_columns) ||
+                !llaminar2::cuda::moe::validGroupedImmaDownColumns(
+                    policy.imma_down_columns) ||
+                !llaminar2::cuda::moe::validGroupedImmaGateUpSchedule(
+                    policy.imma_gateup_schedule))
+            {
+                return {};
+            }
+            return policy;
+        }
+
         CUDAMoEProductionPrefillPolicy policy{
-            kCUDAMoEGenericGateUpOrderedTileN,
-            "generic_mixed_codebooks"};
+            .gateup_tile_n = kCUDAMoEGenericGateUpOrderedTileN,
+            .source = "generic_mixed_codebooks",
+        };
         const int gateup_codebook =
             singleCUDAMoECodebook(gateup_codebook_mask);
         const int down_codebook = singleCUDAMoECodebook(down_codebook_mask);
@@ -589,6 +644,10 @@ namespace
         bool ordered_scatter,
         bool canonical_route_publication,
         int splitk_tile_rows,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule,
         const char *policy_source)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
@@ -615,6 +674,18 @@ namespace
         {
             tags["work_scheduler"] = "compact_directory_grid";
             tags["empty_directory_tail"] = "sentinel_cta_exit";
+            tags["imma_gateup_columns"] = std::to_string(
+                llaminar2::cuda::moe::groupedImmaColumns(
+                    imma_gateup_columns));
+            tags["imma_down_columns"] = std::to_string(
+                llaminar2::cuda::moe::groupedImmaColumns(
+                    imma_down_columns));
+            tags["imma_gateup_schedule"] =
+                imma_gateup_schedule == llaminar2::cuda::moe::
+                                               GroupedImmaGateUpSchedule::
+                                                   PairedProjections
+                    ? "paired_projections"
+                    : "parallel_projections";
         }
         tags["gateup_codebook_mask"] =
             cudaCodebookMaskTag(gateup_codebook_mask);
@@ -1617,6 +1688,10 @@ extern "C"
         int splitk_tile_rows,
         llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine
             projection_engine,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule,
         int device_idx,
         void *stream);
 
@@ -6764,11 +6839,6 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 use_gateup_kpart);
-        if (use_grouped_imma)
-        {
-            prefill_policy.gateup_tile_n = 32;
-            prefill_policy.source = "tensor_core_imma_prefill";
-        }
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
@@ -6779,6 +6849,18 @@ namespace llaminar2
                       << " intermediate=" << intermediate
                       << " num_experts=" << num_experts
                       << " top_k=" << top_k);
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!cuda::moe::validGroupedImmaGateUpColumns(
+                 prefill_policy.imma_gateup_columns) ||
+             !cuda::moe::validGroupedImmaDownColumns(
+                 prefill_policy.imma_down_columns) ||
+             !cuda::moe::validGroupedImmaGateUpSchedule(
+                 prefill_policy.imma_gateup_schedule)))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "capture-time IMMA geometry is invalid");
             return false;
         }
         if (use_gateup_kpart &&
@@ -6970,6 +7052,9 @@ namespace llaminar2
             use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
             projection_engine,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
             device_ordinal_,
             stream);
         if (!ok)
@@ -7021,6 +7106,9 @@ namespace llaminar2
             ordered_scatter_overwrites_output,
             canonical_route_contributions != nullptr,
             splitk_tile_rows,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
             prefill_policy.source);
         return true;
     }
@@ -7109,11 +7197,6 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 use_gateup_kpart);
-        if (use_grouped_imma)
-        {
-            prefill_policy.gateup_tile_n = 32;
-            prefill_policy.source = "tensor_core_imma_prefill";
-        }
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
@@ -7124,6 +7207,18 @@ namespace llaminar2
                       << " intermediate=" << intermediate
                       << " num_experts=" << num_experts
                       << " top_k=" << top_k);
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!cuda::moe::validGroupedImmaGateUpColumns(
+                 prefill_policy.imma_gateup_columns) ||
+             !cuda::moe::validGroupedImmaDownColumns(
+                 prefill_policy.imma_down_columns) ||
+             !cuda::moe::validGroupedImmaGateUpSchedule(
+                 prefill_policy.imma_gateup_schedule)))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "capture-time IMMA geometry is invalid");
             return false;
         }
         /*
@@ -7314,6 +7409,9 @@ namespace llaminar2
             use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
             splitk_tile_rows,
             projection_engine,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
             device_ordinal_,
             stream);
         if (!ok)
@@ -7363,6 +7461,9 @@ namespace llaminar2
             true,
             canonical_route_contributions != nullptr,
             splitk_tile_rows,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
             prefill_policy.source);
         return true;
     }

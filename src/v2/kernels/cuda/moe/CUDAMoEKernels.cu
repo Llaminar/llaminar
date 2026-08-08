@@ -15,6 +15,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
+#include "kernels/cuda/moe/CUDAMoERouterPrefillPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -11361,6 +11362,100 @@ namespace
         }
     }
 
+    /**
+     * @brief Submit one compile-time router geometry to an explicit stream.
+     *
+     * Each specialization changes only output ownership.  The K loop in
+     * `route_logits_tiled_kernel` remains increasing and identical, so a
+     * candidate may be promoted only after the harness proves full-output byte
+     * equality with the installed production geometry.
+     */
+    template <int BM, int BN, int BK, int TM, int TN>
+    bool launch_route_logits_tiled_geometry(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        cudaStream_t stream,
+        const char *launch_name)
+    {
+        static_assert(BM > 0 && BN > 0 && BK > 0 && TM > 0 && TN > 0);
+        static_assert(BM % TM == 0 && BN % TN == 0);
+        constexpr int kThreads = (BM / TM) * (BN / TN);
+        static_assert(kThreads == 256);
+
+        const dim3 grid(
+            static_cast<unsigned int>((num_experts + BN - 1) / BN),
+            static_cast<unsigned int>((seq_len + BM - 1) / BM));
+        route_logits_tiled_kernel<BM, BN, BK, TM, TN>
+            <<<grid, kThreads, 0, stream>>>(
+                hidden,
+                gate_weights,
+                logits,
+                seq_len,
+                d_model,
+                num_experts);
+        return finishLaunch(launch_name);
+    }
+
+    /** Compiler-owned resource facts for one router geometry. */
+    struct RouterPrefillKernelResources
+    {
+        int registers_per_thread = 0;
+        size_t local_memory_bytes_per_thread = 0;
+        size_t static_shared_memory_bytes = 0;
+        int max_threads_per_block = 0;
+        int max_active_blocks_per_sm = 0;
+    };
+
+    /**
+     * @brief Inspect one exact router specialization without launching it.
+     *
+     * CUDA's function attributes expose compiler-local storage before timing,
+     * while the occupancy API evaluates the same 256-thread geometry submitted
+     * by production.  Candidates with local storage never enter the tournament.
+     */
+    template <int BM, int BN, int BK, int TM, int TN>
+    bool query_route_logits_tiled_geometry_resources(
+        RouterPrefillKernelResources *resources)
+    {
+        if (!resources)
+            return false;
+
+        constexpr int kThreads = (BM / TM) * (BN / TN);
+        static_assert(kThreads == 256);
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(
+                &attributes,
+                route_logits_tiled_kernel<BM, BN, BK, TM, TN>) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        int active_blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                route_logits_tiled_kernel<BM, BN, BK, TM, TN>,
+                kThreads,
+                0) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+
+        *resources = RouterPrefillKernelResources{
+            .registers_per_thread = attributes.numRegs,
+            .local_memory_bytes_per_thread = attributes.localSizeBytes,
+            .static_shared_memory_bytes = attributes.sharedSizeBytes,
+            .max_threads_per_block = attributes.maxThreadsPerBlock,
+            .max_active_blocks_per_sm = active_blocks,
+        };
+        return active_blocks > 0;
+    }
+
     __device__ __forceinline__ bool moe_topk_pair_better(
         float candidate_value,
         int candidate_id,
@@ -17585,33 +17680,197 @@ extern "C"
         return finishLaunch("cudaMoE_route_logits_bf16_decode_equivalent_rows");
     }
 
-    bool cudaMoE_route_logits(const float *hidden, const float *gate_weights, float *logits,
-                              int seq_len, int d_model, int num_experts,
-                              int device_idx, void *stream)
+    bool cudaMoE_route_logits_with_geometry(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        int device_idx,
+        void *stream,
+        llaminar2::CUDAMoERouterPrefillGeometry geometry)
     {
-        cudaSetDevice(device_idx);
+        if (!hidden || !gate_weights || !logits || !stream ||
+            seq_len <= 0 || d_model <= 0 || num_experts <= 0)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaMoE_route_logits_with_geometry] invalid arguments\n");
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
 
-        // PREFILL: with many tokens this is a genuine GEMM. The naive block-per-
-        // (expert,token) kernel is L2-bandwidth-bound (re-reads hidden E× and gate S×).
-        // Above this token threshold the tiled SGEMM (smem reuse) is a large win; below
-        // it (decode, seq_len==1) the warp-reduction kernel keeps full SM coverage.
+        const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        using Geometry = llaminar2::CUDAMoERouterPrefillGeometry;
+        switch (geometry)
+        {
+        case Geometry::Tile64x64:
+            return launch_route_logits_tiled_geometry<64, 64, 16, 4, 4>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_64x64");
+        case Geometry::Tile64x32:
+            return launch_route_logits_tiled_geometry<64, 32, 16, 4, 2>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_64x32");
+        case Geometry::Tile32x64:
+            return launch_route_logits_tiled_geometry<32, 64, 16, 2, 4>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_32x64");
+        case Geometry::Tile32x32:
+            return launch_route_logits_tiled_geometry<32, 32, 16, 2, 2>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_32x32");
+        case Geometry::Tile32x24:
+            return launch_route_logits_tiled_geometry<32, 24, 16, 1, 3>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_32x24");
+        case Geometry::Tile24x32:
+            return launch_route_logits_tiled_geometry<24, 32, 16, 3, 1>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_24x32");
+        case Geometry::Tile64x16:
+            return launch_route_logits_tiled_geometry<64, 16, 16, 4, 1>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_64x16");
+        case Geometry::Tile32x16:
+            return launch_route_logits_tiled_geometry<32, 16, 16, 2, 1>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_32x16");
+        case Geometry::Tile16x64:
+            return launch_route_logits_tiled_geometry<16, 64, 16, 1, 4>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_16x64");
+        case Geometry::Tile16x32:
+            return launch_route_logits_tiled_geometry<16, 32, 16, 1, 2>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_16x32");
+        case Geometry::Tile16x16:
+            return launch_route_logits_tiled_geometry<16, 16, 16, 1, 1>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_16x16");
+        case Geometry::Tile8x64:
+            return launch_route_logits_tiled_geometry<8, 64, 16, 1, 2>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_8x64");
+        case Geometry::Tile8x32:
+            return launch_route_logits_tiled_geometry<8, 32, 16, 1, 1>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_8x32");
+        }
+        return false;
+    }
+
+    bool cudaMoE_route_logits_query_geometry_resources(
+        llaminar2::CUDAMoERouterPrefillGeometry geometry,
+        int *registers_per_thread,
+        std::size_t *local_memory_bytes_per_thread,
+        std::size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm)
+    {
+        if (!registers_per_thread || !local_memory_bytes_per_thread ||
+            !static_shared_memory_bytes || !max_threads_per_block ||
+            !max_active_blocks_per_sm)
+        {
+            return false;
+        }
+
+        RouterPrefillKernelResources resources{};
+        bool queried = false;
+        using Geometry = llaminar2::CUDAMoERouterPrefillGeometry;
+        switch (geometry)
+        {
+        case Geometry::Tile64x64:
+            queried = query_route_logits_tiled_geometry_resources<64, 64, 16, 4, 4>(&resources);
+            break;
+        case Geometry::Tile64x32:
+            queried = query_route_logits_tiled_geometry_resources<64, 32, 16, 4, 2>(&resources);
+            break;
+        case Geometry::Tile32x64:
+            queried = query_route_logits_tiled_geometry_resources<32, 64, 16, 2, 4>(&resources);
+            break;
+        case Geometry::Tile32x32:
+            queried = query_route_logits_tiled_geometry_resources<32, 32, 16, 2, 2>(&resources);
+            break;
+        case Geometry::Tile32x24:
+            queried = query_route_logits_tiled_geometry_resources<32, 24, 16, 1, 3>(&resources);
+            break;
+        case Geometry::Tile24x32:
+            queried = query_route_logits_tiled_geometry_resources<24, 32, 16, 3, 1>(&resources);
+            break;
+        case Geometry::Tile64x16:
+            queried = query_route_logits_tiled_geometry_resources<64, 16, 16, 4, 1>(&resources);
+            break;
+        case Geometry::Tile32x16:
+            queried = query_route_logits_tiled_geometry_resources<32, 16, 16, 2, 1>(&resources);
+            break;
+        case Geometry::Tile16x64:
+            queried = query_route_logits_tiled_geometry_resources<16, 64, 16, 1, 4>(&resources);
+            break;
+        case Geometry::Tile16x32:
+            queried = query_route_logits_tiled_geometry_resources<16, 32, 16, 1, 2>(&resources);
+            break;
+        case Geometry::Tile16x16:
+            queried = query_route_logits_tiled_geometry_resources<16, 16, 16, 1, 1>(&resources);
+            break;
+        case Geometry::Tile8x64:
+            queried = query_route_logits_tiled_geometry_resources<8, 64, 16, 1, 2>(&resources);
+            break;
+        case Geometry::Tile8x32:
+            queried = query_route_logits_tiled_geometry_resources<8, 32, 16, 1, 1>(&resources);
+            break;
+        }
+        if (!queried)
+            return false;
+
+        *registers_per_thread = resources.registers_per_thread;
+        *local_memory_bytes_per_thread =
+            resources.local_memory_bytes_per_thread;
+        *static_shared_memory_bytes = resources.static_shared_memory_bytes;
+        *max_threads_per_block = resources.max_threads_per_block;
+        *max_active_blocks_per_sm = resources.max_active_blocks_per_sm;
+        return true;
+    }
+
+    bool cudaMoE_route_logits(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        int device_idx,
+        void *stream)
+    {
+        // M=1 decode keeps one block per expert so all SMs receive useful work.
+        // Prefill resolves a typed tile exactly once while graph topology is
+        // built; captured replay contains only the selected physical kernel.
         constexpr int kRouteTiledMinTokens = 2;
         if (seq_len >= kRouteTiledMinTokens)
         {
-            // Tile geometry must match the template instantiation below. BM=BN=64
-            // (256-thread block) empirically beats smaller tiles here: although it
-            // yields only 44 blocks (occupancy-bound on this M=679,N=256 GEMM), the
-            // 256-thread block's load efficiency and ILP outperform 32×32 (1918) and
-            // 64×32 (1931) configs that produce more blocks but fewer threads each.
-            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
-            constexpr int kTiledThreads = (BM / TM) * (BN / TN); // 16×16 = 256
-            dim3 grid((num_experts + BN - 1) / BN, (seq_len + BM - 1) / BM);
-            route_logits_tiled_kernel<BM, BN, BK, TM, TN>
-                <<<grid, kTiledThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-                    hidden, gate_weights, logits, seq_len, d_model, num_experts);
-            return finishLaunch("cudaMoE_route_logits_tiled");
+            return cudaMoE_route_logits_with_geometry(
+                hidden,
+                gate_weights,
+                logits,
+                seq_len,
+                d_model,
+                num_experts,
+                device_idx,
+                stream,
+                llaminar2::selectCUDAMoERouterPrefillGeometry(
+                    seq_len, d_model, num_experts));
         }
 
+        if (!hidden || !gate_weights || !logits || !stream ||
+            seq_len <= 0 || d_model <= 0 || num_experts <= 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_route_logits] invalid arguments\n");
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
         dim3 grid(num_experts, seq_len);
         route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
@@ -19884,6 +20143,10 @@ extern "C"
      * @param gateup_ordered_tile_n Capture-time gate/up producer block width.
      * @param down_k_partitions Fixed byte-equivalent down partition count.
      * @param splitk_tile_rows Persistent partial-scratch row tile capacity.
+     * @param projection_engine Capture-time grouped projection implementation.
+     * @param imma_gateup_columns Output columns owned by one fused IMMA CTA.
+     * @param imma_down_columns Output columns owned by one down IMMA CTA.
+     * @param imma_gateup_schedule Projection-to-warp ownership in gate/up.
      * @param device_idx CUDA ordinal that owns every supplied pointer.
      * @param stream Exact non-null producer stream embedded by graph capture.
      * @return true after all launches have been enqueued without launch errors.
@@ -19934,6 +20197,10 @@ extern "C"
         int splitk_tile_rows,
         llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine
             projection_engine,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule,
         int device_idx,
         void *stream)
     {
@@ -19964,6 +20231,16 @@ extern "C"
         }
         if (use_grouped_imma &&
             (!d_group_work_directory || group_work_directory_entries <= 0))
+        {
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!llaminar2::cuda::moe::validGroupedImmaGateUpColumns(
+                 imma_gateup_columns) ||
+             !llaminar2::cuda::moe::validGroupedImmaDownColumns(
+                 imma_down_columns) ||
+             !llaminar2::cuda::moe::validGroupedImmaGateUpSchedule(
+                 imma_gateup_schedule)))
         {
             return false;
         }
@@ -20086,6 +20363,8 @@ extern "C"
                     gateup_codebook_mask,
                     llaminar2::CUDAMoEBatchInvariantPolicy::
                         gate_up_k_partitions,
+                    imma_gateup_columns,
+                    imma_gateup_schedule,
                     device_idx,
                     stream))
             {
@@ -20302,6 +20581,7 @@ extern "C"
                     down_codebook_mask,
                     llaminar2::CUDAMoEBatchInvariantPolicy::
                         down_k_partitions,
+                    imma_down_columns,
                     device_idx,
                     stream))
             {

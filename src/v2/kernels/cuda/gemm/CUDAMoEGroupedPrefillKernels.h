@@ -14,8 +14,10 @@
 #include "../../common/DeviceNativeVNNIMatrixDesc.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace llaminar2::cuda::moe
 {
@@ -24,6 +26,196 @@ namespace llaminar2::cuda::moe
 
     /** Maximum descriptor-table width encoded by one directory entry. */
     inline constexpr int kGroupedImmaMaximumExperts = 512;
+
+    /**
+     * @brief Compiled output-column ownership for one grouped IMMA CTA.
+     *
+     * Each warp owns one eight-column `m16n8k32` fragment. Wider CTAs reuse
+     * the same 16-row activation tile across more output columns and reduce
+     * directory/CTA overhead, at the cost of fewer resident CTAs. These are
+     * geometry-only choices: every output element retains the same K-block and
+     * K-partition arithmetic order.
+     */
+    enum class GroupedImmaColumns : uint16_t
+    {
+        Columns32 = 32,
+        Columns64 = 64,
+        Columns128 = 128,
+        Columns256 = 256,
+    };
+
+    /**
+     * @brief Warp ownership policy for the fused gate/up projection.
+     *
+     * `ParallelProjections` assigns disjoint warp banks to gate and up. The
+     * `PairedProjections` candidate assigns both projections for one column
+     * fragment to the same warp, reuses one A fragment, and retains gate/up in
+     * registers until exact SwiGLU publication. Both schedules use identical
+     * per-projection reduction trees and 32-column quantization reductions.
+     */
+    enum class GroupedImmaGateUpSchedule : uint8_t
+    {
+        ParallelProjections = 0,
+        PairedProjections = 1,
+    };
+
+    /** Capture-time geometry for the two grouped MoE projection phases. */
+    struct GroupedImmaLaunchPolicy
+    {
+        GroupedImmaColumns gate_up_columns = GroupedImmaColumns::Columns32;
+        GroupedImmaColumns down_columns = GroupedImmaColumns::Columns32;
+        GroupedImmaGateUpSchedule gate_up_schedule =
+            GroupedImmaGateUpSchedule::PairedProjections;
+        bool exact_overlay = false;
+    };
+
+    /** NativeVNNI execution codebook used by IQ4_XS routed projections. */
+    inline constexpr int kQwenIQ4ExecutionCodebook = 4;
+
+    /** NativeVNNI execution codebook used by Q6_K routed projections. */
+    inline constexpr int kQwenQ6KExecutionCodebook = 8;
+
+    /** NativeVNNI execution codebook used by IQ3_S routed projections. */
+    inline constexpr int kQwenIQ3SExecutionCodebook = 11;
+
+    /** NativeVNNI execution codebook used by IQ2_S routed projections. */
+    inline constexpr int kQwenIQ2SExecutionCodebook = 13;
+
+    /**
+     * @brief One measured codebook regime for the Qwen 35B-A3B geometry.
+     *
+     * The threshold is intentionally contiguous rather than a literal list of
+     * per-bucket minima. Candidate differences below one percent occasionally
+     * changed sign at an isolated bucket, while adjacent buckets and p95 kept
+     * the same regime. A contiguous boundary preserves the robust physical
+     * mode shift and remains total for M values between or beyond captures.
+     */
+    struct GroupedImmaCodebookRegime
+    {
+        int gate_up_codebook = -1;
+        int down_codebook = -1;
+        int columns32_max_rows = 0;
+    };
+
+    /**
+     * Capture-time overlays measured across every production bucket M=64..4096.
+     *
+     * These tuples cover Qwen3.6-35B-A3B UD-IQ3_S's forty main routed layers
+     * (`37 x IQ2_S/IQ4_XS`, `2 x IQ2_S/Q6_K`, and `1 x IQ3_S/Q6_K`) plus the
+     * already-swept IQ2_S/IQ3_S tuple used by Qwen3.5/3.6 variants. The IQ3_S
+     * gate/up regime never produced a stable reason to widen its CTA, so its
+     * threshold deliberately extends across every positive `int` M.
+     */
+    inline constexpr std::array<GroupedImmaCodebookRegime, 4>
+        kQwen35BGroupedImmaCodebookRegimes{{
+            {
+                .gate_up_codebook = kQwenIQ2SExecutionCodebook,
+                .down_codebook = kQwenIQ4ExecutionCodebook,
+                .columns32_max_rows = 768,
+            },
+            {
+                .gate_up_codebook = kQwenIQ2SExecutionCodebook,
+                .down_codebook = kQwenQ6KExecutionCodebook,
+                .columns32_max_rows = 600,
+            },
+            {
+                .gate_up_codebook = kQwenIQ3SExecutionCodebook,
+                .down_codebook = kQwenQ6KExecutionCodebook,
+                .columns32_max_rows = std::numeric_limits<int>::max(),
+            },
+            {
+                .gate_up_codebook = kQwenIQ2SExecutionCodebook,
+                .down_codebook = kQwenIQ3SExecutionCodebook,
+                .columns32_max_rows = 768,
+            },
+        }};
+
+    /**
+     * @brief Select a total capture-time grouped-IMMA launch policy.
+     *
+     * Paired projection ownership is the generic schedule because it removes a
+     * duplicate A-fragment load and gate/up shared-memory round trip while
+     * preserving each projection's public serial-M1 reduction tree. Exact
+     * Qwen 35B-A3B overlays come from production-graph tournaments over every
+     * captured bucket. Positive unseen M values remain total by extending the
+     * adjacent measured regime rather than requiring an exact bucket lookup.
+     *
+     * @param gateup_codebook Sole gate/up execution codebook, or a negative
+     *        value when a mixed descriptor table has no single codebook.
+     * @param down_codebook Sole down execution codebook, or a negative value
+     *        when a mixed descriptor table has no single codebook.
+     * @param seq_len Captured grouped-row bucket.
+     * @param hidden_size Model hidden width.
+     * @param expert_width Routed expert intermediate width.
+     * @param expert_count Routed expert table width.
+     * @param top_k Routed experts selected per token.
+     * @return Complete compiled policy; exact overlays are identified so the
+     *         caller can publish their provenance through PerfStats.
+     */
+    [[nodiscard]] inline constexpr GroupedImmaLaunchPolicy
+    selectGroupedImmaLaunchPolicy(
+        int gateup_codebook,
+        int down_codebook,
+        int seq_len,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k) noexcept
+    {
+        GroupedImmaLaunchPolicy policy{};
+        const bool qwen_35b_geometry =
+            hidden_size == 2048 && expert_width == 512 &&
+            expert_count == 256 && top_k == 8;
+        if (!qwen_35b_geometry)
+            return policy;
+
+        for (const auto &regime : kQwen35BGroupedImmaCodebookRegimes)
+        {
+            if (gateup_codebook == regime.gate_up_codebook &&
+                down_codebook == regime.down_codebook)
+            {
+                policy.gate_up_columns =
+                    seq_len <= regime.columns32_max_rows
+                        ? GroupedImmaColumns::Columns32
+                        : GroupedImmaColumns::Columns64;
+                policy.exact_overlay = true;
+                break;
+            }
+        }
+        return policy;
+    }
+
+    /** @return the integer column width represented by a typed geometry. */
+    [[nodiscard]] inline constexpr int groupedImmaColumns(
+        GroupedImmaColumns geometry) noexcept
+    {
+        return static_cast<int>(geometry);
+    }
+
+    /** @return true when a geometry is compiled for fused gate/up execution. */
+    [[nodiscard]] inline constexpr bool validGroupedImmaGateUpColumns(
+        GroupedImmaColumns geometry) noexcept
+    {
+        const int columns = groupedImmaColumns(geometry);
+        return columns == 32 || columns == 64 || columns == 128;
+    }
+
+    /** @return true when a geometry is compiled for down-projection execution. */
+    [[nodiscard]] inline constexpr bool validGroupedImmaDownColumns(
+        GroupedImmaColumns geometry) noexcept
+    {
+        const int columns = groupedImmaColumns(geometry);
+        return columns == 32 || columns == 64 || columns == 128 ||
+               columns == 256;
+    }
+
+    /** @return true when a gate/up warp schedule names a compiled kernel. */
+    [[nodiscard]] inline constexpr bool validGroupedImmaGateUpSchedule(
+        GroupedImmaGateUpSchedule schedule) noexcept
+    {
+        return schedule == GroupedImmaGateUpSchedule::ParallelProjections ||
+               schedule == GroupedImmaGateUpSchedule::PairedProjections;
+    }
 
     /**
      * @brief Return the conservative graph-captured directory capacity.
@@ -102,6 +294,7 @@ extern "C"
      * @param K Projection reduction width.
      * @param codebook_mask OR-mask of every descriptor codebook in the table.
      * @param k_partitions Public serial-M1 partition count.
+     * @param columns Capture-time output-column ownership per CTA.
      * @param device_idx CUDA ordinal owning every pointer.
      * @param stream Exact non-null producer stream.
      * @return true when every required specialization launch was accepted.
@@ -122,6 +315,7 @@ extern "C"
         int K,
         uint32_t codebook_mask,
         int k_partitions,
+        llaminar2::cuda::moe::GroupedImmaColumns columns,
         int device_idx,
         void *stream);
 
@@ -151,6 +345,8 @@ extern "C"
      * @param K Gate/up reduction width; must be divisible by 32.
      * @param codebook_mask OR-mask of every paired descriptor codebook.
      * @param k_partitions Public serial-M1 gate/up partition count.
+     * @param columns Capture-time output-column ownership per CTA.
+     * @param schedule Capture-time projection-to-warp ownership policy.
      * @param device_idx CUDA ordinal owning every pointer.
      * @param stream Exact non-null producer stream.
      * @return true when every required specialization launch was accepted.
@@ -172,6 +368,8 @@ extern "C"
         int K,
         uint32_t codebook_mask,
         int k_partitions,
+        llaminar2::cuda::moe::GroupedImmaColumns columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
         int device_idx,
         void *stream);
 
@@ -182,6 +380,7 @@ extern "C"
      * It performs no allocation, transfer, launch, or synchronization.
      *
      * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param columns Exact compiled down-projection geometry to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.
      * @param local_memory_bytes_per_thread Receives compiler local-memory use.
      * @param static_shared_memory_bytes Receives static shared-memory bytes.
@@ -191,6 +390,7 @@ extern "C"
      */
     bool cudaMoEGroupedImma_queryKernelResources(
         uint8_t codebook_id,
+        llaminar2::cuda::moe::GroupedImmaColumns columns,
         int *registers_per_thread,
         std::size_t *local_memory_bytes_per_thread,
         std::size_t *static_shared_memory_bytes,
@@ -204,6 +404,8 @@ extern "C"
      * spills or an uneconomical occupancy change before model-level timing.
      *
      * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param columns Exact compiled gate/up geometry to inspect.
+     * @param schedule Exact compiled projection-to-warp schedule to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.
      * @param local_memory_bytes_per_thread Receives compiler local-memory use.
      * @param static_shared_memory_bytes Receives static shared-memory bytes.
@@ -213,6 +415,8 @@ extern "C"
      */
     bool cudaMoEGroupedImma_queryGateUpKernelResources(
         uint8_t codebook_id,
+        llaminar2::cuda::moe::GroupedImmaColumns columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
         int *registers_per_thread,
         std::size_t *local_memory_bytes_per_thread,
         std::size_t *static_shared_memory_bytes,

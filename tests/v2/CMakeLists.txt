@@ -5901,6 +5901,13 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristicQwen36
     LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;NativeVNNI;Qwen36;PerfStats;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillWorkspaceEnvelope
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeVNNIPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;Workspace;MTotality;AllFormats;NativeVNNI;Regression"
+    MPI_PROCS 1
+)
 
 if(HAVE_CUDA)
 add_executable(v2_integration_cuda_moe_kernel integration/kernels/cuda/Test__CUDAMoEKernel.cpp)

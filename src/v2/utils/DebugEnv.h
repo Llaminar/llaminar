@@ -405,6 +405,10 @@ namespace llaminar2
         int cuda_moe_gateup_ordered_kpart_tile_n = 128; ///< Warp-aligned output columns per ordered split-K CUDA gate/up producer block (LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
         bool cuda_moe_gateup_ordered_kpart_tile_n_override_active = false; ///< True only when an explicit environment or trainer override must supersede generated capture-time dispatch.
         int cuda_moe_down_ordered_kpart_tile_n = 128;   ///< Warp-aligned output columns per ordered split-K CUDA down producer block used for canonical route publication (LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
+        int cuda_moe_imma_gateup_columns = 32;  ///< Capture-time grouped-IMMA fused gate/up output width (LLAMINAR_CUDA_MOE_IMMA_GATEUP_COLUMNS, valid 32|64|128).
+        int cuda_moe_imma_down_columns = 32;    ///< Capture-time grouped-IMMA down output width (LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS, valid 32|64|128|256).
+        int cuda_moe_imma_gateup_schedule = 0;  ///< Gate/up warp ownership (LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE, 0=parallel banks, 1=paired projections).
+        bool cuda_moe_imma_geometry_override_active = false; ///< True only when a profiler/trainer or explicit environment overrides installed IMMA dispatch.
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -567,6 +571,34 @@ namespace llaminar2
                 {
                     cuda_moe_down_ordered_kpart_tile_n = requested;
                 }
+            }
+
+            cuda_moe_imma_gateup_columns = 32;
+            cuda_moe_imma_down_columns = 32;
+            cuda_moe_imma_gateup_schedule = 0;
+            cuda_moe_imma_geometry_override_active = false;
+            const char *moe_imma_gateup_columns_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_GATEUP_COLUMNS");
+            const char *moe_imma_down_columns_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS");
+            const char *moe_imma_gateup_schedule_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE");
+            if (moe_imma_gateup_columns_env || moe_imma_down_columns_env ||
+                moe_imma_gateup_schedule_env)
+            {
+                cuda_moe_imma_gateup_columns = moe_imma_gateup_columns_env
+                                                   ? std::atoi(
+                                                         moe_imma_gateup_columns_env)
+                                                   : 32;
+                cuda_moe_imma_down_columns = moe_imma_down_columns_env
+                                                 ? std::atoi(
+                                                       moe_imma_down_columns_env)
+                                                 : 32;
+                cuda_moe_imma_gateup_schedule =
+                    moe_imma_gateup_schedule_env
+                        ? std::atoi(moe_imma_gateup_schedule_env)
+                        : 0;
+                cuda_moe_imma_geometry_override_active = true;
             }
             // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
             // It reduces router GEMV traffic and lets the grouped gate/up decode
