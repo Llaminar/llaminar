@@ -5428,6 +5428,20 @@ add_v2_test(V2_Integration_CUDAFlashAttention_DecodeKVLen
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
+# Device-free capture-policy coverage for every positive query/head/device
+# geometry, including the complete Qwen dense and MoE attention envelope.
+add_executable(v2_unit_cuda_flash_attention_launch_policy
+    unit/kernels/cuda/Test__CUDAFlashAttentionLaunchPolicy.cpp)
+target_link_libraries(v2_unit_cuda_flash_attention_launch_policy
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main)
+add_v2_test(V2_Unit_CUDAFlashAttentionLaunchPolicy
+    COMMAND $<TARGET_FILE:v2_unit_cuda_flash_attention_launch_policy>
+    LABELS "V2;Unit;CUDA;Attention;FlashAttention;GraphCapture;LaunchPolicy;Totality;Qwen"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Quantized GEMM workspace declarations
 # Host-only structural regressions for workspace-owned CUDA GEMM scratch.
 add_executable(v2_unit_cuda_quantised_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
@@ -5682,12 +5696,28 @@ if(HAVE_ROCM)
     endif()
 endif()
 
-# The Qwen 3.6 routed-plus-shared verifier table has 257 descriptors. Keep its
-# capacity proof in the canonical grouped-verifier namespace so CUDA/ROCm table
-# indexing and ROCm's device-owned long-M work directory cannot regress behind
-# the broader performance target. Each backend test selects expert id 256 and
-# sweeps every quantized source format at direct M=4 and runtime M=9/M=31.
 if(HAVE_CUDA)
+    # Exercise both CUDA metadata-reuse specializations under production graph
+    # capture and power-law routing. Compare every output byte with serial-row
+    # publication so economy changes cannot alter grouped arithmetic or leave
+    # partial-tile padding unproved.
+    add_v2_test(V2_Integration_CUDA_MoEPrefillStagedMetadataByteInvariant
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=Perf__MoEVerifierPrefill.CUDA_StagedIQ2SIQ4MetadataIsSerialRowByteInvariant
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;MoE;Prefill;NativeVNNI;ByteExact;PowerLaw;DeviceResident;GraphCapture;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
+    if(TEST V2_Integration_CUDA_MoEPrefillStagedMetadataByteInvariant)
+        set_tests_properties(
+            V2_Integration_CUDA_MoEPrefillStagedMetadataByteInvariant
+            PROPERTIES TIMEOUT 60)
+    endif()
+
+    # The Qwen 3.6 routed-plus-shared verifier table has 257 descriptors. Keep
+    # its capacity proof in the canonical grouped-verifier namespace so CUDA
+    # table indexing cannot regress behind the broader performance target.
     add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoE257DescriptorTable
         COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
                 --gtest_filter=Perf__MoEVerifierPrefill.CUDA_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent
@@ -5699,6 +5729,9 @@ if(HAVE_CUDA)
 endif()
 
 if(HAVE_ROCM)
+    # Mirror the 257-descriptor capacity proof on ROCm, including its
+    # device-owned long-M work directory. This test selects expert id 256 and
+    # sweeps every quantized source format at direct M=4 and runtime M=9/M=31.
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoE257DescriptorTable
         COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
                 --gtest_filter=Perf__MoEVerifierPrefill.ROCm_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent

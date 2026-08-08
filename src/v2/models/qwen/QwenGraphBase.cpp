@@ -4378,6 +4378,20 @@ namespace llaminar2
             attn_params.window_size = -1;
             attn_params.attention_mode = mode;
             attn_params.auto_detect_mode = true;
+            /*
+             * CUDA owns byte-equivalent query-sequence and K/V-context
+             * prefill implementations. The backend resolves this declarative
+             * choice once from the captured bucket, local head shard, cache
+             * capacity, and physical SM count. ROCm and CPU currently declare
+             * their native query-sequence implementation explicitly; they may
+             * not silently enter a CUDA-only context schedule.
+             */
+            attn_params.execution_policy = {
+                .prefill_parallel_axis =
+                    device.is_cuda()
+                        ? attention::AttentionPrefillParallelAxis::GeometrySelected
+                        : attention::AttentionPrefillParallelAxis::QuerySequence,
+            };
             attn_params.workspace_scores = buffers.workspace_scores;
             attn_params.workspace_context = buffers.workspace_context;
             /*

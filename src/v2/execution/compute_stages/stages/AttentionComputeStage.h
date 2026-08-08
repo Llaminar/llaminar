@@ -9,6 +9,7 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "../../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../../memory/BufferId.h"
 
 #include <algorithm>
@@ -68,6 +69,16 @@ namespace llaminar2
             /// Execution mode
             AttentionMode attention_mode = AttentionMode::PREFILL;
             bool auto_detect_mode = true;
+
+            /**
+             * @brief Declarative physical prefill policy for this graph node.
+             *
+             * The model graph declares the permitted logical partition axis.
+             * Backend machinery resolves `GeometrySelected` from immutable
+             * capture geometry and must preserve that concrete topology across
+             * graph replay. Live KV length is not part of this policy.
+             */
+            attention::AttentionExecutionPolicy execution_policy{};
 
             // Workspace buffers
             ITensor *workspace_scores = nullptr;

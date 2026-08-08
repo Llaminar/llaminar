@@ -2237,21 +2237,21 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         ):
             self.assertFalse((gemm / name).exists(), name)
 
-    def test_qwen36_profiles_split_lm_head_without_changing_full_profile(self) -> None:
+    def test_qwen_profiles_split_all_mtp_heads_without_changing_full_profile(self) -> None:
         core = self.run_script("--backend", "rocm", "--profile", "qwen36-core")
-        lm_head = self.run_script("--backend", "rocm", "--profile", "qwen36-lm-head")
+        mtp_head = self.run_script("--backend", "rocm", "--profile", "qwen-mtp-head")
         moe = self.run_script("--backend", "rocm", "--profile", "qwen36-moe")
         full = self.run_script("--backend", "rocm", "--profile", "qwen36")
         cuda_core = self.run_script("--backend", "cuda", "--profile", "qwen36-core")
 
         self.assertEqual(core.returncode, 0, core.stderr)
-        self.assertEqual(lm_head.returncode, 0, lm_head.stderr)
+        self.assertEqual(mtp_head.returncode, 0, mtp_head.stderr)
         self.assertEqual(moe.returncode, 0, moe.stderr)
         self.assertEqual(full.returncode, 0, full.stderr)
         self.assertEqual(cuda_core.returncode, 0, cuda_core.stderr)
 
         core_stdout = core.stdout.replace("\\,", ",")
-        lm_stdout = lm_head.stdout.replace("\\,", ",")
+        mtp_stdout = mtp_head.stdout.replace("\\,", ",")
         moe_stdout = moe.stdout.replace("\\,", ",")
         full_stdout = full.stdout.replace("\\,", ",")
 
@@ -2259,13 +2259,22 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("Qwen36_GDN_OutputProjection", core_stdout)
         self.assertNotIn("Qwen36_LM_Head", core_stdout)
 
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_LM_Head", lm_stdout)
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES="
+            "Qwen35Release_1024x2048,Qwen35Release_2048x4096,"
+            "Qwen35Release_2560x5120,Qwen35Release_3072x6144,"
+            "Qwen35Release_4096x8192,Qwen35Release_5120x10240,"
+            "Qwen35Release_248320x1024,Qwen35Release_248320x2048,"
+            "Qwen35Release_248320x2560,Qwen35Release_248320x3072,"
+            "Qwen35Release_248320x4096,Qwen36_LM_Head",
+            mtp_stdout,
+        )
         self.assertIn(
             "LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured",
-            lm_stdout,
+            mtp_stdout,
         )
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV=", lm_stdout)
-        self.assertNotIn("Qwen36_FFN_GateUp", lm_stdout)
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV=", mtp_stdout)
+        self.assertNotIn("Qwen36_FFN_GateUp", mtp_stdout)
 
         self.assertIn(
             "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=35BMoE_Expert_GateUp,35BMoE_Expert_Down,"
@@ -2279,6 +2288,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("Qwen36_LM_Head", moe_stdout)
 
         self.assertIn("Qwen36_FFN_GateUp", full_stdout)
+        self.assertIn("Qwen35Release_2048x4096", full_stdout)
         self.assertIn("Qwen36_LM_Head", full_stdout)
         self.assertIn("35BMoE_Expert_GateUp", full_stdout)
         self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE", core_stdout)
@@ -3495,12 +3505,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
         self.assertNotIn("--require-inventory-m-values 1,", stdout)
 
-    def test_cpu_qwen36_lm_head_uses_stable_required_key_training_budget(self) -> None:
+    def test_cpu_qwen_mtp_head_uses_stable_complete_training_budget(self) -> None:
         result = self.run_script(
             "--backend",
             "cpu",
             "--profile",
-            "qwen36-lm-head",
+            "qwen-mtp-head",
             "--cpu-formats",
             "Q4_K",
             "--m-values",
@@ -3509,11 +3519,27 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_LM_Head", stdout)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen35Release_1024x2048",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_LM_Head",
+            stdout,
+        )
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=5", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=30", stdout)
         self.assertIn("--require-inventory-formats Q4_K", stdout)
-        self.assertIn("--require-inventory-shapes Qwen36_LM_Head", stdout)
+        self.assertIn(
+            "--require-inventory-shapes "
+            "Qwen35Release_1024x2048,Qwen35Release_2048x4096,"
+            "Qwen35Release_2560x5120,Qwen35Release_3072x6144,"
+            "Qwen35Release_4096x8192,Qwen35Release_5120x10240,"
+            "Qwen35Release_248320x1024,Qwen35Release_248320x2048,"
+            "Qwen35Release_248320x2560,Qwen35Release_248320x3072,"
+            "Qwen35Release_248320x4096,Qwen36_LM_Head",
+            stdout,
+        )
         self.assertIn("--require-inventory-m-values 2,3,4", stdout)
 
     def test_cpu_qwen36_moe_profile_uses_real_expert_buckets_and_stable_budget(self) -> None:

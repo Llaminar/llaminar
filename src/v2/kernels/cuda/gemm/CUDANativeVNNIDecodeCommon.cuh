@@ -1,3 +1,14 @@
+/**
+ * @file CUDANativeVNNIDecodeCommon.cuh
+ * @brief Shared byte-exact CUDA NativeVNNI decode and contribution primitives.
+ *
+ * CUDA GEMV, grouped verifier, and prefill kernels include this header so that
+ * every execution regime decodes quantized weights and publishes FP32 block
+ * contributions with the same arithmetic order. IQ lookup tables are copied
+ * once during backend initialization and remain immutable device-owned state
+ * throughout graph capture and replay.
+ */
+
 #pragma once
 
 #include "tensors/IQQuantTables.h"
@@ -42,6 +53,7 @@ namespace llaminar2::cuda_native_vnni
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq2s_grid, iq2s_grid, std::size(iq2s_grid)))
             return false;
+
         if (!copyHostArrayToDeviceSymbol(d_iq2xs_grid, iq2xs_grid, std::size(iq2xs_grid)))
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq2xxs_grid, iq2xxs_grid, std::size(iq2xxs_grid)))
@@ -369,11 +381,16 @@ namespace llaminar2::cuda_native_vnni
         uint32_t grid4,
         uint8_t sign_lo4)
     {
+        /*
+         * Multiplication by 0x00204081 places nibble bit i at bit 8*i;
+         * masking retains exactly those four byte-low predicates. This is the
+         * same bit expansion as the former shift/OR chain, expressed as one
+         * integer multiply plus one mask so every IQ-grid decoder performs less
+         * scalar address-generation work before the vector byte subtraction.
+         */
         const uint32_t sign_bits =
-            (static_cast<uint32_t>(sign_lo4) & 0x1u) |
-            ((static_cast<uint32_t>(sign_lo4) & 0x2u) << 7) |
-            ((static_cast<uint32_t>(sign_lo4) & 0x4u) << 14) |
-            ((static_cast<uint32_t>(sign_lo4) & 0x8u) << 21);
+            (static_cast<uint32_t>(sign_lo4 & 0x0Fu) * 0x00204081u) &
+            0x01010101u;
         const uint32_t sign_mask = __vsub4(0u, sign_bits);
         return __vsub4(grid4 ^ sign_mask, sign_mask);
     }

@@ -133,7 +133,16 @@ namespace
         T64x128_w2x4,  // BM=64  BN=128 WM=2 WN=4  (256 threads)
         T128x128_w4x2, // BM=128 BN=128 WM=4 WN=2  (256 threads)
         T128x128_w4x4, // BM=128 BN=128 WM=4 WN=4  (512 threads)
+        Count,
     };
+
+    constexpr int kDensePrefillTileCount = static_cast<int>(TileId::Count);
+
+    /** Return whether an integer names one registered BK64 tile geometry. */
+    constexpr bool isDensePrefillTileId(int tile_id)
+    {
+        return tile_id >= 0 && tile_id < kDensePrefillTileCount;
+    }
 
     struct TileChoice
     {
@@ -2218,7 +2227,7 @@ namespace
         uint8_t codebook,
         const llaminar2::cuda::generated::CUDADensePrefillOverlayConfig &config)
     {
-        const bool ordinary_tile = config.tile_id >= 0 && config.tile_id <= 5;
+        const bool ordinary_tile = isDensePrefillTileId(config.tile_id);
         const bool valid_bk256 =
             codebook == 0 && config.bk256 && !config.canonical_kpart &&
             (config.tile_id == -3 || config.tile_id == -2);
@@ -2433,7 +2442,7 @@ namespace
                                  uint8_t codebook = 0)
     {
         // Force-tile override for sweep benchmarks
-        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        if (isDensePrefillTileId(g_force_tile_id))
             return {static_cast<TileId>(g_force_tile_id)};
 
         // Asymmetric/dual-scale formats: specialized heuristic biased
@@ -3046,7 +3055,7 @@ namespace
         return primary_ok;
     }
 
-    /** Query one of the six forceable BK64 output geometries. */
+    /** Query one registered, forceable BK64 output geometry. */
     template <uint8_t CB>
     bool queryDensePrefillTileResources(
         int tile_id,
@@ -3213,7 +3222,7 @@ namespace
             return Q40PrefillRoute::Generic;
         if (g_bk256_force_mode > 0)
             return bk256_geometry();
-        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        if (isDensePrefillTileId(g_force_tile_id))
             return Q40PrefillRoute::Generic;
 
         /*
@@ -3337,7 +3346,7 @@ namespace
             {
                 tc = {TileId::T64x64_w2x2};
             }
-            else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+            else if (isDensePrefillTileId(g_force_tile_id))
             {
                 tc = {static_cast<TileId>(g_force_tile_id)};
             }
@@ -3349,7 +3358,7 @@ namespace
                     M, N, K, prefill_ctx, complexity, CB);
             }
         }
-        else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        else if (isDensePrefillTileId(g_force_tile_id))
         {
             // Force-tile: bypass everything for sweep benchmarks
             tc = {static_cast<TileId>(g_force_tile_id)};
@@ -3377,7 +3386,7 @@ namespace
              * spill-free for direct and canonical arithmetic alike.
              */
             if (use_exact_overlay ||
-                (g_force_tile_id >= 0 && g_force_tile_id <= 5))
+                isDensePrefillTileId(g_force_tile_id))
             {
                 return false;
             }
@@ -3427,6 +3436,8 @@ namespace
             DISPATCH_TILE(128, 128, 4, 2);
         case TileId::T128x128_w4x4:
             DISPATCH_TILE(128, 128, 4, 4);
+        case TileId::Count:
+            break;
         }
 
 #undef DISPATCH_TILE
@@ -3596,7 +3607,7 @@ extern "C"
             return queryDensePrefillBK256Resources<128, 128, 4, 4>(
                 ordered_bk256 != 0, *primary, *auxiliary);
         }
-        if (tile_id < 0 || tile_id > 5 || ordered_bk256 != 0)
+        if (!isDensePrefillTileId(tile_id) || ordered_bk256 != 0)
             return false;
 
         bool queried = false;
@@ -3667,6 +3678,8 @@ extern "C"
             bm = 128;
             bn = 128;
             break;
+        case TileId::Count:
+            return 0;
         }
         return ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
     }

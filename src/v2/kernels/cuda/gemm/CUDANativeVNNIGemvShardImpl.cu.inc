@@ -1841,7 +1841,12 @@ namespace
      * independent Z-grid tiles instead of compiling another kernel or changing
      * the arithmetic performed for an existing row.
      */
-    template <int ROWS_PER_TILE, int TILE_N, int CPT, uint8_t CB>
+    template <
+        int ROWS_PER_TILE,
+        int TILE_N,
+        int CPT,
+        uint8_t CB,
+        bool PUBLISH_SINGLE_PARTITION = false>
     __global__ void nativeVnniGemv_kpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -1851,9 +1856,15 @@ namespace
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int M, int N, int K, int kb,
-        float alpha)
+        float alpha,
+        float beta,
+        const float *__restrict__ d_C_existing,
+        const float *__restrict__ d_bias)
     {
         static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
+        static_assert(
+            !PUBLISH_SINGLE_PARTITION || ROWS_PER_TILE >= 2,
+            "Direct grouped publication requires a grouped row tile");
         using Geometry = GroupedDp4aLaunchGeometry<ROWS_PER_TILE, TILE_N, CPT>;
         const int n_tile_in_block =
             threadIdx.x / Geometry::threads_per_n_tile;
@@ -1980,8 +1991,35 @@ namespace
                     const int row = row_base + tile_row;
                     if (row >= M)
                         continue;
-                    d_C[(static_cast<size_t>(split_idx) * M + row) * N + n] =
-                        alpha * acc[tile_row][c];
+                    if constexpr (PUBLISH_SINGLE_PARTITION)
+                    {
+                        /*
+                         * WIDE/DIRECT serial decode owns one K partition. The
+                         * old grouped path first stored this rounded product in
+                         * the persistent partials arena and then launched a
+                         * second kernel to load it and apply beta/bias. Spell
+                         * out those same rounding points here so direct
+                         * publication removes a launch and a global-memory
+                         * round trip without changing any output byte.
+                         */
+                        const size_t out_idx =
+                            static_cast<size_t>(row) * N + n;
+                        float out = __fmul_rn(alpha, acc[tile_row][c]);
+                        if (beta != 0.0f && d_C_existing)
+                        {
+                            out = __fadd_rn(
+                                out,
+                                __fmul_rn(beta, d_C_existing[out_idx]));
+                        }
+                        if (d_bias)
+                            out = __fadd_rn(out, d_bias[n]);
+                        d_C[out_idx] = out;
+                    }
+                    else
+                    {
+                        d_C[(static_cast<size_t>(split_idx) * M + row) * N + n] =
+                            alpha * acc[tile_row][c];
+                    }
                 }
             }
         }
@@ -2018,36 +2056,6 @@ namespace
         if (d_bias)
             sum += d_bias[n];
         d_C[out_idx] = sum;
-    }
-
-    /**
-     * @brief Publish a grouped WIDE/DIRECT row from its only K partition.
-     *
-     * Serial WIDE/DIRECT decode owns one accumulator spanning K and therefore
-     * does not add that accumulator to an initialized zero during publication.
-     * Loading partition zero directly preserves that exact arithmetic tree and
-     * signed-zero behavior while allowing the preceding grouped DP4A kernel to
-     * decode every weight block once for several verifier rows.
-     */
-    __global__ void nativeVnniGemv_publish_single_partition_small_m(
-        const float *__restrict__ d_partials,
-        float *__restrict__ d_C,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias,
-        int M, int N, float beta)
-    {
-        const int row = blockIdx.y;
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (row >= M || n >= N)
-            return;
-
-        const size_t out_idx = static_cast<size_t>(row) * N + n;
-        float out = d_partials[out_idx];
-        if (beta != 0.0f && d_C_existing)
-            out = __fadd_rn(out, __fmul_rn(beta, d_C_existing[out_idx]));
-        if (d_bias)
-            out = __fadd_rn(out, d_bias[n]);
-        d_C[out_idx] = out;
     }
 
     // =====================================================================
@@ -2117,12 +2125,12 @@ namespace
          * two-phase reducer encoded by `force_two_phase == 1`.
          *
          * WIDE and DIRECT candidates are different: serial M=1 owns exactly one
-         * K partition (`force_two_phase == 0`). Their economical grouped
-         * implementation still materializes several rows together in the
-         * persistent partials tile, but the publication kernel copies that sole
-         * accumulator and applies beta/bias without introducing an FP32 add.
-         * Rejecting this contract as though it were KPAR made every generated
-         * WIDE/DIRECT verifier policy an unlaunchable production state.
+         * K partition (`force_two_phase == 0`). Their grouped specialization
+         * publishes the rounded product and beta/bias directly from the weight-
+         * reuse CTA. Rejecting this contract as though it were KPAR made every
+         * generated WIDE/DIRECT verifier policy an unlaunchable production
+         * state; materializing its sole partial before publication needlessly
+         * added another launch and global-memory round trip.
          */
         if constexpr (MATCH_WIDE_SERIAL)
         {
@@ -2143,18 +2151,27 @@ namespace
          */
         const int desired_tile_rows =
             llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
-        const int workspace_tile_rows = workspaceBoundedKparTileRows(
-            gemv_ctx,
-            desired_tile_rows,
-            kb_capped,
-            N);
+        const int workspace_tile_rows = [&]
+        {
+            if constexpr (MATCH_WIDE_SERIAL)
+                return desired_tile_rows;
+            return workspaceBoundedKparTileRows(
+                gemv_ctx,
+                desired_tile_rows,
+                kb_capped,
+                N);
+        }();
         if (workspace_tile_rows <= 0)
             return false;
-        float *d_partials = getKparPartials(
-            gemv_ctx,
-            static_cast<size_t>(kb_capped) * workspace_tile_rows * N);
-        if (!d_partials)
-            return false;
+        float *d_partials = nullptr;
+        if constexpr (!MATCH_WIDE_SERIAL)
+        {
+            d_partials = getKparPartials(
+                gemv_ctx,
+                static_cast<size_t>(kb_capped) * workspace_tile_rows * N);
+            if (!d_partials)
+                return false;
+        }
 
         const int activation_blocks_per_row = K / BLOCK_K;
         for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
@@ -2176,29 +2193,24 @@ namespace
                     ? d_C_existing + static_cast<size_t>(row_base) * N
                     : nullptr;
 
-            nativeVnniGemv_kpar_small_m<ROWS_PER_TILE, TILE_N, CPT, CB>
+            float *producer_output = MATCH_WIDE_SERIAL ? tile_c : d_partials;
+            nativeVnniGemv_kpar_small_m<
+                ROWS_PER_TILE,
+                TILE_N,
+                CPT,
+                CB,
+                MATCH_WIDE_SERIAL>
                 <<<grid, THREADS, 0, stream>>>(
                     tile_a, d_payload, d_scales, d_mins, d_emins,
-                    d_partials, tile_scales, tile_m, N, K, kb_capped, alpha);
+                    producer_output, tile_scales, tile_m, N, K, kb_capped,
+                    alpha, beta, tile_existing, d_bias);
             const cudaError_t launch_error = cudaGetLastError();
             if (launch_error != cudaSuccess)
                 return false;
 
-            const int reduction_blocks = (N + 255) / 256;
-            if constexpr (MATCH_WIDE_SERIAL)
+            if constexpr (!MATCH_WIDE_SERIAL)
             {
-                nativeVnniGemv_publish_single_partition_small_m<<<
-                    dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
-                    d_partials,
-                    tile_c,
-                    tile_existing,
-                    d_bias,
-                    tile_m,
-                    N,
-                    beta);
-            }
-            else
-            {
+                const int reduction_blocks = (N + 255) / 256;
                 nativeVnniGemv_reduce_small_m<<<
                     dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
                     d_partials,
@@ -2209,9 +2221,9 @@ namespace
                     N,
                     kb_capped,
                     beta);
+                if (cudaGetLastError() != cudaSuccess)
+                    return false;
             }
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
         }
 
         return true;

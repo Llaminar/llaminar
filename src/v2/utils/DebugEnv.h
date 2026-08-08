@@ -778,6 +778,8 @@ namespace llaminar2
         bool debug_kv_append_source_snapshot = false;         ///< Capture source K/V tensors before append when LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT is non-zero.
         std::optional<int> debug_kv_append_source_layer;      ///< Selected layer for source K/V snapshots; nullopt means all layers.
         int cuda_fa2_tile_kv = 0;                             ///< CUDA FA2 KV tile override (LLAMINAR_FA2_TILE_KV, default 0=auto).
+        int cuda_fa2_q_warp_groups = 0;                       ///< CUDA FA2 16-row Q groups per block (LLAMINAR_FA2_Q_WARP_GROUPS; 0=geometry policy, positive values select a compiled tournament candidate).
+        int cuda_fa2_hd256_pv_warps = 4;                      ///< CUDA HD256 FA2 P@V warps per 16-row Q group (LLAMINAR_FA2_HD256_PV_WARPS; valid: 1, 2, or 4; default 4).
 
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
@@ -905,6 +907,18 @@ namespace llaminar2
 
             const char *cuda_fa2_tile_kv_env = std::getenv("LLAMINAR_FA2_TILE_KV");
             cuda_fa2_tile_kv = cuda_fa2_tile_kv_env ? std::atoi(cuda_fa2_tile_kv_env) : 0;
+
+            const char *cuda_fa2_q_warp_groups_env =
+                std::getenv("LLAMINAR_FA2_Q_WARP_GROUPS");
+            cuda_fa2_q_warp_groups = cuda_fa2_q_warp_groups_env
+                                         ? std::atoi(cuda_fa2_q_warp_groups_env)
+                                         : 0;
+
+            const char *cuda_fa2_hd256_pv_warps_env =
+                std::getenv("LLAMINAR_FA2_HD256_PV_WARPS");
+            cuda_fa2_hd256_pv_warps = cuda_fa2_hd256_pv_warps_env
+                                          ? std::atoi(cuda_fa2_hd256_pv_warps_env)
+                                          : 4;
         }
 
     private:

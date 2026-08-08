@@ -73,6 +73,68 @@ namespace
     }
 
     /**
+     * @brief Start one vectorized Ampere global-to-shared Q/K transfer group.
+     *
+     * Long-prefill recurrence consumes one complete Q row and one complete K
+     * row at every causal step.  Each participating lane moves four adjacent
+     * FP32 values directly into shared memory with `cp.async`, avoiding the
+     * register-staged load/store dependency that otherwise dominates sampled
+     * long-scoreboard stalls.  The caller owns the double-buffer lifetime and
+     * must wait for this group before exposing the destination stage.
+     *
+     * The CUDA build requires an SM80-or-newer target, so this is the sole
+     * production implementation rather than an architecture-dependent eager
+     * alternative.
+     *
+     * @tparam D_K Compile-time Q/K row width, divisible by four floats.
+     * @param q_stage Shared-memory destination for the Q row.
+     * @param k_stage Shared-memory destination for the K row.
+     * @param q_src Global-memory source for the Q row.
+     * @param k_src Global-memory source for the K row.
+     */
+    template <int D_K>
+    __device__ __forceinline__ void cuda_gdn_stage_qk_async(
+        float *q_stage,
+        float *k_stage,
+        const float *q_src,
+        const float *k_src)
+    {
+        static_assert(D_K % 4 == 0);
+        const int vector_index = static_cast<int>(threadIdx.x);
+        if (vector_index < D_K / 4)
+        {
+            const int element = vector_index * 4;
+            const uint32_t q_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(q_stage + element));
+            const uint32_t k_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(k_stage + element));
+            asm volatile(
+                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
+                :
+                : "r"(q_shared), "l"(q_src + element), "r"(16)
+                : "memory");
+            asm volatile(
+                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
+                :
+                : "r"(k_shared), "l"(k_src + element), "r"(16)
+                : "memory");
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+
+    /**
+     * @brief Wait until every Q/K transfer group issued by this lane is done.
+     *
+     * A following CTA barrier publishes the completed stage to all consumers.
+     * Keeping the wait and barrier separate makes the producer/consumer edge
+     * explicit and lets recurrence work overlap the in-flight next-row group.
+     */
+    __device__ __forceinline__ void cuda_gdn_wait_qk_async()
+    {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+
+    /**
      * @brief Advance request-local GDN rows with one fixed, batch-invariant tree.
      *
      * Temporal rows remain causal and execute in increasing order inside one
@@ -478,7 +540,7 @@ namespace
     // =========================================================================
 
     template <int D_K>
-    __global__ __launch_bounds__(256, 2) void cuda_gdn_chunk_forward_kernel(
+    __global__ __launch_bounds__(64, 10) void cuda_gdn_chunk_forward_kernel(
         const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
         const float *__restrict__ K,        // [seq_len, n_heads * d_k]
         const float *__restrict__ V,        // [seq_len, n_heads * d_v]
@@ -503,14 +565,22 @@ namespace
         const int tid = threadIdx.x;
         const int block_size = blockDim.x;
 
-        // Row-split parallelism: eight threads collaborate on each column and
-        // own disjoint contiguous D_K/8 state rows. With 256 threads/block this
-        // gives 32 independent columns and eight warps to hide L1 latency.
+        // Row-split parallelism: eight lanes collaborate on each column and
+        // own disjoint contiguous D_K/8 state rows.  Keep all eight lanes in
+        // one warp so their partial sums can be exchanged without shared
+        // reduction buffers or CTA-wide barriers.  Four columns fit in each
+        // warp; a 64-thread block owns eight columns and exposes enough
+        // independent CTAs to hide the remaining scalar and value-load latency.
         constexpr int ROW_SPLIT = kGdnRecurrentRowSplit;
         constexpr int ROWS_PER_SPLIT = D_K / ROW_SPLIT;
+        constexpr int COLUMNS_PER_WARP = 32 / ROW_SPLIT;
         const int cols_per_block = block_size / ROW_SPLIT;
-        const int split_id = tid / cols_per_block; // 0..ROW_SPLIT-1
-        const int col_in_block = tid % cols_per_block;
+        const int lane_id = tid & 31;
+        const int warp_id = tid >> 5;
+        const int split_id = lane_id / COLUMNS_PER_WARP;
+        const int col_in_warp = lane_id % COLUMNS_PER_WARP;
+        const int col_in_block =
+            warp_id * COLUMNS_PER_WARP + col_in_warp;
         const int vi = blockIdx.y * cols_per_block + col_in_block;
 
         const int qk_stride = n_heads * D_K;
@@ -527,12 +597,8 @@ namespace
                            static_cast<size_t>(h) * D_K * d_v;
 
         extern __shared__ float smem[];
-        float *q_local = smem;       // [D_K]
-        float *k_local = smem + D_K; // [D_K]
-        // Shared reduction scratch follows
-        float *reduce_kv = smem + 2 * D_K;
-        // Double-buffered reduction arrays for row-split partial sums
-        float *reduce_out = reduce_kv + block_size;
+        float *q_stages = smem;             // [2][D_K]
+        float *k_stages = smem + 2 * D_K;   // [2][D_K]
 
         int effective_seq_len = request_seq_len;
         if (effective_seq_len_ptr)
@@ -565,12 +631,25 @@ namespace
                 sc[j] = 0.0f;
         }
 
-        // Process each timestep sequentially (inherent to recurrence)
+        // Seed the first Q/K stage once.  Subsequent rows are loaded into the
+        // opposite stage while the current causal recurrence is executing.
+        int active_qk_stage = 0;
+        if (effective_seq_len > 0)
+        {
+            const int first_row = request_row_base;
+            cuda_gdn_stage_qk_async<D_K>(
+                q_stages,
+                k_stages,
+                Q + first_row * qk_stride + h * D_K,
+                K + first_row * qk_stride + h * D_K);
+            cuda_gdn_wait_qk_async();
+            __syncthreads();
+        }
+
+        // Process each timestep sequentially (inherent to recurrence).
         for (int t = 0; t < request_seq_len; t++)
         {
             const int row = request_row_base + t;
-            const float *q_src = Q + row * qk_stride + h * D_K;
-            const float *k_src = K + row * qk_stride + h * D_K;
             const float *v_src = V + row * v_stride + h * d_v;
             float *o_dst = output + row * v_stride + h * d_v;
 
@@ -581,13 +660,20 @@ namespace
                 continue;
             }
 
-            // Load Q and K into shared memory (all threads cooperate)
-            for (int i = tid; i < D_K; i += block_size)
+            const int next_qk_stage = active_qk_stage ^ 1;
+            const bool has_next_row = t + 1 < effective_seq_len;
+            if (has_next_row)
             {
-                q_local[i] = q_src[i];
-                k_local[i] = k_src[i];
+                const int next_row = row + 1;
+                cuda_gdn_stage_qk_async<D_K>(
+                    q_stages + next_qk_stage * D_K,
+                    k_stages + next_qk_stage * D_K,
+                    Q + next_row * qk_stride + h * D_K,
+                    K + next_row * qk_stride + h * D_K);
             }
-            __syncthreads();
+
+            const float *q_local = q_stages + active_qk_stage * D_K;
+            const float *k_local = k_stages + active_qk_stage * D_K;
 
             // The mandatory captured preprocessor publishes canonical Q/K and
             // gate values before this kernel. Long recurrence has no second
@@ -606,15 +692,28 @@ namespace
                     partial_kv += sc[j] * k_local[j_start + j];
                 }
             }
-            reduce_kv[tid] = partial_kv;
-            __syncthreads();
+            float kv = 0.0f;
+            // Every lane named by the full-warp mask participates, including
+            // lanes assigned to a padded tail column.  Their partial is zero,
+            // which keeps the exchange valid without changing a real column.
+#pragma unroll
+            for (int s = 0; s < ROW_SPLIT; ++s)
+            {
+                // Preserve the historical arithmetic exactly: partition zero
+                // is added first and partition seven last.  A tree reduction
+                // would be faster-looking but would change rounding and break
+                // serial-decode byte equivalence.
+                const int source_lane =
+                    s * COLUMNS_PER_WARP + col_in_warp;
+                kv += __shfl_sync(
+                    0xFFFFFFFF,
+                    partial_kv,
+                    source_lane);
+            }
 
             float delta = 0.0f;
             if (vi < d_v)
             {
-                float kv = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    kv += reduce_kv[col_in_block + s * cols_per_block];
                 delta = (v_src[vi] - kv) * beta_h;
             }
 
@@ -628,14 +727,19 @@ namespace
                     partial_out += sc[j] * q_local[j_start + j];
                 }
             }
-            reduce_out[tid] = partial_out;
-            __syncthreads();
-
+            float out_vi = 0.0f;
+#pragma unroll
+            for (int s = 0; s < ROW_SPLIT; ++s)
+            {
+                const int source_lane =
+                    s * COLUMNS_PER_WARP + col_in_warp;
+                out_vi += __shfl_sync(
+                    0xFFFFFFFF,
+                    partial_out,
+                    source_lane);
+            }
             if (vi < d_v && split_id == 0)
             {
-                float out_vi = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    out_vi += reduce_out[col_in_block + s * cols_per_block];
                 o_dst[vi] = out_vi;
             }
 
@@ -652,7 +756,15 @@ namespace
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
                     snapshot[(j_start + j) * d_v + vi] = sc[j];
             }
-            __syncthreads();
+            if (has_next_row)
+            {
+                // Every thread finishes consuming the active stage before any
+                // thread may recycle it two iterations later.  The same edge
+                // also publishes the completed asynchronous next-row stage.
+                cuda_gdn_wait_qk_async();
+                __syncthreads();
+                active_qk_stage = next_qk_stage;
+            }
         }
 
         if (vi < d_v)
@@ -2212,18 +2324,18 @@ extern "C"
         }
 
         // Eight threads retain one deterministic key-row partition per output
-        // column. A 128-thread block owns sixteen columns, giving the Qwen
-        // D_V=128 geometry 256 resident blocks instead of 128 while retaining
-        // exactly the same within-column arithmetic tree.
-        constexpr int col_threads = 128;
+        // column. A 64-thread block owns eight columns, giving the Qwen
+        // D_V=128 geometry 512 independent blocks while retaining exactly the
+        // same within-column arithmetic tree. Profiling selects ten resident
+        // blocks as the best spill-free register/occupancy point on SM86.
+        constexpr int col_threads = 64;
         constexpr int cols_per_block =
             col_threads / kGdnRecurrentRowSplit;
         const int num_col_blocks =
             (d_v + cols_per_block - 1) / cols_per_block;
-        // Shared memory contains Q/K plus one deterministic eight-lane
-        // reduction buffer for each of K*S and Q*S. There is no legacy norm
-        // scratch because preprocessing is a mandatory preceding graph node.
-        const int smem_size = (2 * d_k + 2 * col_threads) * sizeof(float);
+        // Q/K use two shared stages so row t+1 transfers overlap row t's exact
+        // recurrence. No reduction workspace or extra graph binding is needed.
+        const int smem_size = 4 * d_k * sizeof(float);
 
         const int preprocess_blocks = seq_len * n_heads;
         cuda_gdn_prefill_preprocess_kernel<<<preprocess_blocks, 64, 0, (cudaStream_t)stream>>>(

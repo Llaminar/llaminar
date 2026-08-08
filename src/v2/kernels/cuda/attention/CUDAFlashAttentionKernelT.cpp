@@ -9,12 +9,15 @@
  */
 
 #include "CUDAFlashAttentionKernelT.h"
+#include "CUDAFlashAttentionLaunchPolicy.h"
+#include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -50,6 +53,42 @@ extern "C"
         int device_idx,
         int head_start,
         int gqa_n_rep);
+
+    /**
+     * @brief Launch a deterministic K/V-context transaction with FP32 K/V.
+     */
+    int cudaFlashAttn_prefill_fa2_context_parallel(
+        const float *Q, const float *K, const float *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size, int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream, int device_idx, int head_start, int gqa_n_rep);
+
+    /**
+     * @brief Launch a deterministic K/V-context transaction with FP16 K/V.
+     */
+    int cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(
+        const float *Q, const void *K_fp16, const void *V_fp16, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size, int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream, int device_idx, int head_start, int gqa_n_rep);
 
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
@@ -149,6 +188,8 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit,
         void *stream);
 
     int cudaFlashAttn_prepare_device_params_from_geometry(
@@ -157,6 +198,8 @@ extern "C"
         int kv_stride,
         int position_offset,
         int query_rows,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit,
         void *stream);
 
     int cudaFlashAttn_prepare_device_params_from_request_counts(
@@ -197,6 +240,102 @@ namespace llaminar2
 
         // Minimum KV positions per split to avoid excessive overhead
         constexpr int MIN_KV_PER_SPLIT = 16;
+
+        /**
+         * @brief Resolve one CUDA prefill graph plan from immutable geometry.
+         *
+         * CUDA device properties are setup-time inputs. The returned mode is
+         * embedded in graph capture and never re-evaluated from a live sequence
+         * length. Returning an invalid plan is a fatal configuration result at
+         * the caller; this helper never substitutes query execution for an
+         * invalid context request.
+         */
+        static fa2_policy::FA2PrefillParallelPlan resolvePrefillPlanForDevice(
+            int batch_size,
+            int query_rows,
+            int local_query_heads,
+            int head_dim,
+            int kv_capacity,
+            int device_idx,
+            const attention::AttentionExecutionPolicy &execution_policy)
+        {
+            cudaDeviceProp properties{};
+            const cudaError_t status =
+                cudaGetDeviceProperties(&properties, device_idx);
+            if (status != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT] Failed to query CUDA prefill capture geometry for device "
+                          << device_idx << ": " << cudaGetErrorString(status));
+                return {};
+            }
+
+            return fa2_policy::selectFA2PrefillParallelPlan({
+                .batch_size = batch_size,
+                .query_rows = query_rows,
+                .local_query_heads = local_query_heads,
+                .head_dim = head_dim,
+                .kv_capacity = kv_capacity,
+                .sm_count = properties.multiProcessorCount,
+                .requested_axis =
+                    execution_policy.prefill_parallel_axis,
+            });
+        }
+
+        /**
+         * @brief Publish one successfully submitted FA2 physical-plan choice.
+         *
+         * Captured production replay does not return through this host method,
+         * so this setup-owned inventory has no replay-path synchronization or
+         * contention cost. The `gpu_graph_inventory` domain survives benchmark
+         * warmup reset and lets E2E prove that the intended physical mode was
+         * actually launched instead of merely being declared by model policy.
+         */
+        static void recordFA2ParallelPlanSelection(
+            const fa2_policy::FA2PrefillParallelPlan &plan,
+            const attention::AttentionExecutionPolicy &execution_policy,
+            int batch_size,
+            int query_rows,
+            int local_query_heads,
+            int head_dim,
+            int kv_capacity,
+            int device_idx,
+            const char *kv_storage)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            PerfStatsCollector::addCounter(
+                "gpu_graph_inventory",
+                "cuda_fa2_parallel_plan_selections",
+                1.0,
+                "capture_setup",
+                "cuda:" + std::to_string(device_idx),
+                {
+                    {"requested_axis",
+                     attention::attentionPrefillParallelAxisName(
+                         execution_policy.prefill_parallel_axis)},
+                    {"selected_axis",
+                     fa2_policy::fa2PrefillPhysicalModeName(plan.mode)},
+                    {"batch_size", std::to_string(batch_size)},
+                    {"query_rows", std::to_string(query_rows)},
+                    {"local_query_heads", std::to_string(local_query_heads)},
+                    {"head_dim", std::to_string(head_dim)},
+                    {"kv_capacity", std::to_string(kv_capacity)},
+                    {"query_warp_groups",
+                     std::to_string(plan.query_warp_groups)},
+                    {"query_grid_blocks",
+                     std::to_string(plan.query_grid_blocks)},
+                    {"context_partitions",
+                     std::to_string(plan.max_context_partitions)},
+                    {"context_partition_slots",
+                     std::to_string(plan.context_partition_slots)},
+                    {"device_direct_partition_limit",
+                     std::to_string(plan.device_direct_partition_limit)},
+                    {"reducer_dimension_warps",
+                     std::to_string(plan.reducer_dimension_warps)},
+                    {"kv_storage", kv_storage ? kv_storage : "unknown"},
+                });
+        }
 
         /**
          * @brief Select the fixed split envelope for one captured decode graph.
@@ -339,7 +478,9 @@ namespace llaminar2
               dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
               dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
               dynamic_attn_device_valid_(other.dynamic_attn_device_valid_),
-              dynamic_attn_device_derived_(other.dynamic_attn_device_derived_)
+              dynamic_attn_device_derived_(other.dynamic_attn_device_derived_),
+              pending_prefill_conditional_(
+                  std::move(other.pending_prefill_conditional_))
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -376,6 +517,8 @@ namespace llaminar2
                 dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
                 dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
                 dynamic_attn_device_derived_ = other.dynamic_attn_device_derived_;
+                pending_prefill_conditional_ =
+                    std::move(other.pending_prefill_conditional_);
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -671,7 +814,8 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
@@ -954,6 +1098,54 @@ namespace llaminar2
                                                                                  << " head_dim=" << head_dim << " causal=" << causal);
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const int launch_kv_capacity =
+                dynamic_attn_kv_stride_ > 0
+                    ? dynamic_attn_kv_stride_
+                    : kv_len;
+            const fa2_policy::FA2PrefillParallelPlan prefill_plan =
+                resolvePrefillPlanForDevice(
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    execution_policy);
+            if (!prefill_plan.valid)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Invalid declared CUDA prefill capture plan"
+                          << " requested="
+                          << attention::attentionPrefillParallelAxisName(
+                                 execution_policy.prefill_parallel_axis)
+                          << " batch=" << batch_size
+                          << " rows=" << seq_len
+                          << " heads=" << n_heads
+                          << " head_dim=" << head_dim
+                          << " kv_capacity=" << launch_kv_capacity
+                          << " device=" << dev);
+                return false;
+            }
+            std::unique_ptr<CUDAActiveCaptureConditional>
+                active_prefill_conditional;
+            if (pending_prefill_conditional_ &&
+                !prefill_plan.usesDeviceAdaptiveParallelism())
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Device-param producer opened an adaptive transaction for a non-adaptive FA2 plan");
+                pending_prefill_conditional_.reset();
+                return false;
+            }
+            if (pending_prefill_conditional_)
+            {
+                /*
+                 * Move the single-use construction token into this call. Every
+                 * return path now destroys it, including workspace, conversion,
+                 * or launch failures before branch commitment. A failed capture
+                 * cannot leave stale builder state attached to the reusable
+                 * kernel object and poison an unrelated later request.
+                 */
+                active_prefill_conditional =
+                    std::move(pending_prefill_conditional_);
+            }
 
             // Dispatch: FP16 KV direct path (prefill and decode) or standard apply_typed
             if (use_fp16kv_direct)
@@ -1084,33 +1276,126 @@ namespace llaminar2
                     return true;
                 }
 
-                // PREFILL: FA2 with FP16 KV
+                // PREFILL: one capture-stable query or context transaction.
                 LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill path"
+                          << " parallel_axis="
+                          << (prefill_plan.usesContextParallelism()
+                                  ? "key_value_context"
+                                  : "query_sequence")
                           << " seq_len=" << seq_len
                           << " kv_len=" << kv_len
+                          << " kv_capacity=" << launch_kv_capacity
                           << " n_heads=" << n_heads
                           << " n_kv_heads=" << n_kv_heads
                           << " head_dim=" << head_dim
                           << " causal=" << causal
                           << " device_params=" << (d_attn_params != nullptr));
 
-                int result;
+                int result = -1;
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_PREFILL, stream_);
-                    result = cudaFlashAttn_prefill_fa2_fp16kv(
-                        Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
-                        batch_size, seq_len, kv_len,
-                        n_heads, n_kv_heads, head_dim,
-                        causal, window_size, 0,
-                        d_attn_params, mask_ptr,
-                        stream_, dev,
-                        head_start, gqa_n_rep);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(
+                        CUDAKernelType::FLASH_ATTN_PREFILL,
+                        stream_);
+                    if (prefill_plan.usesContextParallelism())
+                    {
+                        if (!stream_ || !workspace_ || !d_attn_params)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP16KV prefill requires an exact stream, bound workspace, and device-owned attention params");
+                            return false;
+                        }
+
+                        float *O_partial = static_cast<float *>(
+                            workspace_->getBuffer(
+                                AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+                        float *m_partial = static_cast<float *>(
+                            workspace_->getBuffer(
+                                AttentionWorkspaceBuffers::PARTIAL_M));
+                        float *l_partial = static_cast<float *>(
+                            workspace_->getBuffer(
+                                AttentionWorkspaceBuffers::PARTIAL_L));
+                        const bool capacity_valid =
+                            O_partial && m_partial && l_partial &&
+                            workspace_->getBufferSize(
+                                AttentionWorkspaceBuffers::PARTIAL_OUTPUT) >=
+                                prefill_plan.partial_output_bytes &&
+                            workspace_->getBufferSize(
+                                AttentionWorkspaceBuffers::PARTIAL_M) >=
+                                prefill_plan.partial_m_bytes &&
+                            workspace_->getBufferSize(
+                                AttentionWorkspaceBuffers::PARTIAL_L) >=
+                                prefill_plan.partial_l_bytes;
+                        if (!capacity_valid)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP16KV workspace does not match the captured plan"
+                                      << " required_output="
+                                      << prefill_plan.partial_output_bytes
+                                      << " required_scalar="
+                                      << prefill_plan.partial_m_bytes);
+                            return false;
+                        }
+
+                        result =
+                            cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(
+                                Q_ptr,
+                                K_fp16_ptr,
+                                V_fp16_ptr,
+                                output_ptr,
+                                O_partial,
+                                m_partial,
+                                l_partial,
+                                batch_size,
+                                seq_len,
+                                launch_kv_capacity,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                causal,
+                                window_size,
+                                /*position_offset=*/0,
+                                d_attn_params,
+                                mask_ptr,
+                                fa2_policy::kFA2CanonicalContextPartitionKeys,
+                                prefill_plan.max_context_partitions,
+                                prefill_plan.context_partition_slots,
+                                prefill_plan.device_direct_partition_limit,
+                                prefill_plan.reducer_dimension_warps,
+                                active_prefill_conditional.get(),
+                                stream_,
+                                dev,
+                                head_start,
+                                gqa_n_rep);
+                    }
+                    else
+                    {
+                        result = cudaFlashAttn_prefill_fa2_fp16kv(
+                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
+                            batch_size, seq_len, kv_len,
+                            n_heads, n_kv_heads, head_dim,
+                            causal, window_size, 0,
+                            d_attn_params, mask_ptr,
+                            stream_, dev,
+                            head_start, gqa_n_rep);
+                    }
                 }
                 if (result != 0)
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV kernel failed");
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill transaction failed"
+                              << " parallel_axis="
+                              << (prefill_plan.usesContextParallelism()
+                                      ? "key_value_context"
+                                      : "query_sequence"));
                     return false;
                 }
+                recordFA2ParallelPlanSelection(
+                    prefill_plan,
+                    execution_policy,
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    "fp16");
                 return true;
             }
 
@@ -1159,26 +1444,134 @@ namespace llaminar2
             }
 
             // Standard path: K/V are FP32 (either native or converted)
+            if (prefill_plan.usesContextParallelism())
+            {
+                if (!stream_ || !workspace_ || !d_attn_params)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP32 prefill requires an exact stream, bound workspace, and device-owned attention params");
+                    return false;
+                }
+
+                float *O_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+                float *m_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_M));
+                float *l_partial = static_cast<float *>(
+                    workspace_->getBuffer(
+                        AttentionWorkspaceBuffers::PARTIAL_L));
+                const bool capacity_valid =
+                    O_partial && m_partial && l_partial &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_OUTPUT) >=
+                        prefill_plan.partial_output_bytes &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_M) >=
+                        prefill_plan.partial_m_bytes &&
+                    workspace_->getBufferSize(
+                        AttentionWorkspaceBuffers::PARTIAL_L) >=
+                        prefill_plan.partial_l_bytes;
+                if (!capacity_valid)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP32 workspace does not match the captured plan"
+                              << " required_output="
+                              << prefill_plan.partial_output_bytes
+                              << " required_scalar="
+                              << prefill_plan.partial_m_bytes);
+                    return false;
+                }
+
+                int result = -1;
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(
+                        CUDAKernelType::FLASH_ATTN_PREFILL,
+                        stream_);
+                    result = cudaFlashAttn_prefill_fa2_context_parallel(
+                        Q_ptr,
+                        K_ptr,
+                        V_ptr,
+                        output_ptr,
+                        O_partial,
+                        m_partial,
+                        l_partial,
+                        batch_size,
+                        seq_len,
+                        launch_kv_capacity,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        /*position_offset=*/0,
+                        d_attn_params,
+                        mask_ptr,
+                        fa2_policy::kFA2CanonicalContextPartitionKeys,
+                        prefill_plan.max_context_partitions,
+                        prefill_plan.context_partition_slots,
+                        prefill_plan.device_direct_partition_limit,
+                        prefill_plan.reducer_dimension_warps,
+                        active_prefill_conditional.get(),
+                        stream_,
+                        dev,
+                        head_start,
+                        gqa_n_rep);
+                }
+                if (result != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 FP32 context transaction failed");
+                    return false;
+                }
+                recordFA2ParallelPlanSelection(
+                    prefill_plan,
+                    execution_policy,
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    "fp32");
+                return true;
+            }
+
+            bool direct_success = false;
             if (kv_len != seq_len)
             {
                 // Decode path (different Q and KV lengths)
-                return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
-                                   batch_size, seq_len, kv_len,
-                                   n_heads, n_kv_heads, head_dim,
-                                   causal, window_size, 0, dev,
-                                   d_attn_params, mask_ptr,
-                                   head_start, gqa_n_rep);
+                direct_success = apply_typed(
+                    Q_ptr, K_ptr, V_ptr, output_ptr,
+                    batch_size, seq_len, kv_len,
+                    n_heads, n_kv_heads, head_dim,
+                    causal, window_size, 0, dev,
+                    d_attn_params, mask_ptr,
+                    head_start, gqa_n_rep);
             }
             else
             {
                 // Prefill path
-                return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
-                                   batch_size, seq_len, seq_len,
-                                   n_heads, n_kv_heads, head_dim,
-                                   causal, window_size, 0, dev,
-                                   d_attn_params, mask_ptr,
-                                   head_start, gqa_n_rep);
+                direct_success = apply_typed(
+                    Q_ptr, K_ptr, V_ptr, output_ptr,
+                    batch_size, seq_len, seq_len,
+                    n_heads, n_kv_heads, head_dim,
+                    causal, window_size, 0, dev,
+                    d_attn_params, mask_ptr,
+                    head_start, gqa_n_rep);
             }
+            if (direct_success && seq_len > 1)
+            {
+                recordFA2ParallelPlanSelection(
+                    prefill_plan,
+                    execution_policy,
+                    batch_size,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    launch_kv_capacity,
+                    dev,
+                    "fp32");
+            }
+            return direct_success;
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_verifier_rows_decode_equivalent(
@@ -1596,6 +1989,8 @@ namespace llaminar2
                     kv_stride,
                     position_offset,
                     query_rows,
+                    /*prefill_branch_condition=*/0,
+                    /*direct_kv_limit=*/0,
                     stream) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device attention-param writer failed"
@@ -1751,7 +2146,8 @@ namespace llaminar2
             int query_rows,
             void *stream,
             int kv_stride,
-            const int *active_query_rows_device)
+            const int *active_query_rows_device,
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture)
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
@@ -1782,14 +2178,133 @@ namespace llaminar2
             }
 
             setGPUStream(stream);
-            const int rc = cudaFlashAttn_prepare_device_params_from_count(
-                d_buf,
-                post_append_cached_tokens_device,
-                seq_len,
-                sanitized_query_rows,
-                kv_stride,
-                active_query_rows_device,
-                stream);
+            if (pending_prefill_conditional_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Previous adaptive prefill transaction was not consumed before a new parameter publication");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+            if (!prefill_capture.empty() && !prefill_capture.valid())
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Partially specified prefill capture geometry cannot publish device attention params");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+            if (prefill_capture.valid() &&
+                prefill_capture.kv_capacity != kv_stride)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Prefill capture capacity disagrees with attention-param stride"
+                          << " capture_capacity=" << prefill_capture.kv_capacity
+                          << " kv_stride=" << kv_stride);
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            const cudaError_t capture_query_status = cudaStreamIsCapturing(
+                static_cast<cudaStream_t>(stream),
+                &capture_status);
+            if (capture_query_status != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Cannot query capture state before device attention-param publication: "
+                          << cudaGetErrorString(capture_query_status));
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            unsigned long long prefill_branch_condition = 0;
+            int direct_kv_limit = 0;
+            if (capture_status == cudaStreamCaptureStatusActive &&
+                prefill_capture.valid())
+            {
+                const fa2_policy::FA2PrefillParallelPlan capture_plan =
+                    resolvePrefillPlanForDevice(
+                        prefill_capture.batch_size,
+                        prefill_capture.query_rows,
+                        prefill_capture.local_query_heads,
+                        prefill_capture.head_dim,
+                        prefill_capture.kv_capacity,
+                        device_idx_,
+                        prefill_capture.execution_policy);
+                if (!capture_plan.valid)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Invalid prefill plan before device attention-param publication");
+                    dynamic_attn_device_valid_ = false;
+                    dynamic_attn_device_derived_ = false;
+                    return false;
+                }
+
+                if (capture_plan.usesDeviceAdaptiveParallelism())
+                {
+#if CUDART_VERSION >= 12030
+                    pending_prefill_conditional_ =
+                        std::make_unique<CUDAActiveCaptureConditional>(
+                            static_cast<cudaStream_t>(stream),
+                            CUDAActiveCaptureConditionalKind::IfOnly);
+                    if (!pending_prefill_conditional_->ready())
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Cannot begin adaptive prefill transaction: "
+                                  << pending_prefill_conditional_->error());
+                        pending_prefill_conditional_.reset();
+                        dynamic_attn_device_valid_ = false;
+                        dynamic_attn_device_derived_ = false;
+                        return false;
+                    }
+                    direct_kv_limit =
+                        fa2_policy::kFA2CanonicalContextPartitionKeys *
+                        capture_plan.device_direct_partition_limit;
+                    const bool published =
+                        pending_prefill_conditional_->publishPredicate(
+                            [&](cudaGraphConditionalHandle condition)
+                            {
+                                prefill_branch_condition =
+                                    static_cast<unsigned long long>(condition);
+                                return cudaFlashAttn_prepare_device_params_from_count(
+                                           d_buf,
+                                           post_append_cached_tokens_device,
+                                           seq_len,
+                                           sanitized_query_rows,
+                                           kv_stride,
+                                           active_query_rows_device,
+                                           prefill_branch_condition,
+                                           direct_kv_limit,
+                                           stream) == 0;
+                            });
+                    if (!published)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device attention-param predicate publication failed: "
+                                  << pending_prefill_conditional_->error());
+                        pending_prefill_conditional_.reset();
+                        dynamic_attn_device_valid_ = false;
+                        dynamic_attn_device_derived_ = false;
+                        return false;
+                    }
+#else
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Adaptive prefill requires CUDA 12.3 native conditional graphs");
+                    dynamic_attn_device_valid_ = false;
+                    dynamic_attn_device_derived_ = false;
+                    return false;
+#endif
+                }
+            }
+
+            const int rc = prefill_branch_condition != 0
+                               ? 0
+                               : cudaFlashAttn_prepare_device_params_from_count(
+                                     d_buf,
+                                     post_append_cached_tokens_device,
+                                     seq_len,
+                                     sanitized_query_rows,
+                                     kv_stride,
+                                     active_query_rows_device,
+                                     /*prefill_branch_condition=*/0,
+                                     /*direct_kv_limit=*/0,
+                                     stream);
             if (rc != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to derive attention params from device KV count");
@@ -2109,7 +2624,8 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             // FP16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 compute_tensor not yet implemented, using FP32");
@@ -2120,7 +2636,8 @@ namespace llaminar2
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
-                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep);
+                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep,
+                                              execution_policy);
         }
 
         // =====================================================================
@@ -2176,6 +2693,8 @@ namespace llaminar2
 
             if (cudaFlashAttn_prepare_device_params_from_geometry(
                     device_params, kv_len, kv_len, position_offset, 1,
+                    /*prefill_branch_condition=*/0,
+                    /*direct_kv_limit=*/0,
                     stream_) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP16>] Device attention-param writer failed");
@@ -2401,7 +2920,8 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             // BF16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 compute_tensor not yet implemented, using FP32");
@@ -2412,7 +2932,8 @@ namespace llaminar2
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
-                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep);
+                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep,
+                                              execution_policy);
         }
 
         // =====================================================================
@@ -2468,6 +2989,8 @@ namespace llaminar2
 
             if (cudaFlashAttn_prepare_device_params_from_geometry(
                     device_params, kv_len, kv_len, position_offset, 1,
+                    /*prefill_branch_condition=*/0,
+                    /*direct_kv_limit=*/0,
                     stream_) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] Device attention-param writer failed");

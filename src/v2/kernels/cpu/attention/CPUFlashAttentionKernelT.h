@@ -581,6 +581,9 @@ namespace llaminar2
          * @param head_start        First head index when sharded (0 = unsharded).
          * @param local_n_heads     Local query heads (-1 = all).
          * @param local_n_kv_heads  Local KV heads (-1 = all).
+         * @param execution_policy  Capture-stable physical prefill policy.
+         *        CPU currently implements query-sequence partitioning and
+         *        rejects a graph that declares a different physical axis.
          * @return true on success.
          */
         bool compute_tensor(
@@ -603,8 +606,18 @@ namespace llaminar2
             int head_start = 0,
             int local_n_heads = -1,
             int local_n_kv_heads = -1,
-            int gqa_n_rep = 0) override
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {}) override
         {
+            if (execution_policy.prefill_parallel_axis !=
+                attention::AttentionPrefillParallelAxis::QuerySequence)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Unsupported declared prefill parallel axis: "
+                          << attention::attentionPrefillParallelAxisName(
+                                 execution_policy.prefill_parallel_axis));
+                return false;
+            }
+
             if constexpr (!std::is_same_v<ElementType, float>)
             {
                 LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() not supported for non-FP32 precision");

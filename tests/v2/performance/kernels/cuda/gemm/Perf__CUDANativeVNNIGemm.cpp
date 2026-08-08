@@ -832,7 +832,7 @@ namespace
         {
             cfg.tile_ids.clear();
             for (int t : tile_vals)
-                if (t >= 0 && t <= 5)
+                if (t >= 0 && t < static_cast<int>(std::size(kAllTiles)))
                     cfg.tile_ids.push_back(t);
         }
 

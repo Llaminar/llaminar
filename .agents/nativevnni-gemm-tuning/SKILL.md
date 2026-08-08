@@ -84,6 +84,25 @@ The production exact-overlay matrix is symmetric: every known geometry is
 measured for all 21 registry formats at Fast M=1 and grouped-verifier M=2..16
 plus M=31. LM heads participate because both learned surfaces execute them.
 Unmeasured positive grouped M values remain total through generic rules.
+
+Use the focused `qwen-mtp-head` profile when changing the MTP projection or
+terminal-head candidate families and only additive evidence is required:
+
+```bash
+scripts/refresh_native_vnni_dispatch_tables.sh \
+  --backend <cpu|cuda|rocm> --profile qwen-mtp-head \
+  --output-dir <work-dir>
+```
+
+The profile derives its matrix list from the shared reviewed Qwen 3.5/3.6
+release catalog and resolves physical dimensions through the canonical shape
+manifest. It covers the six distinct hidden widths, both MTP-specific `H x 2H`
+hidden/embedding projections and `248320 x H` terminal heads, every registry
+format, Fast M=1, grouped M=2..16, and M=31. Do not replace it with a hardcoded
+single-model LM-head list. Ordinary sidecar attention and FFN/MoE matrices are
+owned by the complete release inventory; this focused profile measures only the
+two matrix families introduced specifically by the MTP head.
+
 CPU collection automatically uses every detected physical socket. Each MPMD
 rank owns a distinct resumable timing cell and retains the production
 per-socket thread count; set `--cpu-measurement-lanes N` only for deliberate

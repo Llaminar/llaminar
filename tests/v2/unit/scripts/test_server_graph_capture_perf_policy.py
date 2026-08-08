@@ -316,13 +316,25 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
             counter(
                 "device_generation_terminal_compact_outcome_reductions",
-                value=3,
+                value=2,
                 domain="mtp",
                 device=device,
                 tags={
                     "authority": "device_generation_controller",
                     "accounting_role": "captured_graph_replay_multiplier",
                     "source": "captured_stochastic_compact_outcome",
+                    "execution": "native_conditional_graph",
+                },
+            ),
+            counter(
+                "device_generation_terminal_compact_outcome_reductions",
+                value=1,
+                domain="mtp",
+                device=device,
+                tags={
+                    "authority": "device_generation_controller",
+                    "accounting_role": "captured_graph_replay_multiplier",
+                    "source": "captured_greedy_compact_outcome",
                     "execution": "native_conditional_graph",
                 },
             ),
@@ -364,6 +376,24 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             expected_maximum_depth=15,
         )
         self.assertIn("native stochastic sampling parent", result.error or "")
+
+        missing_stochastic_outcome = [
+            record
+            if (record.get("tags") or {}).get("source")
+            != "captured_stochastic_compact_outcome"
+            else record
+            | {
+                "tags": (record.get("tags") or {})
+                | {"source": "captured_greedy_compact_outcome"}
+            }
+            for record in records
+        ]
+        result = validate_cuda_dynamic_mtp_device_generation_policy(
+            missing_stochastic_outcome,
+            expected_minimum_depth=1,
+            expected_maximum_depth=15,
+        )
+        self.assertIn("compact-outcome provenance", result.error or "")
 
         records[5] = counter(
             "device_generation_terminal_verifier_tokens",

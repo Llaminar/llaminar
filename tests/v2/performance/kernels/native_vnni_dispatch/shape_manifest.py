@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Iterable
 
 from .schema import AspectBucket
-from .qwen_release_geometry import qwen_release_geometries
+from .qwen_release_geometry import (
+    qwen_mtp_head_geometries,
+    qwen_release_geometries,
+)
 
 
 MANIFEST_PATH = (
@@ -111,6 +114,35 @@ class NativeVNNIShapeManifest:
             for shape in self.shapes
             if not production_only or shape.role == ShapeRole.PRODUCTION
         )
+
+    def exact_overlay_names_for_dimensions(
+        self,
+        dimensions: Iterable[tuple[int, int]],
+    ) -> tuple[str, ...]:
+        """Resolve ordered geometry dimensions to canonical overlay names.
+
+        The merged release catalog deliberately deduplicates physical matrix
+        dimensions against older reviewed production aliases.  Focused sweep
+        profiles therefore select by geometry and resolve names here instead
+        of assuming that a release-derived display name survived that merge.
+        Missing or ambiguous production overlays are fatal.
+        """
+
+        names = []
+        for n, k in dimensions:
+            matches = tuple(
+                shape
+                for shape in self.shapes
+                if shape.role == ShapeRole.PRODUCTION
+                and shape.exact_overlay
+                and (shape.n, shape.k) == (n, k)
+            )
+            if len(matches) != 1:
+                raise ValueError(
+                    f"geometry {n}x{k} resolves to {len(matches)} exact overlays"
+                )
+            names.append(matches[0].name)
+        return tuple(names)
 
     def partition_names(
         self,
@@ -538,6 +570,7 @@ def main() -> int:
         choices=(
             "all",
             "production",
+            "mtp-head",
             "fast-development",
             "fast-sealed",
             "verifier-development",
@@ -570,6 +603,11 @@ def main() -> int:
             )
         if args.names in {"all", "production"}:
             names = manifest.names(production_only=args.names == "production")
+        elif args.names == "mtp-head":
+            names = manifest.exact_overlay_names_for_dimensions(
+                (geometry.n, geometry.k)
+                for geometry in qwen_mtp_head_geometries()
+            )
         else:
             surface, partition_name = args.names.split("-", maxsplit=1)
             names = manifest.partition_names(

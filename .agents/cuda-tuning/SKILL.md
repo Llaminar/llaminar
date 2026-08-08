@@ -199,7 +199,7 @@ profile. The critical details are: attach to `llaminar2` directly with
 so the launch budget reaches captured inference:
 
 ```bash
-RUNTIME_KERNELS='regex:(buildGrouped|build_active|count_per|cuda_attention|cuda_derive_attention|cuda_gated|cuda_gdn|cuda_q_gate|cuda_short_conv1d|exclusive_scan|float_to_int|fp32_|grouped_|quantize_activations|router_gate|scatter_tokens|shared_expert|softmax_topk|embedding_lookup|fused_|mtpConcat|requestTerminal|cuda_kv|residual_add|rmsnorm|rope_|flash_attention|nativeVnniTC|route_logits|shiftedMTP|ring_append|ring_gather)'
+RUNTIME_KERNELS='regex:(buildGrouped|build_active|count_per|cuda_attention|cuda_derive_attention|cuda_gated|cuda_gdn|cuda_q_gate|cuda_short_conv1d|exclusive_scan|float_to_int|fp32_|grouped_|groupedImma|quantize_activations|router_gate|scatter_tokens|shared_expert|softmax_topk|embedding_lookup|fused_|mtpConcat|requestTerminal|cuda_kv|residual_add|rmsnorm|rope_|flash_attention|nativeVnniTC|route_logits|shiftedMTP|ring_append|ring_gather)'
 
 sudo -E /usr/local/cuda/bin/ncu \
   --target-processes all \
@@ -236,9 +236,12 @@ Choose `--launch-count` above the expected runtime-node count, then verify the
 CSV reached the terminal graph kernels rather than silently truncating at the
 budget. Sum `gpu__time_duration.sum` by exact demangled kernel name and retain
 call counts plus grid/block geometry; aggregate names without geometry can
-hide one pathological shape behind many cheap launches. This first pass uses
-one metric and is for attribution only. It does not replace warmed unprofiled
-Release timing, and it does not certify occupancy or spills.
+hide one pathological shape behind many cheap launches. Inspect the CSV units
+row before summing: NCU auto-scales `gpu__time_duration.sum` and may emit `us`
+for one report and `ms` for another. Normalize every row to one unit rather than
+assuming a fixed scale. This first pass uses one metric and is for attribution
+only. It does not replace warmed unprofiled Release timing, and it does not
+certify occupancy or spills.
 
 If NCU prints `No kernels were profiled`, first run the profiler-attachment
 smoke above, then inspect the report's `Available Kernels`. Do not switch to
@@ -460,9 +463,12 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    model-level parity proves the generated table.
    If the full qwen36 inventory is too large for one pass, use the same staged
    profiles as ROCm: `--profile qwen36-core` for FFN/GDN projections and
-   `--profile qwen36-lm-head` for the LM-head shape. Do not install either
-   staged artifact until the combined model-level parity and benchmark gates
-   have passed.
+   `--profile qwen-mtp-head` for the complete MTP-specific matrix inventory.
+   The latter is not merely an LM-head alias: it resolves every release hidden
+   width into both the hidden/embedding projection `H x 2H` and terminal
+   `248320 x H` family, then covers M=1, grouped M=2..16, and the M31 sentinel
+   across every supported source format. Do not install either staged artifact
+   until the combined model-level parity and benchmark gates have passed.
 3. Use `--profile family-smoke` for a bounded representative training pass before
    a full acceptance refresh. This profile is stratified by format: it runs one
    small sweep per codebook/family, writes per-format partial CSVs, combines them,

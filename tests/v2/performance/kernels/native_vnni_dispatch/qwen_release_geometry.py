@@ -29,6 +29,16 @@ QWEN_RELEASE_CATALOG_PATH = (
     / "qwen35_qwen36_release_models_v1.json"
 )
 
+# These are the two matrix roles introduced specifically by the MTP head.  The
+# sidecar decoder block also executes attention and FFN/MoE matrices, but those
+# reuse the ordinary release-layer geometries already present in the complete
+# catalog.  Keeping this set narrow lets the focused MTP transaction add or
+# refresh its unique evidence without remeasuring every ordinary layer matrix.
+MTP_UNIQUE_MATRIX_PROJECTIONS = frozenset({
+    "mtp_hidden_embedding",
+    "lm_head",
+})
+
 
 class QwenModelKind(str, Enum):
     """Text-backbone feed-forward architecture used by one release."""
@@ -277,4 +287,26 @@ def qwen_release_geometries() -> tuple[QwenReleaseGeometry, ...]:
             uses=tuple(sorted(set(uses))),
         )
         for (n, k), uses in sorted(uses_by_geometry.items())
+    )
+
+
+def qwen_mtp_head_geometries() -> tuple[QwenReleaseGeometry, ...]:
+    """Return every unique matrix geometry introduced by released MTP heads.
+
+    A NextN/MTP sidecar first projects concatenated normalized hidden and token
+    embedding rows through an ``H x 2H`` matrix, then eventually projects its
+    verified hidden rows through the model's ``vocabulary x H`` terminal head.
+    Both matrices run at serial decode and every grouped verifier width.  This
+    filtered inventory therefore provides a focused, additive sweep while the
+    complete release inventory continues to own the sidecar's ordinary
+    attention and FFN/MoE matrices.
+    """
+
+    return tuple(
+        geometry
+        for geometry in qwen_release_geometries()
+        if any(
+            use.projection in MTP_UNIQUE_MATRIX_PROJECTIONS
+            for use in geometry.uses
+        )
     )

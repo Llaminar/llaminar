@@ -182,6 +182,25 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   `2.72/2.890 us` for 256 threads; ISA evidence shows vectorized dwordx4
   loads/stores, 16 VGPRs, 52 logical SGPRs, and zero scratch, spills, LDS,
   barriers, or atomics.
+- The CUDA NativeVNNI grouped WIDE/DIRECT path now publishes its only K
+  partition directly from the weight-reuse CTA. Explicit RN multiply/add
+  operations preserve the former store/load publication boundary byte for byte,
+  while the obsolete publication kernel and partials-workspace dependency are
+  gone. The canonical all-format grouped-verifier integration gate passed in
+  `115.86 s`, covering native formats, FP32/FP16/BF16, LM-head M16, large-K
+  KPAR, MoE projections, and fused SwiGLU against serial rows. On the
+  Qwen3.6-35B IQ3_S terminal head (`248320 x 2048`, M4), Nsight reports one
+  kernel instead of two, 48 registers/thread, zero local loads/stores, and an
+  unchanged `464.0 us` counter-replay producer versus `464.5 us` before fusion;
+  canonical latency remains approximately `414 us` and is therefore neutral.
+- The shared release geometry catalog now exposes 12 unique MTP-specific
+  matrices: `H x 2H` plus `248320 x H` for every distinct Qwen3.5/3.6 hidden
+  width. The turnkey `qwen-mtp-head` profile sweeps all formats and M=1..16,31.
+  A focused Qwen3.6-35B IQ3_S tournament proved all grouped M=2..16 rows byte
+  exact and retained the installed R2/R4/R8 policy. The terminal M1 KPAR
+  challenger was rejected despite a `1.22%` isolated win because changing the
+  serial family would reintroduce grouped reduction overhead; the existing
+  WIDE serial route remains the economical whole-transaction choice.
 
 ## CUDA LLEP Economy
 
@@ -338,6 +357,89 @@ The final linked Release binary repeated the same `19/19` full-tier result and
 Integration tree rebuilt successfully (`792/792` targets), and the device-free
 unit gate passed `591/591` in 139.32 seconds.
 
+The next CUDA1 prefill slice pipelined the causal GDN recurrence instead of
+changing its arithmetic. Two 16-byte-vectorized `cp.async` stages overlap row
+`t+1` Q/K publication with the exact row-`t` recurrence; the measured launch is
+64 threads with a ten-block launch bound. At the production Qwen M=425 shape,
+latency moved from `568.893 us` to `449.331 us` (`1.266x`). Nsight reports 96
+registers/thread, zero spill requests, 41.67% theoretical and 25.94% achieved
+occupancy, 90.91% L2 hit rate, and `8.39` warp cycles per issued instruction.
+The D_K=64/D_K=128 M-totality, captured M=3, M=2/M=4 snapshot, runtime-M
+publication, and unequal-request continuation tests all remain byte exact. The
+matched Release model replay consequently moved `2749.13 -> 2806.76 tok/s`
+prefill (`+2.10%`) while decode remained `190.36 tok/s`; stochastic acceptance
+remained exactly `450/672` (`66.96%`) with zero transaction-validation failures.
+
+CUDA FA2 has a shared capture-time physical K/V tile policy backed by a
+complete 288-cell Release tournament: every released Qwen attention geometry,
+TP=1/2/4/8 where the head split is legal, M=64/128/512, and KV horizons from 64
+through 131072. `TILE_KV=64` won `0/288`; HD128/HD256 remain within `3.149%`
+with the 16-row tile, while HD64 query groups of width three or six select 32.
+The installed generic rule passed all 288 cells with `2.481%` p95 and `3.149%`
+maximum regret. Its device-free totality gate covers 48/64/100/164 KiB shared
+memory ceilings and fail-closed profiling overrides.
+
+The follow-on slice now implements the real byte-exact K/V-context mode and
+its fixed-order device merge. One immutable captured transaction contains the
+direct query-sequence root and an IF-only context body; the live device-owned
+K/V count publishes the CUDA conditional predicate, so neither mode selection
+nor intermediate attention state crosses the host. The capture plan owns the
+maximum persistent partial-output and `(m,l)` workspace envelope, and invalid
+or incomplete geometry fails closed instead of selecting another launch path.
+
+The certified device-adaptive tournament covers 720 model/TP/M/KV domains:
+all listed Qwen 2.5 and Qwen 3.5/3.6 geometries, legal TP=1/2/4/8 splits,
+HD=64/128/256, M=17/32/64/128, and live K/V lengths
+256/512/1024/8192/131072. Mean regret is `0.574%`, p95 is `3.108%`, and maximum
+regret is `5.511%`. The five domains above 5% are all Qwen2.5-0.5B, KV=256
+launch-floor cases; the worst is `62.935 us` versus `59.648 us`, an absolute
+`3.287 us` difference within the explicit `3.5 us` native-conditional budget.
+An HD256 PV8 challenger was also measured and retired: at Qwen3.6-35B TP8,
+M=64, KV=131072 it regressed context execution by approximately `77%` and
+direct execution by approximately `33%` versus PV4.
+
+Nsight Compute on the retained PV4 context kernel reports `4.51 ms`, 128
+registers/thread, 43.78 KiB dynamic shared memory, zero local-memory spilling
+requests, `24.86%` achieved versus `25%` theoretical occupancy, and 11.93
+active warps/SM. Compute and memory-pipe throughput are both `32.91%`; the
+remaining limiter is fixed-tree barrier latency rather than spills or an
+underfilled grid. The policy unit gate passed `15/15`, and the CUDA attention
+integration binary passed `54/54`, including adaptive replay, fixed direct and
+context byte equality, every native K/V format, grouped M=2..16, TP boundaries,
+and TurboQuant-adjacent cache paths.
+
+The linked Release Qwen3.6-35B CUDA1 server cell then passed `20/20` with
+dynamic stochastic MTP depth 1..15 and the full long-context tier. It proved
+seeded stochastic prefix replay, repeated captured prefill replay, three needle
+positions, strict multi-needle JSON, 1,024-token generation, cache reset,
+3,827/4,096 near-boundary context, oversized rejection, clean exit, and full
+VRAM release. Its 3,365 PerfStats records prove complete homogeneous CUDA graph
+capture with no segmented execution and no forbidden intermediate D2H. The
+run also exposed and fixed a harness-only asymmetry: CUDA terminal-ledger
+validation had rejected valid mixed greedy/stochastic compact-outcome records,
+while the ROCm validator already accepted both audited sources and required at
+least one stochastic record. The focused policy regression now enforces that
+same fail-closed rule for CUDA.
+
+The post-FA2 fixed-depth-3 Release control measures `2785.83 tok/s` prefill and
+`214.25 tok/s` decode with `73.18%` stochastic acceptance and zero transaction
+validation failures. The matched no-MTP control is `2805.78 tok/s` prefill, so
+population of the shifted MTP KV state costs only `0.71%`; main-model prefill,
+not the MTP sidecar, owns the remaining throughput gap.
+
+```bash
+env LLAMINAR_E2E_LONG_CONTEXT=1 \
+  LLAMINAR_E2E_LONG_CONTEXT_TIER=full \
+  LLAMINAR_E2E_CONTEXT_LENGTH=4096 \
+  LLAMINAR_E2E_LONG_MAX_TOKENS=1024 \
+  LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS=900 \
+  LLAMINAR_E2E_PERF_STATS=1 \
+  LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING=1 \
+  tests/v2/e2e/server/test_server_e2e.sh \
+  --binary build_v2_release/llaminar2 \
+  --suite '/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf|cuda:0|64|--moe-residency-maintenance off --mtp --mtp-draft-tokens 4 --mtp-min-draft-tokens 1 --mtp-initial-draft-tokens 4 --mtp-max-draft-tokens 15 --mtp-depth-policy dynamic --mtp-depth-window 4 --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1 --mtp-verify-mode speculative-sampling|qwen36-moe-cuda1-dynamic-mtp-long-context|prefill-graph-probe,require-prefill-graph-capture,stochastic-mtp-probe,non-thinking-only'
+```
+
 ### Reproducible ROCm1 SingleDevice Reference
 
 The active ROCm SingleDevice tuning control uses the Qwen3.6-35B-A3B MoE
@@ -483,9 +585,15 @@ CUDA_VISIBLE_DEVICES=0 \
   --conversation --single-turn --no-display-prompt
 ```
 
-On llama.cpp `5788b51`, three runs gave a `155.4 tok/s` decode median and
-`1122.5 tok/s` prefill median. Promotion retains the stricter historical
-`171.81 tok/s` decode target and requires at least `2245 tok/s` prefill.
+The CUDA reference was rebuilt from current llama.cpp master `f9e832c10e94`
+before measurement. Three serial runs produced
+`1488.2/1411.4/1460.4 tok/s` prefill, for a `1460.4 tok/s` median. Three
+fixed-depth-3 MTP runs produced `1250.5/1290.8/1304.8 tok/s`, for a
+`1290.8 tok/s` median; llama.cpp therefore pays an `11.61%` MTP prefill tax on
+this control. Llaminar is `1.92x` faster than the serial control and `2.16x`
+faster than the MTP control while paying only a `0.71%` MTP prefill tax.
+Promotion retains the stricter historical `171.81 tok/s` decode target and
+requires at least `2245 tok/s` prefill.
 
 ### AIME25 HTTP Math And Multi-Turn Gate
 

@@ -1192,8 +1192,8 @@ namespace
                     ? "paired"
                     : "parallel";
             return std::string("imma_") + schedule_name + "_g" +
-                   std::to_string(gateup_columns) +
-                   "__d" + std::to_string(down_columns);
+                   std::to_string(gateup_columns) + "__d" +
+                   std::to_string(down_columns);
         }
     };
 
@@ -1266,6 +1266,7 @@ namespace
         double finalist_margin = 0.05;
         std::string profiler_request_id;
         std::optional<CudaMoEProductionCandidate> profiler_candidate;
+        std::optional<CudaMoEProductionCandidate> proof_candidate;
 
         /** @return true when this process owns one isolated profiler launch. */
         [[nodiscard]] bool profiling() const noexcept
@@ -1638,7 +1639,7 @@ namespace
             << evidence.candidate.id() << ','
             << llaminar2::cuda::moe::kGroupedImmaTileRows << ','
             << evidence.candidate.gateup_columns << ','
-            << llaminar2::cuda::moe::kGroupedImmaTileRows << ','
+            << 16 << ','
             << evidence.candidate.down_columns << ','
             << evidence.gateup_resources.local_memory_bytes_per_thread << ','
             << evidence.down_resources.local_memory_bytes_per_thread << ','
@@ -1863,11 +1864,19 @@ namespace
             throw std::invalid_argument(
                 "CUDA profiler request and exact candidate must be supplied together");
         }
+        if (settings.profiling() && settings.proof_candidate.has_value())
+        {
+            throw std::invalid_argument(
+                "CUDA profiler and focused-proof candidates are mutually exclusive");
+        }
         const std::vector<CudaMoEProductionCandidate> candidates =
             settings.profiling()
                 ? std::vector<CudaMoEProductionCandidate>{
                       *settings.profiler_candidate}
-                : cudaMoEProductionCandidates();
+                : settings.proof_candidate.has_value()
+                      ? std::vector<CudaMoEProductionCandidate>{
+                            *settings.proof_candidate}
+                      : cudaMoEProductionCandidates();
         const int candidate_count = static_cast<int>(candidates.size());
         if (rows <= 8 || device_ordinal < 0)
         {
@@ -2326,11 +2335,22 @@ namespace
         }
     }
 
-    /** Prove all CUDA launch geometries through the shared tournament path. */
+    /**
+     * @brief Prove CUDA launch geometry through the shared production path.
+     *
+     * With no candidate, the complete non-dominated launch family is checked.
+     * Supplying one exact candidate is reserved for a focused regression whose
+     * production identity is already known; setup, graph capture, routing,
+     * serial-row reference, and full-buffer device comparison remain identical
+     * to the exhaustive certificate.
+     */
     void proveCudaProductionCandidateInvariance(
         const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase &routed_case,
         int rows,
-        int device_ordinal)
+        int device_ordinal,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile route_profile =
+            llaminar2::test::native_vnni_dispatch::MoERoutingProfile::Uniform,
+        std::optional<CudaMoEProductionCandidate> proof_candidate = std::nullopt)
     {
         CudaMoEProductionSweepSettings settings{};
         settings.screening_warmups = 0;
@@ -2341,10 +2361,11 @@ namespace
         settings.robust_replays = 1;
         settings.minimum_finalists = 1;
         settings.maximum_finalists = 1;
+        settings.proof_candidate = std::move(proof_candidate);
         runCudaProductionMoERoutedCase(
             routed_case,
             rows,
-            llaminar2::test::native_vnni_dispatch::MoERoutingProfile::Uniform,
+            route_profile,
             device_ordinal,
             settings,
             nullptr,
@@ -3243,6 +3264,59 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvarian
                 *selected, rows, device_ordinal);
         }
     }
+#endif
+}
+
+/**
+ * @brief Regress the staged Qwen 35B metadata path under uneven expert tails.
+ *
+ * IQ2_S gate/up and IQ4_XS down map to execution codebooks 13 and 4. At the
+ * installed 32-column geometry those are the two specializations that stage
+ * immutable scale metadata in shared memory. Power-law routing creates both
+ * full and partial sixteen-row expert tiles, while M=512 is the production
+ * capture bucket used by the fixed benchmark prompt. The selected graph is
+ * compared over its complete output buffer against serial row decode before
+ * the test can pass.
+ */
+TEST(
+    Perf__MoEVerifierPrefill,
+    CUDA_StagedIQ2SIQ4MetadataIsSerialRowByteInvariant)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    const auto candidate =
+        findCudaMoEProductionCandidate("imma_paired_g32__d32");
+    ASSERT_TRUE(candidate.has_value());
+    const auto &cases =
+        llaminar2::test::native_vnni_dispatch::nativeVnniMoERoutedPrefillCases();
+    const auto selected = std::find_if(
+        cases.begin(),
+        cases.end(),
+        [](const auto &routed_case)
+        {
+            return routed_case.hidden_size == 2048 &&
+                   routed_case.routed_expert_width == 512 &&
+                   routed_case.expert_count == 256 &&
+                   routed_case.experts_per_token == 8 &&
+                   routed_case.routed.gate == "IQ2_S" &&
+                   routed_case.routed.up == "IQ2_S" &&
+                   routed_case.routed.down == "IQ4_XS";
+        });
+    ASSERT_NE(selected, cases.end());
+
+    ScopedEnvOverride rowwise_iterations(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
+    proveCudaProductionCandidateInvariance(
+        *selected,
+        /*rows=*/512,
+        /*device_ordinal=*/0,
+        llaminar2::test::native_vnni_dispatch::MoERoutingProfile::PowerLaw,
+        *candidate);
 #endif
 }
 

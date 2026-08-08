@@ -15,6 +15,7 @@ sys.path.insert(0, str(KERNEL_ROOT))
 from native_vnni_dispatch.qwen_release_geometry import (  # noqa: E402
     QWEN_RELEASE_MODELS,
     model_projection_geometries,
+    qwen_mtp_head_geometries,
     qwen_release_geometries,
 )
 from native_vnni_dispatch.shape_manifest import (  # noqa: E402
@@ -134,6 +135,64 @@ class NativeVNNIQwenReleaseGeometryTest(unittest.TestCase):
             "expert_down": (2_048, 512),
             "lm_head": (248_320, 2_048),
         })
+
+    def test_focused_mtp_head_inventory_covers_every_hidden_width(self) -> None:
+        """Every release must contribute Hx2H and vocabulary-by-H evidence."""
+
+        geometries = qwen_mtp_head_geometries()
+        actual_dimensions = {(geometry.n, geometry.k) for geometry in geometries}
+        hidden_sizes = {model.hidden_size for model in QWEN_RELEASE_MODELS}
+
+        self.assertEqual(len(geometries), 12)
+        self.assertEqual(
+            actual_dimensions,
+            {(hidden, 2 * hidden) for hidden in hidden_sizes}
+            | {(248_320, hidden) for hidden in hidden_sizes},
+        )
+        for model in QWEN_RELEASE_MODELS:
+            with self.subTest(release=model.release_id):
+                uses = {
+                    (geometry.n, geometry.k, use.projection)
+                    for geometry in geometries
+                    for use in geometry.uses
+                    if use.release_id == model.release_id
+                }
+                self.assertIn(
+                    (model.hidden_size, 2 * model.hidden_size,
+                     "mtp_hidden_embedding"),
+                    uses,
+                )
+                self.assertIn(
+                    (248_320, model.hidden_size, "lm_head"),
+                    uses,
+                )
+
+    def test_focused_mtp_head_inventory_resolves_to_exact_overlays(self) -> None:
+        """The focused workflow may only emit production exact-overlay names."""
+
+        manifest = load_shape_manifest()
+        resolved_names = manifest.exact_overlay_names_for_dimensions(
+            (geometry.n, geometry.k)
+            for geometry in qwen_mtp_head_geometries()
+        )
+        self.assertEqual(
+            set(resolved_names),
+            {
+                "Qwen35Release_1024x2048",
+                "Qwen35Release_2048x4096",
+                "Qwen35Release_2560x5120",
+                "Qwen35Release_3072x6144",
+                "Qwen35Release_4096x8192",
+                "Qwen35Release_5120x10240",
+                "Qwen35Release_248320x1024",
+                "Qwen35Release_248320x2048",
+                "Qwen35Release_248320x2560",
+                "Qwen35Release_248320x3072",
+                "Qwen35Release_248320x4096",
+                "Qwen36_LM_Head",
+            },
+        )
+        self.assertEqual(len(resolved_names), 12)
 
     def test_release_aliases_collapse_to_geometry_only(self) -> None:
         """Qwen 3.5/3.6 aliases must not duplicate generated dispatch keys."""

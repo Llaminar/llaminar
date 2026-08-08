@@ -926,8 +926,10 @@ namespace llaminar2
             int query_rows,
             void *stream,
             int kv_stride,
-            const int *active_query_rows_device)
+            const int *active_query_rows_device,
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture)
         {
+            (void)prefill_capture;
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
@@ -1017,12 +1019,22 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
             (void)local_n_heads;
             (void)local_n_kv_heads;
+
+            if (execution_policy.prefill_parallel_axis !=
+                attention::AttentionPrefillParallelAxis::QuerySequence)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Unsupported declared prefill parallel axis: "
+                          << attention::attentionPrefillParallelAxisName(
+                                 execution_policy.prefill_parallel_axis));
+                return false;
+            }
 
             if (!Q || !K || !V || !output)
             {
@@ -2304,7 +2316,8 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             // TODO: Implement FP16 tensor path
             LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>::compute_tensor] Not implemented");
@@ -2328,6 +2341,7 @@ namespace llaminar2
             (void)local_n_heads;
             (void)local_n_kv_heads;
             (void)gqa_n_rep;
+            (void)execution_policy;
             return false;
         }
 
@@ -2658,7 +2672,8 @@ namespace llaminar2
             int head_start,
             int local_n_heads,
             int local_n_kv_heads,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>::compute_tensor] Not implemented for MI50");
             (void)Q;
@@ -2681,6 +2696,7 @@ namespace llaminar2
             (void)local_n_heads;
             (void)local_n_kv_heads;
             (void)gqa_n_rep;
+            (void)execution_policy;
             return false;
         }
 

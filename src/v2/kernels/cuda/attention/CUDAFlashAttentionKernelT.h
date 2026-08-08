@@ -22,11 +22,14 @@
 #include "../../../utils/MPIContext.h"
 #include "../../attention/AttentionDeviceParams.h"
 
+#include <memory>
+
 namespace llaminar2
 {
     // Forward declarations for IWorkspaceConsumer
     class DeviceWorkspaceManager;
     struct WorkspaceRequirements;
+    class CUDAActiveCaptureConditional;
 
     namespace cuda
     {
@@ -304,7 +307,8 @@ namespace llaminar2
                 int query_rows,
                 void *stream,
                 int kv_stride,
-                const int *active_query_rows_device = nullptr) override;
+                const int *active_query_rows_device = nullptr,
+                const attention::AttentionPrefillCaptureGeometry &prefill_capture = {}) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -375,7 +379,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             /**
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
@@ -544,6 +549,17 @@ namespace llaminar2
             bool dynamic_attn_device_derived_ = false;
 
             /**
+             * Graph-construction-only adaptive prefill transaction.
+             *
+             * The device-parameter producer opens and publishes this transaction;
+             * `compute_tensor()` moves it into one RAII-scoped call while
+             * appending FA2 branch bodies. It owns no CUDA graph resource and is
+             * destroyed on every success or failure exit from that call.
+             */
+            std::unique_ptr<CUDAActiveCaptureConditional>
+                pending_prefill_conditional_;
+
+            /**
              * @brief Enqueue explicit geometry into DEVICE_PARAMS on @p stream.
              *
              * The operation is a tiny graph-capturable CUDA kernel. It never
@@ -659,7 +675,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -796,7 +813,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface

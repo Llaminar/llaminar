@@ -7,7 +7,7 @@
  *
  * Algorithms implemented:
  * - Flash Attention 2 with Pipelined Prefetching: Optimized for Ampere (SM >= 8.0)
- *   - Uses cp.async for overlapped global->shared memory transfers
+ *   - Uses dedicated producer warps to overlap global-to-shared K/V loads
  *   - Double-buffered shared memory for K/V tiles
  *   - Producer/consumer warp specialization
  *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
@@ -26,9 +26,10 @@
 #include <cfloat>
 #include <cstdio>
 #include <atomic>
-#include <atomic>
 
+#include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../attention/AttentionDeviceParams.h"
+#include "CUDAFlashAttentionLaunchPolicy.h"
 #include "utils/DebugEnv.h"
 
 // WMMA namespace for Tensor Core operations
@@ -49,14 +50,15 @@ namespace
     constexpr int WMMA_K = 16;
 
     // =========================================================================
-    // Flash Attention 2 - Pipelined Prefill with cp.async (Ampere, SM >= 8.0)
+    // Flash Attention 2 - Pipelined Prefill (Ampere, SM >= 8.0)
     // =========================================================================
     //
-    // This implements Flash Attention 2 (Dao et al., 2023) with software pipelining
-    // optimizations enabled by Ampere's cp.async instruction.
+    // This implements Flash Attention 2 (Dao et al., 2023) with software
+    // pipelining. Dedicated producer warps populate the next shared K/V stage
+    // while consumer warps execute QK, softmax, and P@V on the current stage.
     //
     // Key optimizations:
-    //   1. cp.async for asynchronous global->shared memory transfers
+    //   1. Producer/consumer overlap for global-to-shared K/V transfers
     //   2. Double-buffered K/V tiles to overlap load and compute
     //   3. Producer/consumer warp specialization
     //   4. WMMA (16x16x16) for Tensor Core Q @ K^T computation
@@ -67,7 +69,7 @@ namespace
     //   Stage 1: Load K[i+1], V[i+1] while computing on K[i], V[i]
     //
     // Warp roles (configurable via template):
-    //   Warps 0-1: Producers - async load K/V tiles via cp.async
+    //   Warps 0-1: Producers - load the next K/V tile into shared memory
     //   Warps 2+:  Consumers - WMMA compute + online softmax
     //
     // =========================================================================
@@ -105,6 +107,7 @@ namespace
     {
         int sm_major = 0;
         int sm_minor = 0;
+        int sm_count = 0;
         int max_smem_optin = 0; // Max dynamic shared memory with opt-in
         bool initialized = false;
     };
@@ -127,12 +130,48 @@ namespace
             cudaGetDeviceProperties(&prop, device);
             cfg.sm_major = prop.major;
             cfg.sm_minor = prop.minor;
+            cfg.sm_count = prop.multiProcessorCount;
             cudaDeviceGetAttribute(&cfg.max_smem_optin,
                                    cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
             cfg.initialized = true;
         }
         return cfg;
     }
+
+#if CUDART_VERSION >= 12030
+    /**
+     * @brief Publish only the non-default side of an adaptive prefill decision.
+     *
+     * `CUDAActiveCaptureConditional` creates every handle with a zero launch
+     * default and `cudaGraphCondAssignDefault`. CUDA therefore restores the
+     * short-prefix decision before each graph replay. Calling
+     * `cudaGraphSetConditional(..., 0)` again from the producer needlessly
+     * enters the device graph runtime on the most latency-sensitive path. The
+     * producer only has to override that replay-local default when the live K/V
+     * span selects the context-parallel body.
+     *
+     * This is not a sticky-state optimization: the graph runtime resets the
+     * handle for every launch, so a long-prefix replay followed by a short-prefix
+     * replay cannot inherit the earlier non-zero value.
+     *
+     * @param condition Opaque native conditional handle, or zero when the
+     *        enclosing graph has no adaptive branch.
+     * @param kv_len Device-owned live K/V length for this replay.
+     * @param direct_kv_limit Inclusive direct-query K/V limit in tokens.
+     */
+    __device__ __forceinline__ void publish_context_condition_if_non_default(
+        unsigned long long condition,
+        int kv_len,
+        int direct_kv_limit)
+    {
+        if (condition != 0 && kv_len > direct_kv_limit)
+        {
+            cudaGraphSetConditional(
+                static_cast<cudaGraphConditionalHandle>(condition),
+                /*value=*/1u);
+        }
+    }
+#endif
 
     /**
      * @brief Derive graph-captured attention params from live KV cache count.
@@ -148,7 +187,9 @@ namespace
         int seq_len,
         int query_rows,
         int kv_stride,
-        const int *__restrict__ active_query_rows_device)
+        const int *__restrict__ active_query_rows_device,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -175,6 +216,13 @@ namespace
             out[0].kv_stride = max(kv_len, kv_stride);
             out[0].position_offset = max(0, kv_len - logical_seq_len);
             out[0].mask_stride = kv_len;
+#if CUDART_VERSION >= 12030
+            if (row == 0)
+                publish_context_condition_if_non_default(
+                    prefill_branch_condition,
+                    kv_len,
+                    direct_kv_limit);
+#endif
             return;
         }
 
@@ -194,6 +242,13 @@ namespace
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
+#if CUDART_VERSION >= 12030
+        if (row == 0)
+            publish_context_condition_if_non_default(
+                prefill_branch_condition,
+                kv_len,
+                direct_kv_limit);
+#endif
     }
 
     /**
@@ -214,7 +269,9 @@ namespace
         int kv_len,
         int kv_stride,
         int position_offset,
-        int query_rows)
+        int query_rows,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || row >= query_rows)
@@ -225,6 +282,13 @@ namespace
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
+#if CUDART_VERSION >= 12030
+        if (row == 0)
+            publish_context_condition_if_non_default(
+                prefill_branch_condition,
+                kv_len,
+                direct_kv_limit);
+#endif
     }
 
     /**
@@ -267,20 +331,29 @@ namespace
     inline size_t computeFA2SmemSize(int tile_q, int tile_kv, int head_dim,
                                      int qkv_pad, int scores_pad)
     {
-        const int qkv_stride = head_dim + qkv_pad;
-        const int scores_ld = tile_kv + scores_pad;
-        size_t q_size = tile_q * qkv_stride * sizeof(half);
-        size_t kv_size = FA2_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
-        size_t sc_size = tile_q * scores_ld * sizeof(float);
-        return q_size + kv_size + sc_size;
+        const int query_warp_groups = tile_q / WMMA_M;
+        if (qkv_pad !=
+                llaminar2::cuda::fa2_policy::kFA2QKVSharedMemoryPad ||
+            scores_pad !=
+                llaminar2::cuda::fa2_policy::kFA2ScoreSharedMemoryPad ||
+            FA2_NUM_STAGES !=
+                llaminar2::cuda::fa2_policy::kFA2KVSharedMemoryStages)
+        {
+            return 0;
+        }
+        return llaminar2::cuda::fa2_policy::fa2DynamicSharedMemoryBytes(
+            head_dim,
+            query_warp_groups,
+            tile_kv);
     }
 
     /**
      * @brief Compute FA2 kernel configuration based on head_dim
      *
-     * Search strategy (preserving bank-conflict-free padding):
-     *   1. Try target tile_q with tile_kv=64,48,32 and full padding (qkv=8, scores=16)
-     *   2. Only drop padding as last resort if no tile_kv fits with padding
+     * Apply the shared capture-time physical K/V tile policy while preserving
+     * the mandatory bank-conflict padding and exact query geometry. A geometry
+     * that does not fit is invalid; callers fail capture rather than silently
+     * changing padding, arithmetic, or work ownership.
      *
      * QKV padding is critical: stride(head_dim=128)=256B → 32-way bank conflict.
      * With qkv_pad=8: stride=272B → 4-way conflict (8x better).
@@ -290,164 +363,144 @@ namespace
      * Configurations:
      *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads
      *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads
-     *   - head_dim <= 256: tile_q=32, 2 consumers, 128 threads
+     *   - head_dim <= 256: tile_q=16 or 32, 1 or 2 Q groups, with P@V
+     *                      striping selected independently
      */
     struct FA2KernelConfig
     {
         int tile_q;
         int tile_kv;
-        int num_consumer_warps;
+        int num_q_warp_groups;
+        int pv_warps_per_q_group;
         int block_size;
         size_t smem_size;
         int qkv_pad;
         int scores_pad;
+
+        /**
+         * @brief Return the number of consumer warps in one thread block.
+         *
+         * A Q-warp group owns one 16-row WMMA score tile.  Additional P@V
+         * warps in that group reuse those scores while owning disjoint output
+         * dimension stripes.  The split lowers each thread's live accumulator
+         * footprint without duplicating QK work or introducing multi-writer
+         * output reductions.
+         */
+        [[nodiscard]] int consumerWarps() const
+        {
+            return num_q_warp_groups * pv_warps_per_q_group;
+        }
     };
 
-    inline FA2KernelConfig computeFA2Config(int head_dim, int max_smem)
+    inline FA2KernelConfig computeFA2Config(
+        int head_dim,
+        int max_smem,
+        int selected_q_warp_groups)
     {
-        FA2KernelConfig cfg;
+        FA2KernelConfig cfg{};
 
-        // Target tile_q and consumer warps based on head_dim
-        int target_tile_q;
-        int target_consumer_warps;
-        if (head_dim <= 64)
-        {
-            target_tile_q = 96; // 6 * 16
-            target_consumer_warps = 6;
-        }
-        else if (head_dim <= 128)
-        {
-            target_tile_q = 64; // 4 * 16
-            target_consumer_warps = 4;
-        }
-        else
-        {
-            target_tile_q = 32; // 2 * 16
-            target_consumer_warps = 2;
-        }
+        // Query grouping was selected once from immutable launch geometry.
+        // Every grouping retains the same per-row QK, online-softmax, and P@V
+        // arithmetic; only the number of independent rows owned by a block
+        // changes.
+        const int target_q_warp_groups = selected_q_warp_groups;
+        const int target_tile_q = target_q_warp_groups * WMMA_M;
 
         // Check for env-var tile_kv override (for parameter sweeps)
         const int forced_tile_kv = llaminar2::debugEnv().attention.cuda_fa2_tile_kv;
-
-        // tile_kv candidates: must be multiple of WMMA_N=16.
-        // Occupancy-aware selection: prefer tile_kv that maximizes blocks/SM
-        // (computed via max_smem / smem_per_block), breaking ties by larger
-        // tile_kv (fewer loop iterations). This is critical because shared
-        // memory often limits to 1 block/SM with large tiles; smaller tiles
-        // allow 2+ concurrent blocks and dramatically reduce barrier and
-        // memory-latency stalls via warp-level parallelism.
-        const int tile_kv_options[] = {64, 32, 16};
-        const int num_tile_kv_options = forced_tile_kv > 0 ? 1 : 3;
-
-        // Evaluate all candidates, pick highest occupancy then largest tile_kv
-        int best_tkv = 0;
-        size_t best_smem = 0;
-        int best_blocks_per_sm = 0;
-        bool found = false;
-
-        for (int ti = 0; ti < num_tile_kv_options; ti++)
+        if (forced_tile_kv > 0 &&
+            forced_tile_kv != 16 &&
+            forced_tile_kv != 32 &&
+            forced_tile_kv != 64)
         {
-            int tkv = forced_tile_kv > 0 ? forced_tile_kv : tile_kv_options[ti];
-            size_t smem = computeFA2SmemSize(target_tile_q, tkv,
-                                             head_dim, FA2_QKV_PAD, FA2_SCORES_LD_PAD);
-            if ((int)smem <= max_smem)
-            {
-                int blocks_per_sm = max_smem / (int)smem;
-                if (blocks_per_sm > best_blocks_per_sm ||
-                    (blocks_per_sm == best_blocks_per_sm && tkv > best_tkv))
-                {
-                    best_tkv = tkv;
-                    best_smem = smem;
-                    best_blocks_per_sm = blocks_per_sm;
-                }
-            }
+            return cfg;
         }
 
-        if (best_tkv > 0)
+        const llaminar2::cuda::fa2_policy::FA2KVTileGeometry tile_geometry{
+            .head_dim = head_dim,
+            .query_warp_groups = target_q_warp_groups,
+            .max_dynamic_smem = static_cast<std::size_t>(max_smem),
+        };
+        const int selected_tile_kv =
+            llaminar2::cuda::fa2_policy::selectFA2KVTile(
+                tile_geometry,
+                forced_tile_kv);
+
+        if (selected_tile_kv > 0)
         {
             cfg.tile_q = target_tile_q;
-            cfg.tile_kv = best_tkv;
-            cfg.num_consumer_warps = target_consumer_warps;
+            cfg.tile_kv = selected_tile_kv;
+            cfg.num_q_warp_groups = target_q_warp_groups;
             cfg.qkv_pad = FA2_QKV_PAD;
             cfg.scores_pad = FA2_SCORES_LD_PAD;
-            cfg.smem_size = best_smem;
-            found = true;
+            cfg.smem_size = computeFA2SmemSize(
+                target_tile_q,
+                selected_tile_kv,
+                head_dim,
+                FA2_QKV_PAD,
+                FA2_SCORES_LD_PAD);
         }
 
-        if (!found)
+        if (selected_tile_kv == 0)
+            return cfg;
+
+        cfg.pv_warps_per_q_group =
+            head_dim > 128
+                ? llaminar2::debugEnv().attention.cuda_fa2_hd256_pv_warps
+                : 1;
+        if (!llaminar2::cuda::fa2_policy::isCompiledFA2PVWarpGeometry(
+                head_dim,
+                cfg.pv_warps_per_q_group))
         {
-            // Last resort: drop padding entirely to fit target tile_q
-            int tkv = forced_tile_kv > 0 ? forced_tile_kv : 32;
-            size_t smem = computeFA2SmemSize(target_tile_q, tkv, head_dim, 0, 0);
-            if ((int)smem <= max_smem)
-            {
-                cfg.tile_q = target_tile_q;
-                cfg.tile_kv = tkv;
-                cfg.num_consumer_warps = target_consumer_warps;
-                cfg.qkv_pad = 0;
-                cfg.scores_pad = 0;
-                cfg.smem_size = smem;
-                found = true;
-            }
+            return {};
         }
-
-        if (!found)
-        {
-            // Even target tile_q doesn't fit — find largest that does
-            cfg.qkv_pad = FA2_QKV_PAD;
-            cfg.scores_pad = FA2_SCORES_LD_PAD;
-            cfg.tile_kv = 32;
-            cfg.tile_q = 32; // minimum
-            for (int q : {128, 96, 64, 32})
-            {
-                size_t smem = computeFA2SmemSize(q, 32, head_dim,
-                                                 FA2_QKV_PAD, FA2_SCORES_LD_PAD);
-                if ((int)smem <= max_smem)
-                {
-                    cfg.tile_q = q;
-                    break;
-                }
-            }
-            cfg.num_consumer_warps = cfg.tile_q / 16;
-            if (cfg.num_consumer_warps < 2)
-                cfg.num_consumer_warps = 2;
-            if (cfg.num_consumer_warps > 6)
-                cfg.num_consumer_warps = 6;
-            cfg.smem_size = computeFA2SmemSize(cfg.tile_q, cfg.tile_kv,
-                                               head_dim, cfg.qkv_pad, cfg.scores_pad);
-        }
-
-        cfg.block_size = (FA2_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
+        cfg.block_size = (FA2_PRODUCER_WARPS + cfg.consumerWarps()) * WARP_SIZE;
         return cfg;
     }
 
     /**
      * @brief Flash Attention 2 kernel with pipelined prefetching (Ampere, SM >= 8.0)
      *
-     * Uses cp.async for overlapped memory transfers with computation.
-     * Double-buffered shared memory for K/V tiles.
-     * Producer/consumer warp specialization with WMMA Tensor Core acceleration.
+     * Uses producer/consumer warp specialization to overlap K/V loads with
+     * computation, double-buffered shared memory, and WMMA Tensor Core QK.
      *
      * Template parameters:
-     *   NUM_CONSUMER_WARPS: Number of consumer warps (6 for head_dim=64, 4 for head_dim=128, 2 for head_dim=256)
+     *   MAX_Q_WARP_GROUPS: Maximum independent 16-row WMMA score groups
+     *                      represented by this canonical arithmetic body (6
+     *                      for head_dim=64, 4 for head_dim=128, and 2 for
+     *                      head_dim=256). Capture may launch fewer consumer
+     *                      warps and a smaller runtime tile_q; missing groups
+     *                      simply do not exist in that CTA.
+     *   PV_WARPS_PER_Q_GROUP: Number of P@V warps sharing each score group.
+     *                         Values greater than one divide HEAD_DIM into
+     *                         disjoint stripes, reducing accumulator registers
+     *                         while retaining one QK producer and one output
+     *                         writer per element.
      *   HEAD_DIM: Compile-time head dimension (64, 128, or 256). Critical for enabling
      *             full unrolling of the P@V accumulation loop and keeping O_acc in
      *             registers. Without this, dims_per_lane is runtime → O_acc spills
      *             to local memory → 10-20x performance loss.
-     *   TILE_KV: Compile-time KV tile size (32 or 64). Enables full unrolling of
+     *   TILE_KV: Compile-time KV tile size (16, 32, or 64). Enables full unrolling of
      *            the P@V outer (j) loop over KV positions, allowing the compiler to
      *            interleave V loads with FMAs. Also removes the warp-divergent
      *            masking branch from the P@V hot loop.
      *
-     * Runtime parameters tile_q and tile_kv must be consistent with NUM_CONSUMER_WARPS:
-     *   - tile_q should be NUM_CONSUMER_WARPS * 16 (WMMA_M)
-     *   KV_FP16: When true, K/V pointers are const half* (FP16) — loaded via
-     *            cp.async directly into shared memory with no register staging.
+     * Runtime `tile_q` may represent any positive group count through
+     * MAX_Q_WARP_GROUPS. The launch block contains producer warps plus exactly
+     * the active consumer warps, so narrow geometry does not carry idle
+     * threads while every row executes one canonical compiled instruction body.
+     *   KV_FP16: When true, K/V pointers are const half* (FP16) and producer
+     *            warps copy them directly into shared memory.
      *            When false, K/V are const float* — converted to FP16 per element.
      *            FP16 path eliminates the FP16→FP32→FP16 round-trip when KV cache
      *            is already FP16, roughly halving K/V global memory bandwidth.
      */
-    template <int NUM_CONSUMER_WARPS, int HEAD_DIM, int TILE_KV, bool KV_FP16 = false>
+    template <int MAX_Q_WARP_GROUPS,
+              int PV_WARPS_PER_Q_GROUP,
+              int HEAD_DIM,
+              int TILE_KV,
+              bool KV_FP16 = false,
+              bool WRITE_CONTEXT_PARTIAL = false>
     __global__ void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
@@ -470,7 +523,14 @@ namespace
         int qkv_pad,
         int scores_pad,
         int head_start = 0,
-        int gqa_n_rep = 0)
+        int gqa_n_rep = 0,
+        float *__restrict__ O_partial = nullptr,
+        float *__restrict__ m_partial = nullptr,
+        float *__restrict__ l_partial = nullptr,
+        int context_partition_size = 0,
+        int max_context_partitions = 0,
+        int device_direct_partition_limit = 0,
+        int explicit_context_partition = -1)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -485,9 +545,35 @@ namespace
             mask_stride = device_params->mask_stride;
         }
 
+        if constexpr (!WRITE_CONTEXT_PARTIAL)
+        {
+            /*
+             * An adaptive transaction launches the ordinary lean query kernel
+             * as its first captured node. The positive partition limit marks
+             * that use and gates the whole grid from device-owned live K/V
+             * length. Ordinary query execution passes zero and has no mode
+             * decision. This keeps context-publication code out of the direct
+             * specialization's register allocation and arithmetic path.
+             */
+            if (device_direct_partition_limit > 0)
+            {
+                const int live_partitions = min(
+                    max_context_partitions,
+                    max(
+                        1,
+                        (kv_len_runtime + context_partition_size - 1) /
+                            context_partition_size));
+                if (live_partitions > device_direct_partition_limit)
+                    return;
+            }
+        }
+
         // Block/thread indexing
         const int batch_idx = blockIdx.z;
-        const int head_idx = blockIdx.x;
+        const int flattened_head_partition = blockIdx.x;
+        const int head_idx = WRITE_CONTEXT_PARTIAL
+                                 ? flattened_head_partition % n_heads
+                                 : flattened_head_partition;
         const int q_tile_idx = blockIdx.y;
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int lane_id = threadIdx.x % WARP_SIZE;
@@ -504,11 +590,89 @@ namespace
         if (q_block_start >= seq_len)
             return;
 
+        /*
+         * Context execution uses a bounded persistent grid. A physical slot
+         * walks a strided subset of only the live canonical partitions; graph
+         * capacity therefore never turns into a grid of empty CTAs. The
+         * ordered-node diagnostic supplies one explicit partition and executes
+         * at most that one item. Every decision is uniform within the CTA.
+         */
+        int first_context_partition = 0;
+        int context_partition_stride = 1;
+        int live_context_partitions = 1;
+        bool publish_single_partition_output = false;
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            live_context_partitions = min(
+                max_context_partitions,
+                max(
+                    1,
+                    (kv_len_runtime + context_partition_size - 1) /
+                        context_partition_size));
+            /*
+             * A one-partition context phase already owns the complete online-
+             * softmax tuple and can normalize it directly. That common case
+             * needs no extra query node. Wider direct windows are owned by the
+             * separately specialized query node, so this entire grid retires
+             * uniformly and output ownership remains mutually exclusive.
+             */
+            publish_single_partition_output =
+                device_direct_partition_limit == 1 &&
+                live_context_partitions == 1;
+            if (device_direct_partition_limit > 1 &&
+                live_context_partitions <= device_direct_partition_limit)
+            {
+                return;
+            }
+
+            if (explicit_context_partition >= 0)
+            {
+                first_context_partition = explicit_context_partition;
+                context_partition_stride = max_context_partitions;
+            }
+            else
+            {
+                first_context_partition =
+                    flattened_head_partition / n_heads;
+                context_partition_stride =
+                    static_cast<int>(gridDim.x) / n_heads;
+            }
+            if (first_context_partition >= live_context_partitions ||
+                context_partition_stride <= 0)
+            {
+                return;
+            }
+        }
+
         // Warp role: producer (warps 0-1) or consumer (warps 2+)
         // Use template parameter for consumer warp count
         const bool is_producer = (warp_id < FA2_PRODUCER_WARPS);
+        constexpr int MAX_CONSUMER_WARPS =
+            MAX_Q_WARP_GROUPS * PV_WARPS_PER_Q_GROUP;
+        static_assert(PV_WARPS_PER_Q_GROUP == 1 ||
+                          PV_WARPS_PER_Q_GROUP == 2 ||
+                          PV_WARPS_PER_Q_GROUP == 4,
+                      "FA2 P@V warp striping supports 1, 2, or 4 warps per Q group");
+        static_assert(HEAD_DIM % (2 * PV_WARPS_PER_Q_GROUP) == 0,
+                      "Each P@V lane must own an integral output-dimension stripe");
+        static_assert(
+            llaminar2::cuda::fa2_policy::kFA2CanonicalContextPartitionKeys %
+                    TILE_KV ==
+                0,
+            "Every physical K/V tile must divide the canonical context partition");
+
         const int consumer_warp_id = warp_id - FA2_PRODUCER_WARPS;
-        const bool is_active_consumer = (!is_producer && consumer_warp_id >= 0 && consumer_warp_id < NUM_CONSUMER_WARPS);
+        const bool is_active_consumer =
+            !is_producer && consumer_warp_id >= 0 &&
+            consumer_warp_id < MAX_CONSUMER_WARPS;
+        const int q_warp_group = is_active_consumer
+                                     ? consumer_warp_id / PV_WARPS_PER_Q_GROUP
+                                     : -1;
+        const int pv_warp_in_group = is_active_consumer
+                                         ? consumer_warp_id % PV_WARPS_PER_Q_GROUP
+                                         : -1;
+        const bool owns_score_tile =
+            is_active_consumer && pv_warp_in_group == 0;
 
         // Shared memory layout with double buffering:
         // Buffer 0: K_tile[tile_kv, head_dim], V_tile[tile_kv, head_dim]
@@ -535,16 +699,19 @@ namespace
             return KV_buffers + stage * 2 * kv_tile_size + kv_tile_size;
         };
 
-        // Consumer warps: warp-cooperative per-row accumulators
-        // 2 lanes per Q row: lanes 0-15 handle dims [0, head_dim/2),
-        //                    lanes 16-31 handle dims [head_dim/2, head_dim)
-        // This halves register pressure (O_acc[64] vs [128]) and doubles
-        // throughput of the P@V accumulation loop.
+        // Consumer warps: warp-cooperative per-row accumulators.  Every warp
+        // contributes two lanes per Q row.  Multiple warps in one Q group own
+        // adjacent, non-overlapping dimension stripes while sharing the exact
+        // score tile emitted by the group's first warp.  Consequently each
+        // output element retains the historical serial j accumulation order,
+        // but HD256 no longer requires 128 live FP32 accumulators per thread.
         const int q_tile_rows = min(tile_q, seq_len - q_block_start);
         const int row_in_warp = lane_id & (WMMA_M - 1); // lane_id % 16
-        const int dim_half = lane_id >> 4;              // 0 for lanes 0-15, 1 for 16-31
+        const int lane_pair_index = lane_id >> 4;       // 0 for lanes 0-15, 1 for 16-31
+        const int dim_partition =
+            pv_warp_in_group * 2 + lane_pair_index;
         const int my_consumer_q_row = is_active_consumer
-                                          ? q_block_start + consumer_warp_id * WMMA_M + row_in_warp
+                                          ? q_block_start + q_warp_group * WMMA_M + row_in_warp
                                           : -1;
         const bool owns_row = (my_consumer_q_row >= 0 &&
                                my_consumer_q_row < seq_len &&
@@ -553,20 +720,11 @@ namespace
         // O_acc sized at compile-time HEAD_DIM to keep in registers.
         // active_dims_per_lane uses runtime head_dim for correct bounds
         // when head_dim < HEAD_DIM (e.g., head_dim=32 with HEAD_DIM=64).
-        constexpr int dims_per_lane = HEAD_DIM >> 1;
-        const int active_dims_per_lane = head_dim >> 1;
-        const int dim_start = dim_half * active_dims_per_lane;
-        float O_acc[dims_per_lane];
-        float m_i = -FLT_MAX;
-        float l_i = 0.0f;
-
-        if (owns_row)
-        {
-#pragma unroll
-            for (int d = 0; d < dims_per_lane; d++)
-                O_acc[d] = 0.0f;
-        }
-
+        constexpr int dims_per_lane =
+            HEAD_DIM / (2 * PV_WARPS_PER_Q_GROUP);
+        const int active_dims_per_lane =
+            head_dim / (2 * PV_WARPS_PER_Q_GROUP);
+        const int dim_start = dim_partition * active_dims_per_lane;
         // Pointers for this batch/head
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
 
@@ -584,15 +742,52 @@ namespace
             Q_tile_fp16[local_row * smem_stride + d] = __float2half(val);
         }
 
-        const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
+        for (int context_partition = first_context_partition;
+             context_partition < live_context_partitions;
+             context_partition += context_partition_stride)
+        {
+            float O_acc[dims_per_lane];
+            float m_i = -FLT_MAX;
+            float l_i = 0.0f;
+
+            // Direct execution merges each canonical partition into the output
+            // row as unnormalized private scratch. Each thread owns disjoint
+            // dimensions, while every P@V stripe reconstructs the same scalar
+            // merge state. Context execution resets this state for each exact
+            // canonical partition owned by the persistent physical slot.
+            float merged_m = -FLT_MAX;
+            float merged_l = 0.0f;
+
+            if (owns_row)
+            {
+#pragma unroll
+                for (int d = 0; d < dims_per_lane; d++)
+                    O_acc[d] = 0.0f;
+            }
+
+        /*
+         * Context publication owns one immutable canonical K/V interval. The
+         * direct specialization scans the complete live span and merges those
+         * same canonical intervals before normalizing the output.
+         */
+        const int kv_partition_begin = WRITE_CONTEXT_PARTIAL
+                                           ? context_partition * context_partition_size
+                                           : 0;
+        const int kv_partition_end = WRITE_CONTEXT_PARTIAL
+                                         ? min(kv_partition_begin + context_partition_size,
+                                               kv_len_runtime)
+                                         : kv_len_runtime;
+        const int partition_kv_len = max(0, kv_partition_end - kv_partition_begin);
+        const int num_kv_tiles =
+            (partition_kv_len + tile_kv - 1) / tile_kv;
 
         // =====================================================================
         // Pipeline prologue: Start loading first tile(s)
         // =====================================================================
-        if (is_producer)
+        if (is_producer && num_kv_tiles > 0)
         {
-            const int kv_start_0 = 0;
-            const int kv_end_0 = min(tile_kv, kv_len_runtime);
+            const int kv_start_0 = kv_partition_begin;
+            const int kv_end_0 = min(kv_start_0 + tile_kv, kv_partition_end);
             const int actual_len_0 = kv_end_0 - kv_start_0;
 
             half *K_dst_0 = get_K_tile(0);
@@ -649,14 +844,14 @@ namespace
             const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
-            const int kv_start = kv_tile_iter * tile_kv;
-            const int kv_end_tile = min(kv_start + tile_kv, kv_len_runtime);
+            const int kv_start = kv_partition_begin + kv_tile_iter * tile_kv;
+            const int kv_end_tile = min(kv_start + tile_kv, kv_partition_end);
             const int actual_tile_kv_len = kv_end_tile - kv_start;
 
             // Early exit for causal
             if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset_runtime)
             {
-                continue;
+                break;
             }
 
             // Get current buffers
@@ -668,8 +863,10 @@ namespace
             // ----------------------------------------------------------------
             if (is_producer && kv_tile_iter + 1 < num_kv_tiles)
             {
-                const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end = min(next_kv_start + tile_kv, kv_len_runtime);
+                const int next_kv_start =
+                    kv_partition_begin + (kv_tile_iter + 1) * tile_kv;
+                const int next_kv_end =
+                    min(next_kv_start + tile_kv, kv_partition_end);
                 const int next_actual_len = next_kv_end - next_kv_start;
 
                 half *K_dst = get_K_tile(next_stage);
@@ -715,9 +912,9 @@ namespace
             // ----------------------------------------------------------------
             // CONSUMER WARPS: Compute Q @ K^T using WMMA
             // ----------------------------------------------------------------
-            if (is_active_consumer)
+            if (owns_score_tile)
             {
-                const int warp_q_start = consumer_warp_id * WMMA_M;
+                const int warp_q_start = q_warp_group * WMMA_M;
 
                 if (warp_q_start < q_tile_rows)
                 {
@@ -746,24 +943,22 @@ namespace
             __syncthreads();
 
             // ----------------------------------------------------------------
-            // CONSUMER WARPS: Apply softmax and accumulate P @ V
-            // Warp-cooperative: 2 lanes per row, primary (dim_half=0) does
-            // masking writes, then both lanes accumulate their dim half.
+            // CONSUMER WARPS: Apply softmax and accumulate P @ V.
             //
-            // CRITICAL: __syncwarp() and __shfl_sync() are placed at the
-            // is_active_consumer level (NOT inside owns_row) so that all 32
-            // lanes of the consumer warp participate. When the last Q tile
-            // has fewer rows than tile_q, some lanes have owns_row=false;
-            // placing warp-collective ops inside owns_row would deadlock.
+            // Exactly one warp in each Q group owns masking/scaling writes.
+            // Every P@V stripe must consume those exact published FP32 bytes;
+            // independently reconstructing the value changes the canonical
+            // partition merge by one or more ULPs under CUDA fast math. A full
+            // CTA barrier is retained because the named consumer-only barrier
+            // is slower on GA102 and the producer warps must join the later
+            // shared-stage reuse edge in either case.
             // ----------------------------------------------------------------
-            if (is_active_consumer)
+            if (owns_score_tile)
             {
-                float m_ij = -FLT_MAX;
-
-                // Only primary lane (dim_half==0) of rows that exist writes masking
-                if (owns_row && dim_half == 0)
+                if (owns_row && lane_pair_index == 0)
                 {
-                    const int local_q_row = consumer_warp_id * WMMA_M + row_in_warp;
+                    const int local_q_row =
+                        q_warp_group * WMMA_M + row_in_warp;
                     float *my_scores = scores + local_q_row * scores_ld;
 
                     for (int j = 0; j < actual_tile_kv_len; j++)
@@ -771,219 +966,509 @@ namespace
                         const int kv_pos = kv_start + j;
                         bool masked = false;
 
-                        if (causal && kv_pos > my_consumer_q_row + position_offset_runtime)
+                        if (causal &&
+                            kv_pos > my_consumer_q_row +
+                                         position_offset_runtime)
+                        {
                             masked = true;
+                        }
                         if (window_size > 0)
                         {
-                            int q_pos = my_consumer_q_row + position_offset_runtime;
-                            if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                            const int q_pos =
+                                my_consumer_q_row + position_offset_runtime;
+                            if (kv_pos < q_pos - window_size ||
+                                kv_pos > q_pos + window_size)
+                            {
                                 masked = true;
+                            }
                         }
 
                         if (mask)
                         {
-                            float mask_val = mask[(batch_idx * seq_len + my_consumer_q_row) * mask_stride + kv_pos];
+                            const float mask_val =
+                                mask[(batch_idx * seq_len +
+                                      my_consumer_q_row) *
+                                         mask_stride +
+                                     kv_pos];
                             if (mask_val <= -1.0e20f)
-                            {
                                 masked = true;
-                            }
                             else
-                            {
                                 my_scores[j] += mask_val;
-                            }
                         }
 
                         if (masked)
-                        {
                             my_scores[j] = -FLT_MAX;
-                        }
                         else
-                        {
                             my_scores[j] *= softmax_scale;
-                            m_ij = fmaxf(m_ij, my_scores[j]);
-                        }
                     }
-                }
-
-                // All 32 lanes reach here — safe for warp-collective ops
-                __syncwarp();
-
-                // Broadcast m_ij from primary lane to its secondary partner
-                // Lanes without rows shuffle -FLT_MAX harmlessly
-                m_ij = __shfl_sync(0xFFFFFFFF, m_ij, row_in_warp);
-
-                if (owns_row)
-                {
-                    const int local_q_row = consumer_warp_id * WMMA_M + row_in_warp;
-                    float *my_scores = scores + local_q_row * scores_ld;
-
-                    // Online softmax update
-                    float m_i_new = fmaxf(m_i, m_ij);
-                    float scale_old = __expf(m_i - m_i_new);
-
-#pragma unroll
-                    for (int d = 0; d < dims_per_lane; d++)
-                        O_acc[d] *= scale_old;
-                    l_i *= scale_old;
-
-                    // Accumulate P @ V (branchless with compile-time unrolling)
-                    //
-                    // Optimizations over original scalar loop:
-                    //   1. TILE_KV compile-time loop bound enables full #pragma unroll,
-                    //      letting NVCC interleave V loads with FMAs for ILP.
-                    //   2. Removed per-score branch (if s > -FLT_MAX/2): masked scores
-                    //      are -FLT_MAX, so exp(-FLT_MAX - m) = 0 → zero contribution.
-                    //      Eliminates warp divergence on causal masking boundaries.
-                    //   3. j < actual_tile_kv_len is warp-uniform (same for all lanes)
-                    //      → no divergence; just skips tail iterations.
-                    //   4. Vectorized half2 V loads: 2× shared memory throughput.
-                    float l_ij = 0.0f;
-#pragma unroll 8
-                    for (int j = 0; j < TILE_KV; j++)
-                    {
-                        if (j < actual_tile_kv_len)
-                        {
-                            float p = __expf(my_scores[j] - m_i_new);
-                            l_ij += p;
-
-                            const half2 *V_row_h2 = reinterpret_cast<const half2 *>(
-                                V_tile_fp16 + j * smem_stride + dim_start);
-#pragma unroll
-                            for (int d = 0; d < dims_per_lane; d += 2)
-                            {
-                                float2 v = __half22float2(V_row_h2[d >> 1]);
-                                O_acc[d] += p * v.x;
-                                O_acc[d + 1] += p * v.y;
-                            }
-                        }
-                    }
-
-                    l_i += l_ij;
-                    m_i = m_i_new;
                 }
             }
 
             __syncthreads();
+
+            if (is_active_consumer)
+            {
+                /*
+                 * Physical K/V tiles are a throughput parameter, not an
+                 * arithmetic parameter. Consume every 16-key microtile in
+                 * ascending order so TILE_KV=16/32/64, query partitioning, TP,
+                 * and M all execute the same online-softmax reduction tree.
+                 * This preserves byte identity while still allowing wider
+                 * vectorized loads and fewer CTA barriers where they win.
+                 */
+                constexpr int kReductionTileKV = WMMA_N;
+#pragma unroll
+                for (int reduction_start = 0;
+                     reduction_start < TILE_KV;
+                     reduction_start += kReductionTileKV)
+                {
+                    const int reduction_len =
+                        min(kReductionTileKV,
+                            max(0, actual_tile_kv_len - reduction_start));
+                    float m_ij = -FLT_MAX;
+
+                    // Every stripe warp reconstructs the same row maximum from
+                    // the published score bytes in canonical key order.
+                    if (owns_row && lane_pair_index == 0)
+                    {
+                        const int local_q_row =
+                            q_warp_group * WMMA_M + row_in_warp;
+                        const float *my_scores =
+                            scores + local_q_row * scores_ld + reduction_start;
+#pragma unroll
+                        for (int j = 0; j < kReductionTileKV; ++j)
+                        {
+                            if (j < reduction_len)
+                                m_ij = fmaxf(m_ij, my_scores[j]);
+                        }
+                    }
+
+                    // All lanes participate, including inactive tail-row lanes.
+                    m_ij = __shfl_sync(0xFFFFFFFF, m_ij, row_in_warp);
+
+                    /*
+                     * A causal/window partition can be wholly invisible to an
+                     * earlier query row even when a later row in the same WMMA
+                     * tile consumes it.  In that case every score is -FLT_MAX.
+                     * Treat the microtile as the neutral online-softmax element;
+                     * evaluating exp(-FLT_MAX - -FLT_MAX) would otherwise add
+                     * sixteen spurious unit weights.
+                     */
+                    if (owns_row && reduction_len > 0 && m_ij > -FLT_MAX)
+                    {
+                        const int local_q_row =
+                            q_warp_group * WMMA_M + row_in_warp;
+                        const float *my_scores =
+                            scores + local_q_row * scores_ld + reduction_start;
+
+                        const float m_i_new = fmaxf(m_i, m_ij);
+                        const float scale_old = __expf(m_i - m_i_new);
+
+#pragma unroll
+                        for (int d = 0; d < dims_per_lane; ++d)
+                            O_acc[d] *= scale_old;
+                        l_i *= scale_old;
+
+                        float l_ij = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < kReductionTileKV; ++j)
+                        {
+                            if (j < reduction_len)
+                            {
+                                const float p =
+                                    __expf(my_scores[j] - m_i_new);
+                                l_ij += p;
+
+                                const half2 *V_row_h2 =
+                                    reinterpret_cast<const half2 *>(
+                                        V_tile_fp16 +
+                                        (reduction_start + j) * smem_stride +
+                                        dim_start);
+#pragma unroll
+                                for (int d = 0; d < dims_per_lane; d += 2)
+                                {
+                                    const float2 v =
+                                        __half22float2(V_row_h2[d >> 1]);
+                                    O_acc[d] += p * v.x;
+                                    O_acc[d + 1] += p * v.y;
+                                }
+                            }
+                        }
+
+                        l_i += l_ij;
+                        m_i = m_i_new;
+                    }
+                }
+            }
+
+            __syncthreads();
+
+            if constexpr (!WRITE_CONTEXT_PARTIAL)
+            {
+                constexpr int kCanonicalPartitionKeys =
+                    llaminar2::cuda::fa2_policy::
+                        kFA2CanonicalContextPartitionKeys;
+                const int maximum_visible_key =
+                    q_block_start + tile_q - 1 + position_offset_runtime;
+                const bool next_tile_is_causally_empty =
+                    causal && kv_end_tile > maximum_visible_key;
+                const bool closes_canonical_partition =
+                    kv_end_tile % kCanonicalPartitionKeys == 0;
+                const bool closes_scan =
+                    kv_tile_iter + 1 == num_kv_tiles ||
+                    next_tile_is_causally_empty;
+
+                if ((closes_canonical_partition || closes_scan) && owns_row)
+                {
+                    float *O_batch =
+                        O + batch_idx * seq_len * n_heads * head_dim;
+                    float *O_row =
+                        O_batch + my_consumer_q_row * n_heads * head_dim +
+                        head_idx * head_dim;
+
+                    if (l_i > 0.0f)
+                    {
+                        if (!(merged_l > 0.0f))
+                        {
+                            merged_m = m_i;
+                            merged_l = l_i;
+#pragma unroll
+                            for (int d = 0; d < dims_per_lane; ++d)
+                            {
+                                if (d < active_dims_per_lane)
+                                    O_row[dim_start + d] = O_acc[d];
+                            }
+                        }
+                        else
+                        {
+                            const float next_m = fmaxf(merged_m, m_i);
+                            const float previous_scale =
+                                __expf(merged_m - next_m);
+                            const float partition_scale =
+                                __expf(m_i - next_m);
+#pragma unroll
+                            for (int d = 0; d < dims_per_lane; ++d)
+                            {
+                                if (d < active_dims_per_lane)
+                                {
+                                    O_row[dim_start + d] =
+                                        O_row[dim_start + d] * previous_scale +
+                                        O_acc[d] * partition_scale;
+                                }
+                            }
+                            merged_l = merged_l * previous_scale +
+                                       l_i * partition_scale;
+                            merged_m = next_m;
+                        }
+                    }
+
+                    if (!closes_scan)
+                    {
+#pragma unroll
+                        for (int d = 0; d < dims_per_lane; ++d)
+                            O_acc[d] = 0.0f;
+                        m_i = -FLT_MAX;
+                        l_i = 0.0f;
+                    }
+                }
+
+                // A wholly future tile is the neutral suffix of the current
+                // canonical partition. Once its preceding visible summary has
+                // been merged, later K/V tiles cannot affect any row in this
+                // query block and need not be loaded or scored.
+                if (next_tile_is_causally_empty)
+                    break;
+            }
         }
 
         // =====================================================================
-        // Write final output (each lane writes its half of dims)
+        // Publish either one context summary or the normalized final output.
         // =====================================================================
         if (is_active_consumer && owns_row)
         {
-            float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
-
-            float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
-            float *O_row = O_batch + my_consumer_q_row * n_heads * head_dim + head_idx * head_dim;
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+            {
+                if (publish_single_partition_output)
+                {
+                    const float inverse_l =
+                        l_i > 0.0f ? 1.0f / l_i : 0.0f;
+                    float *O_batch =
+                        O + batch_idx * seq_len * n_heads * head_dim;
+                    float *O_row =
+                        O_batch + my_consumer_q_row * n_heads * head_dim +
+                        head_idx * head_dim;
+#pragma unroll
+                    for (int d = 0; d < dims_per_lane; ++d)
+                    {
+                        if (d < active_dims_per_lane)
+                            O_row[dim_start + d] = O_acc[d] * inverse_l;
+                    }
+                }
+                else
+                {
+                    const size_t summary_index =
+                        ((static_cast<size_t>(batch_idx) * seq_len +
+                          my_consumer_q_row) *
+                             n_heads +
+                         head_idx) *
+                            max_context_partitions +
+                        context_partition;
+                    float *O_summary =
+                        O_partial +
+                        summary_index * static_cast<size_t>(head_dim);
 
 #pragma unroll
-            for (int d = 0; d < dims_per_lane; d++)
+                    for (int d = 0; d < dims_per_lane; ++d)
+                    {
+                        if (d < active_dims_per_lane)
+                            O_summary[dim_start + d] = O_acc[d];
+                    }
+
+                    // All P@V stripes reconstruct identical scalar state. One
+                    // named lane publishes it, preserving single-writer ownership.
+                    if (pv_warp_in_group == 0 && lane_pair_index == 0)
+                    {
+                        m_partial[summary_index] = m_i;
+                        l_partial[summary_index] = l_i;
+                    }
+                }
+            }
+            else
             {
-                if (d < active_dims_per_lane)
-                    O_row[dim_start + d] = O_acc[d] * inv_l;
+                const float inv_l =
+                    (merged_l > 0.0f) ? (1.0f / merged_l) : 0.0f;
+                float *O_batch =
+                    O + batch_idx * seq_len * n_heads * head_dim;
+                float *O_row =
+                    O_batch + my_consumer_q_row * n_heads * head_dim +
+                    head_idx * head_dim;
+
+#pragma unroll
+                for (int d = 0; d < dims_per_lane; d++)
+                {
+                    if (d < active_dims_per_lane)
+                    {
+                        O_row[dim_start + d] =
+                            merged_l > 0.0f
+                                ? O_row[dim_start + d] * inv_l
+                                : 0.0f;
+                    }
+                }
+            }
+        }
+
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+            {
+                // Every thread must finish consuming the shared K/V and score
+                // tiles before this persistent CTA advances to its next
+                // canonical partition and reuses those buffers.
+                __syncthreads();
             }
         }
     }
 
-    // Explicit template instantiations for supported configurations
-    // KV_FP16=false (legacy FP32 K/V inputs)
-    // head_dim=64: 6 consumer warps, tile_q=96
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    // head_dim=128: 4 consumer warps, tile_q=64
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    // head_dim=256: 2 consumer warps, tile_q=32
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, false>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
+    /**
+     * @brief Merge fixed FA2 context summaries in ascending partition order.
+     *
+     * Phase one publishes an unnormalized online-softmax tuple `(m, l, O)` for
+     * every query-row, head, and fixed contiguous K/V partition.  This kernel
+     * assigns one or more warps to each query-row/head pair. Every lane
+     * traverses the same partition prefix in the same order while owning
+     * disjoint output dimensions, so dimension striping changes only physical
+     * residency: there are no atomics, inter-block reductions, or order-
+     * dependent writers.
+     *
+     * The launch grid is immutable under graph replay. The reducer derives its
+     * active partition prefix directly from device-owned K/V length, so stale
+     * summary bytes beyond a shorter replay can never participate. This avoids
+     * both a host scalar and hundreds of neutral-tail loads while preserving the
+     * exact ascending canonical-partition order.
+     *
+     * @param O_partial Unnormalized summaries laid out as
+     *        `[batch, query, head, partition, head_dim]`.
+     * @param m_partial Summary maxima laid out as
+     *        `[batch, query, head, partition]`.
+     * @param l_partial Summary exponential sums with the same scalar layout.
+     * @param O Normalized output `[batch, query, head, head_dim]`.
+     * @param seq_len Captured query-row count.
+     * @param n_heads Participant-local query-head count.
+     * @param head_dim Elements in one output head, at most 256.
+     * @param max_context_partitions Fixed captured partition envelope.
+     * @param device_direct_partition_limit Largest live partition count already
+     *        published directly by phase one; the reducer is then a no-op.
+     * @param device_params Device-owned live K/V length and cache stride.
+     * @tparam DIMENSION_WARPS_PER_ROW Independent 32-dimension stripes assigned
+     *         to each query-row/head reduction.
+     */
+    template <int DIMENSION_WARPS_PER_ROW>
+    __global__ __launch_bounds__(256, 2)
+    void flash_attention_2_context_reduce_kernel(
+        const float *__restrict__ O_partial,
+        const float *__restrict__ m_partial,
+        const float *__restrict__ l_partial,
+        float *__restrict__ O,
+        int seq_len,
+        int n_heads,
+        int head_dim,
+        int max_context_partitions,
+        int device_direct_partition_limit,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__
+            device_params)
+    {
+        constexpr int kWarpsPerBlock = 8;
+        static_assert(
+            DIMENSION_WARPS_PER_ROW == 1 ||
+                DIMENSION_WARPS_PER_ROW == 2 ||
+                DIMENSION_WARPS_PER_ROW == 4 ||
+                DIMENSION_WARPS_PER_ROW == 8,
+            "FA2 reducer dimension striping supports 1, 2, 4, or 8 warps");
+        static_assert(
+            kWarpsPerBlock % DIMENSION_WARPS_PER_ROW == 0,
+            "FA2 reducer rows must divide the 256-thread block exactly");
+        constexpr int kRowsPerBlock =
+            kWarpsPerBlock / DIMENSION_WARPS_PER_ROW;
+        constexpr int kMaximumDimensionsPerLane =
+            8 / DIMENSION_WARPS_PER_ROW;
 
-    // KV_FP16=true (FP16 K/V from KV cache — eliminates FP16→FP32→FP16 round-trip)
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    // head_dim=256: 2 consumer warps, tile_q=32
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
-    template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, true>(
-        const float *, const void *, const void *, float *,
-        int, int, int, int, int, int, float, bool, int, int,
-        const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int, int, int);
+        const int lane = threadIdx.x & (WARP_SIZE - 1);
+        const int warp = threadIdx.x / WARP_SIZE;
+        const int row_in_block = warp / DIMENSION_WARPS_PER_ROW;
+        const int dimension_warp = warp % DIMENSION_WARPS_PER_ROW;
+        const int query_row = blockIdx.y * kRowsPerBlock + row_in_block;
+        if (query_row >= seq_len)
+            return;
 
+        const int head = blockIdx.x;
+        const int batch = blockIdx.z;
+        const size_t scalar_base =
+            ((static_cast<size_t>(batch) * seq_len + query_row) * n_heads +
+             head) *
+            max_context_partitions;
+
+        float output_accumulator[kMaximumDimensionsPerLane] = {0.0f};
+        float merged_m = -FLT_MAX;
+        float merged_l = 0.0f;
+
+        const int live_context_partitions = device_params
+                                                ? min(
+                                                      max_context_partitions,
+                                                      max(
+                                                          1,
+                                                          (device_params->kv_len +
+                                                           llaminar2::cuda::fa2_policy::
+                                                               kFA2CanonicalContextPartitionKeys -
+                                                           1) /
+                                                              llaminar2::cuda::fa2_policy::
+                                                                  kFA2CanonicalContextPartitionKeys))
+                                                : max_context_partitions;
+        if (live_context_partitions <= device_direct_partition_limit)
+            return;
+
+        for (int partition = 0;
+             partition < live_context_partitions;
+             ++partition)
+        {
+            const size_t scalar_index = scalar_base + partition;
+            const float partition_l = l_partial[scalar_index];
+            if (!(partition_l > 0.0f))
+                continue;
+
+            const float partition_m = m_partial[scalar_index];
+            const float *partition_output =
+                O_partial + scalar_index * static_cast<size_t>(head_dim);
+
+            if (!(merged_l > 0.0f))
+            {
+                merged_m = partition_m;
+                merged_l = partition_l;
+#pragma unroll
+                for (int element = 0;
+                     element < kMaximumDimensionsPerLane;
+                     ++element)
+                {
+                    const int dimension =
+                        dimension_warp * WARP_SIZE + lane +
+                        element * WARP_SIZE * DIMENSION_WARPS_PER_ROW;
+                    if (dimension < head_dim)
+                        output_accumulator[element] =
+                            partition_output[dimension];
+                }
+                continue;
+            }
+
+            const float next_m = fmaxf(merged_m, partition_m);
+            const float previous_scale = __expf(merged_m - next_m);
+            const float partition_scale = __expf(partition_m - next_m);
+#pragma unroll
+            for (int element = 0;
+                 element < kMaximumDimensionsPerLane;
+                 ++element)
+            {
+                const int dimension =
+                    dimension_warp * WARP_SIZE + lane +
+                    element * WARP_SIZE * DIMENSION_WARPS_PER_ROW;
+                if (dimension < head_dim)
+                {
+                    output_accumulator[element] =
+                        output_accumulator[element] * previous_scale +
+                        partition_output[dimension] * partition_scale;
+                }
+            }
+            merged_l = merged_l * previous_scale +
+                       partition_l * partition_scale;
+            merged_m = next_m;
+        }
+
+        const float inverse_l =
+            merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+        float *output =
+            O + (static_cast<size_t>(batch) * seq_len * n_heads +
+                 static_cast<size_t>(query_row) * n_heads + head) *
+                    head_dim;
+#pragma unroll
+        for (int element = 0;
+             element < kMaximumDimensionsPerLane;
+             ++element)
+        {
+            const int dimension =
+                dimension_warp * WARP_SIZE + lane +
+                element * WARP_SIZE * DIMENSION_WARPS_PER_ROW;
+            if (dimension < head_dim)
+                output[dimension] =
+                    output_accumulator[element] * inverse_l;
+        }
+    }
+
+    // Explicit instantiations retain one widest query-group body per head
+    // dimension. Runtime active-group selection changes the CTA size and row
+    // ownership while the same compiled body preserves one arithmetic implementation.
+#define FA2_INSTANTIATE(QW, PVW, HD, TKV, KV16)                                      \
+    template __global__ void flash_attention_2_pipelined_kernel<                     \
+        QW, PVW, HD, TKV, KV16>(                                                     \
+        const float *, const void *, const void *, float *,                           \
+        int, int, int, int, int, int, float, bool, int, int,                          \
+        const llaminar2::attention::AttentionDeviceParams *, const float *,           \
+        int, int, int, int, int, int, float *, float *, float *, int, int, int, int)
+
+#define FA2_INSTANTIATE_TILES(QW, PVW, HD, KV16) \
+    FA2_INSTANTIATE(QW, PVW, HD, 16, KV16);      \
+    FA2_INSTANTIATE(QW, PVW, HD, 32, KV16);      \
+    FA2_INSTANTIATE(QW, PVW, HD, 64, KV16)
+
+    FA2_INSTANTIATE_TILES(6, 1, 64, false);
+    FA2_INSTANTIATE_TILES(4, 1, 128, false);
+    FA2_INSTANTIATE_TILES(2, 1, 256, false);
+    FA2_INSTANTIATE_TILES(2, 2, 256, false);
+    FA2_INSTANTIATE_TILES(2, 4, 256, false);
+
+    FA2_INSTANTIATE_TILES(6, 1, 64, true);
+    FA2_INSTANTIATE_TILES(4, 1, 128, true);
+    FA2_INSTANTIATE_TILES(2, 1, 256, true);
+    FA2_INSTANTIATE_TILES(2, 2, 256, true);
+    FA2_INSTANTIATE_TILES(2, 4, 256, true);
+
+#undef FA2_INSTANTIATE_TILES
+#undef FA2_INSTANTIATE
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
     // =========================================================================
@@ -2338,9 +2823,8 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
 
 /**
  * @brief Internal templated FA2 launcher — dispatches based on head_dim + KV_FP16 flag.
- *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
- *   - head_dim <= 128: 4 consumer warps, tile_q=64, 192 threads
- *   - head_dim <= 256: 2 consumer warps, tile_q=32, 128 threads
+ * Query groups are selected from every compiled width through 6 (HD64), 4
+ * (HD128), or 2 (HD256). P@V striping remains an independent HD256 choice.
  * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
  */
 template <bool KV_FP16>
@@ -2368,13 +2852,90 @@ static int fa2_prefill_launch(
         return -2;
     }
 
-    if (head_dim <= 0 || head_dim % 16 != 0 || head_dim > 256)
+    const llaminar2::cuda::fa2_policy::FA2HeadMappingGeometry head_mapping{
+        .local_query_heads = n_heads,
+        .visible_kv_heads = n_kv_heads,
+        .head_start = head_start,
+        .replicated_gqa_n_rep = gqa_n_rep,
+    };
+    if (!Q || !K || !V || !O || batch_size <= 0 || seq_len <= 0 ||
+        kv_len <= 0 ||
+        !llaminar2::cuda::fa2_policy::isValidFA2HeadMapping(head_mapping) ||
+        head_dim <= 0 ||
+        head_dim % 16 != 0 || head_dim > 256)
     {
-        printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d invalid (must be 16-256, multiple of 16)\n", head_dim);
+        printf("[cudaFlashAttn_prefill_fa2] Error: invalid tensor or launch geometry "
+               "(batch=%d, seq=%d, kv=%d, heads=%d, kv_heads=%d, head_dim=%d)\n",
+               batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim);
         return -1;
     }
 
-    FA2KernelConfig cfg = computeFA2Config(head_dim, dev_cfg.max_smem_optin);
+    if (!cuda_stream)
+    {
+        printf("[cudaFlashAttn_prefill_fa2] Error: explicit non-null CUDA stream is required\n");
+        return -1;
+    }
+
+    const int configured_q_warp_groups =
+        llaminar2::debugEnv().attention.cuda_fa2_q_warp_groups;
+    const llaminar2::cuda::fa2_policy::FA2QueryPartitionGeometry
+        query_partition_geometry{
+            .batch_size = batch_size,
+            .query_rows = seq_len,
+            .local_query_heads = n_heads,
+            .head_dim = head_dim,
+            .sm_count = dev_cfg.sm_count,
+        };
+    const int selected_q_warp_groups =
+        llaminar2::cuda::fa2_policy::selectFA2QueryWarpGroups(
+            query_partition_geometry,
+            configured_q_warp_groups);
+    if (selected_q_warp_groups == 0)
+    {
+        printf("[cudaFlashAttn_prefill_fa2] Error: FA2 query partition has no "
+               "compiled specialization (head_dim=%d, requested_groups=%d, "
+               "maximum_groups=%d, sm_count=%d)\n",
+               head_dim,
+               configured_q_warp_groups,
+               llaminar2::cuda::fa2_policy::maximumFA2QueryWarpGroups(head_dim),
+               dev_cfg.sm_count);
+        return -1;
+    }
+
+    const int configured_hd256_pv_warps =
+        llaminar2::debugEnv().attention.cuda_fa2_hd256_pv_warps;
+    if (!llaminar2::cuda::fa2_policy::isCompiledFA2PVWarpGeometry(
+            head_dim,
+            head_dim > 128 ? configured_hd256_pv_warps : 1))
+    {
+        printf("[cudaFlashAttn_prefill_fa2] Error: LLAMINAR_FA2_HD256_PV_WARPS=%d is invalid for head_dim=%d; HD256 expects 1, 2, or 4\n",
+               configured_hd256_pv_warps,
+               head_dim);
+        return -1;
+    }
+
+    FA2KernelConfig cfg = computeFA2Config(
+        head_dim,
+        dev_cfg.max_smem_optin,
+        selected_q_warp_groups);
+
+    if (cfg.tile_q <= 0 ||
+        cfg.tile_kv <= 0 ||
+        cfg.num_q_warp_groups <= 0 ||
+        cfg.pv_warps_per_q_group <= 0 ||
+        cfg.block_size <= 0 ||
+        cfg.smem_size == 0)
+    {
+        printf("[cudaFlashAttn_prefill_fa2] Error: selected FA2 capture "
+               "geometry cannot fit the device shared-memory contract "
+               "(head_dim=%d, q_warp_groups=%d, forced_tile_kv=%d, "
+               "max_dynamic_smem=%d)\n",
+               head_dim,
+               selected_q_warp_groups,
+               llaminar2::debugEnv().attention.cuda_fa2_tile_kv,
+               dev_cfg.max_smem_optin);
+        return -1;
+    }
 
     int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
     dim3 grid(n_heads, num_q_tiles, batch_size);
@@ -2382,15 +2943,15 @@ static int fa2_prefill_launch(
     cudaError_t err;
 
     // Macro to reduce dispatch boilerplate
-#define FA2_LAUNCH(CW, HD, TKV)                                                                            \
+#define FA2_LAUNCH(QW, PVW, HD, TKV)                                                                       \
     do                                                                                                     \
     {                                                                                                      \
-        auto kernel_fn = flash_attention_2_pipelined_kernel<CW, HD, TKV, KV_FP16>;                         \
+        auto kernel_fn = flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_FP16>;                    \
         err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size); \
         if (err != cudaSuccess)                                                                            \
         {                                                                                                  \
-            printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d>(smem=%zu) FAILED: %s\n", \
-                   CW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));                     \
+            printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d,%d>(smem=%zu) FAILED: %s\n", \
+                   QW, PVW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));               \
             return -1;                                                                                     \
         }                                                                                                  \
         kernel_fn<<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(                                   \
@@ -2398,49 +2959,817 @@ static int fa2_prefill_launch(
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,                                    \
             softmax_scale, causal, window_size, position_offset,                                           \
             device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad,                     \
-            head_start, gqa_n_rep);                                                                        \
+            head_start, gqa_n_rep,                                                                          \
+            /*O_partial=*/nullptr, /*m_partial=*/nullptr, /*l_partial=*/nullptr,                             \
+            /*context_partition_size=*/0, /*max_context_partitions=*/0,                                    \
+            /*device_direct_partition_limit=*/0,                                                            \
+            /*explicit_context_partition=*/-1);                                                             \
     } while (0)
 
-    if (cfg.num_consumer_warps == 6)
+#define FA2_LAUNCH_SELECTED_TILE(QW, PVW, HD) \
+    do                                        \
+    {                                         \
+        if (cfg.tile_kv == 64)                \
+            FA2_LAUNCH(QW, PVW, HD, 64);      \
+        else if (cfg.tile_kv == 16)           \
+            FA2_LAUNCH(QW, PVW, HD, 16);      \
+        else                                  \
+            FA2_LAUNCH(QW, PVW, HD, 32);      \
+    } while (0)
+
+    if (head_dim <= 64)
     {
-        if (cfg.tile_kv == 64)
-            FA2_LAUNCH(6, 64, 64);
-        else if (cfg.tile_kv == 16)
-            FA2_LAUNCH(6, 64, 16);
-        else
-            FA2_LAUNCH(6, 64, 32);
+        FA2_LAUNCH_SELECTED_TILE(6, 1, 64);
     }
-    else if (cfg.num_consumer_warps == 2)
+    else if (head_dim <= 128)
     {
-        if (cfg.tile_kv == 64)
-            FA2_LAUNCH(2, 256, 64);
-        else if (cfg.tile_kv == 16)
-            FA2_LAUNCH(2, 256, 16);
-        else
-            FA2_LAUNCH(2, 256, 32);
+        FA2_LAUNCH_SELECTED_TILE(4, 1, 128);
     }
     else
     {
-        if (cfg.tile_kv == 64)
-            FA2_LAUNCH(4, 128, 64);
-        else if (cfg.tile_kv == 16)
-            FA2_LAUNCH(4, 128, 16);
-        else
-            FA2_LAUNCH(4, 128, 32);
+        if (cfg.pv_warps_per_q_group == 1)
+            FA2_LAUNCH_SELECTED_TILE(2, 1, 256);
+        else if (cfg.pv_warps_per_q_group == 2)
+            FA2_LAUNCH_SELECTED_TILE(2, 2, 256);
+        else if (cfg.pv_warps_per_q_group == 4)
+            FA2_LAUNCH_SELECTED_TILE(2, 4, 256);
     }
 
+#undef FA2_LAUNCH_SELECTED_TILE
 #undef FA2_LAUNCH
 
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
         printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
-               "consumer_warps=%d, kv_fp16=%d, grid=(%d,%d,%d), block=%d)\n",
+               "q_warp_groups=%d, pv_warps_per_q_group=%d, consumer_warps=%d, kv_fp16=%d, "
+               "grid=(%d,%d,%d), block=%d)\n",
                cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
-               cfg.num_consumer_warps, (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
+               cfg.num_q_warp_groups, cfg.pv_warps_per_q_group, cfg.consumerWarps(),
+               (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
         return -1;
     }
     return 0;
+}
+
+/**
+ * @brief Physical scheduling of fixed logical K/V partitions during capture.
+ *
+ * Both schedules execute the same compiled phase-one specialization and the
+ * same deterministic reducer.  The sequence schedule records one phase-one
+ * graph node per partition on the explicit stream; the context schedule records
+ * one wider phase-one grid.  Their arithmetic is therefore identical while the
+ * benchmark can measure whether additional context-grid residency is economic.
+ */
+enum class FA2ContextPartitionSchedule
+{
+    SequenceGraphNodes,
+    ContextParallelGrid,
+};
+
+/**
+ * @brief Immutable arguments shared by one captured partition transaction.
+ */
+struct FA2ContextTransactionArguments
+{
+    const float *Q = nullptr;
+    const void *K = nullptr;
+    const void *V = nullptr;
+    float *O = nullptr;
+    float *O_partial = nullptr;
+    float *m_partial = nullptr;
+    float *l_partial = nullptr;
+    int batch_size = 0;
+    int seq_len = 0;
+    int kv_capacity = 0;
+    int n_heads = 0;
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    float softmax_scale = 0.0f;
+    bool causal = false;
+    int window_size = -1;
+    int position_offset = 0;
+    const llaminar2::attention::AttentionDeviceParams *device_params = nullptr;
+    const float *mask = nullptr;
+    int head_start = 0;
+    int gqa_n_rep = 0;
+    int context_partition_size = 0;
+    int max_context_partitions = 0;
+    int context_partition_slots = 0;
+    int device_direct_partition_limit = 0;
+    int reducer_dimension_warps = 0;
+    void *capture_conditional = nullptr;
+};
+
+#if CUDART_VERSION >= 12030
+/**
+ * @brief Placement of one phase kernel in the adaptive captured transaction.
+ */
+enum class FA2AdaptivePhasePlacement
+{
+    ConcurrentGuardedRoot, ///< Parent sibling that retires for context work.
+    ContextIfBody,         ///< Non-zero conditional body publishing summaries.
+};
+
+/**
+ * @brief Append one compiled FA2 phase kernel to its typed adaptive placement.
+ *
+ * CUDA copies every pointed-to argument value while adding the node. Keeping
+ * argument materialization in this helper prevents the direct and context
+ * branches from drifting to different ABI order as fields are added.
+ *
+ * @param transaction Active parent-capture conditional builder.
+ * @param placement Guarded parent root or non-zero context body.
+ * @param function Exact compiled direct or context kernel specialization.
+ * @param grid Immutable physical launch grid.
+ * @param arguments Transaction tensor and model geometry.
+ * @param config Compiled block/shared-memory geometry.
+ * @param output_partial Context-summary output, or null for direct execution.
+ * @param m_partial Context-summary maxima, or null for direct execution.
+ * @param l_partial Context-summary sums, or null for direct execution.
+ * @param explicit_context_partition Diagnostic partition index, normally -1.
+ * @param semantic_name Stable node role used in fatal diagnostics.
+ */
+static bool appendFA2AdaptivePhaseNode(
+    llaminar2::CUDAActiveCaptureConditional &transaction,
+    FA2AdaptivePhasePlacement placement,
+    void *function,
+    dim3 grid,
+    const FA2ContextTransactionArguments &arguments,
+    const FA2KernelConfig &config,
+    float *output_partial,
+    float *m_partial,
+    float *l_partial,
+    int explicit_context_partition,
+    const char *semantic_name)
+{
+    const float *Q = arguments.Q;
+    const void *K = arguments.K;
+    const void *V = arguments.V;
+    float *O = arguments.O;
+    int batch_size = arguments.batch_size;
+    int seq_len = arguments.seq_len;
+    int kv_capacity = arguments.kv_capacity;
+    int n_heads = arguments.n_heads;
+    int n_kv_heads = arguments.n_kv_heads;
+    int head_dim = arguments.head_dim;
+    float softmax_scale = arguments.softmax_scale;
+    bool causal = arguments.causal;
+    int window_size = arguments.window_size;
+    int position_offset = arguments.position_offset;
+    const llaminar2::attention::AttentionDeviceParams *device_params =
+        arguments.device_params;
+    const float *mask = arguments.mask;
+    int tile_q = config.tile_q;
+    int tile_kv = config.tile_kv;
+    int qkv_pad = config.qkv_pad;
+    int scores_pad = config.scores_pad;
+    int head_start = arguments.head_start;
+    int gqa_n_rep = arguments.gqa_n_rep;
+    int context_partition_size = arguments.context_partition_size;
+    int max_context_partitions = arguments.max_context_partitions;
+
+    /*
+     * The guarded root and IF body are graph siblings. The root therefore keeps
+     * the immutable direct-partition threshold and retires uniformly when the
+     * context body owns output. The context body is already selected by CUDA's
+     * native IF and receives zero to keep its arithmetic unconditional.
+     */
+    int device_direct_partition_limit =
+        placement == FA2AdaptivePhasePlacement::ConcurrentGuardedRoot
+            ? arguments.device_direct_partition_limit
+            : 0;
+    void *kernel_arguments[] = {
+        &Q,
+        &K,
+        &V,
+        &O,
+        &batch_size,
+        &seq_len,
+        &kv_capacity,
+        &n_heads,
+        &n_kv_heads,
+        &head_dim,
+        &softmax_scale,
+        &causal,
+        &window_size,
+        &position_offset,
+        &device_params,
+        &mask,
+        &tile_q,
+        &tile_kv,
+        &qkv_pad,
+        &scores_pad,
+        &head_start,
+        &gqa_n_rep,
+        &output_partial,
+        &m_partial,
+        &l_partial,
+        &context_partition_size,
+        &max_context_partitions,
+        &device_direct_partition_limit,
+        &explicit_context_partition,
+    };
+    const cudaKernelNodeParams node_params{
+        .func = function,
+        .gridDim = grid,
+        .blockDim = dim3(config.block_size, 1, 1),
+        .sharedMemBytes = static_cast<unsigned int>(config.smem_size),
+        .kernelParams = kernel_arguments,
+        .extra = nullptr,
+    };
+    if (placement == FA2AdaptivePhasePlacement::ConcurrentGuardedRoot)
+    {
+        return transaction.beginBranchesWithConcurrentRootKernel(
+            node_params,
+            semantic_name);
+    }
+    return transaction.appendKernel(
+        llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+        node_params,
+        semantic_name);
+}
+
+/**
+ * @brief Append the deterministic ascending-partition reducer to one branch.
+ * @tparam DIMENSION_WARPS_PER_ROW Independent output strips per query row.
+ */
+template <int DIMENSION_WARPS_PER_ROW>
+static bool appendFA2ReducerConditionalNode(
+    llaminar2::CUDAActiveCaptureConditional &transaction,
+    llaminar2::CUDAActiveCaptureConditionalBranch branch,
+    dim3 grid,
+    const FA2ContextTransactionArguments &arguments)
+{
+    const float *O_partial = arguments.O_partial;
+    const float *m_partial = arguments.m_partial;
+    const float *l_partial = arguments.l_partial;
+    float *O = arguments.O;
+    int seq_len = arguments.seq_len;
+    int n_heads = arguments.n_heads;
+    int head_dim = arguments.head_dim;
+    int max_context_partitions = arguments.max_context_partitions;
+    int device_direct_partition_limit = 0;
+    const llaminar2::attention::AttentionDeviceParams *device_params =
+        arguments.device_params;
+    void *kernel_arguments[] = {
+        &O_partial,
+        &m_partial,
+        &l_partial,
+        &O,
+        &seq_len,
+        &n_heads,
+        &head_dim,
+        &max_context_partitions,
+        &device_direct_partition_limit,
+        &device_params,
+    };
+    const cudaKernelNodeParams node_params{
+        .func = reinterpret_cast<void *>(
+            flash_attention_2_context_reduce_kernel<
+                DIMENSION_WARPS_PER_ROW>),
+        .gridDim = grid,
+        .blockDim = dim3(256, 1, 1),
+        .sharedMemBytes = 0,
+        .kernelParams = kernel_arguments,
+        .extra = nullptr,
+    };
+    return transaction.appendKernel(
+        branch,
+        node_params,
+        "deterministic context reducer");
+}
+#endif
+
+/**
+ * @brief Launch one exact compiled FA2 transaction specialization.
+ *
+ * @tparam QW Widest query-warp grouping represented by the kernel body.
+ * @tparam PVW P@V stripe warps assigned to each query group.
+ * @tparam HD Compile-time head-dimension ceiling.
+ * @tparam TKV Physical K/V shared-memory tile.
+ * @tparam KV_FP16 True when K/V storage is native FP16.
+ * @param arguments Immutable transaction tensors and logical geometry.
+ * @param config Capture-time physical launch configuration.
+ * @param schedule Sequence-node or context-grid physical scheduling. During
+ *        adaptive capture, the lean query kernel is a root node whose device
+ *        guard retires it for long prefixes; one IF-only child graph owns the
+ *        context summary and reduction work. This avoids an ELSE-child dispatch
+ *        on the latency-sensitive short-prefix path.
+ * @param stream Exact non-null producer stream captured by the caller.
+ * @return Zero on successful launch submission, otherwise a fatal launch error.
+ */
+template <int QW, int PVW, int HD, int TKV, bool KV_FP16>
+static int launchFA2ContextTransactionSpecialization(
+    const FA2ContextTransactionArguments &arguments,
+    const FA2KernelConfig &config,
+    FA2ContextPartitionSchedule schedule,
+    cudaStream_t stream)
+{
+    auto context_phase =
+        flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_FP16, true>;
+    const cudaError_t attribute_status = cudaFuncSetAttribute(
+        context_phase,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        config.smem_size);
+    if (attribute_status != cudaSuccess)
+    {
+        printf("[cudaFlashAttn_context_transaction] Failed to set phase-one "
+               "dynamic shared memory: %s\n",
+               cudaGetErrorString(attribute_status));
+        return -1;
+    }
+
+    const int query_tiles =
+        (arguments.seq_len + config.tile_q - 1) / config.tile_q;
+
+    constexpr int kReducerThreads = 256;
+    constexpr int kReducerWarps = kReducerThreads / WARP_SIZE;
+    if (arguments.reducer_dimension_warps <= 0 ||
+        arguments.reducer_dimension_warps > kReducerWarps ||
+        kReducerWarps % arguments.reducer_dimension_warps != 0)
+    {
+        printf("[cudaFlashAttn_context_transaction] Invalid reducer dimension "
+               "striping: %d\n",
+               arguments.reducer_dimension_warps);
+        return -1;
+    }
+    const int reducer_rows_per_block =
+        kReducerWarps / arguments.reducer_dimension_warps;
+    const dim3 reducer_grid(
+        arguments.n_heads,
+        (arguments.seq_len + reducer_rows_per_block - 1) /
+            reducer_rows_per_block,
+        arguments.batch_size);
+
+    auto direct_phase =
+        flash_attention_2_pipelined_kernel<
+            QW, PVW, HD, TKV, KV_FP16, false>;
+    if (arguments.device_direct_partition_limit > 0)
+    {
+        const cudaError_t direct_attribute_status = cudaFuncSetAttribute(
+            direct_phase,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            config.smem_size);
+        if (direct_attribute_status != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_context_transaction] Failed to set adaptive "
+                   "direct-node dynamic shared memory: %s\n",
+                   cudaGetErrorString(direct_attribute_status));
+            return -1;
+        }
+    }
+
+#if CUDART_VERSION >= 12030
+    if (schedule == FA2ContextPartitionSchedule::ContextParallelGrid &&
+        arguments.device_direct_partition_limit > 0)
+    {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const cudaError_t capture_query_status = cudaStreamIsCapturing(
+            stream,
+            &capture_status);
+        if (capture_query_status != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_context_transaction] Failed to query stream "
+                   "capture state for adaptive transaction: %s\n",
+                   cudaGetErrorString(capture_query_status));
+            return -1;
+        }
+
+        if (capture_status == cudaStreamCaptureStatusActive)
+        {
+            auto *transaction = static_cast<
+                llaminar2::CUDAActiveCaptureConditional *>(
+                arguments.capture_conditional);
+            if (!transaction)
+            {
+                printf("[cudaFlashAttn_context_transaction] Adaptive capture "
+                       "requires a predicate published by the device-parameter "
+                       "producer: missing transaction\n");
+                return -1;
+            }
+
+            const dim3 direct_grid(
+                arguments.n_heads,
+                query_tiles,
+                arguments.batch_size);
+            if (!appendFA2AdaptivePhaseNode(
+                    *transaction,
+                    FA2AdaptivePhasePlacement::ConcurrentGuardedRoot,
+                    reinterpret_cast<void *>(direct_phase),
+                    direct_grid,
+                    arguments,
+                    config,
+                    /*output_partial=*/nullptr,
+                    /*m_partial=*/nullptr,
+                    /*l_partial=*/nullptr,
+                    /*explicit_context_partition=*/-1,
+                    "guarded query-sequence root"))
+            {
+                printf("[cudaFlashAttn_context_transaction] Failed to fork "
+                       "adaptive root and context work: %s\n",
+                       transaction->error().c_str());
+                return -1;
+            }
+
+            const dim3 context_grid(
+                arguments.n_heads * arguments.context_partition_slots,
+                query_tiles,
+                arguments.batch_size);
+            if (!appendFA2AdaptivePhaseNode(
+                    *transaction,
+                    FA2AdaptivePhasePlacement::ContextIfBody,
+                    reinterpret_cast<void *>(context_phase),
+                    context_grid,
+                    arguments,
+                    config,
+                    arguments.O_partial,
+                    arguments.m_partial,
+                    arguments.l_partial,
+                    /*explicit_context_partition=*/-1,
+                    "K/V-context summary phase"))
+            {
+                printf("[cudaFlashAttn_context_transaction] Failed to append native "
+                       "adaptive context branch: %s\n",
+                       transaction->error().c_str());
+                return -1;
+            }
+
+            bool reducer_appended = false;
+            switch (arguments.reducer_dimension_warps)
+            {
+            case 1:
+                reducer_appended = appendFA2ReducerConditionalNode<1>(
+                    *transaction,
+                    llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+                    reducer_grid,
+                    arguments);
+                break;
+            case 2:
+                reducer_appended = appendFA2ReducerConditionalNode<2>(
+                    *transaction,
+                    llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+                    reducer_grid,
+                    arguments);
+                break;
+            case 4:
+                reducer_appended = appendFA2ReducerConditionalNode<4>(
+                    *transaction,
+                    llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+                    reducer_grid,
+                    arguments);
+                break;
+            case 8:
+                reducer_appended = appendFA2ReducerConditionalNode<8>(
+                    *transaction,
+                    llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+                    reducer_grid,
+                    arguments);
+                break;
+            }
+            if (!reducer_appended || !transaction->commit())
+            {
+                printf("[cudaFlashAttn_context_transaction] Failed to complete native "
+                       "adaptive context branch: %s\n",
+                       transaction->error().c_str());
+                return -1;
+            }
+            return 0;
+        }
+    }
+#endif
+
+    if (arguments.device_direct_partition_limit > 1)
+    {
+        direct_phase<<<
+            dim3(arguments.n_heads, query_tiles, arguments.batch_size),
+            config.block_size,
+            config.smem_size,
+            stream>>>(
+            arguments.Q,
+            arguments.K,
+            arguments.V,
+            arguments.O,
+            arguments.batch_size,
+            arguments.seq_len,
+            arguments.kv_capacity,
+            arguments.n_heads,
+            arguments.n_kv_heads,
+            arguments.head_dim,
+            arguments.softmax_scale,
+            arguments.causal,
+            arguments.window_size,
+            arguments.position_offset,
+            arguments.device_params,
+            arguments.mask,
+            config.tile_q,
+            config.tile_kv,
+            config.qkv_pad,
+            config.scores_pad,
+            arguments.head_start,
+            arguments.gqa_n_rep,
+            /*O_partial=*/nullptr,
+            /*m_partial=*/nullptr,
+            /*l_partial=*/nullptr,
+            arguments.context_partition_size,
+            arguments.max_context_partitions,
+            arguments.device_direct_partition_limit,
+            /*explicit_context_partition=*/-1);
+    }
+
+    const auto launch_partition_grid =
+        [&](dim3 grid, int explicit_partition)
+    {
+        context_phase<<<grid, config.block_size, config.smem_size, stream>>>(
+            arguments.Q,
+            arguments.K,
+            arguments.V,
+            arguments.O,
+            arguments.batch_size,
+            arguments.seq_len,
+            arguments.kv_capacity,
+            arguments.n_heads,
+            arguments.n_kv_heads,
+            arguments.head_dim,
+            arguments.softmax_scale,
+            arguments.causal,
+            arguments.window_size,
+            arguments.position_offset,
+            arguments.device_params,
+            arguments.mask,
+            config.tile_q,
+            config.tile_kv,
+            config.qkv_pad,
+            config.scores_pad,
+            arguments.head_start,
+            arguments.gqa_n_rep,
+            arguments.O_partial,
+            arguments.m_partial,
+            arguments.l_partial,
+            arguments.context_partition_size,
+            arguments.max_context_partitions,
+            arguments.device_direct_partition_limit,
+            explicit_partition);
+    };
+
+    if (schedule == FA2ContextPartitionSchedule::ContextParallelGrid)
+    {
+        launch_partition_grid(
+            dim3(
+                arguments.n_heads * arguments.context_partition_slots,
+                query_tiles,
+                arguments.batch_size),
+            /*explicit_partition=*/-1);
+    }
+    else
+    {
+        const dim3 partition_grid(
+            arguments.n_heads,
+            query_tiles,
+            arguments.batch_size);
+        for (int partition = 0;
+             partition < arguments.max_context_partitions;
+             ++partition)
+        {
+            launch_partition_grid(partition_grid, partition);
+        }
+    }
+
+#define FA2_LAUNCH_CONTEXT_REDUCER(DIMENSION_WARPS)                    \
+    flash_attention_2_context_reduce_kernel<DIMENSION_WARPS><<<       \
+        reducer_grid, kReducerThreads, 0, stream>>>(                   \
+        arguments.O_partial, arguments.m_partial, arguments.l_partial, \
+        arguments.O, arguments.seq_len, arguments.n_heads,            \
+        arguments.head_dim, arguments.max_context_partitions,          \
+        arguments.device_direct_partition_limit,                       \
+        arguments.device_params)
+
+    switch (arguments.reducer_dimension_warps)
+    {
+    case 1:
+        FA2_LAUNCH_CONTEXT_REDUCER(1);
+        break;
+    case 2:
+        FA2_LAUNCH_CONTEXT_REDUCER(2);
+        break;
+    case 4:
+        FA2_LAUNCH_CONTEXT_REDUCER(4);
+        break;
+    case 8:
+        FA2_LAUNCH_CONTEXT_REDUCER(8);
+        break;
+    default:
+        printf("[cudaFlashAttn_context_transaction] Reducer dimension "
+               "striping escaped validated dispatch\n");
+        return -1;
+    }
+
+#undef FA2_LAUNCH_CONTEXT_REDUCER
+
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess)
+    {
+        printf("[cudaFlashAttn_context_transaction] CUDA launch failed: %s "
+               "(schedule=%d, partitions=%d, partition_size=%d, grid_q=%d, "
+               "heads=%d, head_dim=%d, reducer_dimension_warps=%d)\n",
+               cudaGetErrorString(launch_status),
+               static_cast<int>(schedule),
+               arguments.max_context_partitions,
+               arguments.context_partition_size,
+               query_tiles,
+               arguments.n_heads,
+               arguments.head_dim,
+               arguments.reducer_dimension_warps);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Validate and dispatch one fully device-resident FA2 context transaction.
+ *
+ * Production selection resolves the immutable geometry before calling this
+ * bridge. The bridge does not provide a fallback: every invalid pointer,
+ * stream, head mapping, partition envelope, adaptive schedule, or unsupported
+ * specialization fails closed.
+ *
+ * @tparam KV_FP16 True for native FP16 K/V storage.
+ */
+template <bool KV_FP16>
+static int fa2_context_transaction_launch(
+    const float *Q,
+    const void *K,
+    const void *V,
+    float *O,
+    float *O_partial,
+    float *m_partial,
+    float *l_partial,
+    int batch_size,
+    int seq_len,
+    int kv_capacity,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    bool causal,
+    int window_size,
+    int position_offset,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    const float *mask,
+    int context_partition_size,
+    int max_context_partitions,
+    int context_partition_slots,
+    int device_direct_partition_limit,
+    int reducer_dimension_warps,
+    void *capture_conditional,
+    FA2ContextPartitionSchedule schedule,
+    cudaStream_t stream,
+    int device_idx,
+    int head_start,
+    int gqa_n_rep)
+{
+    if (!Q || !K || !V || !O || !O_partial || !m_partial || !l_partial ||
+        !stream || batch_size <= 0 || seq_len <= 0 || kv_capacity <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        head_dim % WMMA_K != 0 || head_dim > 256 ||
+        context_partition_size !=
+            llaminar2::cuda::fa2_policy::
+                kFA2CanonicalContextPartitionKeys ||
+        max_context_partitions <= 0 ||
+        max_context_partitions !=
+            (kv_capacity + context_partition_size - 1) /
+                context_partition_size ||
+        context_partition_slots <= 0 ||
+        context_partition_slots > max_context_partitions ||
+        device_direct_partition_limit < 0 ||
+        device_direct_partition_limit > max_context_partitions ||
+        (device_direct_partition_limit > 0 &&
+         (!device_params ||
+          schedule != FA2ContextPartitionSchedule::ContextParallelGrid)))
+    {
+        printf("[cudaFlashAttn_context_transaction] Invalid tensor, stream, or "
+               "partition geometry\n");
+        return -1;
+    }
+
+    const llaminar2::cuda::fa2_policy::FA2HeadMappingGeometry head_mapping{
+        .local_query_heads = n_heads,
+        .visible_kv_heads = n_kv_heads,
+        .head_start = head_start,
+        .replicated_gqa_n_rep = gqa_n_rep,
+    };
+    if (!llaminar2::cuda::fa2_policy::isValidFA2HeadMapping(head_mapping))
+    {
+        printf("[cudaFlashAttn_context_transaction] Invalid GQA head mapping\n");
+        return -1;
+    }
+
+    if (cudaSetDevice(device_idx) != cudaSuccess)
+    {
+        printf("[cudaFlashAttn_context_transaction] Failed to select device %d\n",
+               device_idx);
+        return -1;
+    }
+    const FA2DeviceConfig &device = getFA2DeviceConfig(device_idx);
+    if (device.sm_major < 8)
+    {
+        printf("[cudaFlashAttn_context_transaction] SM %d.%d is unsupported\n",
+               device.sm_major,
+               device.sm_minor);
+        return -2;
+    }
+
+    const llaminar2::cuda::fa2_policy::FA2QueryPartitionGeometry
+        query_geometry{
+            .batch_size = batch_size,
+            .query_rows = seq_len,
+            .local_query_heads = n_heads,
+            .head_dim = head_dim,
+            .sm_count = device.sm_count,
+        };
+    const int query_warp_groups =
+        llaminar2::cuda::fa2_policy::selectFA2QueryWarpGroups(
+            query_geometry,
+            llaminar2::debugEnv().attention.cuda_fa2_q_warp_groups);
+    const int selected_reducer_dimension_warps =
+        llaminar2::cuda::fa2_policy::selectFA2ReducerDimensionWarps(
+            query_geometry,
+            reducer_dimension_warps);
+    const FA2KernelConfig config = computeFA2Config(
+        head_dim,
+        device.max_smem_optin,
+        query_warp_groups);
+    if (query_warp_groups <= 0 || config.tile_q <= 0 ||
+        config.tile_kv <= 0 || config.num_q_warp_groups <= 0 ||
+        config.pv_warps_per_q_group <= 0 || config.block_size <= 0 ||
+        config.smem_size == 0 || selected_reducer_dimension_warps <= 0)
+    {
+        printf("[cudaFlashAttn_context_transaction] No valid compiled launch "
+               "geometry\n");
+        return -1;
+    }
+
+    const FA2ContextTransactionArguments arguments{
+        .Q = Q,
+        .K = K,
+        .V = V,
+        .O = O,
+        .O_partial = O_partial,
+        .m_partial = m_partial,
+        .l_partial = l_partial,
+        .batch_size = batch_size,
+        .seq_len = seq_len,
+        .kv_capacity = kv_capacity,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim)),
+        .causal = causal,
+        .window_size = window_size,
+        .position_offset = position_offset,
+        .device_params = device_params,
+        .mask = mask,
+        .head_start = head_start,
+        .gqa_n_rep = gqa_n_rep,
+        .context_partition_size = context_partition_size,
+        .max_context_partitions = max_context_partitions,
+        .context_partition_slots = context_partition_slots,
+        .device_direct_partition_limit = device_direct_partition_limit,
+        .reducer_dimension_warps = selected_reducer_dimension_warps,
+        .capture_conditional = capture_conditional,
+    };
+
+#define FA2_CONTEXT_DISPATCH(QW, PVW, HD, TKV)                              \
+    return launchFA2ContextTransactionSpecialization<                       \
+        QW, PVW, HD, TKV, KV_FP16>(arguments, config, schedule, stream)
+
+#define FA2_CONTEXT_DISPATCH_TILE(QW, PVW, HD) \
+    do                                          \
+    {                                           \
+        if (config.tile_kv == 16)               \
+            FA2_CONTEXT_DISPATCH(QW, PVW, HD, 16); \
+        if (config.tile_kv == 32)               \
+            FA2_CONTEXT_DISPATCH(QW, PVW, HD, 32); \
+        if (config.tile_kv == 64)               \
+            FA2_CONTEXT_DISPATCH(QW, PVW, HD, 64); \
+    } while (0)
+
+    if (head_dim <= 64)
+        FA2_CONTEXT_DISPATCH_TILE(6, 1, 64);
+    if (head_dim <= 128)
+        FA2_CONTEXT_DISPATCH_TILE(4, 1, 128);
+    if (config.pv_warps_per_q_group == 1)
+        FA2_CONTEXT_DISPATCH_TILE(2, 1, 256);
+    if (config.pv_warps_per_q_group == 2)
+        FA2_CONTEXT_DISPATCH_TILE(2, 2, 256);
+    if (config.pv_warps_per_q_group == 4)
+        FA2_CONTEXT_DISPATCH_TILE(2, 4, 256);
+
+#undef FA2_CONTEXT_DISPATCH_TILE
+#undef FA2_CONTEXT_DISPATCH
+
+    printf("[cudaFlashAttn_context_transaction] Dispatch escaped a validated "
+           "specialization\n");
+    return -1;
 }
 
 // =============================================================================
@@ -2494,6 +3823,218 @@ extern "C"
             causal, window_size, position_offset, device_params, mask,
             static_cast<cudaStream_t>(stream), device_idx,
             head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch canonical fixed-context FA2 as ordered captured graph nodes.
+     *
+     * One phase-one node is recorded for each contiguous logical K/V partition,
+     * followed by the deterministic device reducer.  This is the arithmetic
+     * reference for context-parallel scheduling: it uses the same phase-one
+     * specialization and summary layout, but exposes no cross-partition grid
+     * concurrency.  All workspace is caller-owned and persistent.
+     */
+    int cudaFlashAttn_prefill_fa2_fp16kv_partitioned_sequence(
+        const float *Q,
+        const void *K_fp16,
+        const void *V_fp16,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int batch_size,
+        int seq_len,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return fa2_context_transaction_launch<true>(
+            Q,
+            K_fp16,
+            V_fp16,
+            O,
+            O_partial,
+            m_partial,
+            l_partial,
+            batch_size,
+            seq_len,
+            kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            causal,
+            window_size,
+            position_offset,
+            device_params,
+            mask,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit,
+            reducer_dimension_warps,
+            capture_conditional,
+            FA2ContextPartitionSchedule::SequenceGraphNodes,
+            static_cast<cudaStream_t>(stream),
+            device_idx,
+            head_start,
+            gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch canonical fixed-context FA2 with FP32 K/V storage.
+     *
+     * The arithmetic and persistent summary layout are identical to the FP16
+     * entrypoint below. Only the producer's global-memory load/conversion type
+     * differs, allowing native FP32 and explicitly converted cache views to use
+     * the same capture-stable context graph without an alternate execution path.
+     */
+    int cudaFlashAttn_prefill_fa2_context_parallel(
+        const float *Q,
+        const float *K,
+        const float *V,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int batch_size,
+        int seq_len,
+        int kv_capacity,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return fa2_context_transaction_launch<false>(
+            Q,
+            K,
+            V,
+            O,
+            O_partial,
+            m_partial,
+            l_partial,
+            batch_size,
+            seq_len,
+            kv_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            causal,
+            window_size,
+            position_offset,
+            device_params,
+            mask,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit,
+            reducer_dimension_warps,
+            capture_conditional,
+            FA2ContextPartitionSchedule::ContextParallelGrid,
+            static_cast<cudaStream_t>(stream),
+            device_idx,
+            head_start,
+            gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch canonical fixed-context FA2 with a parallel partition grid.
+     *
+     * Every context partition executes concurrently in one phase-one graph node;
+     * the second node merges summaries in ascending logical order entirely on
+     * device.  The output must be byte-identical to
+     * `cudaFlashAttn_prefill_fa2_fp16kv_partitioned_sequence` before this mode
+     * can be admitted to production dispatch.
+     */
+    int cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(
+        const float *Q,
+        const void *K_fp16,
+        const void *V_fp16,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int batch_size,
+        int seq_len,
+        int kv_capacity,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return fa2_context_transaction_launch<true>(
+            Q,
+            K_fp16,
+            V_fp16,
+            O,
+            O_partial,
+            m_partial,
+            l_partial,
+            batch_size,
+            seq_len,
+            kv_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            causal,
+            window_size,
+            position_offset,
+            device_params,
+            mask,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit,
+            reducer_dimension_warps,
+            capture_conditional,
+            FA2ContextPartitionSchedule::ContextParallelGrid,
+            static_cast<cudaStream_t>(stream),
+            device_idx,
+            head_start,
+            gqa_n_rep);
     }
 
     /**
@@ -2932,6 +4473,10 @@ extern "C"
 
     /**
      * @brief Derive AttentionDeviceParams from device-owned KV cache count.
+     *
+     * When @p prefill_branch_condition is non-zero, this same producer also
+     * publishes the native graph branch after deriving the live K/V length.
+     * The condition and its key threshold must therefore be supplied together.
      */
     int cudaFlashAttn_prepare_device_params_from_count(
         void *device_params,
@@ -2940,14 +4485,21 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
             query_rows <= 0 || kv_stride <= 0 ||
-            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream ||
+            ((prefill_branch_condition == 0) != (direct_kv_limit == 0)))
         {
             return -1;
         }
+#if CUDART_VERSION < 12030
+        if (prefill_branch_condition != 0)
+            return -1;
+#endif
 
         cuda_derive_attention_params_from_cached_tokens_kernel<<<1, query_rows, 0,
                                                                  static_cast<cudaStream_t>(stream)>>>(
@@ -2956,7 +4508,9 @@ extern "C"
             seq_len,
             query_rows,
             kv_stride,
-            active_query_rows_device);
+            active_query_rows_device,
+            prefill_branch_condition,
+            direct_kv_limit);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -2969,6 +4523,10 @@ extern "C"
 
     /**
      * @brief Write explicit decode geometry to the device-owned param block.
+     *
+     * Isolated graph tests may also use this producer to publish an adaptive
+     * prefill branch. Production cache-backed graphs use the count-derived
+     * writer above so replay remains device-owned.
      */
     int cudaFlashAttn_prepare_device_params_from_geometry(
         void *device_params,
@@ -2976,15 +4534,22 @@ extern "C"
         int kv_stride,
         int position_offset,
         int query_rows,
+        unsigned long long prefill_branch_condition,
+        int direct_kv_limit,
         void *stream)
     {
         if (!device_params || kv_len <= 0 || kv_stride < kv_len ||
             position_offset < 0 ||
             query_rows <= 0 ||
-            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream ||
+            ((prefill_branch_condition == 0) != (direct_kv_limit == 0)))
         {
             return -1;
         }
+#if CUDART_VERSION < 12030
+        if (prefill_branch_condition != 0)
+            return -1;
+#endif
 
         cuda_write_attention_params_from_geometry_kernel
             <<<1, query_rows, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -2992,7 +4557,9 @@ extern "C"
                 kv_len,
                 kv_stride,
                 position_offset,
-                query_rows);
+                query_rows,
+                prefill_branch_condition,
+                direct_kv_limit);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

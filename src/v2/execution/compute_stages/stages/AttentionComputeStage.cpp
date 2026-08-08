@@ -32,6 +32,8 @@
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "../../../kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
+#include "../../../kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace llaminar2
@@ -471,6 +473,91 @@ namespace llaminar2
             workspace_partial_rows,
             workspace_heads,
             workspace_head_dim);
+
+#if defined(HAVE_CUDA)
+        if (params_.device_id.is_cuda())
+        {
+            cudaDeviceProp properties{};
+            const int device_index =
+                params_.device_id.toKernelDeviceIndex();
+            const cudaError_t property_status =
+                cudaGetDeviceProperties(&properties, device_index);
+            if (property_status != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "AttentionComputeStage could not query immutable CUDA "
+                    "capture geometry for " +
+                    params_.device_id.toString() + ": " +
+                    cudaGetErrorString(property_status));
+            }
+
+            const int kv_capacity =
+                params_.kv_cache
+                    ? params_.kv_cache->max_seq_len()
+                    : std::max(params_.kv_len, params_.seq_len);
+            const cuda::fa2_policy::FA2PrefillParallelPlan prefill_plan =
+                cuda::fa2_policy::selectFA2PrefillParallelPlan({
+                    .batch_size = params_.batch_size,
+                    .query_rows = params_.seq_len,
+                    .local_query_heads = params_.n_heads,
+                    .head_dim = params_.head_dim,
+                    .kv_capacity = kv_capacity,
+                    .sm_count = properties.multiProcessorCount,
+                    .requested_axis =
+                        params_.execution_policy.prefill_parallel_axis,
+                });
+            if (!prefill_plan.valid)
+            {
+                throw std::runtime_error(
+                    "AttentionComputeStage received an invalid CUDA FA2 "
+                    "capture plan for " + params_.device_id.toString());
+            }
+
+            if (prefill_plan.usesContextParallelism())
+            {
+                const auto require_capacity = [&reqs](
+                                                  const char *name,
+                                                  std::size_t bytes)
+                {
+                    for (auto &buffer : reqs.buffers)
+                    {
+                        if (buffer.name == name)
+                        {
+                            buffer.size_bytes =
+                                std::max(buffer.size_bytes, bytes);
+                            return;
+                        }
+                    }
+                    reqs.buffers.push_back({name, bytes, 256, true});
+                };
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    prefill_plan.partial_output_bytes);
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_M,
+                    prefill_plan.partial_m_bytes);
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_L,
+                    prefill_plan.partial_l_bytes);
+            }
+
+            LOG_TRACE(
+                "[AttentionComputeStage] CUDA prefill capture plan"
+                << " device=" << params_.device_id.toString()
+                << " requested="
+                << attention::attentionPrefillParallelAxisName(
+                       params_.execution_policy.prefill_parallel_axis)
+                << " selected="
+                << (prefill_plan.usesContextParallelism()
+                        ? "key_value_context"
+                        : "query_sequence")
+                << " query_blocks=" << prefill_plan.query_grid_blocks
+                << " context_partitions="
+                << prefill_plan.max_context_partitions
+                << " partial_output_bytes="
+                << prefill_plan.partial_output_bytes);
+        }
+#endif
 
         /*
          * Mixed-precision KV conversion has a different index space from the
@@ -933,6 +1020,15 @@ namespace llaminar2
                 attention::kMaxGroupedVerifierAttentionRows &&
             params_.causal;
 
+        const attention::AttentionPrefillCaptureGeometry prefill_capture{
+            .batch_size = params_.batch_size,
+            .query_rows = params_.seq_len,
+            .local_query_heads = params_.n_heads,
+            .head_dim = params_.head_dim,
+            .kv_capacity = effective_kv_stride,
+            .execution_policy = params_.execution_policy,
+        };
+
         if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)
         {
             const int *device_cached_tokens =
@@ -952,7 +1048,8 @@ namespace llaminar2
                             query_rows_for_params,
                             gpuStream(),
                             effective_kv_stride,
-                            params_.active_query_rows_device))
+                            params_.active_query_rows_device,
+                            prefill_capture))
                     {
                         LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
                                   << params_.layer_idx << " on " << params_.device_id.toString());
@@ -1411,7 +1508,8 @@ namespace llaminar2
                 params_.head_start,
                 -1, // local_n_heads (n_heads is already local)
                 -1, // local_n_kv_heads (n_kv_heads is already local)
-                params_.gqa_n_rep);
+                params_.gqa_n_rep,
+                params_.execution_policy);
         }
 
         if (!success)

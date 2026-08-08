@@ -24,9 +24,10 @@ namespace llaminar2
     /**
      * @brief Compiled FP32 router-prefill tile geometries.
      *
-     * The names encode the output tile dimensions.  Every candidate uses a
-     * 16-element K tile and 256 threads; changing M/N tiling changes grid-level
-     * parallelism and operand reuse while preserving each accumulator's K order.
+     * The names encode the output tile dimensions and, where more than one K
+     * strip is compiled for the same output tile, the explicit K width.
+     * Changing M/N/K tiling changes grid-level parallelism, operand reuse, and
+     * barrier count while preserving each accumulator's increasing-K order.
      */
     enum class CUDAMoERouterPrefillGeometry : uint8_t
     {
@@ -34,6 +35,7 @@ namespace llaminar2
         Tile64x32,
         Tile32x64,
         Tile32x32,
+        Tile32x32K16,
         Tile32x24,
         Tile24x32,
         Tile64x16,
@@ -77,7 +79,9 @@ namespace llaminar2
         case Geometry::Tile32x64:
             return {"tile32x64", 32, 64, 16, 2, 4, 256};
         case Geometry::Tile32x32:
-            return {"tile32x32", 32, 32, 16, 2, 2, 256};
+            return {"tile32x32", 32, 32, 32, 2, 2, 256};
+        case Geometry::Tile32x32K16:
+            return {"tile32x32_k16", 32, 32, 16, 2, 2, 256};
         case Geometry::Tile32x24:
             return {"tile32x24", 32, 24, 16, 1, 3, 256};
         case Geometry::Tile24x32:
@@ -117,20 +121,18 @@ namespace llaminar2
     {
         if (d_model == 2048 && num_experts == 256)
         {
-            if (seq_len <= 128)
+            if (seq_len <= 64)
                 return CUDAMoERouterPrefillGeometry::Tile16x16;
+            if (seq_len <= 128)
+                return CUDAMoERouterPrefillGeometry::Tile32x16;
             if (seq_len <= 256)
                 return CUDAMoERouterPrefillGeometry::Tile32x32;
             if (seq_len <= 384)
-                return CUDAMoERouterPrefillGeometry::Tile24x32;
+                return CUDAMoERouterPrefillGeometry::Tile64x32;
             if (seq_len <= 640)
-                return CUDAMoERouterPrefillGeometry::Tile32x32;
-            if (seq_len <= 704)
-                return CUDAMoERouterPrefillGeometry::Tile32x24;
-            if (seq_len <= 768)
-                return CUDAMoERouterPrefillGeometry::Tile32x32;
+                return CUDAMoERouterPrefillGeometry::Tile32x32K16;
             if (seq_len <= 1536)
-                return CUDAMoERouterPrefillGeometry::Tile32x64;
+                return CUDAMoERouterPrefillGeometry::Tile64x32;
         }
         return CUDAMoERouterPrefillGeometry::Tile64x64;
     }

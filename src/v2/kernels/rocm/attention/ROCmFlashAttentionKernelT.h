@@ -280,7 +280,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
         private:
             int device_idx_;
@@ -413,7 +414,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             /**
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
@@ -491,7 +493,8 @@ namespace llaminar2
                 int query_rows,
                 void *stream,
                 int kv_stride,
-                const int *active_query_rows_device = nullptr) override;
+                const int *active_query_rows_device = nullptr,
+                const attention::AttentionPrefillCaptureGeometry &prefill_capture = {}) override;
             void resetDynamicState() override;
 
             // =========================================================================
@@ -695,7 +698,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -833,7 +837,8 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface

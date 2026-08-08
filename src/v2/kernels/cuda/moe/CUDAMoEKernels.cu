@@ -11294,31 +11294,104 @@ namespace
             for (int j = 0; j < TN; ++j)
                 acc[i][j] = 0.0f;
 
+        /*
+         * The production Qwen matrices and arena rows are at least 16-byte
+         * aligned and K is divisible by four.  Load both operands as float4
+         * vectors in that common case, then transpose the four scalars into
+         * the established K-major shared-memory layout.  The arithmetic loop
+         * below is deliberately untouched: every output still consumes
+         * k=0,1,... in exactly the same order, so vectorizing transport cannot
+         * change a router-logit byte.
+         *
+         * Ragged or externally supplied geometries retain scalar cooperative
+         * loads.  This is geometry totality, not a production fallback: both
+         * branches feed the same physical kernel and identical arithmetic.
+         */
+        const bool vector_loads =
+            (d_model % BK) == 0 &&
+            (reinterpret_cast<uintptr_t>(hidden) & (alignof(float4) - 1)) == 0 &&
+            (reinterpret_cast<uintptr_t>(gate_weights) &
+             (alignof(float4) - 1)) == 0;
+
         // March across the K (d_model) dimension one BK-wide strip at a time.
         for (int kk = 0; kk < d_model; kk += BK)
         {
-            // Cooperative load of the hidden tile into smem (K-major). Consecutive
-            // threads read consecutive k → fully coalesced within each hidden row.
-            for (int idx = threadIdx.x; idx < BM * BK; idx += blockDim.x)
+            if (vector_loads)
             {
-                const int m = idx / BK;
-                const int k = idx % BK;
-                const int gm = blockM + m;
-                const int gk = kk + k;
-                As[k * BM + m] = (gm < seq_len && gk < d_model)
-                                     ? hidden[static_cast<size_t>(gm) * d_model + gk]
-                                     : 0.0f;
+                static_assert(BK % 4 == 0);
+                constexpr int kVectorsPerRow = BK / 4;
+                constexpr int kHiddenVectors = BM * kVectorsPerRow;
+                constexpr int kGateVectors = BN * kVectorsPerRow;
+                constexpr int kTotalVectors =
+                    kHiddenVectors + kGateVectors;
+
+                for (int vector_index = threadIdx.x;
+                     vector_index < kTotalVectors;
+                     vector_index += blockDim.x)
+                {
+                    const bool loads_hidden = vector_index < kHiddenVectors;
+                    const int operand_index = loads_hidden
+                                                  ? vector_index
+                                                  : vector_index - kHiddenVectors;
+                    const int row = operand_index / kVectorsPerRow;
+                    const int first_k =
+                        (operand_index % kVectorsPerRow) * 4;
+                    const int global_row =
+                        (loads_hidden ? blockM : blockN) + row;
+                    const int row_limit =
+                        loads_hidden ? seq_len : num_experts;
+
+                    float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    if (global_row < row_limit)
+                    {
+                        const float *operand =
+                            loads_hidden ? hidden : gate_weights;
+                        const float *source =
+                            operand +
+                            static_cast<size_t>(global_row) * d_model +
+                            kk + first_k;
+                        values = *reinterpret_cast<const float4 *>(source);
+                    }
+
+                    float *tile = loads_hidden ? As : Bs;
+                    const int tile_rows = loads_hidden ? BM : BN;
+                    tile[(first_k + 0) * tile_rows + row] = values.x;
+                    tile[(first_k + 1) * tile_rows + row] = values.y;
+                    tile[(first_k + 2) * tile_rows + row] = values.z;
+                    tile[(first_k + 3) * tile_rows + row] = values.w;
+                }
             }
-            // Cooperative load of the gate tile into smem (K-major), same coalescing.
-            for (int idx = threadIdx.x; idx < BN * BK; idx += blockDim.x)
+            else
             {
-                const int n = idx / BK;
-                const int k = idx % BK;
-                const int gn = blockN + n;
-                const int gk = kk + k;
-                Bs[k * BN + n] = (gn < num_experts && gk < d_model)
-                                     ? gate_weights[static_cast<size_t>(gn) * d_model + gk]
-                                     : 0.0f;
+                // Scalar transport covers arbitrary positive K and alignment.
+                for (int idx = threadIdx.x;
+                     idx < BM * BK;
+                     idx += blockDim.x)
+                {
+                    const int m = idx / BK;
+                    const int k = idx % BK;
+                    const int gm = blockM + m;
+                    const int gk = kk + k;
+                    As[k * BM + m] = (gm < seq_len && gk < d_model)
+                                         ? hidden[static_cast<size_t>(gm) *
+                                                      d_model +
+                                                  gk]
+                                         : 0.0f;
+                }
+                for (int idx = threadIdx.x;
+                     idx < BN * BK;
+                     idx += blockDim.x)
+                {
+                    const int n = idx / BK;
+                    const int k = idx % BK;
+                    const int gn = blockN + n;
+                    const int gk = kk + k;
+                    Bs[k * BN + n] = (gn < num_experts && gk < d_model)
+                                         ? gate_weights[static_cast<size_t>(gn) *
+                                                            d_model +
+                                                        gk]
+                                         : 0.0f;
+                }
             }
             __syncthreads();
 
@@ -11329,12 +11402,63 @@ namespace
             {
                 float regM[TM];
                 float regN[TN];
+                /*
+                 * Each thread owns contiguous rows/columns within the K-major
+                 * shared tiles.  Consume those fragments with one naturally
+                 * aligned vector instruction when their compile-time width
+                 * permits it.  Components are still fed to the same scalar
+                 * FMA nest below, so this only reduces shared-memory LSU
+                 * instructions; it cannot reorder a dot product.
+                 */
+                if constexpr (TM == 4)
+                {
+                    const float4 values =
+                        *reinterpret_cast<const float4 *>(
+                            &As[k * BM + threadRow * TM]);
+                    regM[0] = values.x;
+                    regM[1] = values.y;
+                    regM[2] = values.z;
+                    regM[3] = values.w;
+                }
+                else if constexpr (TM == 2)
+                {
+                    const float2 values =
+                        *reinterpret_cast<const float2 *>(
+                            &As[k * BM + threadRow * TM]);
+                    regM[0] = values.x;
+                    regM[1] = values.y;
+                }
+                else
+                {
 #pragma unroll
-                for (int i = 0; i < TM; ++i)
-                    regM[i] = As[k * BM + threadRow * TM + i];
+                    for (int i = 0; i < TM; ++i)
+                        regM[i] = As[k * BM + threadRow * TM + i];
+                }
+
+                if constexpr (TN == 4)
+                {
+                    const float4 values =
+                        *reinterpret_cast<const float4 *>(
+                            &Bs[k * BN + threadCol * TN]);
+                    regN[0] = values.x;
+                    regN[1] = values.y;
+                    regN[2] = values.z;
+                    regN[3] = values.w;
+                }
+                else if constexpr (TN == 2)
+                {
+                    const float2 values =
+                        *reinterpret_cast<const float2 *>(
+                            &Bs[k * BN + threadCol * TN]);
+                    regN[0] = values.x;
+                    regN[1] = values.y;
+                }
+                else
+                {
 #pragma unroll
-                for (int j = 0; j < TN; ++j)
-                    regN[j] = Bs[k * BN + threadCol * TN + j];
+                    for (int j = 0; j < TN; ++j)
+                        regN[j] = Bs[k * BN + threadCol * TN + j];
+                }
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -17719,9 +17843,13 @@ extern "C"
                 hidden, gate_weights, logits, seq_len, d_model, num_experts,
                 cuda_stream, "cudaMoE_route_logits_tiled_32x64");
         case Geometry::Tile32x32:
-            return launch_route_logits_tiled_geometry<32, 32, 16, 2, 2>(
+            return launch_route_logits_tiled_geometry<32, 32, 32, 2, 2>(
                 hidden, gate_weights, logits, seq_len, d_model, num_experts,
                 cuda_stream, "cudaMoE_route_logits_tiled_32x32");
+        case Geometry::Tile32x32K16:
+            return launch_route_logits_tiled_geometry<32, 32, 16, 2, 2>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                cuda_stream, "cudaMoE_route_logits_tiled_32x32_k16");
         case Geometry::Tile32x24:
             return launch_route_logits_tiled_geometry<32, 24, 16, 1, 3>(
                 hidden, gate_weights, logits, seq_len, d_model, num_experts,
@@ -17792,6 +17920,9 @@ extern "C"
             queried = query_route_logits_tiled_geometry_resources<32, 64, 16, 2, 4>(&resources);
             break;
         case Geometry::Tile32x32:
+            queried = query_route_logits_tiled_geometry_resources<32, 32, 32, 2, 2>(&resources);
+            break;
+        case Geometry::Tile32x32K16:
             queried = query_route_logits_tiled_geometry_resources<32, 32, 16, 2, 2>(&resources);
             break;
         case Geometry::Tile32x24:

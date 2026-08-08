@@ -15,6 +15,7 @@
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
 #include "../kernels/GDNDeviceStateBinding.h"
+#include "../kernels/attention/AttentionExecutionPolicy.h"
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
@@ -1610,6 +1611,9 @@ namespace llaminar2
          * @param head_start First query head to compute (0-indexed, default 0)
          * @param local_n_heads Number of query heads to compute (-1 = all)
          * @param local_n_kv_heads Number of KV heads for this slice (-1 = all)
+         * @param execution_policy Capture-stable physical prefill policy. The
+         *        backend must either implement the requested axis exactly or
+         *        reject it; silently substituting another path is forbidden.
          * @return true on success, false on failure or unsupported type combination
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
@@ -1649,7 +1653,8 @@ namespace llaminar2
             int head_start = 0,        ///< First query head (TP slice start)
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
             int local_n_kv_heads = -1, ///< Number of KV heads (-1 = all)
-            int gqa_n_rep = 0)         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
+            int gqa_n_rep = 0,         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
+            const attention::AttentionExecutionPolicy &execution_policy = {})
             = 0;
 
         /**
@@ -1902,6 +1907,10 @@ namespace llaminar2
          *        When non-null, @p seq_len and @p query_rows remain immutable
          *        physical launch geometry while this scalar determines which
          *        leading rows may observe and publish serial-equivalent state.
+         * @param prefill_capture Immutable physical prefill geometry and policy.
+         *        CUDA uses this before the parameter producer to establish native
+         *        device-controlled graph branching. An empty value is valid for
+         *        decode/grouped calls that do not construct a prefill graph.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
@@ -1909,7 +1918,8 @@ namespace llaminar2
             int query_rows,
             void *stream,
             int kv_stride,
-            const int *active_query_rows_device = nullptr)
+            const int *active_query_rows_device = nullptr,
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture = {})
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;
@@ -1917,6 +1927,7 @@ namespace llaminar2
             (void)stream;
             (void)kv_stride;
             (void)active_query_rows_device;
+            (void)prefill_capture;
             return false;
         }
     };

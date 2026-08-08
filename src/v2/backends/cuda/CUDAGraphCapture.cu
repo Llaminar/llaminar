@@ -29,6 +29,397 @@
 namespace llaminar2
 {
 
+#if CUDART_VERSION >= 12030
+    CUDAActiveCaptureConditional::CUDAActiveCaptureConditional(
+        cudaStream_t stream,
+        CUDAActiveCaptureConditionalKind kind)
+        : stream_(stream), kind_(kind)
+    {
+        if (!stream_)
+        {
+            (void)fail(
+                "CUDA active-capture conditional requires an explicit non-default stream");
+            return;
+        }
+
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t dependency_count = 0;
+        cudaError_t status = cudaStreamGetCaptureInfo(
+            stream_,
+            &capture_status,
+            &capture_id_,
+            &parent_graph_,
+            &dependencies,
+            &edge_data,
+            &dependency_count);
+        if (status != cudaSuccess)
+        {
+            (void)fail("cudaStreamGetCaptureInfo(active conditional)", status);
+            return;
+        }
+        if (capture_status != cudaStreamCaptureStatusActive || !parent_graph_)
+        {
+            (void)fail(
+                "CUDA active-capture conditional was requested outside an active stream capture");
+            return;
+        }
+        if (dependency_count > 0 && (!dependencies || !edge_data))
+        {
+            (void)fail(
+                "CUDA active-capture dependency frontier omitted node or edge metadata");
+            return;
+        }
+
+        if (dependency_count > 0)
+        {
+            incoming_dependencies_.assign(
+                dependencies,
+                dependencies + dependency_count);
+            incoming_edge_data_.assign(
+                edge_data,
+                edge_data + dependency_count);
+        }
+
+        status = cudaGraphConditionalHandleCreate(
+            &condition_,
+            parent_graph_,
+            /*defaultLaunchValue=*/0,
+            cudaGraphCondAssignDefault);
+        if (status != cudaSuccess)
+        {
+            (void)fail(
+                "cudaGraphConditionalHandleCreate(active conditional)",
+                status);
+            return;
+        }
+        state_ = State::AwaitingPredicate;
+    }
+
+    bool CUDAActiveCaptureConditional::ready() const noexcept
+    {
+        return state_ == State::AwaitingPredicate && condition_ != 0 &&
+               parent_graph_ != nullptr && stream_ != nullptr;
+    }
+
+    bool CUDAActiveCaptureConditional::bindPublishedPredicate()
+    {
+        if (!ready())
+            return fail(
+                "CUDA active-capture conditional predicate frontier was bound out of lifecycle order");
+
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        unsigned long long current_capture_id = 0;
+        cudaGraph_t current_graph = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t dependency_count = 0;
+        cudaError_t status = cudaStreamGetCaptureInfo(
+            stream_,
+            &capture_status,
+            &current_capture_id,
+            &current_graph,
+            &dependencies,
+            &edge_data,
+            &dependency_count);
+        if (status != cudaSuccess)
+            return fail(
+                "cudaStreamGetCaptureInfo(bind published predicate)",
+                status);
+        if (capture_status != cudaStreamCaptureStatusActive ||
+            current_capture_id != capture_id_ || current_graph != parent_graph_)
+        {
+            return fail(
+                "CUDA active-capture conditional predicate publisher lost its parent capture identity");
+        }
+        if (dependency_count == 0 || !dependencies || !edge_data)
+            return fail(
+                "CUDA active-capture conditional predicate publisher produced no dependency frontier");
+
+        const bool frontier_unchanged =
+            dependency_count == incoming_dependencies_.size() &&
+            std::equal(
+                dependencies,
+                dependencies + dependency_count,
+                incoming_dependencies_.begin());
+        if (frontier_unchanged)
+            return fail(
+                "CUDA active-capture conditional predicate publisher enqueued no graph operation");
+
+        state_ = State::AwaitingBranches;
+        return true;
+    }
+
+    bool CUDAActiveCaptureConditional::beginBranches()
+    {
+        if (state_ != State::AwaitingBranches)
+            return fail(
+                "CUDA active-capture conditional branches were begun out of lifecycle order");
+
+        std::vector<cudaGraphNode_t> dependencies;
+        std::vector<cudaGraphEdgeData> edge_data;
+        if (!queryCurrentFrontier(
+                dependencies,
+                edge_data,
+                "begin conditional branches"))
+        {
+            return false;
+        }
+        return materializeBranches(dependencies, edge_data);
+    }
+
+    bool CUDAActiveCaptureConditional::beginBranchesWithConcurrentRootKernel(
+        const cudaKernelNodeParams &params,
+        const char *semantic_name)
+    {
+        if (state_ != State::AwaitingBranches ||
+            kind_ != CUDAActiveCaptureConditionalKind::IfOnly ||
+            concurrent_root_node_)
+        {
+            return fail(
+                "CUDA concurrent-root conditional was begun out of lifecycle order or with a two-body topology");
+        }
+        if (!semantic_name || semantic_name[0] == '\0' || !params.func ||
+            params.gridDim.x == 0 || params.gridDim.y == 0 ||
+            params.gridDim.z == 0 || params.blockDim.x == 0 ||
+            params.blockDim.y == 0 || params.blockDim.z == 0 ||
+            (params.kernelParams && params.extra))
+        {
+            return fail(
+                "CUDA concurrent-root conditional has invalid semantic identity or launch parameters");
+        }
+
+        std::vector<cudaGraphNode_t> dependencies;
+        std::vector<cudaGraphEdgeData> edge_data;
+        if (!queryCurrentFrontier(
+                dependencies,
+                edge_data,
+                "begin concurrent-root conditional branches"))
+        {
+            return false;
+        }
+
+        const cudaError_t root_status = cudaGraphAddKernelNode(
+            &concurrent_root_node_,
+            parent_graph_,
+            dependencies.data(),
+            dependencies.size(),
+            &params);
+        if (root_status != cudaSuccess)
+        {
+            return fail(
+                std::string("cudaGraphAddKernelNode(concurrent root '") +
+                semantic_name + "'): " + cudaGetErrorString(root_status));
+        }
+
+        return materializeBranches(dependencies, edge_data);
+    }
+
+    bool CUDAActiveCaptureConditional::queryCurrentFrontier(
+        std::vector<cudaGraphNode_t> &dependencies_out,
+        std::vector<cudaGraphEdgeData> &edge_data_out,
+        const char *operation)
+    {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        unsigned long long current_capture_id = 0;
+        cudaGraph_t current_graph = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t dependency_count = 0;
+        cudaError_t status = cudaStreamGetCaptureInfo(
+            stream_,
+            &capture_status,
+            &current_capture_id,
+            &current_graph,
+            &dependencies,
+            &edge_data,
+            &dependency_count);
+        if (status != cudaSuccess)
+        {
+            const std::string capture_operation =
+                std::string("cudaStreamGetCaptureInfo(") +
+                (operation ? operation : "query current frontier") + ")";
+            return fail(capture_operation.c_str(), status);
+        }
+        if (capture_status != cudaStreamCaptureStatusActive ||
+            current_capture_id != capture_id_ || current_graph != parent_graph_)
+        {
+            return fail(
+                "CUDA active-capture conditional lost its parent identity before branch construction");
+        }
+        if (dependency_count == 0 || !dependencies || !edge_data)
+            return fail(
+                "CUDA active-capture conditional has no prepared branch-input frontier");
+
+        dependencies_out.assign(
+            dependencies,
+            dependencies + dependency_count);
+        edge_data_out.assign(edge_data, edge_data + dependency_count);
+        return true;
+    }
+
+    bool CUDAActiveCaptureConditional::materializeBranches(
+        const std::vector<cudaGraphNode_t> &dependencies,
+        const std::vector<cudaGraphEdgeData> &edge_data)
+    {
+        if (state_ != State::AwaitingBranches || dependencies.empty() ||
+            dependencies.size() != edge_data.size())
+        {
+            return fail(
+                "CUDA active-capture conditional received an invalid prepared frontier");
+        }
+        cudaGraphNodeParams conditional_params{};
+        conditional_params.type = cudaGraphNodeTypeConditional;
+        conditional_params.conditional.handle = condition_;
+        conditional_params.conditional.type = cudaGraphCondTypeIf;
+        conditional_params.conditional.size =
+            kind_ == CUDAActiveCaptureConditionalKind::IfOnly ? 1 : 2;
+        const cudaError_t status = cudaGraphAddNode(
+            &conditional_node_,
+            parent_graph_,
+            dependencies.data(),
+            edge_data.data(),
+            dependencies.size(),
+            &conditional_params);
+        if (status != cudaSuccess)
+            return fail("cudaGraphAddNode(active conditional)", status);
+        if (!conditional_params.conditional.phGraph_out ||
+            !conditional_params.conditional.phGraph_out[0] ||
+            (kind_ == CUDAActiveCaptureConditionalKind::IfElse &&
+             !conditional_params.conditional.phGraph_out[1]))
+        {
+            return fail(
+                "CUDA did not materialize the declared active-capture conditional bodies");
+        }
+
+        branch_graphs_[branchIndex(
+            CUDAActiveCaptureConditionalBranch::IfNonZero)] =
+            conditional_params.conditional.phGraph_out[0];
+        if (kind_ == CUDAActiveCaptureConditionalKind::IfElse)
+        {
+            branch_graphs_[branchIndex(
+                CUDAActiveCaptureConditionalBranch::ElseZero)] =
+                conditional_params.conditional.phGraph_out[1];
+        }
+        state_ = State::BuildingBranches;
+        return true;
+    }
+
+    bool CUDAActiveCaptureConditional::appendKernel(
+        CUDAActiveCaptureConditionalBranch branch,
+        const cudaKernelNodeParams &params,
+        const char *semantic_name)
+    {
+        const std::size_t index = branchIndex(branch);
+        if (state_ != State::BuildingBranches || index >= branch_graphs_.size() ||
+            (branch == CUDAActiveCaptureConditionalBranch::ElseZero &&
+             kind_ == CUDAActiveCaptureConditionalKind::IfOnly))
+            return fail(
+                "CUDA active-capture conditional branch kernel was appended out of lifecycle order");
+        if (!semantic_name || semantic_name[0] == '\0' || !branch_graphs_[index] ||
+            !params.func || params.gridDim.x == 0 || params.gridDim.y == 0 ||
+            params.gridDim.z == 0 || params.blockDim.x == 0 ||
+            params.blockDim.y == 0 || params.blockDim.z == 0 ||
+            (params.kernelParams && params.extra))
+        {
+            return fail(
+                "CUDA active-capture conditional branch has invalid semantic identity or launch parameters");
+        }
+
+        cudaGraphNode_t node = nullptr;
+        const cudaGraphNode_t dependency = branch_tails_[index];
+        const cudaError_t status = cudaGraphAddKernelNode(
+            &node,
+            branch_graphs_[index],
+            dependency ? &dependency : nullptr,
+            dependency ? 1 : 0,
+            &params);
+        if (status != cudaSuccess)
+        {
+            return fail(
+                std::string("cudaGraphAddKernelNode(active branch '") +
+                semantic_name + "'): " + cudaGetErrorString(status));
+        }
+        branch_tails_[index] = node;
+        ++branch_node_counts_[index];
+        return true;
+    }
+
+    bool CUDAActiveCaptureConditional::commit()
+    {
+        if (state_ != State::BuildingBranches || !conditional_node_)
+            return fail(
+                "CUDA active-capture conditional was committed out of lifecycle order");
+        if (branch_node_counts_[0] == 0 ||
+            (kind_ == CUDAActiveCaptureConditionalKind::IfElse &&
+             branch_node_counts_[1] == 0))
+            return fail(
+                "CUDA active-capture conditional requires every declared body to be non-empty");
+
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        unsigned long long current_capture_id = 0;
+        cudaGraph_t current_graph = nullptr;
+        cudaError_t status = cudaStreamGetCaptureInfo(
+            stream_,
+            &capture_status,
+            &current_capture_id,
+            &current_graph,
+            /*dependencies_out=*/nullptr,
+            /*edgeData_out=*/nullptr,
+            /*numDependencies_out=*/nullptr);
+        if (status != cudaSuccess)
+            return fail("cudaStreamGetCaptureInfo(commit conditional)", status);
+        if (capture_status != cudaStreamCaptureStatusActive ||
+            current_capture_id != capture_id_ || current_graph != parent_graph_)
+        {
+            return fail(
+                "CUDA active-capture conditional lost its parent capture identity before commit");
+        }
+
+        std::array<cudaGraphNode_t, 2> new_tails{
+            conditional_node_,
+            concurrent_root_node_,
+        };
+        const std::size_t new_tail_count =
+            concurrent_root_node_ ? 2 : 1;
+        status = cudaStreamUpdateCaptureDependencies(
+            stream_,
+            new_tails.data(),
+            /*dependencyData=*/nullptr,
+            new_tail_count,
+            cudaStreamSetCaptureDependencies);
+        if (status != cudaSuccess)
+        {
+            return fail(
+                "cudaStreamUpdateCaptureDependencies(commit conditional)",
+                status);
+        }
+        state_ = State::Committed;
+        return true;
+    }
+
+    bool CUDAActiveCaptureConditional::fail(
+        const char *operation,
+        cudaError_t status)
+    {
+        return fail(
+            std::string(operation ? operation : "unknown CUDA operation") +
+            ": " + cudaGetErrorString(status));
+    }
+
+    bool CUDAActiveCaptureConditional::fail(const std::string &message)
+    {
+        if (error_.empty())
+        {
+            error_ = message;
+            LOG_ERROR("[CUDAActiveCaptureConditional] " << error_);
+        }
+        state_ = State::Failed;
+        return false;
+    }
+#endif
+
     namespace
     {
         /**

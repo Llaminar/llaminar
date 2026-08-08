@@ -1,3 +1,13 @@
+/**
+ * @file CUDANativeVNNIIQTables.cu
+ * @brief Device storage for immutable CUDA NativeVNNI IQ decode tables.
+ *
+ * Backend initialization publishes canonical host codebooks into these device
+ * arrays before any graph is captured. Kernels subsequently treat the arrays
+ * as immutable read-only state; no inference replay performs allocation,
+ * transfer, mutation, or host synchronization for table access.
+ */
+
 #include <cstdint>
 
 namespace llaminar2::cuda_native_vnni

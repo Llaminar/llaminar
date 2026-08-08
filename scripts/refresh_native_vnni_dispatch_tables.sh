@@ -15,7 +15,7 @@ Options:
                               Backend to refresh (default: both; all installs
                               M=1/grouped policies for CPU, CUDA, and ROCm).
                               cpu-prefill is offline research only.
-  --profile quick|family-smoke|qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all
+  --profile quick|family-smoke|qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all
                               Sweep breadth (default: quick)
   --output-dir DIR             Output directory for CSVs, includes, summaries
   --m-values LIST              Comma list of M buckets. Production requires
@@ -1316,9 +1316,9 @@ if [[ -n "${cpu_prefill_fit_candidate_expansion_plan}" ||
 fi
 
 case "${profile}" in
-  quick|family-smoke|qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all) ;;
+  quick|family-smoke|qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all) ;;
   *)
-    echo "error: --profile must be quick, family-smoke, qwen36-core, qwen36-lm-head, qwen36-moe, qwen36, or all" >&2
+    echo "error: --profile must be quick, family-smoke, qwen36-core, qwen-mtp-head, qwen36-moe, qwen36, or all" >&2
     exit 2
     ;;
 esac
@@ -1349,7 +1349,7 @@ fi
 case "${profile}" in
   quick) measurement_profile="quick" ;;
   family-smoke) measurement_profile="family-smoke" ;;
-  qwen36-core|qwen36-lm-head|qwen36-moe|qwen36)
+  qwen36-core|qwen-mtp-head|qwen36-moe|qwen36)
     measurement_profile="partial-production"
     ;;
   all) measurement_profile="production" ;;
@@ -2008,6 +2008,7 @@ if [[ -z "${output_dir}" ]]; then
   output_dir="${repo_root}/benchmark_results/native_vnni_dispatch/${timestamp}-${backend}-${profile}"
 fi
 
+shape_manifest_python_root="${repo_root}/tests/v2/performance/kernels"
 quick_formats="Q4_1,Q5_1,Q6_K"
 all_formats="$(
   PYTHONPATH="${repo_root}/tests/v2/performance/kernels" \
@@ -2023,16 +2024,18 @@ cpu_family_smoke_formats="${family_smoke_formats}"
 quick_shapes="Qwen36_FFN_DownProjection,Qwen36_GDN_OutputProjection"
 family_smoke_shapes="Qwen36_GDN_TimeProjection"
 qwen36_core_shapes="Qwen36_Attn_QKVProjection,Qwen36_FFN_GateUp,Qwen36_FFN_DownProjection,Qwen36_GDN_InnerProjection,Qwen36_GDN_ZProjection,Qwen36_GDN_TimeProjection,Qwen36_GDN_OutputProjection"
-qwen36_lm_head_shapes="Qwen36_LM_Head"
+qwen_mtp_head_shapes="$(
+  PYTHONPATH="${shape_manifest_python_root}" \
+    python3 -m native_vnni_dispatch.shape_manifest --names mtp-head
+)"
 qwen36_moe_shapes="35BMoE_Expert_GateUp,35BMoE_Expert_Down,Qwen36MoE_GDN_QKVProjection,Qwen36MoE_GDN_ZProjection"
-qwen36_shapes="${qwen36_core_shapes},${qwen36_lm_head_shapes},${qwen36_moe_shapes}"
+qwen36_shapes="${qwen36_core_shapes},${qwen_mtp_head_shapes},${qwen36_moe_shapes}"
 shape_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json"
 cpu_serial_arithmetic_contract_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/cpu_native_vnni_serial_m1_arithmetic_v1.json"
 gpu_measurement_plan_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_gpu_measurement_plan_v1.json"
 if [[ -z "${cpu_prefill_split_manifest_path}" ]]; then
   cpu_prefill_split_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v13.json"
 fi
-shape_manifest_python_root="${repo_root}/tests/v2/performance/kernels"
 cpu_prefill_training_plan_module="native_vnni_dispatch.cpu_prefill_training_plan"
 cpu_prefill_generic_refinement_module="native_vnni_dispatch.cpu_prefill_generic_refinement"
 cpu_prefill_development_lineage_module="native_vnni_dispatch.cpu_prefill_development_lineage"
@@ -2108,7 +2111,7 @@ if [[ -z "${cuda_formats}" ]]; then
   case "${profile}" in
     quick) cuda_formats="${quick_formats}" ;;
     family-smoke) cuda_formats="${cuda_family_smoke_formats}" ;;
-    qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all) cuda_formats="${cuda_all_formats}" ;;
+    qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all) cuda_formats="${cuda_all_formats}" ;;
   esac
 fi
 
@@ -2116,7 +2119,7 @@ if [[ -z "${rocm_formats}" ]]; then
   case "${profile}" in
     quick) rocm_formats="${quick_formats}" ;;
     family-smoke) rocm_formats="${rocm_family_smoke_formats}" ;;
-    qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all) rocm_formats="${rocm_all_formats}" ;;
+    qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all) rocm_formats="${rocm_all_formats}" ;;
   esac
 fi
 
@@ -2124,7 +2127,7 @@ if [[ -z "${cpu_formats}" ]]; then
   case "${profile}" in
     quick) cpu_formats="${quick_formats}" ;;
     family-smoke) cpu_formats="${cpu_family_smoke_formats}" ;;
-    qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all) cpu_formats="${cpu_all_formats}" ;;
+    qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all) cpu_formats="${cpu_all_formats}" ;;
   esac
 fi
 
@@ -2133,7 +2136,7 @@ if [[ -z "${shapes}" ]]; then
     quick) shapes="${quick_shapes}" ;;
     family-smoke) shapes="${family_smoke_shapes}" ;;
     qwen36-core) shapes="${qwen36_core_shapes}" ;;
-    qwen36-lm-head) shapes="${qwen36_lm_head_shapes}" ;;
+    qwen-mtp-head) shapes="${qwen_mtp_head_shapes}" ;;
     qwen36-moe) shapes="${qwen36_moe_shapes}" ;;
     qwen36) shapes="${qwen36_shapes}" ;;
     all) shapes="${partition_manifest_shapes}" ;;
@@ -2176,7 +2179,7 @@ case "${profile}" in
     cpu_warmup="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_WARMUP:-2}"
     cpu_iters="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_ITERS:-5}"
     ;;
-  qwen36-core|qwen36-moe|qwen36|all)
+  qwen36-core|qwen-mtp-head|qwen36-moe|qwen36|all)
     cpu_require_policy_keys=1
     cuda_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_MAX_CASES:-1000000}"
     rocm_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_MAX_CASES:-1000000}"
@@ -2186,21 +2189,6 @@ case "${profile}" in
     cuda_timed_replays="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_TIMED_REPLAYS:-16}"
     # An empty override selects the trainer's complete KB1..64 inventory plus
     # the explicit grouped-verifier INHERIT_SERIAL_M1 candidate.
-    rocm_variants="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_VARIANTS:-}"
-    rocm_warmups="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_WARMUPS:-5}"
-    rocm_samples="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_SAMPLES:-30}"
-    cpu_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_MAX_CASES:-1000000}"
-    cpu_warmup="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_WARMUP:-5}"
-    cpu_iters="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_ITERS:-30}"
-    ;;
-  qwen36-lm-head)
-    cpu_require_policy_keys=1
-    cuda_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_MAX_CASES:-1000000}"
-    rocm_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_MAX_CASES:-1000000}"
-    cuda_candidates="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_CANDIDATES:-}"
-    cuda_warmups="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_WARMUPS:-5}"
-    cuda_samples="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_SAMPLES:-30}"
-    cuda_timed_replays="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_TIMED_REPLAYS:-16}"
     rocm_variants="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_VARIANTS:-}"
     rocm_warmups="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_WARMUPS:-5}"
     rocm_samples="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_SAMPLES:-30}"
@@ -5754,7 +5742,7 @@ refresh_rocm() {
     --measurement-plan "${gpu_measurement_plan_path}"
   )
   case "${profile}" in
-    qwen36-core|qwen36-lm-head|qwen36-moe)
+    qwen36-core|qwen-mtp-head|qwen36-moe)
       rocm_generator_args+=(--base-include "${rocm_base_include}")
       ;;
   esac

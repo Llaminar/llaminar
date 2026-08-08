@@ -94,6 +94,7 @@ namespace
                 ? gate_up_value_bytes
                 : gate_up_operand_bytes;
     };
+
     constexpr uint32_t kSupportedCodebookMask =
         (uint32_t{1} << 0) |
         (uint32_t{1} << 4) |
@@ -309,6 +310,195 @@ namespace
     }
 
     /**
+     * @brief Publish an ordinary dual-scale MMA dot from staged raw FP16 bits.
+     *
+     * IQ2_S uses independent scales for the low and high sixteen-value halves
+     * but has no minimum or IQ1 correction term. The paired gate/up kernel can
+     * therefore stage the two raw scale words once per output column and reuse
+     * them for all sixteen rows. This helper deliberately enters the same
+     * canonical contribution function as the generic path; shared-memory
+     * placement changes where metadata is loaded, never its arithmetic.
+     *
+     * @tparam CodebookId NativeVNNI ordinary dual-scale codebook identifier.
+     * @param dot_lo Exact low-half integer dot product from IMMA.
+     * @param dot_hi Exact high-half integer dot product from IMMA.
+     * @param activation_scale Exact FP32 activation scale for this row/block.
+     * @param packed_scales Low-scale bits in bits 0--15 and high-scale bits in
+     *        bits 16--31.
+     * @return Canonically rounded FP32 contribution for this quant block.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float contributionFromStagedDualScaleMma(
+        int32_t dot_lo,
+        int32_t dot_hi,
+        float activation_scale,
+        uint32_t packed_scales)
+    {
+        using Traits =
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+        static_assert(Traits::is_dual_scale);
+        static_assert(!Traits::is_dual_scale_asym);
+        static_assert(!Traits::is_iq1_m);
+        return llaminar2::cuda_native_vnni::
+            native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
+                dot_lo,
+                dot_hi,
+                activation_scale,
+                static_cast<uint16_t>(packed_scales),
+                static_cast<uint16_t>(packed_scales >> 16),
+                /*emin_bits=*/0,
+                /*activation_sum=*/0,
+                /*activation_sum_lo=*/0,
+                /*activation_sum_hi=*/0,
+                /*iq1m_qh=*/0,
+                /*subgroup_sum0=*/0,
+                /*subgroup_sum1=*/0,
+                /*subgroup_sum2=*/0,
+                /*subgroup_sum3=*/0);
+    }
+
+    /**
+     * @brief Publish a symmetric MMA dot from one staged raw FP16 scale.
+     *
+     * Symmetric codebooks have no correction metadata, so a scale loaded once
+     * per output column can be shared by all sixteen row owners. The call still
+     * enters the canonical NativeVNNI FP32 publication contract and therefore
+     * preserves every serial-row rounding boundary.
+     *
+     * @tparam CodebookId NativeVNNI symmetric codebook identifier.
+     * @param dot Exact integer dot product from IMMA.
+     * @param activation_scale Exact FP32 activation scale for this row/block.
+     * @param scale_bits Raw FP16 weight-scale bits.
+     * @return Canonically rounded FP32 contribution for this quant block.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float contributionFromStagedSymmetricMma(
+        int32_t dot,
+        float activation_scale,
+        uint16_t scale_bits)
+    {
+        using Traits =
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+        static_assert(!Traits::is_asymmetric);
+        static_assert(!Traits::is_dual_scale);
+        static_assert(!Traits::is_iq1_m);
+        return llaminar2::cuda_native_vnni::
+            native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
+                dot,
+                /*dot_hi=*/0,
+                activation_scale,
+                scale_bits,
+                /*secondary_bits=*/0,
+                /*emin_bits=*/0,
+                /*activation_sum=*/0,
+                /*activation_sum_lo=*/0,
+                /*activation_sum_hi=*/0,
+                /*iq1m_qh=*/0,
+                /*subgroup_sum0=*/0,
+                /*subgroup_sum1=*/0,
+                /*subgroup_sum2=*/0,
+                /*subgroup_sum3=*/0);
+    }
+
+    /**
+     * @brief Decode paired IQ2_S gate/up fragments with independent loads in flight.
+     *
+     * Gate and up payloads use unrelated immutable weight arrays, so their
+     * codebook lookups have no ordering dependency. Issuing both random
+     * read-only-table loads before applying either sign mask gives the SM two
+     * independent misses to overlap. The decoded bytes and their shared-memory
+     * destinations are exactly the same as two calls to the ordinary IQ2_S
+     * fragment decoder; only instruction scheduling changes.
+     *
+     * @param gate_payload_base Device-owned gate payload allocation.
+     * @param up_payload_base Device-owned up payload allocation.
+     * @param shared_gate_weights Warp-private gate destination.
+     * @param shared_up_weights Warp-private up destination.
+     * @param block Quantization block along K.
+     * @param N Projection output width.
+     * @param column_base First output column owned by this warp.
+     * @param lane Lane index within the warp.
+     */
+    __device__ __forceinline__ void decodePairedIQ2SWeightFragments(
+        const uint8_t *__restrict__ gate_payload_base,
+        const uint8_t *__restrict__ up_payload_base,
+        int8_t *__restrict__ shared_gate_weights,
+        int8_t *__restrict__ shared_up_weights,
+        int block,
+        int N,
+        int column_base,
+        int lane)
+    {
+        constexpr int kPayloadBytes =
+            llaminar2::cuda_native_vnni::CodebookTraits<13>::payload_bytes;
+        const int local_column = lane >> 2;
+        const int lookup = lane & 3;
+        const int column = column_base + local_column;
+        uint64_t signed_gate_grid = 0;
+        uint64_t signed_up_grid = 0;
+        if (column < N)
+        {
+            const size_t linear =
+                static_cast<size_t>(block) * N + column;
+            const uint8_t *gate_payload =
+                gate_payload_base + linear * kPayloadBytes;
+            const uint8_t *up_payload =
+                up_payload_base + linear * kPayloadBytes;
+            const uint8_t gate_qh = gate_payload[4];
+            const uint8_t up_qh = up_payload[4];
+            const int gate_index =
+                static_cast<int>(gate_payload[lookup]) |
+                (static_cast<int>((gate_qh >> (2 * lookup)) & 0x3u) << 8);
+            const int up_index =
+                static_cast<int>(up_payload[lookup]) |
+                (static_cast<int>((up_qh >> (2 * lookup)) & 0x3u) << 8);
+
+            /*
+             * Keep these adjacent and ahead of all dependent sign arithmetic.
+             * nvcc can therefore issue both independent read-only requests
+             * before either result reaches its packed-byte data path.
+             */
+            const uint64_t gate_grid =
+                llaminar2::cuda_native_vnni::iq2_grid_lookup<13>(gate_index);
+            const uint64_t up_grid =
+                llaminar2::cuda_native_vnni::iq2_grid_lookup<13>(up_index);
+            const uint8_t gate_signs = gate_payload[5 + lookup];
+            const uint8_t up_signs = up_payload[5 + lookup];
+
+            const uint32_t gate_low =
+                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    static_cast<uint32_t>(gate_grid),
+                    gate_signs & 0x0Fu);
+            const uint32_t gate_high =
+                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    static_cast<uint32_t>(gate_grid >> 32),
+                    gate_signs >> 4);
+            const uint32_t up_low =
+                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    static_cast<uint32_t>(up_grid),
+                    up_signs & 0x0Fu);
+            const uint32_t up_high =
+                llaminar2::cuda_native_vnni::iq_apply_signs_4(
+                    static_cast<uint32_t>(up_grid >> 32),
+                    up_signs >> 4);
+            signed_gate_grid =
+                static_cast<uint64_t>(gate_low) |
+                (static_cast<uint64_t>(gate_high) << 32);
+            signed_up_grid =
+                static_cast<uint64_t>(up_low) |
+                (static_cast<uint64_t>(up_high) << 32);
+        }
+
+        const size_t fragment_offset =
+            static_cast<size_t>(local_column) * kQuantBlock +
+            lookup * sizeof(uint64_t);
+        *reinterpret_cast<uint64_t *>(
+            shared_gate_weights + fragment_offset) = signed_gate_grid;
+        *reinterpret_cast<uint64_t *>(
+            shared_up_weights + fragment_offset) = signed_up_grid;
+    }
+
+    /**
      * @brief Decode one warp's 32x8 signed-INT8 B fragment into shared memory.
      *
      * IQ2_S and IQ4_NL are the dominant mixed-format expert tensors in the
@@ -485,7 +675,8 @@ namespace
             const int first_tile = tid == 0
                                        ? 0
                                        : inclusive_tile_counts[tid - 1];
-            const int expert_tiles = (count + kRows - 1) / kRows;
+            const int expert_tiles =
+                (count + kRows - 1) / kRows;
             for (int tile = 0; tile < expert_tiles; ++tile)
             {
                 const uint32_t first_row =
@@ -509,7 +700,8 @@ namespace
     template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
         GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
-        GroupedImmaGeometry<ColumnsPerBlock>::projection_minimum_blocks_per_sm)
+        GroupedImmaGeometry<ColumnsPerBlock>::
+            projection_minimum_blocks_per_sm)
     void groupedImmaProjectionKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
@@ -571,10 +763,25 @@ namespace
             (static_cast<int>(blockIdx.x) * Geometry::projection_warps + warp) *
             kColumnsPerWarp;
 
-        __shared__ __align__(16) int8_t shared_a[kRows * kQuantBlock];
-        __shared__ __align__(16)
-            int8_t shared_b[Geometry::projection_warps]
-                            [kColumnsPerWarp * kQuantBlock];
+        constexpr bool kStageIQ4Metadata =
+            CodebookId == 4 && ColumnsPerBlock == 32;
+        constexpr int kScaleColumns =
+            Geometry::projection_warps * kColumnsPerWarp;
+        constexpr int kOperandBytes =
+            kRows * kQuantBlock +
+            Geometry::projection_warps * kColumnsPerWarp * kQuantBlock;
+        constexpr int kStagedMetadataWords =
+            kStageIQ4Metadata ? kScaleColumns : 0;
+        static_assert((kOperandBytes % sizeof(uint32_t)) == 0);
+        __shared__ __align__(16) uint32_t shared_storage[
+            kOperandBytes / sizeof(uint32_t) + kStagedMetadataWords];
+        auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
+        int8_t *shared_a = shared_bytes;
+        int8_t *shared_b =
+            shared_bytes + kRows * kQuantBlock +
+            warp * kColumnsPerWarp * kQuantBlock;
+        uint32_t *shared_weight_scales =
+            shared_storage + kOperandBytes / sizeof(uint32_t);
 
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
@@ -607,7 +814,8 @@ namespace
                  */
                 if (threadIdx.x < 32)
                 {
-                    const int local_row = static_cast<int>(threadIdx.x) >> 1;
+                    const int local_row =
+                        static_cast<int>(threadIdx.x) >> 1;
                     const int half = static_cast<int>(threadIdx.x) & 1;
                     int4 activation = make_int4(0, 0, 0, 0);
                     if (local_row < active_rows)
@@ -624,11 +832,27 @@ namespace
 
                 decodeMmaWeightFragment<CodebookId>(
                     descriptor,
-                    shared_b[warp],
+                    shared_b,
                     block,
                     N,
                     column_base,
                     lane);
+                if constexpr (kStageIQ4Metadata)
+                {
+                    if (lane < kColumnsPerWarp)
+                    {
+                        const int column = column_base + lane;
+                        uint32_t scale_bits = 0;
+                        if (column < N)
+                        {
+                            const size_t linear =
+                                static_cast<size_t>(block) * N + column;
+                            scale_bits = weight_scales[linear];
+                        }
+                        shared_weight_scales[
+                            warp * kColumnsPerWarp + lane] = scale_bits;
+                    }
+                }
                 __syncthreads();
 
                 uint32_t a_fragment[4];
@@ -639,7 +863,7 @@ namespace
                     lane);
                 loadMmaB(
                     b_fragment,
-                    reinterpret_cast<const int *>(shared_b[warp]),
+                    reinterpret_cast<const int *>(shared_b),
                     lane);
 
                 int32_t dot_lo[4] = {0, 0, 0, 0};
@@ -667,26 +891,41 @@ namespace
                         continue;
 
                     const int grouped_row = grouped_row_base + local_row;
-                    const size_t linear =
-                        static_cast<size_t>(block) * N + column;
-                    const uint8_t *payload =
-                        descriptor.payload + linear * kPayloadBytes;
                     const float activation_scale = scales_A[
                         static_cast<size_t>(grouped_row) * blocks_per_row +
                         block];
-                    const float contribution = contributionFromMma<CodebookId>(
-                        shared_a + local_row * kQuantBlock,
-                        dot_lo[element],
-                        dot_hi[element],
-                        payload,
-                        weight_scales,
-                        weight_mins,
-                        weight_emins,
-                        linear,
-                        activation_scale);
-                    partial[element] = __fadd_rn(
-                        partial[element],
-                        contribution);
+                    if constexpr (kStageIQ4Metadata)
+                    {
+                        const int scale_index =
+                            warp * kColumnsPerWarp +
+                            mmaFragmentColumn(lane, element);
+                        partial[element] = __fadd_rn(
+                            partial[element],
+                            contributionFromStagedSymmetricMma<CodebookId>(
+                                dot_lo[element],
+                                activation_scale,
+                                static_cast<uint16_t>(
+                                    shared_weight_scales[scale_index])));
+                    }
+                    else
+                    {
+                        const size_t linear =
+                            static_cast<size_t>(block) * N + column;
+                        const uint8_t *payload =
+                            descriptor.payload + linear * kPayloadBytes;
+                        partial[element] = __fadd_rn(
+                            partial[element],
+                            contributionFromMma<CodebookId>(
+                                shared_a + local_row * kQuantBlock,
+                                dot_lo[element],
+                                dot_hi[element],
+                                payload,
+                                weight_scales,
+                                weight_mins,
+                                weight_emins,
+                                linear,
+                                activation_scale));
+                    }
                 }
                 __syncthreads();
             }
@@ -1038,20 +1277,19 @@ namespace
     }
 
     /**
-     * @brief Compute gate and up in one warp and retain the pair in registers.
+     * @brief Execute the proven sixteen-row paired gate/up schedule.
      *
-     * A warp owns the same eight output columns for both projections. It
-     * decodes both B fragments into disjoint shared ranges, loads the common A
-     * fragment once, and evaluates the two canonical partition trees without
-     * an intervening publication. Only the exact SwiGLU result is written to
-     * shared memory for the unchanged 32-column blockwise quantizer. This
-     * schedule removes the duplicate A `ldmatrix` and the gate/up FP32 shared
-     * round trip while preserving every serial-row rounding boundary.
+     * A warp owns eight output columns for both projections. It decodes the two
+     * B fragments into disjoint shared ranges, loads the common A fragment once,
+     * and evaluates the fixed partition tree without an intervening
+     * publication. Only the exact SwiGLU value enters shared memory for the
+     * unchanged 32-column blockwise quantizer.
      */
     template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
         PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
-        PairedGateUpGeometry<ColumnsPerBlock>::gate_up_minimum_blocks_per_sm)
+        PairedGateUpGeometry<ColumnsPerBlock>::
+            gate_up_minimum_blocks_per_sm)
     void groupedImmaPairedGateUpSwiGluKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
@@ -1098,8 +1336,8 @@ namespace
         if (gate_descriptors[expert].codebook_id != CodebookId)
             return;
 
-        const auto gate_descriptor = gate_descriptors[expert];
-        const auto up_descriptor = up_descriptors[expert];
+        const auto &gate_descriptor = gate_descriptors[expert];
+        const auto &up_descriptor = up_descriptors[expert];
         if (!descriptorMatches<CodebookId>(gate_descriptor, N, K) ||
             !descriptorMatches<CodebookId>(up_descriptor, N, K) ||
             k_partitions <= 0)
@@ -1118,8 +1356,15 @@ namespace
 
         static_assert(
             (Geometry::gate_up_shared_bytes % sizeof(uint32_t)) == 0);
+        constexpr int kScaleColumns =
+            Geometry::gate_up_warps * kColumnsPerWarp;
+        constexpr bool kStageIQ2SMetadata =
+            CodebookId == 13 && ColumnsPerBlock == 32;
+        constexpr int kStagedMetadataWords =
+            kStageIQ2SMetadata ? 2 * kScaleColumns + kRows : 0;
         __shared__ __align__(16) uint32_t shared_storage[
-            Geometry::gate_up_shared_bytes / sizeof(uint32_t)];
+            Geometry::gate_up_shared_bytes / sizeof(uint32_t) +
+            kStagedMetadataWords];
         auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
         int8_t *shared_a = shared_bytes;
         constexpr int kWarpWeightBytes = kColumnsPerWarp * kQuantBlock;
@@ -1130,9 +1375,19 @@ namespace
             Geometry::gate_up_warps * kWarpWeightBytes +
             warp * kWarpWeightBytes;
 
+        uint32_t *shared_gate_scale_pairs =
+            shared_storage +
+            Geometry::gate_up_shared_bytes / sizeof(uint32_t);
+        uint32_t *shared_up_scale_pairs =
+            shared_gate_scale_pairs + kScaleColumns;
+        float *shared_activation_scales = reinterpret_cast<float *>(
+            shared_up_scale_pairs + kScaleColumns);
+
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::
                 payload_bytes;
+        const uint8_t *gate_payload_base = gate_descriptor.payload;
+        const uint8_t *up_payload_base = up_descriptor.payload;
         const auto *gate_scales =
             static_cast<const uint16_t *>(gate_descriptor.scales);
         const auto *gate_mins =
@@ -1164,14 +1419,17 @@ namespace
             {
                 if (threadIdx.x < 32)
                 {
-                    const int local_row = static_cast<int>(threadIdx.x) >> 1;
+                    const int local_row =
+                        static_cast<int>(threadIdx.x) >> 1;
                     const int half = static_cast<int>(threadIdx.x) & 1;
                     int4 activation = make_int4(0, 0, 0, 0);
                     if (local_row < active_rows)
                     {
-                        const int grouped_row = grouped_row_base + local_row;
+                        const int grouped_row =
+                            grouped_row_base + local_row;
                         activation = *reinterpret_cast<const int4 *>(
-                            A_int8 + static_cast<size_t>(grouped_row) * K +
+                            A_int8 +
+                            static_cast<size_t>(grouped_row) * K +
                             block * kQuantBlock + half * sizeof(int4));
                     }
                     *reinterpret_cast<int4 *>(
@@ -1179,20 +1437,76 @@ namespace
                         half * sizeof(int4)) = activation;
                 }
 
-                decodeMmaWeightFragment<CodebookId>(
-                    gate_descriptor,
-                    shared_gate_b,
-                    block,
-                    N,
-                    column_base,
-                    lane);
-                decodeMmaWeightFragment<CodebookId>(
-                    up_descriptor,
-                    shared_up_b,
-                    block,
-                    N,
-                    column_base,
-                    lane);
+                if constexpr (CodebookId == 13)
+                {
+                    decodePairedIQ2SWeightFragments(
+                        gate_payload_base,
+                        up_payload_base,
+                        shared_gate_b,
+                        shared_up_b,
+                        block,
+                        N,
+                        column_base,
+                        lane);
+                }
+                else
+                {
+                    decodeMmaWeightFragment<CodebookId>(
+                        gate_descriptor,
+                        shared_gate_b,
+                        block,
+                        N,
+                        column_base,
+                        lane);
+                    decodeMmaWeightFragment<CodebookId>(
+                        up_descriptor,
+                        shared_up_b,
+                        block,
+                        N,
+                        column_base,
+                        lane);
+                }
+
+                if constexpr (kStageIQ2SMetadata)
+                {
+                    if (lane < kColumnsPerWarp)
+                    {
+                        const int column = column_base + lane;
+                        uint32_t gate_scale_pair = 0;
+                        uint32_t up_scale_pair = 0;
+                        if (column < N)
+                        {
+                            const size_t linear =
+                                static_cast<size_t>(block) * N + column;
+                            gate_scale_pair =
+                                static_cast<uint32_t>(gate_scales[linear]) |
+                                (static_cast<uint32_t>(gate_mins[linear])
+                                 << 16);
+                            up_scale_pair =
+                                static_cast<uint32_t>(up_scales[linear]) |
+                                (static_cast<uint32_t>(up_mins[linear]) << 16);
+                        }
+                        const int scale_index =
+                            warp * kColumnsPerWarp + lane;
+                        shared_gate_scale_pairs[scale_index] = gate_scale_pair;
+                        shared_up_scale_pairs[scale_index] = up_scale_pair;
+                    }
+                    if (threadIdx.x < kRows)
+                    {
+                        const int local_row =
+                            static_cast<int>(threadIdx.x);
+                        float activation_scale = 0.0f;
+                        if (local_row < active_rows)
+                        {
+                            activation_scale = scales_A[
+                                static_cast<size_t>(
+                                    grouped_row_base + local_row) *
+                                    blocks_per_row +
+                                block];
+                        }
+                        shared_activation_scales[local_row] = activation_scale;
+                    }
+                }
                 __syncthreads();
 
                 uint32_t a_fragment[4];
@@ -1222,8 +1536,10 @@ namespace
                         gate_b_fragment[0], 0u};
                     const uint32_t gate_b_hi[2] = {
                         0u, gate_b_fragment[1]};
-                    const uint32_t up_b_lo[2] = {up_b_fragment[0], 0u};
-                    const uint32_t up_b_hi[2] = {0u, up_b_fragment[1]};
+                    const uint32_t up_b_lo[2] = {
+                        up_b_fragment[0], 0u};
+                    const uint32_t up_b_hi[2] = {
+                        0u, up_b_fragment[1]};
                     mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_lo);
                     mmaM16N8K32(gate_dot_hi, a_fragment, gate_b_hi);
                     mmaM16N8K32(up_dot_lo, a_fragment, up_b_lo);
@@ -1231,8 +1547,14 @@ namespace
                 }
                 else
                 {
-                    mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_fragment);
-                    mmaM16N8K32(up_dot_lo, a_fragment, up_b_fragment);
+                    mmaM16N8K32(
+                        gate_dot_lo,
+                        a_fragment,
+                        gate_b_fragment);
+                    mmaM16N8K32(
+                        up_dot_lo,
+                        a_fragment,
+                        up_b_fragment);
                 }
 
 #pragma unroll
@@ -1244,36 +1566,61 @@ namespace
                     if (local_row >= active_rows || column >= N)
                         continue;
 
-                    const int grouped_row = grouped_row_base + local_row;
-                    const size_t linear =
-                        static_cast<size_t>(block) * N + column;
-                    const float activation_scale = scales_A[
-                        static_cast<size_t>(grouped_row) * blocks_per_row +
-                        block];
-                    gate_partial[element] = __fadd_rn(
-                        gate_partial[element],
-                        contributionFromMma<CodebookId>(
-                            shared_a + local_row * kQuantBlock,
-                            gate_dot_lo[element],
-                            gate_dot_hi[element],
-                            gate_descriptor.payload + linear * kPayloadBytes,
-                            gate_scales,
-                            gate_mins,
-                            gate_emins,
-                            linear,
-                            activation_scale));
-                    up_partial[element] = __fadd_rn(
-                        up_partial[element],
-                        contributionFromMma<CodebookId>(
-                            shared_a + local_row * kQuantBlock,
-                            up_dot_lo[element],
-                            up_dot_hi[element],
-                            up_descriptor.payload + linear * kPayloadBytes,
-                            up_scales,
-                            up_mins,
-                            up_emins,
-                            linear,
-                            activation_scale));
+                    if constexpr (kStageIQ2SMetadata)
+                    {
+                        const int scale_index =
+                            warp * kColumnsPerWarp +
+                            mmaFragmentColumn(lane, element);
+                        const float activation_scale =
+                            shared_activation_scales[local_row];
+                        gate_partial[element] = __fadd_rn(
+                            gate_partial[element],
+                            contributionFromStagedDualScaleMma<CodebookId>(
+                                gate_dot_lo[element],
+                                gate_dot_hi[element],
+                                activation_scale,
+                                shared_gate_scale_pairs[scale_index]));
+                        up_partial[element] = __fadd_rn(
+                            up_partial[element],
+                            contributionFromStagedDualScaleMma<CodebookId>(
+                                up_dot_lo[element],
+                                up_dot_hi[element],
+                                activation_scale,
+                                shared_up_scale_pairs[scale_index]));
+                    }
+                    else
+                    {
+                        const int grouped_row = grouped_row_base + local_row;
+                        const size_t linear =
+                            static_cast<size_t>(block) * N + column;
+                        const float activation_scale = scales_A[
+                            static_cast<size_t>(grouped_row) * blocks_per_row +
+                            block];
+                        gate_partial[element] = __fadd_rn(
+                            gate_partial[element],
+                            contributionFromMma<CodebookId>(
+                                shared_a + local_row * kQuantBlock,
+                                gate_dot_lo[element],
+                                gate_dot_hi[element],
+                                gate_payload_base + linear * kPayloadBytes,
+                                gate_scales,
+                                gate_mins,
+                                gate_emins,
+                                linear,
+                                activation_scale));
+                        up_partial[element] = __fadd_rn(
+                            up_partial[element],
+                            contributionFromMma<CodebookId>(
+                                shared_a + local_row * kQuantBlock,
+                                up_dot_lo[element],
+                                up_dot_hi[element],
+                                up_payload_base + linear * kPayloadBytes,
+                                up_scales,
+                                up_mins,
+                                up_emins,
+                                linear,
+                                activation_scale));
+                    }
                 }
                 __syncthreads();
             }

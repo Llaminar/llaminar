@@ -287,9 +287,16 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
             or (record.get("tags") or {}).get("accounting_role")
             != "captured_graph_replay_multiplier"
             or (record.get("tags") or {}).get("source")
-            != "captured_stochastic_compact_outcome"
+            not in {
+                "captured_greedy_compact_outcome",
+                "captured_stochastic_compact_outcome",
+            }
             or (record.get("tags") or {}).get("execution")
             != "native_conditional_graph"
+            for record in compact_records
+        ) or not any(
+            (record.get("tags") or {}).get("source")
+            == "captured_stochastic_compact_outcome"
             for record in compact_records
         ):
             return MTPDeviceGenerationValidation(
