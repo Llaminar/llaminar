@@ -1134,8 +1134,9 @@ TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBind
     EXPECT_EQ(kernel.speculative_state_size, 32);
 }
 
-TEST(Test__GDNKernels, CPUShortConvVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+TEST(Test__GDNKernels, CPUShortConvVerifierStageRequiresManagerOwnedCaptureSlots)
 {
+    ensureCPUBackendForWorkspace();
     RecordingShortConvolution kernel;
     std::vector<float> conv_state(48, 0.0f);
 
@@ -1152,18 +1153,31 @@ TEST(Test__GDNKernels, CPUShortConvVerifierStageOwnsHostCaptureSlotsWhenWorkspac
     stage.bindWorkspace(nullptr);
 
     EXPECT_EQ(kernel.capture_bind_calls, 1);
-    ASSERT_NE(kernel.capture_workspace, nullptr);
-    EXPECT_NE(kernel.capture_workspace, conv_state.data());
-    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
     EXPECT_EQ(kernel.capture_state_size, 48);
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
     EXPECT_EQ(kernel.speculative_state_size, 48);
     EXPECT_TRUE(stage.hasVerifierStateCapture());
+
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_EQ(reqs.buffers.size(), 1U);
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    stage.bindWorkspace(&workspace);
+    EXPECT_EQ(kernel.capture_workspace,
+              workspace.getBuffer(reqs.buffers.front().name));
+    EXPECT_NE(kernel.capture_workspace, conv_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
 }
 
-TEST(Test__GDNKernels, CPURecurrenceVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+TEST(Test__GDNKernels, CPURecurrenceVerifierStageRequiresManagerOwnedCaptureSlots)
 {
+    ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet kernel;
     std::vector<float> recurrence_state(32, 0.0f);
 
@@ -1182,14 +1196,26 @@ TEST(Test__GDNKernels, CPURecurrenceVerifierStageOwnsHostCaptureSlotsWhenWorkspa
     stage.bindWorkspace(nullptr);
 
     EXPECT_EQ(kernel.capture_bind_calls, 1);
-    ASSERT_NE(kernel.capture_workspace, nullptr);
-    EXPECT_NE(kernel.capture_workspace, recurrence_state.data());
-    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
     EXPECT_EQ(kernel.capture_state_size, 32);
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
     EXPECT_EQ(kernel.speculative_state_size, 32);
     EXPECT_TRUE(stage.hasVerifierStateCapture());
+
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_EQ(reqs.buffers.size(), 1U);
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    stage.bindWorkspace(&workspace);
+    EXPECT_EQ(kernel.capture_workspace,
+              workspace.getBuffer(reqs.buffers.front().name));
+    EXPECT_NE(kernel.capture_workspace, recurrence_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
 }
 
 TEST(Test__GDNKernels, ShortConvStageResetClearsStaleSpeculativeStateBinding)
@@ -1280,7 +1306,7 @@ TEST(Test__GDNKernels, ShortConvGraphReplayRequiresNoHostWorkspaceRebind)
            "explicit publication entry point owns any required rebind.";
 }
 
-TEST(Test__GDNKernels, ShortConvPublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+TEST(Test__GDNKernels, ShortConvPublicationUsesStageBoundManagerCaptureAfterSharedKernelClear)
 {
     ensureCPUBackendForWorkspace();
     RecordingShortConvolution kernel;
@@ -1435,7 +1461,7 @@ TEST(Test__GDNKernels, RecurrenceGraphReplayRequiresNoHostWorkspaceRebind)
            "explicit publication entry point owns any required rebind.";
 }
 
-TEST(Test__GDNKernels, RecurrencePublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSharedKernelClear)
 {
     ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet kernel;
@@ -2141,6 +2167,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeBy
 
 TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
 {
+    ensureCPUBackendForWorkspace();
     static constexpr int seq_len = 2;
     static constexpr int n_k_heads = 2;
     static constexpr int n_heads = 4;
@@ -2223,6 +2250,13 @@ TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDe
     verifier_p.speculative_state_slot_rows = seq_len;
 
     GDNRecurrenceStage verifier_stage(verifier_p);
+    const WorkspaceRequirements verifier_reqs =
+        verifier_stage.getWorkspaceRequirements(seq_len);
+    DeviceWorkspaceManager verifier_workspace(
+        DeviceId::cpu(),
+        verifier_reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(verifier_workspace.allocate(verifier_reqs));
+    verifier_stage.bindWorkspace(&verifier_workspace);
     ASSERT_TRUE(verifier_stage.execute(ctx.get()));
     EXPECT_EQ(verifier_state, initial_state)
         << "Verifier chunk capture must not mutate live recurrence state";

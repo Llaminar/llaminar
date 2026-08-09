@@ -23,7 +23,6 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -252,8 +251,6 @@ namespace llaminar2
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
-        std::vector<float> host_verifier_state_slots_;
-
         int effectivePrefillSeqLen() const;
         bool shouldUseScalarRealLengthContract() const;
         std::string workspaceStableId() const;
@@ -265,7 +262,21 @@ namespace llaminar2
         bool ensureVerifierStateCaptureWorkspaceBound() const;
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
+        /**
+         * @brief Resolve the readable CPU verifier slots from the bound manager.
+         *
+         * @return The exact manager-owned buffer address, or null when this is a
+         *         GPU stage, no slots are bound, or the binding is incomplete.
+         *
+         * No stage-private host container is permitted: incomplete workspace
+         * discovery must fail visibly instead of acquiring a second owner.
+         */
         const float *cpuVerifierStateCaptureSource() const;
+        /**
+         * @brief Publish one accepted CPU verifier row into live conv state.
+         * @param row Zero-based row in the manager-owned verifier slot matrix.
+         * @return true after an exact state copy, otherwise false.
+         */
         bool restoreCPUVerifierStateCaptureRowDirect(int row);
     };
 

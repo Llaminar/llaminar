@@ -739,6 +739,23 @@ namespace llaminar2
         const std::vector<int32_t> &target_verifier_state_commit_counts,
         const std::vector<int32_t> &stopped_flags)
     {
+        return buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+            shape,
+            requests,
+            committed_output_counts,
+            target_verifier_state_commit_counts,
+            stopped_flags,
+            {});
+    }
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
+        const std::vector<int32_t> &stopped_flags,
+        const std::vector<int32_t> &all_drafts_accepted_flags)
+    {
         if (!shape.valid())
             return metadataFailure(shape, "invalid MTP spec-decode metadata shape");
         if (requests.empty())
@@ -751,6 +768,13 @@ namespace llaminar2
             return metadataFailure(shape, "target verifier state commit count vector does not match request count");
         if (stopped_flags.size() != requests.size())
             return metadataFailure(shape, "stopped flag vector does not match request count");
+        if (!all_drafts_accepted_flags.empty() &&
+            all_drafts_accepted_flags.size() != requests.size())
+        {
+            return metadataFailure(
+                shape,
+                "all-drafts-accepted flag vector does not match request count");
+        }
 
         MTPSpecDecodeMetadataBatch batch;
         batch.ok = true;
@@ -845,7 +869,9 @@ namespace llaminar2
             batch.token_indices_to_sample[request_index] = tx.token_index_to_sample;
             batch.next_condition_tokens[request_index] = tx.next_condition_token;
             batch.all_drafts_accepted_flags[request_index] =
-                tx.allDraftsAccepted() ? 1 : 0;
+                all_drafts_accepted_flags.empty()
+                    ? (tx.allDraftsAccepted() ? 1 : 0)
+                    : (all_drafts_accepted_flags[request_index] != 0 ? 1 : 0);
             batch.stopped_flags[request_index] =
                 stopped_flags[request_index] != 0 ? 1 : 0;
             batch.query_start_locs[request_index] = query_cursor;
@@ -933,7 +959,7 @@ namespace llaminar2
         std::vector<int32_t> target_verifier_state_commit_counts;
         std::vector<int32_t> stopped_flags;
         std::vector<int> expected_accepted_verifier_prefixes;
-        std::vector<bool> expected_all_drafts_accepted_flags;
+        std::vector<int32_t> expected_all_drafts_accepted_flags;
         std::vector<int32_t> expected_next_condition_tokens;
         std::vector<int> expected_valid_sampled_counts;
         spec_requests.reserve(requests.size());
@@ -977,10 +1003,19 @@ namespace llaminar2
                 return fail_request("MTP spec-decode catch-up accepted all drafts without a ready token");
             }
 
+            /*
+             * Acceptance and continuation are independent predicates. A stop
+             * token can truncate an otherwise rejection-free transaction, and
+             * can itself be the final accepted draft. Preserve that acceptance
+             * fact in the transaction metadata while separately withholding the
+             * bonus row whenever output stopped.
+             */
             const bool expected_all_drafts_accepted =
-                result.all_speculative_accepted && !result.stopped_on_output;
+                result.all_speculative_accepted;
+            const bool has_bonus_ready_token =
+                expected_all_drafts_accepted && !result.stopped_on_output;
             const std::optional<int32_t> bonus_ready_token =
-                expected_all_drafts_accepted
+                has_bonus_ready_token
                     ? std::optional<int32_t>{result.ready_token}
                     : std::optional<int32_t>{};
             const int expected_accepted_verifier_prefix =
@@ -1008,12 +1043,12 @@ namespace llaminar2
             expected_accepted_verifier_prefixes.push_back(
                 expected_accepted_verifier_prefix);
             expected_all_drafts_accepted_flags.push_back(
-                expected_all_drafts_accepted);
+                expected_all_drafts_accepted ? 1 : 0);
             expected_valid_sampled_counts.push_back(
                 static_cast<int>(result.accepted_tokens.size()) +
-                (expected_all_drafts_accepted ? 1 : 0));
+                (has_bonus_ready_token ? 1 : 0));
             expected_next_condition_tokens.push_back(
-                expected_all_drafts_accepted
+                has_bonus_ready_token
                     ? result.ready_token
                     : result.accepted_tokens.back());
         }
@@ -1024,7 +1059,8 @@ namespace llaminar2
                 spec_requests,
                 committed_output_counts,
                 target_verifier_state_commit_counts,
-                stopped_flags);
+                stopped_flags,
+                expected_all_drafts_accepted_flags);
         if (!batch.ok)
             return batch;
         if (batch.transactions.size() != requests.size())
@@ -1041,7 +1077,8 @@ namespace llaminar2
                     "MTP spec-decode accepted-prefix mismatch between catch-up result and transaction");
             }
 
-            if (tx.allDraftsAccepted() != expected_all_drafts_accepted_flags[i])
+            if (!results[i].stopped_on_output &&
+                tx.allDraftsAccepted() != expected_all_drafts_accepted_flags[i])
             {
                 return metadataFailure(
                     shape,

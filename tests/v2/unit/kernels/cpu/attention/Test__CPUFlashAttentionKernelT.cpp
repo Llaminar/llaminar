@@ -5,7 +5,6 @@
  * Exercises every code path in the flash attention kernel:
  *   - FP32 decode (seq_len=1, dot_fp32_avx512)
  *   - FP32 prefill (dot_fp32_avx512, online softmax over KV tiles)
- *   - AVX512-VNNI i16/i12 prefill (quantise + packed-pair dot products)
  *   - Causal masking, window masking, GQA head broadcasting
  *   - Edge cases: non-multiple-of-32 head_dim, odd kv_len, single token
  *
@@ -28,7 +27,6 @@
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
-#include "v2/utils/CPUFeatures.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
 #include "v2/utils/PerfStatsCollector.h"
@@ -126,6 +124,7 @@ namespace
             << PerfStatsCollector::summaryString(
                    {"kernel.cpu_attention_grouped_verifier_rows_calls"}, 20);
     }
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -286,44 +285,10 @@ namespace
         return true;
     }
 
-    /// Set env var helper (uses setenv on Linux).
-    struct ScopedEnv
-    {
-        std::string key_;
-        std::string old_val_;
-        bool had_old_ = false;
-
-        ScopedEnv(const char *key, const char *val) : key_(key)
-        {
-            const char *old = std::getenv(key);
-            if (old)
-            {
-                had_old_ = true;
-                old_val_ = old;
-            }
-            setenv(key, val, 1);
-        }
-
-        ~ScopedEnv()
-        {
-            if (had_old_)
-                setenv(key_.c_str(), old_val_.c_str(), 1);
-            else
-                unsetenv(key_.c_str());
-        }
-    };
-
     /// FP32 tolerance for the FP32-only path (flash vs reference).
     /// Online softmax introduces small rounding differences vs. 2-pass softmax.
     constexpr float FP32_TOLERANCE = 1e-4f;
     constexpr float FP32_COSINE_THRESHOLD = 0.99999f;
-
-    /// VNNI i16 quantised path — now the DEFAULT production prefill path.
-    /// INT16 quantisation introduces measurable but bounded error.
-    /// Tolerances here are tight enough to catch regressions while allowing
-    /// the inherent quantisation noise from 12-bit effective precision.
-    constexpr float VNNI_MAX_ABS_TOLERANCE = 0.02f;
-    constexpr float VNNI_COSINE_THRESHOLD = 0.9995f;
 
 } // anonymous namespace
 
@@ -338,17 +303,6 @@ protected:
     void SetUp() override
     {
         rng().seed(42); // deterministic per test
-
-        // Explicitly disable VNNI so these tests isolate the FP32 code path.
-        // VNNI accuracy is tested separately in Test__CPUFlashAttentionKernelT_VNNI.
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "0", 1);
-        mutableDebugEnv().attention.reload();
-    }
-
-    void TearDown() override
-    {
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12");
-        mutableDebugEnv().attention.reload();
     }
 
     /// Run kernel compute() and compare to reference.
@@ -523,7 +477,6 @@ TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen
     constexpr int kQStride = kHeads * kHeadDim;
     constexpr int kKVStride = kKVHeads * kHeadDim;
     const std::array<int, 3> base_kv_lengths = {9, 37, 129};
-
     for (const int verifier_rows : test::kGroupedVerifierRuntimeRows)
     {
         for (const int base_kv_len : base_kv_lengths)
@@ -965,310 +918,7 @@ TEST_F(Test__CPUFlashAttentionKernelT, EdgeCase_PrimeSeqLen)
 }
 
 // ===========================================================================
-// 8. VNNI i16/i12 Prefill Path Tests
-//    These require setting environment variables to enable the VNNI path
-//    and lowering thresholds so short sequences trigger it.
-// ===========================================================================
-
-class Test__CPUFlashAttentionKernelT_VNNI : public ::testing::Test
-{
-protected:
-    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel_;
-
-    void SetUp() override
-    {
-        rng().seed(42);
-
-        // Set env vars to enable VNNI i16/i12 path with zero thresholds
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "1", 1);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ", "1", 1);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV", "1", 1);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK", "0", 1);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM", "256", 1);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12_QMAX", "2047", 1);
-
-        // Force DebugEnv singleton to re-read the attention env vars
-        mutableDebugEnv().attention.reload();
-    }
-
-    void TearDown() override
-    {
-        // Restore defaults
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12");
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ");
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV");
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK");
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM");
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12_QMAX");
-        mutableDebugEnv().attention.reload();
-    }
-
-    void runVNNIAndCompare(
-        int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
-        bool causal,
-        float max_abs_tol, float cosine_tol,
-        const char *label)
-    {
-        const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
-        const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
-
-        std::vector<float> Q(q_size), K(kv_size), V(kv_size);
-        std::vector<float> out_kernel(q_size, 0.0f);
-        std::vector<float> out_ref(q_size, 0.0f);
-
-        fill_random(Q.data(), q_size, -0.5f, 0.5f);
-        fill_random(K.data(), kv_size, -0.5f, 0.5f);
-        fill_random(V.data(), kv_size, -0.5f, 0.5f);
-
-        // Use compute() which feeds into compute_flash_fp32 with is_decode=false
-        bool ok = kernel_.compute(
-            Q.data(), K.data(), V.data(), out_kernel.data(),
-            seq_len, n_heads, n_kv_heads, head_dim,
-            causal, -1,
-            nullptr, nullptr, nullptr, nullptr,
-            false, nullptr, -1);
-        ASSERT_TRUE(ok) << label << ": kernel.compute() failed";
-
-        ref::attention(Q.data(), K.data(), V.data(), out_ref.data(),
-                       seq_len, seq_len, n_heads, n_kv_heads, head_dim,
-                       causal, -1, 0);
-
-        ASSERT_TRUE(is_finite(out_kernel.data(), q_size)) << label << ": kernel output has NaN/Inf";
-        ASSERT_TRUE(is_finite(out_ref.data(), q_size)) << label << ": reference output has NaN/Inf";
-
-        float mae = max_abs_error(out_kernel.data(), out_ref.data(), q_size);
-        float rmse = rms_error(out_kernel.data(), out_ref.data(), q_size);
-        float cos = cosine_similarity(out_kernel.data(), out_ref.data(), q_size);
-
-        EXPECT_LE(mae, max_abs_tol)
-            << label << ": max abs error " << mae << " > " << max_abs_tol
-            << " (rmse=" << rmse << ", cosine=" << cos << ")";
-        EXPECT_GE(cos, cosine_tol)
-            << label << ": cosine sim " << cos << " < " << cosine_tol;
-    }
-};
-
-// Note: VNNI i16/i12 prefill is now ON by default. The VNNI fixture forces
-// the thresholds low (min_seq=1, min_kv=1) so even small test cases exercise
-// the VNNI code path. The runtime guard cpu_supports_avx512_vnni() still
-// applies — on machines without VNNI these tests fall back to FP32 and pass
-// with even tighter margins.
-//
-// The base fixture (Test__CPUFlashAttentionKernelT) explicitly disables VNNI
-// to isolate the FP32 code path.
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_Small_4x64_Causal)
-{
-    // 4 tokens, 64 head_dim — exactly 2 AVX512 iterations per row
-    // 4-row VNNI fast path can fire (4 positions >= k+3 threshold)
-    runVNNIAndCompare(4, 4, 2, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_Small_4x64_Causal");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_Medium_32x64_Causal)
-{
-    runVNNIAndCompare(32, 32, 4, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_Medium_32x64_Causal");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_128x64_Causal)
-{
-    // Large enough to exercise multi-tile KV processing
-    runVNNIAndCompare(128, 128, 4, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_128x64_Causal");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_64x128_Causal)
-{
-    // head_dim=128 (Llama-style), forces i16_row_stride=128 (4 blocks of 32)
-    runVNNIAndCompare(64, 64, 4, 2, 128, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_64x128_Causal");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_NoCausal)
-{
-    // Non-causal prefill with VNNI
-    runVNNIAndCompare(32, 32, 4, 4, 64, false,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_NoCausal");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_OddKVLen_31)
-{
-    // kv_len=31 is odd → last K row goes into a packed pair with zero padding
-    // Tests single-from-packedpair fallback path for the last KV position
-    runVNNIAndCompare(31, 31, 2, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_OddKVLen_31");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_OddKVLen_5)
-{
-    // kv_len=5: 2 pairs + 1 single → exercises 4-row(fail), 2-row, then 1-row paths
-    runVNNIAndCompare(5, 5, 2, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_OddKVLen_5");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_HeadDimNotMultipleOf32)
-{
-    // head_dim=48: padded to 64 in i16 quantisation → tests zero-padding
-    runVNNIAndCompare(16, 16, 2, 2, 48, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_HeadDimNotMultipleOf32");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_HeadDim96)
-{
-    // 96 = 3*32, aligned but 3 blocks per row
-    runVNNIAndCompare(16, 16, 2, 2, 96, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_HeadDim96");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_GQA_8To2)
-{
-    // GQA with VNNI path: 8 q heads, 2 kv heads
-    runVNNIAndCompare(32, 32, 8, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_GQA_8To2");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_MQA_8To1)
-{
-    // MQA with VNNI: 8 q heads, 1 kv head
-    runVNNIAndCompare(32, 32, 8, 1, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_MQA_8To1");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_256Tokens_64HeadDim)
-{
-    // Larger stress test
-    runVNNIAndCompare(256, 256, 4, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_256Tokens_64HeadDim");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_KV3_AllDispatchPaths)
-{
-    // kv_len=3: pair0 has rows 0,1; pair1 has row 2 + zero pad
-    // 4-row path needs k+3<valid_end → fails for kv_len=3 causal where valid_end<=3
-    // Exercises 2-row + 1-row fallback only
-    runVNNIAndCompare(3, 3, 2, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_KV3_AllDispatchPaths");
-}
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_KV2_PairOnly)
-{
-    // kv_len=2: exactly 1 pair, exercises 2-row path
-    runVNNIAndCompare(2, 2, 2, 2, 64, true,
-                      VNNI_MAX_ABS_TOLERANCE, VNNI_COSINE_THRESHOLD,
-                      "VNNI_KV2_PairOnly");
-}
-
-// ===========================================================================
-// 9. A/B comparison: same data, VNNI path vs FP32 path
-//    Runs the kernel twice with identical inputs — once with VNNI enabled
-//    (already set by the VNNI fixture), once with VNNI explicitly disabled.
-//    This proves the VNNI code path is actually executing and measures its
-//    error relative to both the FP32 kernel path and the scalar reference.
-// ===========================================================================
-
-TEST_F(Test__CPUFlashAttentionKernelT_VNNI, VNNI_vs_FP32_AB_Comparison)
-{
-    const int seq_len = 128;
-    const int n_heads = 4;
-    const int n_kv_heads = 2;
-    const int head_dim = 64;
-
-    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
-    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
-
-    std::vector<float> Q(q_size), K(kv_size), V(kv_size);
-    // Use [-1, 1] range to make quantisation error more visible
-    fill_random(Q.data(), q_size, -1.0f, 1.0f);
-    fill_random(K.data(), kv_size, -1.0f, 1.0f);
-    fill_random(V.data(), kv_size, -1.0f, 1.0f);
-
-    // --- Run A: VNNI path (env is already set by fixture SetUp) ---
-    std::vector<float> out_vnni(q_size, 0.0f);
-    ASSERT_TRUE(kernel_.compute(
-        Q.data(), K.data(), V.data(), out_vnni.data(),
-        seq_len, n_heads, n_kv_heads, head_dim,
-        true, -1,
-        nullptr, nullptr, nullptr, nullptr,
-        false, nullptr, -1));
-
-    // --- Run B: FP32 path (temporarily disable VNNI) ---
-    setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "0", 1);
-    mutableDebugEnv().attention.reload();
-
-    std::vector<float> out_fp32(q_size, 0.0f);
-    ASSERT_TRUE(kernel_.compute(
-        Q.data(), K.data(), V.data(), out_fp32.data(),
-        seq_len, n_heads, n_kv_heads, head_dim,
-        true, -1,
-        nullptr, nullptr, nullptr, nullptr,
-        false, nullptr, -1));
-
-    // Re-enable VNNI for subsequent tests
-    setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "1", 1);
-    mutableDebugEnv().attention.reload();
-
-    // --- Scalar reference ---
-    std::vector<float> out_ref(q_size, 0.0f);
-    ref::attention(Q.data(), K.data(), V.data(), out_ref.data(),
-                   seq_len, seq_len, n_heads, n_kv_heads, head_dim,
-                   true, -1, 0);
-
-    ASSERT_TRUE(is_finite(out_vnni.data(), q_size));
-    ASSERT_TRUE(is_finite(out_fp32.data(), q_size));
-
-    // VNNI vs reference
-    float vnni_mae = max_abs_error(out_vnni.data(), out_ref.data(), q_size);
-    float vnni_rmse = rms_error(out_vnni.data(), out_ref.data(), q_size);
-    float vnni_cos = cosine_similarity(out_vnni.data(), out_ref.data(), q_size);
-
-    // FP32 vs reference
-    float fp32_mae = max_abs_error(out_fp32.data(), out_ref.data(), q_size);
-    float fp32_rmse = rms_error(out_fp32.data(), out_ref.data(), q_size);
-
-    // VNNI vs FP32 kernel (direct comparison)
-    float ab_mae = max_abs_error(out_vnni.data(), out_fp32.data(), q_size);
-
-    std::cout << "[A/B] VNNI vs ref:  mae=" << vnni_mae
-              << " rmse=" << vnni_rmse
-              << " cosine=" << vnni_cos << std::endl;
-    std::cout << "[A/B] FP32 vs ref:  mae=" << fp32_mae
-              << " rmse=" << fp32_rmse << std::endl;
-    std::cout << "[A/B] VNNI vs FP32: mae=" << ab_mae << std::endl;
-
-    // On AVX512-VNNI hardware, the two paths MUST produce different outputs.
-    // The int16 quantisation introduces measurable error vs FP32.
-    if (cpu_supports_avx512_vnni())
-    {
-        EXPECT_GT(ab_mae, 0.0f)
-            << "VNNI and FP32 outputs are identical — VNNI path is NOT executing!";
-        // VNNI error should be meaningfully larger than FP32 rounding error
-        EXPECT_GT(vnni_mae, fp32_mae)
-            << "VNNI error is not larger than FP32 error — VNNI path may not be active";
-    }
-
-    // Accuracy bounds for production VNNI path
-    EXPECT_LE(vnni_mae, VNNI_MAX_ABS_TOLERANCE)
-        << "VNNI output deviates too much from reference";
-    EXPECT_GE(vnni_cos, VNNI_COSINE_THRESHOLD)
-        << "VNNI output cosine similarity too low";
-}
-
-// ===========================================================================
-// 10. Null / Invalid Input Handling
+// 8. Null / Invalid Input Handling
 // ===========================================================================
 
 TEST_F(Test__CPUFlashAttentionKernelT, NullPointers_ReturnFalse)
@@ -1479,14 +1129,6 @@ protected:
     void SetUp() override
     {
         rng().seed(42);
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "0", 1);
-        mutableDebugEnv().attention.reload();
-    }
-
-    void TearDown() override
-    {
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12");
-        mutableDebugEnv().attention.reload();
     }
 
     /// Run compute_tensor with head_start/gqa_n_rep and compare to TP reference.

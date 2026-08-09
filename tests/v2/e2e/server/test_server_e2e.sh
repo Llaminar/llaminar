@@ -188,6 +188,8 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 #                       variants even when the model family supports thinking.
 #   prefill-graph-probe  Send repeated same-key long-enough prompts to prove capture/replay.
 #   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
+#   require-cpu-fa2-context-parallel  For a CPU long-context lane, fail unless
+#                       PerfStats prove both query-sequence and K/V-context FA2.
 #   prefix-cache-rebalance-clear-probe  Exercise HTTP prefix-cache requests while
 #                       dynamic MoE rebalance leaves a prepared publish for request cleanup;
 #                       fail unless PerfStats prove prefix-cache harvest and restore.
@@ -1158,6 +1160,11 @@ suite_runs_stochastic_mtp_probe() {
     [[ ",${suite_options}," == *",stochastic-mtp-probe,"* ]]
 }
 
+suite_requires_cpu_fa2_context_parallel() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",require-cpu-fa2-context-parallel,"* ]]
+}
+
 is_gpu_backend() {
     local backend="$1"
     [[ "$backend" == cuda:* || "$backend" == rocm:* || "$backend" == "tp" || "$backend" == "pp" ]]
@@ -2083,7 +2090,8 @@ validate_perf_stats() {
         if is_gpu_backend "$backend" ||
            suite_runs_prefill_graph_probe "$suite_options" ||
            suite_runs_prefix_cache_rebalance_clear_probe "$suite_options" ||
-           suite_runs_moe_rebalance_movement_probe "$suite_options"; then
+           suite_runs_moe_rebalance_movement_probe "$suite_options" ||
+           suite_requires_cpu_fa2_context_parallel "$suite_options"; then
             fail "[${tag}] PerfStats: missing required artifact (${perf_path})"
         else
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
@@ -2101,7 +2109,10 @@ path, backend, extra_flags, long_context_run, suite_options, policy_module_dir =
 sys.path.insert(0, policy_module_dir)
 
 from graph_capture_perf_policy import validate_graph_capture_policy
-from flash_attention_perf_policy import validate_flash_attention_plan_policy
+from flash_attention_perf_policy import (
+    validate_cpu_flash_attention_execution_policy,
+    validate_flash_attention_plan_policy,
+)
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
 from mtp_device_generation_perf_policy import (
@@ -2132,6 +2143,9 @@ require_prefill_replay = "prefill-graph-probe" in suite_option_set
 require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
 require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_set
 require_stochastic_mtp = "stochastic-mtp-probe" in suite_option_set
+require_cpu_fa2_context_parallel = (
+    "require-cpu-fa2-context-parallel" in suite_option_set
+)
 expect_decode_replay = (
     is_mtp
     or long_context_run == "true"
@@ -2174,6 +2188,17 @@ if is_gpu:
     host_transfer_validation = validate_gpu_host_transfer_policy(records)
     if host_transfer_validation.error:
         print(f"FAIL: {host_transfer_validation.error}")
+        sys.exit(0)
+
+if require_cpu_fa2_context_parallel:
+    if not backend.startswith("cpu"):
+        print(
+            "FAIL: CPU FA2 context-parallel probe requires an explicit CPU backend"
+        )
+        sys.exit(0)
+    cpu_fa2_validation = validate_cpu_flash_attention_execution_policy(records)
+    if cpu_fa2_validation.error:
+        print(f"FAIL: {cpu_fa2_validation.error}")
         sys.exit(0)
 
 def has_record(name=None, domain=None, tags=None):

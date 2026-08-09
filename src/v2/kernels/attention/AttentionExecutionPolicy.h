@@ -35,6 +35,46 @@ namespace llaminar2::attention
     };
 
     /**
+     * @brief Physical representation of keys published into the KV cache.
+     *
+     * `PostRotary` pays the positional transform once before native cache
+     * quantization and lets every later attention read consume the persistent
+     * tensor directly. `PreRotaryDeviceTransform` is reserved for GPU caches
+     * whose captured gather/attention path applies RoPE entirely on device.
+     * CPU kernels must use `PostRotary`: converting or repeatedly transforming
+     * native cache rows would defeat direct Q8/Q16/TurboQuant attention.
+     */
+    enum class AttentionKeyCacheEncoding : std::uint8_t
+    {
+        PostRotary,
+        PreRotaryDeviceTransform,
+    };
+
+    /**
+     * @brief Declarative key-cache publication and consumption policy.
+     *
+     * RoPE parameters are carried with the encoding decision so graph builders,
+     * append stages, and attention readers cannot disagree about whether cached
+     * key bytes are already positional. They are meaningful only for
+     * `PreRotaryDeviceTransform` but remain initialized for complete graph
+     * identity and diagnostics.
+     */
+    struct AttentionKeyCachePolicy
+    {
+        AttentionKeyCacheEncoding encoding =
+            AttentionKeyCacheEncoding::PostRotary;
+        float rope_theta = 10000.0f;
+        float partial_rotary_factor = 1.0f;
+
+        /** @return True when the consuming device graph must transform K. */
+        [[nodiscard]] constexpr bool transformsOnRead() const noexcept
+        {
+            return encoding ==
+                   AttentionKeyCacheEncoding::PreRotaryDeviceTransform;
+        }
+    };
+
+    /**
      * @brief Model-declared attention execution policy carried into a stage.
      *
      * Additional backend-independent axes belong here as typed fields. Avoid
@@ -46,6 +86,61 @@ namespace llaminar2::attention
     {
         AttentionPrefillParallelAxis prefill_parallel_axis =
             AttentionPrefillParallelAxis::QuerySequence;
+        AttentionKeyCachePolicy key_cache{};
+    };
+
+    /**
+     * @brief Logical-to-physical row mapping for a native KV tensor view.
+     *
+     * Attention always reasons about K/V rows in oldest-to-newest logical
+     * order. A ring cache may expose its persistent backing tensor directly,
+     * in which case logical row zero begins at `logical_row_origin` and wraps
+     * at `physical_row_capacity`. Keeping that mapping in the kernel contract
+     * removes any need to unroll or dequantize the cache into a shadow tensor.
+     *
+     * The all-zero value denotes an ordinary contiguous tensor. A circular
+     * descriptor is valid only when its origin is inside a positive capacity
+     * and the requested logical span fits in that capacity. Invalid geometry
+     * is a hard kernel error; implementations must not reinterpret it as a
+     * contiguous view.
+     */
+    struct AttentionKVLogicalView
+    {
+        int logical_row_origin = 0;  ///< Physical row containing logical row zero.
+        int physical_row_capacity = 0; ///< Ring modulus; zero means contiguous.
+
+        /** @return True when this descriptor names an ordinary contiguous view. */
+        [[nodiscard]] constexpr bool isContiguous() const noexcept
+        {
+            return physical_row_capacity == 0;
+        }
+
+        /**
+         * @brief Validate the descriptor against a requested logical row count.
+         * @param logical_rows Number of oldest-to-newest rows attention will read.
+         */
+        [[nodiscard]] constexpr bool validFor(int logical_rows) const noexcept
+        {
+            if (logical_rows < 0)
+                return false;
+            if (isContiguous())
+                return logical_row_origin == 0;
+            return logical_row_origin >= 0 &&
+                   logical_row_origin < physical_row_capacity &&
+                   logical_rows <= physical_row_capacity;
+        }
+
+        /**
+         * @brief Translate one validated logical row into its physical tensor row.
+         * @param logical_row Oldest-to-newest row index in `[0, logical_rows)`.
+         */
+        [[nodiscard]] constexpr int physicalRow(int logical_row) const noexcept
+        {
+            return isContiguous()
+                       ? logical_row
+                       : (logical_row_origin + logical_row) %
+                             physical_row_capacity;
+        }
     };
 
     /**
@@ -103,6 +198,20 @@ namespace llaminar2::attention
             return "key_value_context";
         case AttentionPrefillParallelAxis::GeometrySelected:
             return "geometry_selected";
+        }
+        return "invalid";
+    }
+
+    /** @return Stable diagnostic name for a key-cache encoding policy. */
+    [[nodiscard]] inline constexpr const char *attentionKeyCacheEncodingName(
+        AttentionKeyCacheEncoding encoding)
+    {
+        switch (encoding)
+        {
+        case AttentionKeyCacheEncoding::PostRotary:
+            return "post_rotary";
+        case AttentionKeyCacheEncoding::PreRotaryDeviceTransform:
+            return "pre_rotary_device_transform";
         }
         return "invalid";
     }

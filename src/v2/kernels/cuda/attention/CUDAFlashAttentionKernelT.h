@@ -380,7 +380,8 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
                 int gqa_n_rep = 0,
-                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             /**
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
@@ -407,7 +408,9 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 int head_start = 0,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionKVLogicalView &kv_logical_view = {},
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
 
             /**
              * @brief Run independent request cache banks through one CUDA decode grid.
@@ -676,7 +679,8 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
                 int gqa_n_rep = 0,
-                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -814,7 +818,8 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
                 int gqa_n_rep = 0,
-                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface

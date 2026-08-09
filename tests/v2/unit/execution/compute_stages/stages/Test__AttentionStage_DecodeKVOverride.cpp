@@ -17,6 +17,7 @@
 #include <memory>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
@@ -60,6 +61,17 @@ namespace llaminar2
                 if (layer < 0 || layer >= num_layers_)
                     return 0;
                 return cached_tokens_[layer];
+            }
+
+            KVCacheSequenceState sequenceState(int layer, int seq_idx) const override
+            {
+                if (seq_idx != 0 || layer < 0 || layer >= num_layers_)
+                    return {};
+                return {
+                    .cached_tokens = cached_tokens_[layer],
+                    .implementation_head = 0,
+                    .wrapped = false,
+                };
             }
 
             bool get_kv(int layer, int seq_idx, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr) override
@@ -111,9 +123,15 @@ namespace llaminar2
                                   int *out_kv_len = nullptr,
                                   const KVReadParams *rope = nullptr) override
             {
+                (void)layer;
+                (void)seq_idx;
                 (void)target;
+                (void)out_k;
+                (void)out_v;
+                (void)out_kv_len;
                 (void)rope;
-                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+                throw std::logic_error(
+                    "CPU attention must consume the cache's native logical view");
             }
 
             ITensor *get_k(int layer, int seq_idx = 0) override

@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Validate production FlashAttention capture-plan evidence.
+"""Validate production FlashAttention plan and execution evidence.
 
 Qwen model graphs declare a backend-neutral, geometry-selected prefill policy.
 CUDA and ROCm then choose one immutable physical transaction while the graph is
 captured. This validator proves that a live server cell actually reached that
 backend policy and that its published geometry is internally coherent.
 
-The check intentionally consumes only capture-time ``gpu_graph_inventory``
-records. It does not inspect live sequence lengths, synchronize a stream, or
-introduce host-owned inference state.
+CPU has no graph-capture boundary, so its corresponding evidence is emitted at
+the common format-generic execution planner. A targeted long-context lane can
+therefore prove that both complete-query ownership and K/V-context ownership
+ran in production, rather than inferring mode selection from unit-level policy
+tests or benchmark-only controls.
+
+The GPU check consumes only capture-time ``gpu_graph_inventory`` records. The
+CPU check consumes aggregate execution counters and never inspects tensor data
+or introduces an additional synchronization boundary.
 """
 
 from __future__ import annotations
@@ -49,6 +55,16 @@ class FlashAttentionPlanValidation:
     expected_backends: frozenset[str]
     observed_backends: frozenset[str]
     plan_count: int
+    selected_modes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class CPUFlashAttentionExecutionValidation:
+    """Result of authenticating CPU FA2 physical execution records."""
+
+    error: str | None
+    plan_count: int
+    execution_count: float
     selected_modes: frozenset[str]
 
 
@@ -229,5 +245,135 @@ def validate_flash_attention_plan_policy(
         expected_backends=expected_backends,
         observed_backends=observed_backends,
         plan_count=len(plan_records),
+        selected_modes=selected_modes,
+    )
+
+
+_CPU_EXECUTION_RECORD = "cpu_fa2_parallel_plan_executions"
+_CPU_SELECTED_MODES = frozenset({"query_sequence", "key_value_context"})
+_CPU_POSITIVE_TAGS = (
+    "query_rows",
+    "local_query_heads",
+    "head_dim",
+    "physical_workers",
+    "arithmetic_partitions",
+    "context_partitions",
+    "context_partition_rows",
+    "physical_kv_tile",
+)
+
+
+def _validate_cpu_execution_record(record: Mapping[str, Any]) -> str | None:
+    """Return a precise error for one malformed CPU FA2 execution record."""
+
+    if record.get("domain") != "kernel":
+        return f"{_CPU_EXECUTION_RECORD} is outside the kernel domain"
+    if record.get("phase") != "execute":
+        return f"{_CPU_EXECUTION_RECORD} was not published during execute"
+    if str(record.get("device", "")).lower() != "cpu":
+        return f"{_CPU_EXECUTION_RECORD} has a mismatched device identity"
+    if _numeric(record.get("value", record.get("count", 0.0))) <= 0.0:
+        return f"{_CPU_EXECUTION_RECORD} did not record an execution"
+
+    tags = record.get("tags") or {}
+    if tags.get("requested_axis") != "geometry_selected":
+        return (
+            f"{_CPU_EXECUTION_RECORD} did not enter the production "
+            "geometry-selected policy "
+            f"(requested_axis={tags.get('requested_axis')!r})"
+        )
+
+    selected_mode = str(tags.get("selected_mode", ""))
+    if selected_mode not in _CPU_SELECTED_MODES:
+        return (
+            f"{_CPU_EXECUTION_RECORD} published invalid "
+            f"selected_mode={selected_mode!r}"
+        )
+
+    values: dict[str, int] = {}
+    for key in _CPU_POSITIVE_TAGS:
+        value = _integer_tag(tags, key)
+        if value is None or value <= 0:
+            return f"{_CPU_EXECUTION_RECORD} requires positive integer tag {key}"
+        values[key] = value
+
+    context_partitions = values["context_partitions"]
+    arithmetic_partitions = values["arithmetic_partitions"]
+    if arithmetic_partitions < context_partitions:
+        return (
+            f"{_CPU_EXECUTION_RECORD} scheduled more physical context "
+            "producers than canonical arithmetic summaries"
+        )
+    if selected_mode == "query_sequence" and context_partitions != 1:
+        return (
+            f"{_CPU_EXECUTION_RECORD} query_sequence execution retained "
+            "multiple context producers"
+        )
+    if selected_mode == "key_value_context" and context_partitions <= 1:
+        return (
+            f"{_CPU_EXECUTION_RECORD} context execution did not expose "
+            "multiple context producers"
+        )
+
+    partition_rows = values["context_partition_rows"]
+    physical_tile = values["physical_kv_tile"]
+    if physical_tile > partition_rows or partition_rows % physical_tile != 0:
+        return (
+            f"{_CPU_EXECUTION_RECORD} physical K/V tile does not preserve "
+            "canonical summary boundaries"
+        )
+
+    return None
+
+
+def validate_cpu_flash_attention_execution_policy(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    require_query_sequence: bool = True,
+    require_key_value_context: bool = True,
+) -> CPUFlashAttentionExecutionValidation:
+    """Require coherent production CPU FA2 evidence for selected modes.
+
+    The targeted long-context gate requires both branches: prefill should have
+    enough independent query rows for query-sequence ownership, while decode or
+    compact grouped verification should expose long K/V spans across physical
+    workers. Callers may relax either presence requirement for narrower probes,
+    but every observed record remains subject to the same fail-closed checks.
+    """
+
+    execution_records = [
+        record
+        for record in records
+        if record.get("name") == _CPU_EXECUTION_RECORD
+    ]
+    selected_modes = frozenset(
+        str((record.get("tags") or {}).get("selected_mode", ""))
+        for record in execution_records
+    )
+    execution_count = sum(
+        _numeric(record.get("value", record.get("count", 0.0)))
+        for record in execution_records
+    )
+
+    error: str | None = None
+    if not execution_records:
+        error = "CPU cell emitted no FlashAttention physical execution evidence"
+    else:
+        for record in execution_records:
+            error = _validate_cpu_execution_record(record)
+            if error:
+                break
+
+    if error is None and require_query_sequence:
+        if "query_sequence" not in selected_modes:
+            error = "CPU cell never exercised query-sequence FlashAttention"
+    if error is None and require_key_value_context:
+        if "key_value_context" not in selected_modes:
+            error = "CPU cell never exercised K/V-context FlashAttention"
+
+    return CPUFlashAttentionExecutionValidation(
+        error=error,
+        plan_count=len(execution_records),
+        execution_count=execution_count,
         selected_modes=selected_modes,
     )

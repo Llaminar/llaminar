@@ -31,7 +31,6 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -306,9 +305,6 @@ namespace llaminar2
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
-        std::unique_ptr<float[]> host_verifier_state_slots_;
-        size_t host_verifier_state_slot_capacity_ = 0;
-
         // Reusable scratch for QKV deinterleaving (grow-only)
         mutable std::vector<float> q_deinterleave_;
         mutable std::vector<float> k_deinterleave_;
@@ -325,7 +321,22 @@ namespace llaminar2
         bool ensureVerifierStateCaptureWorkspaceBound() const;
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
-        const float *cpuVerifierStateCaptureSource() const;
+        /**
+         * @brief Resolve the writable CPU verifier slots from the bound manager.
+         *
+         * @return The exact manager-owned buffer address, or null when this is a
+         *         GPU stage, no slots are bound, or the binding is incomplete.
+         *
+         * The stage deliberately owns no replacement host container. Returning
+         * null therefore makes an omitted graph-family workspace participant a
+         * fatal execution error instead of concealing it with private storage.
+         */
+        float *cpuVerifierStateCaptureWorkspace() const;
+        /**
+         * @brief Publish one accepted CPU verifier row into live recurrence state.
+         * @param row Zero-based row in the manager-owned verifier slot matrix.
+         * @return true after an exact state copy, otherwise false.
+         */
         bool restoreCPUVerifierStateCaptureRowDirect(int row);
         size_t deinterleaveScratchFloats(int seq_len) const;
         bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;

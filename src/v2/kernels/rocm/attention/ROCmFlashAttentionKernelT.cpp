@@ -1253,7 +1253,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
@@ -1263,6 +1264,12 @@ namespace llaminar2
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Null tensor");
+                return false;
+            }
+            if (!kv_logical_view.isContiguous())
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                          "circular CPU-style KV descriptors are invalid for gathered ROCm views");
                 return false;
             }
 
@@ -1902,10 +1909,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionKVLogicalView &kv_logical_view,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
             (void)window_size;
             (void)mpi_ctx;
+            (void)execution_policy;
+            if (!kv_logical_view.isContiguous())
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "circular CPU-style KV descriptors are invalid for gathered ROCm views");
+                return false;
+            }
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Null tensor");
@@ -2801,7 +2817,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             // TODO: Implement FP16 tensor path
             LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>::compute_tensor] Not implemented");
@@ -2826,6 +2843,7 @@ namespace llaminar2
             (void)local_n_kv_heads;
             (void)gqa_n_rep;
             (void)execution_policy;
+            (void)kv_logical_view;
             return false;
         }
 
@@ -3157,7 +3175,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>::compute_tensor] Not implemented for MI50");
             (void)Q;
@@ -3181,6 +3200,7 @@ namespace llaminar2
             (void)local_n_kv_heads;
             (void)gqa_n_rep;
             (void)execution_policy;
+            (void)kv_logical_view;
             return false;
         }
 

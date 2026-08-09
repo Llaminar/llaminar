@@ -67,7 +67,7 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
 | LocalTP | CUDA2 | A/A | A/A | Dynamic-maintenance/current-batch-LLEP matrix green; perf active |
 | LocalTP | ROCm2 | A/A | A/A | Dynamic-maintenance/current-batch-LLEP matrix green; perf pending |
 | LocalTP | ROCm4 | A/R | R/R | full refresh pending |
-| NodeLocalTP | CPU2 | A/A | R/R | dense E2E green; MoE/perf pending |
+| NodeLocalTP | CPU2 | A/A | A/A | MoE long-context green; economy red |
 | ExpertParallel | GPU+CPU | A/R | G/R | explicit Dynamic/LLEP greedy+prefix green |
 
 ## Correctness Proof
@@ -535,6 +535,73 @@ request policy or malformed/missing per-backend FA2 capture evidence.
 The complete Integration target set rebuilt cleanly, and the final device-free
 unit/source-policy checkpoint passed `593/593` after synchronizing the stale
 CUDA MoE router boundary regression with its installed measured overlay.
+
+The 2026-08-09 CPU FA2 slice replaced cache-percentage magic numbers with a
+typed, empirically certified K/V tile policy. Code-generation ISA and runtime
+dispatch ISA are independent policy axes: native AVX2 passed 81 domains at
+`2.859%` p95 regret (`4.120%` maximum), native AVX-512 passed at `3.371%`
+(`5.124%` maximum), and an AVX-512 build forced through AVX2 runtime dispatch
+passed at `2.733%` (`10.079%` maximum). The mixed-profile maximum is one
+Q16_1, HD128, M=1 domain; it remains explicit evidence rather than being
+hidden by an alias to the native AVX2 policy. CPU certification runs must be
+isolated: simultaneous socket-wide tournaments measurably perturb shared
+power and memory behavior and are not valid policy evidence.
+
+The production byte-totality gate independently covers 34 distinct
+participant geometries induced by every listed Qwen dense/MoE geometry and
+legal TP=1/2/4/8 split, all nine native K/V formats, decode M=1, grouped
+M=2/4/8/15, and prefill M=32/128/257 over a 512-row prefix. Every one of the
+2,448 domains executes all seven compiled physical tiles through the optimized
+kernel, for 17,136 candidate executions, and is byte identical to the fixed
+canonical arithmetic. The complete gate passed in `326.68 s`; the focused
+policy, Q16, tournament-driver, and production-kernel checks pass in `1.46 s`.
+
+### CPU Qwen3.6-35B MoE Release Matrix
+
+The 2026-08-09 control uses the 434-token canonical chat prompt
+(`sha256:63d628982074c2785953dfde6f327e4f0146162a5c51396a48b1f59a239a97ae`),
+256 stochastic output tokens, seed 123, temperature 0.8, top-k 40, top-p 0.9,
+one warmup, and three measured iterations. Single-socket rows use 28 physical
+cores. Dual-socket rows use two MPI ranks pinned one per socket with 28 physical
+cores each. PSS is the observed warm process-tree value, not model-file size.
+
+| ISA | Topology | MTP | Prefill tok/s | Decode tok/s | Acceptance | MTP decode / baseline | PSS MiB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| AVX-512 | 1 socket | off | 110.84 | 15.69 | - | 1.000x | 42,239 |
+| AVX-512 | 1 socket | fixed d3 | 108.77 | 10.71 | 79.91% | 0.683x | 43,680 |
+| AVX-512 | 2 sockets | off | 32.07 | 20.09 | - | 1.000x | 44,904 |
+| AVX-512 | 2 sockets | fixed d3 | 31.81 | 14.77 | 78.77% | 0.735x | 46,355 |
+| AVX2 | 1 socket | off | 71.21 | 14.28 | - | 1.000x | 42,640 |
+| AVX2 | 1 socket | fixed d3 | 69.90 | 9.08 | 74.09% | 0.636x | 44,084 |
+| AVX2 | 2 sockets | off | 27.05 | 19.83 | - | 1.000x | 45,585 |
+| AVX2 | 2 sockets | fixed d3 | 26.92 | 14.36 | 79.81% | 0.724x | 46,433 |
+
+All eight cells completed with zero transaction rollbacks and zero transaction
+validation failures. AVX-512 improves single-socket prefill by `1.557x` and
+decode by `1.099x` over AVX2. Dual-socket baseline decode scales by `1.281x`
+on AVX-512 and `1.389x` on AVX2, but dual-socket prefill regresses to only
+`0.289x` and `0.380x` of one socket. MTP is also unequivocally uneconomical in
+this control despite high proposal acceptance; its loss is verifier/draft
+execution cost, not rejection or rollback pathology.
+
+The first structural dual-prefill defect is explicit in the collective code.
+Same-node CPU TP selects `ShmemSpinBackend`, whose native allreduce is capped at
+8,192 elements. A 434-row by 2,048-hidden activation has 888,832 elements, so
+large prefill allreduces leave the shared-memory implementation and enter its
+MPI fallback, while decode-sized 2,048-element reductions remain native. This
+matches the measured phase split but still requires per-stage timing before
+attributing the entire deficit. The fix gate is an economical, total native
+same-node allreduce for all positive payload sizes; retaining the fallback is
+not an acceptable final architecture.
+
+Both AVX-512 and AVX2 Release binaries then passed the full 4,096-context CPU2
+MoE server tier `20/20`, including 2,048-token generation, boundary handling,
+RAM prefix restore with MTP state, and CPU FA2 policy PerfStats. The complete
+Integration target set rebuilt cleanly, and the device-free unit/source gate
+passed `592/592` in `159.17 s`. Runtime ISA reporting now reads
+`activeISALevel()` rather than claiming every CPU run is AVX-512, and the
+canonical matrix wrapper admits CPU2 MoE through the UPI same-node policy
+instead of rejecting the lane or forcing MPI-only transport.
 
 The llama.cpp CLI command below intentionally receives the unwrapped source
 file because `--conversation` applies the GGUF chat template itself. Its

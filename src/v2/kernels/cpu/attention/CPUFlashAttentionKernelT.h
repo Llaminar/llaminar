@@ -17,24 +17,15 @@
  *
  * ## Template parameter
  *
- * The kernel is templated on `ActivationPrecision` so the same code serves
- * FP32, BF16, and FP16 builds.  Only FP32 precision is currently supported;
- * non-FP32 instantiations will return false.
- *
- * ## Integer quantised prefill path (I16/I12)
- *
- * For long prefill sequences the QK dot-products can optionally be computed in
- * integer arithmetic using 16-bit quantisation with a 12-bit value range
- * (qmax ≈ 2047).  When AVX-512 VNNI is available this uses the `VPDPWSSD`
- * instruction which does 32 × int16 multiply-add per cycle.  Two consecutive K
- * rows are packed into a single "pair" buffer so a single VNNI loop produces
- * two dot-products at once.  This is a significant speedup for prefill where
- * `seq_len × kv_len` can be in the millions.
+ * The kernel is templated on the graph activation precision. The production
+ * tensor API currently requires FP32 Q/output rows and consumes native FP32,
+ * FP16, BF16, Q8_1, Q16_1, TQ4, and TQ8 KV storage directly. Each storage
+ * format has a vectorized inner loop; none requires an FP32 cache shadow.
  *
  * ## How this file is organised
  *
- * 1. `detail::CacheAwareFlashKVTilePolicy` – chooses the KV tile size based on
- *    the CPU cache hierarchy and the actual working-set size.
+ * 1. `cpu::fa2_policy::selectCPUFA2KVTile()` chooses the KV tile size from
+ *    detected private-cache capacity and the exact K/V storage format.
  * 2. `detail::FlashAttentionPrecisionToTensor` – maps `ActivationPrecision`
  *    enum values to concrete tensor classes (FP32Tensor, BF16Tensor, …).
  * 3. `CPUFlashAttentionKernelT<Precision>` – the main kernel class.
@@ -45,24 +36,30 @@
  *      core `compute_flash_fp32()` tiled-softmax implementation.
  *
  * @see ITensorAttention     The polymorphic interface this class implements.
- * @see AttentionCacheConfig  Cache-hierarchy model used by the tile policy.
+ * @see cpu::fa2_policy::CPUFA2KVTileGeometry Cache and storage launch model.
  */
 
 #pragma once
 
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/config/RuntimeConfig.h"
+#include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TQ8Tensor.h"
 #include "../../../tensors/TQ4Tensor.h"
 #include "../../../utils/CPUFeatures.h"
+#include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../primitives/ActivationTraits.h"
+#include "../CPUKernelBase.h"
 #include "../turboquant/TurboQuantRotation.h"
 #include "../turboquant/TurboQuantContext.h"
+#include "CPUFlashAttentionLaunchPolicy.h"
 #include "TQFusedAttentionPrimitives.h"
 
 #include <algorithm>
@@ -73,8 +70,9 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
-#include <vector>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -89,191 +87,187 @@ class AVX2Q16DotParityTest;
 
 namespace llaminar2
 {
+    namespace cpu::AttentionWorkspaceBuffers
+    {
+        /** Persistent FP32 numerator summaries for CPU K/V-context attention. */
+        inline constexpr const char *PARTIAL_OUTPUT = "attn_partial_output";
+        /** Persistent per-summary online-softmax maxima. */
+        inline constexpr const char *PARTIAL_M = "attn_partial_m";
+        /** Persistent per-summary online-softmax denominators. */
+        inline constexpr const char *PARTIAL_L = "attn_partial_l";
+    } // namespace cpu::AttentionWorkspaceBuffers
+
     namespace detail
     {
         /**
-         * @brief Cache-aware policy that decides how many KV positions to process per tile.
+         * @brief Select one authenticated K/V tile from exact storage geometry.
          *
-         * ## Why tile size matters
+         * The cache detector reports capacities per physical core. The caller
+         * supplies one stored K head row and one stored V head row so FP32,
+         * FP16, Q16, Q8, and TurboQuant all use the same normalized policy
+         * without lying about memory traffic. Debug tournament controls are
+         * exact: an uncompiled positive override is a fatal configuration error
+         * rather than being rounded to a different experiment.
          *
-         * Flash Attention iterates over KV positions in tiles.  Each tile loads
-         * `kv_tile` rows of K *and* V into registers / L1 cache, computes the
-         * partial QK scores, runs partial softmax, and accumulates into the
-         * output.  A tile that is too large spills to L2/L3 and loses cache
-         * locality; a tile that is too small pays excessive loop overhead.
-         *
-         * This policy inspects the CPU cache hierarchy (L1/L2/L3 sizes fetched
-         * once from `AttentionCacheConfig`) and picks the largest power-of-two
-         * tile that keeps the per-tile working set within a target fraction of
-         * the relevant cache level.
-         *
-         * ## Template parameters
-         *
-         * @tparam DecodeTargetPct    Target percentage of the cache to use during
-         *                            decode (single-token generation).  Default 50%.
-         * @tparam PrefillTargetPct   Target percentage during prefill (multi-token).
-         *                            Default 37% – lower because prefill has more
-         *                            concurrent data (Q rows × K tile).
-         * @tparam DecodeMinTile      Minimum tile size for decode.  Must be ≥ 1.
-         * @tparam DecodeMaxTile      Maximum tile size for decode.
-         * @tparam PrefillMinTile     Minimum tile size for prefill.
-         * @tparam PrefillMaxTile     Maximum tile size for prefill.
-         *
-         * ## Environment overrides
-         *
-         * The tile size can be overridden at runtime with the debug environment
-         * variables `LLAMINAR_ATTN_FLASH_KV_TILE_DECODE` and
-         * `LLAMINAR_ATTN_FLASH_KV_TILE_PREFILL` (see `debugEnv()`).
+         * @param storage_pair Exact native K/V codecs executed by this path.
+         * @param head_dim Logical elements in one attention head.
+         * @param kv_len Number of addressable K/V rows.
+         * @param key_head_row_bytes Stored bytes read for one K head row.
+         * @param value_head_row_bytes Stored bytes read for one V head row.
+         * @param explicit_tile Stable per-kernel tournament override, or zero.
+         * @return A compiled tile in `cpu::fa2_policy::kCompiledKVTiles`.
          */
-        template <int DecodeTargetPct,
-                  int PrefillTargetPct,
-                  int DecodeMinTile,
-                  int DecodeMaxTile,
-                  int PrefillMinTile,
-                  int PrefillMaxTile>
-        struct CacheAwareFlashKVTilePolicy
+        [[nodiscard]] inline int selectCPUFlashKVTile(
+            cpu::fa2_policy::CPUFA2KVStoragePair storage_pair,
+            int head_dim,
+            int kv_len,
+            std::size_t key_head_row_bytes,
+            std::size_t value_head_row_bytes,
+            int explicit_tile)
         {
-            static_assert(DecodeTargetPct > 0 && DecodeTargetPct <= 100, "DecodeTargetPct must be in (0, 100]");
-            static_assert(PrefillTargetPct > 0 && PrefillTargetPct <= 100, "PrefillTargetPct must be in (0, 100]");
-
-            /**
-             * @brief Select the optimal KV tile size for the given attention parameters.
-             *
-             * The algorithm works as follows:
-             * 1. Check for a user-supplied override via the debug environment.
-             * 2. Build an `AttentionCacheConfig` to query the CPU cache hierarchy.
-             * 3. Compute the bytes needed per KV position in a tile
-             *    (one K row + one V row + one score float).
-             * 4. Pick the cache level that best matches the work size (SMALL → L1,
-             *    LARGE → L2, XL → L3/8).
-             * 5. Divide the usable cache budget by the per-position cost to get
-             *    the raw tile size, then clamp to the nearest power-of-two within
-             *    the [min, max] range.
-             *
-             * @param head_dim    Dimension per attention head (e.g. 64 or 128).
-             * @param n_kv_heads  Number of key/value heads (for GQA/MQA).
-             * @param kv_len      Current key/value sequence length.
-             * @param is_decode   True when generating one token at a time (decode),
-             *                    false during prompt prefill.
-             * @return Tile size as a power of two, in range [MinTile, MaxTile].
-             */
-            static int choose(int head_dim, int n_kv_heads, int kv_len, bool is_decode)
+            const CacheInfo &cache = cache_info();
+            const auto vector_isa = []
             {
-                const int override_tile = tile_override(is_decode);
-                if (override_tile > 0)
+                switch (activeISALevel())
                 {
-                    return clamp_to_power2(override_tile,
-                                           is_decode ? DecodeMinTile : PrefillMinTile,
-                                           is_decode ? DecodeMaxTile : PrefillMaxTile);
+                case ISALevel::Scalar:
+                    return cpu::fa2_policy::CPUFA2VectorISA::Scalar;
+                case ISALevel::AVX2:
+                    return cpu::fa2_policy::CPUFA2VectorISA::AVX2;
+                case ISALevel::AVX512:
+                    return cpu::fa2_policy::CPUFA2VectorISA::AVX512;
                 }
-
-                AttentionCacheConfig cfg(head_dim, n_kv_heads, kv_len);
-                const size_t kv_row_bytes = static_cast<size_t>(head_dim) * sizeof(float) * 2ULL;
-                const size_t score_bytes = sizeof(float);
-                const size_t bytes_per_kv_position = kv_row_bytes + score_bytes;
-
-                size_t target_cache_bytes = 0;
-                switch (cfg.work_size())
+                return cpu::fa2_policy::CPUFA2VectorISA::Invalid;
+            }();
+            const int tile = cpu::fa2_policy::selectCPUFA2KVTile(
                 {
-                case AttentionWorkSize::SMALL:
-                    target_cache_bytes = static_cast<size_t>(cfg.l1_size);
-                    break;
-                case AttentionWorkSize::LARGE:
-                    target_cache_bytes = static_cast<size_t>(cfg.l2_size);
-                    break;
-                case AttentionWorkSize::XL:
-                default:
-                    target_cache_bytes = std::max<size_t>(cfg.l3_size / 8, cfg.l2_size);
-                    break;
-                }
-
-                const int target_pct = is_decode ? DecodeTargetPct : PrefillTargetPct;
-                target_cache_bytes = (target_cache_bytes * static_cast<size_t>(target_pct)) / 100ULL;
-
-                size_t raw_tile = target_cache_bytes > 0
-                                      ? (target_cache_bytes / std::max<size_t>(1, bytes_per_kv_position))
-                                      : static_cast<size_t>(is_decode ? DecodeMinTile : PrefillMinTile);
-
-                if (!is_decode && cfg.prefer_kv8_tile())
-                {
-                    raw_tile = std::max<size_t>(raw_tile, 8);
-                }
-
-                const int min_tile = is_decode ? DecodeMinTile : PrefillMinTile;
-                const int max_tile = is_decode ? DecodeMaxTile : PrefillMaxTile;
-                return clamp_to_power2(static_cast<int>(raw_tile), min_tile, max_tile);
-            }
-
-        private:
-            /**
-             * @brief Round a value down to the nearest power-of-two within [min_tile, max_tile].
-             *
-             * The flash-attention loop benefits from power-of-two tile sizes
-             * because the inner loops can be fully unrolled by the compiler and
-             * SIMD widths (16 floats for AVX-512) divide evenly.
-             *
-             * @param value     Raw (non-power-of-two) tile size estimate.
-             * @param min_tile  Floor – never return less than this.
-             * @param max_tile  Ceiling – never return more than this.
-             * @return The clamped power-of-two tile size.
-             */
-            static int clamp_to_power2(int value, int min_tile, int max_tile)
+                    .storage_pair = storage_pair,
+                    .vector_isa = vector_isa,
+                    .codegen_isa =
+                        cpu::fa2_policy::compiledCPUFA2CodegenISA(),
+                    .head_dim = head_dim,
+                    .kv_rows = kv_len,
+                    .key_head_row_bytes = key_head_row_bytes,
+                    .value_head_row_bytes = value_head_row_bytes,
+                    .cache = {
+                        .private_l1d_bytes = cache.l1_size,
+                        .private_l2_bytes = cache.l2_size,
+                        .shared_l3_bytes = cache.l3_size,
+                        .cache_line_bytes = cache.cache_line,
+                    },
+                },
+                explicit_tile);
+            if (tile == 0)
             {
-                if (value <= 0)
-                {
-                    value = min_tile;
-                }
-
-                int p2 = 1;
-                while ((p2 << 1) > 0 && (p2 << 1) <= value)
-                {
-                    p2 <<= 1;
-                }
-
-                if (p2 < min_tile)
-                {
-                    p2 = min_tile;
-                }
-                if (p2 > max_tile)
-                {
-                    p2 = max_tile;
-                }
-                return std::max(1, p2);
+                LLAMINAR_UNREACHABLE(
+                    "invalid CPU FA2 K/V tile request: override="
+                    << explicit_tile << " storage="
+                    << cpu::fa2_policy::cpuFA2KVStoragePairName(storage_pair)
+                    << " isa="
+                    << cpu::fa2_policy::cpuFA2VectorISAName(vector_isa)
+                    << " codegen="
+                    << cpu::fa2_policy::cpuFA2CodegenISAName(
+                           cpu::fa2_policy::compiledCPUFA2CodegenISA())
+                    << " head_dim=" << head_dim
+                    << " kv_len=" << kv_len << " K-row-bytes="
+                    << key_head_row_bytes << " V-row-bytes="
+                    << value_head_row_bytes);
             }
-
-            /**
-             * @brief Check for a user-supplied tile-size override from the debug environment.
-             *
-             * Returns 0 (meaning "no override") when the relevant env var is unset.
-             *
-             * @param is_decode  Whether we are in decode (true) or prefill (false).
-             * @return The override value, or 0 if none was set.
-             */
-            static int tile_override(bool is_decode)
-            {
-                const auto &env = debugEnv();
-                const int decode_override = env.attention.flash_kv_tile_decode;
-                const int prefill_override = env.attention.flash_kv_tile_prefill;
-                return is_decode ? decode_override : prefill_override;
-            }
-        };
-
-        /**
-         * @brief The default tile-size policy used by CPUFlashAttentionKernelT.
-         *
-         * Parameters:
-         * - Decode: target 50% of cache, tiles in [8, 32].
-         * - Prefill: target 37% of cache, tiles in [4, 32].
-         */
-        using DefaultFlashKVTilePolicy = CacheAwareFlashKVTilePolicy<50, 37, 8, 32, 4, 32>;
+            return tile;
+        }
 
         /// Maximum KV tile size across all flash attention policies.
         /// Used to size stack-allocated score buffers instead of heap vectors.
-        static constexpr int kMaxKVTile = 32;
+        static constexpr int kMaxKVTile = cpu::fa2_policy::kMaximumKVTile;
 
         /// Maximum I16 row stride for quantized Q buffers.
         /// Covers head_dim up to 256 with 32-element alignment: ((256+31)/32)*32 = 256.
         static constexpr int kMaxI16RowStride = 256;
+
+        /**
+         * @brief Authenticated logical-row addressing for one Q16 K/V tensor.
+         *
+         * Q16 cache tensors have two supported physical layouts. Position-major
+         * tensors store every KV head in one physical row, while head-major
+         * tensors store one `[head][physical-row]` pair per tensor row. The
+         * attention arithmetic must always consume oldest-to-newest logical
+         * rows, regardless of both that layout choice and the ring origin.
+         *
+         * Centralising the formula here is intentional: score, value, prefetch,
+         * prefill, and decode loops must not reconstruct subtly different byte
+         * offsets. Callers validate the instance once, then use `blockIndex()`
+         * for every raw block access.
+         */
+        struct Q16KVLogicalLayout
+        {
+            std::size_t blocks_per_tensor_row = 0;
+            std::size_t blocks_per_head = 0;
+            std::size_t physical_rows_per_head = 0;
+            int kv_heads = 0;
+            bool head_major = false;
+            attention::AttentionKVLogicalView logical_view{};
+
+            /**
+             * @brief Validate layout and ring geometry against a tensor pair.
+             * @param tensor_rows Number of physical rows in either Q16 tensor.
+             * @param logical_rows Number of oldest-to-newest rows to consume.
+             * @return True only when every translated block lies in the tensor.
+             */
+            [[nodiscard]] constexpr bool valid(
+                std::size_t tensor_rows,
+                int logical_rows) const noexcept
+            {
+                if (blocks_per_tensor_row == 0 || blocks_per_head == 0 ||
+                    physical_rows_per_head == 0 || kv_heads <= 0 ||
+                    !logical_view.validFor(logical_rows))
+                {
+                    return false;
+                }
+
+                const std::size_t expected_rows = head_major
+                                                      ? physical_rows_per_head *
+                                                            static_cast<std::size_t>(kv_heads)
+                                                      : physical_rows_per_head;
+                if (expected_rows != tensor_rows)
+                    return false;
+
+                if (logical_view.isContiguous())
+                {
+                    return static_cast<std::size_t>(logical_rows) <=
+                           physical_rows_per_head;
+                }
+                return static_cast<std::size_t>(
+                           logical_view.physical_row_capacity) <=
+                       physical_rows_per_head;
+            }
+
+            /**
+             * @brief Map one logical KV element block into the raw Q16 array.
+             * @param logical_row Oldest-to-newest cache row.
+             * @param kv_head KV head stored in that row.
+             * @param head_block Block offset within the selected head.
+             * @return Flat Q16 block index in the backing tensor.
+             */
+            [[nodiscard]] constexpr std::size_t blockIndex(
+                int logical_row,
+                int kv_head,
+                std::size_t head_block) const noexcept
+            {
+                const std::size_t physical_row = static_cast<std::size_t>(
+                    logical_view.physicalRow(logical_row));
+                if (head_major)
+                {
+                    const std::size_t tensor_row =
+                        static_cast<std::size_t>(kv_head) *
+                            physical_rows_per_head +
+                        physical_row;
+                    return tensor_row * blocks_per_head + head_block;
+                }
+                return physical_row * blocks_per_tensor_row +
+                       static_cast<std::size_t>(kv_head) * blocks_per_head +
+                       head_block;
+            }
+        };
 
         /**
          * @brief Compile-time map from ActivationPrecision → concrete tensor type.
@@ -346,19 +340,191 @@ namespace llaminar2
      * @tparam Precision  The activation storage format.  Currently FP32 is
      *                    fully optimised; non-FP32 precisions are unsupported.
      *
-     * @see CacheAwareFlashKVTilePolicy  Tile-size selection logic.
+     * @see cpu::fa2_policy::selectCPUFA2KVTile Tile-size selection logic.
      */
     template <ActivationPrecision Precision>
-    class CPUFlashAttentionKernelT : public ITensorAttention
+    class CPUFlashAttentionKernelT : public ITensorAttention,
+                                     public CPUKernelBase
     {
+    private:
+        /**
+         * @brief Physical query-row layout consumed by the direct Q16 kernel.
+         *
+         * Ordinary prefill stores Q as `[row][head][dim]`. Hybrid Q16 RoPE
+         * deliberately leaves compact verifier queries as `[head][row][dim]`
+         * so serial decode can consume one contiguous head. Teaching the
+         * grouped kernel both layouts keeps that producer contract intact and
+         * avoids a heap-backed transpose in the verifier hot path.
+         */
+        enum class Q16QueryLayout : std::uint8_t
+        {
+            RowMajor,
+            HeadMajor,
+        };
+
     public:
         /** @brief The concrete tensor class for this precision (e.g. FP32Tensor). */
         using TensorT = typename detail::FlashAttentionPrecisionToTensor<Precision>::Type;
         /** @brief The scalar element type for this precision (e.g. float). */
         using ElementType = typename primitives::ActivationTraits<TensorT>::ElementType;
 
-        CPUFlashAttentionKernelT() = default;
+        /**
+         * @brief Construct a kernel with launch policy snapshotted from config.
+         *
+         * The debug override is read once here, never from a compute call. This
+         * keeps launch behavior stable for the lifetime of a captured or
+         * prepared kernel and prevents mutable process state from changing a
+         * live request's cache-access pattern.
+         */
+        CPUFlashAttentionKernelT()
+        {
+            const int configured_tile = debugEnv().attention.flash_kv_tile;
+            configureLaunchPolicy({
+                .explicit_kv_tile = configured_tile > 0 ? configured_tile : 0,
+            });
+        }
         ~CPUFlashAttentionKernelT() override = default;
+
+        /**
+         * @brief Install an authenticated launch policy before execution.
+         *
+         * Performance tournaments use this typed setter between synchronous
+         * CPU launches. Production graph/stage setup calls it, if needed,
+         * before exposing the kernel to execution. Invalid candidates fail
+         * immediately instead of being rounded or deferred to a hot call.
+         *
+         * @param policy Complete per-instance CPU FA2 launch policy.
+         */
+        void configureLaunchPolicy(
+            const cpu::fa2_policy::CPUFA2KernelLaunchPolicy &policy)
+        {
+            if (!policy.valid())
+            {
+                LLAMINAR_UNREACHABLE(
+                    "invalid CPU FA2 per-kernel K/V tile override: "
+                    << policy.explicit_kv_tile);
+            }
+            launch_policy_ = policy;
+        }
+
+        /**
+         * @brief Declare persistent summaries for the largest grouped CPU row set.
+         *
+         * `m` is the compact query-row envelope supplied by the attention
+         * stage, `n` is local query heads, and `k` is head dimension. The split
+         * count is deliberately derived from heads and physical workers rather
+         * than M, matching the batch-invariant production launch policy.
+         *
+         * @param m Maximum compact query rows sharing this graph family.
+         * @param n Maximum local query heads.
+         * @param k Maximum head dimension.
+         * @return Required named CPU workspace buffers.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override
+        {
+            const std::size_t rows = static_cast<std::size_t>(std::max(1, m));
+            const std::size_t heads = static_cast<std::size_t>(std::max(1, n));
+            const std::size_t head_dim = static_cast<std::size_t>(std::max(1, k));
+            const std::size_t workers =
+                static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
+            const std::size_t producer_slots =
+                std::max<std::size_t>(1, (workers + heads - 1) / heads);
+            const std::size_t slots_per_row = producer_slots + 1;
+
+            const auto checked_product = [](std::size_t lhs,
+                                            std::size_t rhs,
+                                            const char *description)
+            {
+                if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs)
+                {
+                    throw std::overflow_error(
+                        std::string("CPU FA2 workspace overflow for ") +
+                        description);
+                }
+                return lhs * rhs;
+            };
+
+            const std::size_t partial_slots = checked_product(
+                checked_product(rows, heads, "rows x heads"),
+                slots_per_row,
+                "rows x heads x merged/producer slots");
+            const std::size_t padded_head_dim = (head_dim + 15U) & ~15U;
+            const std::size_t partial_output_elements = checked_product(
+                partial_slots,
+                padded_head_dim,
+                "partial slots x padded head dimension");
+            const std::size_t partial_output_bytes = checked_product(
+                partial_output_elements,
+                sizeof(float),
+                "partial output bytes");
+            const std::size_t partial_meta_bytes = checked_product(
+                partial_slots,
+                sizeof(float),
+                "partial metadata bytes");
+
+            WorkspaceRequirements requirements;
+            requirements.buffers.push_back({
+                cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                partial_output_bytes,
+                64,
+                true});
+            requirements.buffers.push_back({
+                cpu::AttentionWorkspaceBuffers::PARTIAL_M,
+                partial_meta_bytes,
+                64,
+                true});
+            requirements.buffers.push_back({
+                cpu::AttentionWorkspaceBuffers::PARTIAL_L,
+                partial_meta_bytes,
+                64,
+                true});
+            return requirements;
+        }
+
+        /**
+         * @brief Bind setup-owned CPU attention summaries before execution.
+         *
+         * Binding caches both addresses and capacities. Hot attention calls do
+         * not perform map lookups, allocation, growth, or ownership changes.
+         * A context-parallel call with an absent or undersized binding fails
+         * instead of entering an internal-allocation path.
+         *
+         * @param workspace Manager whose named buffers are already allocated.
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override
+        {
+            CPUKernelBase::bindWorkspace(workspace);
+            partial_output_ = workspace
+                                  ? static_cast<float *>(workspace->getBuffer(
+                                        cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT))
+                                  : nullptr;
+            partial_m_ = workspace
+                             ? static_cast<float *>(workspace->getBuffer(
+                                   cpu::AttentionWorkspaceBuffers::PARTIAL_M))
+                             : nullptr;
+            partial_l_ = workspace
+                             ? static_cast<float *>(workspace->getBuffer(
+                                   cpu::AttentionWorkspaceBuffers::PARTIAL_L))
+                             : nullptr;
+            partial_output_capacity_ = workspace
+                                           ? workspace->getBufferSize(
+                                                 cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT) /
+                                                 sizeof(float)
+                                           : 0;
+            partial_m_capacity_ = workspace
+                                      ? workspace->getBufferSize(
+                                            cpu::AttentionWorkspaceBuffers::PARTIAL_M) /
+                                            sizeof(float)
+                                      : 0;
+            partial_l_capacity_ = workspace
+                                      ? workspace->getBufferSize(
+                                            cpu::AttentionWorkspaceBuffers::PARTIAL_L) /
+                                            sizeof(float)
+                                      : 0;
+        }
 
         /**
          * @brief Reports whether this kernel can run on a given device.
@@ -552,15 +718,14 @@ namespace llaminar2
          * interface used by `DeviceGraphExecutor` and the compute-stage
          * framework) and routes to the appropriate raw-pointer method.
          *
-         * ### Fallback conditions
+         * ### Native execution contract
          *
-         * The flash path is used only when *all* of the following hold:
-         * - Precision is FP32.
-         * - No head sharding (`head_start == 0`, `local_n_heads == -1`).
-         * - Q and output are FP32 tensors.
-         * - Raw `fp32_data()` pointers are obtainable.
-         *
-         * Otherwise, the call returns false.
+         * Q and output are FP32 activation rows. K/V may remain in any native
+         * cache format implemented above; the dispatch enters that format's
+         * direct SIMD implementation and returns false for an invalid pairing
+         * rather than converting it behind the caller's back. Both declared
+         * physical axes reduce the same fixed 256-row summaries in ascending
+         * order, making physical scheduling byte-invariant.
          *
          * @param Q                 Query tensor.
          * @param K                 Key tensor.
@@ -581,9 +746,8 @@ namespace llaminar2
          * @param head_start        First head index when sharded (0 = unsharded).
          * @param local_n_heads     Local query heads (-1 = all).
          * @param local_n_kv_heads  Local KV heads (-1 = all).
-         * @param execution_policy  Capture-stable physical prefill policy.
-         *        CPU currently implements query-sequence partitioning and
-         *        rejects a graph that declares a different physical axis.
+         * @param execution_policy  Typed physical scheduling policy. Query-row
+         *        and K/V-context modes are both native implementations.
          * @return true on success.
          */
         bool compute_tensor(
@@ -607,17 +771,9 @@ namespace llaminar2
             int local_n_heads = -1,
             int local_n_kv_heads = -1,
             int gqa_n_rep = 0,
-            const attention::AttentionExecutionPolicy &execution_policy = {}) override
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {}) override
         {
-            if (execution_policy.prefill_parallel_axis !=
-                attention::AttentionPrefillParallelAxis::QuerySequence)
-            {
-                LOG_ERROR("[CPUFlashAttentionKernelT] Unsupported declared prefill parallel axis: "
-                          << attention::attentionPrefillParallelAxisName(
-                                 execution_policy.prefill_parallel_axis));
-                return false;
-            }
-
             if constexpr (!std::is_same_v<ElementType, float>)
             {
                 LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() not supported for non-FP32 precision");
@@ -628,6 +784,31 @@ namespace llaminar2
                 output->native_type() != TensorType::FP32)
             {
                 LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() requires FP32 Q and output tensors");
+                return false;
+            }
+
+            const cpu::fa2_policy::CPUFA2ParallelPlan invocation_plan =
+                cpu::fa2_policy::selectCPUFA2ParallelPlan({
+                    .batch_size = batch_size,
+                    .query_rows = seq_len,
+                    .local_query_heads = n_heads,
+                    .kv_rows = kv_len,
+                    .physical_workers = std::max(1, omp_get_max_threads()),
+                    .requested_axis =
+                        execution_policy.prefill_parallel_axis,
+                });
+            if (!invocation_plan.valid)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid declared CPU FA2 geometry");
+                return false;
+            }
+            if (!kv_logical_view.validFor(kv_len))
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid logical KV view: origin="
+                          << kv_logical_view.logical_row_origin
+                          << " capacity="
+                          << kv_logical_view.physical_row_capacity
+                          << " logical_rows=" << kv_len);
                 return false;
             }
 
@@ -644,51 +825,65 @@ namespace llaminar2
             }
 
             // ---------------------------------------------------------------
-            // FP16 KV decode fast-path: read FP16 directly, no FP32 buffer.
-            // This halves KV memory bandwidth and eliminates DRAM bank
-            // disturbance that degrades subsequent GEMM at long context.
+            // FP16/BF16 native K/V path: convert in-register for every query
+            // count, without allocating or materializing an FP32 shadow cache.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) && defined(__F16C__)
-            if (kv_len != seq_len && batch_size == 1 &&
-                K->native_type() == TensorType::FP16 &&
-                V->native_type() == TensorType::FP16)
+            if (batch_size == 1 &&
+                K->native_type() == V->native_type() &&
+                (K->native_type() == TensorType::FP16 ||
+                 K->native_type() == TensorType::BF16))
             {
-                const auto *K_fp16 = dynamic_cast<const FP16Tensor *>(K);
-                const auto *V_fp16 = dynamic_cast<const FP16Tensor *>(V);
-                if (K_fp16 && V_fp16)
+                const float *Q_ptr = Q_base->fp32_data();
+                float *O_ptr = O_base->mutable_data();
+                if (!Q_ptr || !O_ptr)
+                    return false;
+
+                const int base_position_offset = (kv_len > seq_len)
+                                                     ? (kv_len - seq_len)
+                                                     : 0;
+                const auto launch = [&]<Native16BitKVFormat Format,
+                                        typename Tensor>(
+                                        const Tensor *key_tensor,
+                                        const Tensor *value_tensor)
                 {
-                    const float *Q_ptr = Q_base->fp32_data();
-                    float *O_ptr = O_base->mutable_data();
-                    if (Q_ptr && O_ptr)
-                    {
-                        const int q_stride = n_heads * head_dim;
-                        const int base_position_offset = (kv_len > seq_len)
-                                                             ? (kv_len - seq_len)
-                                                             : 0;
-                        for (int row = 0; row < seq_len; ++row)
-                        {
-                            if (!compute_decode_fp16kv(
-                                    Q_ptr + static_cast<size_t>(row) * q_stride,
-                                    K_fp16->typed_data(),
-                                    V_fp16->typed_data(),
-                                    O_ptr + static_cast<size_t>(row) * q_stride,
-                                    kv_len, n_heads, n_kv_heads, head_dim,
-                                    causal, base_position_offset + row,
-                                    head_start, gqa_n_rep))
-                            {
-                                return false;
-                            }
-                        }
-                        return true;
-                    }
+                    if (!key_tensor || !value_tensor)
+                        return false;
+                    return compute_native16kv<Format>(
+                        Q_ptr,
+                        key_tensor->typed_data(),
+                        value_tensor->typed_data(),
+                        O_ptr,
+                        seq_len,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        base_position_offset,
+                        head_start,
+                        gqa_n_rep,
+                        execution_policy,
+                        kv_logical_view);
+                };
+
+                if (K->native_type() == TensorType::FP16)
+                {
+                    return launch.template operator()<
+                        Native16BitKVFormat::FP16>(
+                        dynamic_cast<const FP16Tensor *>(K),
+                        dynamic_cast<const FP16Tensor *>(V));
                 }
+                return launch.template operator()<
+                    Native16BitKVFormat::BF16>(
+                    dynamic_cast<const BF16Tensor *>(K),
+                    dynamic_cast<const BF16Tensor *>(V));
             }
-#endif
 
             // ---------------------------------------------------------------
-            // Q16_1 KV decode fast-path: VNNI int16 QK dot product + int16 V.
-            // Halves KV bandwidth (int16 values are 2 bytes vs 4 bytes FP32)
-            // and leverages VPDPWSSD for compute-free QK scoring.
+            // Native Q16_1 VNNI attention for decode, grouped verification,
+            // and prefill. One implementation owns every M so all regimes use
+            // identical canonical summaries and bounded wave workspace.
             // ---------------------------------------------------------------
 #if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
             if (K->native_type() == TensorType::Q16_1 &&
@@ -706,84 +901,108 @@ namespace llaminar2
                         const int position_offset = (kv_len > seq_len)
                                                         ? (kv_len - seq_len)
                                                         : 0;
-                        if (kv_len != seq_len)
-                        {
-                            const int q_stride = n_heads * head_dim;
-                            for (int row = 0; row < seq_len; ++row)
-                            {
-                                if (!compute_decode_q16kv(
-                                        Q_ptr + static_cast<size_t>(row) * q_stride,
-                                        K_q16, V_q16,
-                                        O_ptr + static_cast<size_t>(row) * q_stride,
-                                        kv_len, n_heads, n_kv_heads, head_dim,
-                                        causal, position_offset + row,
-                                        head_start, gqa_n_rep))
-                                {
-                                    return false;
-                                }
-                            }
-                            return true;
-                        }
-                        else
-                        {
-                            return compute_prefill_q16kv(
-                                Q_ptr, K_q16, V_q16, O_ptr,
-                                seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, window_size, position_offset,
-                                head_start, gqa_n_rep);
-                        }
+                        return compute_prefill_q16kv(
+                            Q_ptr,
+                            K_q16,
+                            V_q16,
+                            O_ptr,
+                            seq_len,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            position_offset,
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            kv_logical_view);
                     }
                 }
             }
 #endif
 
             // ---------------------------------------------------------------
-            // TurboQuant TQ8-K / TQ4-V fused decode path: zero shadow buffers.
-            // Pre-rotates Q once per head [O(D²)], then O(D) per KV position.
-            // V accumulated in rotated centroid space, one final Πᵀ at end.
+            // TurboQuant TQ4/TQ8 native paths: zero shadow buffers for decode,
+            // grouped verification, and prefill. Q is rotated once per logical
+            // output row, then each K/V row costs O(D). Both symmetric cache
+            // modes and the production TQ8-K/TQ4-V asymmetric mode enter this
+            // same scheduler and therefore share one arithmetic contract.
             // ---------------------------------------------------------------
 #if defined(__AVX512F__) || defined(__AVX2__)
-            if (K->native_type() == TensorType::TQ8 &&
-                V->native_type() == TensorType::TQ4 &&
-                batch_size == 1 && kv_len != seq_len) // decode only
+            if ((K->native_type() == TensorType::TQ4 ||
+                 K->native_type() == TensorType::TQ8) &&
+                (V->native_type() == TensorType::TQ4 ||
+                 V->native_type() == TensorType::TQ8) &&
+                batch_size == 1)
             {
-                const auto *K_tq8 = dynamic_cast<const TQ8Tensor *>(K);
-                const auto *V_tq4 = dynamic_cast<const TQ4Tensor *>(V);
-                if (K_tq8 && V_tq4 && K_tq8->turboquant_context())
+                const float *Q_ptr = Q_base->fp32_data();
+                float *O_ptr = O_base->mutable_data();
+                if (!Q_ptr || !O_ptr)
+                    return false;
+
+                const int base_position_offset = (kv_len > seq_len)
+                                                     ? (kv_len - seq_len)
+                                                     : 0;
+                const auto launch = [&]<typename KeyTensor,
+                                        typename ValueTensor>(
+                                        const KeyTensor *key_tensor,
+                                        const ValueTensor *value_tensor)
                 {
-                    const float *Q_ptr = Q_base->fp32_data();
-                    float *O_ptr = O_base->mutable_data();
-                    if (Q_ptr && O_ptr)
+                    if (!key_tensor || !value_tensor ||
+                        !key_tensor->turboquant_context() ||
+                        !value_tensor->turboquant_context())
+                        return false;
+                    return compute_tqkv(
+                        Q_ptr,
+                        key_tensor,
+                        value_tensor,
+                        O_ptr,
+                        seq_len,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        base_position_offset,
+                        head_start,
+                        gqa_n_rep,
+                        execution_policy,
+                        kv_logical_view);
+                };
+
+                const auto launch_for_key = [&]<typename KeyTensor>(
+                                                const KeyTensor *key_tensor)
+                {
+                    if (V->native_type() == TensorType::TQ4)
                     {
-                        const int q_stride = n_heads * head_dim;
-                        const int base_position_offset = (kv_len > seq_len)
-                                                             ? (kv_len - seq_len)
-                                                             : 0;
-                        for (int row = 0; row < seq_len; ++row)
-                        {
-                            if (!compute_decode_tqkv(
-                                    Q_ptr + static_cast<size_t>(row) * q_stride,
-                                    K_tq8, V_tq4,
-                                    O_ptr + static_cast<size_t>(row) * q_stride,
-                                    kv_len, n_heads, n_kv_heads, head_dim,
-                                    causal, base_position_offset + row,
-                                    head_start, gqa_n_rep))
-                            {
-                                return false;
-                            }
-                        }
-                        return true;
+                        return launch(
+                            key_tensor,
+                            dynamic_cast<const TQ4Tensor *>(V));
                     }
+                    return launch(
+                        key_tensor,
+                        dynamic_cast<const TQ8Tensor *>(V));
+                };
+
+                if (K->native_type() == TensorType::TQ4)
+                {
+                    return launch_for_key(
+                        dynamic_cast<const TQ4Tensor *>(K));
                 }
+                return launch_for_key(
+                    dynamic_cast<const TQ8Tensor *>(K));
             }
 #endif
 
             // ---------------------------------------------------------------
-            // Q8_1 KV decode fast-path: inline int8→float dequant in the
-            // attention inner loop. Eliminates FP32 shadow buffers (saves
-            // ~440 MB for 7B models) while keeping compute accurate.
+            // Q8_1 native K/V path: inline int8-to-float dequantization for
+            // decode, grouped verification, and prefill. No FP32 shadow cache
+            // is materialized for any query-row count.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) && defined(__F16C__)
+#if defined(__AVX512F__) || defined(__AVX2__)
             if (K->native_type() == TensorType::Q8_1 &&
                 V->native_type() == TensorType::Q8_1 &&
                 batch_size == 1)
@@ -799,32 +1018,45 @@ namespace llaminar2
                         const int position_offset = (kv_len > seq_len)
                                                         ? (kv_len - seq_len)
                                                         : 0;
-                        if (kv_len != seq_len)
-                        {
-                            const int q_stride = n_heads * head_dim;
-                            for (int row = 0; row < seq_len; ++row)
-                            {
-                                if (!compute_decode_q8kv(
-                                        Q_ptr + static_cast<size_t>(row) * q_stride,
-                                        K_q8, V_q8,
-                                        O_ptr + static_cast<size_t>(row) * q_stride,
-                                        kv_len, n_heads, n_kv_heads, head_dim,
-                                        causal, position_offset + row,
-                                        head_start, gqa_n_rep))
-                                {
-                                    return false;
-                                }
-                            }
-                            return true;
-                        }
+                        return compute_q8kv(
+                            Q_ptr,
+                            K_q8,
+                            V_q8,
+                            O_ptr,
+                            seq_len,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            position_offset,
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            kv_logical_view);
                     }
                 }
             }
 #endif
 
-            const float *Q_ptr = Q_base->fp32_data();
-            const float *K_ptr = K_base->fp32_data();
-            const float *V_ptr = V_base->fp32_data();
+            if (K->native_type() != TensorType::FP32 ||
+                V->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] No direct CPU attention implementation for K="
+                          << static_cast<int>(K->native_type())
+                          << " V=" << static_cast<int>(V->native_type()));
+                return false;
+            }
+            if (batch_size > 1 && !kv_logical_view.isContiguous())
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Request-batched ring views require per-request descriptors");
+                return false;
+            }
+
+            const float *Q_ptr = Q_base->data();
+            const float *K_ptr = K_base->data();
+            const float *V_ptr = V_base->data();
             float *O_ptr = O_base->mutable_data();
 
             if (!Q_ptr || !K_ptr || !V_ptr || !O_ptr)
@@ -850,7 +1082,9 @@ namespace llaminar2
                 return compute_flash_fp32(Q_ptr, K_ptr, V_ptr, O_ptr,
                                           seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                                           causal, window_size, position_offset, mask,
-                                          head_start, gqa_n_rep);
+                                          head_start, gqa_n_rep,
+                                          execution_policy,
+                                          kv_logical_view);
             }
 
             {
@@ -858,19 +1092,22 @@ namespace llaminar2
                 return compute_flash_fp32(Q_ptr, K_ptr, V_ptr, O_ptr,
                                           seq_len, seq_len, n_heads, n_kv_heads, head_dim,
                                           causal, window_size, 0, mask,
-                                          head_start, gqa_n_rep);
+                                          head_start, gqa_n_rep,
+                                          execution_policy,
+                                          kv_logical_view);
             }
         }
 
         /**
          * @brief Group independent CPU request histories without stage-level replay.
          *
-         * Each request receives the exact `compute_flash_fp32()` arithmetic used
-         * by ordinary M=1 decode, but descriptor validation and dispatch happen
-         * once for the group. The cache conversion layer keeps K/V shadows
-         * incremental, while the flash primitive parallelizes each long history
-         * over query heads. This avoids a stage/executor replay loop and keeps
-         * request-local causal horizons explicit.
+         * Descriptor authentication and storage-format dispatch happen once for
+         * the request group. Each independent history then enters the matching
+         * native tiled primitive directly; the method never calls the public
+         * polymorphic entry point per request and never asks a tensor to expose
+         * an FP32 conversion shadow. Long histories retain full-team K/V-context
+         * parallelism, so processing requests in stable admission order does not
+         * strand cores merely to manufacture request-axis concurrency.
          */
         bool compute_request_batch_decode_equivalent(
             const ITensor *Q,
@@ -888,7 +1125,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
-            int gqa_n_rep = 0) override
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr) override
         {
             (void)mpi_ctx;
             (void)device_idx;
@@ -898,7 +1137,8 @@ namespace llaminar2
                 return false;
             }
 
-            if (!Q || !K_by_request || !V_by_request || !kv_lens || !output ||
+            if (!Q || !K_by_request || !V_by_request || !kv_lens ||
+                !kv_logical_views || !output ||
                 request_count <= 1 || query_rows <= 0 ||
                 n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
             {
@@ -907,7 +1147,7 @@ namespace llaminar2
 
             const auto *q_tensor = dynamic_cast<const TensorBase *>(Q);
             auto *output_tensor = dynamic_cast<TensorBase *>(output);
-            const float *q = q_tensor ? q_tensor->fp32_data() : nullptr;
+            const float *q = q_tensor ? q_tensor->data() : nullptr;
             float *out = output_tensor ? output_tensor->mutable_data() : nullptr;
             if (!q || !out || Q->native_type() != TensorType::FP32 ||
                 output->native_type() != TensorType::FP32)
@@ -915,42 +1155,289 @@ namespace llaminar2
                 return false;
             }
 
+            if (!K_by_request[0] || !V_by_request[0])
+                return false;
+            const TensorType key_type = K_by_request[0]->native_type();
+            const TensorType value_type = V_by_request[0]->native_type();
+            for (int request = 0; request < request_count; ++request)
+            {
+                if (!K_by_request[request] || !V_by_request[request] ||
+                    K_by_request[request]->native_type() != key_type ||
+                    V_by_request[request]->native_type() != value_type ||
+                    kv_lens[request] < query_rows ||
+                    !kv_logical_views[request].validFor(kv_lens[request]))
+                {
+                    LOG_ERROR("[CPUFlashAttentionKernelT] Invalid or heterogeneous native request-batch descriptor"
+                              << " request=" << request);
+                    return false;
+                }
+            }
+
             const size_t query_stride =
                 static_cast<size_t>(query_rows) *
                 static_cast<size_t>(n_heads) *
                 static_cast<size_t>(head_dim);
-            for (int request = 0; request < request_count; ++request)
+            const auto run_requests = [&](auto &&launch_request)
             {
-                const auto *k_tensor =
-                    dynamic_cast<const TensorBase *>(K_by_request[request]);
-                const auto *v_tensor =
-                    dynamic_cast<const TensorBase *>(V_by_request[request]);
-                const float *k = k_tensor ? k_tensor->fp32_data() : nullptr;
-                const float *v = v_tensor ? v_tensor->fp32_data() : nullptr;
-                const int kv_len = kv_lens[request];
-                if (!k || !v || kv_len < query_rows)
-                    return false;
-
-                if (!compute_flash_fp32(
-                        q + static_cast<size_t>(request) * query_stride,
-                        k,
-                        v,
-                        out + static_cast<size_t>(request) * query_stride,
-                        query_rows,
-                        kv_len,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        causal,
-                        window_size,
-                        std::max(0, kv_len - query_rows),
-                        /*mask=*/nullptr,
-                        head_start,
-                        gqa_n_rep,
-                        /*force_decode_tile_policy=*/query_rows > 1))
+                for (int request = 0; request < request_count; ++request)
                 {
-                    return false;
+                    if (!launch_request(
+                            request,
+                            q + static_cast<size_t>(request) * query_stride,
+                            out + static_cast<size_t>(request) * query_stride,
+                            kv_lens[request],
+                            kv_logical_views[request]))
+                    {
+                        return false;
+                    }
                 }
+                return true;
+            };
+
+            bool success = false;
+            if (key_type == TensorType::FP32 &&
+                value_type == TensorType::FP32)
+            {
+                success = run_requests(
+                    [&](int request,
+                        const float *request_q,
+                        float *request_output,
+                        int kv_len,
+                        const attention::AttentionKVLogicalView &view)
+                    {
+                        const auto *key = dynamic_cast<const FP32Tensor *>(
+                            K_by_request[request]);
+                        const auto *value = dynamic_cast<const FP32Tensor *>(
+                            V_by_request[request]);
+                        return key && value && compute_flash_fp32(
+                            request_q,
+                            key->data(),
+                            value->data(),
+                            request_output,
+                            query_rows,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            std::max(0, kv_len - query_rows),
+                            /*mask=*/nullptr,
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            view);
+                    });
+            }
+            else if (key_type == TensorType::FP16 &&
+                     value_type == TensorType::FP16)
+            {
+                success = run_requests(
+                    [&](int request,
+                        const float *request_q,
+                        float *request_output,
+                        int kv_len,
+                        const attention::AttentionKVLogicalView &view)
+                    {
+                        const auto *key = dynamic_cast<const FP16Tensor *>(
+                            K_by_request[request]);
+                        const auto *value = dynamic_cast<const FP16Tensor *>(
+                            V_by_request[request]);
+                        return key && value && compute_native16kv<
+                            Native16BitKVFormat::FP16>(
+                            request_q,
+                            key->typed_data(),
+                            value->typed_data(),
+                            request_output,
+                            query_rows,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            std::max(0, kv_len - query_rows),
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            view);
+                    });
+            }
+            else if (key_type == TensorType::BF16 &&
+                     value_type == TensorType::BF16)
+            {
+                success = run_requests(
+                    [&](int request,
+                        const float *request_q,
+                        float *request_output,
+                        int kv_len,
+                        const attention::AttentionKVLogicalView &view)
+                    {
+                        const auto *key = dynamic_cast<const BF16Tensor *>(
+                            K_by_request[request]);
+                        const auto *value = dynamic_cast<const BF16Tensor *>(
+                            V_by_request[request]);
+                        return key && value && compute_native16kv<
+                            Native16BitKVFormat::BF16>(
+                            request_q,
+                            key->typed_data(),
+                            value->typed_data(),
+                            request_output,
+                            query_rows,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            std::max(0, kv_len - query_rows),
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            view);
+                    });
+            }
+#if defined(__AVX512F__) || defined(__AVX2__)
+            else if (key_type == TensorType::Q8_1 &&
+                     value_type == TensorType::Q8_1)
+            {
+                success = run_requests(
+                    [&](int request,
+                        const float *request_q,
+                        float *request_output,
+                        int kv_len,
+                        const attention::AttentionKVLogicalView &view)
+                    {
+                        const auto *key = dynamic_cast<const Q8_1Tensor *>(
+                            K_by_request[request]);
+                        const auto *value = dynamic_cast<const Q8_1Tensor *>(
+                            V_by_request[request]);
+                        return key && value && compute_q8kv(
+                            request_q,
+                            key,
+                            value,
+                            request_output,
+                            query_rows,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            std::max(0, kv_len - query_rows),
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            view);
+                    });
+            }
+            else if ((key_type == TensorType::TQ4 ||
+                      key_type == TensorType::TQ8) &&
+                     (value_type == TensorType::TQ4 ||
+                      value_type == TensorType::TQ8))
+            {
+                const auto run_tq_pair = [&]<typename KeyTensor,
+                                              typename ValueTensor>()
+                {
+                    return run_requests(
+                        [&](int request,
+                            const float *request_q,
+                            float *request_output,
+                            int kv_len,
+                            const attention::AttentionKVLogicalView &view)
+                        {
+                            const auto *key = dynamic_cast<const KeyTensor *>(
+                                K_by_request[request]);
+                            const auto *value = dynamic_cast<const ValueTensor *>(
+                                V_by_request[request]);
+                            return key && value &&
+                                   key->turboquant_context() &&
+                                   value->turboquant_context() ==
+                                       key->turboquant_context() &&
+                                   compute_tqkv(
+                                       request_q,
+                                       key,
+                                       value,
+                                       request_output,
+                                       query_rows,
+                                       kv_len,
+                                       n_heads,
+                                       n_kv_heads,
+                                       head_dim,
+                                       causal,
+                                       window_size,
+                                       std::max(0, kv_len - query_rows),
+                                       head_start,
+                                       gqa_n_rep,
+                                       execution_policy,
+                                       view);
+                        });
+                };
+
+                if (key_type == TensorType::TQ4)
+                {
+                    success = value_type == TensorType::TQ4
+                                  ? run_tq_pair.template operator()<
+                                        TQ4Tensor, TQ4Tensor>()
+                                  : run_tq_pair.template operator()<
+                                        TQ4Tensor, TQ8Tensor>();
+                }
+                else
+                {
+                    success = value_type == TensorType::TQ4
+                                  ? run_tq_pair.template operator()<
+                                        TQ8Tensor, TQ4Tensor>()
+                                  : run_tq_pair.template operator()<
+                                        TQ8Tensor, TQ8Tensor>();
+                }
+            }
+#endif
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+            else if (key_type == TensorType::Q16_1 &&
+                     value_type == TensorType::Q16_1)
+            {
+                success = run_requests(
+                    [&](int request,
+                        const float *request_q,
+                        float *request_output,
+                        int kv_len,
+                        const attention::AttentionKVLogicalView &view)
+                    {
+                        const auto *key = dynamic_cast<const Q16_1Tensor *>(
+                            K_by_request[request]);
+                        const auto *value = dynamic_cast<const Q16_1Tensor *>(
+                            V_by_request[request]);
+                        if (!key || !value)
+                            return false;
+                        const int position_offset =
+                            std::max(0, kv_len - query_rows);
+                        return compute_prefill_q16kv(
+                            request_q,
+                            key,
+                            value,
+                            request_output,
+                            query_rows,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            causal,
+                            window_size,
+                            position_offset,
+                            head_start,
+                            gqa_n_rep,
+                            execution_policy,
+                            view);
+                    });
+            }
+#endif
+
+            if (!success)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] No direct native request-batch implementation for K="
+                          << static_cast<int>(key_type)
+                          << " V=" << static_cast<int>(value_type));
+                return false;
             }
 
             PerfStatsCollector::addCounter(
@@ -961,7 +1448,9 @@ namespace llaminar2
                 "cpu",
                 {{"requests", std::to_string(request_count)},
                  {"query_rows", std::to_string(query_rows)},
-                 {"cache_view", "per_request_fp32_shadow"},
+                 {"cache_view", "per_request_native_ring"},
+                 {"key_type", std::to_string(static_cast<int>(key_type))},
+                 {"value_type", std::to_string(static_cast<int>(value_type))},
                  {"math", "serial_decode_equivalent"}});
             return true;
         }
@@ -971,11 +1460,12 @@ namespace llaminar2
          *
          * This is the CPU implementation of the Phase 9.8 verifier contract:
          * compute all compact verifier rows in one grouped attention call while
-         * preserving the causal visibility of serial one-token decode.  The
-         * promoted Qwen3.6 CPU lane stores hybrid KV cache rows as Q16_1, while
-         * the unquantized CPU lane uses FP32 K/V.  Both formats run one grouped
-         * attention invocation with a row-local decode tile policy; unsupported
-         * cache formats fail closed instead of silently replaying serial rows.
+         * preserving the causal visibility of serial one-token decode. Q16_1
+         * retains its dedicated grouped VNNI implementation. Every other
+         * native CPU cache format enters `compute_tensor()` once for the entire
+         * verifier group, so reduced-precision storage cannot drift into an
+         * FP32 shadow-materialization path. Unsupported combinations fail
+         * closed instead of silently replaying serial rows.
          */
         bool compute_verifier_rows_decode_equivalent(
             const ITensor *Q,
@@ -992,7 +1482,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
-            int gqa_n_rep = 0) override
+            int gqa_n_rep = 0,
+            const attention::AttentionKVLogicalView &kv_logical_view = {},
+            const attention::AttentionExecutionPolicy &execution_policy = {}) override
         {
             (void)mpi_ctx;
             (void)device_idx;
@@ -1006,7 +1498,7 @@ namespace llaminar2
                 verifier_rows < 2 ||
                 kv_len <= verifier_rows ||
                 n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
-                !causal)
+                !causal || !kv_logical_view.validFor(kv_len))
             {
                 return false;
             }
@@ -1030,15 +1522,12 @@ namespace llaminar2
                 return false;
             }
 
-            const int q_stride = n_heads * head_dim;
-            const float *q_rows = q_src;
-            std::vector<float> row_major_q;
-
             /*
              * Hybrid Q16 CPU RoPE may leave Q in [head][row][dim] order so the
              * single-row integer attention kernel can consume one head block.
-             * The grouped kernel operates over logical verifier rows and
-             * therefore gathers that layout once into [row][head][dim].
+             * The grouped Q16 kernel accepts that physical layout directly;
+             * transposing it here would allocate and copy in the verifier hot
+             * path.
              */
             const auto &q_shape = Q_base->shape();
             const bool head_major_q =
@@ -1046,34 +1535,12 @@ namespace llaminar2
                 q_shape.size() >= 2 &&
                 q_shape[0] == static_cast<size_t>(n_heads * verifier_rows) &&
                 q_shape[1] == static_cast<size_t>(head_dim);
-            if (head_major_q)
-            {
-                row_major_q.assign(static_cast<size_t>(verifier_rows) *
-                                       static_cast<size_t>(q_stride),
-                                   0.0f);
-                for (int row = 0; row < verifier_rows; ++row)
-                {
-                    for (int h = 0; h < n_heads; ++h)
-                    {
-                        const size_t src_offset =
-                            (static_cast<size_t>(h) * static_cast<size_t>(verifier_rows) +
-                             static_cast<size_t>(row)) *
-                            static_cast<size_t>(head_dim);
-                        const size_t dst_offset =
-                            static_cast<size_t>(row) * static_cast<size_t>(q_stride) +
-                            static_cast<size_t>(h) * static_cast<size_t>(head_dim);
-                        std::copy_n(q_src + src_offset, head_dim,
-                                    row_major_q.data() + dst_offset);
-                    }
-                }
-                q_rows = row_major_q.data();
-            }
 
             const int base_position_offset = kv_len - verifier_rows;
             if (K_q16 && V_q16)
             {
                 const bool success = compute_prefill_q16kv(
-                    q_rows,
+                    q_src,
                     K_q16,
                     V_q16,
                     out,
@@ -1087,7 +1554,11 @@ namespace llaminar2
                     base_position_offset,
                     head_start,
                     gqa_n_rep,
-                    /*force_decode_tile_policy=*/true);
+                    execution_policy,
+                    kv_logical_view,
+                    head_major_q
+                        ? Q16QueryLayout::HeadMajor
+                        : Q16QueryLayout::RowMajor);
                 if (success)
                 {
                     PerfStatsCollector::addCounter(
@@ -1107,47 +1578,74 @@ namespace llaminar2
                 return success;
             }
 
-            const float *k_fp32 = K_base->fp32_data();
-            const float *v_fp32 = V_base->fp32_data();
-            if (k_fp32 && v_fp32)
-            {
-                const bool success = compute_flash_fp32(
-                    q_rows,
-                    k_fp32,
-                    v_fp32,
-                    out,
-                    verifier_rows,
-                    kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    causal,
-                    window_size,
-                    base_position_offset,
-                    /*mask=*/nullptr,
-                    head_start,
-                    gqa_n_rep,
-                    /*force_decode_tile_policy=*/true);
-                if (success)
-                {
-                    PerfStatsCollector::addCounter(
-                        "kernel",
-                        "cpu_attention_grouped_verifier_rows_calls",
-                        1.0,
-                        "verifier",
-                        "cpu",
-                        {{"cache_format", "fp32"},
-                         {"verifier_rows", std::to_string(verifier_rows)},
-                         {"kv_len", std::to_string(kv_len)},
-                         {"n_heads", std::to_string(n_heads)},
-                         {"n_kv_heads", std::to_string(n_kv_heads)},
-                         {"head_dim", std::to_string(head_dim)},
-                         {"tile_policy", "serial_decode_equivalent"}});
-                }
-                return success;
-            }
+            if (Q->native_type() != TensorType::FP32)
+                return false;
 
-            return false;
+            const bool success = compute_tensor(
+                Q,
+                K,
+                V,
+                output,
+                /*batch_size=*/1,
+                verifier_rows,
+                kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+                window_size,
+                /*workspace_scores=*/nullptr,
+                /*workspace_mask=*/nullptr,
+                mpi_ctx,
+                device_idx,
+                head_start,
+                /*local_n_heads=*/-1,
+                /*local_n_kv_heads=*/-1,
+                gqa_n_rep,
+                execution_policy,
+                kv_logical_view);
+            if (success)
+            {
+                const auto cache_format = [&]() -> const char *
+                {
+                    if (K->native_type() == TensorType::FP32 &&
+                        V->native_type() == TensorType::FP32)
+                        return "fp32";
+                    if (K->native_type() == TensorType::FP16 &&
+                        V->native_type() == TensorType::FP16)
+                        return "fp16";
+                    if (K->native_type() == TensorType::BF16 &&
+                        V->native_type() == TensorType::BF16)
+                        return "bf16";
+                    if (K->native_type() == TensorType::Q8_1 &&
+                        V->native_type() == TensorType::Q8_1)
+                        return "q8_1";
+                    if (K->native_type() == TensorType::TQ4 &&
+                        V->native_type() == TensorType::TQ4)
+                        return "tq4_k_tq4_v";
+                    if (K->native_type() == TensorType::TQ8 &&
+                        V->native_type() == TensorType::TQ4)
+                        return "tq8_k_tq4_v";
+                    if (K->native_type() == TensorType::TQ8 &&
+                        V->native_type() == TensorType::TQ8)
+                        return "tq8_k_tq8_v";
+                    return "invalid";
+                }();
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_attention_grouped_verifier_rows_calls",
+                    1.0,
+                    "verifier",
+                    "cpu",
+                    {{"cache_format", cache_format},
+                     {"verifier_rows", std::to_string(verifier_rows)},
+                     {"kv_len", std::to_string(kv_len)},
+                     {"n_heads", std::to_string(n_heads)},
+                     {"n_kv_heads", std::to_string(n_kv_heads)},
+                     {"head_dim", std::to_string(head_dim)},
+                     {"tile_policy", "serial_decode_equivalent"}});
+            }
+            return success;
         }
 
         /**
@@ -1406,183 +1904,568 @@ namespace llaminar2
             }
         }
 
-        // =================================================================
-        // FP16 KV helpers — load FP16, convert to FP32, compute
-        // =================================================================
+#endif
 
         /**
-         * @brief Dot product of FP32 query × FP16 key with on-the-fly conversion.
+         * @brief Native two-byte KV encodings consumed without an FP32 shadow.
          *
-         * Reads 16 FP16 values at a time (32 bytes), converts to FP32 via
-         * vcvtph2ps, then FMA-accumulates against the FP32 query vector.
-         * Half the KV memory bandwidth vs the FP32 path.
+         * FP16 and BF16 have identical storage width but different bit layouts.
+         * Carrying the distinction as a template argument lets one attention
+         * scheduler share its arithmetic order while each ISA emits the
+         * correct in-register conversion instruction sequence.
          */
-        static float dot_fp16_avx512(const float *q, const uint16_t *k, int head_dim)
+        enum class Native16BitKVFormat : std::uint8_t
         {
-            __m512 acc = _mm512_setzero_ps();
-            int d = 0;
-            for (; d + 15 < head_dim; d += 16)
-            {
-                __m512 vq = _mm512_loadu_ps(q + d);
-                __m256i k16 = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i *>(k + d));
-                __m512 vk = _mm512_cvtph_ps(k16);
-                acc = _mm512_fmadd_ps(vq, vk, acc);
-            }
-            float sum = _mm512_reduce_add_ps(acc);
-            for (; d < head_dim; ++d)
-            {
-                // Scalar FP16→FP32 conversion for tail elements
-                __m128i h = _mm_set1_epi16(static_cast<short>(k[d]));
-                float kf = _mm_cvtss_f32(_mm_cvtph_ps(h));
-                sum += q[d] * kf;
-            }
+            FP16,
+            BF16,
+        };
+
+        /** @brief Decode one native 16-bit KV element for scalar execution. */
+        template <Native16BitKVFormat Format>
+        static float decode_native16_scalar(std::uint16_t value)
+        {
+            if constexpr (Format == Native16BitKVFormat::FP16)
+                return fp16_to_fp32(value);
+            return simd::bf16_to_fp32(value);
+        }
+
+        /** @brief Scalar FP32-query dot product against one native 16-bit row. */
+        template <Native16BitKVFormat Format>
+        static float dot_native16_scalar(
+            const float *query,
+            const std::uint16_t *key,
+            int head_dim)
+        {
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
+                sum += query[d] * decode_native16_scalar<Format>(key[d]);
             return sum;
         }
 
-        /**
-         * @brief 4-row batched dot product: FP32 Q × FP16 K for ILP.
-         */
-        static void dot_fp16_avx512_4row(
-            const float *q,
-            const uint16_t *k0, const uint16_t *k1,
-            const uint16_t *k2, const uint16_t *k3,
+        /** @brief Scalar four-row native 16-bit dot product with independent accumulators. */
+        template <Native16BitKVFormat Format>
+        static void dot_native16_4row_scalar(
+            const float *query,
+            const std::uint16_t *key0,
+            const std::uint16_t *key1,
+            const std::uint16_t *key2,
+            const std::uint16_t *key3,
             int head_dim,
-            float &s0, float &s1, float &s2, float &s3)
+            float &score0,
+            float &score1,
+            float &score2,
+            float &score3)
         {
-            __m512 acc0 = _mm512_setzero_ps();
-            __m512 acc1 = _mm512_setzero_ps();
-            __m512 acc2 = _mm512_setzero_ps();
-            __m512 acc3 = _mm512_setzero_ps();
-
-            int d = 0;
-            for (; d + 15 < head_dim; d += 16)
+            score0 = 0.0f;
+            score1 = 0.0f;
+            score2 = 0.0f;
+            score3 = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
             {
-                __m512 vq = _mm512_loadu_ps(q + d);
-                acc0 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k0 + d))), acc0);
-                acc1 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k1 + d))), acc1);
-                acc2 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k2 + d))), acc2);
-                acc3 = _mm512_fmadd_ps(vq, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(k3 + d))), acc3);
-            }
-
-            s0 = _mm512_reduce_add_ps(acc0);
-            s1 = _mm512_reduce_add_ps(acc1);
-            s2 = _mm512_reduce_add_ps(acc2);
-            s3 = _mm512_reduce_add_ps(acc3);
-
-            for (; d < head_dim; ++d)
-            {
-                float qd = q[d];
-                auto cvt = [](uint16_t h)
-                {
-                    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(static_cast<short>(h))));
-                };
-                s0 += qd * cvt(k0[d]);
-                s1 += qd * cvt(k1[d]);
-                s2 += qd * cvt(k2[d]);
-                s3 += qd * cvt(k3[d]);
+                const float q = query[d];
+                score0 += q * decode_native16_scalar<Format>(key0[d]);
+                score1 += q * decode_native16_scalar<Format>(key1[d]);
+                score2 += q * decode_native16_scalar<Format>(key2[d]);
+                score3 += q * decode_native16_scalar<Format>(key3[d]);
             }
         }
 
-        /**
-         * @brief Weighted V accumulation: out[d] += weight * FP16_to_FP32(v[d]).
-         */
-        static void accum_weighted_v_fp16(
-            float *out, const uint16_t *v, float weight, int head_dim)
-        {
-            __m512 w = _mm512_set1_ps(weight);
-            int d = 0;
-            for (; d + 15 < head_dim; d += 16)
-            {
-                __m512 o = _mm512_loadu_ps(out + d);
-                __m256i v16 = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i *>(v + d));
-                __m512 vv = _mm512_cvtph_ps(v16);
-                o = _mm512_fmadd_ps(vv, w, o);
-                _mm512_storeu_ps(out + d, o);
-            }
-            for (; d < head_dim; ++d)
-            {
-                __m128i h = _mm_set1_epi16(static_cast<short>(v[d]));
-                out[d] += weight * _mm_cvtss_f32(_mm_cvtph_ps(h));
-            }
-        }
-
-        /**
-         * @brief 4-row batched FP16 V accumulation with 2× unrolled inner loop.
-         *
-         * Like `accum_weighted_v_fp16` but processes 4 KV rows in one pass:
-         *   out[d] += w0*cvt(v0[d]) + w1*cvt(v1[d]) + w2*cvt(v2[d]) + w3*cvt(v3[d])
-         * for each dimension d.  Loads/stores `out` once per 32-element chunk
-         * instead of 4× (once per row), saving ~60% L1 traffic.
-         */
-        static void accum_weighted_v_fp16_4row(
-            float *__restrict out,
-            const uint16_t *v0, float w0,
-            const uint16_t *v1, float w1,
-            const uint16_t *v2, float w2,
-            const uint16_t *v3, float w3,
+        /** @brief Scalar weighted accumulation from one native 16-bit V row. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_scalar(
+            float *output,
+            const std::uint16_t *value,
+            float weight,
             int head_dim)
         {
-            const __m512 vw0 = _mm512_set1_ps(w0);
-            const __m512 vw1 = _mm512_set1_ps(w1);
-            const __m512 vw2 = _mm512_set1_ps(w2);
-            const __m512 vw3 = _mm512_set1_ps(w3);
-            int d = 0;
-            // 2x unrolled: 32 elements per iteration
-            for (; d + 31 < head_dim; d += 32)
+            for (int d = 0; d < head_dim; ++d)
             {
-                __m512 oA = _mm512_loadu_ps(out + d);
-                __m512 oB = _mm512_loadu_ps(out + d + 16);
-                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d))), vw0, oA);
-                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d + 16))), vw0, oB);
-                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d))), vw1, oA);
-                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d + 16))), vw1, oB);
-                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d))), vw2, oA);
-                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d + 16))), vw2, oB);
-                oA = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d))), vw3, oA);
-                oB = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d + 16))), vw3, oB);
-                _mm512_storeu_ps(out + d, oA);
-                _mm512_storeu_ps(out + d + 16, oB);
-            }
-            for (; d + 15 < head_dim; d += 16)
-            {
-                __m512 o = _mm512_loadu_ps(out + d);
-                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v0 + d))), vw0, o);
-                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v1 + d))), vw1, o);
-                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v2 + d))), vw2, o);
-                o = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v3 + d))), vw3, o);
-                _mm512_storeu_ps(out + d, o);
-            }
-            for (; d < head_dim; ++d)
-            {
-                auto cvt = [](uint16_t fp16_val) -> float
-                {
-                    __m128i h = _mm_set1_epi16(static_cast<short>(fp16_val));
-                    return _mm_cvtss_f32(_mm_cvtph_ps(h));
-                };
-                out[d] += w0 * cvt(v0[d]) + w1 * cvt(v1[d]) + w2 * cvt(v2[d]) + w3 * cvt(v3[d]);
+                output[d] +=
+                    weight * decode_native16_scalar<Format>(value[d]);
             }
         }
 
-        /**
-         * @brief Scale a vector by a scalar: out[d] *= alpha (FP32, AVX-512).
-         * Duplicated from scale_vec to avoid dependency on use_avx512 bool.
-         */
-        static void scale_vec_fp16path(float *out, float alpha, int head_dim)
+        /** @brief Scalar weighted accumulation from four native 16-bit V rows. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_4row_scalar(
+            float *output,
+            const std::uint16_t *value0,
+            float weight0,
+            const std::uint16_t *value1,
+            float weight1,
+            const std::uint16_t *value2,
+            float weight2,
+            const std::uint16_t *value3,
+            float weight3,
+            int head_dim)
         {
-            __m512 a = _mm512_set1_ps(alpha);
-            int d = 0;
-            for (; d + 15 < head_dim; d += 16)
+            for (int d = 0; d < head_dim; ++d)
             {
-                _mm512_storeu_ps(out + d, _mm512_mul_ps(a, _mm512_loadu_ps(out + d)));
+                output[d] +=
+                    weight0 * decode_native16_scalar<Format>(value0[d]) +
+                    weight1 * decode_native16_scalar<Format>(value1[d]) +
+                    weight2 * decode_native16_scalar<Format>(value2[d]) +
+                    weight3 * decode_native16_scalar<Format>(value3[d]);
+            }
+        }
+
+#if defined(__AVX2__) && defined(__F16C__)
+        /** @brief Convert eight FP16 or BF16 elements to one AVX2 FP32 vector. */
+        template <Native16BitKVFormat Format>
+        static __m256 load_native16_avx2(const std::uint16_t *source)
+        {
+            const __m128i packed = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(source));
+            if constexpr (Format == Native16BitKVFormat::FP16)
+                return _mm256_cvtph_ps(packed);
+
+            const __m256i expanded = _mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(packed),
+                16);
+            return _mm256_castsi256_ps(expanded);
+        }
+
+        /** @brief AVX2 FP32-query dot product against one native 16-bit row. */
+        template <Native16BitKVFormat Format>
+        static float dot_native16_avx2(
+            const float *query,
+            const std::uint16_t *key,
+            int head_dim)
+        {
+            __m256 accumulator = _mm256_setzero_ps();
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8)
+            {
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(query + d),
+                    load_native16_avx2<Format>(key + d),
+                    accumulator);
+            }
+            float sum = avx2::hsum_ps(accumulator);
+            for (; d < head_dim; ++d)
+                sum += query[d] * decode_native16_scalar<Format>(key[d]);
+            return sum;
+        }
+
+        /** @brief AVX2 four-row dot product for native 16-bit K storage. */
+        template <Native16BitKVFormat Format>
+        static void dot_native16_4row_avx2(
+            const float *query,
+            const std::uint16_t *key0,
+            const std::uint16_t *key1,
+            const std::uint16_t *key2,
+            const std::uint16_t *key3,
+            int head_dim,
+            float &score0,
+            float &score1,
+            float &score2,
+            float &score3)
+        {
+            __m256 accumulator0 = _mm256_setzero_ps();
+            __m256 accumulator1 = _mm256_setzero_ps();
+            __m256 accumulator2 = _mm256_setzero_ps();
+            __m256 accumulator3 = _mm256_setzero_ps();
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8)
+            {
+                const __m256 q = _mm256_loadu_ps(query + d);
+                accumulator0 = _mm256_fmadd_ps(
+                    q, load_native16_avx2<Format>(key0 + d), accumulator0);
+                accumulator1 = _mm256_fmadd_ps(
+                    q, load_native16_avx2<Format>(key1 + d), accumulator1);
+                accumulator2 = _mm256_fmadd_ps(
+                    q, load_native16_avx2<Format>(key2 + d), accumulator2);
+                accumulator3 = _mm256_fmadd_ps(
+                    q, load_native16_avx2<Format>(key3 + d), accumulator3);
+            }
+            score0 = avx2::hsum_ps(accumulator0);
+            score1 = avx2::hsum_ps(accumulator1);
+            score2 = avx2::hsum_ps(accumulator2);
+            score3 = avx2::hsum_ps(accumulator3);
+            for (; d < head_dim; ++d)
+            {
+                const float q = query[d];
+                score0 += q * decode_native16_scalar<Format>(key0[d]);
+                score1 += q * decode_native16_scalar<Format>(key1[d]);
+                score2 += q * decode_native16_scalar<Format>(key2[d]);
+                score3 += q * decode_native16_scalar<Format>(key3[d]);
+            }
+        }
+
+        /** @brief AVX2 weighted accumulation from one native 16-bit V row. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_avx2(
+            float *output,
+            const std::uint16_t *value,
+            float weight,
+            int head_dim)
+        {
+            const __m256 vector_weight = _mm256_set1_ps(weight);
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8)
+            {
+                const __m256 previous = _mm256_loadu_ps(output + d);
+                _mm256_storeu_ps(
+                    output + d,
+                    _mm256_fmadd_ps(
+                        load_native16_avx2<Format>(value + d),
+                        vector_weight,
+                        previous));
             }
             for (; d < head_dim; ++d)
             {
-                out[d] *= alpha;
+                output[d] +=
+                    weight * decode_native16_scalar<Format>(value[d]);
+            }
+        }
+
+        /** @brief AVX2 weighted accumulation from four native 16-bit V rows. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_4row_avx2(
+            float *output,
+            const std::uint16_t *value0,
+            float weight0,
+            const std::uint16_t *value1,
+            float weight1,
+            const std::uint16_t *value2,
+            float weight2,
+            const std::uint16_t *value3,
+            float weight3,
+            int head_dim)
+        {
+            const __m256 vector_weight0 = _mm256_set1_ps(weight0);
+            const __m256 vector_weight1 = _mm256_set1_ps(weight1);
+            const __m256 vector_weight2 = _mm256_set1_ps(weight2);
+            const __m256 vector_weight3 = _mm256_set1_ps(weight3);
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8)
+            {
+                __m256 accumulated = _mm256_loadu_ps(output + d);
+                accumulated = _mm256_fmadd_ps(
+                    load_native16_avx2<Format>(value0 + d),
+                    vector_weight0,
+                    accumulated);
+                accumulated = _mm256_fmadd_ps(
+                    load_native16_avx2<Format>(value1 + d),
+                    vector_weight1,
+                    accumulated);
+                accumulated = _mm256_fmadd_ps(
+                    load_native16_avx2<Format>(value2 + d),
+                    vector_weight2,
+                    accumulated);
+                accumulated = _mm256_fmadd_ps(
+                    load_native16_avx2<Format>(value3 + d),
+                    vector_weight3,
+                    accumulated);
+                _mm256_storeu_ps(output + d, accumulated);
+            }
+            for (; d < head_dim; ++d)
+            {
+                output[d] +=
+                    weight0 * decode_native16_scalar<Format>(value0[d]) +
+                    weight1 * decode_native16_scalar<Format>(value1[d]) +
+                    weight2 * decode_native16_scalar<Format>(value2[d]) +
+                    weight3 * decode_native16_scalar<Format>(value3[d]);
             }
         }
 #endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+        /** @brief Convert sixteen FP16 or BF16 elements to one AVX-512 FP32 vector. */
+        template <Native16BitKVFormat Format>
+        static __m512 load_native16_avx512(const std::uint16_t *source)
+        {
+            const __m256i packed = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(source));
+            if constexpr (Format == Native16BitKVFormat::FP16)
+                return _mm512_cvtph_ps(packed);
+
+            const __m512i expanded = _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(packed),
+                16);
+            return _mm512_castsi512_ps(expanded);
+        }
+
+        /** @brief AVX-512 FP32-query dot product against one native 16-bit row. */
+        template <Native16BitKVFormat Format>
+        static float dot_native16_avx512(
+            const float *query,
+            const std::uint16_t *key,
+            int head_dim)
+        {
+            __m512 accumulator = _mm512_setzero_ps();
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16)
+            {
+                accumulator = _mm512_fmadd_ps(
+                    _mm512_loadu_ps(query + d),
+                    load_native16_avx512<Format>(key + d),
+                    accumulator);
+            }
+            float sum = _mm512_reduce_add_ps(accumulator);
+            for (; d < head_dim; ++d)
+                sum += query[d] * decode_native16_scalar<Format>(key[d]);
+            return sum;
+        }
+
+        /** @brief AVX-512 four-row dot product for native 16-bit K storage. */
+        template <Native16BitKVFormat Format>
+        static void dot_native16_4row_avx512(
+            const float *query,
+            const std::uint16_t *key0,
+            const std::uint16_t *key1,
+            const std::uint16_t *key2,
+            const std::uint16_t *key3,
+            int head_dim,
+            float &score0,
+            float &score1,
+            float &score2,
+            float &score3)
+        {
+            __m512 accumulator0 = _mm512_setzero_ps();
+            __m512 accumulator1 = _mm512_setzero_ps();
+            __m512 accumulator2 = _mm512_setzero_ps();
+            __m512 accumulator3 = _mm512_setzero_ps();
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16)
+            {
+                const __m512 q = _mm512_loadu_ps(query + d);
+                accumulator0 = _mm512_fmadd_ps(
+                    q, load_native16_avx512<Format>(key0 + d), accumulator0);
+                accumulator1 = _mm512_fmadd_ps(
+                    q, load_native16_avx512<Format>(key1 + d), accumulator1);
+                accumulator2 = _mm512_fmadd_ps(
+                    q, load_native16_avx512<Format>(key2 + d), accumulator2);
+                accumulator3 = _mm512_fmadd_ps(
+                    q, load_native16_avx512<Format>(key3 + d), accumulator3);
+            }
+            score0 = _mm512_reduce_add_ps(accumulator0);
+            score1 = _mm512_reduce_add_ps(accumulator1);
+            score2 = _mm512_reduce_add_ps(accumulator2);
+            score3 = _mm512_reduce_add_ps(accumulator3);
+            for (; d < head_dim; ++d)
+            {
+                const float q = query[d];
+                score0 += q * decode_native16_scalar<Format>(key0[d]);
+                score1 += q * decode_native16_scalar<Format>(key1[d]);
+                score2 += q * decode_native16_scalar<Format>(key2[d]);
+                score3 += q * decode_native16_scalar<Format>(key3[d]);
+            }
+        }
+
+        /** @brief AVX-512 weighted accumulation from one native 16-bit V row. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_avx512(
+            float *output,
+            const std::uint16_t *value,
+            float weight,
+            int head_dim)
+        {
+            const __m512 vector_weight = _mm512_set1_ps(weight);
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16)
+            {
+                const __m512 previous = _mm512_loadu_ps(output + d);
+                _mm512_storeu_ps(
+                    output + d,
+                    _mm512_fmadd_ps(
+                        load_native16_avx512<Format>(value + d),
+                        vector_weight,
+                        previous));
+            }
+            for (; d < head_dim; ++d)
+            {
+                output[d] +=
+                    weight * decode_native16_scalar<Format>(value[d]);
+            }
+        }
+
+        /** @brief AVX-512 weighted accumulation from four native 16-bit V rows. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_4row_avx512(
+            float *output,
+            const std::uint16_t *value0,
+            float weight0,
+            const std::uint16_t *value1,
+            float weight1,
+            const std::uint16_t *value2,
+            float weight2,
+            const std::uint16_t *value3,
+            float weight3,
+            int head_dim)
+        {
+            const __m512 vector_weight0 = _mm512_set1_ps(weight0);
+            const __m512 vector_weight1 = _mm512_set1_ps(weight1);
+            const __m512 vector_weight2 = _mm512_set1_ps(weight2);
+            const __m512 vector_weight3 = _mm512_set1_ps(weight3);
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16)
+            {
+                __m512 accumulated = _mm512_loadu_ps(output + d);
+                accumulated = _mm512_fmadd_ps(
+                    load_native16_avx512<Format>(value0 + d),
+                    vector_weight0,
+                    accumulated);
+                accumulated = _mm512_fmadd_ps(
+                    load_native16_avx512<Format>(value1 + d),
+                    vector_weight1,
+                    accumulated);
+                accumulated = _mm512_fmadd_ps(
+                    load_native16_avx512<Format>(value2 + d),
+                    vector_weight2,
+                    accumulated);
+                accumulated = _mm512_fmadd_ps(
+                    load_native16_avx512<Format>(value3 + d),
+                    vector_weight3,
+                    accumulated);
+                _mm512_storeu_ps(output + d, accumulated);
+            }
+            for (; d < head_dim; ++d)
+            {
+                output[d] +=
+                    weight0 * decode_native16_scalar<Format>(value0[d]) +
+                    weight1 * decode_native16_scalar<Format>(value1[d]) +
+                    weight2 * decode_native16_scalar<Format>(value2[d]) +
+                    weight3 * decode_native16_scalar<Format>(value3[d]);
+            }
+        }
+#endif
+
+        /** @brief Runtime-ISA dispatch for one native 16-bit K dot product. */
+        template <Native16BitKVFormat Format>
+        static float dot_native16(
+            const float *query,
+            const std::uint16_t *key,
+            int head_dim)
+        {
+            switch (activeISALevel())
+            {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+            case ISALevel::AVX512:
+                return dot_native16_avx512<Format>(query, key, head_dim);
+#endif
+#if defined(__AVX2__) && defined(__F16C__)
+            case ISALevel::AVX2:
+                return dot_native16_avx2<Format>(query, key, head_dim);
+#endif
+            default:
+                return dot_native16_scalar<Format>(query, key, head_dim);
+            }
+        }
+
+        /** @brief Runtime-ISA dispatch for four native 16-bit K dot products. */
+        template <Native16BitKVFormat Format>
+        static void dot_native16_4row(
+            const float *query,
+            const std::uint16_t *key0,
+            const std::uint16_t *key1,
+            const std::uint16_t *key2,
+            const std::uint16_t *key3,
+            int head_dim,
+            float &score0,
+            float &score1,
+            float &score2,
+            float &score3)
+        {
+            switch (activeISALevel())
+            {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+            case ISALevel::AVX512:
+                dot_native16_4row_avx512<Format>(
+                    query, key0, key1, key2, key3, head_dim,
+                    score0, score1, score2, score3);
+                return;
+#endif
+#if defined(__AVX2__) && defined(__F16C__)
+            case ISALevel::AVX2:
+                dot_native16_4row_avx2<Format>(
+                    query, key0, key1, key2, key3, head_dim,
+                    score0, score1, score2, score3);
+                return;
+#endif
+            default:
+                dot_native16_4row_scalar<Format>(
+                    query, key0, key1, key2, key3, head_dim,
+                    score0, score1, score2, score3);
+            }
+        }
+
+        /** @brief Runtime-ISA dispatch for one native 16-bit V accumulation. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16(
+            float *output,
+            const std::uint16_t *value,
+            float weight,
+            int head_dim)
+        {
+            switch (activeISALevel())
+            {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+            case ISALevel::AVX512:
+                accum_native16_avx512<Format>(
+                    output, value, weight, head_dim);
+                return;
+#endif
+#if defined(__AVX2__) && defined(__F16C__)
+            case ISALevel::AVX2:
+                accum_native16_avx2<Format>(
+                    output, value, weight, head_dim);
+                return;
+#endif
+            default:
+                accum_native16_scalar<Format>(
+                    output, value, weight, head_dim);
+            }
+        }
+
+        /** @brief Runtime-ISA dispatch for four native 16-bit V accumulations. */
+        template <Native16BitKVFormat Format>
+        static void accum_native16_4row(
+            float *output,
+            const std::uint16_t *value0,
+            float weight0,
+            const std::uint16_t *value1,
+            float weight1,
+            const std::uint16_t *value2,
+            float weight2,
+            const std::uint16_t *value3,
+            float weight3,
+            int head_dim)
+        {
+            switch (activeISALevel())
+            {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+            case ISALevel::AVX512:
+                accum_native16_4row_avx512<Format>(
+                    output,
+                    value0, weight0,
+                    value1, weight1,
+                    value2, weight2,
+                    value3, weight3,
+                    head_dim);
+                return;
+#endif
+#if defined(__AVX2__) && defined(__F16C__)
+            case ISALevel::AVX2:
+                accum_native16_4row_avx2<Format>(
+                    output,
+                    value0, weight0,
+                    value1, weight1,
+                    value2, weight2,
+                    value3, weight3,
+                    head_dim);
+                return;
+#endif
+            default:
+                accum_native16_4row_scalar<Format>(
+                    output,
+                    value0, weight0,
+                    value1, weight1,
+                    value2, weight2,
+                    value3, weight3,
+                    head_dim);
+            }
+        }
 
 #if defined(__AVX2__)
         /**
@@ -1769,8 +2652,18 @@ namespace llaminar2
                 return 1;
             }
 
+            const int64_t independent_output_rows =
+                static_cast<int64_t>(n_heads) *
+                static_cast<int64_t>(std::max(1, seq_len));
             int desired = static_cast<int>(total_flops / MIN_FLOPS_PER_THREAD);
-            return std::max(1, std::min({desired, n_heads, max_threads}));
+            return std::max(
+                1,
+                std::min(
+                    {desired,
+                     static_cast<int>(std::min<int64_t>(
+                         independent_output_rows,
+                         std::numeric_limits<int>::max())),
+                     max_threads}));
         }
 
         // -----------------------------------------------------------------
@@ -2084,16 +2977,14 @@ namespace llaminar2
         }
 
         // -----------------------------------------------------------------
-        // I16/I12 quantisation helpers for the integer prefill path
+        // I16/I12 query quantisation for native Q16 K/V attention
         // -----------------------------------------------------------------
         // These routines quantise FP32 rows into 16-bit integers using an
         // absmax scheme with a configurable `qmax` (typically 2047, giving
         // ~12 effective bits).  The resulting integers can be fed into the
-        // VNNI dot-product routines below for high-throughput QK scoring.
-        //
-        // The "packed pair" variants interleave two K rows into a single
-        // buffer so that a single VNNI loop can compute two dot-products
-        // simultaneously (doubling throughput for the QK phase).
+        // native Q16 cache rows below for high-throughput QK scoring. K/V are
+        // never repacked: decode, grouped verification, and prefill all read
+        // the same cache bytes and use the same fixed arithmetic order.
         // -----------------------------------------------------------------
 
         /**
@@ -2250,96 +3141,6 @@ namespace llaminar2
             default:
                 return quantize_row_i16_i12_scalar(src, dst, n, qmax);
             }
-        }
-
-        /**
-         * @brief Quantise with zero-padding to a multiple of the VNNI width.
-         *
-         * Same as `quantize_row_i16_i12()` but pads the output with zeros
-         * from index `n` to `padded_n - 1`.  The VNNI dot-product routines
-         * operate in 32-element blocks, so the row length must be rounded up.
-         *
-         * @param src       Source FP32 vector.
-         * @param dst       Destination int16 vector, length `padded_n`.
-         * @param n         Actual number of elements.
-         * @param padded_n  Padded length (multiple of 32).
-         * @param qmax      Maximum quantised value.
-         * @return The absmax scale factor.
-         */
-        static float quantize_row_i16_i12_padded(const float *src, int16_t *dst, int n, int padded_n, int qmax)
-        {
-            const float scale = quantize_row_i16_i12(src, dst, n, qmax);
-            if (padded_n > n)
-            {
-                std::memset(dst + n, 0, static_cast<size_t>(padded_n - n) * sizeof(int16_t));
-            }
-            return scale;
-        }
-
-        /**
-         * @brief Quantise into a "packed pair" buffer for dual-row VNNI.
-         *
-         * Two K rows share one contiguous buffer laid out as interleaved
-         * 32-element blocks:
-         *
-         *   [block0_row0 (32 int16)] [block0_row1 (32 int16)]
-         *   [block1_row0 (32 int16)] [block1_row1 (32 int16)]
-         *   …
-         *
-         * `row_sel` (0 or 1) selects which half of each 64-element block
-         * this call writes into.  The other half is expected to have been
-         * written by a prior call with the other `row_sel`.
-         *
-         * @param src       Source FP32 vector.
-         * @param pair_dst  Packed-pair destination buffer.
-         * @param n         Actual number of elements per row.
-         * @param padded_n  Padded length per row (multiple of 32).
-         * @param qmax      Maximum quantised value.
-         * @param row_sel   Which row slot (0 or 1) to write into.
-         * @return The absmax scale factor for this row.
-         */
-        static float quantize_row_i16_i12_to_packedpair(
-            const float *src,
-            int16_t *pair_dst,
-            int n,
-            int padded_n,
-            int qmax,
-            int row_sel)
-        {
-            float max_abs = 0.0f;
-            for (int i = 0; i < n; ++i)
-            {
-                max_abs = std::max(max_abs, std::abs(src[i]));
-            }
-
-            if (max_abs <= 1e-12f)
-            {
-                for (int i = 0; i < padded_n; ++i)
-                {
-                    const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                    const size_t lane = static_cast<size_t>(i % 32);
-                    pair_dst[block + static_cast<size_t>(row_sel) * 32ULL + lane] = 0;
-                }
-                return 0.0f;
-            }
-
-            const float scale = max_abs / static_cast<float>(qmax);
-            const float inv_scale = 1.0f / scale;
-            for (int i = 0; i < n; ++i)
-            {
-                const int q = static_cast<int>(std::lrint(src[i] * inv_scale));
-                const int16_t v = static_cast<int16_t>(std::max(-qmax, std::min(q, qmax)));
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                pair_dst[block + static_cast<size_t>(row_sel) * 32ULL + lane] = v;
-            }
-            for (int i = n; i < padded_n; ++i)
-            {
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                pair_dst[block + static_cast<size_t>(row_sel) * 32ULL + lane] = 0;
-            }
-            return scale;
         }
 
         // -----------------------------------------------------------------
@@ -2596,395 +3397,14 @@ namespace llaminar2
         // Named implementations are public for direct parity testing.
         // Use the dispatch functions (dot_i16_i16_i32_vnni_*) for production code.
 
-        // ---- 2-row packed-pair: named implementations ----
-
-        static inline void dot_2row_packedpair_scalar(
-            const int16_t *q, const int16_t *k_pair, int n,
-            int32_t &out0, int32_t &out1)
-        {
-            out0 = 0;
-            out1 = 0;
-            for (int i = 0; i < n; ++i)
-            {
-                const int pair_block = i / 32;
-                const int lane = i % 32;
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                out0 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + lane]);
-                out1 += qv * static_cast<int32_t>(k_pair[static_cast<size_t>(pair_block) * 64 + 32 + lane]);
-            }
-        }
-
-#if defined(__AVX2__)
-        static inline void dot_2row_packedpair_avx2(
-            const int16_t *q, const int16_t *k_pair, int n,
-            int32_t &out0, int32_t &out1)
-        {
-            // Process 32 elements per iteration to match packed-pair block alignment.
-            // Layout: [row0_32, row1_32, row0_32, row1_32, ...] — each 64 int16 chunk.
-            __m256i a0 = _mm256_setzero_si256();
-            __m256i a1 = _mm256_setzero_si256();
-            int i = 0;
-            const int16_t *pp = k_pair;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
-                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp))));
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 16))));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 32))));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp + 48))));
-                pp += 64;
-            }
-            auto hsum = [](const __m256i &v) -> int32_t
-            {
-                __m128i lo = _mm256_castsi256_si128(v);
-                __m128i hi = _mm256_extracti128_si256(v, 1);
-                lo = _mm_add_epi32(lo, hi);
-                lo = _mm_hadd_epi32(lo, lo);
-                lo = _mm_hadd_epi32(lo, lo);
-                return _mm_extract_epi32(lo, 0);
-            };
-            int32_t sum0 = hsum(a0);
-            int32_t sum1 = hsum(a1);
-            for (; i < n; ++i)
-            {
-                sum0 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + (i % 32)]);
-                sum1 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + 32 + (i % 32)]);
-            }
-            out0 = sum0;
-            out1 = sum1;
-        }
-#endif
-
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-        static inline void dot_2row_packedpair_avx512(
-            const int16_t *q, const int16_t *k_pair, int n,
-            int32_t &out0, int32_t &out1)
-        {
-            __m512i acc0 = _mm512_setzero_si512();
-            __m512i acc1 = _mm512_setzero_si512();
-
-            int i = 0;
-            const int16_t *pair_ptr = k_pair;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m512i qv = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
-                const __m512i k0v = _mm512_loadu_si512(reinterpret_cast<const void *>(pair_ptr));
-                const __m512i k1v = _mm512_loadu_si512(reinterpret_cast<const void *>(pair_ptr + 32));
-                acc0 = _mm512_dpwssd_epi32(acc0, qv, k0v);
-                acc1 = _mm512_dpwssd_epi32(acc1, qv, k1v);
-                pair_ptr += 64;
-            }
-
-            alignas(64) int32_t lanes0[16];
-            alignas(64) int32_t lanes1[16];
-            _mm512_store_si512(reinterpret_cast<void *>(lanes0), acc0);
-            _mm512_store_si512(reinterpret_cast<void *>(lanes1), acc1);
-
-            int32_t sum0 = 0;
-            int32_t sum1 = 0;
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                sum0 += lanes0[lane];
-                sum1 += lanes1[lane];
-            }
-
-            for (; i < n; ++i)
-            {
-                sum0 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + (i % 32)]);
-                sum1 += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + 32 + (i % 32)]);
-            }
-
-            out0 = sum0;
-            out1 = sum1;
-        }
-#endif
-
-        /** @brief Dispatch: dual-row dot from packed pair. */
-        static void dot_i16_i16_i32_vnni_2row_packedpair(
-            const int16_t *q, const int16_t *k_pair, int n,
-            int32_t &out0, int32_t &out1)
-        {
-            switch (activeISALevel())
-            {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-            case ISALevel::AVX512:
-                dot_2row_packedpair_avx512(q, k_pair, n, out0, out1);
-                break;
-#endif
-            case ISALevel::AVX2:
-                dot_2row_packedpair_avx2(q, k_pair, n, out0, out1);
-                break;
-            default:
-                dot_2row_packedpair_scalar(q, k_pair, n, out0, out1);
-                break;
-            }
-        }
-
-        // ---- 4-row packed-pair: named implementations ----
-
-        static inline void dot_4row_packedpair_scalar(
-            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
-            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
-        {
-            out0 = 0;
-            out1 = 0;
-            out2 = 0;
-            out3 = 0;
-            for (int i = 0; i < n; ++i)
-            {
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                out0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
-                out1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
-                out2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
-                out3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
-            }
-        }
-
-#if defined(__AVX2__)
-        static inline void dot_4row_packedpair_avx2(
-            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
-            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
-        {
-            __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
-            __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
-            int i = 0;
-            const int16_t *pp0 = k_pair0;
-            const int16_t *pp1 = k_pair1;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
-                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0))));
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 16))));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 32))));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp0 + 48))));
-                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1))));
-                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 16))));
-                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 32))));
-                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pp1 + 48))));
-                pp0 += 64;
-                pp1 += 64;
-            }
-            auto hsum = [](const __m256i &v) -> int32_t
-            {
-                __m128i lo = _mm256_castsi256_si128(v);
-                __m128i hi = _mm256_extracti128_si256(v, 1);
-                lo = _mm_add_epi32(lo, hi);
-                lo = _mm_hadd_epi32(lo, lo);
-                lo = _mm_hadd_epi32(lo, lo);
-                return _mm_extract_epi32(lo, 0);
-            };
-            int32_t sum0 = hsum(a0), sum1 = hsum(a1);
-            int32_t sum2 = hsum(a2), sum3 = hsum(a3);
-            for (; i < n; ++i)
-            {
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                sum0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
-                sum1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
-                sum2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
-                sum3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
-            }
-            out0 = sum0;
-            out1 = sum1;
-            out2 = sum2;
-            out3 = sum3;
-        }
-#endif
-
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-        static inline void dot_4row_packedpair_avx512(
-            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
-            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
-        {
-            __m512i acc0 = _mm512_setzero_si512();
-            __m512i acc1 = _mm512_setzero_si512();
-            __m512i acc2 = _mm512_setzero_si512();
-            __m512i acc3 = _mm512_setzero_si512();
-
-            int i = 0;
-            const int16_t *p0 = k_pair0;
-            const int16_t *p1 = k_pair1;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m512i qv = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
-                const __m512i k00 = _mm512_loadu_si512(reinterpret_cast<const void *>(p0));
-                const __m512i k01 = _mm512_loadu_si512(reinterpret_cast<const void *>(p0 + 32));
-                const __m512i k10 = _mm512_loadu_si512(reinterpret_cast<const void *>(p1));
-                const __m512i k11 = _mm512_loadu_si512(reinterpret_cast<const void *>(p1 + 32));
-                acc0 = _mm512_dpwssd_epi32(acc0, qv, k00);
-                acc1 = _mm512_dpwssd_epi32(acc1, qv, k01);
-                acc2 = _mm512_dpwssd_epi32(acc2, qv, k10);
-                acc3 = _mm512_dpwssd_epi32(acc3, qv, k11);
-                p0 += 64;
-                p1 += 64;
-            }
-
-            alignas(64) int32_t lanes0[16], lanes1[16], lanes2[16], lanes3[16];
-            _mm512_store_si512(reinterpret_cast<void *>(lanes0), acc0);
-            _mm512_store_si512(reinterpret_cast<void *>(lanes1), acc1);
-            _mm512_store_si512(reinterpret_cast<void *>(lanes2), acc2);
-            _mm512_store_si512(reinterpret_cast<void *>(lanes3), acc3);
-
-            int32_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                sum0 += lanes0[lane];
-                sum1 += lanes1[lane];
-                sum2 += lanes2[lane];
-                sum3 += lanes3[lane];
-            }
-
-            for (; i < n; ++i)
-            {
-                const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                const size_t lane = static_cast<size_t>(i % 32);
-                const int32_t qv = static_cast<int32_t>(q[i]);
-                sum0 += qv * static_cast<int32_t>(k_pair0[block + lane]);
-                sum1 += qv * static_cast<int32_t>(k_pair0[block + 32ULL + lane]);
-                sum2 += qv * static_cast<int32_t>(k_pair1[block + lane]);
-                sum3 += qv * static_cast<int32_t>(k_pair1[block + 32ULL + lane]);
-            }
-
-            out0 = sum0;
-            out1 = sum1;
-            out2 = sum2;
-            out3 = sum3;
-        }
-#endif
-
-        /** @brief Dispatch: quad-row dot from two packed pairs. */
-        static void dot_i16_i16_i32_vnni_4row_packedpair(
-            const int16_t *q, const int16_t *k_pair0, const int16_t *k_pair1,
-            int n, int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
-        {
-            switch (activeISALevel())
-            {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-            case ISALevel::AVX512:
-                dot_4row_packedpair_avx512(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
-                break;
-#endif
-            case ISALevel::AVX2:
-                dot_4row_packedpair_avx2(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
-                break;
-            default:
-                dot_4row_packedpair_scalar(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
-                break;
-            }
-        }
-
-        /**
-         * @brief Single-row VNNI dot product from one slot of a packed pair.
-         *
-         * Extracts and dot-products against only one of the two rows stored
-         * in a packed-pair buffer.  Used for the "tail" case when an odd
-         * number of KV positions remain in the tile (the last position has
-         * no partner to pair with).
-         *
-         * @param q        Quantised query vector, length `n`.
-         * @param k_pair   Packed-pair buffer containing two interleaved K rows.
-         * @param n        Padded row length.
-         * @param row_sel  Which row to read: 0 = first row, 1 = second row.
-         * @return The int32 dot product `Σ q[i] * k_pair[row_sel][i]`.
-         */
-        // ---- single-from-packed-pair: named implementations ----
-
-        static inline int32_t dot_single_from_packedpair_scalar(
-            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
-        {
-            int32_t sum = 0;
-            const int row_off = (row_sel != 0) ? 32 : 0;
-            for (int i = 0; i < n; ++i)
-                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
-            return sum;
-        }
-
-#if defined(__AVX2__)
-        static inline int32_t dot_single_from_packedpair_avx2(
-            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
-        {
-            __m256i acc = _mm256_setzero_si256();
-            int i = 0;
-            const int16_t *pair_ptr = k_pair;
-            const int row_off = (row_sel != 0) ? 32 : 0;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i));
-                const __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + i + 16));
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_ptr + row_off))));
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_ptr + row_off + 16))));
-                pair_ptr += 64;
-            }
-            __m128i lo = _mm256_castsi256_si128(acc);
-            __m128i hi = _mm256_extracti128_si256(acc, 1);
-            lo = _mm_add_epi32(lo, hi);
-            lo = _mm_hadd_epi32(lo, lo);
-            lo = _mm_hadd_epi32(lo, lo);
-            int32_t sum = _mm_extract_epi32(lo, 0);
-            for (; i < n; ++i)
-                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
-            return sum;
-        }
-#endif
-
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-        static inline int32_t dot_single_from_packedpair_avx512(
-            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
-        {
-            __m512i acc = _mm512_setzero_si512();
-            int i = 0;
-            const int16_t *pair_ptr = k_pair;
-            const int row_off = (row_sel != 0) ? 32 : 0;
-            for (; i + 31 < n; i += 32)
-            {
-                const __m512i qv = _mm512_loadu_si512(reinterpret_cast<const void *>(q + i));
-                const __m512i kv = _mm512_loadu_si512(reinterpret_cast<const void *>(pair_ptr + row_off));
-                acc = _mm512_dpwssd_epi32(acc, qv, kv);
-                pair_ptr += 64;
-            }
-
-            alignas(64) int32_t lanes[16];
-            _mm512_store_si512(reinterpret_cast<void *>(lanes), acc);
-            int32_t sum = 0;
-            for (int lane = 0; lane < 16; ++lane)
-                sum += lanes[lane];
-
-            for (; i < n; ++i)
-                sum += static_cast<int32_t>(q[i]) * static_cast<int32_t>(k_pair[(static_cast<size_t>(i) / 32) * 64 + row_off + (i % 32)]);
-            return sum;
-        }
-#endif
-
-        /** @brief Dispatch: single-row dot from one slot of a packed pair. */
-        static int32_t dot_i16_i16_i32_vnni_single_from_packedpair(
-            const int16_t *q, const int16_t *k_pair, int n, int row_sel)
-        {
-            switch (activeISALevel())
-            {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-            case ISALevel::AVX512:
-                return dot_single_from_packedpair_avx512(q, k_pair, n, row_sel);
-#endif
-            case ISALevel::AVX2:
-                return dot_single_from_packedpair_avx2(q, k_pair, n, row_sel);
-            default:
-                return dot_single_from_packedpair_scalar(q, k_pair, n, row_sel);
-            }
-        }
-
         /**
          * @brief 4-row VNNI dot product against separate (non-packed) K rows.
          *
          * Computes four independent int16 dot products in a single pass over
          * the Q vector, exploiting ILP across four accumulator chains.
-         * Unlike the packed-pair variant, each K row is at a separate address.
-         * Used by the Q16_1 KV cache decode path where K rows are stored as
-         * contiguous Q16_1Block qs[] arrays.
+         * Each K row remains at its native cache address. The Q16_1 decode and
+         * grouped-verifier paths use this layout directly, avoiding a
+         * transient repack while retaining four independent accumulators.
          *
          * @param q   Quantised query vector, length `n`.
          * @param k0  First K row (int16), length `n`.
@@ -3122,6 +3542,682 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Maximum head width accepted by the stack-resident CPU FA2 scheduler.
+         *
+         * Every currently supported Qwen attention geometry is at most 256
+         * elements wide. Keeping the row summaries in worker-local aligned
+         * storage avoids allocation and false sharing in both physical modes.
+         * A wider model must extend this compile-time contract and its totality
+         * tests deliberately rather than entering a hidden heap path.
+         */
+        static constexpr int kMaximumAttentionHeadDim = 256;
+
+        /** Visible K/V interval for one query row inside one physical tile. */
+        struct CPUFA2VisibleTile
+        {
+            int begin = 0; ///< First visible K/V row, inclusive.
+            int end = 0;   ///< Last visible K/V row, exclusive.
+
+            /** @return True when this tile contributes to the attention row. */
+            [[nodiscard]] constexpr bool empty() const noexcept
+            {
+                return begin >= end;
+            }
+        };
+
+        /**
+         * @brief Merge one unnormalised online-softmax summary in fixed order.
+         *
+         * Query-sequence execution and K/V-context execution both call this
+         * exact routine for the same canonical partitions in ascending K/V
+         * order. Their only difference is which worker produces a partition.
+         * Consequently thread scheduling cannot alter reduction order or the
+         * resulting bytes.
+         *
+         * @param destination Accumulated FP32 numerator, initialized to zero.
+         * @param merged_m Running maximum for all prior partitions.
+         * @param merged_l Running denominator for all prior partitions.
+         * @param partial Numerator produced by the next partition.
+         * @param partial_m Maximum produced by the next partition.
+         * @param partial_l Denominator produced by the next partition.
+         * @param head_dim Number of valid FP32 elements in each numerator.
+         */
+        static void mergeAttentionSummary(
+            float *destination,
+            float &merged_m,
+            float &merged_l,
+            const float *partial,
+            float partial_m,
+            float partial_l,
+            int head_dim)
+        {
+            if (partial_l == 0.0f)
+                return;
+
+            const float new_m = std::max(merged_m, partial_m);
+            const float destination_scale = std::isfinite(merged_m)
+                                                ? std::exp(merged_m - new_m)
+                                                : 0.0f;
+            const float partial_scale = std::exp(partial_m - new_m);
+#if defined(__AVX512F__)
+            const __m512 vd = _mm512_set1_ps(destination_scale);
+            const __m512 vp = _mm512_set1_ps(partial_scale);
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                _mm512_storeu_ps(
+                    destination + d,
+                    _mm512_fmadd_ps(
+                        vp,
+                        _mm512_loadu_ps(partial + d),
+                        _mm512_mul_ps(
+                            vd,
+                            _mm512_loadu_ps(destination + d))));
+            }
+            for (; d < head_dim; ++d)
+            {
+                destination[d] = destination[d] * destination_scale +
+                                 partial[d] * partial_scale;
+            }
+#elif defined(__AVX2__)
+            const __m256 vd = _mm256_set1_ps(destination_scale);
+            const __m256 vp = _mm256_set1_ps(partial_scale);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+            {
+                _mm256_storeu_ps(
+                    destination + d,
+                    _mm256_fmadd_ps(
+                        vp,
+                        _mm256_loadu_ps(partial + d),
+                        _mm256_mul_ps(
+                            vd,
+                            _mm256_loadu_ps(destination + d))));
+            }
+            for (; d < head_dim; ++d)
+            {
+                destination[d] = destination[d] * destination_scale +
+                                 partial[d] * partial_scale;
+            }
+#else
+            for (int d = 0; d < head_dim; ++d)
+            {
+                destination[d] = destination[d] * destination_scale +
+                                 partial[d] * partial_scale;
+            }
+#endif
+            merged_l = merged_l * destination_scale +
+                       partial_l * partial_scale;
+            merged_m = new_m;
+        }
+
+        /**
+         * @brief Evaluate one canonical summary through cache-sized K/V chunks.
+         *
+         * Physical tiling and floating-point arithmetic are intentionally
+         * separate concepts. `arithmetic_begin` identifies the immutable
+         * canonical score-array origin. `visible` is resolved once for the whole
+         * canonical summary, then both QK and P@V visit that interval in chunks
+         * of `physical_kv_tile` rows. Every compiled tile is a multiple of four,
+         * so the format callbacks retain the same four-row vector groups and the
+         * same scalar tail for every physical tile choice.
+         *
+         * The maximum is reduced over the complete canonical score array before
+         * the numerator is scaled, and `partial_m`/`partial_l` are published only
+         * after the complete P@V phase. Thus changing cache geometry cannot alter
+         * online-softmax boundaries, reduction order, or result bytes.
+         *
+         * @tparam Scratch Format-specific worker-local row state.
+         * @tparam ScoreTile Callback that writes scores and extends `block_max`.
+         * @tparam AccumulateTile Callback that consumes scores and accumulates V.
+         * @param row Logical `(query, head)` output-row index.
+         * @param scratch Prepared format-specific row state.
+         * @param arithmetic_begin First row of the canonical score array.
+         * @param visible Complete visible interval inside this canonical summary.
+         * @param head_dim Number of elements in the output accumulator.
+         * @param physical_kv_tile Rows streamed through cache per callback.
+         * @param score_tile Format-specific QK callback.
+         * @param accumulate_tile Format-specific P@V callback.
+         * @param scores Canonical score array with capacity for 256 rows.
+         * @param partial Unnormalised canonical output numerator.
+         * @param partial_m Canonical maximum, initialized to negative infinity.
+         * @param partial_l Canonical denominator, initialized to zero.
+         * @param profiling_enabled Whether phase timing is active.
+         * @param qk_duration_ns Thread-local QK profiler accumulator.
+         * @param v_duration_ns Thread-local P@V profiler accumulator.
+         */
+        template <typename Scratch,
+                  typename ScoreTile,
+                  typename AccumulateTile>
+        static void evaluateCanonicalAttentionSummary(
+            int row,
+            const Scratch &scratch,
+            int arithmetic_begin,
+            CPUFA2VisibleTile visible,
+            int head_dim,
+            int physical_kv_tile,
+            ScoreTile &score_tile,
+            AccumulateTile &accumulate_tile,
+            float *scores,
+            float *partial,
+            float &partial_m,
+            float &partial_l,
+            bool profiling_enabled,
+            std::uint64_t &qk_duration_ns,
+            std::uint64_t &v_duration_ns)
+        {
+            if (visible.empty())
+                return;
+
+            float block_max = -std::numeric_limits<float>::infinity();
+            const auto qk_start = profiling_enabled
+                                      ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+            for (int physical_begin = visible.begin;
+                 physical_begin < visible.end;
+                 physical_begin += physical_kv_tile)
+            {
+                const CPUFA2VisibleTile physical_visible{
+                    .begin = physical_begin,
+                    .end = std::min(
+                        physical_begin + physical_kv_tile,
+                        visible.end),
+                };
+                score_tile(
+                    row,
+                    scratch,
+                    arithmetic_begin,
+                    physical_visible,
+                    scores,
+                    block_max);
+            }
+            if (profiling_enabled)
+            {
+                qk_duration_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - qk_start)
+                        .count());
+            }
+
+            const float new_m = std::max(partial_m, block_max);
+            const float alpha = std::isfinite(partial_m)
+                                    ? std::exp(partial_m - new_m)
+                                    : 0.0f;
+            scale_vec(
+                partial,
+                alpha,
+                head_dim,
+                cpu_supports_avx512());
+            float new_l = partial_l * alpha;
+
+            const auto v_start = profiling_enabled
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+            for (int physical_begin = visible.begin;
+                 physical_begin < visible.end;
+                 physical_begin += physical_kv_tile)
+            {
+                const CPUFA2VisibleTile physical_visible{
+                    .begin = physical_begin,
+                    .end = std::min(
+                        physical_begin + physical_kv_tile,
+                        visible.end),
+                };
+                accumulate_tile(
+                    row,
+                    scratch,
+                    arithmetic_begin,
+                    physical_visible,
+                    scores,
+                    new_m,
+                    partial,
+                    new_l);
+            }
+            if (profiling_enabled)
+            {
+                v_duration_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - v_start)
+                        .count());
+            }
+
+            partial_m = new_m;
+            partial_l = new_l;
+        }
+
+        /**
+         * @brief Produce canonical K/V summaries in bounded parallel waves.
+         *
+         * A long context can contain thousands of canonical 256-row summaries,
+         * but only enough producer slots to occupy the physical worker team are
+         * useful at once. Slot zero of every output row retains the merged
+         * numerator/max/denominator. Slots `[1, P]` hold one wave of at most P
+         * independently produced summaries. After the producer barrier, a
+         * row-parallel reducer merges those slots in ascending K/V order before
+         * the next wave overwrites them.
+         *
+         * This design bounds persistent workspace by physical concurrency while
+         * preserving exactly the same canonical arithmetic sequence used by
+         * query-owned execution. It performs no allocation and introduces no
+         * dependence on OpenMP scheduling order.
+         */
+        template <typename Scratch,
+                  typename PrepareRow,
+                  typename VisibleTile,
+                  typename ScoreTile,
+                  typename AccumulateTile,
+                  typename FinalizeRow>
+        bool executeContextParallelAttentionWaves(
+            int query_rows,
+            int n_heads,
+            int kv_len,
+            int head_dim,
+            int kv_tile,
+            const cpu::fa2_policy::CPUFA2ParallelPlan &plan,
+            PrepareRow &prepare_row,
+            VisibleTile &visible_tile,
+            ScoreTile &score_tile,
+            AccumulateTile &accumulate_tile,
+            FinalizeRow &finalize_row)
+        {
+            const int output_rows = query_rows * n_heads;
+            const int producer_slots = plan.context_partitions;
+            const int slots_per_row = producer_slots + 1;
+            const int canonical_summaries = plan.arithmetic_partitions;
+            const int padded_head_dim = (head_dim + 15) & ~15;
+            const std::size_t workspace_slots =
+                static_cast<std::size_t>(output_rows) * slots_per_row;
+            if (!hasContextSummaryCapacity(
+                    workspace_slots,
+                    static_cast<std::size_t>(padded_head_dim)))
+            {
+                return false;
+            }
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            std::uint64_t qk_duration_ns = 0;
+            std::uint64_t v_duration_ns = 0;
+            const auto slot_index = [slots_per_row](int row, int slot)
+            {
+                return static_cast<std::size_t>(row) * slots_per_row + slot;
+            };
+
+            auto work = [&]()
+            {
+                Scratch scratch{};
+                alignas(64) float scores[detail::kMaxKVTile];
+
+#pragma omp for schedule(static)
+                for (int row = 0; row < output_rows; ++row)
+                {
+                    const std::size_t merged_slot = slot_index(row, 0);
+                    std::fill(
+                        partial_output_ + merged_slot * padded_head_dim,
+                        partial_output_ + merged_slot * padded_head_dim +
+                            head_dim,
+                        0.0f);
+                    partial_m_[merged_slot] =
+                        -std::numeric_limits<float>::infinity();
+                    partial_l_[merged_slot] = 0.0f;
+                }
+
+                for (int wave_begin = 0;
+                     wave_begin < canonical_summaries;
+                     wave_begin += producer_slots)
+                {
+                    const int active_slots = std::min(
+                        producer_slots,
+                        canonical_summaries - wave_begin);
+                    const int wave_items = output_rows * active_slots;
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                    for (int item = 0; item < wave_items; ++item)
+                    {
+                        const int row = item / active_slots;
+                        const int producer_slot = item % active_slots;
+                        const int summary = wave_begin + producer_slot;
+                        const int range_begin =
+                            summary * plan.context_partition_rows;
+                        const int range_end = std::min(
+                            range_begin + plan.context_partition_rows,
+                            kv_len);
+                        const std::size_t workspace_slot =
+                            slot_index(row, producer_slot + 1);
+                        float *partial =
+                            partial_output_ + workspace_slot * padded_head_dim;
+                        std::fill(partial, partial + head_dim, 0.0f);
+                        float partial_m =
+                            -std::numeric_limits<float>::infinity();
+                        float partial_l = 0.0f;
+                        prepare_row(row, scratch);
+
+                        const CPUFA2VisibleTile visible =
+                            visible_tile(row, range_begin, range_end);
+                        evaluateCanonicalAttentionSummary(
+                            row,
+                            scratch,
+                            range_begin,
+                            visible,
+                            head_dim,
+                            kv_tile,
+                            score_tile,
+                            accumulate_tile,
+                            scores,
+                            partial,
+                            partial_m,
+                            partial_l,
+                            profiling_enabled,
+                            qk_duration_ns,
+                            v_duration_ns);
+                        partial_m_[workspace_slot] = partial_m;
+                        partial_l_[workspace_slot] = partial_l;
+                    }
+
+                    /* Producer `omp for` completion is the wave publication. */
+#pragma omp for schedule(static)
+                    for (int row = 0; row < output_rows; ++row)
+                    {
+                        const std::size_t merged_slot = slot_index(row, 0);
+                        float *merged = partial_output_ +
+                                        merged_slot * padded_head_dim;
+                        float merged_m = partial_m_[merged_slot];
+                        float merged_l = partial_l_[merged_slot];
+                        for (int producer_slot = 0;
+                             producer_slot < active_slots;
+                             ++producer_slot)
+                        {
+                            const std::size_t workspace_slot =
+                                slot_index(row, producer_slot + 1);
+                            mergeAttentionSummary(
+                                merged,
+                                merged_m,
+                                merged_l,
+                                partial_output_ +
+                                    workspace_slot * padded_head_dim,
+                                partial_m_[workspace_slot],
+                                partial_l_[workspace_slot],
+                                head_dim);
+                        }
+                        partial_m_[merged_slot] = merged_m;
+                        partial_l_[merged_slot] = merged_l;
+                    }
+                }
+
+#pragma omp for schedule(static)
+                for (int row = 0; row < output_rows; ++row)
+                {
+                    const std::size_t merged_slot = slot_index(row, 0);
+                    finalize_row(
+                        row,
+                        partial_output_ + merged_slot * padded_head_dim,
+                        partial_l_[merged_slot]);
+                }
+            };
+
+            OMP_WORKSHARE_REGION(work);
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(
+                    KernelType::ATTENTION_QK,
+                    qk_duration_ns,
+                    omp_get_max_threads());
+                KernelProfiler::recordParallel(
+                    KernelType::ATTENTION_V,
+                    v_duration_ns,
+                    omp_get_max_threads());
+            }
+            return true;
+        }
+
+        /**
+         * @brief Execute canonical K/V summaries under either physical schedule.
+         *
+         * The format-specific callbacks contain only storage decoding and
+         * vector math. This scheduler owns partition boundaries, OpenMP work
+         * ownership, persistent context workspace, ordered reduction, and
+         * profiler accounting once for every CPU K/V representation.
+         *
+         * `PrepareRow` runs before a worker evaluates one logical output row.
+         * `VisibleTile` returns causal/window bounds for one canonical summary.
+         * `ScoreTile` fills scores relative to the canonical summary origin and
+         * updates its maximum while visiting a physical cache chunk.
+         * `AccumulateTile` adds weighted V rows from one cache chunk to an
+         * unnormalised numerator. `FinalizeRow` normalizes or transforms the
+         * merged numerator into the caller's output layout.
+         *
+         * @tparam Scratch Worker-local, default-constructible format scratch.
+         * @param query_rows Number of logical query rows in this invocation.
+         * @param n_heads Number of local query heads per query row.
+         * @param kv_len Number of addressable K/V rows.
+         * @param head_dim Elements in one attention head.
+         * @param kv_tile Cache-derived physical K/V tile width.
+         * @param causal Whether the invocation applies causal visibility.
+         * @param execution_policy Declarative physical scheduling policy.
+         * @param prepare_row Format-specific row preparation callback.
+         * @param visible_tile Query-specific K/V visibility callback.
+         * @param score_tile Format-specific QK callback.
+         * @param accumulate_tile Format-specific P@V callback.
+         * @param finalize_row Format-specific final-output callback.
+         * @return True after all rows are produced and finalized.
+         */
+        template <typename Scratch,
+                  typename PrepareRow,
+                  typename VisibleTile,
+                  typename ScoreTile,
+                  typename AccumulateTile,
+                  typename FinalizeRow>
+        bool executePartitionedAttention(
+            int query_rows,
+            int n_heads,
+            int kv_len,
+            int head_dim,
+            int kv_tile,
+            bool causal,
+            const attention::AttentionExecutionPolicy &execution_policy,
+            PrepareRow &&prepare_row,
+            VisibleTile &&visible_tile,
+            ScoreTile &&score_tile,
+            AccumulateTile &&accumulate_tile,
+            FinalizeRow &&finalize_row)
+        {
+            if (query_rows <= 0 || n_heads <= 0 || kv_len <= 0 ||
+                head_dim <= 0 || head_dim > kMaximumAttentionHeadDim ||
+                kv_tile <= 0 || kv_tile > detail::kMaxKVTile)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid partitioned attention geometry");
+                return false;
+            }
+
+            const int physical_workers = std::max(1, omp_get_max_threads());
+            const cpu::fa2_policy::CPUFA2ParallelPlan plan =
+                cpu::fa2_policy::selectCPUFA2ParallelPlan({
+                    .batch_size = 1,
+                    .query_rows = query_rows,
+                    .local_query_heads = n_heads,
+                    .kv_rows = kv_len,
+                    .physical_workers = physical_workers,
+                    .requested_axis =
+                        execution_policy.prefill_parallel_axis,
+                });
+            if (!plan.valid)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid partitioned attention plan");
+                return false;
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                /*
+                 * Report the branch that will actually execute, rather than
+                 * merely echoing the requested policy. In particular, an
+                 * explicitly requested context plan with only one available
+                 * partition enters the query-row implementation below. The
+                 * E2E contract must authenticate physical execution, not an
+                 * intent that the runtime geometry could not realize.
+                 *
+                 * `kv_len` is intentionally absent from the key. Canonical
+                 * arithmetic/context partition counts expose every meaningful
+                 * mode transition while keeping the number of aggregated
+                 * records bounded during long decode runs.
+                 */
+                const auto executed_mode =
+                    plan.usesContextParallelism()
+                        ? cpu::fa2_policy::CPUFA2PhysicalMode::KeyValueContext
+                        : cpu::fa2_policy::CPUFA2PhysicalMode::QuerySequence;
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_fa2_parallel_plan_executions",
+                    1.0,
+                    "execute",
+                    "cpu",
+                    {
+                        {"requested_axis",
+                         attention::attentionPrefillParallelAxisName(
+                             execution_policy.prefill_parallel_axis)},
+                        {"selected_mode",
+                         cpu::fa2_policy::cpuFA2PhysicalModeName(executed_mode)},
+                        {"query_rows", std::to_string(query_rows)},
+                        {"local_query_heads", std::to_string(n_heads)},
+                        {"head_dim", std::to_string(head_dim)},
+                        {"physical_workers", std::to_string(physical_workers)},
+                        {"arithmetic_partitions",
+                         std::to_string(plan.arithmetic_partitions)},
+                        {"context_partitions",
+                         std::to_string(plan.context_partitions)},
+                        {"context_partition_rows",
+                         std::to_string(plan.context_partition_rows)},
+                        {"physical_kv_tile", std::to_string(kv_tile)},
+                    });
+            }
+
+            if (plan.usesContextParallelism())
+            {
+                return executeContextParallelAttentionWaves<Scratch>(
+                    query_rows,
+                    n_heads,
+                    kv_len,
+                    head_dim,
+                    kv_tile,
+                    plan,
+                    prepare_row,
+                    visible_tile,
+                    score_tile,
+                    accumulate_tile,
+                    finalize_row);
+            }
+
+            const int output_rows = query_rows * n_heads;
+            const int partitions = plan.arithmetic_partitions;
+            const int partition_rows = plan.context_partition_rows;
+            const int work_items = output_rows;
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            std::uint64_t qk_duration_ns = 0;
+            std::uint64_t v_duration_ns = 0;
+            const int requested_threads = computeOptimalAttentionThreads(
+                n_heads, query_rows, kv_len, head_dim, causal);
+
+            auto work = [&]()
+            {
+                Scratch scratch{};
+                alignas(64) float local_partial[kMaximumAttentionHeadDim];
+                alignas(64) float merged[kMaximumAttentionHeadDim];
+                alignas(64) float scores[detail::kMaxKVTile];
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int item = 0; item < work_items; ++item)
+                {
+                    const int row = item;
+                    prepare_row(row, scratch);
+
+                    std::fill(merged, merged + head_dim, 0.0f);
+                    float merged_m =
+                        -std::numeric_limits<float>::infinity();
+                    float merged_l = 0.0f;
+
+                    const int first_partition = 0;
+                    const int partition_end = partitions;
+                    for (int partition = first_partition;
+                         partition < partition_end;
+                         ++partition)
+                    {
+                        const int range_begin = partition * partition_rows;
+                        const int range_end =
+                            std::min(range_begin + partition_rows, kv_len);
+                        if (range_begin >= range_end)
+                            continue;
+
+                        float *partial = local_partial;
+                        std::fill(partial, partial + head_dim, 0.0f);
+                        float partial_m =
+                            -std::numeric_limits<float>::infinity();
+                        float partial_l = 0.0f;
+
+                        const CPUFA2VisibleTile visible =
+                            visible_tile(row, range_begin, range_end);
+                        evaluateCanonicalAttentionSummary(
+                            row,
+                            scratch,
+                            range_begin,
+                            visible,
+                            head_dim,
+                            kv_tile,
+                            score_tile,
+                            accumulate_tile,
+                            scores,
+                            partial,
+                            partial_m,
+                            partial_l,
+                            profiling_enabled,
+                            qk_duration_ns,
+                            v_duration_ns);
+
+                        mergeAttentionSummary(
+                            merged,
+                            merged_m,
+                            merged_l,
+                            partial,
+                            partial_m,
+                            partial_l,
+                            head_dim);
+                    }
+
+                    finalize_row(row, merged, merged_l);
+                }
+
+            };
+
+            const bool use_full_team =
+                kv_len > 100 || output_rows >= physical_workers;
+            int actual_threads = requested_threads;
+            if (use_full_team)
+            {
+                OMP_WORKSHARE_REGION(work);
+                actual_threads = physical_workers;
+            }
+            else
+            {
+#pragma omp parallel num_threads(requested_threads)
+                {
+                    work();
+                }
+            }
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(
+                    KernelType::ATTENTION_QK,
+                    qk_duration_ns,
+                    actual_threads);
+                KernelProfiler::recordParallel(
+                    KernelType::ATTENTION_V,
+                    v_duration_ns,
+                    actual_threads);
+            }
+            return true;
+        }
+
         /**
          * @brief Weighted V accumulation from Q16_1 block: out[d] += weight * (scale * qs[d]).
          *
@@ -3400,8 +4496,8 @@ namespace llaminar2
          *      (running softmax denominator).
          *   2. Iterate over KV-position tiles of size `kv_tile`.
          *      a. Compute `score[k] = Q[q,h] · K[k, kv_h] / √d` for each
-         *         position k in the tile.  Optionally use I16/VNNI arithmetic
-         *         for the dot-product during prefill.
+         *         position k in the tile with the exact FP32 dot-product
+         *         arithmetic used by serial decode.
          *      b. Find `block_max` = max score in this tile.
          *      c. Compute `new_m = max(running_m, block_max)`.
          *      d. **Rescale** the running output and denominator:
@@ -3435,7 +4531,7 @@ namespace llaminar2
          * @param mask            Optional additive mask [seq_len, kv_len] or nullptr.
          * @return true on success, false if pointers are null or dimensions invalid.
          */
-        static bool compute_flash_fp32(
+        bool compute_flash_fp32(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
@@ -3443,7 +4539,8 @@ namespace llaminar2
             const float *mask,
             int head_start = 0,
             int gqa_n_rep = 0,
-            bool force_decode_tile_policy = false)
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3463,26 +4560,29 @@ namespace llaminar2
             {
                 return false;
             }
+            if (!kv_logical_view.validFor(kv_len))
+                return false;
+
+            const auto physical_kv_row = [&](int logical_row) -> std::size_t
+            {
+                return static_cast<std::size_t>(
+                    kv_logical_view.physicalRow(logical_row));
+            };
 
             // --- Pre-compute constants ---
             const bool use_avx512 = cpu_supports_avx512();
-            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
-
-            // Choose the KV tile size based on cache hierarchy.  Ordinary
-            // decode/prefill uses one logical KV length for the whole call.
-            // The MTP verifier is different: row r is mathematically the same
-            // as a serial one-token decode at KV length
-            // `position_offset + r + 1`, even though the cache already contains
-            // the later speculative rows.  In that mode we compute a row-local
-            // tile below so the grouped verifier matches serial decode
-            // numerically instead of merely relying on causal masks.
-            const bool decode_equivalent_verifier_rows =
-                force_decode_tile_policy &&
-                seq_len > 1 &&
-                kv_len > seq_len &&
-                causal &&
-                mask == nullptr;
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(head_dim, n_kv_heads, kv_len, is_decode);
+            // Tile choice is invariant over positive K/V length. Grouped rows
+            // can therefore use the same physical tile as their serial-decode
+            // counterparts while causal bounds hide later speculative rows.
+            const std::size_t fp32_head_row_bytes =
+                static_cast<std::size_t>(head_dim) * sizeof(float);
+            const int kv_tile = detail::selectCPUFlashKVTile(
+                cpu::fa2_policy::CPUFA2KVStoragePair::FP32,
+                head_dim,
+                kv_len,
+                fp32_head_row_bytes,
+                fp32_head_row_bytes,
+                launch_policy_.explicit_kv_tile);
 
             // For Grouped Query Attention: how many Q heads share one KV head.
             // TP-aware: use global GQA ratio when gqa_n_rep is provided.
@@ -3495,123 +4595,247 @@ namespace llaminar2
             const int q_stride = n_heads * head_dim;     // Q row = all Q heads concatenated
             const int kv_stride = n_kv_heads * head_dim; // K/V row = all KV heads concatenated
 
-            // --- I16/VNNI quantisation layout parameters ---
-            // Pad head_dim up to a multiple of 32 (the VNNI block width).
-            const int i16_row_stride = ((head_dim + 31) / 32) * 32;
-            const int i16_chunks = i16_row_stride / 32; // Number of 32-element VNNI blocks per row
-
-            // Packed pairs: two K rows are interleaved into one buffer.
-            // This halves the number of outer loop iterations in the QK phase.
-            const int kv_pair_count = (kv_len + 1) / 2;
-            // Each packed pair = i16_chunks blocks × 64 int16 elements (32 per row × 2 rows).
-            const int k_pair_stride = i16_chunks * 64;
-
             // Profiling: track QK dot-product and V accumulation times separately.
             const bool profiling_enabled = KernelProfiler::isEnabled();
             uint64_t qk_duration_ns = 0;
             uint64_t v_duration_ns = 0;
 
-            // --- Decide whether to use the I16/I12 integer dot-product path ---
-            // The integer path is faster for long prefill sequences on CPUs with
-            // VNNI support, because VPDPWSSD does 32 × int16 multiply-adds per
-            // cycle vs. 16 × FP32 FMAs.  We only enable it when the problem is
-            // large enough to amortise the quantisation overhead.
-            const auto &env = debugEnv();
-            const int64_t prefill_work = static_cast<int64_t>(seq_len) * static_cast<int64_t>(kv_len);
-            const bool use_i16_i12_prefill =
-                !is_decode &&
-                env.attention.flash_prefill_i16_i12 &&                          // Feature flag from debugEnv
-                cpu_supports_avx512_vnni() &&                                   // Hardware must have VNNI
-                seq_len >= env.attention.flash_prefill_i16_i12_min_seq &&       // Minimum seq_len threshold
-                kv_len >= env.attention.flash_prefill_i16_i12_min_kv &&         // Minimum kv_len threshold
-                prefill_work >= env.attention.flash_prefill_i16_i12_min_work && // Minimum total work
-                head_dim <= env.attention.flash_prefill_i16_i12_max_head_dim;   // head_dim cap
-
-            // qmax controls the I12 quantisation range.  Typical value: 2047, giving
-            // ~12 effective bits of precision within 16-bit integer storage.
-            const int qmax = std::max(1, std::min(env.attention.flash_prefill_i16_i12_qmax, 32767));
-
-            // Pre-quantised packed-pair K buffers and their per-row absmax scales.
-            // These are populated once (before the main attention loop) and reused
-            // for every Q row, amortising the quantisation cost.
-            std::vector<int16_t> packed_k_pairs_i16;
-            std::vector<float> packed_k_pair_scales;
-
-            // ---------------------------------------------------------------
-            // Phase 1 (optional): Pre-quantise all K rows into packed pairs
-            // ---------------------------------------------------------------
-            // This runs only during prefill when the I16 path is active.
-            // Each pair of consecutive K rows (k0, k1) is quantised into a
-            // single interleaved buffer so the VNNI dot-product loop can
-            // compute two scores per iteration.
-            if (use_i16_i12_prefill)
+            const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
+                cpu::fa2_policy::selectCPUFA2ParallelPlan({
+                    .batch_size = 1,
+                    .query_rows = seq_len,
+                    .local_query_heads = n_heads,
+                    .kv_rows = kv_len,
+                    .physical_workers = std::max(1, omp_get_max_threads()),
+                    .requested_axis =
+                        execution_policy.prefill_parallel_axis,
+                });
+            if (!partition_plan.valid)
             {
-                // Allocate: [n_kv_heads × kv_pair_count] packed-pair buffers.
-                packed_k_pairs_i16.resize(static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kv_pair_count) * static_cast<size_t>(k_pair_stride));
-                // Two scale factors per pair (one per K row).
-                packed_k_pair_scales.resize(static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kv_pair_count) * 2ULL, 0.0f);
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid FP32 attention partition plan");
+                return false;
+            }
 
-                // Parallel quantisation across KV heads and pair indices.
-                auto do_pack = [&]()
+            /*
+             * The one-summary case below remains the lowest-overhead physical
+             * implementation. Once a local head shard requires more than one
+             * canonical summary, both query ownership and context ownership
+             * enter the common producer/reducer so their arithmetic bytes are
+             * identical. Grouped verifier rows retain their row-local decode
+             * tiles; that separately proven path compares against serial rows
+             * with differing visible cache lengths.
+             */
+            if (partition_plan.arithmetic_partitions > 1)
+            {
+                /** Per-worker state for one FP32 output row. */
+                struct FP32RowScratch
                 {
-#pragma omp for collapse(2) schedule(static)
-                    for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+                    const float *query = nullptr;
+                    const float *key = nullptr;
+                    const float *value = nullptr;
+                    const float *mask = nullptr;
+                    int query_position = 0;
+                    int visible_kv_rows = 0;
+                };
+
+                const auto prepare_row = [&](int row,
+                                             FP32RowScratch &scratch)
+                {
+                    const int query_position = row / n_heads;
+                    const int head = row % n_heads;
+                    const int kv_head = (gqa_n_rep > 0)
+                                            ? (head_start + head) / heads_per_kv
+                                            : head / heads_per_kv;
+                    scratch.query =
+                        Q + static_cast<std::size_t>(query_position) * q_stride +
+                        static_cast<std::size_t>(head) * head_dim;
+                    scratch.key =
+                        K + static_cast<std::size_t>(kv_head) * head_dim;
+                    scratch.value =
+                        V + static_cast<std::size_t>(kv_head) * head_dim;
+                    scratch.mask = mask
+                                       ? mask +
+                                             static_cast<std::size_t>(query_position) *
+                                                 kv_len
+                                       : nullptr;
+                    scratch.query_position = position_offset + query_position;
+                    scratch.visible_kv_rows = kv_len;
+                };
+
+                const auto visible_tile = [&](int row,
+                                              int tile_begin,
+                                              int tile_end)
+                {
+                    const int query_position = row / n_heads;
+                    const int absolute_position =
+                        position_offset + query_position;
+                    int visible_begin = tile_begin;
+                    int visible_end = tile_end;
+                    if (window_size > 0)
                     {
-                        for (int pair_idx = 0; pair_idx < kv_pair_count; ++pair_idx)
+                        visible_begin = std::max(
+                            visible_begin,
+                            absolute_position - window_size + 1);
+                    }
+                    if (causal)
+                        visible_end = std::min(visible_end, absolute_position + 1);
+                    return CPUFA2VisibleTile{
+                        .begin = std::max(
+                            tile_begin,
+                            std::min(visible_begin, tile_end)),
+                        .end = std::max(
+                            tile_begin,
+                            std::min(visible_end, tile_end)),
+                    };
+                };
+
+                const auto score_tile = [&](int,
+                                            const FP32RowScratch &scratch,
+                                            int tile_begin,
+                                            CPUFA2VisibleTile visible,
+                                            float *scores,
+                                            float &block_max)
+                {
+                    int kv_row = visible.begin;
+                    while (kv_row < visible.end)
+                    {
+                        if (kv_row + 3 < visible.end)
                         {
-                            // Each pair contains two consecutive KV positions.
-                            const int k0 = pair_idx * 2;
-                            const int k1 = k0 + 1;
-
-                            // Global index into the flat packed_k_pairs arrays.
-                            const size_t pair_global = static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) + static_cast<size_t>(pair_idx);
-                            int16_t *pair_dst = packed_k_pairs_i16.data() + pair_global * static_cast<size_t>(k_pair_stride);
-
-                            // Quantise row 0 of the pair (slot 0 in the interleaved buffer).
-                            float s0 = 0.0f;
-                            float s1 = 0.0f;
-                            if (k0 < kv_len)
+                            float score0 = 0.0f;
+                            float score1 = 0.0f;
+                            float score2 = 0.0f;
+                            float score3 = 0.0f;
+                            dot_fp32_4row(
+                                scratch.query,
+                                scratch.key +
+                                    physical_kv_row(kv_row + 0) * kv_stride,
+                                scratch.key +
+                                    physical_kv_row(kv_row + 1) * kv_stride,
+                                scratch.key +
+                                    physical_kv_row(kv_row + 2) * kv_stride,
+                                scratch.key +
+                                    physical_kv_row(kv_row + 3) * kv_stride,
+                                head_dim,
+                                score0,
+                                score1,
+                                score2,
+                                score3);
+                            float values[4]{
+                                score0 * scale,
+                                score1 * scale,
+                                score2 * scale,
+                                score3 * scale,
+                            };
+                            for (int lane = 0; lane < 4; ++lane)
                             {
-                                const float *k_src0 = K + static_cast<size_t>(k0) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-                                s0 = quantize_row_i16_i12_to_packedpair(k_src0, pair_dst, head_dim, i16_row_stride, qmax, 0);
+                                if (scratch.mask)
+                                    values[lane] += scratch.mask[kv_row + lane];
+                                scores[static_cast<std::size_t>(
+                                    kv_row + lane - tile_begin)] = values[lane];
+                                block_max = std::max(block_max, values[lane]);
                             }
-                            else
-                            {
-                                // Beyond the end of the KV sequence — zero-fill slot 0.
-                                for (int i = 0; i < i16_row_stride; ++i)
-                                {
-                                    const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                                    const size_t lane = static_cast<size_t>(i % 32);
-                                    pair_dst[block + lane] = 0;
-                                }
-                            }
-
-                            // Quantise row 1 of the pair (slot 1 in the interleaved buffer).
-                            if (k1 < kv_len)
-                            {
-                                const float *k_src1 = K + static_cast<size_t>(k1) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-                                s1 = quantize_row_i16_i12_to_packedpair(k_src1, pair_dst, head_dim, i16_row_stride, qmax, 1);
-                            }
-                            else
-                            {
-                                // Beyond the end — zero-fill slot 1.
-                                for (int i = 0; i < i16_row_stride; ++i)
-                                {
-                                    const size_t block = static_cast<size_t>(i / 32) * 64ULL;
-                                    const size_t lane = static_cast<size_t>(i % 32);
-                                    pair_dst[block + 32ULL + lane] = 0;
-                                }
-                            }
-
-                            // Store the absmax scale for each row so we can recover
-                            // the approximate FP32 dot product later:
-                            //   fp32_dot ≈ int32_dot × q_scale × k_scale
-                            packed_k_pair_scales[pair_global * 2ULL + 0ULL] = s0;
-                            packed_k_pair_scales[pair_global * 2ULL + 1ULL] = s1;
+                            kv_row += 4;
+                            continue;
                         }
+
+                        float score = dot_fp32(
+                                          scratch.query,
+                                          scratch.key +
+                                              physical_kv_row(kv_row) * kv_stride,
+                                          head_dim) *
+                                      scale;
+                        if (scratch.mask)
+                            score += scratch.mask[kv_row];
+                        scores[static_cast<std::size_t>(kv_row - tile_begin)] =
+                            score;
+                        block_max = std::max(block_max, score);
+                        ++kv_row;
                     }
                 };
-                OMP_WORKSHARE_REGION(do_pack);
+
+                const auto accumulate_tile = [&](int,
+                                                 const FP32RowScratch &scratch,
+                                                 int tile_begin,
+                                                 CPUFA2VisibleTile visible,
+                                                 const float *scores,
+                                                 float new_m,
+                                                 float *partial,
+                                                 float &new_l)
+                {
+                    int kv_row = visible.begin;
+                    for (; kv_row + 3 < visible.end; kv_row += 4)
+                    {
+                        float probabilities[4];
+                        batch_exp_4(
+                            scores[static_cast<std::size_t>(kv_row - tile_begin + 0)],
+                            scores[static_cast<std::size_t>(kv_row - tile_begin + 1)],
+                            scores[static_cast<std::size_t>(kv_row - tile_begin + 2)],
+                            scores[static_cast<std::size_t>(kv_row - tile_begin + 3)],
+                            new_m,
+                            probabilities[0],
+                            probabilities[1],
+                            probabilities[2],
+                            probabilities[3]);
+                        new_l += probabilities[0] + probabilities[1] +
+                                 probabilities[2] + probabilities[3];
+                        accum_weighted_v_4row(
+                            partial,
+                            scratch.value +
+                                physical_kv_row(kv_row + 0) * kv_stride,
+                            probabilities[0],
+                            scratch.value +
+                                physical_kv_row(kv_row + 1) * kv_stride,
+                            probabilities[1],
+                            scratch.value +
+                                physical_kv_row(kv_row + 2) * kv_stride,
+                            probabilities[2],
+                            scratch.value +
+                                physical_kv_row(kv_row + 3) * kv_stride,
+                            probabilities[3],
+                            head_dim);
+                    }
+                    for (; kv_row < visible.end; ++kv_row)
+                    {
+                        const float probability = std::exp(
+                            scores[static_cast<std::size_t>(kv_row - tile_begin)] -
+                            new_m);
+                        new_l += probability;
+                        accum_weighted_v(
+                            partial,
+                            scratch.value +
+                                physical_kv_row(kv_row) * kv_stride,
+                            probability,
+                            head_dim,
+                            use_avx512);
+                    }
+                };
+
+                const auto finalize_row = [&](int row,
+                                              float *merged,
+                                              float merged_l)
+                {
+                    if (merged_l > 0.0f)
+                        div_vec(merged, merged_l, head_dim, use_avx512);
+                    std::memcpy(
+                        output + static_cast<std::size_t>(row / n_heads) * q_stride +
+                            static_cast<std::size_t>(row % n_heads) * head_dim,
+                        merged,
+                        static_cast<std::size_t>(head_dim) * sizeof(float));
+                };
+
+                return executePartitionedAttention<FP32RowScratch>(
+                    seq_len,
+                    n_heads,
+                    kv_len,
+                    head_dim,
+                    kv_tile,
+                    causal,
+                    execution_policy,
+                    prepare_row,
+                    visible_tile,
+                    score_tile,
+                    accumulate_tile,
+                    finalize_row);
             }
 
             // ---------------------------------------------------------------
@@ -3624,32 +4848,40 @@ namespace llaminar2
             const int attn_threads = computeOptimalAttentionThreads(
                 n_heads, seq_len, kv_len, head_dim, causal);
 
+            /*
+             * This flag controls only OpenMP ownership. Physical K/V tiling is
+             * resolved independently from detected private-cache geometry; the
+             * canonical scheduler keeps arithmetic byte-invariant under either
+             * ownership or tile choice.
+             */
+            const bool decode_schedule = kv_len != seq_len && kv_len >= 1;
+            const bool partition_query_rows =
+                !decode_schedule && seq_len > 1;
+            const int attention_tasks =
+                partition_query_rows ? n_heads * seq_len : n_heads;
+
             auto work = [&]()
             {
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int task = 0;
-                     task < (decode_equivalent_verifier_rows
-                                 ? n_heads * seq_len
-                                 : n_heads);
-                     ++task)
+                for (int task = 0; task < attention_tasks; ++task)
                 {
                     /*
-                     * Ordinary prefill/decode parallelizes by head and keeps
-                     * all query rows for a head in one task.  MTP verifier
-                     * decode-equivalent groups are different: M is only 2..4,
-                     * each row performs a long causal decode, and keeping all
-                     * rows inside one head task makes long-context M=2 slower
-                     * than two serial decodes.  Splitting only this verifier
-                     * mode by (head,row) improves task balance without changing
-                     * per-row floating-point order.
+                     * Every prefill output row is independent once Q/K/V and
+                     * its causal horizon are fixed.  Scheduling complete
+                     * (head,row) tasks therefore exposes the query-sequence
+                     * policy promised by the public interface while preserving
+                     * the exact dot-product, tile, softmax, and V-accumulation
+                     * order within each row.  Decode remains head-partitioned;
+                     * grouped verifier rows use the same row decomposition so
+                     * small-M work can occupy surplus cores without row replay.
                      */
-                    const int h = decode_equivalent_verifier_rows
+                    const int h = partition_query_rows
                                       ? (task / seq_len)
                                       : task;
-                    const int q_begin = decode_equivalent_verifier_rows
+                    const int q_begin = partition_query_rows
                                             ? (task % seq_len)
                                             : 0;
-                    const int q_end = decode_equivalent_verifier_rows
+                    const int q_end = partition_query_rows
                                           ? q_begin + 1
                                           : seq_len;
 
@@ -3661,15 +4893,6 @@ namespace llaminar2
                     const int kv_h = (gqa_n_rep > 0)
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
-
-                    // Pointer to the pre-quantised packed-pair K data for this KV head
-                    // (nullptr when using the FP32 dot-product path).
-                    const int16_t *k_head_pairs_i16 = use_i16_i12_prefill
-                                                          ? packed_k_pairs_i16.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * static_cast<size_t>(k_pair_stride)
-                                                          : nullptr;
-                    const float *k_head_pair_scales = use_i16_i12_prefill
-                                                          ? packed_k_pair_scales.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * 2ULL
-                                                          : nullptr;
 
                     // --- Loop over query positions for this head ---
                     for (int q_pos = q_begin; q_pos < q_end; ++q_pos)
@@ -3694,22 +4917,8 @@ namespace llaminar2
                         // Optional additive mask row for this query position.
                         const float *mask_row = mask ? (mask + static_cast<size_t>(q_pos) * kv_len) : nullptr;
 
-                        const int query_kv_len = decode_equivalent_verifier_rows
-                                                     ? std::min(kv_len, position_offset + q_pos + 1)
-                                                     : kv_len;
-                        const int query_kv_tile = decode_equivalent_verifier_rows
-                                                      ? detail::DefaultFlashKVTilePolicy::choose(
-                                                            head_dim, n_kv_heads, query_kv_len, /*is_decode=*/true)
-                                                      : kv_tile;
-
-                        // Stack-allocated I16 quantised Q buffer.
-                        alignas(64) int16_t q_i16[detail::kMaxI16RowStride];
-                        float q_scale_i16 = 0.0f;
-                        if (use_i16_i12_prefill)
-                        {
-                            // Quantise the Q row once; it will be dotted against every K pair.
-                            q_scale_i16 = quantize_row_i16_i12_padded(q_ptr, q_i16, head_dim, i16_row_stride, qmax);
-                        }
+                        const int query_kv_len = kv_len;
+                        const int query_kv_tile = kv_tile;
 
                         // ===================================================
                         // KV tile loop — the heart of flash attention
@@ -3760,117 +4969,22 @@ namespace llaminar2
                             }
 
                             // --- QK Phase: compute score[k] = Q · K[k] / √d ---
-                            // The code below dispatches to I16 VNNI or FP32 AVX-512
-                            // dot-products depending on settings.  The I16 path
-                            // processes 4, 2, or 1 KV positions at a time using the
-                            // packed-pair layout for maximum throughput.
+                            // Four-row FP32 dot products expose independent
+                            // accumulators for instruction-level parallelism;
+                            // the scalar loop handles only the final tail.
                             for (int k = valid_start; k < valid_end;)
                             {
-                                if (use_i16_i12_prefill)
-                                {
-                                    // --- I16 fast path: try 4-at-a-time (two packed pairs) ---
-                                    if (k + 3 < valid_end)
-                                    {
-                                        const int pair_idx0 = k / 2;
-                                        const int pair_idx1 = pair_idx0 + 1;
-                                        const int16_t *k_pair0 = k_head_pairs_i16 + static_cast<size_t>(pair_idx0) * static_cast<size_t>(k_pair_stride);
-                                        const int16_t *k_pair1 = k_head_pairs_i16 + static_cast<size_t>(pair_idx1) * static_cast<size_t>(k_pair_stride);
-                                        const float k_scale0 = k_head_pair_scales[static_cast<size_t>(pair_idx0) * 2ULL + 0ULL];
-                                        const float k_scale1 = k_head_pair_scales[static_cast<size_t>(pair_idx0) * 2ULL + 1ULL];
-                                        const float k_scale2 = k_head_pair_scales[static_cast<size_t>(pair_idx1) * 2ULL + 0ULL];
-                                        const float k_scale3 = k_head_pair_scales[static_cast<size_t>(pair_idx1) * 2ULL + 1ULL];
-
-                                        int32_t dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
-                                        dot_i16_i16_i32_vnni_4row_packedpair(q_i16, k_pair0, k_pair1, i16_row_stride, dot0, dot1, dot2, dot3);
-
-                                        float s0 = static_cast<float>(dot0) * (q_scale_i16 * k_scale0) * scale;
-                                        float s1 = static_cast<float>(dot1) * (q_scale_i16 * k_scale1) * scale;
-                                        float s2 = static_cast<float>(dot2) * (q_scale_i16 * k_scale2) * scale;
-                                        float s3 = static_cast<float>(dot3) * (q_scale_i16 * k_scale3) * scale;
-
-                                        if (mask_row)
-                                        {
-                                            s0 += mask_row[k + 0];
-                                            s1 += mask_row[k + 1];
-                                            s2 += mask_row[k + 2];
-                                            s3 += mask_row[k + 3];
-                                        }
-
-                                        block_scores[static_cast<size_t>(k - k0)] = s0;
-                                        block_scores[static_cast<size_t>(k + 1 - k0)] = s1;
-                                        block_scores[static_cast<size_t>(k + 2 - k0)] = s2;
-                                        block_scores[static_cast<size_t>(k + 3 - k0)] = s3;
-                                        block_max = std::max(block_max, s0);
-                                        block_max = std::max(block_max, s1);
-                                        block_max = std::max(block_max, s2);
-                                        block_max = std::max(block_max, s3);
-
-                                        k += 4;
-                                        continue;
-                                    }
-
-                                    // --- I16 fast path: try 2-at-a-time (one packed pair) ---
-                                    if (k + 1 < valid_end)
-                                    {
-                                        const int pair_idx = k / 2;
-                                        const int16_t *k_pair = k_head_pairs_i16 + static_cast<size_t>(pair_idx) * static_cast<size_t>(k_pair_stride);
-                                        const float k_scale0 = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + 0ULL];
-                                        const float k_scale1 = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + 1ULL];
-                                        int32_t dot_i32_0 = 0;
-                                        int32_t dot_i32_1 = 0;
-                                        dot_i16_i16_i32_vnni_2row_packedpair(q_i16, k_pair, i16_row_stride, dot_i32_0, dot_i32_1);
-
-                                        float s0 = static_cast<float>(dot_i32_0) * (q_scale_i16 * k_scale0);
-                                        float s1 = static_cast<float>(dot_i32_1) * (q_scale_i16 * k_scale1);
-                                        s0 *= scale;
-                                        s1 *= scale;
-
-                                        if (mask_row)
-                                        {
-                                            s0 += mask_row[k];
-                                            s1 += mask_row[k + 1];
-                                        }
-
-                                        block_scores[static_cast<size_t>(k - k0)] = s0;
-                                        block_scores[static_cast<size_t>(k + 1 - k0)] = s1;
-                                        block_max = std::max(block_max, s0);
-                                        block_max = std::max(block_max, s1);
-                                        k += 2;
-                                        continue;
-                                    }
-
-                                    // --- I16 tail: single remaining position ---
-                                    const int pair_idx = k / 2;
-                                    const int row_sel = (k & 1); // 0 = first row in pair, 1 = second
-                                    const int16_t *k_pair = k_head_pairs_i16 + static_cast<size_t>(pair_idx) * static_cast<size_t>(k_pair_stride);
-                                    const float k_scale = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + static_cast<size_t>(row_sel)];
-                                    const int32_t dot_i32 = dot_i16_i16_i32_vnni_single_from_packedpair(q_i16, k_pair, i16_row_stride, row_sel);
-                                    // Recover approximate FP32 dot: int_dot × q_scale × k_scale
-                                    float s = static_cast<float>(dot_i32) * (q_scale_i16 * k_scale);
-                                    s *= scale;
-
-                                    if (mask_row)
-                                    {
-                                        s += mask_row[k];
-                                    }
-
-                                    block_scores[static_cast<size_t>(k - k0)] = s;
-                                    block_max = std::max(block_max, s);
-                                    ++k;
-                                    continue;
-                                }
-
-                                // --- FP32 path: batched 4-row dot products for ILP ---
+                                // Batched 4-row dot products for ILP.
                                 if (k + 3 < valid_end)
                                 {
                                     const float *kbase = K + static_cast<size_t>(kv_h) * head_dim;
                                     float s0, s1, s2, s3;
                                     dot_fp32_4row(
                                         q_ptr,
-                                        kbase + static_cast<size_t>(k + 0) * kv_stride,
-                                        kbase + static_cast<size_t>(k + 1) * kv_stride,
-                                        kbase + static_cast<size_t>(k + 2) * kv_stride,
-                                        kbase + static_cast<size_t>(k + 3) * kv_stride,
+                                        kbase + physical_kv_row(k + 0) * kv_stride,
+                                        kbase + physical_kv_row(k + 1) * kv_stride,
+                                        kbase + physical_kv_row(k + 2) * kv_stride,
+                                        kbase + physical_kv_row(k + 3) * kv_stride,
                                         head_dim, s0, s1, s2, s3);
                                     s0 *= scale;
                                     s1 *= scale;
@@ -3894,7 +5008,8 @@ namespace llaminar2
                                 // Scalar / tail path
                                 float s = dot_fp32(
                                     q_ptr,
-                                    K + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
+                                    K + physical_kv_row(k) * kv_stride +
+                                        static_cast<size_t>(kv_h) * head_dim,
                                     head_dim);
                                 s *= scale;
 
@@ -3953,10 +5068,10 @@ namespace llaminar2
 
                                     accum_weighted_v_4row(
                                         out,
-                                        v_base + static_cast<size_t>(k + 0) * kv_stride, pp[0],
-                                        v_base + static_cast<size_t>(k + 1) * kv_stride, pp[1],
-                                        v_base + static_cast<size_t>(k + 2) * kv_stride, pp[2],
-                                        v_base + static_cast<size_t>(k + 3) * kv_stride, pp[3],
+                                        v_base + physical_kv_row(k + 0) * kv_stride, pp[0],
+                                        v_base + physical_kv_row(k + 1) * kv_stride, pp[1],
+                                        v_base + physical_kv_row(k + 2) * kv_stride, pp[2],
+                                        v_base + physical_kv_row(k + 3) * kv_stride, pp[3],
                                         head_dim);
                                 }
                                 // Scalar tail: remaining valid positions
@@ -3964,7 +5079,12 @@ namespace llaminar2
                                 {
                                     const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
                                     new_l += p;
-                                    accum_weighted_v(out, v_base + static_cast<size_t>(k) * kv_stride, p, head_dim, use_avx512);
+                                    accum_weighted_v(
+                                        out,
+                                        v_base + physical_kv_row(k) * kv_stride,
+                                        p,
+                                        head_dim,
+                                        use_avx512);
                                 }
                             }
 
@@ -4056,7 +5176,7 @@ namespace llaminar2
          * V Phase: 4-wide vectorized exp via fast_exp_avx512 + batched
          * accum_weighted_v_q16_4row for maximum throughput.
          */
-        static bool compute_prefill_q16kv(
+        bool compute_prefill_q16kv(
             const float *Q,
             const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
             float *output,
@@ -4065,7 +5185,9 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             int head_start = 0,
             int gqa_n_rep = 0,
-            bool force_decode_tile_policy = false)
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {},
+            Q16QueryLayout query_layout = Q16QueryLayout::RowMajor)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -4074,6 +5196,8 @@ namespace llaminar2
             if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
+                return false;
+            if (!kv_logical_view.validFor(kv_len))
                 return false;
 
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
@@ -4094,17 +5218,56 @@ namespace llaminar2
                                              ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
                                              : 0;
 
+            const detail::Q16KVLogicalLayout q16_layout{
+                .blocks_per_tensor_row = blocks_per_kv_row,
+                .blocks_per_head = blocks_per_head_detect,
+                .physical_rows_per_head = is_head_major
+                                              ? rows_per_head
+                                              : K_q16->rows(),
+                .kv_heads = n_kv_heads,
+                .head_major = is_head_major,
+                .logical_view = kv_logical_view,
+            };
+            if (K_q16->q16_block_size() != V_q16->q16_block_size() ||
+                K_q16->rows() != V_q16->rows() ||
+                K_q16->blocks_per_row() != V_q16->blocks_per_row() ||
+                !q16_layout.valid(K_q16->rows(), kv_len))
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill K/V layout or logical ring view");
+                return false;
+            }
+
             const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
                 return false;
 
             const int q_stride = n_heads * head_dim;
+            const auto query_head = [&](int query_position,
+                                        int head) -> const float *
+            {
+                if (query_layout == Q16QueryLayout::HeadMajor)
+                {
+                    return Q +
+                           (static_cast<std::size_t>(head) * seq_len +
+                            static_cast<std::size_t>(query_position)) *
+                               head_dim;
+                }
+                return Q +
+                       static_cast<std::size_t>(query_position) * q_stride +
+                       static_cast<std::size_t>(head) * head_dim;
+            };
 
-            // KV tile size for prefill
-            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
-                head_dim, n_kv_heads, kv_len, is_decode);
+            // Physical cache tiling is independent of canonical arithmetic.
+            const std::size_t q16_head_row_bytes =
+                blocks_per_head_detect * block_bytes;
+            const int kv_tile = detail::selectCPUFlashKVTile(
+                cpu::fa2_policy::CPUFA2KVStoragePair::Q16_1,
+                head_dim,
+                kv_len,
+                q16_head_row_bytes,
+                q16_head_row_bytes,
+                launch_policy_.explicit_kv_tile);
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
             uint64_t qk_duration_ns = 0;
@@ -4116,13 +5279,356 @@ namespace llaminar2
             // For VNNI QK: Q is quantized per-head to int16
             constexpr int QMAX = 2047;
 
+            const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
+                cpu::fa2_policy::selectCPUFA2ParallelPlan({
+                    .batch_size = 1,
+                    .query_rows = seq_len,
+                    .local_query_heads = n_heads,
+                    .kv_rows = kv_len,
+                    .physical_workers = std::max(1, omp_get_max_threads()),
+                    .requested_axis =
+                        execution_policy.prefill_parallel_axis,
+                });
+            if (!partition_plan.valid)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill partition plan");
+                return false;
+            }
+
+            if (partition_plan.arithmetic_partitions > 1)
+            {
+                /** Per-worker state for one Q16 output row. */
+                struct Q16RowScratch
+                {
+                    alignas(64) std::int16_t query[
+                        detail::kMaxI16RowStride]{};
+                    float combined_query_scale = 0.0f;
+                    int kv_head = 0;
+                    int absolute_position = 0;
+                };
+
+                const auto prepare_row = [&](int row,
+                                             Q16RowScratch &scratch)
+                {
+                    const int query_position = row / n_heads;
+                    const int head = row % n_heads;
+                    const int kv_head = (gqa_n_rep > 0)
+                                            ? (head_start + head) / heads_per_kv
+                                            : head / heads_per_kv;
+                    const float *query = query_head(query_position, head);
+                    scratch.combined_query_scale = quantize_row_i16_i12(
+                                                       query,
+                                                       scratch.query,
+                                                       head_dim,
+                                                       QMAX) *
+                                                   scale;
+                    scratch.kv_head = kv_head;
+                    scratch.absolute_position =
+                        position_offset + query_position;
+                };
+
+                const auto visible_tile = [&](int row,
+                                              int tile_begin,
+                                              int tile_end)
+                {
+                    const int absolute_position =
+                        position_offset + row / n_heads;
+                    int visible_begin = tile_begin;
+                    int visible_end = tile_end;
+                    if (window_size > 0)
+                    {
+                        visible_begin = std::max(
+                            visible_begin,
+                            absolute_position - window_size + 1);
+                    }
+                    if (causal)
+                        visible_end = std::min(visible_end, absolute_position + 1);
+                    return CPUFA2VisibleTile{
+                        .begin = std::max(
+                            tile_begin,
+                            std::min(visible_begin, tile_end)),
+                        .end = std::max(
+                            tile_begin,
+                            std::min(visible_end, tile_end)),
+                    };
+                };
+
+                const auto score_tile = [&](int,
+                                            const Q16RowScratch &scratch,
+                                            int tile_begin,
+                                            CPUFA2VisibleTile visible,
+                                            float *scores,
+                                            float &block_max)
+                {
+                    int kv_row = visible.begin;
+                    while (kv_row < visible.end)
+                    {
+                        if (q16_layout.blocks_per_head == 1 &&
+                            kv_row + 3 < visible.end)
+                        {
+                            const std::uint8_t *block0 =
+                                k_raw + q16_layout.blockIndex(
+                                            kv_row + 0, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block1 =
+                                k_raw + q16_layout.blockIndex(
+                                            kv_row + 1, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block2 =
+                                k_raw + q16_layout.blockIndex(
+                                            kv_row + 2, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block3 =
+                                k_raw + q16_layout.blockIndex(
+                                            kv_row + 3, scratch.kv_head, 0) *
+                                            block_bytes;
+                            float scale0 = 0.0f;
+                            float scale1 = 0.0f;
+                            float scale2 = 0.0f;
+                            float scale3 = 0.0f;
+                            std::memcpy(&scale0, block0, sizeof(float));
+                            std::memcpy(&scale1, block1, sizeof(float));
+                            std::memcpy(&scale2, block2, sizeof(float));
+                            std::memcpy(&scale3, block3, sizeof(float));
+                            std::int32_t dot0 = 0;
+                            std::int32_t dot1 = 0;
+                            std::int32_t dot2 = 0;
+                            std::int32_t dot3 = 0;
+                            dot_i16_i16_i32_vnni_4row(
+                                scratch.query,
+                                reinterpret_cast<const std::int16_t *>(
+                                    block0 + QS_OFFSET),
+                                reinterpret_cast<const std::int16_t *>(
+                                    block1 + QS_OFFSET),
+                                reinterpret_cast<const std::int16_t *>(
+                                    block2 + QS_OFFSET),
+                                reinterpret_cast<const std::int16_t *>(
+                                    block3 + QS_OFFSET),
+                                head_dim,
+                                dot0,
+                                dot1,
+                                dot2,
+                                dot3);
+                            const float values[4]{
+                                static_cast<float>(dot0) *
+                                    scratch.combined_query_scale * scale0,
+                                static_cast<float>(dot1) *
+                                    scratch.combined_query_scale * scale1,
+                                static_cast<float>(dot2) *
+                                    scratch.combined_query_scale * scale2,
+                                static_cast<float>(dot3) *
+                                    scratch.combined_query_scale * scale3,
+                            };
+                            for (int lane = 0; lane < 4; ++lane)
+                            {
+                                scores[static_cast<std::size_t>(
+                                    kv_row + lane - tile_begin)] = values[lane];
+                                block_max = std::max(block_max, values[lane]);
+                            }
+                            kv_row += 4;
+                            continue;
+                        }
+
+                        float score = 0.0f;
+                        for (std::size_t block = 0;
+                             block < q16_layout.blocks_per_head;
+                             ++block)
+                        {
+                            const std::size_t block_index =
+                                q16_layout.blockIndex(
+                                    kv_row, scratch.kv_head, block);
+                            const std::uint8_t *stored =
+                                k_raw + block_index * block_bytes;
+                            float stored_scale = 0.0f;
+                            std::memcpy(
+                                &stored_scale,
+                                stored,
+                                sizeof(float));
+                            const int elements = static_cast<int>(std::min(
+                                block_elems,
+                                static_cast<std::size_t>(head_dim) -
+                                    block * block_elems));
+                            const std::int32_t dot = dot_i16_i16_i32(
+                                scratch.query + block * block_elems,
+                                reinterpret_cast<const std::int16_t *>(
+                                    stored + QS_OFFSET),
+                                elements);
+                            score += static_cast<float>(dot) *
+                                     scratch.combined_query_scale *
+                                     stored_scale;
+                        }
+                        scores[static_cast<std::size_t>(kv_row - tile_begin)] =
+                            score;
+                        block_max = std::max(block_max, score);
+                        ++kv_row;
+                    }
+                };
+
+                const auto accumulate_tile = [&](int,
+                                                 const Q16RowScratch &scratch,
+                                                 int tile_begin,
+                                                 CPUFA2VisibleTile visible,
+                                                 const float *scores,
+                                                 float new_m,
+                                                 float *partial,
+                                                 float &new_l)
+                {
+                    int kv_row = visible.begin;
+                    if (q16_layout.blocks_per_head == 1)
+                    {
+                        for (; kv_row + 3 < visible.end; kv_row += 4)
+                        {
+                            float probabilities[4];
+                            batch_exp_4(
+                                scores[static_cast<std::size_t>(kv_row - tile_begin + 0)],
+                                scores[static_cast<std::size_t>(kv_row - tile_begin + 1)],
+                                scores[static_cast<std::size_t>(kv_row - tile_begin + 2)],
+                                scores[static_cast<std::size_t>(kv_row - tile_begin + 3)],
+                                new_m,
+                                probabilities[0],
+                                probabilities[1],
+                                probabilities[2],
+                                probabilities[3]);
+                            new_l += probabilities[0] + probabilities[1] +
+                                     probabilities[2] + probabilities[3];
+                            const std::uint8_t *block0 =
+                                v_raw + q16_layout.blockIndex(
+                                            kv_row + 0, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block1 =
+                                v_raw + q16_layout.blockIndex(
+                                            kv_row + 1, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block2 =
+                                v_raw + q16_layout.blockIndex(
+                                            kv_row + 2, scratch.kv_head, 0) *
+                                            block_bytes;
+                            const std::uint8_t *block3 =
+                                v_raw + q16_layout.blockIndex(
+                                            kv_row + 3, scratch.kv_head, 0) *
+                                            block_bytes;
+                            float scale0 = 0.0f;
+                            float scale1 = 0.0f;
+                            float scale2 = 0.0f;
+                            float scale3 = 0.0f;
+                            std::memcpy(&scale0, block0, sizeof(float));
+                            std::memcpy(&scale1, block1, sizeof(float));
+                            std::memcpy(&scale2, block2, sizeof(float));
+                            std::memcpy(&scale3, block3, sizeof(float));
+                            accum_weighted_v_q16_4row(
+                                partial,
+                                reinterpret_cast<const std::int16_t *>(
+                                    block0 + QS_OFFSET),
+                                probabilities[0] * scale0,
+                                reinterpret_cast<const std::int16_t *>(
+                                    block1 + QS_OFFSET),
+                                probabilities[1] * scale1,
+                                reinterpret_cast<const std::int16_t *>(
+                                    block2 + QS_OFFSET),
+                                probabilities[2] * scale2,
+                                reinterpret_cast<const std::int16_t *>(
+                                    block3 + QS_OFFSET),
+                                probabilities[3] * scale3,
+                                head_dim);
+                        }
+                    }
+
+                    for (; kv_row < visible.end; ++kv_row)
+                    {
+                        const float probability = std::exp(
+                            scores[static_cast<std::size_t>(kv_row - tile_begin)] -
+                            new_m);
+                        new_l += probability;
+                        for (std::size_t block = 0;
+                             block < q16_layout.blocks_per_head;
+                             ++block)
+                        {
+                            const std::size_t block_index =
+                                q16_layout.blockIndex(
+                                    kv_row, scratch.kv_head, block);
+                            const std::uint8_t *stored =
+                                v_raw + block_index * block_bytes;
+                            float stored_scale = 0.0f;
+                            std::memcpy(
+                                &stored_scale,
+                                stored,
+                                sizeof(float));
+                            const int elements = static_cast<int>(std::min(
+                                block_elems,
+                                static_cast<std::size_t>(head_dim) -
+                                    block * block_elems));
+                            accum_weighted_v_q16(
+                                partial + block * block_elems,
+                                reinterpret_cast<const std::int16_t *>(
+                                    stored + QS_OFFSET),
+                                probability * stored_scale,
+                                elements);
+                        }
+                    }
+                };
+
+                const auto finalize_row = [&](int row,
+                                              float *merged,
+                                              float merged_l)
+                {
+                    if (merged_l > 0.0f)
+                    {
+                        scale_vec(
+                            merged,
+                            1.0f / merged_l,
+                            head_dim,
+                            cpu_supports_avx512());
+                    }
+                    std::memcpy(
+                        output + static_cast<std::size_t>(row / n_heads) * q_stride +
+                            static_cast<std::size_t>(row % n_heads) * head_dim,
+                        merged,
+                        static_cast<std::size_t>(head_dim) * sizeof(float));
+                };
+
+                return executePartitionedAttention<Q16RowScratch>(
+                    seq_len,
+                    n_heads,
+                    kv_len,
+                    head_dim,
+                    kv_tile,
+                    causal,
+                    execution_policy,
+                    prepare_row,
+                    visible_tile,
+                    score_tile,
+                    accumulate_tile,
+                    finalize_row);
+            }
+
+            const bool partition_query_rows = seq_len > 1;
+            const int attention_tasks =
+                partition_query_rows ? n_heads * seq_len : n_heads;
+
             auto work = [&]()
             {
                 alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+                for (int task = 0; task < attention_tasks; ++task)
                 {
+                    /*
+                     * Quantized prefill follows the same physical query policy
+                     * as FP32: one task owns one complete output row.  Keeping
+                     * the entire row inside a task preserves VNNI dot-product
+                     * and online-softmax order while allowing TP shards with
+                     * fewer heads than cores to use their full worker team.
+                     */
+                    const int h = partition_query_rows
+                                      ? task / seq_len
+                                      : task;
+                    const int q_begin = partition_query_rows
+                                            ? task % seq_len
+                                            : 0;
+                    const int q_end = partition_query_rows
+                                          ? q_begin + 1
+                                          : seq_len;
+
                     // GQA mapping: replicated KV uses global head position;
                     // sharded KV uses local indexing (see compute_flash_fp32 comment).
                     const int kv_h = (gqa_n_rep > 0)
@@ -4133,17 +5639,12 @@ namespace llaminar2
                     // may be either [position][head][dim] or [head][position][dim].
                     // The grouped verifier must read the same logical cache
                     // rows as serial decode, so both layouts share the same
-                    // address formula as compute_decode_q16kv().
-                    const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-                    const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
-                    const size_t head_block_start = is_head_major
-                                                        ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
-                                                        : (static_cast<size_t>(kv_h) * blocks_per_head);
-                    const size_t blk_off_bytes = head_block_start * block_bytes;
+                    // address formula as every native Q16 attention regime.
+                    const size_t blocks_per_head = q16_layout.blocks_per_head;
 
                     float block_scores[detail::kMaxKVTile];
 
-                    for (int q_pos = 0; q_pos < seq_len; ++q_pos)
+                    for (int q_pos = q_begin; q_pos < q_end; ++q_pos)
                     {
                         float *out = output + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
                         std::fill(out, out + head_dim, 0.0f);
@@ -4151,7 +5652,7 @@ namespace llaminar2
                         float running_m = -std::numeric_limits<float>::infinity();
                         float running_l = 0.0f;
 
-                        const float *q_ptr = Q + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+                        const float *q_ptr = query_head(q_pos, h);
                         const int q_abs = position_offset + q_pos;
 
                         // Quantize Q to int16 once per (head, q_pos)
@@ -4195,24 +5696,24 @@ namespace llaminar2
                                     // Fast path: 1 block per head
                                     if (k + 3 < valid_end)
                                     {
-                                        const uint8_t *b0 = k_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
-                                        const uint8_t *b1 = k_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
-                                        const uint8_t *b2 = k_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
-                                        const uint8_t *b3 = k_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+                                        const uint8_t *b0 = k_raw + q16_layout.blockIndex(k + 0, kv_h, 0) * block_bytes;
+                                        const uint8_t *b1 = k_raw + q16_layout.blockIndex(k + 1, kv_h, 0) * block_bytes;
+                                        const uint8_t *b2 = k_raw + q16_layout.blockIndex(k + 2, kv_h, 0) * block_bytes;
+                                        const uint8_t *b3 = k_raw + q16_layout.blockIndex(k + 3, kv_h, 0) * block_bytes;
 
                                         if (k + 7 < valid_end)
                                         {
                                             _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                             k_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
                                                          _MM_HINT_T0);
                                             _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                             k_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
                                                          _MM_HINT_T0);
                                             _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                             k_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
                                                          _MM_HINT_T0);
                                             _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                             k_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
                                                          _MM_HINT_T0);
                                         }
 
@@ -4247,7 +5748,7 @@ namespace llaminar2
                                     }
 
                                     // Scalar tail
-                                    const uint8_t *blk_s = k_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *blk_s = k_raw + q16_layout.blockIndex(k, kv_h, 0) * block_bytes;
                                     float kd;
                                     std::memcpy(&kd, blk_s, sizeof(float));
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
@@ -4263,7 +5764,7 @@ namespace llaminar2
                                     float s = 0.0f;
                                     for (size_t bi = 0; bi < blocks_per_head; ++bi)
                                     {
-                                        const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                        const size_t blk_idx = q16_layout.blockIndex(k, kv_h, bi);
                                         const uint8_t *blk_ptr = k_raw + blk_idx * block_bytes;
                                         float kd;
                                         std::memcpy(&kd, blk_ptr, sizeof(float));
@@ -4324,16 +5825,16 @@ namespace llaminar2
                                     if (k + 7 < valid_end)
                                     {
                                         _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
+                                                         v_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
                                                      _MM_HINT_T0);
                                         _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
+                                                         v_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
                                                      _MM_HINT_T0);
                                         _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
+                                                         v_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
                                                      _MM_HINT_T0);
                                         _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
+                                                         v_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
                                                      _MM_HINT_T0);
                                     }
 
@@ -4347,10 +5848,10 @@ namespace llaminar2
                                         pp[0], pp[1], pp[2], pp[3]);
                                     new_l += pp[0] + pp[1] + pp[2] + pp[3];
 
-                                    const uint8_t *vb0 = v_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *vb1 = v_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *vb2 = v_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *vb3 = v_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *vb0 = v_raw + q16_layout.blockIndex(k + 0, kv_h, 0) * block_bytes;
+                                    const uint8_t *vb1 = v_raw + q16_layout.blockIndex(k + 1, kv_h, 0) * block_bytes;
+                                    const uint8_t *vb2 = v_raw + q16_layout.blockIndex(k + 2, kv_h, 0) * block_bytes;
+                                    const uint8_t *vb3 = v_raw + q16_layout.blockIndex(k + 3, kv_h, 0) * block_bytes;
 
                                     float vd0, vd1, vd2, vd3;
                                     std::memcpy(&vd0, vb0, sizeof(float));
@@ -4372,7 +5873,7 @@ namespace llaminar2
                                 {
                                     const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
                                     new_l += p;
-                                    const uint8_t *blk_ptr = v_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
+                                    const uint8_t *blk_ptr = v_raw + q16_layout.blockIndex(k, kv_h, 0) * block_bytes;
                                     float vd;
                                     std::memcpy(&vd, blk_ptr, sizeof(float));
                                     accum_weighted_v_q16(out,
@@ -4382,14 +5883,14 @@ namespace llaminar2
                             }
                             else
                             {
-                                // Multi-block fallback
+                                // Native multi-block implementation.
                                 for (int k = valid_start; k < valid_end; ++k)
                                 {
                                     const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
                                     new_l += p;
                                     for (size_t bi = 0; bi < blocks_per_head; ++bi)
                                     {
-                                        const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
+                                        const size_t blk_idx = q16_layout.blockIndex(k, kv_h, bi);
                                         const uint8_t *blk_ptr = v_raw + blk_idx * block_bytes;
                                         float vd;
                                         std::memcpy(&vd, blk_ptr, sizeof(float));
@@ -4449,608 +5950,6 @@ namespace llaminar2
         }
 #endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
 
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
-        /**
-         * @brief Decode-only flash attention with Q16_1 KV cache (VNNI accelerated).
-         *
-         * Reads K and V directly from Q16_1Tensor block storage. The QK dot
-         * product uses VPDPWSSD (int16×int16→int32) against the block's qs[]
-         * array, with the query quantized on-the-fly to int16. The V phase
-         * loads int16 values, widens to FP32, and FMA-accumulates weighted
-         * by the softmax probability × block scale.
-         *
-         * Bandwidth savings: 2 bytes/element (int16 qs[]) + 8 bytes/block
-         * overhead vs 4 bytes/element for FP32. For head_dim=128 with BLOCK_128:
-         * 264 bytes/head vs 512 bytes FP32 = 48% bandwidth reduction.
-         *
-         * Only supports the decode path (seq_len == 1, kv_len >= 1).
-         */
-        static bool compute_decode_q16kv(
-            const float *Q,
-            const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
-            float *output,
-            int kv_len,
-            int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset,
-            int head_start = 0,
-            int gqa_n_rep = 0)
-        {
-            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
-
-            if (!Q || !K_q16 || !V_q16 || !output)
-                return false;
-            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
-                return false;
-            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
-                return false;
-
-            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
-            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-            // Q16_1 block layout: all blocks have {float d, int32_t sum_qs, int16_t qs[block_elems]}
-            // The qs offset is always 8 bytes from block start (sizeof(float) + sizeof(int32_t)).
-            const Q16BlockSize blk_size = K_q16->q16_block_size();
-            const size_t block_bytes = q16_block_size_bytes(blk_size);
-            const size_t block_elems = q16_block_size_elements(blk_size);
-            const size_t blocks_per_kv_row = K_q16->blocks_per_row();
-            constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
-
-            // Detect HEAD_MAJOR layout: Q16_1 KV caches store data as [head][pos][head_dim],
-            // where each row contains one head's data (blocks_per_row == blocks_per_head).
-            // POSITION_MAJOR stores [pos][all_heads] with blocks_per_row == n_kv_heads * blocks_per_head.
-            const size_t blocks_per_head_detect = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-            const bool is_head_major = (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
-            // For HEAD_MAJOR: number of physical rows allocated per head (max_seq_len)
-            const size_t rows_per_head = is_head_major
-                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
-                                             : 0;
-
-            // Raw byte data for direct block access (avoids block-size-templated dispatch)
-            const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
-            const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
-
-            if (!k_raw || !v_raw)
-                return false;
-
-            // KV tile size for decode
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
-                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
-
-            const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
-            // For VNNI QK: Q is quantized once per head to int16 (head_dim elements).
-            // qmax=2047 ≈ 12 effective bits, matching the existing I12 scheme.
-            constexpr int QMAX = 2047;
-
-            // =================================================================
-            // Split-KV parallelization (FlashDecoding-style)
-            //
-            // When n_heads << available threads, head-parallel attention wastes
-            // cores (e.g. 8 heads on 28 threads = 71% idle). Split-KV distributes
-            // KV chunks across surplus threads, then reduces partial online
-            // softmax states. Each (head, kv_chunk) pair is an independent work
-            // item. Q quantization is redundantly computed per-item (cheap: single
-            // row of head_dim int16s).
-            //
-            // Activation thresholds (conservative to avoid overhead on small KV):
-            //   - Thread utilization ≤50% (n_heads * 2 ≤ max_threads)
-            //   - Enough KV work per chunk (min 128 positions/chunk)
-            //   - KV length ≥ 512 to amortize scheduling + reduction overhead
-            // =================================================================
-            const int max_threads_avail = omp_get_max_threads();
-            const bool use_split_kv = (n_heads * 2 <= max_threads_avail) && (kv_len >= 512);
-
-            int kv_splits = 1;
-            int kv_chunk_size = kv_len;
-            int total_work_items = n_heads;
-            const int padded_hd = (head_dim + 15) & ~15; // 16-float aligned for AVX-512
-
-            // Persistent partial result storage — avoids per-call heap allocation.
-            // Safe: this static function is always called from the same executor
-            // thread (sequential stage execution), and OMP workers only access
-            // these via captured references inside the parallel region.
-            static std::vector<float> split_partial_out;
-            static std::vector<float> split_partial_m;
-            static std::vector<float> split_partial_l;
-
-            if (use_split_kv)
-            {
-                kv_splits = std::min(
-                    (max_threads_avail + n_heads - 1) / n_heads,
-                    std::max(1, kv_len / 128) // at least 128 KV positions per chunk
-                );
-                kv_chunk_size = (kv_len + kv_splits - 1) / kv_splits;
-                total_work_items = n_heads * kv_splits;
-
-                // Grow-only: avoid repeated alloc/dealloc across calls
-                const size_t out_need = static_cast<size_t>(total_work_items) * padded_hd;
-                if (split_partial_out.size() < out_need)
-                    split_partial_out.resize(out_need);
-                if (split_partial_m.size() < static_cast<size_t>(total_work_items))
-                    split_partial_m.resize(total_work_items);
-                if (split_partial_l.size() < static_cast<size_t>(total_work_items))
-                    split_partial_l.resize(total_work_items);
-                // No need to zero — each work item's std::fill and
-                // explicit writes to partial_m/partial_l handle initialization
-            }
-
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
-
-            auto work = [&]()
-            {
-                // Per-thread Q quantisation buffer
-                alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
-
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int item = 0; item < total_work_items; ++item)
-                {
-                    // Derive head index and KV range from work item
-                    const int h = use_split_kv ? (item / kv_splits) : item;
-                    const int kv_range_start = use_split_kv ? ((item % kv_splits) * kv_chunk_size) : 0;
-                    const int kv_range_end = use_split_kv
-                                                 ? std::min(kv_range_start + kv_chunk_size, kv_len)
-                                                 : kv_len;
-                    if (kv_range_start >= kv_len)
-                        continue;
-
-                    // GQA mapping: replicated KV uses global head position;
-                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
-                    const int kv_h = (gqa_n_rep > 0)
-                                         ? (head_start + h) / heads_per_kv
-                                         : h / heads_per_kv;
-
-                    // Output pointer: partial buffer for split-KV, direct output otherwise
-                    float *out;
-                    if (use_split_kv)
-                    {
-                        out = split_partial_out.data() + static_cast<size_t>(item) * padded_hd;
-                    }
-                    else
-                    {
-                        out = output + static_cast<size_t>(h) * head_dim;
-                    }
-                    std::fill(out, out + head_dim, 0.0f);
-
-                    float running_m = -std::numeric_limits<float>::infinity();
-                    float running_l = 0.0f;
-
-                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
-                    const int q_abs = position_offset;
-
-                    // Quantize Q to int16 once per head
-                    const float q_scale = quantize_row_i16_i12(
-                        q_ptr, q_i16_buf, head_dim, QMAX);
-
-                    // Precompute combined scale: q_scale * (1/√d)
-                    // This saves one multiply per QK score reconstruction.
-                    const float qk_combined_scale = q_scale * scale;
-
-                    // Hoist per-head block layout invariants outside the tile loop
-                    const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-                    const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
-                    // HEAD_MAJOR: head data at offset kv_h * rows_per_head * row_stride
-                    // POSITION_MAJOR: head data at offset kv_h * blocks_per_head * block_bytes within each row
-                    const size_t blk_off_bytes = is_head_major
-                                                     ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head * block_bytes)
-                                                     : (static_cast<size_t>(kv_h) * blocks_per_head * block_bytes);
-                    const size_t head_block_start = is_head_major
-                                                        ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
-                                                        : (static_cast<size_t>(kv_h) * blocks_per_head);
-
-                    float block_scores[detail::kMaxKVTile];
-
-                    for (int k0 = kv_range_start; k0 < kv_range_end; k0 += kv_tile)
-                    {
-                        const int k1 = std::min(k0 + kv_tile, kv_range_end);
-                        float block_max = -std::numeric_limits<float>::infinity();
-
-                        const int blk = k1 - k0;
-
-                        // Valid window for causal masking
-                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
-                        valid_end = std::max(k0, std::min(valid_end, k1));
-
-                        // Fill masked positions
-                        for (int k = valid_end; k < k1; ++k)
-                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
-
-                        const auto qk_start = profiling_enabled
-                                                  ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point();
-
-                        // --- QK Phase: VNNI int16 dot products ---
-
-                        for (int k = k0; k < valid_end;)
-                        {
-                            if (blocks_per_head == 1)
-                            {
-                                // Fast path: 1 block per head — qs[] is contiguous head_dim int16s
-                                if (k + 3 < valid_end)
-                                {
-                                    const uint8_t *b0 = k_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *b1 = k_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *b2 = k_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
-                                    const uint8_t *b3 = k_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
-
-                                    // Prefetch next 4 K blocks (stride is too large for HW prefetcher)
-                                    if (k + 7 < valid_end)
-                                    {
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         k_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         k_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         k_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         k_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
-                                                     _MM_HINT_T0);
-                                    }
-
-                                    // Get K block scales (float d at offset 0 of each block)
-                                    float kd0, kd1, kd2, kd3;
-                                    std::memcpy(&kd0, b0, sizeof(float));
-                                    std::memcpy(&kd1, b1, sizeof(float));
-                                    std::memcpy(&kd2, b2, sizeof(float));
-                                    std::memcpy(&kd3, b3, sizeof(float));
-
-                                    // Get qs[] pointers (at QS_OFFSET into each block)
-                                    const int16_t *k_qs0 = reinterpret_cast<const int16_t *>(b0 + QS_OFFSET);
-                                    const int16_t *k_qs1 = reinterpret_cast<const int16_t *>(b1 + QS_OFFSET);
-                                    const int16_t *k_qs2 = reinterpret_cast<const int16_t *>(b2 + QS_OFFSET);
-                                    const int16_t *k_qs3 = reinterpret_cast<const int16_t *>(b3 + QS_OFFSET);
-
-                                    int32_t dot0, dot1, dot2, dot3;
-                                    dot_i16_i16_i32_vnni_4row(
-                                        q_i16_buf, k_qs0, k_qs1, k_qs2, k_qs3,
-                                        head_dim, dot0, dot1, dot2, dot3);
-
-                                    // Score: int_dot * (q_scale / √d) * k_scale
-                                    float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
-                                    float s1 = static_cast<float>(dot1) * qk_combined_scale * kd1;
-                                    float s2 = static_cast<float>(dot2) * qk_combined_scale * kd2;
-                                    float s3 = static_cast<float>(dot3) * qk_combined_scale * kd3;
-
-                                    block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
-                                    block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
-                                    block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
-                                    block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
-                                    block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
-                                    k += 4;
-                                    continue;
-                                }
-
-                                // Scalar tail: 1 row at a time
-                                const uint8_t *blk_s = k_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
-                                float kd;
-                                std::memcpy(&kd, blk_s, sizeof(float));
-                                const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim);
-                                float s = static_cast<float>(dot) * qk_combined_scale * kd;
-                                block_scores[static_cast<size_t>(k - k0)] = s;
-                                block_max = std::max(block_max, s);
-                                ++k;
-                            }
-                            else
-                            {
-                                // Multi-block-per-head fallback: accumulate across blocks
-                                float s = 0.0f;
-                                for (size_t bi = 0; bi < blocks_per_head; ++bi)
-                                {
-                                    const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
-                                    const uint8_t *blk_ptr = k_raw + blk_idx * block_bytes;
-                                    float kd;
-                                    std::memcpy(&kd, blk_ptr, sizeof(float));
-                                    const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
-                                    const int elem_count = static_cast<int>(
-                                        std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
-                                    int32_t dot = dot_i16_i16_i32(
-                                        q_i16_buf + bi * block_elems, k_qs, elem_count);
-                                    s += static_cast<float>(dot) * q_scale * kd;
-                                }
-                                s *= scale;
-                                block_scores[static_cast<size_t>(k - k0)] = s;
-                                block_max = std::max(block_max, s);
-                                ++k;
-                            }
-                        }
-
-                        if (profiling_enabled)
-                            qk_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - qk_start)
-                                    .count());
-
-                        // --- Online softmax correction ---
-                        const float new_m = std::max(running_m, block_max);
-                        const float alpha = std::isfinite(running_m)
-                                                ? std::exp(running_m - new_m)
-                                                : 0.0f;
-                        {
-                            // Scale output: out[d] *= alpha (inline to avoid F16C guard dep)
-#if defined(__AVX512F__)
-                            const __m512 va = _mm512_set1_ps(alpha);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= alpha;
-#else
-                            const __m256 va = _mm256_set1_ps(alpha);
-                            int sd = 0;
-                            for (; sd + 7 < head_dim; sd += 8)
-                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(va, _mm256_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= alpha;
-#endif
-                        }
-                        float new_l = running_l * alpha;
-
-                        // --- V Phase: Q16_1 V weighted accumulation ---
-                        const auto v_start = profiling_enabled
-                                                 ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point();
-
-                        if (blocks_per_head == 1)
-                        {
-                            // Fast path: 4-wide batched V accumulation
-                            // Positions in [k0, valid_end) are guaranteed finite (computed in QK).
-                            // Positions in [valid_end, k1) are -inf (masked) — skip them.
-                            int k = k0;
-                            for (; k + 3 < valid_end; k += 4)
-                            {
-                                // Prefetch next 4 V blocks
-                                if (k + 7 < valid_end)
-                                {
-                                    _mm_prefetch(reinterpret_cast<const char *>(
-                                                     v_raw + static_cast<size_t>(k + 4) * row_stride_bytes + blk_off_bytes),
-                                                 _MM_HINT_T0);
-                                    _mm_prefetch(reinterpret_cast<const char *>(
-                                                     v_raw + static_cast<size_t>(k + 5) * row_stride_bytes + blk_off_bytes),
-                                                 _MM_HINT_T0);
-                                    _mm_prefetch(reinterpret_cast<const char *>(
-                                                     v_raw + static_cast<size_t>(k + 6) * row_stride_bytes + blk_off_bytes),
-                                                 _MM_HINT_T0);
-                                    _mm_prefetch(reinterpret_cast<const char *>(
-                                                     v_raw + static_cast<size_t>(k + 7) * row_stride_bytes + blk_off_bytes),
-                                                 _MM_HINT_T0);
-                                }
-
-                                alignas(16) float pp[4];
-                                batch_exp_4(
-                                    block_scores[static_cast<size_t>(k - k0 + 0)],
-                                    block_scores[static_cast<size_t>(k - k0 + 1)],
-                                    block_scores[static_cast<size_t>(k - k0 + 2)],
-                                    block_scores[static_cast<size_t>(k - k0 + 3)],
-                                    new_m,
-                                    pp[0], pp[1], pp[2], pp[3]);
-                                const float p0 = pp[0], p1 = pp[1], p2 = pp[2], p3 = pp[3];
-                                new_l += p0 + p1 + p2 + p3;
-
-                                const uint8_t *vb0 = v_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
-                                const uint8_t *vb1 = v_raw + static_cast<size_t>(k + 1) * row_stride_bytes + blk_off_bytes;
-                                const uint8_t *vb2 = v_raw + static_cast<size_t>(k + 2) * row_stride_bytes + blk_off_bytes;
-                                const uint8_t *vb3 = v_raw + static_cast<size_t>(k + 3) * row_stride_bytes + blk_off_bytes;
-
-                                float vd0, vd1, vd2, vd3;
-                                std::memcpy(&vd0, vb0, sizeof(float));
-                                std::memcpy(&vd1, vb1, sizeof(float));
-                                std::memcpy(&vd2, vb2, sizeof(float));
-                                std::memcpy(&vd3, vb3, sizeof(float));
-
-                                accum_weighted_v_q16_4row(
-                                    out,
-                                    reinterpret_cast<const int16_t *>(vb0 + QS_OFFSET), p0 * vd0,
-                                    reinterpret_cast<const int16_t *>(vb1 + QS_OFFSET), p1 * vd1,
-                                    reinterpret_cast<const int16_t *>(vb2 + QS_OFFSET), p2 * vd2,
-                                    reinterpret_cast<const int16_t *>(vb3 + QS_OFFSET), p3 * vd3,
-                                    head_dim);
-                            }
-
-                            // Scalar tail: remaining valid positions
-                            for (; k < valid_end; ++k)
-                            {
-                                const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
-                                new_l += p;
-                                const uint8_t *blk_ptr = v_raw + static_cast<size_t>(k) * row_stride_bytes + blk_off_bytes;
-                                float vd;
-                                std::memcpy(&vd, blk_ptr, sizeof(float));
-                                accum_weighted_v_q16(out,
-                                                     reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET),
-                                                     p * vd, head_dim);
-                            }
-                            // Positions [valid_end, k1) are masked — no V accumulation needed
-                        }
-                        else
-                        {
-                            // Multi-block fallback (unchanged)
-                            for (int k = k0; k < k1; ++k)
-                            {
-                                const float s = block_scores[static_cast<size_t>(k - k0)];
-                                if (!std::isfinite(s))
-                                    continue;
-                                const float p = std::exp(s - new_m);
-                                new_l += p;
-
-                                for (size_t bi = 0; bi < blocks_per_head; ++bi)
-                                {
-                                    const size_t blk_idx = static_cast<size_t>(k) * blocks_per_kv_row + head_block_start + bi;
-                                    const uint8_t *blk_ptr = v_raw + blk_idx * block_bytes;
-                                    float vd;
-                                    std::memcpy(&vd, blk_ptr, sizeof(float));
-                                    const int16_t *v_qs = reinterpret_cast<const int16_t *>(blk_ptr + QS_OFFSET);
-                                    const int elem_count = static_cast<int>(
-                                        std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
-                                    accum_weighted_v_q16(
-                                        out + bi * block_elems, v_qs, p * vd, elem_count);
-                                }
-                            }
-                        }
-
-                        if (profiling_enabled)
-                            v_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - v_start)
-                                    .count());
-
-                        running_m = new_m;
-                        running_l = new_l;
-                    } // end KV tile loop
-
-                    if (use_split_kv)
-                    {
-                        // Store partial online softmax state for reduction
-                        split_partial_m[item] = running_m;
-                        split_partial_l[item] = running_l;
-                        // out (partial buffer) already accumulated
-                    }
-                    else
-                    {
-                        // Final normalisation (original head-parallel path)
-                        if (running_l > 0.0f)
-                        {
-                            const float inv_l = 1.0f / running_l;
-#if defined(__AVX512F__)
-                            const __m512 vi = _mm512_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#else
-                            const __m256 vi = _mm256_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 7 < head_dim; sd += 8)
-                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#endif
-                        }
-                    }
-                } // end item loop
-
-                // =============================================================
-                // Split-KV reduction: merge partial online softmax per head
-                //
-                // For each head, we have kv_splits partial results with:
-                //   partial_m[i] = max score seen in chunk i
-                //   partial_l[i] = sum of exp(score - partial_m[i]) in chunk i
-                //   partial_out[i][d] = sum of exp(score_k - partial_m[i]) * V_k[d]
-                //
-                // To merge: global_m = max(partial_m), then rescale each chunk's
-                // contribution by exp(partial_m[i] - global_m) before summing.
-                // =============================================================
-                if (use_split_kv)
-                {
-                    // implicit barrier from the omp for above ensures all partials are written
-
-#pragma omp for schedule(static)
-                    for (int rh = 0; rh < n_heads; ++rh)
-                    {
-                        float *final_out = output + static_cast<size_t>(rh) * head_dim;
-
-                        // Pass 1: find global max across all splits for this head
-                        float global_m = -std::numeric_limits<float>::infinity();
-                        for (int s = 0; s < kv_splits; ++s)
-                        {
-                            const int idx = rh * kv_splits + s;
-                            if (idx < total_work_items && split_partial_m[idx] > global_m)
-                                global_m = split_partial_m[idx];
-                        }
-
-                        // Pass 2: merge with online softmax correction
-                        std::fill(final_out, final_out + head_dim, 0.0f);
-                        float global_l = 0.0f;
-
-                        for (int s = 0; s < kv_splits; ++s)
-                        {
-                            const int idx = rh * kv_splits + s;
-                            if (idx >= total_work_items || split_partial_l[idx] == 0.0f)
-                                continue;
-
-                            const float correction = std::exp(split_partial_m[idx] - global_m);
-                            global_l += split_partial_l[idx] * correction;
-
-                            const float *pout = split_partial_out.data() +
-                                                static_cast<size_t>(idx) * padded_hd;
-
-                            // Vectorized FMA: final_out[d] += correction * pout[d]
-#if defined(__AVX512F__)
-                            const __m512 vc = _mm512_set1_ps(correction);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(final_out + sd,
-                                                 _mm512_fmadd_ps(vc,
-                                                                 _mm512_loadu_ps(pout + sd),
-                                                                 _mm512_loadu_ps(final_out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                final_out[sd] += correction * pout[sd];
-#else
-                            for (int sd = 0; sd < head_dim; ++sd)
-                                final_out[sd] += correction * pout[sd];
-#endif
-                        }
-
-                        // Final normalization
-                        if (global_l > 0.0f)
-                        {
-                            const float inv_l = 1.0f / global_l;
-#if defined(__AVX512F__)
-                            const __m512 vi = _mm512_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(final_out + sd,
-                                                 _mm512_mul_ps(vi, _mm512_loadu_ps(final_out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                final_out[sd] *= inv_l;
-#else
-                            const __m256 vi = _mm256_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 7 < head_dim; sd += 8)
-                                _mm256_storeu_ps(final_out + sd,
-                                                 _mm256_mul_ps(vi, _mm256_loadu_ps(final_out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                final_out[sd] *= inv_l;
-#endif
-                        }
-                    } // end reduction loop
-                }     // end split-KV reduction
-            };
-
-            // Threading strategy:
-            // - Split-KV: always use full thread pool (that's the whole point)
-            // - Large KV (>100): use full pool for head-parallel
-            // - Small KV: use computeOptimalAttentionThreads() cap
-            const bool force_full_pool_q16 = kv_len > 100 || use_split_kv;
-
-            int actual_threads_q16;
-            if (force_full_pool_q16)
-            {
-                OMP_WORKSHARE_REGION(work);
-                actual_threads_q16 = omp_get_max_threads();
-            }
-            else
-            {
-#pragma omp parallel num_threads(attn_threads)
-                {
-                    work();
-                }
-                actual_threads_q16 = attn_threads;
-            }
-
-            if (profiling_enabled)
-            {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_q16);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_q16);
-            }
-            return true;
-        }
-#endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
 
         // =================================================================
         // Q8_1 inline-dequant helpers for fused attention
@@ -5093,7 +5992,7 @@ namespace llaminar2
 
             return _mm512_reduce_add_ps(prod1);
 #else
-            const float k_scale = _cvtsh_ss(k_block->d);
+            const float k_scale = fp16_to_fp32(k_block->d);
             float dot = 0.0f;
             for (int i = 0; i < 32; ++i)
                 dot += q_fp32[i] * (static_cast<float>(k_block->qs[i]) * k_scale);
@@ -5133,7 +6032,7 @@ namespace llaminar2
             _mm512_storeu_ps(out, o0);
             _mm512_storeu_ps(out + 16, o1);
 #else
-            const float v_scale = _cvtsh_ss(v_block->d);
+            const float v_scale = fp16_to_fp32(v_block->d);
             const float combined = weight * v_scale;
             for (int i = 0; i < 32; ++i)
                 out[i] += combined * static_cast<float>(v_block->qs[i]);
@@ -5141,7 +6040,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Decode-only flash attention with Q8_1 KV cache (no FP32 shadow buffers).
+         * @brief Native Q8_1 flash attention for every positive query-row count.
          *
          * Reads K and V directly as Q8_1 blocks, performing inline int8→float
          * dequantization in the dot product and V accumulation inner loops.
@@ -5150,24 +6049,35 @@ namespace llaminar2
          * Layout support: POSITION_MAJOR [pos][n_kv_heads * blocks_per_head]
          * and HEAD_MAJOR [head][pos][blocks_per_head].
          */
-        static bool compute_decode_q8kv(
+        bool compute_q8kv(
             const float *Q,
             const Q8_1Tensor *K_q8, const Q8_1Tensor *V_q8,
             float *output,
-            int kv_len,
+            int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset,
+            bool causal, int window_size, int position_offset,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
             if (!Q || !K_q8 || !V_q8 || !output)
                 return false;
-            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+            if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 ||
+                n_kv_heads <= 0 || head_dim <= 0)
                 return false;
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
+            if (!kv_logical_view.validFor(kv_len))
+                return false;
+
+            const auto physical_kv_row = [&](int logical_row) -> std::size_t
+            {
+                return static_cast<std::size_t>(
+                    kv_logical_view.physicalRow(logical_row));
+            };
 
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -5191,410 +6101,473 @@ namespace llaminar2
             const size_t rows_per_head = is_head_major
                                              ? (K_q8->shape()[0] / static_cast<size_t>(n_kv_heads))
                                              : 0;
-
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
-                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
-
-            const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
-
-            auto work = [&]()
+            const std::size_t physical_rows = is_head_major
+                                                  ? rows_per_head
+                                                  : K_q8->shape()[0];
+            if (!kv_logical_view.isContiguous() &&
+                static_cast<std::size_t>(
+                    kv_logical_view.physical_row_capacity) != physical_rows)
             {
-                float block_scores[detail::kMaxKVTile];
+                return false;
+            }
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    // GQA mapping: replicated KV uses global head position;
-                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
-                    const int kv_h = (gqa_n_rep > 0)
-                                         ? (head_start + h) / heads_per_kv
-                                         : h / heads_per_kv;
-                    float *out = output + static_cast<size_t>(h) * head_dim;
-                    std::fill(out, out + head_dim, 0.0f);
+            const std::size_t q8_head_row_bytes =
+                blocks_per_head * sizeof(Q8_1Block);
+            const int kv_tile = detail::selectCPUFlashKVTile(
+                cpu::fa2_policy::CPUFA2KVStoragePair::Q8_1,
+                head_dim,
+                kv_len,
+                q8_head_row_bytes,
+                q8_head_row_bytes,
+                launch_policy_.explicit_kv_tile);
 
-                    float running_m = -std::numeric_limits<float>::infinity();
-                    float running_l = 0.0f;
-
-                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
-                    const int q_abs = position_offset;
-
-                    // Per-head block layout
-                    // HEAD_MAJOR:     head data at block offset [kv_h * rows_per_head * blocks_per_head + pos * blocks_per_head]
-                    // POSITION_MAJOR: head data at block offset [pos * blocks_per_kv_row + kv_h * blocks_per_head]
-                    const size_t head_base = is_head_major
-                                                 ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
-                                                 : (static_cast<size_t>(kv_h) * blocks_per_head);
-
-                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
-                    {
-                        const int k1 = std::min(k0 + kv_tile, kv_len);
-                        float block_max = -std::numeric_limits<float>::infinity();
-
-                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
-                        valid_end = std::max(k0, std::min(valid_end, k1));
-
-                        for (int k = valid_end; k < k1; ++k)
-                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
-
-                        const auto qk_start = profiling_enabled
-                                                  ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point();
-
-                        // --- QK Phase: inline int8→float dequant + FP32 dot ---
-                        for (int k = k0; k < valid_end; ++k)
-                        {
-                            float dot = 0.0f;
-                            for (size_t bi = 0; bi < blocks_per_head; ++bi)
-                            {
-                                const size_t blk_idx = is_head_major
-                                                           ? (head_base + static_cast<size_t>(k) * blocks_per_head + bi)
-                                                           : (static_cast<size_t>(k) * blocks_per_kv_row + head_base + bi);
-                                dot += dot_q_fp32_k_q8_1_block(
-                                    q_ptr + bi * BLOCK_SIZE,
-                                    &k_blocks[blk_idx]);
-                            }
-                            const float s = dot * scale;
-                            block_scores[static_cast<size_t>(k - k0)] = s;
-                            block_max = std::max(block_max, s);
-
-                            // Prefetch next K position
-                            if (k + 1 < valid_end)
-                            {
-                                const size_t next_idx = is_head_major
-                                                            ? (head_base + static_cast<size_t>(k + 1) * blocks_per_head)
-                                                            : (static_cast<size_t>(k + 1) * blocks_per_kv_row + head_base);
-                                _mm_prefetch(reinterpret_cast<const char *>(&k_blocks[next_idx]),
-                                             _MM_HINT_T0);
-                            }
-                        }
-
-                        if (profiling_enabled)
-                            qk_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - qk_start)
-                                    .count());
-
-                        // --- Online softmax correction ---
-                        const float new_m = std::max(running_m, block_max);
-                        const float alpha = std::isfinite(running_m)
-                                                ? std::exp(running_m - new_m)
-                                                : 0.0f;
-                        scale_vec(out, alpha, head_dim, cpu_supports_avx512());
-                        float new_l = running_l * alpha;
-
-                        // --- V Phase: inline int8→float dequant + weighted accumulation ---
-                        const auto v_start = profiling_enabled
-                                                 ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point();
-
-                        for (int k = k0; k < valid_end; ++k)
-                        {
-                            const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
-                            new_l += p;
-
-                            for (size_t bi = 0; bi < blocks_per_head; ++bi)
-                            {
-                                const size_t blk_idx = is_head_major
-                                                           ? (head_base + static_cast<size_t>(k) * blocks_per_head + bi)
-                                                           : (static_cast<size_t>(k) * blocks_per_kv_row + head_base + bi);
-                                accum_weighted_v_q8_1_block(
-                                    out + bi * BLOCK_SIZE,
-                                    &v_blocks[blk_idx],
-                                    p);
-                            }
-
-                            // Prefetch next V position
-                            if (k + 1 < valid_end)
-                            {
-                                const size_t next_idx = is_head_major
-                                                            ? (head_base + static_cast<size_t>(k + 1) * blocks_per_head)
-                                                            : (static_cast<size_t>(k + 1) * blocks_per_kv_row + head_base);
-                                _mm_prefetch(reinterpret_cast<const char *>(&v_blocks[next_idx]),
-                                             _MM_HINT_T0);
-                            }
-                        }
-
-                        if (profiling_enabled)
-                            v_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - v_start)
-                                    .count());
-
-                        running_m = new_m;
-                        running_l = new_l;
-                    } // end KV tile loop
-
-                    // Final normalisation
-                    if (running_l > 0.0f)
-                    {
-                        const float inv_l = 1.0f / running_l;
-                        scale_vec(out, inv_l, head_dim, cpu_supports_avx512());
-                    }
-                } // end head loop
+            /** Per-worker immutable addresses for one Q8 attention row. */
+            struct Q8RowScratch
+            {
+                const float *query = nullptr;
+                std::size_t head_base = 0;
             };
 
-            const bool force_full_pool = kv_len > 100;
-            int actual_threads;
-            if (force_full_pool)
+            const auto prepare_row = [&](int row, Q8RowScratch &scratch)
             {
-                OMP_WORKSHARE_REGION(work);
-                actual_threads = omp_get_max_threads();
-            }
-            else
-            {
-#pragma omp parallel num_threads(attn_threads)
-                {
-                    work();
-                }
-                actual_threads = attn_threads;
-            }
+                const int query_position = row / n_heads;
+                const int h = row % n_heads;
+                const int kv_h = (gqa_n_rep > 0)
+                                     ? (head_start + h) / heads_per_kv
+                                     : h / heads_per_kv;
+                scratch.query =
+                    Q + static_cast<std::size_t>(query_position) *
+                            n_heads * head_dim +
+                    static_cast<std::size_t>(h) * head_dim;
+                scratch.head_base = is_head_major
+                                        ? static_cast<std::size_t>(kv_h) *
+                                              rows_per_head * blocks_per_head
+                                        : static_cast<std::size_t>(kv_h) *
+                                              blocks_per_head;
+            };
 
-            if (profiling_enabled)
+            const auto visible_tile = [&](int row,
+                                          int tile_begin,
+                                          int tile_end)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
-            }
-            return true;
+                const int absolute_position =
+                    position_offset + row / n_heads;
+                int visible_begin = tile_begin;
+                if (window_size > 0)
+                {
+                    visible_begin = std::max(
+                        visible_begin,
+                        absolute_position - window_size + 1);
+                }
+                const int visible_end = causal
+                                            ? std::min(
+                                                  tile_end,
+                                                  absolute_position + 1)
+                                            : tile_end;
+                return CPUFA2VisibleTile{
+                    .begin = std::max(
+                        tile_begin,
+                        std::min(visible_begin, tile_end)),
+                    .end = std::max(
+                        tile_begin,
+                        std::min(visible_end, tile_end)),
+                };
+            };
+
+            const auto score_tile = [&](int,
+                                        const Q8RowScratch &scratch,
+                                        int tile_begin,
+                                        CPUFA2VisibleTile visible,
+                                        float *scores,
+                                        float &block_max)
+            {
+                for (int kv_row = visible.begin;
+                     kv_row < visible.end;
+                     ++kv_row)
+                {
+                    float dot = 0.0f;
+                    for (std::size_t block = 0;
+                         block < blocks_per_head;
+                         ++block)
+                    {
+                        const std::size_t block_index = is_head_major
+                                                            ? scratch.head_base +
+                                                                  physical_kv_row(kv_row) *
+                                                                      blocks_per_head +
+                                                                  block
+                                                            : physical_kv_row(kv_row) *
+                                                                      blocks_per_kv_row +
+                                                                  scratch.head_base +
+                                                                  block;
+                        dot += dot_q_fp32_k_q8_1_block(
+                            scratch.query + block * BLOCK_SIZE,
+                            &k_blocks[block_index]);
+                    }
+                    const float score = dot * scale;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin)] =
+                        score;
+                    block_max = std::max(block_max, score);
+
+                    if (kv_row + 1 < visible.end)
+                    {
+                        const std::size_t next_index = is_head_major
+                                                           ? scratch.head_base +
+                                                                 physical_kv_row(kv_row + 1) *
+                                                                     blocks_per_head
+                                                           : physical_kv_row(kv_row + 1) *
+                                                                     blocks_per_kv_row +
+                                                                 scratch.head_base;
+                        _mm_prefetch(
+                            reinterpret_cast<const char *>(
+                                &k_blocks[next_index]),
+                            _MM_HINT_T0);
+                    }
+                }
+            };
+
+            const auto accumulate_tile = [&](int,
+                                             const Q8RowScratch &scratch,
+                                             int tile_begin,
+                                             CPUFA2VisibleTile visible,
+                                             const float *scores,
+                                             float new_m,
+                                             float *partial,
+                                             float &new_l)
+            {
+                for (int kv_row = visible.begin;
+                     kv_row < visible.end;
+                     ++kv_row)
+                {
+                    const float probability = std::exp(
+                        scores[static_cast<std::size_t>(kv_row - tile_begin)] -
+                        new_m);
+                    new_l += probability;
+                    for (std::size_t block = 0;
+                         block < blocks_per_head;
+                         ++block)
+                    {
+                        const std::size_t block_index = is_head_major
+                                                            ? scratch.head_base +
+                                                                  physical_kv_row(kv_row) *
+                                                                      blocks_per_head +
+                                                                  block
+                                                            : physical_kv_row(kv_row) *
+                                                                      blocks_per_kv_row +
+                                                                  scratch.head_base +
+                                                                  block;
+                        accum_weighted_v_q8_1_block(
+                            partial + block * BLOCK_SIZE,
+                            &v_blocks[block_index],
+                            probability);
+                    }
+
+                    if (kv_row + 1 < visible.end)
+                    {
+                        const std::size_t next_index = is_head_major
+                                                           ? scratch.head_base +
+                                                                 physical_kv_row(kv_row + 1) *
+                                                                     blocks_per_head
+                                                           : physical_kv_row(kv_row + 1) *
+                                                                     blocks_per_kv_row +
+                                                                 scratch.head_base;
+                        _mm_prefetch(
+                            reinterpret_cast<const char *>(
+                                &v_blocks[next_index]),
+                            _MM_HINT_T0);
+                    }
+                }
+            };
+
+            const auto finalize_row = [&](int row,
+                                          float *merged,
+                                          float merged_l)
+            {
+                if (merged_l > 0.0f)
+                {
+                    scale_vec(
+                        merged,
+                        1.0f / merged_l,
+                        head_dim,
+                        activeISALevel() == ISALevel::AVX512);
+                }
+                std::memcpy(
+                    output + static_cast<std::size_t>(row / n_heads) *
+                                     n_heads * head_dim +
+                        static_cast<std::size_t>(row % n_heads) * head_dim,
+                    merged,
+                    static_cast<std::size_t>(head_dim) * sizeof(float));
+            };
+
+            return executePartitionedAttention<Q8RowScratch>(
+                seq_len,
+                n_heads,
+                kv_len,
+                head_dim,
+                kv_tile,
+                causal,
+                execution_policy,
+                prepare_row,
+                visible_tile,
+                score_tile,
+                accumulate_tile,
+                finalize_row);
         }
 
-#if defined(__AVX512F__) && defined(__F16C__)
         /**
-         * @brief Decode-only flash attention with FP16 KV cache (no FP32 copy).
+         * @brief Native FP16/BF16 attention for every positive query-row count.
          *
-         * Reads K and V directly as FP16, converting to FP32 on the fly in the
-         * dot product and V accumulation inner loops. This halves KV memory
-         * bandwidth and eliminates the need for persistent FP32 KV buffers,
-         * reducing DRAM bank disturbance that causes GEMM throughput degradation
-         * at long context (>300 tokens).
+         * Reads K and V directly in their two-byte storage format and converts
+         * each vector register in place. The direct path is available to AVX2,
+         * AVX-512, and scalar builds; no ISA configuration is permitted to
+         * materialize a persistent FP32 cache as an execution substitute.
          *
-         * Only supports the decode path (seq_len == 1, kv_len >= 1).
+         * @tparam Format Native FP16 or BF16 bit interpretation.
          */
-        static bool compute_decode_fp16kv(
+        template <Native16BitKVFormat Format>
+        bool compute_native16kv(
             const float *Q,
-            const uint16_t *K_fp16, const uint16_t *V_fp16,
+            const uint16_t *K_native, const uint16_t *V_native,
             float *output,
-            int kv_len,
+            int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset,
+            bool causal, int window_size, int position_offset,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
-            if (!Q || !K_fp16 || !V_fp16 || !output)
+            if (!Q || !K_native || !V_native || !output)
                 return false;
-            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+            if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 ||
+                n_kv_heads <= 0 || head_dim <= 0)
                 return false;
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
+            if (!kv_logical_view.validFor(kv_len))
+                return false;
+
+            const auto physical_kv_row = [&](int logical_row) -> std::size_t
+            {
+                return static_cast<std::size_t>(
+                    kv_logical_view.physicalRow(logical_row));
+            };
 
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
             const int q_stride = n_heads * head_dim;
             const int kv_stride = n_kv_heads * head_dim;
 
-            // KV tile size for decode
-            const bool is_decode = true;
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
-                head_dim, n_kv_heads, kv_len, is_decode);
+            const std::size_t native_head_row_bytes =
+                static_cast<std::size_t>(head_dim) * sizeof(std::uint16_t);
+            constexpr auto storage_pair =
+                Format == Native16BitKVFormat::FP16
+                    ? cpu::fa2_policy::CPUFA2KVStoragePair::FP16
+                    : cpu::fa2_policy::CPUFA2KVStoragePair::BF16;
+            const int kv_tile = detail::selectCPUFlashKVTile(
+                storage_pair,
+                head_dim,
+                kv_len,
+                native_head_row_bytes,
+                native_head_row_bytes,
+                launch_policy_.explicit_kv_tile);
 
-            const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
-
-            auto work = [&]()
+            /** Per-worker immutable addresses for one native 16-bit row. */
+            struct Native16BitRowScratch
             {
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    // GQA mapping: replicated KV uses global head position;
-                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
-                    const int kv_h = (gqa_n_rep > 0)
-                                         ? (head_start + h) / heads_per_kv
-                                         : h / heads_per_kv;
-                    float *out = output + static_cast<size_t>(h) * head_dim;
-                    std::fill(out, out + head_dim, 0.0f);
-
-                    float running_m = -std::numeric_limits<float>::infinity();
-                    float running_l = 0.0f;
-
-                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
-                    const int q_abs = position_offset;
-
-                    float block_scores[detail::kMaxKVTile];
-
-                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
-                    {
-                        const int k1 = std::min(k0 + kv_tile, kv_len);
-                        float block_max = -std::numeric_limits<float>::infinity();
-
-                        const int blk = k1 - k0;
-
-                        // Valid window for causal masking
-                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
-                        valid_end = std::max(k0, std::min(valid_end, k1));
-
-                        // Fill masked positions
-                        for (int k = valid_end; k < k1; ++k)
-                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
-
-                        const auto qk_start = profiling_enabled
-                                                  ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point();
-
-                        // --- QK Phase: FP16 K dot products ---
-                        for (int k = k0; k < valid_end;)
-                        {
-                            const uint16_t *kbase = K_fp16 + static_cast<size_t>(kv_h) * head_dim;
-
-                            if (k + 3 < valid_end)
-                            {
-                                float s0, s1, s2, s3;
-                                dot_fp16_avx512_4row(
-                                    q_ptr,
-                                    kbase + static_cast<size_t>(k + 0) * kv_stride,
-                                    kbase + static_cast<size_t>(k + 1) * kv_stride,
-                                    kbase + static_cast<size_t>(k + 2) * kv_stride,
-                                    kbase + static_cast<size_t>(k + 3) * kv_stride,
-                                    head_dim, s0, s1, s2, s3);
-                                s0 *= scale;
-                                s1 *= scale;
-                                s2 *= scale;
-                                s3 *= scale;
-                                block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
-                                block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
-                                block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
-                                block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
-                                block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
-                                k += 4;
-                                continue;
-                            }
-
-                            float s = dot_fp16_avx512(
-                                q_ptr,
-                                K_fp16 + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
-                                head_dim);
-                            s *= scale;
-                            block_scores[static_cast<size_t>(k - k0)] = s;
-                            block_max = std::max(block_max, s);
-                            ++k;
-                        }
-
-                        if (profiling_enabled)
-                            qk_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - qk_start)
-                                    .count());
-
-                        // --- Online softmax correction ---
-                        const float new_m = std::max(running_m, block_max);
-                        const float alpha = std::isfinite(running_m)
-                                                ? std::exp(running_m - new_m)
-                                                : 0.0f;
-                        scale_vec_fp16path(out, alpha, head_dim);
-                        float new_l = running_l * alpha;
-
-                        // --- V Phase: FP16 V weighted accumulation ---
-                        // Iterate [k0, valid_end) — all positions are guaranteed finite.
-                        // Positions [valid_end, k1) are masked to -inf — skip them.
-                        const auto v_start = profiling_enabled
-                                                 ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point();
-
-                        {
-                            const uint16_t *v_base = V_fp16 + static_cast<size_t>(kv_h) * head_dim;
-                            int k = k0;
-                            // 4-wide batched: vectorized exp + batched FP16 V accumulation
-                            for (; k + 3 < valid_end; k += 4)
-                            {
-                                const __m128 scores4 = _mm_set_ps(
-                                    block_scores[static_cast<size_t>(k - k0 + 3)],
-                                    block_scores[static_cast<size_t>(k - k0 + 2)],
-                                    block_scores[static_cast<size_t>(k - k0 + 1)],
-                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
-                                const __m128 nm4 = _mm_set1_ps(new_m);
-                                const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
-                                const __m512 exp_out = fast_exp_avx512(exp_in);
-                                const __m128 probs = _mm512_castps512_ps128(exp_out);
-                                alignas(16) float pp[4];
-                                _mm_store_ps(pp, probs);
-                                new_l += pp[0] + pp[1] + pp[2] + pp[3];
-
-                                accum_weighted_v_fp16_4row(
-                                    out,
-                                    v_base + static_cast<size_t>(k + 0) * kv_stride, pp[0],
-                                    v_base + static_cast<size_t>(k + 1) * kv_stride, pp[1],
-                                    v_base + static_cast<size_t>(k + 2) * kv_stride, pp[2],
-                                    v_base + static_cast<size_t>(k + 3) * kv_stride, pp[3],
-                                    head_dim);
-                            }
-                            // Scalar tail: remaining valid positions
-                            for (; k < valid_end; ++k)
-                            {
-                                const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
-                                new_l += p;
-                                const uint16_t *v_ptr = v_base + static_cast<size_t>(k) * kv_stride;
-                                accum_weighted_v_fp16(out, v_ptr, p, head_dim);
-                            }
-                        }
-
-                        if (profiling_enabled)
-                            v_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - v_start)
-                                    .count());
-
-                        running_m = new_m;
-                        running_l = new_l;
-                    } // end KV tile loop
-
-                    // Final normalisation
-                    if (running_l > 0.0f)
-                    {
-                        float inv_l = 1.0f / running_l;
-                        scale_vec_fp16path(out, inv_l, head_dim);
-                    }
-                } // end head loop
+                const float *query = nullptr;
+                const std::uint16_t *key = nullptr;
+                const std::uint16_t *value = nullptr;
             };
 
-            // Same decode threading fix as FP32 path — see detailed comment there.
-            // This path is always decode (kv_len != seq_len by construction).
-            const bool force_full_pool_fp16 = kv_len > 100;
+            const auto prepare_row = [&](int row,
+                                         Native16BitRowScratch &scratch)
+            {
+                const int query_position = row / n_heads;
+                const int h = row % n_heads;
+                const int kv_h = (gqa_n_rep > 0)
+                                     ? (head_start + h) / heads_per_kv
+                                     : h / heads_per_kv;
+                scratch.query =
+                    Q + static_cast<std::size_t>(query_position) * q_stride +
+                    static_cast<std::size_t>(h) * head_dim;
+                scratch.key = K_native + static_cast<std::size_t>(kv_h) * head_dim;
+                scratch.value = V_native + static_cast<std::size_t>(kv_h) * head_dim;
+            };
 
-            int actual_threads_fp16;
-            if (force_full_pool_fp16)
+            const auto visible_tile = [&](int row,
+                                          int tile_begin,
+                                          int tile_end)
             {
-                OMP_WORKSHARE_REGION(work);
-                actual_threads_fp16 = omp_get_max_threads();
-            }
-            else
-            {
-#pragma omp parallel num_threads(attn_threads)
+                const int absolute_position =
+                    position_offset + row / n_heads;
+                int visible_begin = tile_begin;
+                if (window_size > 0)
                 {
-                    work();
+                    visible_begin = std::max(
+                        visible_begin,
+                        absolute_position - window_size + 1);
                 }
-                actual_threads_fp16 = attn_threads;
-            }
+                const int visible_end = causal
+                                            ? std::min(
+                                                  tile_end,
+                                                  absolute_position + 1)
+                                            : tile_end;
+                return CPUFA2VisibleTile{
+                    .begin = std::max(
+                        tile_begin,
+                        std::min(visible_begin, tile_end)),
+                    .end = std::max(
+                        tile_begin,
+                        std::min(visible_end, tile_end)),
+                };
+            };
 
-            if (profiling_enabled)
+            const auto score_tile = [&](int,
+                                        const Native16BitRowScratch &scratch,
+                                        int tile_begin,
+                                        CPUFA2VisibleTile visible,
+                                        float *scores,
+                                        float &block_max)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_fp16);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_fp16);
-            }
-            return true;
+                int kv_row = visible.begin;
+                for (; kv_row + 3 < visible.end; kv_row += 4)
+                {
+                    float score0 = 0.0f;
+                    float score1 = 0.0f;
+                    float score2 = 0.0f;
+                    float score3 = 0.0f;
+                    dot_native16_4row<Format>(
+                        scratch.query,
+                        scratch.key + physical_kv_row(kv_row + 0) * kv_stride,
+                        scratch.key + physical_kv_row(kv_row + 1) * kv_stride,
+                        scratch.key + physical_kv_row(kv_row + 2) * kv_stride,
+                        scratch.key + physical_kv_row(kv_row + 3) * kv_stride,
+                        head_dim,
+                        score0,
+                        score1,
+                        score2,
+                        score3);
+                    score0 *= scale;
+                    score1 *= scale;
+                    score2 *= scale;
+                    score3 *= scale;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin + 0)] = score0;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin + 1)] = score1;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin + 2)] = score2;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin + 3)] = score3;
+                    block_max = std::max(
+                        block_max,
+                        std::max(
+                            std::max(score0, score1),
+                            std::max(score2, score3)));
+                }
+                for (; kv_row < visible.end; ++kv_row)
+                {
+                    const float score = dot_native16<Format>(
+                                            scratch.query,
+                                            scratch.key +
+                                                physical_kv_row(kv_row) * kv_stride,
+                                            head_dim) *
+                                        scale;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin)] = score;
+                    block_max = std::max(block_max, score);
+                }
+            };
+
+            const auto accumulate_tile = [&](int,
+                                             const Native16BitRowScratch &scratch,
+                                             int tile_begin,
+                                             CPUFA2VisibleTile visible,
+                                             const float *scores,
+                                             float new_m,
+                                             float *partial,
+                                             float &new_l)
+            {
+                int kv_row = visible.begin;
+                for (; kv_row + 3 < visible.end; kv_row += 4)
+                {
+                    float probability0 = 0.0f;
+                    float probability1 = 0.0f;
+                    float probability2 = 0.0f;
+                    float probability3 = 0.0f;
+                    batch_exp_4(
+                        scores[static_cast<std::size_t>(kv_row - tile_begin + 0)],
+                        scores[static_cast<std::size_t>(kv_row - tile_begin + 1)],
+                        scores[static_cast<std::size_t>(kv_row - tile_begin + 2)],
+                        scores[static_cast<std::size_t>(kv_row - tile_begin + 3)],
+                        new_m,
+                        probability0,
+                        probability1,
+                        probability2,
+                        probability3);
+                    new_l += probability0 + probability1 +
+                             probability2 + probability3;
+                    accum_native16_4row<Format>(
+                        partial,
+                        scratch.value + physical_kv_row(kv_row + 0) * kv_stride,
+                        probability0,
+                        scratch.value + physical_kv_row(kv_row + 1) * kv_stride,
+                        probability1,
+                        scratch.value + physical_kv_row(kv_row + 2) * kv_stride,
+                        probability2,
+                        scratch.value + physical_kv_row(kv_row + 3) * kv_stride,
+                        probability3,
+                        head_dim);
+                }
+                for (; kv_row < visible.end; ++kv_row)
+                {
+                    const float probability = std::exp(
+                        scores[static_cast<std::size_t>(kv_row - tile_begin)] -
+                        new_m);
+                    new_l += probability;
+                    accum_native16<Format>(
+                        partial,
+                        scratch.value +
+                            physical_kv_row(kv_row) * kv_stride,
+                        probability,
+                        head_dim);
+                }
+            };
+
+            const auto finalize_row = [&](int row,
+                                          float *merged,
+                                          float merged_l)
+            {
+                if (merged_l > 0.0f)
+                {
+                    scale_vec(
+                        merged,
+                        1.0f / merged_l,
+                        head_dim,
+                        activeISALevel() == ISALevel::AVX512);
+                }
+                std::memcpy(
+                    output + static_cast<std::size_t>(row / n_heads) *
+                                     q_stride +
+                        static_cast<std::size_t>(row % n_heads) * head_dim,
+                    merged,
+                    static_cast<std::size_t>(head_dim) * sizeof(float));
+            };
+
+            return executePartitionedAttention<Native16BitRowScratch>(
+                seq_len,
+                n_heads,
+                kv_len,
+                head_dim,
+                kv_tile,
+                causal,
+                execution_policy,
+                prepare_row,
+                visible_tile,
+                score_tile,
+                accumulate_tile,
+                finalize_row);
         }
-#endif // __AVX512F__ && __F16C__
 
         // =================================================================
-        // TurboQuant TQ8-K / TQ4-V fused decode attention (zero shadow buffers)
+        // TurboQuant fused native attention (zero shadow buffers)
         //
         // Exploits the orthogonality of the TQ rotation matrix:
         //   dot(Q, dequant(K)) = (norm/√D) · dot(Π·Q, centroids(K))
@@ -5605,12 +6578,18 @@ namespace llaminar2
         // =================================================================
 #if defined(__AVX512F__) || defined(__AVX2__)
         /**
-         * @brief Fused TQ8-K / TQ4-V decode attention with zero shadow buffers.
+         * @brief Native TQ4/TQ8 attention for every supported K/V pairing.
          *
-         * @param Q          Query tensor data [n_heads × head_dim], FP32
-         * @param K_tq8      TQ8 K cache tensor (POSITION_MAJOR layout)
-         * @param V_tq4      TQ4 V cache tensor (POSITION_MAJOR layout)
-         * @param output     Output tensor [n_heads × head_dim], FP32
+         * `KeyTensor` selects the direct key-score codec and `ValueTensor`
+         * selects the direct value-accumulation codec. Online-softmax
+         * partitioning and reduction are identical for every combination, so
+         * adding a storage mode cannot change grouped verifier ordering.
+         *
+         * @param Q          Query tensor data [seq_len × n_heads × head_dim], FP32
+         * @param K_tq       TQ4 or TQ8 K cache tensor (POSITION_MAJOR layout)
+         * @param V_tq       TQ4 or TQ8 V cache tensor (POSITION_MAJOR layout)
+         * @param output     Output tensor [seq_len × n_heads × head_dim], FP32
+         * @param seq_len    Number of logical query rows
          * @param kv_len     Number of cached KV positions
          * @param n_heads    Number of query heads
          * @param n_kv_heads Number of KV heads (GQA: n_heads / n_kv_heads is group size)
@@ -5619,30 +6598,57 @@ namespace llaminar2
          * @param position_offset Offset for causal masking (typically kv_len - 1 for decode)
          * @return true on success
          */
-        static bool compute_decode_tqkv(
+        template <typename KeyTensor, typename ValueTensor>
+        bool compute_tqkv(
             const float *Q,
-            const TQ8Tensor *K_tq8,
-            const TQ4Tensor *V_tq4,
+            const KeyTensor *K_tq,
+            const ValueTensor *V_tq,
             float *output,
-            int kv_len,
+            int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset,
+            bool causal, int window_size, int position_offset,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
         {
+            static_assert(
+                std::is_same_v<KeyTensor, TQ4Tensor> ||
+                    std::is_same_v<KeyTensor, TQ8Tensor>,
+                "TurboQuant attention supports only native TQ4 or TQ8 K");
+            static_assert(
+                std::is_same_v<ValueTensor, TQ4Tensor> ||
+                    std::is_same_v<ValueTensor, TQ8Tensor>,
+                "TurboQuant attention supports only native TQ4 or TQ8 V");
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
-            if (!Q || !K_tq8 || !V_tq4 || !output)
+            if (!Q || !K_tq || !V_tq || !output)
                 return false;
-            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+            if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 ||
+                n_kv_heads <= 0 || head_dim <= 0)
                 return false;
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
+            if (!kv_logical_view.validFor(kv_len))
+                return false;
+
+            const auto physical_kv_row = [&](int logical_row) -> std::size_t
+            {
+                return static_cast<std::size_t>(
+                    kv_logical_view.physicalRow(logical_row));
+            };
 
             // Get TQ context (per-layer, set by the stage).
             // Each KV head uses a DIFFERENT derived rotation: ctx.for_layer(kv_h).
-            const TurboQuantContext *tq_ctx = K_tq8->turboquant_context();
-            if (!tq_ctx)
+            const TurboQuantContext *tq_ctx = K_tq->turboquant_context();
+            if (!tq_ctx || V_tq->turboquant_context() != tq_ctx)
+                return false;
+            if (K_tq->head_dim() != head_dim ||
+                V_tq->head_dim() != head_dim ||
+                K_tq->blocks_per_row() <
+                    static_cast<std::size_t>(n_kv_heads) ||
+                V_tq->blocks_per_row() <
+                    static_cast<std::size_t>(n_kv_heads))
                 return false;
 
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
@@ -5650,207 +6656,319 @@ namespace llaminar2
             const float combined_scale = 1.0f / static_cast<float>(head_dim);
 
             // Raw byte access for position-major TQ layout
-            const uint8_t *k_raw = K_tq8->typed_data();
-            const uint8_t *v_raw = V_tq4->typed_data();
+            const uint8_t *k_raw = K_tq->typed_data();
+            const uint8_t *v_raw = V_tq->typed_data();
             if (!k_raw || !v_raw)
                 return false;
 
-            const size_t k_block_bytes = K_tq8->block_bytes();
-            const size_t v_block_bytes = V_tq4->block_bytes();
-            const size_t k_blocks_per_row = K_tq8->blocks_per_row();
-            const size_t v_blocks_per_row = V_tq4->blocks_per_row();
+            const size_t k_block_bytes = K_tq->block_bytes();
+            const size_t v_block_bytes = V_tq->block_bytes();
+            const size_t k_blocks_per_row = K_tq->blocks_per_row();
+            const size_t v_blocks_per_row = V_tq->blocks_per_row();
             const size_t k_row_stride = k_blocks_per_row * k_block_bytes;
             const size_t v_row_stride = v_blocks_per_row * v_block_bytes;
 
-            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
-                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
-
-            const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
+            constexpr auto storage_pair =
+                std::is_same_v<KeyTensor, TQ4Tensor>
+                    ? (std::is_same_v<ValueTensor, TQ4Tensor>
+                           ? cpu::fa2_policy::CPUFA2KVStoragePair::TQ4_TQ4
+                           : cpu::fa2_policy::CPUFA2KVStoragePair::TQ4_TQ8)
+                    : (std::is_same_v<ValueTensor, TQ4Tensor>
+                           ? cpu::fa2_policy::CPUFA2KVStoragePair::TQ8_TQ4
+                           : cpu::fa2_policy::CPUFA2KVStoragePair::TQ8_TQ8);
+            const int kv_tile = detail::selectCPUFlashKVTile(
+                storage_pair,
+                head_dim,
+                kv_len,
+                k_block_bytes,
+                v_block_bytes,
+                launch_policy_.explicit_kv_tile);
 
             // V accumulation in rotated space uses 1/√D scaling:
             // rotated_accum accumulates weight × norm × centroids.
             // The 1/√D from TQ descale is deferred to the final inverse rotation step.
             const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-            auto work = [&]()
+            /*
+             * Rotation is O(D^2), so performing it independently in every
+             * context partition would erase the parallel-attention benefit.
+             * The caller-owned output row is not observable until completion;
+             * use it as the invocation-persistent rotated-Q buffer. All
+             * partition producers read it before the reducer overwrites it.
+             */
+            auto rotate_queries = [&]()
             {
-                // Per-thread scratch buffers (on-stack, L1-hot)
-                alignas(64) float q_rot[256];         // Pre-rotated Q: Π·Q
-                alignas(64) float rotated_accum[256]; // V accumulator in rotated space
-
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+#pragma omp for schedule(static)
+                for (int row = 0; row < seq_len * n_heads; ++row)
                 {
-                    // GQA mapping: replicated KV uses global head position;
-                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int query_position = row / n_heads;
+                    const int h = row % n_heads;
                     const int kv_h = (gqa_n_rep > 0)
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
-                    float *out = output + static_cast<size_t>(h) * head_dim;
-
-                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
-                    const int q_abs = position_offset;
-
-                    // Each KV head has its own derived rotation (same as dequant path):
-                    //   ctx.for_layer(kv_h) → per-head TurboQuantContext → rotation()
-                    const TurboQuantRotation &head_rotation =
+                    const TurboQuantRotation &rotation =
                         tq_ctx->for_layer(kv_h).rotation();
+                    apply_rotation(
+                        rotation,
+                        Q + static_cast<std::size_t>(query_position) *
+                                n_heads * head_dim +
+                            static_cast<std::size_t>(h) * head_dim,
+                        output + static_cast<std::size_t>(query_position) *
+                                     n_heads * head_dim +
+                            static_cast<std::size_t>(h) * head_dim);
+                }
+            };
+            OMP_WORKSHARE_REGION(rotate_queries);
 
-                    // Pre-rotate Q: Q_rot = Π_kv_h · Q (once per head, O(D²))
-                    apply_rotation(head_rotation, q_ptr, q_rot);
+            /** Per-worker immutable addresses for one TurboQuant row. */
+            struct TurboQuantRowScratch
+            {
+                const float *rotated_query = nullptr;
+                std::size_t key_head_offset = 0;
+                std::size_t value_head_offset = 0;
+            };
 
-                    // Zero rotated V accumulator
-                    std::memset(rotated_accum, 0, static_cast<size_t>(head_dim) * sizeof(float));
+            const auto prepare_row = [&](int row,
+                                         TurboQuantRowScratch &scratch)
+            {
+                const int query_position = row / n_heads;
+                const int h = row % n_heads;
+                const int kv_h = (gqa_n_rep > 0)
+                                     ? (head_start + h) / heads_per_kv
+                                     : h / heads_per_kv;
+                scratch.rotated_query =
+                    output + static_cast<std::size_t>(query_position) *
+                                 n_heads * head_dim +
+                    static_cast<std::size_t>(h) * head_dim;
+                scratch.key_head_offset =
+                    static_cast<std::size_t>(kv_h) * k_block_bytes;
+                scratch.value_head_offset =
+                    static_cast<std::size_t>(kv_h) * v_block_bytes;
+            };
 
-                    float running_m = -std::numeric_limits<float>::infinity();
-                    float running_l = 0.0f;
+            const auto visible_tile = [&](int row,
+                                          int tile_begin,
+                                          int tile_end)
+            {
+                const int absolute_position =
+                    position_offset + row / n_heads;
+                int visible_begin = tile_begin;
+                if (window_size > 0)
+                {
+                    visible_begin = std::max(
+                        visible_begin,
+                        absolute_position - window_size + 1);
+                }
+                const int visible_end = causal
+                                            ? std::min(
+                                                  tile_end,
+                                                  absolute_position + 1)
+                                            : tile_end;
+                return CPUFA2VisibleTile{
+                    .begin = std::max(
+                        tile_begin,
+                        std::min(visible_begin, tile_end)),
+                    .end = std::max(
+                        tile_begin,
+                        std::min(visible_end, tile_end)),
+                };
+            };
 
-                    // Block offsets for this KV head in POSITION_MAJOR layout
-                    const size_t k_head_offset = static_cast<size_t>(kv_h) * k_block_bytes;
-                    const size_t v_head_offset = static_cast<size_t>(kv_h) * v_block_bytes;
-
-                    float block_scores[detail::kMaxKVTile];
-
-                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+            const auto score_tile = [&](int,
+                                        const TurboQuantRowScratch &scratch,
+                                        int tile_begin,
+                                        CPUFA2VisibleTile visible,
+                                        float *scores,
+                                        float &block_max)
+            {
+                for (int kv_row = visible.begin;
+                     kv_row < visible.end;
+                     ++kv_row)
+                {
+                    if (kv_row + 4 < visible.end)
                     {
-                        const int k1 = std::min(k0 + kv_tile, kv_len);
-                        float block_max = -std::numeric_limits<float>::infinity();
-
-                        // Valid window for causal masking
-                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
-                        valid_end = std::max(k0, std::min(valid_end, k1));
-
-                        // Fill masked positions
-                        for (int k = valid_end; k < k1; ++k)
-                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
-
-                        // --- QK Phase: TQ8 fused dot products ---
-                        const auto qk_start = profiling_enabled
-                                                  ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point();
-
-                        for (int k = k0; k < valid_end; ++k)
-                        {
-                            // Prefetch next K block (stride too large for HW prefetcher)
-                            if (k + 4 < valid_end)
-                            {
-                                _mm_prefetch(reinterpret_cast<const char *>(
-                                                 k_raw + static_cast<size_t>(k + 4) * k_row_stride + k_head_offset),
-                                             _MM_HINT_T0);
-                            }
-
-                            const uint8_t *k_blk = k_raw + static_cast<size_t>(k) * k_row_stride + k_head_offset;
-
-                            // tq8_dot_rotated_q returns dot(Q_rot, centroids) × norm
-                            // Multiply by combined_scale = 1/D to get attention score:
-                            //   score = (norm/√D) · dot(Q_rot, c) · (1/√D) = norm·dot(Q_rot,c)/D
-                            float s = tq8_dot_rotated_q(q_rot, k_blk, head_dim) * combined_scale;
-                            block_scores[static_cast<size_t>(k - k0)] = s;
-                            block_max = std::max(block_max, s);
-                        }
-
-                        if (profiling_enabled)
-                            qk_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - qk_start)
-                                    .count());
-
-                        // --- Online softmax correction ---
-                        const float new_m = std::max(running_m, block_max);
-                        const float alpha = std::isfinite(running_m)
-                                                ? std::exp(running_m - new_m)
-                                                : 0.0f;
-
-                        // Scale rotated V accumulator by alpha (same as Q16 path scales output)
-                        scale_vec(rotated_accum, alpha, head_dim, false);
-                        float new_l = running_l * alpha;
-
-                        // --- V Phase: TQ4 fused accumulation in rotated space ---
-                        const auto v_start = profiling_enabled
-                                                 ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point();
-
-                        for (int k = k0; k < valid_end; ++k)
-                        {
-                            // Prefetch next V block
-                            if (k + 4 < valid_end)
-                            {
-                                _mm_prefetch(reinterpret_cast<const char *>(
-                                                 v_raw + static_cast<size_t>(k + 4) * v_row_stride + v_head_offset),
-                                             _MM_HINT_T0);
-                            }
-
-                            const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
-                            new_l += p;
-
-                            const uint8_t *v_blk = v_raw + static_cast<size_t>(k) * v_row_stride + v_head_offset;
-
-                            // Accumulate: rotated_accum += p × norm × centroids(V_block)
-                            tq4_accum_weighted(rotated_accum, v_blk, p, head_dim);
-                        }
-
-                        if (profiling_enabled)
-                            v_duration_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - v_start)
-                                    .count());
-
-                        running_m = new_m;
-                        running_l = new_l;
-                    } // end KV tile loop
-
-                    // --- Final: Inverse-rotate + normalize ---
-                    // rotated_accum = Σ_k (weight_k × norm_k × centroid_vec_k)
-                    // output = (1/√D) × Πᵀ × rotated_accum / running_l
-                    //
-                    // Apply 1/√D (deferred TQ descale) before inverse rotation:
-                    if (running_l > 0.0f)
+                        _mm_prefetch(
+                            reinterpret_cast<const char *>(
+                                k_raw +
+                                physical_kv_row(kv_row + 4) *
+                                    k_row_stride +
+                                scratch.key_head_offset),
+                            _MM_HINT_T0);
+                    }
+                    const std::uint8_t *key_block =
+                        k_raw + physical_kv_row(kv_row) * k_row_stride +
+                        scratch.key_head_offset;
+                    const float unscaled_score = [&]()
                     {
-                        const float final_scale = inv_sqrt_d / running_l;
-                        scale_vec(rotated_accum, final_scale, head_dim, false);
+                        if constexpr (std::is_same_v<KeyTensor, TQ8Tensor>)
+                        {
+                            return tq8_dot_rotated_q(
+                                scratch.rotated_query,
+                                key_block,
+                                head_dim);
+                        }
+                        else
+                        {
+                            return tq4_dot_rotated_q(
+                                scratch.rotated_query,
+                                key_block,
+                                head_dim);
+                        }
+                    }();
+                    const float score = unscaled_score * combined_scale;
+                    scores[static_cast<std::size_t>(kv_row - tile_begin)] = score;
+                    block_max = std::max(block_max, score);
+                }
+            };
+
+            const auto accumulate_tile = [&](int,
+                                             const TurboQuantRowScratch &scratch,
+                                             int tile_begin,
+                                             CPUFA2VisibleTile visible,
+                                             const float *scores,
+                                             float new_m,
+                                             float *partial,
+                                             float &new_l)
+            {
+                for (int kv_row = visible.begin;
+                     kv_row < visible.end;
+                     ++kv_row)
+                {
+                    if (kv_row + 4 < visible.end)
+                    {
+                        _mm_prefetch(
+                            reinterpret_cast<const char *>(
+                                v_raw +
+                                physical_kv_row(kv_row + 4) *
+                                    v_row_stride +
+                                scratch.value_head_offset),
+                            _MM_HINT_T0);
+                    }
+                    const float probability = std::exp(
+                        scores[static_cast<std::size_t>(kv_row - tile_begin)] -
+                        new_m);
+                    new_l += probability;
+                    const std::uint8_t *value_block =
+                        v_raw + physical_kv_row(kv_row) * v_row_stride +
+                        scratch.value_head_offset;
+                    if constexpr (std::is_same_v<ValueTensor, TQ8Tensor>)
+                    {
+                        tq8_accum_weighted(
+                            partial,
+                            value_block,
+                            probability,
+                            head_dim);
                     }
                     else
                     {
-                        std::memset(rotated_accum, 0, static_cast<size_t>(head_dim) * sizeof(float));
+                        tq4_accum_weighted(
+                            partial,
+                            value_block,
+                            probability,
+                            head_dim);
                     }
-
-                    // Inverse rotation: output = Πᵀ_kv_h × rotated_accum (O(D²), once per head)
-                    apply_rotation_transpose(head_rotation, rotated_accum, out);
-
-                } // end head loop
+                }
             };
 
-            // Threading strategy: use full thread pool for long contexts
-            const bool force_full_pool_tq = kv_len > 100;
-
-            int actual_threads_tq;
-            if (force_full_pool_tq)
+            const auto finalize_row = [&](int row,
+                                          float *merged,
+                                          float merged_l)
             {
-                OMP_WORKSHARE_REGION(work);
-                actual_threads_tq = omp_get_max_threads();
-            }
-            else
-            {
-#pragma omp parallel num_threads(attn_threads)
+                if (merged_l > 0.0f)
                 {
-                    work();
+                    scale_vec(
+                        merged,
+                        inv_sqrt_d / merged_l,
+                        head_dim,
+                        false);
                 }
-                actual_threads_tq = attn_threads;
+                else
+                {
+                    std::fill(merged, merged + head_dim, 0.0f);
+                }
+
+                const int query_position = row / n_heads;
+                const int h = row % n_heads;
+                const int kv_h = (gqa_n_rep > 0)
+                                     ? (head_start + h) / heads_per_kv
+                                     : h / heads_per_kv;
+                apply_rotation_transpose(
+                    tq_ctx->for_layer(kv_h).rotation(),
+                    merged,
+                    output + static_cast<std::size_t>(query_position) *
+                                 n_heads * head_dim +
+                        static_cast<std::size_t>(h) * head_dim);
+            };
+
+            return executePartitionedAttention<TurboQuantRowScratch>(
+                seq_len,
+                n_heads,
+                kv_len,
+                head_dim,
+                kv_tile,
+                causal,
+                execution_policy,
+                prepare_row,
+                visible_tile,
+                score_tile,
+                accumulate_tile,
+                finalize_row);
+        }
+#endif // __AVX512F__ || __AVX2__ (TQ fused)
+
+        /**
+         * @brief Validate and expose prebound context-summary storage.
+         *
+         * This method performs arithmetic and pointer checks only. It never
+         * allocates, grows, clears, or rebinds workspace. Callers initialize
+         * every element they consume inside the producer OpenMP phase.
+         *
+         * @param partial_slots Number of `(row, head, partition)` summaries.
+         * @param padded_head_dim FP32 stride reserved for each numerator.
+         * @return True when all three named buffers cover the requested span.
+         */
+        [[nodiscard]] bool hasContextSummaryCapacity(
+            std::size_t partial_slots,
+            std::size_t padded_head_dim) const
+        {
+            if (partial_slots == 0 || padded_head_dim == 0 ||
+                partial_slots >
+                    std::numeric_limits<std::size_t>::max() /
+                        padded_head_dim)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid context-summary geometry: slots="
+                          << partial_slots << " padded_head_dim="
+                          << padded_head_dim);
+                return false;
             }
 
-            if (profiling_enabled)
+            const std::size_t output_elements =
+                partial_slots * padded_head_dim;
+            if (!partial_output_ || !partial_m_ || !partial_l_ ||
+                partial_output_capacity_ < output_elements ||
+                partial_m_capacity_ < partial_slots ||
+                partial_l_capacity_ < partial_slots)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_tq);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_tq);
+                LOG_ERROR("[CPUFlashAttentionKernelT] Context-parallel attention requires complete prebound workspace: "
+                          << "required output/meta elements=" << output_elements
+                          << "/" << partial_slots
+                          << " available output/m/l="
+                          << partial_output_capacity_ << "/"
+                          << partial_m_capacity_ << "/"
+                          << partial_l_capacity_);
+                return false;
             }
             return true;
         }
-#endif // __AVX512F__ || __AVX2__ (TQ fused)
+
+        /** Immutable-by-execution launch controls resolved during setup. */
+        cpu::fa2_policy::CPUFA2KernelLaunchPolicy launch_policy_{};
+        float *partial_output_ = nullptr; ///< Prebound FP32 partial numerators.
+        float *partial_m_ = nullptr;      ///< Prebound partial score maxima.
+        float *partial_l_ = nullptr;      ///< Prebound partial softmax sums.
+        std::size_t partial_output_capacity_ = 0; ///< Numerator FP32 elements.
+        std::size_t partial_m_capacity_ = 0;      ///< Maximum-count elements.
+        std::size_t partial_l_capacity_ = 0;      ///< Denominator elements.
     };
 
     extern template class CPUFlashAttentionKernelT<ActivationPrecision::FP32>;

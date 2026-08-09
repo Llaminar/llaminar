@@ -1614,6 +1614,8 @@ namespace llaminar2
          * @param execution_policy Capture-stable physical prefill policy. The
          *        backend must either implement the requested axis exactly or
          *        reject it; silently substituting another path is forbidden.
+         * @param kv_logical_view Logical-to-physical row mapping when K/V are
+         *        direct ring-cache tensors. The default denotes contiguous K/V.
          * @return true on success, false on failure or unsupported type combination
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
@@ -1654,13 +1656,14 @@ namespace llaminar2
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
             int local_n_kv_heads = -1, ///< Number of KV heads (-1 = all)
             int gqa_n_rep = 0,         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
-            const attention::AttentionExecutionPolicy &execution_policy = {})
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
             = 0;
 
         /**
          * @brief Compute MTP verifier rows through a grouped decode-equivalent path.
          *
-         * The verifier input contains M compact rows (currently production M=2..4)
+         * The verifier input contains M compact rows (production M=2..15)
          * appended after an existing prefix in the KV cache. The implementation
          * must compute every row as if serial decode had processed rows
          * `[0, M)` one at a time, including causal visibility:
@@ -1689,7 +1692,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionKVLogicalView &kv_logical_view = {},
+            const attention::AttentionExecutionPolicy &execution_policy = {})
         {
             (void)Q;
             (void)K;
@@ -1706,6 +1711,8 @@ namespace llaminar2
             (void)device_idx;
             (void)head_start;
             (void)gqa_n_rep;
+            (void)kv_logical_view;
+            (void)execution_policy;
             return false;
         }
 
@@ -1728,6 +1735,10 @@ namespace llaminar2
          * @param K_by_request One logical K history tensor per request.
          * @param V_by_request One logical V history tensor per request.
          * @param kv_lens Logical KV row count for each request tensor.
+         * @param kv_logical_views Per-request mapping from logical history rows
+         *        to each persistent native ring tensor. This array is mandatory:
+         *        callers use an all-zero element for a compact tensor rather
+         *        than omitting ownership information.
          * @param output Row-major output tensor matching @p Q.
          * @return true only when the grouped implementation executed.
          */
@@ -1747,7 +1758,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr)
         {
             (void)Q;
             (void)K_by_request;
@@ -1765,6 +1778,8 @@ namespace llaminar2
             (void)device_idx;
             (void)head_start;
             (void)gqa_n_rep;
+            (void)execution_policy;
+            (void)kv_logical_views;
             return false;
         }
 

@@ -32,11 +32,12 @@ namespace llaminar2
     class IBackend;
 
     /**
-     * @brief Declares the physical lifetime relationship between GPU graphs.
+     * @brief Declares the physical lifetime relationship between executable graphs.
      *
-     * GPU graph executables retain raw workspace addresses. The policy therefore
-     * describes both the sizing surface that must be known before capture and
-     * whether another graph may use the same physical bytes.
+     * GPU graph executables and CPU stage objects both retain raw workspace
+     * addresses. The policy therefore describes both the sizing surface that
+     * must be known before capture/materialization and whether another graph may
+     * use the same physical bytes.
      *
      * A serial device family includes ordinary prefill/decode, MTP sidecars,
      * grouped verification, accepted-state publication, and decode catch-up on

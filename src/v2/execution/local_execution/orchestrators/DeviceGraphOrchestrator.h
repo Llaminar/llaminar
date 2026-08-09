@@ -8566,13 +8566,15 @@ namespace llaminar2
                 exact_serial_participants);
 
         /**
-         * @brief Materialize every GPU MTP workspace topology without executing it.
+         * @brief Materialize every backend MTP workspace topology without executing it.
          *
          * The returned graphs are short-lived declarations used by the first
-         * workspace plan. They are built through the same model graph builder
-         * as production sidecars, so new stages and workspace names
-         * automatically join the family instead of requiring byte-count
-         * updates here.
+         * workspace plan on CPU, CUDA, and ROCm. They are built through the same
+         * model graph builder as production sidecars, so new stages and
+         * workspace names automatically join the family instead of requiring
+         * byte-count updates here. CPU stage objects retain raw workspace
+         * addresses just as captured GPU graph nodes do, so CPU sidecars must
+         * participate before the family allocation is published.
          *
          * @pre @p owned_mtp_graphs is empty. Primary-lane declarations have a
          *      separate owner, so this MTP contributor cannot erase, reorder,

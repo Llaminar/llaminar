@@ -3404,9 +3404,9 @@ namespace
     };
 } // anonymous namespace
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_BindsCPUStages)
 {
-    // Test that ensureDeviceWorkspaceAllocated() skips CPU stages
+    // CPU stages retain raw workspace addresses just like captured GPU nodes.
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a graph with a mock workspace consumer on CPU device
@@ -3414,7 +3414,6 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
     auto *cpu_stage_ptr = cpu_stage.get();
 
-    // Add with CPU device - this should be skipped by workspace allocation
     graph.addNode("cpu_gemm_node", std::move(cpu_stage), DeviceId::cpu());
 
     IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -3423,12 +3422,10 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Execute - workspace allocation should skip CPU stage
     bool result = orchestrator->execute(graph, ctx);
     EXPECT_TRUE(result);
-
-    // CPU stage should NOT have had workspace bound (is_gpu() returns false)
-    EXPECT_FALSE(cpu_stage_ptr->wasBound());
+    EXPECT_TRUE(cpu_stage_ptr->wasBound());
+    EXPECT_NE(cpu_stage_ptr->getBoundWorkspace(), nullptr);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsNonWorkspaceConsumerStages)
@@ -3546,7 +3543,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_BindsWorkspaceToAllCon
     }
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesCPUWorkspaceConsumers)
 {
     // Test that a graph with stages but none on GPU works correctly
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -3568,13 +3565,11 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUS
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Execute should succeed
     bool result = orchestrator->execute(graph, ctx);
     EXPECT_TRUE(result);
-
-    // Neither CPU stage should have workspace bound (workspace only for GPU)
-    EXPECT_FALSE(stage1_ptr->wasBound());
-    EXPECT_FALSE(stage2_ptr->wasBound());
+    EXPECT_TRUE(stage1_ptr->wasBound());
+    EXPECT_TRUE(stage2_ptr->wasBound());
+    EXPECT_EQ(stage1_ptr->getBoundWorkspace(), stage2_ptr->getBoundWorkspace());
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExecutions)
@@ -4032,7 +4027,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
     EXPECT_GT(rocm_ptr->getLastM(), 0) << "ROCm stage should receive positive m dimension";
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_GetsDimensionsAndBinding)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
@@ -4049,12 +4044,13 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 
     orchestrator->execute(graph, ctx);
 
-    // CPU stages should NOT receive workspace (workspace is GPU-only)
-    EXPECT_FALSE(cpu_ptr->wasBound())
-        << "CPU stage should not have workspace bound";
+    EXPECT_TRUE(cpu_ptr->wasBound())
+        << "CPU stages with non-empty requirements must receive setup-owned workspace";
+    EXPECT_GT(cpu_ptr->getRequirementsCallCount(), 0);
+    EXPECT_GT(cpu_ptr->getLastM(), 0);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_AllConsumersGetWorkspace)
 {
     // Skip if neither CUDA nor ROCm backend available
     const auto &dm = DeviceManager::instance();
@@ -4099,9 +4095,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
 
     orchestrator->execute(graph, ctx);
 
-    // Only GPU stages should have workspace
-    EXPECT_FALSE(cpu_ptr->wasBound()) << "CPU stage should not have workspace";
-    // GPU stages should have requirements queried for available backends
+    EXPECT_TRUE(cpu_ptr->wasBound())
+        << "CPU and GPU graph participants use the same workspace contract";
+    // GPU stages should have requirements queried for available backends.
     if (cuda_ptr)
     {
         EXPECT_GT(cuda_ptr->getRequirementsCallCount(), 0) << "CUDA stage requirements should be queried";

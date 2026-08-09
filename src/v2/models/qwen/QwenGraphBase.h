@@ -45,6 +45,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../kernels/cpu/CPUKVCache.h"
+#include "../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
 #include "../../config/TensorParallelConfig.h"
@@ -799,6 +800,31 @@ namespace llaminar2
         // Shared Attention Building Blocks
         // =====================================================================
 
+        /**
+         * @brief Resolve one complete attention policy for a graph participant.
+         *
+         * Every backend receives geometry-selected physical ownership. CPU,
+         * CUDA, and ROCm each resolve that declaration through their own typed
+         * launch policy; model graphs never pin a backend to a legacy physical
+         * schedule. Explicit query/context requests remain isolated kernel
+         * tournament controls rather than production graph policy.
+         *
+         * CPU cache publication always stores post-RoPE native K so direct
+         * Q8/Q16/TurboQuant attention can consume persistent bytes without a
+         * conversion shadow. CUDA and ROCm may honor the model's
+         * @c rope_on_read preference only when a real KV cache is present; a
+         * cacheless graph must rotate its projected K before attention.
+         *
+         * @param device Participant that will execute the attention node.
+         * @param cache_backed True when the graph publishes and consumes a KV cache.
+         * @return Immutable policy shared by every attention-related graph node.
+         * @throws std::invalid_argument for an unsupported or invalid device.
+         */
+        [[nodiscard]] attention::AttentionExecutionPolicy
+        resolveAttentionExecutionPolicy(
+            DeviceId device,
+            bool cache_backed) const;
+
         /** Resolve TP-aware local head counts. */
         std::pair<int, int> resolveLocalHeadCounts() const;
 
@@ -850,6 +876,7 @@ namespace llaminar2
          * @param position_ids Optional host position row for CPU execution.
          * @param position_ids_device Optional device-owned GPU position row.
          * @param device Stage device.
+         * @param execution_policy Resolved publication/consumption contract.
          * @param projection_dependency Node that produces K.
          * @return The final node whose completion makes K cache-ready.
          */
@@ -863,15 +890,17 @@ namespace llaminar2
             const int *position_ids,
             const void *position_ids_device,
             DeviceId device,
+            const attention::AttentionExecutionPolicy &execution_policy,
             const std::string &projection_dependency);
 
         /**
          * @brief Add the declarative RoPE stage for Q and, when configured, K.
          *
-         * The graph-wide @c rope_on_read policy is the sole owner of whether K
-         * is rotated here or while reading the KV cache. Callers must not
-         * override that policy for individual execution phases, because doing
-         * so gives full and chunked prefill different numerical paths.
+         * The resolved execution policy is the sole owner of whether K is
+         * rotated here or while reading a GPU KV cache. Callers must pass the
+         * same policy to append and attention construction, because divergent
+         * producer/consumer policies give full and chunked prefill different
+         * numerical paths.
          *
          * @return Node name (prefix + "rope").
          */
@@ -884,7 +913,8 @@ namespace llaminar2
             int total_tokens,
             const int *position_ids,
             const void *position_ids_device,
-            DeviceId device);
+            DeviceId device,
+            const attention::AttentionExecutionPolicy &execution_policy);
 
         /**
          * @brief Add a KV cache append stage.
@@ -899,6 +929,7 @@ namespace llaminar2
          *                                 KV cache layer id.
          * @param request_sequence_lengths_device Device-owned request lengths
          *        consumed by captured GPU append publication.
+         * @param execution_policy Resolved publication/consumption contract.
          * @return KV append node name, or rope_dependency when no KV cache is present.
          */
         std::string addKVCacheAppend(
@@ -911,6 +942,7 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int32_t *request_sequence_lengths_device,
             DeviceId device,
+            const attention::AttentionExecutionPolicy &execution_policy,
             const std::string &rope_dependency,
             const std::vector<std::string> &cache_source_dependencies = {},
             bool layer_idx_is_cache_local = false,
@@ -925,6 +957,7 @@ namespace llaminar2
          *                                 KV cache layer id.
          * @param request_sequence_lengths_device Device-owned request lengths
          *        consumed by captured GPU append publication.
+         * @param execution_policy Resolved publication/consumption contract.
          * @return Terminal attention node name
          */
         std::string addKVCacheAndAttention(
@@ -942,6 +975,7 @@ namespace llaminar2
             const int32_t *request_sequence_lengths_device,
             DeviceId device,
             bool has_qkv_proj,
+            const attention::AttentionExecutionPolicy &execution_policy,
             const std::string &rope_dependency,
             const std::vector<std::string> &cache_source_dependencies = {},
             bool layer_idx_is_cache_local = false);

@@ -451,8 +451,32 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnAcceptedTokenWithoutReady
     EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
     EXPECT_THAT(result.verifier_tokens, ElementsAre(9));
     EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_TRUE(result.all_speculative_accepted)
+        << "A stop truncates continuation but does not invent a verifier rejection";
     EXPECT_EQ(result.ready_token, -1);
     EXPECT_EQ(result.target_verifier_state_commit_count, 2);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierPreservesFinalAcceptedStop)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 8));
+    EXPECT_TRUE(result.all_speculative_accepted);
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_EQ(result.accepted_speculative_prefix, 2);
+    EXPECT_EQ(result.ready_token, -1)
+        << "The unused bonus row must not become a continuation after a stop";
+    EXPECT_EQ(result.target_verifier_state_commit_count, 3);
 }
 
 TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnRejectedCorrectionWithoutReplay)

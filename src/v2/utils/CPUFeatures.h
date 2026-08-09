@@ -323,6 +323,31 @@ namespace llaminar2
         AVX512 = 2
     };
 
+    /**
+     * @brief Return the stable display name for one runtime SIMD level.
+     *
+     * This helper deliberately accepts an explicit value rather than reading
+     * the process singleton.  Callers that report the active execution policy
+     * pass `activeISALevel()`, while device-free tests can prove every enum
+     * spelling without mutating the process environment or cached dispatch.
+     *
+     * @param level Runtime SIMD level selected by dispatch.
+     * @return Static human-readable name suitable for logs and diagnostics.
+     */
+    inline constexpr const char *isaLevelName(ISALevel level)
+    {
+        switch (level)
+        {
+        case ISALevel::Scalar:
+            return "Scalar";
+        case ISALevel::AVX2:
+            return "AVX2";
+        case ISALevel::AVX512:
+            return "AVX-512";
+        }
+        return "Unknown";
+    }
+
     // Forward declarations for activeISALevel()
     inline bool cpu_supports_avx2();
     inline bool cpu_supports_avx512();

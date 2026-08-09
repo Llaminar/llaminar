@@ -302,6 +302,7 @@ namespace llaminar2
             SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
             APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
             FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
+            SET_STOP_TOKENS = 8,     ///< Install request stop policy (followed by count + token IDs)
             SHUTDOWN = 99            ///< Exit the worker loop
         };
 

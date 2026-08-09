@@ -132,7 +132,21 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("--mpi-procs 2", result.stdout)
         self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
         self.assertIn("--tp-scope node_local", result.stdout)
+        self.assertIn("--backend upi", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
+
+    def test_nodelocaltp_topology_accepts_moe_models(self) -> None:
+        """CPU2 MoE is a production lane, not a dense-only topology."""
+        result = self.run_matrix(
+            "baseline",
+            topologies="nodelocaltp_cpu2",
+            models="moe",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
+        self.assertIn("--backend upi", result.stdout)
+        self.assertIn("moe.gguf", result.stdout)
 
     def test_tiered_routed_expert_topology_uses_explicit_policy_flags(self) -> None:
         result = self.run_matrix(

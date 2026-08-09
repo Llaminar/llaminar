@@ -188,4 +188,18 @@ namespace llaminar2::test
         EXPECT_NE(strstr(summary, "L2"), nullptr) << "Summary should mention L2";
     }
 
+    /**
+     * @brief Keep diagnostic ISA names aligned with runtime dispatch policy.
+     *
+     * The startup banner and benchmark logs consume this helper.  Exercising
+     * explicit enum values avoids dependence on the host ISA and on the
+     * process-cached `LLAMINAR_ISA_LEVEL` override.
+     */
+    TEST_F(Test__CacheInfo, RuntimeISALevelNamesAreExplicit)
+    {
+        EXPECT_STREQ(isaLevelName(ISALevel::Scalar), "Scalar");
+        EXPECT_STREQ(isaLevelName(ISALevel::AVX2), "AVX2");
+        EXPECT_STREQ(isaLevelName(ISALevel::AVX512), "AVX-512");
+    }
+
 } // namespace llaminar2::test

@@ -337,26 +337,6 @@ namespace llaminar2
             return Base::gather_kv_batched(kv_idx, num_sequences, out_k, out_v, out_kv_lens);
         }
 
-        bool get_kv_converted(int layer, int seq_idx,
-                              ActivationPrecision target,
-                              ITensor **out_k, ITensor **out_v,
-                              int *out_kv_len = nullptr,
-                              const typename Base::KVReadParams *rope = nullptr) override
-        {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-            {
-                if (out_k)
-                    *out_k = nullptr;
-                if (out_v)
-                    *out_v = nullptr;
-                if (out_kv_len)
-                    *out_kv_len = 0;
-                return false;
-            }
-            return Base::get_kv_converted(kv_idx, seq_idx, target, out_k, out_v, out_kv_len, rope);
-        }
-
         DeviceId get_layer_device(int layer) const override
         {
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));

@@ -75,7 +75,9 @@ namespace llaminar2
         std::vector<int32_t> rejected_token_counts;
         std::vector<int32_t> token_indices_to_sample;
         std::vector<int32_t> next_condition_tokens;
+        /** No verifier comparison rejected; `stopped_flags` may still truncate the width. */
         std::vector<int32_t> all_drafts_accepted_flags;
+        /** Output encountered a request stop token and cannot publish a bonus continuation. */
         std::vector<int32_t> stopped_flags;
         std::vector<int32_t> query_start_locs;
         std::vector<int32_t> state_indices;
@@ -274,12 +276,47 @@ namespace llaminar2
     MTPSpecDecodeVerifierGraphForwardPlan buildMTPSpecDecodeVerifierGraphForwardPlan(
         const MTPSpecDecodeVerifierInputPlan &plan);
 
+    /**
+     * @brief Build transaction metadata with explicit state and control facts.
+     *
+     * The five-argument overload derives acceptance from exact draft/sample
+     * comparison. A verifier catch-up result uses the six-argument overload
+     * because a stop can truncate the compared width without representing a
+     * rejection. The independent stopped vector then prevents bonus-continuation
+     * publication.
+     *
+     * @param shape Padded request/depth capacity of the metadata family.
+     * @param requests Token-visible speculative requests.
+     * @param committed_output_counts Response tokens committed per request.
+     * @param target_verifier_state_commit_counts Verifier input rows whose state is publishable.
+     * @param stopped_flags Per-request stop-token predicates.
+     * @return Validated metadata and publication indices, or a precise failure.
+     */
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &target_verifier_state_commit_counts,
         const std::vector<int32_t> &stopped_flags);
+
+    /**
+     * @brief Build transaction metadata with an explicit no-rejection vector.
+     *
+     * @param shape Padded request/depth capacity of the metadata family.
+     * @param requests Token-visible speculative requests.
+     * @param committed_output_counts Response tokens committed per request.
+     * @param target_verifier_state_commit_counts Verifier input rows whose state is publishable.
+     * @param stopped_flags Per-request stop-token predicates.
+     * @param all_drafts_accepted_flags Explicit per-request no-rejection predicates.
+     * @return Validated metadata and publication indices, or a precise failure.
+     */
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
+        const std::vector<int32_t> &stopped_flags,
+        const std::vector<int32_t> &all_drafts_accepted_flags);
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
         const MTPSpecDecodeMetadataShape &shape,

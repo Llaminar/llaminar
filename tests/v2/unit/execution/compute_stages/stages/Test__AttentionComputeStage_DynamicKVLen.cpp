@@ -18,6 +18,7 @@
 #include <memory>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -166,6 +167,17 @@ namespace llaminar2
                 return cached_tokens_[layer];
             }
 
+            KVCacheSequenceState sequenceState(int layer, int seq_idx) const override
+            {
+                if (seq_idx != 0 || layer < 0 || layer >= num_layers_)
+                    return {};
+                return {
+                    .cached_tokens = cached_tokens_[layer],
+                    .implementation_head = 0,
+                    .wrapped = false,
+                };
+            }
+
             // Unified KV access (new interface)
             bool get_kv(int layer, int seq_idx, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr) override
             {
@@ -217,9 +229,15 @@ namespace llaminar2
                                   int *out_kv_len = nullptr,
                                   const KVReadParams *rope = nullptr) override
             {
+                (void)layer;
+                (void)seq_idx;
                 (void)target;
+                (void)out_k;
+                (void)out_v;
+                (void)out_kv_len;
                 (void)rope;
-                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+                throw std::logic_error(
+                    "CPU attention must consume the cache's native logical view");
             }
 
             // Legacy individual accessors (deprecated)

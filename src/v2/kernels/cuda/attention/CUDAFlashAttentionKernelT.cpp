@@ -815,7 +815,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
@@ -825,6 +826,12 @@ namespace llaminar2
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Null tensor provided");
+                return false;
+            }
+            if (!kv_logical_view.isContiguous())
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] "
+                          "circular CPU-style KV descriptors are invalid for gathered CUDA views");
                 return false;
             }
 
@@ -1589,11 +1596,20 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
-            int gqa_n_rep)
+            int gqa_n_rep,
+            const attention::AttentionKVLogicalView &kv_logical_view,
+            const attention::AttentionExecutionPolicy &execution_policy)
         {
+            (void)execution_policy;
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Null tensor");
+                return false;
+            }
+            if (!kv_logical_view.isContiguous())
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "circular CPU-style KV descriptors are invalid for gathered CUDA views");
                 return false;
             }
             if (verifier_rows < 2 || verifier_rows > MAX_SMALL_DECODE_ROWS ||
@@ -1656,7 +1672,9 @@ namespace llaminar2
                                   head_start,
                                   n_heads,
                                   n_kv_heads,
-                                  gqa_n_rep);
+                                  gqa_n_rep,
+                                  /*execution_policy=*/{},
+                                  kv_logical_view);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_device_request_batch_decode_equivalent(
@@ -2625,7 +2643,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             // FP16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 compute_tensor not yet implemented, using FP32");
@@ -2637,7 +2656,7 @@ namespace llaminar2
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
                                               head_start, local_n_heads, local_n_kv_heads, gqa_n_rep,
-                                              execution_policy);
+                                              execution_policy, kv_logical_view);
         }
 
         // =====================================================================
@@ -2921,7 +2940,8 @@ namespace llaminar2
             int local_n_heads,
             int local_n_kv_heads,
             int gqa_n_rep,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            const attention::AttentionKVLogicalView &kv_logical_view)
         {
             // BF16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 compute_tensor not yet implemented, using FP32");
@@ -2933,7 +2953,7 @@ namespace llaminar2
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
                                               head_start, local_n_heads, local_n_kv_heads, gqa_n_rep,
-                                              execution_policy);
+                                              execution_policy, kv_logical_view);
         }
 
         // =====================================================================

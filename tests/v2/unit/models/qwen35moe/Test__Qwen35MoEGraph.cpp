@@ -2697,7 +2697,7 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
     }
 }
 
-TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
+TEST(Test__Qwen35MoEGraph, CPUAttentionPublishesPostRotaryNativeKDespiteGpuReadPreference)
 {
     GraphConfig config = makeMoEConfig();
     config.layer_types = {"full_attention", "gdn"};
@@ -2730,9 +2730,26 @@ TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
     ASSERT_NE(graph.getNode("layer0_rope"), nullptr);
     ASSERT_NE(graph.getNode("layer0_k_norm"), nullptr);
 
+    const auto *rope = dynamic_cast<const RoPEStage *>(
+        graph.getNode("layer0_rope")->stage.get());
+    ASSERT_NE(rope, nullptr);
+    EXPECT_FALSE(rope->getParams().skip_k);
+
+    const auto *attention = dynamic_cast<const AttentionComputeStage *>(
+        graph.getNode("layer0_attention")->stage.get());
+    ASSERT_NE(attention, nullptr);
+    EXPECT_EQ(
+        attention->getParams().execution_policy.key_cache.encoding,
+        attention::AttentionKeyCacheEncoding::PostRotary);
+    EXPECT_EQ(
+        attention->getParams().execution_policy.prefill_parallel_axis,
+        attention::AttentionPrefillParallelAxis::GeometrySelected)
+        << "CPU production graphs must let the backend select byte-equivalent "
+           "query or K/V-context ownership from immutable geometry";
+
     EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
     EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"))
-        << "rope_on_read stores pre-RoPE K, but it must still wait for K norm";
+        << "CPU native cache bytes must be transformed once before publication";
 }
 
 /**
@@ -2928,7 +2945,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
     EXPECT_EQ(attention->getParams().gqa_n_rep,
               config.n_heads / config.n_kv_heads);
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
-    EXPECT_TRUE(attention->getParams().apply_rope_to_k);
+    EXPECT_TRUE(
+        attention->getParams().execution_policy.key_cache.transformsOnRead());
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_kv_append"));
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_rope"))
         << "Local prefill attention must consume RoPE-applied Q/K after the cache handoff captured pre-RoPE K.";
@@ -3000,7 +3018,8 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedAtt
     EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
     EXPECT_EQ(attention->getParams().head_start, config.head_start);
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
-    EXPECT_TRUE(attention->getParams().apply_rope_to_k);
+    EXPECT_TRUE(
+        attention->getParams().execution_policy.key_cache.transformsOnRead());
 }
 
 TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopology)

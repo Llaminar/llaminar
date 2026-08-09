@@ -335,22 +335,28 @@ function(add_v2_test TEST_NAME)
         set(INTEGRATION_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_integration")
         list(GET ARG_COMMAND 0 EXECUTABLE_TARGET)
         get_filename_component(EXECUTABLE_NAME ${EXECUTABLE_TARGET} NAME)
-        
-        if(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
+
+        # Absolute tools such as the discovered Python interpreter are already
+        # complete commands. Rewriting them beneath tests/v2 produces an invalid
+        # path and silently breaks every script registered through this helper.
+        if(IS_ABSOLUTE "${EXECUTABLE_TARGET}")
+            set(FINAL_COMMAND ${ARG_COMMAND})
+        elseif(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
             string(REGEX REPLACE ".*TARGET_FILE:([^>]+)>.*" "\\1" TARGET_NAME "${EXECUTABLE_TARGET}")
             set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${TARGET_NAME}")
+            list(REMOVE_AT ARG_COMMAND 0)
+            set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
         else()
             set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
+            list(REMOVE_AT ARG_COMMAND 0)
+            set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
         endif()
-        
-        list(REMOVE_AT ARG_COMMAND 0)
-        set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
     else()
         # Use Debug build (default, CMAKE_CURRENT_BINARY_DIR)
         # Check if COMMAND uses $<TARGET_FILE:...> generator expression
         list(GET ARG_COMMAND 0 FIRST_ARG)
-        if(FIRST_ARG MATCHES "\\$<TARGET_FILE:")
-            # Already has full path via generator expression, use as-is
+        if(IS_ABSOLUTE "${FIRST_ARG}" OR FIRST_ARG MATCHES "\\$<TARGET_FILE:")
+            # Absolute tools and generator expressions already carry full paths.
             set(FINAL_COMMAND ${ARG_COMMAND})
         else()
             # Bare executable name, need to prepend CMAKE_CURRENT_BINARY_DIR
@@ -3605,7 +3611,7 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
     MPI_PROCS 1
 )
 
-# Test: CPUFlashAttentionKernelT (Flash attention accuracy: FP32, VNNI i16/i12, causal, GQA, window)
+# Test: CPUFlashAttentionKernelT (exact FP32/Q16 attention, causal, GQA, window)
 add_executable(v2_test_cpu_flash_attention_kernel_t unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
@@ -3615,6 +3621,21 @@ target_link_libraries(v2_test_cpu_flash_attention_kernel_t
 add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
     LABELS "V2;Unit;Kernels;Attention;FlashAttention;FP32;VNNI;CPU;Accuracy;GQA;TensorParallel"
+    MPI_PROCS 1
+)
+
+# Test: typed CPU FlashAttention2 cache and physical-axis launch policy.
+add_executable(v2_test_cpu_flash_attention_launch_policy
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionLaunchPolicy.cpp
+)
+target_link_libraries(v2_test_cpu_flash_attention_launch_policy
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUFlashAttentionLaunchPolicy
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
+    LABELS "V2;Unit;Kernels;Attention;FlashAttention;CPU;Dispatch;CachePolicy;Totality"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
@@ -3652,9 +3673,9 @@ add_v2_test(V2_Unit_Q16DecodeHeadMajor
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_Q16
     COMMAND $<TARGET_FILE:v2_test_q16_decode_head_major>
-            --gtest_filter=Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_RuntimeM:Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_RuntimeBoundaries
+            --gtest_filter=Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_RuntimeM:Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_RuntimeBoundaries:Test__Q16DecodeHeadMajor.HeadMajorWrappedRingMatchesCompactForDecodeAndGroupedRuntimeM:Test__Q16DecodeHeadMajor.NativeRequestBatchWithUnequalWrappedHeadMajorHistoriesIsByteExact
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;Q16_1;HeadMajor;Regression"
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;Q16_1;HeadMajor;WrappedRing;Regression"
     MPI_PROCS 1
 )
 
@@ -4198,45 +4219,6 @@ target_link_libraries(v2_test_cpu_ring_kv_cache
 add_v2_test(V2_Unit_CPURingKVCache
     COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache>
     LABELS "V2;Unit;KVCache;Ring;CPU;FP32;Phase1"
-    MPI_PROCS 1
-)
-
-# Test: CPURingKVCache get_kv_converted (ring wrap correctness for FP32 shadow buffers)
-add_executable(v2_test_cpu_ring_kv_cache_get_kv_converted unit/kernels/cpu/Test__CPURingKVCache_GetKvConverted.cpp)
-target_link_libraries(v2_test_cpu_ring_kv_cache_get_kv_converted
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPURingKVCache_GetKvConverted
-    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_get_kv_converted>
-    LABELS "V2;Unit;KVCache;Ring;CPU;FP32;FP16;GetKvConverted"
-    MPI_PROCS 1
-)
-
-# Test: CPURingKVCache comprehensive (shadow invalidation, edge cases, multi-seq, eviction, factory, stress)
-add_executable(v2_test_cpu_ring_kv_cache_comprehensive unit/kernels/cpu/Test__CPURingKVCache_Comprehensive.cpp)
-target_link_libraries(v2_test_cpu_ring_kv_cache_comprehensive
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPURingKVCache_Comprehensive
-    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_comprehensive>
-    LABELS "V2;Unit;KVCache;Ring;CPU;FP32;FP16;BF16;Shadow;Eviction;Factory;Comprehensive"
-    MPI_PROCS 1
-)
-
-# Test: CPURingKVCache Q16_1 (variable block sizes, HEAD_MAJOR layout, get_kv_converted)
-add_executable(v2_test_cpu_ring_kv_cache_q16_1 unit/kernels/cpu/Test__CPURingKVCache_Q16_1.cpp)
-target_link_libraries(v2_test_cpu_ring_kv_cache_q16_1
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPURingKVCache_Q16_1
-    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache_q16_1>
-    LABELS "V2;Unit;KVCache;Ring;CPU;Q16_1;HeadMajor;BlockSize;Shadow;Quantization"
     MPI_PROCS 1
 )
 
@@ -8559,7 +8541,7 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Regression"
     MPI_PROCS 1
-    TIMEOUT 600
+    TIMEOUT 900
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPGpuGraphsRealModelSmoke
@@ -10729,6 +10711,40 @@ add_v2_test(V2_Perf_CPUFlashAttentionSweep
     MPI_PROCS 1
 )
 
+# Performance Test: common byte-invariant CPU FA2 K/V tile tournament.
+add_executable(v2_perf_cpu_flash_attention_tile_tournament
+    performance/kernels/cpu/attention/Perf__CPUFlashAttentionTileTournament.cpp
+)
+target_link_libraries(v2_perf_cpu_flash_attention_tile_tournament
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUFlashAttentionTileTournament
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cpu/attention/run_cpu_fa2_tile_tournament.py
+            --binary $<TARGET_FILE:v2_perf_cpu_flash_attention_tile_tournament>
+    LABELS "V2;Performance;Attention;FlashAttention;CPU;Decode;GroupedVerifier;Prefill;Qwen;TensorParallel;AllFormats;Tuning"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
+
+add_v2_test(V2_Integration_CPUFlashAttentionQwenTPAllFormatTotality
+    COMMAND $<TARGET_FILE:v2_perf_cpu_flash_attention_tile_tournament>
+            --gtest_filter=Perf__CPUFlashAttentionTileTournament.FullQwenTPAllFormatByteTotality
+    LABELS "V2;Integration;Attention;FlashAttention;CPU;Decode;GroupedVerifier;Prefill;Qwen;TensorParallel;AllFormats;Totality"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
+
+add_v2_test(V2_Unit_CPUFlashAttentionTournamentDriver
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_fa2_tile_tournament_driver.py
+    LABELS "V2;Unit;CPU;Attention;FlashAttention;CachePolicy;Totality"
+    MPI_PROCS 1
+    TIMEOUT 30
+)
+
 # Performance Test: CPU flash-attention MTP verifier rows
 add_executable(v2_perf_cpu_flash_attention_verifier_rows performance/kernels/cpu/attention/Perf__CPUFlashAttentionVerifierRows.cpp)
 target_link_libraries(v2_perf_cpu_flash_attention_verifier_rows
@@ -11116,7 +11132,13 @@ target_link_libraries(v2_integration_cpu_flash_attention_kernel
 )
 add_v2_test(V2_Integration_CPUFlashAttentionKernel
     COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_kernel>
-    LABELS "V2;Integration;CPU;FlashAttention;Q8_1;Decode;Prefill"
+    LABELS "V2;Integration;CPU;FlashAttention;FP32;FP16;BF16;Q8_1;TurboQuant;Decode;Prefill"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats
+    COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_kernel>
+            --gtest_filter=Test__CPUFlashAttentionKernel.PhysicalModesAndGroupedVerifierAreByteExactForEveryNonQ16NativeKVFormat:Test__CPUFlashAttentionKernel.WrappedNativeKVRingMatchesCompactForEveryNonQ16FormatAndM:Test__CPUFlashAttentionKernel.NativeRequestBatchWithUnequalWrappedHistoriesIsByteExactForEveryNonQ16Format
+    LABELS "V2;Integration;CPU;Attention;GroupedVerifier;ByteExact;AllFormats;MTotality;PhysicalModes;WrappedRing;FP32;FP16;BF16;Q8_1;TurboQuant;TQ4;TQ8"
     MPI_PROCS 1
 )
 

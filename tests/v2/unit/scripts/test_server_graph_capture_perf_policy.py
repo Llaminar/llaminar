@@ -23,6 +23,7 @@ from graph_capture_perf_policy import (  # noqa: E402
     validate_graph_capture_policy,
 )
 from flash_attention_perf_policy import (  # noqa: E402
+    validate_cpu_flash_attention_execution_policy,
     validate_flash_attention_plan_policy,
 )
 from gpu_host_transfer_perf_policy import (  # noqa: E402
@@ -204,6 +205,141 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             "--define-domain mixed=cuda:0,rocm:0",
         )
         self.assertIn("cuda, rocm", result.error or "")
+
+    def test_cpu_flash_attention_policy_accepts_both_physical_modes(
+        self,
+    ) -> None:
+        """A long CPU lane proves prefill and context-split decode execution."""
+
+        common_tags = {
+            "requested_axis": "geometry_selected",
+            "local_query_heads": "8",
+            "head_dim": "256",
+            "physical_workers": "28",
+            "context_partition_rows": "256",
+            "physical_kv_tile": "256",
+        }
+        query = counter(
+            "cpu_fa2_parallel_plan_executions",
+            value=96.0,
+            domain="kernel",
+            device="cpu",
+            tags=common_tags
+            | {
+                "selected_mode": "query_sequence",
+                "query_rows": "4096",
+                "arithmetic_partitions": "16",
+                "context_partitions": "1",
+            },
+        ) | {"phase": "execute"}
+        context = counter(
+            "cpu_fa2_parallel_plan_executions",
+            value=808.0,
+            domain="kernel",
+            device="cpu",
+            tags=common_tags
+            | {
+                "selected_mode": "key_value_context",
+                "query_rows": "1",
+                "arithmetic_partitions": "16",
+                "context_partitions": "4",
+            },
+        ) | {"phase": "execute"}
+
+        result = validate_cpu_flash_attention_execution_policy(
+            [query, context]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.plan_count, 2)
+        self.assertEqual(result.execution_count, 904.0)
+        self.assertEqual(
+            result.selected_modes,
+            frozenset({"query_sequence", "key_value_context"}),
+        )
+
+    def test_cpu_flash_attention_policy_requires_context_execution(
+        self,
+    ) -> None:
+        """A declaration or query-only run cannot certify context splitting."""
+
+        query = counter(
+            "cpu_fa2_parallel_plan_executions",
+            domain="kernel",
+            device="cpu",
+            tags={
+                "requested_axis": "geometry_selected",
+                "selected_mode": "query_sequence",
+                "query_rows": "128",
+                "local_query_heads": "8",
+                "head_dim": "256",
+                "physical_workers": "28",
+                "arithmetic_partitions": "4",
+                "context_partitions": "1",
+                "context_partition_rows": "256",
+                "physical_kv_tile": "128",
+            },
+        ) | {"phase": "execute"}
+
+        result = validate_cpu_flash_attention_execution_policy([query])
+        self.assertIn("never exercised K/V-context", result.error or "")
+
+    def test_cpu_flash_attention_policy_rejects_false_context_record(
+        self,
+    ) -> None:
+        """Context mode must represent multiple real physical producers."""
+
+        context = counter(
+            "cpu_fa2_parallel_plan_executions",
+            domain="kernel",
+            device="cpu",
+            tags={
+                "requested_axis": "geometry_selected",
+                "selected_mode": "key_value_context",
+                "query_rows": "1",
+                "local_query_heads": "8",
+                "head_dim": "256",
+                "physical_workers": "28",
+                "arithmetic_partitions": "8",
+                "context_partitions": "1",
+                "context_partition_rows": "256",
+                "physical_kv_tile": "256",
+            },
+        ) | {"phase": "execute"}
+
+        result = validate_cpu_flash_attention_execution_policy(
+            [context],
+            require_query_sequence=False,
+        )
+        self.assertIn("multiple context producers", result.error or "")
+
+    def test_cpu_flash_attention_policy_rejects_diagnostic_axis(
+        self,
+    ) -> None:
+        """Forced tournament controls cannot authenticate production policy."""
+
+        context = counter(
+            "cpu_fa2_parallel_plan_executions",
+            domain="kernel",
+            device="cpu",
+            tags={
+                "requested_axis": "key_value_context",
+                "selected_mode": "key_value_context",
+                "query_rows": "1",
+                "local_query_heads": "8",
+                "head_dim": "256",
+                "physical_workers": "28",
+                "arithmetic_partitions": "8",
+                "context_partitions": "4",
+                "context_partition_rows": "256",
+                "physical_kv_tile": "256",
+            },
+        ) | {"phase": "execute"}
+
+        result = validate_cpu_flash_attention_execution_policy(
+            [context],
+            require_query_sequence=False,
+        )
+        self.assertIn("geometry-selected", result.error or "")
 
     def test_gpu_host_transfer_policy_accepts_only_response_materialization(
         self,

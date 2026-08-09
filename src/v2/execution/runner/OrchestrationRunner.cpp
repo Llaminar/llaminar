@@ -46,6 +46,7 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
+#include "../../utils/CPUFeatures.h"
 #include "../../utils/MPITopology.h"
 #include "../../utils/NodeDetection.h"
 #include "../../utils/NUMATopology.h"
@@ -68,6 +69,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <print>
 #include <random>
 #include <stdexcept>
@@ -80,6 +82,19 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Describe the CPU backend using the ISA that dispatch will use.
+         *
+         * An AVX-512 build may intentionally run its AVX2 implementation under
+         * `LLAMINAR_ISA_LEVEL=avx2`.  Reporting the compile-time maximum here
+         * made benchmark matrices claim AVX-512 while measuring AVX2.
+         */
+        std::string cpuBackendDescription()
+        {
+            return std::string("CPU (oneDNN/") +
+                   isaLevelName(activeISALevel()) + ")";
+        }
+
         bool requiresOverlayMPIWorld(const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan)
         {
             if (!plan || !plan->isTieredOverlay())
@@ -13608,12 +13623,41 @@ namespace llaminar2
 
     void OrchestrationRunner::setStopTokens(const std::vector<int32_t> &stop_tokens)
     {
-        stop_tokens_ = stop_tokens;
+        if (stop_tokens.size() >
+            static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        {
+            throw std::invalid_argument(
+                "Request stop-token policy exceeds the MPI protocol's int32 count range");
+        }
+
+        /*
+         * Stop recognition changes whether an MTP transaction launches another
+         * sidecar. Install the policy locally before publishing it: a rejected
+         * root policy must never release workers into a request with a different
+         * termination contract. Once accepted, the command and its two payloads
+         * form one ordered worker-loop transaction ahead of PREFILL/DECODE_STEP.
+         */
         if (runner_ &&
-            !runner_->configureMTPRequestStopTokens(stop_tokens_))
+            !runner_->configureMTPRequestStopTokens(stop_tokens))
         {
             throw std::runtime_error(
                 "Inference runner rejected request stop-token policy");
+        }
+        stop_tokens_ = stop_tokens;
+
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 &&
+            mpi_ctx_->world_size() > 1)
+        {
+            broadcastCommand(MPICommand::SET_STOP_TOKENS);
+            int32_t stop_token_count = static_cast<int32_t>(stop_tokens_.size());
+            mpi_ctx_->broadcast_int32(&stop_token_count, 1, 0);
+            if (stop_token_count > 0)
+            {
+                mpi_ctx_->broadcast_int32(
+                    stop_tokens_.data(),
+                    static_cast<size_t>(stop_token_count),
+                    0);
+            }
         }
     }
 
@@ -14415,7 +14459,7 @@ namespace llaminar2
 
             // Backend
             if (device.is_cpu())
-                data.backend = "CPU (OneDNN/AVX-512)";
+                data.backend = cpuBackendDescription();
             else if (device.is_cuda())
                 data.backend = "CUDA (GPU " + std::to_string(device.ordinal) + ")";
             else if (device.is_rocm())
@@ -14786,7 +14830,7 @@ namespace llaminar2
         LOG_DEBUG("[OrchestrationRunner]   Device source: " << device_source);
         if (device.is_cpu())
         {
-            LOG_DEBUG("[OrchestrationRunner]   Backend: CPU (OneDNN/AVX-512)");
+            LOG_DEBUG("[OrchestrationRunner]   Backend: " << cpuBackendDescription());
         }
         else if (device.is_cuda())
         {
@@ -15776,6 +15820,29 @@ namespace llaminar2
                 sp.presence_penalty = params_buf[4];
                 sp.frequency_penalty = params_buf[5];
                 setSamplingParams(sp);
+                break;
+            }
+
+            case MPICommand::SET_STOP_TOKENS:
+            {
+                int32_t stop_token_count = 0;
+                mpi_ctx_->broadcast_int32(&stop_token_count, 1, 0);
+                if (stop_token_count < 0)
+                {
+                    throw std::runtime_error(
+                        "MPI worker received a negative request stop-token count");
+                }
+
+                std::vector<int32_t> stop_tokens(
+                    static_cast<size_t>(stop_token_count));
+                if (stop_token_count > 0)
+                {
+                    mpi_ctx_->broadcast_int32(
+                        stop_tokens.data(),
+                        static_cast<size_t>(stop_token_count),
+                        0);
+                }
+                setStopTokens(stop_tokens);
                 break;
             }
 

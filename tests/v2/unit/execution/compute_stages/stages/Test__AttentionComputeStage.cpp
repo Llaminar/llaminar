@@ -14,6 +14,7 @@
 #include <vector>
 #include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "backends/DeviceId.h"
@@ -242,6 +243,51 @@ namespace
         auto stage = std::make_unique<AttentionComputeStage>(params);
         ASSERT_NE(stage, nullptr);
         EXPECT_EQ(stage->type(), ComputeStageType::ATTENTION);
+    }
+
+    /**
+     * @brief Reject pre-RoPE cache bytes anywhere except the captured GPU reader.
+     *
+     * The policy replaces three independently mutable stage fields. These
+     * constructor checks make it impossible for a manually assembled CPU stage,
+     * cacheless GPU stage, or projection-reading GPU stage to claim that a later
+     * operation will transform K.
+     */
+    TEST_F(Test__AttentionComputeStage, PreRotaryKeyCachePolicyRequiresCacheBackedGPUReader)
+    {
+        FakeCaptureKVCache cache;
+        AttentionComputeStage::Params params;
+        params.execution_policy.key_cache = {
+            .encoding = attention::AttentionKeyCacheEncoding::
+                PreRotaryDeviceTransform,
+            .rope_theta = 10000.0f,
+            .partial_rotary_factor = 1.0f,
+        };
+        params.kv_cache = &cache;
+        params.read_kv_from_cache = true;
+
+        params.device_id = DeviceId::cpu();
+        EXPECT_THROW(
+            { AttentionComputeStage stage(params); },
+            std::invalid_argument);
+
+        params.device_id = DeviceId::cuda(0);
+        params.kv_cache = nullptr;
+        EXPECT_THROW(
+            { AttentionComputeStage stage(params); },
+            std::invalid_argument);
+
+        params.kv_cache = &cache;
+        params.read_kv_from_cache = false;
+        EXPECT_THROW(
+            { AttentionComputeStage stage(params); },
+            std::invalid_argument);
+
+        params.read_kv_from_cache = true;
+        params.execution_policy.key_cache.partial_rotary_factor = 0.0f;
+        EXPECT_THROW(
+            { AttentionComputeStage stage(params); },
+            std::invalid_argument);
     }
 
     /**

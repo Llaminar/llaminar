@@ -71,12 +71,13 @@ namespace llaminar2
             bool auto_detect_mode = true;
 
             /**
-             * @brief Declarative physical prefill policy for this graph node.
+             * @brief Complete declarative attention policy for this graph node.
              *
-             * The model graph declares the permitted logical partition axis.
-             * Backend machinery resolves `GeometrySelected` from immutable
-             * capture geometry and must preserve that concrete topology across
-             * graph replay. Live KV length is not part of this policy.
+             * The model graph declares the permitted logical partition axis and
+             * the physical encoding of persistent K cache bytes. Backend
+             * machinery resolves `GeometrySelected` from immutable capture
+             * geometry and must preserve that concrete topology across replay.
+             * Live KV length is not part of this policy.
              */
             attention::AttentionExecutionPolicy execution_policy{};
 
@@ -99,9 +100,9 @@ namespace llaminar2
              */
             const int32_t *active_query_rows_device = nullptr;
 
-            // When true, read K/V from kv_cache at execution time instead of
-            // using the statically-wired K/V pointers. Enables GPU prefill to
-            // use post-append FP16 cache tensors instead of Q8_1 projections.
+            // When true, read native K/V from kv_cache at execution time instead
+            // of using transient projection tensors. GPU cache-backed attention
+            // requires this path for every phase.
             bool read_kv_from_cache = false;
 
             // Position offset for decode mode causal masking
@@ -121,13 +122,6 @@ namespace llaminar2
             /// output is inverse-rotated after weighted-V accumulation.
             const ActivationRotation *kv_rotation = nullptr;
 
-            // RoPE-on-read: apply RoPE to K inside this attention stage.
-            // When enabled, K in the KV cache is stored pre-RoPE, and position
-            // embeddings are fused into the TQ4 dequant / applied in-place for FP32.
-            bool apply_rope_to_k = false;
-            float rope_theta = 10000.0f;        ///< RoPE frequency base (only used when apply_rope_to_k=true)
-            float partial_rotary_factor = 1.0f; ///< Fraction of head dimensions to rotate (only used when apply_rope_to_k=true)
-
         };
 
         explicit AttentionComputeStage(Params params);
@@ -141,10 +135,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override
         {
-            // TQ KV cache dequant runs inside execute() via get_kv_converted() with
-            // iteration-varying arguments (ring_pos, out_offset grow each step).
-            // Device-side dynamic params are pre-uploaded before capture/replay,
-            // so captured execution records kernels only.
+            // Device-owned native or transformed KV views consume replay-varying
+            // ring geometry through persistent device parameters. Capture records
+            // kernels only; no host conversion shadow participates.
             if (params_.kv_cache)
             {
                 const auto kp = params_.kv_cache->k_precision();
@@ -329,6 +322,8 @@ namespace llaminar2
         std::vector<const ITensor *> cpu_grouped_k_views_;
         std::vector<const ITensor *> cpu_grouped_v_views_;
         std::vector<int> cpu_grouped_kv_lens_;
+        std::vector<attention::AttentionKVLogicalView>
+            cpu_grouped_kv_logical_views_;
 
         /**
          * @brief Get or create the attention kernel

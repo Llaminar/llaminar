@@ -209,6 +209,14 @@ namespace
             return requires_mpi_coordinated_decode_sampling_;
         }
 
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            stop_tokens_ = stop_tokens;
+            ++configure_stop_tokens_count_;
+            return true;
+        }
+
         void setSkipLogitsGatherDecode(bool skip) override
         {
             skip_logits_gather_ = skip;
@@ -222,6 +230,8 @@ namespace
         int skipLogitsCalls() const { return skip_logits_calls_; }
         bool skipLogitsGather() const { return skip_logits_gather_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
+        const std::vector<int32_t> &stopTokens() const { return stop_tokens_; }
+        int configureStopTokensCount() const { return configure_stop_tokens_count_; }
 
         // Failure injection
         void setForwardSuccess(bool success) { forward_success_ = success; }
@@ -247,6 +257,8 @@ namespace
         bool requires_mpi_coordinated_decode_sampling_{false};
         int fail_after_n_forwards_{0}; // 0 = disabled
         std::vector<int> last_forward_tokens_;
+        std::vector<int32_t> stop_tokens_;
+        int configure_stop_tokens_count_{0};
     };
 
     // =========================================================================
@@ -568,6 +580,44 @@ namespace
         EXPECT_FLOAT_EQ(data.float_data[3], 42.0f);
         EXPECT_FLOAT_EQ(data.float_data[4], 0.0f);
         EXPECT_FLOAT_EQ(data.float_data[5], 0.0f);
+    }
+
+    // =========================================================================
+    // setStopTokens() Coordination Tests
+    // =========================================================================
+
+    TEST_F(Test__MPICoordinatedMode, SetStopTokensBroadcastsCompleteRequestPolicy)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->setStopTokens({151643, 151645});
+
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_STOP_TOKENS)));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(2));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data,
+                    ElementsAre(151643, 151645));
+        EXPECT_THAT(mock->stopTokens(), ElementsAre(151643, 151645));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, SetEmptyStopPolicyPublishesZeroCountOnly)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->setStopTokens({});
+
+        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_STOP_TOKENS)));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_TRUE(mock->stopTokens().empty());
     }
 
     // =========================================================================
@@ -1074,6 +1124,37 @@ namespace
         EXPECT_FLOAT_EQ(params.top_p, 0.9f);
         EXPECT_EQ(params.top_k, 40);
         EXPECT_EQ(params.seed, 42u);
+    }
+
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopInstallsRootStopPolicyBeforeInference)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SET_STOP_TOKENS)});
+        scripted->scriptInt32({2});
+        scripted->scriptInt32({151643, 151645});
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+
+        EXPECT_THAT(mock->stopTokens(), ElementsAre(151643, 151645));
+        EXPECT_EQ(mock->configureStopTokensCount(), 1);
+        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+    }
+
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopRejectsMalformedNegativeStopCount)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SET_STOP_TOKENS)});
+        scripted->scriptInt32({-1});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_TRUE(mock->stopTokens().empty());
     }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesSkipLogitsDecode)

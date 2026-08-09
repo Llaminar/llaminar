@@ -3943,6 +3943,34 @@ namespace llaminar2
         return true;
     }
 
+    attention::AttentionExecutionPolicy
+    QwenGraphBase::resolveAttentionExecutionPolicy(
+        DeviceId device,
+        bool cache_backed) const
+    {
+        if (!device.is_cpu() && !device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "attention execution policy requires a valid CPU, CUDA, or ROCm device");
+        }
+
+        const bool device_transforms_cached_keys =
+            cache_backed && device.is_gpu() && config_.rope_on_read;
+        return {
+            .prefill_parallel_axis =
+                attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .key_cache = {
+                .encoding =
+                    device_transforms_cached_keys
+                        ? attention::AttentionKeyCacheEncoding::
+                              PreRotaryDeviceTransform
+                        : attention::AttentionKeyCacheEncoding::PostRotary,
+                .rope_theta = config_.rope_theta,
+                .partial_rotary_factor = config_.partial_rotary_factor,
+            },
+        };
+    }
+
     std::string QwenGraphBase::addKeyCachePublicationTransforms(
         ComputeGraph &graph,
         const std::string &prefix,
@@ -3953,6 +3981,7 @@ namespace llaminar2
         const int *position_ids,
         const void *position_ids_device,
         DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &projection_dependency)
     {
         if (!buffers.K || local_n_kv_heads <= 0 || total_tokens <= 0 ||
@@ -3984,7 +4013,7 @@ namespace llaminar2
             key_terminal = norm_node;
         }
 
-        if (!config_.rope_on_read)
+        if (!execution_policy.key_cache.transformsOnRead())
         {
             const std::string rope_node = prefix + "k_rope";
             const int pos_offset = position_ids ? position_ids[0] : 0;
@@ -4025,7 +4054,8 @@ namespace llaminar2
         int total_tokens,
         const int *position_ids,
         const void *position_ids_device,
-        DeviceId device)
+        DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy)
     {
         const std::string node_name = prefix + "rope";
         int pos_offset = position_ids ? position_ids[0] : 0;
@@ -4048,7 +4078,7 @@ namespace llaminar2
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
                           .position_ids_device = position_ids_device,
-                          .skip_k = config_.rope_on_read,
+                          .skip_k = execution_policy.key_cache.transformsOnRead(),
                           .force_decode_equivalent_verifier_prefill =
                               force_decode_equivalent_rope_verifier_prefill,
                           .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
@@ -4069,6 +4099,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int32_t *request_sequence_lengths_device,
         DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &rope_dependency,
         const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local,
@@ -4170,7 +4201,8 @@ namespace llaminar2
                               }),
                               device);
 
-                if (config_.rope_on_read && !cache_source_dependencies.empty())
+                if (execution_policy.key_cache.transformsOnRead() &&
+                    !cache_source_dependencies.empty())
                 {
                     for (const auto &dep : cache_source_dependencies)
                     {
@@ -4248,6 +4280,7 @@ namespace llaminar2
         const int32_t *request_sequence_lengths_device,
         DeviceId device,
         bool has_qkv_proj,
+        const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &rope_dependency,
         const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local)
@@ -4270,6 +4303,7 @@ namespace llaminar2
                 kv_cache,
                 request_sequence_lengths_device,
                 device,
+                execution_policy,
                 rope_dependency,
                 cache_source_dependencies,
                 layer_idx_is_cache_local);
@@ -4379,20 +4413,11 @@ namespace llaminar2
             attn_params.attention_mode = mode;
             attn_params.auto_detect_mode = true;
             /*
-             * Both GPU backends own byte-equivalent query-sequence and
-             * K/V-context prefill implementations. Each backend resolves this
-             * declarative choice once from the captured bucket, local head
-             * shard, cache capacity, and physical accelerator geometry. The
-             * resulting launch envelope is immutable across graph replay;
-             * device-live row and KV lengths select only work inside that
-             * envelope. CPU retains its native query-sequence implementation.
+             * The graph resolves physical parallelism and cached-K encoding
+             * once. The exact same value already governed RoPE and cache append,
+             * so the attention consumer cannot silently choose different bytes.
              */
-            attn_params.execution_policy = {
-                .prefill_parallel_axis =
-                    device.is_gpu()
-                        ? attention::AttentionPrefillParallelAxis::GeometrySelected
-                        : attention::AttentionPrefillParallelAxis::QuerySequence,
-            };
+            attn_params.execution_policy = execution_policy;
             attn_params.workspace_scores = buffers.workspace_scores;
             attn_params.workspace_context = buffers.workspace_context;
             /*
@@ -4430,13 +4455,6 @@ namespace llaminar2
             // buffers removed). Don't set buffer_ids for the contract.
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
-
-            if (config_.rope_on_read)
-            {
-                attn_params.apply_rope_to_k = true;
-                attn_params.rope_theta = config_.rope_theta;
-                attn_params.partial_rotary_factor = config_.partial_rotary_factor;
-            }
 
             graph.addNode(prefix + "attention",
                           ComputeStageFactory::createAttentionCompute(attn_params),

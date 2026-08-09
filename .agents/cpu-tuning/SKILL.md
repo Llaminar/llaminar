@@ -94,11 +94,59 @@ cmake --build build_v2_release --parallel --target \
 cmake --build build_v2_release --parallel --target \
   v2_perf_cpu_flash_attention_sweep
 cmake --build build_v2_release --parallel --target \
+  v2_perf_cpu_flash_attention_tile_tournament
+cmake --build build_v2_release --parallel --target \
   v2_perf_gemm_tuning_sweep
 ```
 
 Search `tests/v2/CMakeLists.txt` for the exact target that owns the kernel; do
 not profile a neighboring proxy when the production-shaped harness exists.
+
+### CPU FlashAttention cache-tile policy
+
+CPU FA2 keeps arithmetic and cache blocking separate. The shared scheduler in
+`CPUFlashAttentionKernelT.h` always forms canonical 256-row online-softmax
+summaries and merges them in ascending K/V order. A physical K/V tile may alter
+which rows stream through private cache in one callback, but it must never alter
+score indexing, four-row vector groups, summary boundaries, or output bytes.
+Do not install a tile optimization that couples those two policies again.
+
+Build and certify AVX2 and AVX-512 independently with Release code generation:
+
+```bash
+cmake -B build_v2_release_avx2 -S src/v2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DLLAMINAR_CPU_ISA=AVX2
+cmake --build build_v2_release_avx2 --parallel --target \
+  v2_perf_cpu_flash_attention_tile_tournament
+
+python tests/v2/performance/kernels/cpu/attention/run_cpu_fa2_tile_tournament.py \
+  --binary build_v2_release_avx2/tests/v2/v2_perf_cpu_flash_attention_tile_tournament \
+  --family-repeats 3 --max-p95-regret 5
+```
+
+Repeat with `-DLLAMINAR_CPU_ISA=AVX512` and a distinct AVX-512 build directory.
+Also run that AVX-512 binary with `LLAMINAR_ISA_LEVEL=avx2`; compiler code
+generation and runtime algorithm dispatch are independent measured axes, and
+the mixed regime must not reuse AVX2-only evidence implicitly. Tournament CSV
+and summaries must name both `codegen_isa` and `runtime_isa`.
+
+The driver selects one hardware thread per physical core on one socket, runs
+each `(native K/V format, head dimension)` family in a fresh process, and takes
+the median domain regret across fresh-process repeats. Its complete compact
+matrix is nine native K/V pairings, head dimensions 64/128/256, decode M=1,
+grouped M=15, prefill M=128, and all seven compiled physical tiles. Every
+candidate is byte-authenticated through the production kernel before timing;
+missing candidates, mixed code-generation/runtime ISA profiles, malformed
+evidence, and byte mismatches are fatal. Use `--cpu-list` when topology or
+governor control requires an explicit socket.
+
+For one isolated profiler experiment, filter the C++ worker directly with
+`LLAMINAR_CPU_FA2_TOURNAMENT_FORMAT`, `_HEAD_DIM`, `_M`, `_KV`, and `_TILE`.
+Set `_SAMPLES` to a complete forward/reverse candidate-cycle count, keep
+`_WARMUP` outside timing, and use `_COLD=1` only for an explicitly cold-cache
+question. One `_TILE` worker is profiler evidence, not a regret certificate.
+Keep the all-tile integration regressions and the process-isolated policy gate
+green after any scheduler, codec, cache rule, or SIMD change.
 
 ## 2. Prepare Linux perf safely
 

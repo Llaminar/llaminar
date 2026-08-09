@@ -167,6 +167,8 @@ namespace llaminar2
 
         // Resolve local head counts for TP
         auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
 
         // Stage 2.5: Per-head QK RMSNorm (Qwen3)
         bool has_qk_norms = addQKNorms(
@@ -189,7 +191,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device, attention_policy);
 
         // Wire RoPE dependencies
         if (has_qk_norms)
@@ -208,7 +210,7 @@ namespace llaminar2
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
             kv_cache, position_ids, position_ids_device,
             sequence_lengths_device,
-            device, has_qkv_proj, rope_node,
+            device, has_qkv_proj, attention_policy, rope_node,
             cache_source_dependencies);
 
         // Stage 5: Wo projection + optional TP allreduce

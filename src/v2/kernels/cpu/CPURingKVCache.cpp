@@ -28,13 +28,9 @@
 #include "CPURingKVCache.h"
 
 #include "../kvcache/KVCacheLogicalBlockCodec.h"
-#include "turboquant/TurboQuantDequantizeTQ4.h"
-#include "turboquant/TurboQuantDequantizeSplitTQ.h"
-#include "../../tensors/SIMDHelpers.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 
 namespace llaminar2
@@ -321,483 +317,6 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Converted KV Access (get_kv_converted)
-    // =========================================================================
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    bool CPURingKVCache<KPrecision, VPrecision>::get_kv_converted(
-        int layer, int seq_idx,
-        ActivationPrecision target,
-        ITensor **out_k, ITensor **out_v,
-        int *out_kv_len,
-        const KVReadParams *rope)
-    {
-        // Only FP32 target is supported currently
-        if (target != ActivationPrecision::FP32)
-        {
-            LOG_ERROR("[CPURingKVCache] get_kv_converted: only FP32 target supported, got "
-                      << static_cast<int>(target));
-            return false;
-        }
-
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return false;
-        }
-
-        // FP32 cache: passthrough when head==0, linearize into shadow otherwise
-        if constexpr (KPrecision == ActivationPrecision::FP32 && VPrecision == ActivationPrecision::FP32)
-        {
-            auto &entry = entries_[layer][seq_idx];
-
-            if (entry.head == 0)
-            {
-                // No wrap: passthrough raw buffer (fast path)
-                if (out_k)
-                    *out_k = entry.K.get();
-                if (out_v)
-                    *out_v = entry.V.get();
-                if (out_kv_len)
-                    *out_kv_len = entry.size;
-
-                if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0 && rope->head_dim > 0)
-                {
-                    auto &shadow = ensureFP32Shadow(layer, seq_idx);
-                    if (shadow.converted_rows < entry.size)
-                    {
-                        const int new_rows = entry.size - shadow.converted_rows;
-                        apply_rope_to_k_fp32(
-                            entry.K->mutable_data() + static_cast<size_t>(shadow.converted_rows) * kv_dim_,
-                            new_rows, rope->head_dim, rope->n_kv_heads,
-                            rope->rope_theta, rope->position_start + shadow.converted_rows,
-                            rope->rope_dim);
-                        shadow.converted_rows = entry.size;
-                    }
-                }
-                return true;
-            }
-
-            // Ring has wrapped (head != 0): linearize into shadow buffer
-            auto &shadow = ensureFP32Shadow(layer, seq_idx);
-
-            // Detect head movement → full re-linearization needed
-            if (entry.head != shadow.last_head)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = entry.head;
-            }
-
-            if (shadow.converted_rows < entry.size)
-            {
-                float *k_fp32 = shadow.K->mutable_data();
-                float *v_fp32 = shadow.V->mutable_data();
-                const float *src_k = entry.K->data();
-                const float *src_v = entry.V->data();
-
-                for (int r = shadow.converted_rows; r < entry.size; ++r)
-                {
-                    const int phys = (entry.head + r) % max_seq_len_;
-                    const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                    const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                    std::memcpy(k_fp32 + dst_off, src_k + src_off, kv_dim_ * sizeof(float));
-                    std::memcpy(v_fp32 + dst_off, src_v + src_off, kv_dim_ * sizeof(float));
-                }
-
-                if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0 && rope->head_dim > 0)
-                {
-                    const size_t offset = static_cast<size_t>(shadow.converted_rows) * kv_dim_;
-                    apply_rope_to_k_fp32(
-                        k_fp32 + offset,
-                        entry.size - shadow.converted_rows, rope->head_dim, rope->n_kv_heads,
-                        rope->rope_theta, rope->position_start + shadow.converted_rows,
-                        rope->rope_dim);
-                }
-
-                shadow.converted_rows = entry.size;
-            }
-
-            if (out_k)
-                *out_k = shadow.K.get();
-            if (out_v)
-                *out_v = shadow.V.get();
-            if (out_kv_len)
-                *out_kv_len = entry.size;
-            return true;
-        }
-        else
-        {
-            auto &entry = entries_[layer][seq_idx];
-            const int kv_len = entry.size;
-
-            auto &shadow = ensureFP32Shadow(layer, seq_idx);
-
-            // Detect cache clear (kv_len decreased since last call)
-            if (kv_len < shadow.converted_rows)
-                shadow.converted_rows = 0;
-
-            // Detect ring head movement (wrap) → full reconversion needed
-            if (entry.head != shadow.last_head)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = entry.head;
-            }
-
-            // Convert new rows incrementally
-            if (shadow.converted_rows < kv_len)
-            {
-                convertNewRows(layer, seq_idx, shadow, entry, rope);
-            }
-
-            if (out_k)
-                *out_k = shadow.K.get();
-            if (out_v)
-                *out_v = shadow.V.get();
-            if (out_kv_len)
-                *out_kv_len = kv_len;
-            return true;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Shadow buffer lazy allocation
-    // -------------------------------------------------------------------------
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    auto CPURingKVCache<KPrecision, VPrecision>::ensureFP32Shadow(int layer, int seq_idx) const
-        -> FP32Shadow &
-    {
-        // Lazy init the 2D vector if empty
-        if (fp32_shadows_.empty())
-        {
-            fp32_shadows_.resize(n_layers_);
-            for (auto &layer_vec : fp32_shadows_)
-                layer_vec.resize(batch_size_);
-        }
-
-        auto &shadow = fp32_shadows_[layer][seq_idx];
-        if (!shadow.K)
-        {
-            const size_t total = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_dim_);
-            shadow.K = std::make_unique<FP32Tensor>(std::vector<size_t>{total});
-            shadow.V = std::make_unique<FP32Tensor>(std::vector<size_t>{total});
-            shadow.converted_rows = 0;
-        }
-        return shadow;
-    }
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::invalidateFP32Shadow(int layer, int seq_idx) const
-    {
-        if (fp32_shadows_.empty() || layer < 0 || layer >= static_cast<int>(fp32_shadows_.size()) ||
-            seq_idx < 0 || seq_idx >= static_cast<int>(fp32_shadows_[layer].size()))
-        {
-            return;
-        }
-
-        auto &shadow = fp32_shadows_[layer][seq_idx];
-        shadow.converted_rows = 0;
-        shadow.last_head = -1;
-    }
-
-    // -------------------------------------------------------------------------
-    // Per-precision incremental conversion dispatch
-    // -------------------------------------------------------------------------
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::convertNewRows(
-        int layer, int seq_idx,
-        FP32Shadow &shadow, const EntryT &entry,
-        const KVReadParams *rope) const
-    {
-        const int from = shadow.converted_rows;
-        const int to = entry.size;
-        float *k_fp32 = shadow.K->mutable_data();
-        float *v_fp32 = shadow.V->mutable_data();
-
-        // FP16 cache
-        if constexpr (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16)
-        {
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::convert_fp16_to_fp32(entry.K->typed_data() + src_off, k_fp32 + dst_off, kv_dim_);
-                simd::convert_fp16_to_fp32(entry.V->typed_data() + src_off, v_fp32 + dst_off, kv_dim_);
-            }
-
-            // Apply RoPE to newly converted K rows if requested
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // BF16 cache
-        else if constexpr (KPrecision == ActivationPrecision::BF16 && VPrecision == ActivationPrecision::BF16)
-        {
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::convert_bf16_to_fp32(entry.K->typed_data() + src_off, k_fp32 + dst_off, kv_dim_);
-                simd::convert_bf16_to_fp32(entry.V->typed_data() + src_off, v_fp32 + dst_off, kv_dim_);
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // Q8_1 cache
-        else if constexpr (KPrecision == ActivationPrecision::Q8_1 && VPrecision == ActivationPrecision::Q8_1)
-        {
-            const size_t blocks_per_row = entry.K->blocks_per_row();
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const Q8_1Block *k_row = entry.K->typed_data() + phys * blocks_per_row;
-                const Q8_1Block *v_row = entry.V->typed_data() + phys * blocks_per_row;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::dequantize_q8_1_to_fp32(k_row, k_fp32 + dst_off, kv_dim_);
-                simd::dequantize_q8_1_to_fp32(v_row, v_fp32 + dst_off, kv_dim_);
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // TQ4 symmetric cache (both K and V are TQ4)
-        // NOTE: TQ paths pass from/to as physical row indices to turboquant helpers.
-        // After ring wrap, these need physical→logical mapping too (same as FP16/Q8_1 above).
-        // Currently safe because TQ caches don't use sequences exceeding max_seq_len in practice,
-        // but this should be fixed when TQ + ring wrap is needed.
-        else if constexpr (KPrecision == ActivationPrecision::TQ4 && VPrecision == ActivationPrecision::TQ4)
-        {
-            if (!rope || !rope->turboquant_ctx)
-            {
-                LOG_ERROR("[CPURingKVCache] TQ4 get_kv_converted requires turboquant_ctx in KVReadParams");
-                shadow.converted_rows = to;
-                return;
-            }
-            const auto &layer_ctx = rope->turboquant_ctx->for_layer(layer);
-
-            auto *K_tq4 = entry.K.get();
-            auto *V_tq4 = entry.V.get();
-            K_tq4->set_turboquant_context(&layer_ctx);
-            V_tq4->set_turboquant_context(&layer_ctx);
-
-            if (rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                turboquant_dequantize_kv_rows_with_rope(
-                    K_tq4->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    rope->head_dim, rope->n_kv_heads,
-                    K_tq4->blocks_per_row() * K_tq4->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq4->block_bytes(), V_tq4->block_bytes(),
-                    rope->rope_theta, rope->position_start + from);
-            }
-            else
-            {
-                turboquant_dequantize_kv_rows(
-                    K_tq4->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    head_dim_, n_kv_heads_,
-                    K_tq4->blocks_per_row() * K_tq4->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq4->block_bytes(), V_tq4->block_bytes());
-            }
-        }
-        // Split TQ cache: K is TQ8, V is TQ4
-        // NOTE: Same ring wrap limitation as TQ4 above.
-        else if constexpr (KPrecision == ActivationPrecision::TQ8 && VPrecision == ActivationPrecision::TQ4)
-        {
-            if (!rope || !rope->turboquant_ctx)
-            {
-                LOG_ERROR("[CPURingKVCache] Split TQ get_kv_converted requires turboquant_ctx in KVReadParams");
-                shadow.converted_rows = to;
-                return;
-            }
-            const auto &layer_ctx = rope->turboquant_ctx->for_layer(layer);
-
-            auto *K_tq8 = entry.K.get();
-            auto *V_tq4 = entry.V.get();
-            K_tq8->set_turboquant_context(&layer_ctx);
-            V_tq4->set_turboquant_context(&layer_ctx);
-
-            if (rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                turboquant_dequantize_split_kv_rows_with_rope(
-                    K_tq8->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    rope->head_dim, rope->n_kv_heads,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq8->block_bytes(), V_tq4->block_bytes(),
-                    rope->rope_theta, rope->position_start + from);
-            }
-            else
-            {
-                turboquant_dequantize_split_kv_rows(
-                    K_tq8->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    head_dim_, n_kv_heads_,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq8->block_bytes(), V_tq4->block_bytes());
-            }
-        }
-        // Q16_1 cache (both K and V are Q16_1)
-        // Q16_1 always uses HEAD_MAJOR layout: [n_kv_heads][position][head_dim]
-        // The Q16_1Tensor has shape (local_n_kv_heads * max_seq_len, head_dim).
-        // Each "raw row" is one head for one position (head_dim elements).
-        // The FP32 shadow is POSITION_MAJOR: row r = [head0..head1..] kv_dim wide.
-        else if constexpr (KPrecision == ActivationPrecision::Q16_1 && VPrecision == ActivationPrecision::Q16_1)
-        {
-            // Block geometry for K
-            const size_t k_block_elems = q16_block_size_elements(entry.K->q16_block_size());
-            const size_t k_block_bytes = q16_block_size_bytes(entry.K->q16_block_size());
-            const size_t k_bpr = entry.K->blocks_per_row(); // blocks per head_dim
-            const size_t k_head_row_bytes = k_bpr * k_block_bytes;
-
-            // Block geometry for V
-            const size_t v_block_elems = q16_block_size_elements(entry.V->q16_block_size());
-            const size_t v_block_bytes = q16_block_size_bytes(entry.V->q16_block_size());
-            const size_t v_bpr = entry.V->blocks_per_row();
-            const size_t v_head_row_bytes = v_bpr * v_block_bytes;
-
-            const uint8_t *k_raw = reinterpret_cast<const uint8_t *>(entry.K->raw_data());
-            const uint8_t *v_raw = reinterpret_cast<const uint8_t *>(entry.V->raw_data());
-
-            constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // int16_t qs[]
-
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t dst_row_off = static_cast<size_t>(r) * kv_dim_;
-
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    // HEAD_MAJOR raw row = h * max_seq_len + phys
-                    const size_t raw_row = static_cast<size_t>(h) * max_seq_len_ + phys;
-                    const size_t dst_head_off = dst_row_off + static_cast<size_t>(h) * head_dim_;
-
-                    // Dequantize K: head h, position phys
-                    const uint8_t *k_head = k_raw + raw_row * k_head_row_bytes;
-                    for (size_t b = 0; b < k_bpr; ++b)
-                    {
-                        const uint8_t *blk = k_head + b * k_block_bytes;
-                        float d;
-                        std::memcpy(&d, blk, sizeof(float));
-                        const int16_t *qs = reinterpret_cast<const int16_t *>(blk + QS_OFFSET);
-                        const size_t base = b * k_block_elems;
-                        const size_t count = std::min(k_block_elems, static_cast<size_t>(head_dim_) - base);
-                        for (size_t i = 0; i < count; ++i)
-                            k_fp32[dst_head_off + base + i] = d * static_cast<float>(qs[i]);
-                    }
-
-                    // Dequantize V: head h, position phys
-                    const uint8_t *v_head = v_raw + raw_row * v_head_row_bytes;
-                    for (size_t b = 0; b < v_bpr; ++b)
-                    {
-                        const uint8_t *blk = v_head + b * v_block_bytes;
-                        float d;
-                        std::memcpy(&d, blk, sizeof(float));
-                        const int16_t *qs = reinterpret_cast<const int16_t *>(blk + QS_OFFSET);
-                        const size_t base = b * v_block_elems;
-                        const size_t count = std::min(v_block_elems, static_cast<size_t>(head_dim_) - base);
-                        for (size_t i = 0; i < count; ++i)
-                            v_fp32[dst_head_off + base + i] = d * static_cast<float>(qs[i]);
-                    }
-                }
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // Symmetric TQ8 cache (both K and V are TQ8).
-        else if constexpr (KPrecision == ActivationPrecision::TQ8 && VPrecision == ActivationPrecision::TQ8)
-        {
-            if (!rope || !rope->turboquant_ctx)
-            {
-                LOG_ERROR("[CPURingKVCache] Symmetric TQ8 get_kv_converted requires turboquant_ctx in KVReadParams");
-                shadow.converted_rows = to;
-                return;
-            }
-            const auto &layer_ctx = rope->turboquant_ctx->for_layer(layer);
-            auto *K_tq8 = entry.K.get();
-            auto *V_tq8 = entry.V.get();
-            K_tq8->set_turboquant_context(&layer_ctx);
-            V_tq8->set_turboquant_context(&layer_ctx);
-
-            if (rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                turboquant_dequantize_tq8_kv_rows_with_rope(
-                    K_tq8->typed_data(), V_tq8->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to, rope->head_dim, rope->n_kv_heads,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq8->blocks_per_row() * V_tq8->block_bytes(),
-                    K_tq8->block_bytes(), V_tq8->block_bytes(),
-                    rope->rope_theta, rope->position_start + from);
-            }
-            else
-            {
-                turboquant_dequantize_tq8_kv_rows(
-                    K_tq8->typed_data(), V_tq8->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to, head_dim_, local_n_kv_heads_,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq8->blocks_per_row() * V_tq8->block_bytes(),
-                    K_tq8->block_bytes(), V_tq8->block_bytes());
-            }
-        }
-        else
-        {
-            LOG_ERROR("[CPURingKVCache] get_kv_converted not implemented for precision K="
-                      << static_cast<int>(KPrecision) << " V=" << static_cast<int>(VPrecision));
-            shadow.converted_rows = to;
-            return;
-        }
-
-        shadow.converted_rows = to;
-    }
-
-    // =========================================================================
     // Individual K / V Accessors
     // =========================================================================
     // These are thin wrappers that return the raw K or V tensor pointer.
@@ -868,14 +387,6 @@ namespace llaminar2
                 entries_[layer][seq_idx].size = 0;
             }
         }
-        for (auto &layer_shadows : fp32_shadows_)
-        {
-            for (auto &shadow : layer_shadows)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = -1;
-            }
-        }
         wrap_warned_ = false;
         return true;
     }
@@ -898,7 +409,6 @@ namespace llaminar2
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
-        invalidateFP32Shadow(layer, seq_idx);
         return true;
     }
 
@@ -919,7 +429,6 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
-            invalidateFP32Shadow(layer, seq_idx);
         }
         return true;
     }
@@ -941,7 +450,6 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
-            invalidateFP32Shadow(layer, seq_idx);
         }
         return true;
     }
@@ -1351,7 +859,6 @@ namespace llaminar2
 
         entry.head = next_head;
         entry.size = next_size;
-        invalidateFP32Shadow(layer, seq_idx);
         PerfStatsCollector::addCounter(
             "kernel",
             "cpu_kv_cache_grouped_verifier_append_calls",
@@ -1663,7 +1170,6 @@ namespace llaminar2
             entry.head = (entry.head + evict) % max_seq_len_;
             entry.size -= evict;
             total_evicted_ += evict;
-            invalidateFP32Shadow(layer, seq_idx);
         }
     }
 
@@ -1909,7 +1415,6 @@ namespace llaminar2
             {
                 entry.head = 0;
                 entry.size = 0;
-                invalidateFP32Shadow(local_layer, desc.seq_idx);
             }
             return true;
         }
@@ -1968,7 +1473,6 @@ namespace llaminar2
 
         entry.head = 0;
         entry.size = std::max(entry.size, desc.logical_token_start + desc.token_count);
-        invalidateFP32Shadow(local_layer, desc.seq_idx);
         return true;
     }
 
@@ -2001,7 +1505,6 @@ namespace llaminar2
                 entry.head = 0;
             }
             entry.size = cached_tokens;
-            invalidateFP32Shadow(layer, seq_idx);
         }
         return true;
     }

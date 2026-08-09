@@ -3400,9 +3400,12 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
     params.kv_cache = kv_cache.get();
     params.layer_idx = 0;
     params.read_kv_from_cache = true;
-    params.apply_rope_to_k = true;
-    params.rope_theta = rope_theta;
-    params.partial_rotary_factor = partial_rotary_factor;
+    params.execution_policy.key_cache = {
+        .encoding = attention::AttentionKeyCacheEncoding::
+            PreRotaryDeviceTransform,
+        .rope_theta = rope_theta,
+        .partial_rotary_factor = partial_rotary_factor,
+    };
     params.mpi_ctx = &mpi_ctx;
 
     AttentionComputeStage stage(params);
@@ -3693,9 +3696,12 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = true;
-    attn_params.rope_theta = rope_theta;
-    attn_params.partial_rotary_factor = partial_rotary_factor;
+    attn_params.execution_policy.key_cache = {
+        .encoding = attention::AttentionKeyCacheEncoding::
+            PreRotaryDeviceTransform,
+        .rope_theta = rope_theta,
+        .partial_rotary_factor = partial_rotary_factor,
+    };
     attn_params.turboquant_ctx = turboquant_context.get();
     attn_params.mpi_ctx = &mpi_ctx;
     attn_params.head_start = head_start;

@@ -2070,7 +2070,7 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
     EXPECT_FALSE(isLiveStateVersionedReplayCache(single_token_decode));
     EXPECT_FALSE(isLiveStateVersionedReplayCache(all_position_verifier));
     EXPECT_FALSE(isLiveStateVersionedReplayCache(multirow_all_position_verifier))
-        << "All-position verifier replay publishes row-local state through stage-owned capture slots "
+        << "All-position verifier replay publishes row-local state through workspace-manager-owned capture slots "
            "and refreshes row metadata before every launch.";
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
               ForwardReplayStateCacheClass::ExactPrefill);

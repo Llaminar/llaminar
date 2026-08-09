@@ -145,9 +145,9 @@ namespace llaminar2
         // Device settings
         config.default_device = plan.primary_device.toLocalDeviceId();
 
-        // Enable rope_on_read: fuses RoPE into KV cache read path
-        // (get_kv_converted applies RoPE during incremental dequant)
-        // Supported on CPU (all precisions) and GPU (via get_kv_converted override)
+        // GPU preference: CUDA/ROCm may fuse RoPE into their captured,
+        // device-owned cache read. CPU graph policy always publishes post-RoPE
+        // native cache bytes and never constructs a conversion shadow.
         {
             config.rope_on_read = debugEnv().runtime_debug.rope_on_read;
         }
@@ -421,11 +421,8 @@ namespace llaminar2
             config.rms_norm_eps = loader->rmsNormEps();
         }
 
-        // Enable rope_on_read: fuses RoPE into KV cache read path.
-        // K is stored pre-RoPE in the cache; get_kv_converted() applies RoPE
-        // during read (fused with dequantization for quantized caches).
-        // Required for TQ caches (raw TQ blocks can't be read by attention),
-        // and saves a kernel launch for all cache types during decode.
+        // GPU rope_on_read stores pre-RoPE K and transforms it inside the
+        // captured device cache-read path. CPU retains post-RoPE native bytes.
         // TODO: Re-enable once the TQ pipeline parity is acceptable
         // config.rope_on_read = true;
 

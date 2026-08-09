@@ -1879,7 +1879,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
     ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
 }
 
-TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
+TEST(Test__MTPGraphConstruction, CPUKVOnlySidecarPublishesPostRotaryKDespiteGpuReadPreference)
 {
     DenseMTPGraphFixture fixture;
     fixture.config.rope_on_read = true;
@@ -1922,7 +1922,12 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     EXPECT_EQ(graph.getNode("MTP0_q_gate_split"), nullptr);
     EXPECT_EQ(graph.getNode("MTP0_q_norm"), nullptr);
     EXPECT_EQ(graph.getNode("MTP0_rope"), nullptr);
-    EXPECT_EQ(graph.getNode("MTP0_k_rope"), nullptr);
+    const auto *key_rope_node = graph.getNode("MTP0_k_rope");
+    ASSERT_NE(key_rope_node, nullptr);
+    const auto *key_rope =
+        dynamic_cast<const RoPEStage *>(key_rope_node->stage.get());
+    ASSERT_NE(key_rope, nullptr);
+    EXPECT_EQ(key_rope->getParams().operand_set, RoPEOperandSet::KeyOnly);
     EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
     EXPECT_EQ(graph.getNode("layer64_ffn_residual"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_final_norm"), nullptr);
@@ -1932,7 +1937,8 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     EXPECT_TRUE(hasDependency(graph, "MTP0_attn_norm", "mtp0_fc"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_kv_proj", "MTP0_attn_norm"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_k_norm", "MTP0_kv_proj"));
-    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_k_rope", "MTP0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_k_rope"));
 
     const auto kv_contract = graph.getNode("MTP0_kv_proj")->stage->bufferContract();
     EXPECT_TRUE(contractReads(kv_contract, BufferId::MTP_NORM_HIDDEN));
@@ -3703,6 +3709,113 @@ TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)
     };
     EXPECT_GT(payload_abs_sum(mtp.kvKData(), mtp.layout.bytes_per_fa_layer_k), 0.0f);
     EXPECT_GT(payload_abs_sum(mtp.kvVData(), mtp.layout.bytes_per_fa_layer_v), 0.0f);
+}
+
+/**
+ * @brief CPU MTP workspace discovery uses the canonical host-owned row plan.
+ *
+ * Eager graph-family materialization runs before the first server request and
+ * must declare the largest grouped-verifier topology. GPU participants bind
+ * persistent arena rows at this boundary, but CPU participants deliberately
+ * own token, position, and ragged-length rows in host memory. This regression
+ * covers a multi-request shape so an undersized one-request manifest cannot
+ * hide behind the common scalar server configuration.
+ */
+TEST(Test__MTPGraphConstruction,
+     CPUWorkspaceFamilyMaterializesBatchedGroupedVerifierWithHostRows)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.draft_tokens = 3;
+    fixture.config.mtp.max_request_batch = 2;
+    auto graph_builder =
+        std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(
+        *orchestrator.frozenWeightSet(),
+        store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    EXPECT_TRUE(orchestrator.materializeForwardGraphForShape(
+        /*seq_len=*/1,
+        /*batch_size=*/2));
+    EXPECT_FALSE(graph_builder->config().grouped_mtp_verifier)
+        << "Workspace discovery must restore declarative graph policy after "
+           "the grouped participant is built.";
+
+    EXPECT_GT(
+        static_cast<const IForwardExecutionHost &>(orchestrator)
+            .workspaceGeneration(DeviceId::cpu()),
+        0U)
+        << "CPU executable stages retain workspace addresses and therefore need "
+           "a published graph-family generation before request execution.";
+
+    const int maximum_sidecar_rows =
+        resolveMTPMaxTargetQueryRows(fixture.config.mtp);
+    const auto records = PerfStatsCollector::snapshot({"memory", "mtp"});
+    const auto participant = std::find_if(
+        records.begin(),
+        records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            const auto backend = record.tags.find("backend");
+            const auto maximum_rows = record.tags.find("maximum_rows");
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "mtp" &&
+                   record.name == "workspace_family_graph_participants" &&
+                   record.phase == "materialize" &&
+                   record.device == DeviceId::cpu().toString() &&
+                   backend != record.tags.end() &&
+                   backend->second == "cpu" &&
+                   maximum_rows != record.tags.end() &&
+                   maximum_rows->second ==
+                       std::to_string(maximum_sidecar_rows);
+        });
+    ASSERT_NE(participant, records.end())
+        << "CPU MTP sidecars must be declared as exact serial-family members.";
+    EXPECT_DOUBLE_EQ(
+        participant->value,
+        static_cast<double>(maximum_sidecar_rows + 2))
+        << "The family contains full, chained, and every configured KV-only row shape.";
+
+    for (const char *buffer_name : {
+             "attn_partial_output",
+             "attn_partial_m",
+             "attn_partial_l"})
+    {
+        EXPECT_TRUE(std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                const auto name = record.tags.find("name");
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "memory" &&
+                       record.name == "workspace_suballoc_bytes" &&
+                       record.phase == "allocate" &&
+                       record.device == DeviceId::cpu().toString() &&
+                       record.value > 0.0 &&
+                       name != record.tags.end() &&
+                       name->second == buffer_name;
+            }))
+            << "Missing setup-owned CPU attention workspace buffer "
+            << buffer_name;
+    }
+    PerfStatsCollector::reset();
 }
 
 /**

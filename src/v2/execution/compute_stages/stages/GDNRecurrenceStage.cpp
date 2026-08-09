@@ -274,19 +274,6 @@ namespace llaminar2
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
         }
-        else if (!params_.device_id.is_gpu() && capture_state_size > 0)
-        {
-            const int max_rows = std::max(1, params_.seq_len);
-            capture_rows = std::min(speculative_slot_rows, max_rows);
-            const size_t required_floats =
-                static_cast<size_t>(capture_rows) * static_cast<size_t>(capture_state_size);
-            if (required_floats > host_verifier_state_slot_capacity_)
-            {
-                host_verifier_state_slots_.reset(new float[required_floats]);
-                host_verifier_state_slot_capacity_ = required_floats;
-            }
-            capture = required_floats == 0 ? nullptr : host_verifier_state_slots_.get();
-        }
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
         verifier_capture_rows_bound_ = capture_rows;
@@ -466,7 +453,7 @@ namespace llaminar2
         return false;
     }
 
-    const float *GDNRecurrenceStage::cpuVerifierStateCaptureSource() const
+    float *GDNRecurrenceStage::cpuVerifierStateCaptureWorkspace() const
     {
         if (params_.device_id.is_gpu() ||
             verifier_capture_rows_bound_ <= 0 ||
@@ -478,13 +465,11 @@ namespace llaminar2
         if (bound_workspace_ &&
             bound_workspace_->hasBuffer(speculativeStateSlotsBufferName()))
         {
-            return static_cast<const float *>(
+            return static_cast<float *>(
                 bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
         }
 
-        return !host_verifier_state_slots_
-                   ? nullptr
-                   : host_verifier_state_slots_.get();
+        return nullptr;
     }
 
     bool GDNRecurrenceStage::restoreCPUVerifierStateCaptureRowDirect(int row)
@@ -496,16 +481,16 @@ namespace llaminar2
         if (row < 0 || row >= verifier_capture_rows_bound_)
             return false;
 
-        const float *capture = cpuVerifierStateCaptureSource();
+        const float *capture = cpuVerifierStateCaptureWorkspace();
         if (!capture || !params_.recurrence_state)
             return false;
 
         /*
-         * CPU GDN kernels are shared backend objects.  Rebinding that shared
+         * CPU GDN kernels are shared backend objects. Rebinding that shared
          * object during parallel MTP publication is racy, so CPU publication
-         * copies from the stage-owned capture slot directly.  GPU stages still
-         * delegate to the backend restore kernel because their slots live on
-         * device and must stay ordered on the explicit capture stream.
+         * copies directly from this stage's manager-owned workspace binding.
+         * GPU stages still delegate to the backend restore kernel because their
+         * slots live on device and must stay ordered on the explicit stream.
          */
         std::memcpy(
             params_.recurrence_state,
@@ -1214,10 +1199,11 @@ namespace llaminar2
                 verifier_capture_state_size_bound_ > 0;
             if (direct_merged_verifier)
             {
-                if (!host_verifier_state_slots_ ||
-                    verifier_capture_rows_bound_ <= 0)
+                float *const verifier_state_slots =
+                    cpuVerifierStateCaptureWorkspace();
+                if (!verifier_state_slots || verifier_capture_rows_bound_ <= 0)
                 {
-                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier requires bound host state slots");
+                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier requires manager-owned state slots");
                     return false;
                 }
 
@@ -1247,9 +1233,9 @@ namespace llaminar2
                         params_.global_v_head_offset,
                         params_.chunk_size,
                         params_.use_qk_l2norm,
-                    host_verifier_state_slots_.get(),
-                    verifier_capture_state_size_bound_,
-                    verifier_capture_rows_bound_);
+                        verifier_state_slots,
+                        verifier_capture_state_size_bound_,
+                        verifier_capture_rows_bound_);
                 }
                 if (!ok)
                 {

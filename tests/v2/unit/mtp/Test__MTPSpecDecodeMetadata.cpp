@@ -1136,6 +1136,83 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromGreedyCatchupRejectAfterPref
                 ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, FinalAcceptedStopHasNoBonusContinuation)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {8};
+    const MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    const MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/1000,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_TRUE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1));
+    EXPECT_THAT(batch.stopped_flags, ElementsAre(1));
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(3));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(3));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(8));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_state_slot_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, AcceptedStopTruncationIsNotARejection)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {9};
+    const MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    const MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/1000,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_FALSE(batch.transactions.front().allDraftsAccepted())
+        << "Token comparison sees a truncated row, while the explicit outcome "
+           "records that no verifier comparison rejected";
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1));
+    EXPECT_THAT(batch.stopped_flags, ElementsAre(1));
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(2));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(2));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(2));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(9));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(0));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, UsesExplicitVerifierStateCommitCountForRejectedCorrection)
 {
     MTPSpecDecodeMetadataShape shape;

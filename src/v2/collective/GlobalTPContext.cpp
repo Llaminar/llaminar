@@ -342,7 +342,7 @@ namespace llaminar2
     // =============================================================================
 
     GlobalTPContext::GlobalTPContext(GlobalTPContext &&other) noexcept
-        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_type_(other.backend_type_), backend_(std::move(other.backend_)), abort_requested_(other.abort_requested_.load(std::memory_order_acquire))
+        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_type_(other.backend_type_), backend_(std::move(other.backend_)), abort_requested_(other.abort_requested_.load(std::memory_order_acquire)), allreduce_sequence_(other.allreduce_sequence_.load(std::memory_order_acquire))
     {
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
@@ -380,6 +380,9 @@ namespace llaminar2
             backend_type_ = other.backend_type_;
             backend_ = std::move(other.backend_);
             abort_requested_.store(other.abort_requested_.load(std::memory_order_acquire), std::memory_order_release);
+            allreduce_sequence_.store(
+                other.allreduce_sequence_.load(std::memory_order_acquire),
+                std::memory_order_release);
 
             // Clear source to prevent double-free
             other.domain_comm_ = MPI_COMM_NULL;
@@ -414,8 +417,6 @@ namespace llaminar2
 
     bool GlobalTPContext::allreduce(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
-        (void)stage_name; // Stage name currently not used by GLOBAL TP backend
-
         if (isAbortRequested())
         {
             LOG_ERROR("GlobalTPContext::allreduce - abort already requested for domain " << domain_id_);
@@ -458,8 +459,41 @@ namespace llaminar2
             return true; // Nothing to reduce
         }
 
-        // Delegate to UPI backend
-        return backend_->allreduce(data, effective_count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
+        const uint64_t sequence =
+            allreduce_sequence_.fetch_add(
+                1,
+                std::memory_order_acq_rel) +
+            1;
+        const char *const diagnostic_stage =
+            stage_name.empty() ? "(none)" : stage_name.c_str();
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=globaltp_allreduce_enter"
+                      << " domain=" << domain_id_
+                      << " rank=" << my_rank_in_domain_
+                      << " sequence=" << sequence
+                      << " stage=" << diagnostic_stage
+                      << " count=" << effective_count
+                      << " backend=" << backend_->name());
+        }
+
+        const bool success = backend_->allreduce(
+            data,
+            effective_count,
+            CollectiveDataType::FLOAT32,
+            CollectiveOp::ALLREDUCE_SUM);
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=globaltp_allreduce_exit"
+                      << " domain=" << domain_id_
+                      << " rank=" << my_rank_in_domain_
+                      << " sequence=" << sequence
+                      << " stage=" << diagnostic_stage
+                      << " count=" << effective_count
+                      << " backend=" << backend_->name()
+                      << " success=" << (success ? "true" : "false"));
+        }
+        return success;
     }
 
     bool GlobalTPContext::broadcast(TensorBase *tensor, int source_index)

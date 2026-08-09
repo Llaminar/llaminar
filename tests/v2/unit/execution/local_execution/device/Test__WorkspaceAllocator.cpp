@@ -1,3 +1,13 @@
+/**
+ * @file Test__WorkspaceAllocator.cpp
+ * @brief Device-free and backend-specific tests for graph-family workspace planning.
+ *
+ * The suite proves that setup-time workspace discovery is complete before a
+ * graph family publishes raw addresses. CPU executable stages, CUDA graphs,
+ * and ROCm graphs share the same typed allocation contract; tests that need an
+ * accelerator say so explicitly, while CPU coverage remains in the unit gate.
+ */
+
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
@@ -1822,7 +1832,7 @@ TEST(Test__WorkspaceAllocator, ExactGroupedTerminalProjectionUsesVerifierCardina
     EXPECT_TRUE(lm_head_ptr->sawDeclaredM());
 }
 
-TEST(Test__WorkspaceAllocator, GraphConsumerSkipsCPUWorkspaceForDeclaredStage)
+TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesAndBindsCPUWorkspaceForDeclaredStage)
 {
     if (!hasCPUBackend())
     {
@@ -1854,14 +1864,18 @@ TEST(Test__WorkspaceAllocator, GraphConsumerSkipsCPUWorkspaceForDeclaredStage)
         config));
 
     auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    EXPECT_EQ(workspace, nullptr)
-        << "Graph-level DeviceWorkspaceManager binding is GPU-only; CPU scratch is owned by CPU kernels";
-    EXPECT_EQ(raw_stage->boundWorkspace(), nullptr);
-    EXPECT_EQ(raw_stage->requirementsCalls(), 0);
-    EXPECT_EQ(raw_stage->bindCalls(), 0);
+    ASSERT_NE(workspace, nullptr)
+        << "CPU kernels with declared persistent scratch are graph-family workspace consumers";
+    EXPECT_EQ(raw_stage->boundWorkspace(), workspace);
+    EXPECT_GT(raw_stage->requirementsCalls(), 0);
+    EXPECT_EQ(raw_stage->bindCalls(), 1);
+    EXPECT_TRUE(workspace->hasBuffer("declared_shape_scratch"));
+    EXPECT_GE(
+        workspace->getBufferSize("declared_shape_scratch"),
+        size_t{4096});
 }
 
-TEST(Test__WorkspaceAllocator, ExtraCPUConsumersAreIgnoredByGraphAllocator)
+TEST(Test__WorkspaceAllocator, ExtraCPUConsumersUseTheSameAppendOnlyWorkspaceLifecycle)
 {
     if (!hasCPUBackend())
     {
@@ -1890,12 +1904,14 @@ TEST(Test__WorkspaceAllocator, ExtraCPUConsumersAreIgnoredByGraphAllocator)
         config));
 
     auto *initial_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    EXPECT_EQ(initial_workspace, nullptr);
-    EXPECT_EQ(initial_consumer.boundWorkspace(), nullptr);
-    EXPECT_EQ(initial_consumer.requirementsCalls(), 0);
-    EXPECT_EQ(initial_consumer.bindCalls(), 0);
+    ASSERT_NE(initial_workspace, nullptr);
+    EXPECT_EQ(initial_consumer.boundWorkspace(), initial_workspace);
+    EXPECT_GT(initial_consumer.requirementsCalls(), 0);
+    EXPECT_EQ(initial_consumer.bindCalls(), 1);
+    EXPECT_TRUE(initial_workspace->hasBuffer("shared_scratch"));
+    EXPECT_TRUE(initial_workspace->hasBuffer("old_only_scratch"));
     const uint64_t initial_generation = allocator.deviceGeneration(DeviceId::cpu());
-    EXPECT_EQ(initial_generation, 0u);
+    EXPECT_GT(initial_generation, 0u);
 
     MockWorkspaceConsumer larger_consumer({
         {"shared_scratch", 4096, 256, true},
@@ -1909,10 +1925,14 @@ TEST(Test__WorkspaceAllocator, ExtraCPUConsumersAreIgnoredByGraphAllocator)
         config));
 
     auto *reallocated_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    EXPECT_EQ(reallocated_workspace, nullptr);
-    EXPECT_EQ(larger_consumer.boundWorkspace(), nullptr);
-    EXPECT_EQ(larger_consumer.requirementsCalls(), 0);
-    EXPECT_EQ(larger_consumer.bindCalls(), 0);
+    ASSERT_EQ(reallocated_workspace, initial_workspace)
+        << "CPU graph-family growth must preserve the manager and old addresses";
+    EXPECT_EQ(larger_consumer.boundWorkspace(), reallocated_workspace);
+    EXPECT_GT(larger_consumer.requirementsCalls(), 0);
+    EXPECT_EQ(larger_consumer.bindCalls(), 1);
+    EXPECT_EQ(reallocated_workspace->getBufferSize("shared_scratch"), 4096u);
+    EXPECT_TRUE(reallocated_workspace->hasBuffer("old_only_scratch"));
+    EXPECT_TRUE(reallocated_workspace->hasBuffer("new_only_scratch"));
     EXPECT_EQ(allocator.deviceGeneration(DeviceId::cpu()), initial_generation);
 }
 

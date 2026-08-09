@@ -1595,6 +1595,8 @@ namespace llaminar2
         graph.addDependency(kv_projection, prefix + "attn_norm");
 
         const int local_n_kv_heads = resolveLocalHeadCounts().second;
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
         const std::string key_terminal = addKeyCachePublicationTransforms(
             graph,
             prefix,
@@ -1605,6 +1607,7 @@ namespace llaminar2
             position_ids,
             position_ids_device,
             device,
+            attention_policy,
             kv_projection);
 
         const std::string kv_append = addKVCacheAppend(
@@ -1617,6 +1620,7 @@ namespace llaminar2
             kv_cache,
             sequence_lengths_device,
             device,
+            attention_policy,
             key_terminal,
             {key_terminal},
             layer_idx_is_cache_local,
@@ -1757,6 +1761,8 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
         std::vector<std::string> cache_source_dependencies;
         if (has_qk_norms)
         {
@@ -1776,7 +1782,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device, attention_policy);
 
         if (has_qk_norms)
         {
@@ -1798,7 +1804,7 @@ namespace llaminar2
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
             kv_cache, position_ids, position_ids_device,
             sequence_lengths_device,
-            device, has_qkv_proj, rope_node,
+            device, has_qkv_proj, attention_policy, rope_node,
             cache_source_dependencies,
             layer_idx_is_cache_local);
 

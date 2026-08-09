@@ -5412,6 +5412,82 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GDNVerifierCaptureWorkspacesAreGraphRol
               std::string::npos);
 }
 
+/**
+ * @brief Keep CPU and GPU GDN verifier snapshots under one workspace owner.
+ *
+ * Short-convolution and recurrence stages used to allocate private host vectors
+ * whenever a CPU verifier graph had not been included in centralized workspace
+ * discovery. That concealed an incomplete graph-family plan and gave the direct
+ * merged-QKV path a different owner from the kernel binding. Every backend now
+ * declares the slots through @c WorkspaceRequirements; an unbound speculative
+ * stage is invalid and may not manufacture replacement storage.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     GDNVerifierCaptureSlotsAreExclusivelyWorkspaceManaged)
+{
+    const auto root = repoRoot();
+    const std::array<std::pair<std::string, std::filesystem::path>, 2> stages = {{
+        {"GDNRecurrenceStage",
+         root / "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.cpp"},
+        {"ShortConv1dStage",
+         root / "src/v2/execution/compute_stages/stages/ShortConv1dStage.cpp"},
+    }};
+
+    for (const auto &[class_name, source_path] : stages)
+    {
+        const auto source = stripCommentsAndStringLiterals(readFile(source_path));
+        const auto requirements = removeAsciiWhitespace(sliceBetween(
+            source,
+            "WorkspaceRequirements " + class_name + "::getWorkspaceRequirements(",
+            "void " + class_name + "::bindWorkspace("));
+        const auto binding = removeAsciiWhitespace(sliceBetween(
+            source,
+            "void " + class_name + "::bindKernelWorkspace()",
+            "void " + class_name + "::clearKernelVerifierStateWorkspace()"));
+
+        const size_t slot_declaration =
+            requirements.find("speculativeStateSlotsBufferName()");
+        const size_t cpu_return =
+            requirements.find("if(!params_.device_id.is_gpu())returnreqs;");
+        ASSERT_NE(slot_declaration, std::string::npos) << source_path;
+        ASSERT_NE(cpu_return, std::string::npos) << source_path;
+        EXPECT_LT(slot_declaration, cpu_return)
+            << class_name << " must declare CPU verifier slots through the same "
+                          << "workspace contract as GPU verifier slots";
+
+        EXPECT_NE(
+            binding.find(
+                "bound_workspace_&&bound_workspace_->hasBuffer(speculativeStateSlotsBufferName())"),
+            std::string::npos)
+            << class_name << " must consume the exact manager-owned slot address";
+
+        for (const char *forbidden : {
+                 "newfloat[",
+                 "std::make_unique",
+                 "std::vector<",
+                 ".resize(",
+                 "malloc("})
+        {
+            EXPECT_EQ(binding.find(forbidden), std::string::npos)
+                << class_name << " may not create private verifier storage via "
+                << forbidden;
+        }
+    }
+
+    const std::array<std::filesystem::path, 2> headers = {
+        root / "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.h",
+        root / "src/v2/execution/compute_stages/stages/ShortConv1dStage.h",
+    };
+    for (const auto &header_path : headers)
+    {
+        const auto header = stripCommentsAndStringLiterals(readFile(header_path));
+        EXPECT_EQ(header.find("host_verifier_state_slots"), std::string::npos)
+            << header_path << " may not own a hidden verifier-slot container";
+        EXPECT_EQ(header.find("host_verifier_state_slot_capacity"), std::string::npos)
+            << header_path << " may not track capacity outside the workspace plan";
+    }
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, ResidentGroupedOutcomeControlIsDeviceAuthoritative)
 {
     const auto runner_api = readFile(
@@ -14005,12 +14081,38 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(grouped_participant));
 
     EXPECT_NE(
+        compact_grouped.find("if(state_.device_id.is_gpu())"),
+        std::string::npos)
+        << "Persistent device rows are the GPU authority, not a requirement "
+           "that may leak into CPU workspace discovery.";
+    EXPECT_NE(
         compact_grouped.find(
             "grouped_input.sequence_lengths_device="
             "static_cast<constint32_t*>("
             "mtp_verifier_request_lengths_dev_);"),
         std::string::npos)
         << "The captured grouped graph must bind its own permanent length row.";
+    EXPECT_NE(
+        compact_grouped.find(
+            "grouped_input.token_ids="
+            "grouped_verifier_tokens.data();"),
+        std::string::npos)
+        << "CPU grouped-verifier declarations must retain their canonical "
+           "host token authority.";
+    EXPECT_NE(
+        compact_grouped.find(
+            "grouped_input.position_ids="
+            "grouped_verifier_positions.data();"),
+        std::string::npos)
+        << "CPU grouped-verifier declarations must retain their canonical "
+           "host position authority.";
+    EXPECT_NE(
+        compact_grouped.find(
+            "grouped_input.sequence_lengths="
+            "&grouped_verifier_request_lengths;"),
+        std::string::npos)
+        << "Batched CPU grouped-verifier declarations must carry the same "
+           "host ragged-row contract as production execution.";
 
     const auto metadata_prelude = sliceBetween(
         source,

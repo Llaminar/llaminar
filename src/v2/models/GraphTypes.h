@@ -320,12 +320,11 @@ namespace llaminar2
         /// rotated after the weighted-V accumulation. Not owned by GraphConfig.
         const ActivationRotation *kv_rotation = nullptr;
 
-        /// RoPE-on-read mode: store pre-RoPE K in the KV cache and apply
-        /// position embeddings lazily during attention (fused with TQ4 dequant).
-        /// Benefits: (1) fused dequant+RoPE is nearly free (O(D) vs O(D²) dequant),
-        /// (2) position-free cache enables speculative decoding,
-        /// (3) eliminates separate RoPE computation for K.
-        /// Currently supported for TQ4 (fused) and FP32 (in-place) KV precision.
+        /// GPU RoPE-on-read preference. CUDA/ROCm may store pre-RoPE K and apply
+        /// the positional transform in their captured device cache-read path.
+        /// CPU graph policy deliberately publishes post-RoPE native cache bytes
+        /// so Q8/Q16/TurboQuant attention never materializes a conversion shadow.
+        /// Cacheless graphs also rotate projected K before attention.
         bool rope_on_read = false;
 
         // Execution settings

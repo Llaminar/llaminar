@@ -254,9 +254,12 @@ topology_model_supported() {
     single)
       return 0
       ;;
-    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2)
+    localtp_rocm2|localtp_cuda2|localpp_rocm2)
       [[ "${model}" == "dense" ]]
       return
+      ;;
+    nodelocaltp_cpu2)
+      return 0
       ;;
     routed_expert_tiered_rocm2_hot|routed_expert_tiered_rocm2_cpu2)
       [[ "${model}" == "moe" ]]
@@ -333,7 +336,7 @@ describe_topology() {
         --device-map "0=cpu:0,1=cpu:1"
         --tensor-parallelism-degree 2
         --tp-scope node_local
-        --backend mpi
+        --backend upi
       )
       ;;
     routed_expert_tiered_rocm2_hot)

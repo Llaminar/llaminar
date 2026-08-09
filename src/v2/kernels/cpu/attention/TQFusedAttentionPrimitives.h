@@ -22,6 +22,7 @@
  *
  * - tq8_dot_rotated_q():   dot(Q_rot, centroids(TQ8_block)) · norm
  * - tq4_accum_weighted():  accum += weight · norm · centroids(TQ4_block)
+ * - tq8_accum_weighted():  accum += weight · norm · centroids(TQ8_block)
  *
  * Both operate on raw block bytes with runtime head_dim, no templates needed.
  * Attention scale (1/√D) is applied by the caller for flexibility.
@@ -195,6 +196,339 @@ namespace llaminar2
         int head_dim)
     {
         return ISA_DISPATCH_RETVAL(tq8_dot_rotated_q, Q_rot, tq8_block, head_dim);
+    }
+
+    // ========================================================================
+    // TQ4 K dot product: score = dot(Q_rot, centroids) * norm
+    // ========================================================================
+
+    /**
+     * @brief Compute a scalar dot product against one native TQ4 key block.
+     *
+     * TQ4 stores each centroid index as a three-bit MSE code plus a separate
+     * high-bit plane. Decoding those two streams directly inside the score
+     * loop avoids constructing an FP32 key row while preserving the exact
+     * TurboQuant rotation and scaling used by the TQ8-key path.
+     *
+     * @param Q_rot Query after the per-head TurboQuant forward rotation.
+     * @param tq4_block Raw TQ4 block bytes for one KV head and position.
+     * @param head_dim Number of centroid indices in the block; must be a
+     *        positive multiple of eight.
+     * @return `dot(Q_rot, centroid_vector) * norm`.
+     */
+    inline float tq4_dot_rotated_q_scalar(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq4_block, sizeof(float));
+        if (norm < 1e-30f)
+            return 0.0f;
+
+        const uint8_t *mse_indices = tq4_block + 8;
+        const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t low_indices[8];
+            uint8_t high_indices[8];
+            tq3_unpack_8(mse_indices + group * 3, low_indices);
+            tq_attn_detail::unpack_bitplane_8_local(
+                high_bits + group,
+                high_indices);
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                const uint8_t centroid =
+                    low_indices[lane] |
+                    static_cast<uint8_t>(high_indices[lane] << 3);
+                dot += Q_rot[i + lane] * TQ4_CENTROIDS[centroid];
+            }
+        }
+        return dot * norm;
+    }
+
+#if defined(__AVX2__)
+    /** @brief AVX2 native TQ4 key dot product using eight-wide gathers. */
+    inline float tq4_dot_rotated_q_avx2(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq4_block, sizeof(float));
+        if (norm < 1e-30f)
+            return 0.0f;
+
+        const uint8_t *mse_indices = tq4_block + 8;
+        const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int i = 0; i < head_dim; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t low_indices[8];
+            uint8_t high_indices[8];
+            alignas(32) int32_t expanded_indices[8];
+            tq3_unpack_8(mse_indices + group * 3, low_indices);
+            tq_attn_detail::unpack_bitplane_8_local(
+                high_bits + group,
+                high_indices);
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                expanded_indices[lane] =
+                    low_indices[lane] | (high_indices[lane] << 3);
+            }
+
+            const __m256i indices = _mm256_load_si256(
+                reinterpret_cast<const __m256i *>(expanded_indices));
+            const __m256 centroids = _mm256_i32gather_ps(
+                TQ4_CENTROIDS.data(),
+                indices,
+                sizeof(float));
+            accumulator = _mm256_fmadd_ps(
+                _mm256_loadu_ps(Q_rot + i),
+                centroids,
+                accumulator);
+        }
+        return avx2::hsum_ps(accumulator) * norm;
+    }
+#endif
+
+#if defined(__AVX512F__)
+    /** @brief AVX-512 native TQ4 key dot product using sixteen-wide gathers. */
+    inline float tq4_dot_rotated_q_avx512(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq4_block, sizeof(float));
+        if (norm < 1e-30f)
+            return 0.0f;
+
+        const uint8_t *mse_indices = tq4_block + 8;
+        const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
+        __m512 accumulator = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= head_dim; i += 16)
+        {
+            alignas(64) int32_t expanded_indices[16];
+            for (int half = 0; half < 2; ++half)
+            {
+                const int base = i + half * 8;
+                const int group = base / 8;
+                uint8_t low_indices[8];
+                uint8_t high_indices[8];
+                tq3_unpack_8(mse_indices + group * 3, low_indices);
+                tq_attn_detail::unpack_bitplane_8_local(
+                    high_bits + group,
+                    high_indices);
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    expanded_indices[half * 8 + lane] =
+                        low_indices[lane] | (high_indices[lane] << 3);
+                }
+            }
+
+            const __m512i indices = _mm512_load_si512(expanded_indices);
+            const __m512 centroids = _mm512_i32gather_ps(
+                indices,
+                TQ4_CENTROIDS.data(),
+                sizeof(float));
+            accumulator = _mm512_fmadd_ps(
+                _mm512_loadu_ps(Q_rot + i),
+                centroids,
+                accumulator);
+        }
+
+        float dot = _mm512_reduce_add_ps(accumulator);
+        for (; i < head_dim; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t low_indices[8];
+            uint8_t high_indices[8];
+            tq3_unpack_8(mse_indices + group * 3, low_indices);
+            tq_attn_detail::unpack_bitplane_8_local(
+                high_bits + group,
+                high_indices);
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                const uint8_t centroid =
+                    low_indices[lane] |
+                    static_cast<uint8_t>(high_indices[lane] << 3);
+                dot += Q_rot[i + lane] * TQ4_CENTROIDS[centroid];
+            }
+        }
+        return dot * norm;
+    }
+#endif
+
+#if !defined(__AVX2__)
+    inline float tq4_dot_rotated_q_avx2(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        return tq4_dot_rotated_q_scalar(Q_rot, tq4_block, head_dim);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline float tq4_dot_rotated_q_avx512(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        return tq4_dot_rotated_q_avx2(Q_rot, tq4_block, head_dim);
+    }
+#endif
+
+    /** @brief Runtime-ISA dispatch for direct TQ4 key scoring. */
+    inline float tq4_dot_rotated_q(
+        const float *__restrict__ Q_rot,
+        const uint8_t *__restrict__ tq4_block,
+        int head_dim)
+    {
+        return ISA_DISPATCH_RETVAL(
+            tq4_dot_rotated_q,
+            Q_rot,
+            tq4_block,
+            head_dim);
+    }
+
+    // ========================================================================
+    // TQ8 V accumulation in rotated space
+    // ========================================================================
+
+    /**
+     * @brief Accumulate a weighted TQ8 centroid vector in rotated space.
+     *
+     * Symmetric TQ8-K/TQ8-V caches use exactly the same block encoding for K
+     * and V. The attention numerator needs the V centroid vector rather than a
+     * dot product, so this primitive gathers each centroid and performs the
+     * fixed-order update `accum[i] += weight * norm * centroid[index[i]]`.
+     * The caller applies the common `1/sqrt(D)` scale and inverse rotation once
+     * after the online-softmax reduction.
+     *
+     * @param accum Rotated-space attention numerator, updated in place.
+     * @param tq8_block Raw `[norm, residual_norm, indices...]` TQ8 block.
+     * @param weight Unnormalized online-softmax probability for this K/V row.
+     * @param head_dim Number of elements encoded by the block.
+     */
+    inline void tq8_accum_weighted_scalar(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq8_block, sizeof(float));
+        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+            return;
+
+        const float combined_weight = weight * norm;
+        const uint8_t *indices = tq8_block + 8;
+        for (int i = 0; i < head_dim; ++i)
+            accum[i] += combined_weight * TQ8_CENTROIDS[indices[i]];
+    }
+
+#if defined(__AVX2__)
+    /** @brief AVX2 TQ8 value accumulation using eight-wide centroid gathers. */
+    inline void tq8_accum_weighted_avx2(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq8_block, sizeof(float));
+        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+            return;
+
+        const __m256 weighted_norm = _mm256_set1_ps(weight * norm);
+        const uint8_t *indices = tq8_block + 8;
+        int i = 0;
+        for (; i + 8 <= head_dim; i += 8)
+        {
+            const __m128i packed_indices = _mm_loadl_epi64(
+                reinterpret_cast<const __m128i *>(indices + i));
+            const __m256i expanded_indices =
+                _mm256_cvtepu8_epi32(packed_indices);
+            const __m256 centroids = _mm256_i32gather_ps(
+                TQ8_CENTROIDS.data(), expanded_indices, sizeof(float));
+            const __m256 previous = _mm256_loadu_ps(accum + i);
+            _mm256_storeu_ps(
+                accum + i,
+                _mm256_fmadd_ps(centroids, weighted_norm, previous));
+        }
+        for (; i < head_dim; ++i)
+            accum[i] += weight * norm * TQ8_CENTROIDS[indices[i]];
+    }
+#endif
+
+#if defined(__AVX512F__)
+    /** @brief AVX-512 TQ8 value accumulation using sixteen-wide gathers. */
+    inline void tq8_accum_weighted_avx512(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        float norm;
+        std::memcpy(&norm, tq8_block, sizeof(float));
+        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+            return;
+
+        const __m512 weighted_norm = _mm512_set1_ps(weight * norm);
+        const uint8_t *indices = tq8_block + 8;
+        int i = 0;
+        for (; i + 16 <= head_dim; i += 16)
+        {
+            const __m128i packed_indices = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(indices + i));
+            const __m512i expanded_indices =
+                _mm512_cvtepu8_epi32(packed_indices);
+            const __m512 centroids = _mm512_i32gather_ps(
+                expanded_indices, TQ8_CENTROIDS.data(), sizeof(float));
+            const __m512 previous = _mm512_loadu_ps(accum + i);
+            _mm512_storeu_ps(
+                accum + i,
+                _mm512_fmadd_ps(centroids, weighted_norm, previous));
+        }
+        for (; i < head_dim; ++i)
+            accum[i] += weight * norm * TQ8_CENTROIDS[indices[i]];
+    }
+#endif
+
+#if !defined(__AVX2__)
+    inline void tq8_accum_weighted_avx2(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        tq8_accum_weighted_scalar(accum, tq8_block, weight, head_dim);
+    }
+#endif
+#if !defined(__AVX512F__)
+    inline void tq8_accum_weighted_avx512(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        tq8_accum_weighted_avx2(accum, tq8_block, weight, head_dim);
+    }
+#endif
+
+    /** @brief Runtime-ISA dispatch for native symmetric TQ8 value accumulation. */
+    inline void tq8_accum_weighted(
+        float *__restrict__ accum,
+        const uint8_t *__restrict__ tq8_block,
+        float weight,
+        int head_dim)
+    {
+        ISA_DISPATCH_VOID(tq8_accum_weighted, accum, tq8_block, weight, head_dim);
     }
 
     // ========================================================================

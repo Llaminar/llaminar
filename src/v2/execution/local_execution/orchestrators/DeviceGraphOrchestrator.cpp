@@ -50288,22 +50288,24 @@ namespace llaminar2
         }
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        if (!state_.device_id.is_gpu())
-            return true;
         if (!state_.isInitialized() || !hasGlobalWeights())
         {
-            LOG_ERROR("[DGO] Cannot declare the GPU MTP workspace family before inference state and weights are initialized");
+            LOG_ERROR("[DGO] Cannot declare the MTP workspace family before inference state and weights are initialized");
             return false;
         }
         if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
         {
-            LOG_ERROR("[DGO] Cannot declare the GPU MTP workspace family without its depth-zero KV cache");
+            LOG_ERROR("[DGO] Cannot declare the MTP workspace family without its depth-zero KV cache");
             return false;
         }
-        if (!mtp_sidecar_condition_token_dev_ ||
-            !mtp_sidecar_position_ids_dev_ ||
-            mtp_sidecar_condition_token_slot_width_ <= 0 ||
-            !state_.hidden)
+        if (mtp_sidecar_condition_token_slot_width_ <= 0 || !state_.hidden)
+        {
+            LOG_ERROR("[DGO] Cannot declare the MTP workspace family without its configured row capacity and hidden-state owner");
+            return false;
+        }
+        if (state_.device_id.is_gpu() &&
+            (!mtp_sidecar_condition_token_dev_ ||
+             !mtp_sidecar_position_ids_dev_))
         {
             LOG_ERROR("[DGO] Cannot declare the GPU MTP workspace family without persistent device token/position slots");
             return false;
@@ -50311,7 +50313,7 @@ namespace llaminar2
         if (!ensureMTPTerminalHiddenBuffer(
                 mtp_sidecar_condition_token_slot_width_))
         {
-            LOG_ERROR("[DGO] Cannot declare the GPU MTP workspace family without its maximum-capacity terminal-hidden mailbox");
+            LOG_ERROR("[DGO] Cannot declare the MTP workspace family without its maximum-capacity terminal-hidden mailbox");
             return false;
         }
 
@@ -50368,13 +50370,17 @@ namespace llaminar2
             .moe_up_scratch = extension(BufferId::MOE_UP_SCRATCH),
         };
 
-        void *const publication_stream =
-            explicitGPUStreamForOperation(
-                "mtp_workspace_family_manifest");
+        void *const publication_stream = state_.device_id.is_gpu()
+                                             ? explicitGPUStreamForOperation(
+                                                   "mtp_workspace_family_manifest")
+                                             : nullptr;
         if (!publication_stream)
         {
-            LOG_ERROR("[DGO] GPU MTP workspace-family declaration requires an explicit publication stream");
-            return false;
+            if (state_.device_id.is_gpu())
+            {
+                LOG_ERROR("[DGO] GPU MTP workspace-family declaration requires an explicit publication stream");
+                return false;
+            }
         }
 
         const int maximum_rows =
@@ -50396,16 +50402,17 @@ namespace llaminar2
             if (rows <= 0 || rows > maximum_rows || !terminal_hidden)
                 return false;
 
-            const int condition_slot =
-                mtp_sidecar_capture_layout_.conditionTokenSlot(
-                    role,
-                    rows);
+            const int condition_slot = state_.device_id.is_gpu()
+                                           ? mtp_sidecar_capture_layout_
+                                                 .conditionTokenSlot(role, rows)
+                                           : -1;
             const int required_token_capacity =
                 (condition_slot + 1) *
                 mtp_sidecar_condition_token_slot_width_;
-            if (condition_slot < 0 ||
-                required_token_capacity >
-                    mtp_sidecar_condition_token_capacity_)
+            if (state_.device_id.is_gpu() &&
+                (condition_slot < 0 ||
+                 required_token_capacity >
+                     mtp_sidecar_condition_token_capacity_))
             {
                 LOG_ERROR("[DGO] MTP workspace-family token slot exceeds the persistent arena: role="
                           << static_cast<int>(role)
@@ -50417,18 +50424,21 @@ namespace llaminar2
                 return false;
             }
 
-            const auto *condition_tokens =
-                static_cast<const int32_t *>(
-                    mtp_sidecar_condition_token_dev_) +
-                condition_slot *
-                    mtp_sidecar_condition_token_slot_width_;
+            const auto *condition_tokens = state_.device_id.is_gpu()
+                                               ? static_cast<const int32_t *>(
+                                                     mtp_sidecar_condition_token_dev_) +
+                                                     condition_slot *
+                                                         mtp_sidecar_condition_token_slot_width_
+                                               : nullptr;
             MTPForwardInput input{
                 .draft_token_ids = host_tokens.data(),
                 .draft_token_ids_device = condition_tokens,
                 .terminal_hidden = terminal_hidden,
                 .kv_cache = state_.mtp_kv_caches[0].get(),
                 .position_ids = host_positions.data(),
-                .position_ids_device = mtp_sidecar_position_ids_dev_,
+                .position_ids_device = state_.device_id.is_gpu()
+                                           ? mtp_sidecar_position_ids_dev_
+                                           : nullptr,
                 .sequence_lengths = nullptr,
                 .sequence_lengths_device = nullptr,
                 .batch_size = 1,
@@ -50499,6 +50509,23 @@ namespace llaminar2
         }
 
         /*
+         * This count authenticates family completeness at the setup boundary.
+         * It is intentionally emitted for CPU too: an executable CPU stage
+         * retains its bound workspace addresses, so omitting its sidecar graph
+         * is the same lifetime defect as omitting a captured GPU participant.
+         */
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "workspace_family_graph_participants",
+            static_cast<double>(owned_mtp_graphs.size()),
+            "materialize",
+            state_.device_id.toString(),
+            {{"backend", state_.device_id.is_gpu() ? "gpu" : "cpu"},
+             {"maximum_rows", std::to_string(maximum_rows)},
+             {"full_graphs", "2"},
+             {"kv_only_graphs", std::to_string(maximum_rows)}});
+
+        /*
          * Terminal-hidden publication no longer contributes private workspace
          * buffers to this family manifest. Fixed ranges encode their source
          * offset in the captured D2D node, request terminals consume the arena
@@ -50506,6 +50533,9 @@ namespace llaminar2
          * metadata workspace. Materializing a host-owned scalar or row array
          * here would reserve dead memory and keep the retired upload path alive.
          */
+
+        if (!state_.device_id.is_gpu())
+            return true;
 
         publishGraphBuildDeviceStateReady(
             mtp_graph_build_device_state_ready_,
@@ -50804,6 +50834,7 @@ namespace llaminar2
 
         std::vector<int> grouped_verifier_tokens;
         std::vector<int> grouped_verifier_positions;
+        std::vector<int> grouped_verifier_request_lengths;
         if (graph_builder_->config().mtp.enabled &&
             mtp_max_verifier_rows_ > 1)
         {
@@ -50812,16 +50843,12 @@ namespace llaminar2
              * It selects speculative recurrent-state banks and grouped
              * decode-equivalent kernels that ordinary decode/prefill graphs do
              * not contain. Declare its maximum configured M with the same
-             * device token/position owners used by production replay.
+             * backend-specific authority used by production replay: CPU owns
+             * host rows, while GPU owns persistent arena rows. Applying the GPU
+             * pointer requirement to CPU makes the canonical host path
+             * impossible to materialize; retaining host rows beside GPU rows
+             * would instead create two competing authorities.
              */
-            if (!mtp_verifier_input_tokens_dev_ ||
-                !mtp_verifier_position_ids_dev_ ||
-                !mtp_verifier_request_lengths_dev_)
-            {
-                LOG_ERROR("[DGO] Grouped-verifier workspace-family declaration requires persistent device token, position, and request-length rows");
-                return false;
-            }
-
             struct GroupedVerifierGraphPolicyScope
             {
                 IGraphBuilder *builder = nullptr;
@@ -50854,28 +50881,62 @@ namespace llaminar2
 
             const int grouped_rows =
                 mtp_max_verifier_rows_;
+            const int grouped_total_rows =
+                batch_size * grouped_rows;
             grouped_verifier_tokens.assign(
-                static_cast<size_t>(grouped_rows),
+                static_cast<size_t>(grouped_total_rows),
                 0);
             grouped_verifier_positions.resize(
-                static_cast<size_t>(grouped_rows));
-            std::iota(
-                grouped_verifier_positions.begin(),
-                grouped_verifier_positions.end(),
-                1);
+                static_cast<size_t>(grouped_total_rows));
+            for (int request = 0; request < batch_size; ++request)
+            {
+                std::iota(
+                    grouped_verifier_positions.begin() +
+                        static_cast<ptrdiff_t>(request * grouped_rows),
+                    grouped_verifier_positions.begin() +
+                        static_cast<ptrdiff_t>((request + 1) * grouped_rows),
+                    1);
+            }
 
             ForwardInput grouped_input = input;
-            grouped_input.token_ids =
-                grouped_verifier_tokens.data();
-            grouped_input.token_ids_device =
-                mtp_verifier_input_tokens_dev_;
-            grouped_input.position_ids =
-                grouped_verifier_positions.data();
-            grouped_input.position_ids_device =
-                mtp_verifier_position_ids_dev_;
-            grouped_input.sequence_lengths_device =
-                static_cast<const int32_t *>(
-                    mtp_verifier_request_lengths_dev_);
+            grouped_input.token_ids = nullptr;
+            grouped_input.token_ids_device = nullptr;
+            grouped_input.position_ids = nullptr;
+            grouped_input.position_ids_device = nullptr;
+            grouped_input.sequence_lengths = nullptr;
+            grouped_input.sequence_lengths_device = nullptr;
+            if (state_.device_id.is_gpu())
+            {
+                if (!mtp_verifier_input_tokens_dev_ ||
+                    !mtp_verifier_position_ids_dev_ ||
+                    !mtp_verifier_request_lengths_dev_)
+                {
+                    LOG_ERROR("[DGO] GPU grouped-verifier workspace-family declaration requires persistent device token, position, and request-length rows");
+                    return false;
+                }
+                grouped_input.token_ids_device =
+                    mtp_verifier_input_tokens_dev_;
+                grouped_input.position_ids_device =
+                    mtp_verifier_position_ids_dev_;
+                grouped_input.sequence_lengths_device =
+                    static_cast<const int32_t *>(
+                        mtp_verifier_request_lengths_dev_);
+            }
+            else
+            {
+                grouped_input.token_ids =
+                    grouped_verifier_tokens.data();
+                grouped_input.position_ids =
+                    grouped_verifier_positions.data();
+                if (batch_size > 1)
+                {
+                    grouped_verifier_request_lengths.assign(
+                        static_cast<size_t>(batch_size),
+                        grouped_rows);
+                    grouped_input.sequence_lengths =
+                        &grouped_verifier_request_lengths;
+                }
+            }
             grouped_input.execution_role =
                 ForwardExecutionRole::GroupedMTPVerifier;
             grouped_input.execution_phase =

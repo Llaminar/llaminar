@@ -16,6 +16,7 @@
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -221,6 +222,16 @@ namespace llaminar2
         CollectiveBackendType backend_type_;          ///< Backend type for this context
         std::unique_ptr<ICollectiveBackend> backend_; ///< Backend for collective operations (ShmemSpin or UPI)
         std::atomic<bool> abort_requested_{false};    ///< One-sided failure/cancel flag
+        /**
+         * @brief Rank-local ordinal for backend allreduce submissions.
+         *
+         * All ranks in a valid TP transaction must submit the same named
+         * collective at the same ordinal. The value is intentionally advanced
+         * only after argument validation and immediately before backend entry,
+         * making paired diagnostic traces useful for locating the first
+         * control-flow divergence without adding another collective.
+         */
+        std::atomic<uint64_t> allreduce_sequence_{0};
     };
 
 } // namespace llaminar2

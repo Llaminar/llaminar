@@ -1373,9 +1373,12 @@ protected:
         attn_params.kv_cache = kv_cache.get();
         attn_params.layer_idx = 0;
         attn_params.read_kv_from_cache = true;
-        attn_params.apply_rope_to_k = true;
-        attn_params.rope_theta = rope_theta;
-        attn_params.partial_rotary_factor = partial_rotary_factor;
+        attn_params.execution_policy.key_cache = {
+            .encoding = attention::AttentionKeyCacheEncoding::
+                PreRotaryDeviceTransform,
+            .rope_theta = rope_theta,
+            .partial_rotary_factor = partial_rotary_factor,
+        };
         attn_params.turboquant_ctx = turboquant_context.get();
         attn_params.mpi_ctx = &mpi_ctx_;
 
@@ -3876,9 +3879,12 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M2RoPEOnRe
     params.kv_cache = kv_cache.get();
     params.layer_idx = 0;
     params.read_kv_from_cache = true;
-    params.apply_rope_to_k = true;
-    params.rope_theta = rope_theta;
-    params.partial_rotary_factor = partial_rotary_factor;
+    params.execution_policy.key_cache = {
+        .encoding = attention::AttentionKeyCacheEncoding::
+            PreRotaryDeviceTransform,
+        .rope_theta = rope_theta,
+        .partial_rotary_factor = partial_rotary_factor,
+    };
     params.mpi_ctx = &mpi_ctx_;
 
     AttentionComputeStage stage(params);
@@ -4109,9 +4115,12 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = true;
-    attn_params.rope_theta = rope_theta;
-    attn_params.partial_rotary_factor = partial_rotary_factor;
+    attn_params.execution_policy.key_cache = {
+        .encoding = attention::AttentionKeyCacheEncoding::
+            PreRotaryDeviceTransform,
+        .rope_theta = rope_theta,
+        .partial_rotary_factor = partial_rotary_factor,
+    };
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage::Params append_params;
@@ -5598,7 +5607,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_FP16KV_Qwen35
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = false;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -5790,12 +5798,17 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedGrowingRequestBatchFP16CacheMatch
         .gqa_n_rep = gqa_n_rep,
         .causal = true,
         .auto_detect_mode = true,
+        .execution_policy = {
+            .key_cache = {
+                .encoding = attention::AttentionKeyCacheEncoding::
+                    PreRotaryDeviceTransform,
+                .rope_theta = rope_theta,
+                .partial_rotary_factor = partial_rotary_factor,
+            },
+        },
         .kv_cache = kv_cache.get(),
         .layer_idx = 0,
         .read_kv_from_cache = true,
-        .apply_rope_to_k = true,
-        .rope_theta = rope_theta,
-        .partial_rotary_factor = partial_rotary_factor,
     });
     append_stage.setGPUStream(stream);
     attention_stage.setGPUStream(stream);
@@ -6335,12 +6348,17 @@ TEST_F(
             .gqa_n_rep = n_heads / n_kv_heads,
             .causal = true,
             .auto_detect_mode = true,
+            .execution_policy = {
+                .key_cache = {
+                    .encoding = attention::AttentionKeyCacheEncoding::
+                        PreRotaryDeviceTransform,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                },
+            },
             .kv_cache = production_cache.get(),
             .layer_idx = 0,
             .read_kv_from_cache = true,
-            .apply_rope_to_k = true,
-            .rope_theta = rope_theta,
-            .partial_rotary_factor = partial_rotary_factor,
         });
         append_stage.setGPUStream(stream);
         attention_stage.setGPUStream(stream);
@@ -7056,7 +7074,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_ConvertsGpuFP
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = false;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -7235,7 +7252,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_RealQwen35Lay
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = false;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -7419,9 +7435,12 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageRoPEOnRead_RealQwen35Layer3
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
     attn_params.read_kv_from_cache = true;
-    attn_params.apply_rope_to_k = true;
-    attn_params.rope_theta = rope_theta;
-    attn_params.partial_rotary_factor = partial_rotary_factor;
+    attn_params.execution_policy.key_cache = {
+        .encoding = attention::AttentionKeyCacheEncoding::
+            PreRotaryDeviceTransform,
+        .rope_theta = rope_theta,
+        .partial_rotary_factor = partial_rotary_factor,
+    };
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
